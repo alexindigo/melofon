@@ -11,11 +11,23 @@ export interface Config {
   user: string | undefined;
   password: string | undefined;
   secret: string | undefined;
+  // Server version for protocol envelopes (OpenSubsonic serverVersion), read
+  // from deno.json at load — not an env knob.
+  version?: string;
 }
 
 export function loadConfig(
   env: (name: string) => string | undefined = (n) => Deno.env.get(n),
 ): Config {
+  let version: string | undefined;
+  try {
+    const denoJson = JSON.parse(
+      Deno.readTextFileSync(new URL('../deno.json', import.meta.url)),
+    );
+    if (typeof denoJson.version === 'string') version = denoJson.version;
+  } catch {
+    // deno.json unreadable — version stays undefined, envelopes fall back
+  }
   const listenRaw = env('MELOFON_LISTEN');
   let listen: Config['listen'];
   if (listenRaw !== undefined && listenRaw.trim() !== '') {
@@ -45,5 +57,6 @@ export function loadConfig(
     user: env('MELOFON_USER'),
     password: env('MELOFON_PASSWORD'),
     secret: env('MELOFON_SECRET'),
+    version,
   };
 }

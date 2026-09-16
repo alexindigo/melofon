@@ -1,10 +1,9 @@
 // src/layers.ts — glob layers/*/, read the optional manifest.json, boot one
 // pathfinder app per folder. The layer name is the folder name; core never
-// imports a layer by name.
+// imports a layer by name. Layers get the injected service bag (app.user,
+// app.library, …, cfg) — never a DuckDB handle.
 import { pathfinder } from '@pathfinder/pathfinder';
 import type { PathfinderApp } from '@pathfinder/pathfinder';
-import type { Config } from './config.ts';
-import type { Db } from './db.ts';
 
 export interface HeaderMatch {
   name: string;
@@ -20,8 +19,7 @@ export interface Layer {
 }
 
 export async function loadLayers(opts: {
-  db: Db;
-  cfg: Config;
+  app: object;
   layersRoot?: string;
 }): Promise<Layer[]> {
   const root = opts.layersRoot ?? './layers';
@@ -40,7 +38,7 @@ export async function loadLayers(opts: {
     }
     const app = await pathfinder({
       roots: [dir],
-      app: { db: opts.db, cfg: opts.cfg },
+      app: opts.app,
     });
     layers.push({
       name: entry.name,

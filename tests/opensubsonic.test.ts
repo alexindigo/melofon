@@ -1,0 +1,277 @@
+// tests/opensubsonic.test.ts — the opensubsonic hat end to end (in-process):
+// auth (password, enc: hex, md5 token, failures), the XML/JSON envelope,
+// ping/getLicense, unknown-op and 404 shapes, and facade dispatch into the
+// layer. Fixture library + seeded admin/test user per test.
+import { assert, assertEquals } from '@std/assert';
+import { pathfinder } from '@pathfinder/pathfinder';
+import { openDb } from '../src/db.ts';
+import { seedFirstUser } from '../src/users.ts';
+import { scanLibrary } from '../src/scan.ts';
+import { createUserService } from '../src/user.ts';
+import { createLibrary } from '../src/library.ts';
+import { facade } from '../src/facade.ts';
+import { normalizeOp } from '../layers/opensubsonic/00-subsonic.ts';
+
+const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
+
+async function setup() {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-os-' });
+  const db = await openDb(dir);
+  const cfg = {
+    listen: undefined,
+    dataDir: dir,
+    library: 'tests/fixtures/library',
+    user: 'admin',
+    password: 'test',
+    secret: 's3cret',
+    version: '0.0.0-test',
+  };
+  await seedFirstUser(db, cfg);
+  await scanLibrary(db, cfg.library);
+  const bag = {
+    cfg,
+    user: createUserService(db, cfg),
+    library: createLibrary(db),
+  };
+  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  return {
+    db,
+    dir,
+    app,
+    close: async () => {
+      db.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
+}
+
+async function jsonBody(res: Response) {
+  const body = await res.json();
+  return (body as Record<string, Record<string, unknown>>)[
+    'subsonic-response'
+  ];
+}
+
+Deno.test('ping returns the ok envelope as JSON', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(
+      new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
+    );
+    assertEquals(res.status, 200);
+    const body = await jsonBody(res);
+    assertEquals(body.status, 'ok');
+    assertEquals(body.version, '1.16.1');
+    assertEquals(body.type, 'melofon');
+    assertEquals(body.serverVersion, '0.0.0-test');
+    assertEquals(body.openSubsonic, true);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ping defaults to the XML envelope', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(new Request(`http://x/rest/ping.view?${AUTH}`));
+    assertEquals(res.status, 200);
+    assert(res.headers.get('content-type')?.startsWith('application/xml'));
+    const text = await res.text();
+    assert(text.startsWith('<?xml version="1.0" encoding="UTF-8"?>'));
+    assert(text.includes('<subsonic-response status="ok"'));
+    assert(text.includes('type="melofon"'));
+    assert(text.includes('openSubsonic="true"'));
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('wrong password and unknown user share the generic code-40 body', async () => {
+  const { app, close } = await setup();
+  try {
+    const badPass = await app(
+      new Request(
+        'http://x/rest/ping.view?u=admin&p=wrong&v=1.16.1&c=t&f=json',
+      ),
+    );
+    assertEquals(badPass.status, 200); // Navidrome: errors ride HTTP 200
+    const badPassBody = await jsonBody(badPass);
+    assertEquals(badPassBody.status, 'failed');
+    assertEquals(
+      (badPassBody.error as { code: number; message: string }).code,
+      40,
+    );
+    assertEquals(
+      (badPassBody.error as { message: string }).message,
+      'Wrong username or password',
+    );
+
+    const noUser = await app(
+      new Request('http://x/rest/ping.view?u=ghost&p=test&v=1.16.1&c=t&f=json'),
+    );
+    assertEquals(await jsonBody(noUser), badPassBody); // no user enumeration
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('missing u/v/c is code 10; no credentials at all is code 40', async () => {
+  const { app, close } = await setup();
+  try {
+    const noUser = await app(
+      new Request('http://x/rest/ping.view?v=1.16.1&c=t&f=json'),
+    );
+    assertEquals(
+      ((await jsonBody(noUser)).error as { code: number }).code,
+      10,
+    );
+    const noCreds = await app(
+      new Request('http://x/rest/ping.view?u=admin&v=1.16.1&c=t&f=json'),
+    );
+    assertEquals(
+      ((await jsonBody(noCreds)).error as { code: number }).code,
+      40,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('enc: hex password authenticates', async () => {
+  const { app, close } = await setup();
+  try {
+    // hex('test') = 74657374
+    const res = await app(
+      new Request(
+        'http://x/rest/ping.view?u=admin&p=enc:74657374&v=1.16.1&c=t&f=json',
+      ),
+    );
+    assertEquals((await jsonBody(res)).status, 'ok');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('md5 token+salt authenticates; a bad token fails', async () => {
+  const { app, db, close } = await setup();
+  try {
+    const res = await db.conn.runAndReadAll(
+      `SELECT md5('test' || 'c19b2d') AS h`,
+    );
+    const token = (res.getRowObjects() as { h: string }[])[0].h;
+    const ok = await app(
+      new Request(
+        `http://x/rest/ping.view?u=admin&t=${token}&s=c19b2d&v=1.16.1&c=t&f=json`,
+      ),
+    );
+    assertEquals((await jsonBody(ok)).status, 'ok');
+
+    const bad = await app(
+      new Request(
+        'http://x/rest/ping.view?u=admin&t=00000000000000000000000000000000&s=c19b2d&v=1.16.1&c=t&f=json',
+      ),
+    );
+    assertEquals(
+      ((await jsonBody(bad)).error as { code: number }).code,
+      40,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getLicense is valid in both formats', async () => {
+  const { app, close } = await setup();
+  try {
+    const json = await app(
+      new Request(`http://x/rest/getLicense.view?${AUTH}&f=json`),
+    );
+    assertEquals(
+      ((await jsonBody(json)).license as { valid: boolean }).valid,
+      true,
+    );
+    const xml = await app(new Request(`http://x/rest/getLicense.view?${AUTH}`));
+    assert((await xml.text()).includes('<license valid="true"/>'));
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('POST form credentials authenticate (formpost model)', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(
+      new Request('http://x/rest/ping.view', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: `${AUTH}&f=json`,
+      }),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await jsonBody(res)).status, 'ok');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('unknown op fails as envelope code 0; bare /rest/<op> dispatches too', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(
+      new Request(`http://x/rest/getPodcasts.view?${AUTH}&f=json`),
+    );
+    const body = await jsonBody(res);
+    assertEquals(body.status, 'failed');
+    assertEquals((body.error as { code: number }).code, 0);
+
+    const bare = await app(new Request(`http://x/rest/ping?${AUTH}&f=json`));
+    assertEquals((await jsonBody(bare)).status, 'ok');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('a miss under /rest/ renders the Subsonic envelope, not pathfinder JSON', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(
+      new Request(`http://x/rest/deep/path?${AUTH}&f=json`),
+    );
+    assertEquals(res.status, 404);
+    const body = await jsonBody(res);
+    assertEquals(body.status, 'failed');
+    assertEquals(body.type, 'melofon');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('normalizeOp strips .view under any route registration order', () => {
+  assertEquals(normalizeOp('ping'), 'ping');
+  assertEquals(normalizeOp('ping.view'), 'ping');
+  assertEquals(normalizeOp('getArtists.view'), 'getArtists');
+});
+
+Deno.test('facade dispatches /rest/ping.view into the opensubsonic layer', async () => {
+  const { app, db, close } = await setup();
+  try {
+    const core = await pathfinder({
+      roots: ['core/'],
+      app: { db, cfg: {} },
+    });
+    const layer = {
+      name: 'opensubsonic',
+      app,
+      port: undefined,
+      headers: [],
+      dir: 'layers/opensubsonic',
+    };
+    const res = await facade(core, [layer])(
+      new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await jsonBody(res)).status, 'ok');
+  } finally {
+    await close();
+  }
+});
