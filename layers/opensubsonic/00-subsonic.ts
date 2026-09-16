@@ -23,6 +23,7 @@ export interface HatRequest {
   body: {
     form(): Promise<FormData>;
   };
+  _raw: Request;
 }
 
 export interface HatContext {
@@ -65,6 +66,14 @@ export interface HatContext {
       ): Promise<
         { artists: ArtistRow[]; albums: AlbumRow[]; songs: SongRow[] }
       >;
+      /** Absolute path of a song's audio file (null when unknown). */
+      songPath(id: string): Promise<string | null>;
+    };
+    stream: {
+      file(request: Request, path: string): Promise<Response>;
+    };
+    artwork: {
+      cover(id: string): Promise<Response>;
     };
   };
   state: {
@@ -439,6 +448,24 @@ const OPS: Record<string, OpHandler> = {
       offset: intParam(params, 'offset', 0),
     });
     return { albumList2: { album: albums.map(albumId3Of) } };
+  },
+
+  // Original file bytes, Range-aware; transcode params are ignored in M1.
+  // Not a scrobble — playing does not mark anything.
+  stream: async (request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const path = await context.app.library.songPath(id);
+    if (path === null) return notFound(context);
+    return await context.app.stream.file(request._raw, path);
+  },
+
+  // Album cover.jpg or the placeholder — always an image. `size` is ignored
+  // in M1 (no rescaling).
+  getCoverArt: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    return await context.app.artwork.cover(id);
   },
 };
 

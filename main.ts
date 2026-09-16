@@ -9,6 +9,8 @@ import { seedFirstUser } from './src/users.ts';
 import { scanLibrary } from './src/scan.ts';
 import { createUserService } from './src/user.ts';
 import { createLibrary } from './src/library.ts';
+import { createStream } from './src/stream.ts';
+import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
 import { facade } from './src/facade.ts';
 
@@ -24,10 +26,13 @@ if (cfg.library !== undefined) {
 }
 const app = { db, cfg };
 const core = await pathfinder({ roots: ['core/'], app });
+const library = createLibrary(db);
 const bag = {
   cfg,
   user: createUserService(db, cfg),
-  library: createLibrary(db),
+  library,
+  stream: createStream(),
+  artwork: createArtwork(library),
 };
 const layers = await loadLayers({ app: bag });
 Deno.serve(cfg.listen ?? {}, facade(core, layers));

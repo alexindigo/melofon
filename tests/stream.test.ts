@@ -1,0 +1,183 @@
+// tests/stream.test.ts — stream (original bytes, Range, no scrobble) and
+// getCoverArt (cover.jpg / placeholder) over the fixture library.
+import { assert, assertEquals } from '@std/assert';
+import { pathfinder } from '@pathfinder/pathfinder';
+import { openDb } from '../src/db.ts';
+import { seedFirstUser } from '../src/users.ts';
+import { scanLibrary } from '../src/scan.ts';
+import { createUserService } from '../src/user.ts';
+import { createLibrary } from '../src/library.ts';
+import { createStream } from '../src/stream.ts';
+import { createArtwork } from '../src/artwork.ts';
+
+const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
+
+async function setup() {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-stream-' });
+  const db = await openDb(dir);
+  const cfg = {
+    listen: undefined,
+    dataDir: dir,
+    library: 'tests/fixtures/library',
+    user: 'admin',
+    password: 'test',
+    secret: 's3cret',
+    version: '0.0.0-test',
+  };
+  await seedFirstUser(db, cfg);
+  await scanLibrary(db, cfg.library);
+  const library = createLibrary(db);
+  const bag = {
+    cfg,
+    user: createUserService(db, cfg),
+    library,
+    stream: createStream(),
+    artwork: createArtwork(library),
+  };
+  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  return {
+    db,
+    dir,
+    app,
+    library,
+    close: async () => {
+      db.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
+}
+
+async function songId(
+  library: ReturnType<typeof createLibrary>,
+  title: string,
+): Promise<string> {
+  const found = await library.search3(title, {
+    artistCount: 0,
+    artistOffset: 0,
+    albumCount: 0,
+    albumOffset: 0,
+    songCount: 1,
+    songOffset: 0,
+  });
+  return found.songs[0].id;
+}
+
+Deno.test('stream returns the original file bytes', async () => {
+  const { app, library, close } = await setup();
+  try {
+    const id = await songId(library, 'First');
+    const res = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(res.headers.get('content-type'), 'audio/mpeg');
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const onDisk = await Deno.readFile(
+      'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3',
+    );
+    assertEquals(bytes.length, onDisk.length);
+    assertEquals(bytes.slice(0, 64), onDisk.slice(0, 64));
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('stream honors Range with a 206 partial response', async () => {
+  const { app, library, close } = await setup();
+  try {
+    const id = await songId(library, 'First');
+    const res = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`, {
+        headers: { range: 'bytes=0-99' },
+      }),
+    );
+    assertEquals(res.status, 206);
+    const size = (await Deno.stat(
+      'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3',
+    )).size;
+    assertEquals(res.headers.get('content-range'), `bytes 0-99/${size}`);
+    assertEquals((await res.arrayBuffer()).byteLength, 100);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('stream with an unknown id is envelope code 70; missing id is 10', async () => {
+  const { app, close } = await setup();
+  try {
+    const unknown = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=nope&f=json`),
+    );
+    const body = (await unknown.json()) as Record<
+      string,
+      { error: { code: number } }
+    >;
+    assertEquals(body['subsonic-response'].error.code, 70);
+
+    const missing = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&f=json`),
+    );
+    const missingBody = (await missing.json()) as Record<
+      string,
+      { error: { code: number } }
+    >;
+    assertEquals(missingBody['subsonic-response'].error.code, 10);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getCoverArt serves cover.jpg when the album has one', async () => {
+  const { app, library, close } = await setup();
+  try {
+    const found = await library.search3('Fixture Album', {
+      artistCount: 0,
+      artistOffset: 0,
+      albumCount: 1,
+      albumOffset: 0,
+      songCount: 0,
+      songOffset: 0,
+    });
+    const res = await app(
+      new Request(
+        `http://x/rest/getCoverArt.view?${AUTH}&id=${found.albums[0].id}`,
+      ),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(res.headers.get('content-type'), 'image/jpeg');
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const onDisk = await Deno.readFile(
+      'tests/fixtures/library/Fixture Artist/Fixture Album/cover.jpg',
+    );
+    assertEquals(bytes.length, onDisk.length);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getCoverArt falls back to the placeholder for missing or unknown covers', async () => {
+  const { app, library, close } = await setup();
+  try {
+    const ost = await library.search3('Fixture OST', {
+      artistCount: 0,
+      artistOffset: 0,
+      albumCount: 1,
+      albumOffset: 0,
+      songCount: 0,
+      songOffset: 0,
+    });
+    for (const id of [ost.albums[0].id, 'no-such-id']) {
+      const res = await app(
+        new Request(`http://x/rest/getCoverArt.view?${AUTH}&id=${id}`),
+      );
+      assertEquals(res.status, 200);
+      assertEquals(res.headers.get('content-type'), 'image/png');
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      assert(bytes.length > 100);
+      // PNG magic bytes
+      assertEquals(Array.from(bytes.slice(0, 4)), [0x89, 0x50, 0x4e, 0x47]);
+    }
+  } finally {
+    await close();
+  }
+});
