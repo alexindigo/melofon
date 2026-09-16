@@ -1,6 +1,6 @@
-// GET /health — the M0 floor: ok only if the DuckDB index is open on this
-// layer's context.app.db. Distinct from pathfinder's Layer 0
-// /_status/health, which is router liveness and knows nothing about DuckDB.
+// GET /_/health — the core infra probe: ok only if the DuckDB index is open
+// on context.app.db. Core's tree is rooted at core/ and reached via the
+// "no layer" force prefix /_/; it is never globbed as a layer.
 export default async function (
   _request: unknown,
   context: {

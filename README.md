@@ -16,7 +16,7 @@ mkdir -p "$MELOFON_DATA" "$MELOFON_LIBRARY"
 deno task start
 ```
 
-`GET /health` returns `{"ok":true}` once the DuckDB index is open.
+`GET /_/health` returns `{"ok":true}` once the DuckDB index is open.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — the secret and the password live in env only.
 

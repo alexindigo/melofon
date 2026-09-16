@@ -1,29 +1,37 @@
-// tests/facade.test.ts — dispatch rules with one layer: lookup pass-through,
-// unknown paths answered by the default layer, force prefix strips, /_status
-// pins to the default layer (masked 404 in-process: Layer 0 loopback guard).
+// tests/facade.test.ts — dispatch grammar: /_/ → core tree, /_<name>/ → that
+// layer stripped, lookup pass-through on a hit, bare 404 from core on a miss.
+// The fixture layer (tests/fixtures/layer-a) is a real endpoint tree: an
+// empty tree is not representable (pathfinder rejects zero-file roots), so
+// dispatch into a layer is proven by its own endpoint, never by a fake
+// product route.
 import { assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { openDb } from '../src/db.ts';
 
-async function makeUiLayer() {
+async function makeApps() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-facade-' });
   const db = await openDb(dir);
-  const app = await pathfinder({ roots: ['layers/ui/'], app: { db, cfg: {} } });
+  const app = { db, cfg: {} };
+  const core = await pathfinder({ roots: ['core/'], app });
+  const layerA = {
+    name: 'a',
+    app: await pathfinder({ roots: ['tests/fixtures/layer-a/'], app }),
+    port: undefined,
+    headers: [],
+    dir: 'tests/fixtures/layer-a',
+  };
   const close = async () => {
     db.close();
     await Deno.remove(dir, { recursive: true });
   };
-  return {
-    layer: { name: 'ui', app, port: undefined, headers: [], dir: 'layers/ui' },
-    close,
-  };
+  return { core, layers: [layerA], close };
 }
 
-Deno.test('facade passes /health through to the ui layer', async () => {
-  const { layer, close } = await makeUiLayer();
+Deno.test('/_/health routes to the core tree', async () => {
+  const { core, layers, close } = await makeApps();
   try {
-    const res = await facade([layer])(new Request('http://x/health'));
+    const res = await facade(core, layers)(new Request('http://x/_/health'));
     assertEquals(res.status, 200);
     assertEquals(await res.json(), { ok: true });
   } finally {
@@ -31,34 +39,46 @@ Deno.test('facade passes /health through to the ui layer', async () => {
   }
 });
 
-Deno.test('facade force prefix /_ui strips and dispatches', async () => {
-  const { layer, close } = await makeUiLayer();
+Deno.test('/_<name>/ strips the prefix and dispatches into the layer', async () => {
+  const { core, layers, close } = await makeApps();
   try {
-    const res = await facade([layer])(new Request('http://x/_ui/health'));
+    const res = await facade(core, layers)(new Request('http://x/_a/echo'));
     assertEquals(res.status, 200);
-    assertEquals(await res.json(), { ok: true });
+    assertEquals(await res.json(), { layer: 'a', route: '/echo' });
   } finally {
     await close();
   }
 });
 
-Deno.test('facade answers unknown paths with the default layer 404', async () => {
-  const { layer, close } = await makeUiLayer();
+Deno.test('lookup pass-through: one hit → that layer', async () => {
+  const { core, layers, close } = await makeApps();
   try {
-    const res = await facade([layer])(new Request('http://x/nope'));
-    assertEquals(res.status, 404);
+    const res = await facade(core, layers)(new Request('http://x/echo'));
+    assertEquals(res.status, 200);
+    assertEquals(await res.json(), { layer: 'a', route: '/echo' });
   } finally {
     await close();
   }
 });
 
-Deno.test('facade pins /_status to the default layer (masked 404 in-process)', async () => {
-  const { layer, close } = await makeUiLayer();
+Deno.test('lookup miss → bare 404 from core (no default-layer backstop)', async () => {
+  const { core, layers, close } = await makeApps();
   try {
-    // In-process requests carry no remoteAddr, so pathfinder's Layer 0
-    // loopback guard fails closed: 404. The pin itself is what M0 proves.
-    const res = await facade([layer])(new Request('http://x/_status/health'));
+    const res = await facade(core, layers)(new Request('http://x/nope'));
     assertEquals(res.status, 404);
+    assertEquals(await res.json(), { detail: 'Not Found' });
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('/_/ answers the core tree even when no layers exist', async () => {
+  const { core, close } = await makeApps();
+  try {
+    const res = await facade(core, [])(new Request('http://x/_/health'));
+    assertEquals(res.status, 200);
+    const miss = await facade(core, [])(new Request('http://x/anything'));
+    assertEquals(miss.status, 404);
   } finally {
     await close();
   }
