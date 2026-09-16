@@ -1,5 +1,5 @@
 -- users + catalog tables + M2 user-state tables. The scan rebuilds only the
--- catalog (files/albums/artists). User state is keep-on-rescan.
+-- catalog (files/albums/artists). User state and libraries are keep-on-rescan.
 -- No play_count column anywhere: stats are GROUP BY at read time.
 -- NB: db.ts splits this file on the semicolon character, so comments must
 -- never contain one.
@@ -8,6 +8,13 @@ CREATE TABLE IF NOT EXISTS users (
   name VARCHAR UNIQUE NOT NULL,
   password_enc VARCHAR NOT NULL,
   created_at TIMESTAMPTZ NOT NULL
+);
+-- M3 scan sources: disjoint folders, one OpenSubsonic music folder per row.
+-- Keep-on-rescan: the scan reads this table, never writes it.
+CREATE TABLE IF NOT EXISTS libraries (
+  id VARCHAR PRIMARY KEY,
+  name VARCHAR NOT NULL,
+  path VARCHAR UNIQUE NOT NULL
 );
 CREATE TABLE IF NOT EXISTS artists (
   id VARCHAR PRIMARY KEY,
@@ -21,6 +28,7 @@ CREATE TABLE IF NOT EXISTS albums (
 CREATE TABLE IF NOT EXISTS files (
   id VARCHAR PRIMARY KEY,
   path VARCHAR UNIQUE NOT NULL,
+  library_id VARCHAR,
   mtime BIGINT,
   size BIGINT,
   title VARCHAR,
@@ -30,6 +38,8 @@ CREATE TABLE IF NOT EXISTS files (
   disc INTEGER,
   duration_ms INTEGER
 );
+-- M3: existing M2 databases gain library_id without a rebuild.
+ALTER TABLE files ADD COLUMN IF NOT EXISTS library_id VARCHAR;
 
 -- M2 user state (keep-on-rescan: scan never deletes from these).
 CREATE TABLE IF NOT EXISTS listens (

@@ -1,9 +1,10 @@
-// src/scan.ts — walk MELOFON_LIBRARY, read tags, rebuild the catalog tables
-// (artists / albums / files) from disk. The users table is never touched:
-// catalog IDs are stable content hashes, so a rescan of the same paths keeps
-// every ID (M2's stars/playlists survive). Unreadable files are skipped and
-// counted, never fatal. ffprobe is the duration fallback only (when
-// music-metadata parsed but found no duration).
+// src/scan.ts — walk every configured source (libraries table), read tags,
+// rebuild the catalog tables (artists / albums / files) from disk. The users
+// table is never touched: catalog IDs are stable content hashes, so a rescan
+// of the same paths keeps every ID (M2's stars/playlists survive). Unreadable
+// files are skipped and counted, never fatal; an unreadable source root is
+// warned about and skipped, never fatal. ffprobe is the duration fallback
+// only (when music-metadata parsed but found no duration).
 import { parseFile } from 'music-metadata';
 import { encodeHex } from '@std/encoding/hex';
 import type { Db } from './db.ts';
@@ -38,6 +39,7 @@ interface AlbumIn {
 interface FileIn {
   id: string;
   path: string;
+  libraryId: string;
   mtime: number | null;
   size: number | null;
   title: string;
@@ -98,76 +100,102 @@ async function ffprobeDurationMs(path: string): Promise<number | null> {
   }
 }
 
-export async function scanLibrary(
-  db: Db,
-  libraryRoot: string,
-): Promise<ScanCounts> {
-  const root = libraryRoot.replace(/\/+$/, '');
+export async function scanLibrary(db: Db): Promise<ScanCounts> {
+  const sources = await db.conn.runAndReadAll(
+    'SELECT id, name, path FROM libraries ORDER BY name',
+  );
   const artists = new Map<string, ArtistIn>(); // name → row
   const albums = new Map<string, AlbumIn>(); // id → row
   const files: FileIn[] = [];
   let skipped = 0;
 
-  for await (const { abs, rel } of walkAudio(root)) {
-    let title: string | undefined;
-    let trackArtist: string | undefined;
-    let albumName: string | undefined;
-    let albumArtist: string | undefined;
-    let trackNo: number | null = null;
-    let discNo: number | null = null;
-    let durationMs: number | null = null;
+  for (
+    const source of sources.getRowObjects() as {
+      id: string;
+      name: string;
+      path: string;
+    }[]
+  ) {
+    const root = source.path.replace(/\/+$/, '');
     try {
-      const meta = await parseFile(abs);
-      // Garbage bytes resolve with an empty format (no container, no codec)
-      // rather than throwing — unrecognized audio is unreadable too.
-      if (
-        meta.format.container === undefined && meta.format.codec === undefined
-      ) {
-        throw new Error('unrecognized audio format');
-      }
-      title = meta.common.title?.trim() || undefined;
-      trackArtist = meta.common.artist?.trim() || undefined;
-      albumName = meta.common.album?.trim() || undefined;
-      // TPE2 (album artist) wins — household VA/OST rule; TPE1 is the track
-      // artist. Fallback: album-level artist = track artist.
-      albumArtist = meta.common.albumartist?.trim() || trackArtist;
-      trackNo = meta.common.track.no;
-      discNo = meta.common.disk.no;
-      if (meta.format.duration && meta.format.duration > 0) {
-        durationMs = Math.round(meta.format.duration * 1000);
-      }
-    } catch {
-      skipped++;
-      continue; // unreadable tags — skip the file, keep scanning
-    }
-    if (durationMs === null) durationMs = await ffprobeDurationMs(abs);
+      for await (const { abs, rel } of walkAudio(root)) {
+        let title: string | undefined;
+        let trackArtist: string | undefined;
+        let albumName: string | undefined;
+        let albumArtist: string | undefined;
+        let trackNo: number | null = null;
+        let discNo: number | null = null;
+        let durationMs: number | null = null;
+        try {
+          const meta = await parseFile(abs);
+          // Garbage bytes resolve with an empty format (no container, no codec)
+          // rather than throwing — unrecognized audio is unreadable too.
+          if (
+            meta.format.container === undefined &&
+            meta.format.codec === undefined
+          ) {
+            throw new Error('unrecognized audio format');
+          }
+          title = meta.common.title?.trim() || undefined;
+          trackArtist = meta.common.artist?.trim() || undefined;
+          albumName = meta.common.album?.trim() || undefined;
+          // TPE2 (album artist) wins — household VA/OST rule; TPE1 is the track
+          // artist. Fallback: album-level artist = track artist.
+          albumArtist = meta.common.albumartist?.trim() || trackArtist;
+          trackNo = meta.common.track.no;
+          discNo = meta.common.disk.no;
+          if (meta.format.duration && meta.format.duration > 0) {
+            durationMs = Math.round(meta.format.duration * 1000);
+          }
+        } catch {
+          skipped++;
+          continue; // unreadable tags — skip the file, keep scanning
+        }
+        if (durationMs === null) durationMs = await ffprobeDurationMs(abs);
 
-    const stat = await Deno.stat(abs).catch(() => null);
-    const name = rel.split('/').pop()!.replace(/\.[^.]*$/, '');
-    let artistId: string | null = null;
-    if (trackArtist !== undefined) {
-      artistId = await stableId('artist', trackArtist);
-      artists.set(trackArtist, { id: artistId, name: trackArtist });
+        const stat = await Deno.stat(abs).catch(() => null);
+        const name = rel.split('/').pop()!.replace(/\.[^.]*$/, '');
+        let artistId: string | null = null;
+        if (trackArtist !== undefined) {
+          artistId = await stableId('artist', trackArtist);
+          artists.set(trackArtist, { id: artistId, name: trackArtist });
+        }
+        let albumId: string | null = null;
+        if (albumName !== undefined && albumArtist !== undefined) {
+          albumId = await stableId('album', `${albumArtist}\n${albumName}`);
+          const albumArtistId = await stableId('artist', albumArtist);
+          artists.set(albumArtist, { id: albumArtistId, name: albumArtist });
+          albums.set(albumId, { id: albumId, name: albumName, albumArtistId });
+        }
+        files.push({
+          // The same relative path can exist in two sources — the library id
+          // is part of the key, so disjoint folders never collide.
+          id: await stableId('file', `${source.id}\n${rel}`),
+          path: abs,
+          libraryId: source.id,
+          mtime: stat?.mtime?.getTime() ?? null,
+          size: stat?.size ?? null,
+          title: title ?? name,
+          albumId,
+          artistId,
+          track: trackNo,
+          disc: discNo,
+          durationMs,
+        });
+      }
+    } catch (err) {
+      if (
+        err instanceof Deno.errors.NotFound ||
+        err instanceof Deno.errors.PermissionDenied
+      ) {
+        console.warn(
+          `[melofon] scan: skipping unreadable source ` +
+            `${source.name} (${root}): ${err.message}`,
+        );
+        continue;
+      }
+      throw err;
     }
-    let albumId: string | null = null;
-    if (albumName !== undefined && albumArtist !== undefined) {
-      albumId = await stableId('album', `${albumArtist}\n${albumName}`);
-      const albumArtistId = await stableId('artist', albumArtist);
-      artists.set(albumArtist, { id: albumArtistId, name: albumArtist });
-      albums.set(albumId, { id: albumId, name: albumName, albumArtistId });
-    }
-    files.push({
-      id: await stableId('file', rel),
-      path: abs,
-      mtime: stat?.mtime?.getTime() ?? null,
-      size: stat?.size ?? null,
-      title: title ?? name,
-      albumId,
-      artistId,
-      track: trackNo,
-      disc: discNo,
-      durationMs,
-    });
   }
 
   // Rebuild catalog tables from disk; users/listens are never touched.
@@ -199,27 +227,28 @@ export async function scanLibrary(
     albumStmt.destroySync();
 
     const fileStmt = await db.conn.prepare(
-      `INSERT INTO files (id, path, mtime, size, title, album_id, artist_id,
-        track, disc, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO files (id, path, library_id, mtime, size, title, album_id,
+        artist_id, track, disc, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const file of files) {
       fileStmt.bindVarchar(1, file.id);
       fileStmt.bindVarchar(2, file.path);
-      if (file.mtime === null) fileStmt.bindNull(3);
-      else fileStmt.bindBigInt(3, BigInt(file.mtime));
-      if (file.size === null) fileStmt.bindNull(4);
-      else fileStmt.bindBigInt(4, BigInt(file.size));
-      fileStmt.bindVarchar(5, file.title);
-      if (file.albumId === null) fileStmt.bindNull(6);
-      else fileStmt.bindVarchar(6, file.albumId);
-      if (file.artistId === null) fileStmt.bindNull(7);
-      else fileStmt.bindVarchar(7, file.artistId);
-      if (file.track === null) fileStmt.bindNull(8);
-      else fileStmt.bindInteger(8, file.track);
-      if (file.disc === null) fileStmt.bindNull(9);
-      else fileStmt.bindInteger(9, file.disc);
-      if (file.durationMs === null) fileStmt.bindNull(10);
-      else fileStmt.bindInteger(10, file.durationMs);
+      fileStmt.bindVarchar(3, file.libraryId);
+      if (file.mtime === null) fileStmt.bindNull(4);
+      else fileStmt.bindBigInt(4, BigInt(file.mtime));
+      if (file.size === null) fileStmt.bindNull(5);
+      else fileStmt.bindBigInt(5, BigInt(file.size));
+      fileStmt.bindVarchar(6, file.title);
+      if (file.albumId === null) fileStmt.bindNull(7);
+      else fileStmt.bindVarchar(7, file.albumId);
+      if (file.artistId === null) fileStmt.bindNull(8);
+      else fileStmt.bindVarchar(8, file.artistId);
+      if (file.track === null) fileStmt.bindNull(9);
+      else fileStmt.bindInteger(9, file.track);
+      if (file.disc === null) fileStmt.bindNull(10);
+      else fileStmt.bindInteger(10, file.disc);
+      if (file.durationMs === null) fileStmt.bindNull(11);
+      else fileStmt.bindInteger(11, file.durationMs);
       await fileStmt.run();
     }
     fileStmt.destroySync();

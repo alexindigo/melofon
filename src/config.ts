@@ -1,13 +1,13 @@
-// src/config.ts — env → config. Listen, data dir, library path, first-boot
-// user, and the server secret all come from the environment; the Settings UI
-// (M5) does not exist yet, so env is the only settings channel.
+// src/config.ts — env → config. Listen, data dir, first-boot user, and the
+// server secret all come from the environment; the Settings UI (M5) does not
+// exist yet, so env is the only settings channel. Scan sources are NOT here:
+// they live in the libraries table (app.libraries / /_/libraries) since M3 —
+// MELOFON_LIBRARY is not the live list.
 export interface Config {
   // MELOFON_LISTEN parsed to {hostname, port} or undefined (Deno.serve default).
   listen: { hostname: string; port: number } | undefined;
   // MELOFON_DATA — directory for melofon.duckdb (default ./data).
   dataDir: string;
-  // MELOFON_LIBRARY — recorded now, scanned in M1. May be unset in M0.
-  library: string | undefined;
   user: string | undefined;
   password: string | undefined;
   secret: string | undefined;
@@ -53,7 +53,6 @@ export function loadConfig(
   return {
     listen,
     dataDir: env('MELOFON_DATA') ?? './data',
-    library: env('MELOFON_LIBRARY'),
     user: env('MELOFON_USER'),
     password: env('MELOFON_PASSWORD'),
     secret: env('MELOFON_SECRET'),

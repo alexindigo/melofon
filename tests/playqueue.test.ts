@@ -6,6 +6,7 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
+import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
@@ -28,16 +29,18 @@ async function setup() {
   const cfg = {
     listen: undefined,
     dataDir: dir,
-    library: 'tests/fixtures/library',
     user: 'admin',
     password: 'test',
     secret: 's3cret',
     version: '0.0.0-test',
   };
   await seedFirstUser(db, cfg);
-  await scanLibrary(db, cfg.library);
+  const libraries = createLibraries(db);
+  await libraries.add('Music', 'tests/fixtures/library');
+  await scanLibrary(db);
   const bag = {
     cfg,
+    libraries,
     user: createUserService(db, cfg),
     library: createLibrary(db),
     annotation: createAnnotation(db),

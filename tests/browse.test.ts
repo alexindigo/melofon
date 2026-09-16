@@ -7,6 +7,7 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
+import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 
@@ -18,16 +19,18 @@ async function setup() {
   const cfg = {
     listen: undefined,
     dataDir: dir,
-    library: 'tests/fixtures/library',
     user: 'admin',
     password: 'test',
     secret: 's3cret',
     version: '0.0.0-test',
   };
   await seedFirstUser(db, cfg);
-  await scanLibrary(db, cfg.library);
+  const libraries = createLibraries(db);
+  await libraries.add('Music', 'tests/fixtures/library');
+  await scanLibrary(db);
   const bag = {
     cfg,
+    libraries,
     user: createUserService(db, cfg),
     library: createLibrary(db),
   };
@@ -228,11 +231,12 @@ Deno.test('getMusicFolders and getOpenSubsonicExtensions answer Feishin probes',
   const { app, close } = await setup();
   try {
     const folders = await get(app, 'getMusicFolders');
-    assertEquals(
-      (folders.musicFolders as { musicFolder: { id: number; name: string }[] })
-        .musicFolder,
-      [{ id: 0, name: 'Music' }],
-    );
+    const musicFolder = (
+      folders.musicFolders as { musicFolder: { id: string; name: string }[] }
+    ).musicFolder;
+    assertEquals(musicFolder.length, 1);
+    assertEquals(musicFolder[0].name, 'Music');
+    assert(/^[0-9a-f]{32}$/.test(musicFolder[0].id));
     const extensions = await get(app, 'getOpenSubsonicExtensions');
     assertEquals(
       (extensions.openSubsonicExtensions as {

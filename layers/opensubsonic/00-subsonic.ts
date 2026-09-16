@@ -30,7 +30,6 @@ export interface HatContext {
   app: {
     cfg: {
       version?: string;
-      library?: string;
     };
     user: {
       auth(username: string, password: string): Promise<StateUser | null>;
@@ -40,14 +39,18 @@ export interface HatContext {
         salt: string,
       ): Promise<StateUser | null>;
     };
+    libraries: {
+      list(): Promise<LibraryFolderRow[]>;
+    };
     library: {
-      listArtists(): Promise<ArtistRow[]>;
+      listArtists(folderId?: string): Promise<ArtistRow[]>;
       getArtist(id: string): Promise<ArtistRow | null>;
       albumsByArtist(artistId: string): Promise<AlbumRow[]>;
       listAlbums(opts: {
         sort: 'name' | 'random' | 'newest';
         size: number;
         offset: number;
+        folderId?: string;
       }): Promise<AlbumRow[]>;
       getAlbum(
         id: string,
@@ -62,6 +65,7 @@ export interface HatContext {
           albumOffset: number;
           songCount: number;
           songOffset: number;
+          folderId?: string;
         },
       ): Promise<
         { artists: ArtistRow[]; albums: AlbumRow[]; songs: SongRow[] }
@@ -69,7 +73,7 @@ export interface HatContext {
       /** Absolute path of a song's audio file (null when unknown). */
       songPath(id: string): Promise<string | null>;
       /** Random songs from the catalog (getRandomSongs pull-forward). */
-      randomSongs(size: number): Promise<SongRow[]>;
+      randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
     };
     annotation: {
       star(
@@ -151,6 +155,12 @@ export interface HatContext {
 }
 
 // Domain rows, declared structurally (the hat does not import src/).
+export interface LibraryFolderRow {
+  id: string;
+  name: string;
+  path: string;
+}
+
 export interface ArtistRow {
   id: string;
   name: string;
@@ -169,6 +179,8 @@ export interface AlbumRow {
 export interface SongRow {
   id: string;
   path: string;
+  libraryId: string | null;
+  libraryPath: string | null;
   title: string;
   albumId: string | null;
   albumName: string | null;
@@ -361,9 +373,12 @@ function albumId3Of(album: AlbumRow): Record<string, unknown> {
   };
 }
 
-function childOf(song: SongRow, libraryRoot?: string): Record<string, unknown> {
-  const path = libraryRoot !== undefined && song.path.startsWith(libraryRoot)
-    ? song.path.slice(libraryRoot.length).replace(/^\/+/, '')
+// The wire `path` is relative to the song's own source root — the simulated
+// Navidrome tree ("Artist/Album/01 - Song.mp3"), never the absolute path.
+function childOf(song: SongRow): Record<string, unknown> {
+  const root = song.libraryPath;
+  const path = root !== null && song.path.startsWith(root)
+    ? song.path.slice(root.length).replace(/^\/+/, '')
     : song.path;
   return {
     id: song.id,
@@ -426,7 +441,7 @@ async function entriesFor(
   for (const trackId of trackIds) {
     const song = await context.app.library.getSong(trackId);
     if (song !== null) {
-      entries.push(childOf(song, context.app.cfg.library));
+      entries.push(childOf(song));
     }
   }
   return entries;
@@ -467,15 +482,21 @@ function notFound(context: HatContext): Response {
 const OPS: Record<string, OpHandler> = {
   ping: () => ({}),
   getLicense: () => ({ license: { valid: true } }),
-  getMusicFolders: () => ({
-    musicFolders: { musicFolder: [{ id: 0, name: 'Music' }] },
-  }),
+  getMusicFolders: async (_request, context) => {
+    const folders = await context.app.libraries.list();
+    return {
+      musicFolders: {
+        musicFolder: folders.map((f) => ({ id: f.id, name: f.name })),
+      },
+    };
+  },
   getOpenSubsonicExtensions: () => ({
     openSubsonicExtensions: { openSubsonicExtension: [] },
   }),
 
   getArtists: async (_request, context) => {
-    const artists = await context.app.library.listArtists();
+    const folderId = context.state.params!.get('musicFolderId') ?? undefined;
+    const artists = await context.app.library.listArtists(folderId);
     const byIndex = new Map<string, Record<string, unknown>[]>();
     for (const artist of artists) {
       const name = indexName(artist.name);
@@ -516,7 +537,7 @@ const OPS: Record<string, OpHandler> = {
     return {
       album: {
         ...albumId3Of(got.album),
-        song: got.songs.map((song) => childOf(song, context.app.cfg.library)),
+        song: got.songs.map((song) => childOf(song)),
       },
     };
   },
@@ -526,7 +547,7 @@ const OPS: Record<string, OpHandler> = {
     if (id instanceof Response) return id;
     const song = await context.app.library.getSong(id);
     if (song === null) return notFound(context);
-    return { song: childOf(song, context.app.cfg.library) };
+    return { song: childOf(song) };
   },
 
   search3: async (_request, context) => {
@@ -540,14 +561,13 @@ const OPS: Record<string, OpHandler> = {
       albumOffset: intParam(params, 'albumOffset', 0),
       songCount: intParam(params, 'songCount', 20),
       songOffset: intParam(params, 'songOffset', 0),
+      folderId: params.get('musicFolderId') ?? undefined,
     });
     return {
       searchResult3: {
         artist: result.artists.map(artistId3Of),
         album: result.albums.map(albumId3Of),
-        song: result.songs.map((song) =>
-          childOf(song, context.app.cfg.library)
-        ),
+        song: result.songs.map((song) => childOf(song)),
       },
     };
   },
@@ -574,6 +594,7 @@ const OPS: Record<string, OpHandler> = {
       sort,
       size: intParam(params, 'size', 10),
       offset: intParam(params, 'offset', 0),
+      folderId: params.get('musicFolderId') ?? undefined,
     });
     return { albumList2: { album: albums.map(albumId3Of) } };
   },
@@ -721,7 +742,7 @@ const OPS: Record<string, OpHandler> = {
         const song = await context.app.library.getSong(row.targetId);
         if (song !== null) {
           songs.push({
-            ...childOf(song, context.app.cfg.library),
+            ...childOf(song),
             starred,
           });
         }
@@ -744,10 +765,11 @@ const OPS: Record<string, OpHandler> = {
     const params = context.state.params!;
     const songs = await context.app.library.randomSongs(
       intParam(params, 'size', 10),
+      params.get('musicFolderId') ?? undefined,
     );
     return {
       randomSongs: {
-        song: songs.map((song) => childOf(song, context.app.cfg.library)),
+        song: songs.map((song) => childOf(song)),
       },
     };
   },

@@ -49,7 +49,6 @@ Deno.test('seedFirstUser inserts one row with an encrypted password', async () =
     await seedFirstUser(db, {
       listen: undefined,
       dataDir: dir,
-      library: undefined,
       user: 'admin',
       password: 'test',
       secret: 's3cret',
@@ -78,7 +77,6 @@ Deno.test('seedFirstUser does not overwrite existing users', async () => {
     const cfg = {
       listen: undefined,
       dataDir: dir,
-      library: undefined,
       user: 'admin',
       password: 'first',
       secret: 's3cret',

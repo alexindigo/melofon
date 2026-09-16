@@ -1,13 +1,14 @@
 // main.ts — load config, open DB, seed the first-boot user, scan the library
-// into the catalog, boot the core tree + glob layers, serve the facade on the
-// process default listen. Layers get the injected service bag (app.user,
-// app.library, cfg) — never a DuckDB handle.
+// sources into the catalog, boot the core tree + glob layers, serve the facade
+// on the process default listen. Layers get the injected service bag
+// (app.user, app.library, app.libraries, cfg) — never a DuckDB handle.
 import { pathfinder } from '@pathfinder/pathfinder';
 import { loadConfig } from './src/config.ts';
 import { openDb } from './src/db.ts';
 import { seedFirstUser } from './src/users.ts';
 import { scanLibrary } from './src/scan.ts';
 import { createUserService } from './src/user.ts';
+import { createLibraries } from './src/libraries.ts';
 import { createLibrary } from './src/library.ts';
 import { createAnnotation } from './src/annotation.ts';
 import { createListens } from './src/listens.ts';
@@ -21,18 +22,18 @@ import { facade } from './src/facade.ts';
 const cfg = loadConfig();
 const db = await openDb(cfg.dataDir);
 await seedFirstUser(db, cfg);
-if (cfg.library !== undefined) {
-  const counts = await scanLibrary(db, cfg.library);
-  console.log(
-    `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
-      `${counts.artists} artists, ${counts.albums} albums`,
-  );
-}
-const app = { db, cfg };
+const libraries = createLibraries(db);
+const counts = await scanLibrary(db);
+console.log(
+  `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
+    `${counts.artists} artists, ${counts.albums} albums`,
+);
+const app = { db, cfg, libraries };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const bag = {
   cfg,
+  libraries,
   user: createUserService(db, cfg),
   library,
   annotation: createAnnotation(db),

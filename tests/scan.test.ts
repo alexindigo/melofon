@@ -1,10 +1,13 @@
 // tests/scan.test.ts — scanLibrary rebuilds the catalog from the fixture
 // library (tags, TPE2 album artists, corrupt-file skip), keeps users and IDs
 // stable across rescans; app.library answers domain queries over the result.
+// The fixture root is registered as a libraries row (M3 sources); the scan
+// walks every configured source.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { openDb } from '../src/db.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
+import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 
 const FIXTURE_LIBRARY = 'tests/fixtures/library';
@@ -12,6 +15,7 @@ const FIXTURE_LIBRARY = 'tests/fixtures/library';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-scan-' });
   const db = await openDb(dir);
+  await createLibraries(db).add('Music', FIXTURE_LIBRARY);
   return {
     dir,
     db,
@@ -25,7 +29,7 @@ async function setup() {
 Deno.test('scanLibrary reads tags, honors TPE2, skips corrupt files', async () => {
   const { db, close } = await setup();
   try {
-    const counts = await scanLibrary(db, FIXTURE_LIBRARY);
+    const counts = await scanLibrary(db);
     assertEquals(counts, { files: 3, skipped: 1, artists: 3, albums: 2 });
 
     const songs = await db.conn.runAndReadAll(
@@ -49,18 +53,17 @@ Deno.test('rescan keeps users and stable IDs', async () => {
     await seedFirstUser(db, {
       listen: undefined,
       dataDir: '',
-      library: undefined,
       user: 'admin',
       password: 'test',
       secret: 's3cret',
     });
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     const first = await db.conn.runAndReadAll(
       'SELECT id FROM files ORDER BY id',
     );
     const firstIds = first.getRowObjects().map((r) => (r as { id: string }).id);
 
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     const second = await db.conn.runAndReadAll(
       'SELECT id FROM files ORDER BY id',
     );
@@ -80,7 +83,7 @@ Deno.test('rescan keeps users and stable IDs', async () => {
 Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_queues)', async () => {
   const { db, close } = await setup();
   try {
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     await db.conn.run(
       "INSERT INTO listens (user_id, track_id, played_at, duration_ms, source) VALUES ('u1', 't1', now(), 1000, 'opensubsonic')",
     );
@@ -100,7 +103,7 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
       "INSERT INTO play_queues (user_id, current_id, position_ms, changed_at, track_ids) VALUES ('u1', 't1', 0, now(), ['t1'])",
     );
 
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
 
     const res = await db.conn.runAndReadAll(
       `SELECT
@@ -132,7 +135,7 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
 Deno.test('library.listArtists returns album artists with album counts', async () => {
   const { db, close } = await setup();
   try {
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     const library = createLibrary(db);
     const artists = await library.listArtists();
     assertEquals(
@@ -150,7 +153,7 @@ Deno.test('library.listArtists returns album artists with album counts', async (
 Deno.test('library.getAlbum returns the album with ordered songs', async () => {
   const { db, close } = await setup();
   try {
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     const library = createLibrary(db);
     const artists = await library.listArtists();
     const fixtureArtist = artists.find((a) => a.name === 'Fixture Artist')!;
@@ -183,7 +186,7 @@ Deno.test('library.getAlbum returns the album with ordered songs', async () => {
 Deno.test('library.getSong returns one song with album and artist names', async () => {
   const { db, close } = await setup();
   try {
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     const library = createLibrary(db);
     const found = await library.search3('Theme', {
       artistCount: 20,
@@ -207,7 +210,7 @@ Deno.test('library.getSong returns one song with album and artist names', async 
 Deno.test('library.search3 matches artists, albums, and songs by substring', async () => {
   const { db, close } = await setup();
   try {
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     const library = createLibrary(db);
     const res = await library.search3('fixture', {
       artistCount: 20,
@@ -240,7 +243,7 @@ Deno.test('library.search3 matches artists, albums, and songs by substring', asy
 Deno.test('library.songPath and albumCoverPath resolve real files', async () => {
   const { db, close } = await setup();
   try {
-    await scanLibrary(db, FIXTURE_LIBRARY);
+    await scanLibrary(db);
     const library = createLibrary(db);
     const found = await library.search3('First', {
       artistCount: 20,
