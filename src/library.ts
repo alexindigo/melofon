@@ -44,6 +44,16 @@ export interface Search3Result {
 export interface Library {
   /** Album artists (artists with at least one album), alphabetically. */
   listArtists(): Promise<ArtistRow[]>;
+  /** One album artist by ID (null when unknown or has no albums). */
+  getArtist(id: string): Promise<ArtistRow | null>;
+  /** Albums of one album artist, alphabetically. */
+  albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+  /** Album lists for getAlbumList2-shaped hats. */
+  listAlbums(opts: {
+    sort: 'name' | 'random' | 'newest';
+    size: number;
+    offset: number;
+  }): Promise<AlbumRow[]>;
   getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
   getSong(id: string): Promise<SongRow | null>;
   search3(
@@ -174,6 +184,47 @@ export function createLibrary(db: Db): Library {
         name: row.name,
         albumCount: Number(row.album_count),
       }));
+    },
+
+    async getArtist(id) {
+      const res = await db.conn.runAndReadAll(
+        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
+         FROM artists ar
+         JOIN albums al ON al.album_artist_id = ar.id
+         WHERE ar.id = ${esc(id)}
+         GROUP BY ar.id, ar.name`,
+      );
+      const row = (res.getRowObjects() as {
+        id: string;
+        name: string;
+        album_count: number | bigint;
+      }[])[0];
+      if (!row) return null;
+      return {
+        id: row.id,
+        name: row.name,
+        albumCount: Number(row.album_count),
+      };
+    },
+
+    async albumsByArtist(artistId) {
+      const res = await db.conn.runAndReadAll(
+        `${ALBUM_SELECT} HAVING al.album_artist_id = ${esc(artistId)}
+         ORDER BY al.name`,
+      );
+      return (res.getRowObjects() as unknown as AlbumSqlRow[]).map(albumOf);
+    },
+
+    async listAlbums(opts) {
+      const order = opts.sort === 'random'
+        ? 'ORDER BY RANDOM()'
+        : opts.sort === 'newest'
+        ? 'ORDER BY MAX(f.mtime) DESC NULLS LAST'
+        : 'ORDER BY al.name';
+      const res = await db.conn.runAndReadAll(
+        `${ALBUM_SELECT} ${order} LIMIT ${opts.size} OFFSET ${opts.offset}`,
+      );
+      return (res.getRowObjects() as unknown as AlbumSqlRow[]).map(albumOf);
     },
 
     async getAlbum(id) {

@@ -29,6 +29,7 @@ export interface HatContext {
   app: {
     cfg: {
       version?: string;
+      library?: string;
     };
     user: {
       auth(username: string, password: string): Promise<StateUser | null>;
@@ -38,11 +39,70 @@ export interface HatContext {
         salt: string,
       ): Promise<StateUser | null>;
     };
+    library: {
+      listArtists(): Promise<ArtistRow[]>;
+      getArtist(id: string): Promise<ArtistRow | null>;
+      albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+      listAlbums(opts: {
+        sort: 'name' | 'random' | 'newest';
+        size: number;
+        offset: number;
+      }): Promise<AlbumRow[]>;
+      getAlbum(
+        id: string,
+      ): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
+      getSong(id: string): Promise<SongRow | null>;
+      search3(
+        query: string,
+        opts: {
+          artistCount: number;
+          artistOffset: number;
+          albumCount: number;
+          albumOffset: number;
+          songCount: number;
+          songOffset: number;
+        },
+      ): Promise<
+        { artists: ArtistRow[]; albums: AlbumRow[]; songs: SongRow[] }
+      >;
+    };
   };
   state: {
     user?: StateUser;
     params?: URLSearchParams;
   };
+}
+
+// Domain rows, declared structurally (the hat does not import src/).
+export interface ArtistRow {
+  id: string;
+  name: string;
+  albumCount: number;
+}
+
+export interface AlbumRow {
+  id: string;
+  name: string;
+  artistId: string;
+  artistName: string;
+  songCount: number;
+  durationMs: number;
+}
+
+export interface SongRow {
+  id: string;
+  path: string;
+  title: string;
+  albumId: string | null;
+  albumName: string | null;
+  artistId: string | null;
+  artistName: string | null;
+  track: number | null;
+  disc: number | null;
+  durationMs: number | null;
+  size: number | null;
+  suffix: string;
+  contentType: string;
 }
 
 // --- Params ------------------------------------------------------------------
@@ -173,16 +233,213 @@ export function hexDecode(hex: string): string {
   return new TextDecoder().decode(bytes);
 }
 
+// --- ID3 payload mapping -------------------------------------------------------
+
+const IGNORED_ARTICLES = 'The El La Los Las Le Les';
+
+function artistId3Of(artist: ArtistRow): Record<string, unknown> {
+  return {
+    id: artist.id,
+    name: artist.name,
+    albumCount: artist.albumCount,
+  };
+}
+
+function albumId3Of(album: AlbumRow): Record<string, unknown> {
+  return {
+    id: album.id,
+    name: album.name,
+    artist: album.artistName,
+    artistId: album.artistId,
+    coverArt: album.id, // getCoverArt resolves album IDs
+    songCount: album.songCount,
+    duration: Math.round(album.durationMs / 1000),
+  };
+}
+
+function childOf(song: SongRow, libraryRoot?: string): Record<string, unknown> {
+  const path = libraryRoot !== undefined && song.path.startsWith(libraryRoot)
+    ? song.path.slice(libraryRoot.length).replace(/^\/+/, '')
+    : song.path;
+  return {
+    id: song.id,
+    isDir: false,
+    title: song.title,
+    album: song.albumName ?? undefined,
+    artist: song.artistName ?? undefined,
+    track: song.track ?? undefined,
+    coverArt: song.albumId ?? undefined,
+    size: song.size ?? undefined,
+    contentType: song.contentType,
+    suffix: song.suffix,
+    duration: song.durationMs === null
+      ? undefined
+      : Math.round(song.durationMs / 1000),
+    path,
+    albumId: song.albumId ?? undefined,
+    artistId: song.artistId ?? undefined,
+    type: 'music',
+    isVideo: false,
+  };
+}
+
+function intParam(
+  params: URLSearchParams,
+  name: string,
+  fallback: number,
+): number {
+  const raw = params.get(name);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) return fallback;
+  return value;
+}
+
+function indexName(name: string): string {
+  const ch = name.charAt(0).toUpperCase();
+  return ch >= 'A' && ch <= 'Z' ? ch : '#';
+}
+
 // --- Op dispatch ---------------------------------------------------------------
 
+// Handlers return a payload object (wrapped in the ok envelope) or a Response
+// (an already-rendered failure).
 type OpHandler = (
   request: HatRequest,
   context: HatContext,
-) => Record<string, unknown> | Promise<Record<string, unknown>>;
+) =>
+  | Record<string, unknown>
+  | Response
+  | Promise<Record<string, unknown> | Response>;
+
+function requiredParam(
+  context: HatContext,
+  name: string,
+): string | Response {
+  const value = context.state.params?.get(name);
+  if (value === null || value === undefined || value === '') {
+    return failResponse(context, 10, 'Required parameter is missing');
+  }
+  return value;
+}
+
+function notFound(context: HatContext): Response {
+  return failResponse(context, 70, 'The requested data was not found');
+}
 
 const OPS: Record<string, OpHandler> = {
   ping: () => ({}),
   getLicense: () => ({ license: { valid: true } }),
+  getMusicFolders: () => ({
+    musicFolders: { musicFolder: [{ id: 0, name: 'Music' }] },
+  }),
+  getOpenSubsonicExtensions: () => ({
+    openSubsonicExtensions: { openSubsonicExtension: [] },
+  }),
+
+  getArtists: async (_request, context) => {
+    const artists = await context.app.library.listArtists();
+    const byIndex = new Map<string, Record<string, unknown>[]>();
+    for (const artist of artists) {
+      const name = indexName(artist.name);
+      const list = byIndex.get(name) ?? [];
+      list.push(artistId3Of(artist));
+      byIndex.set(name, list);
+    }
+    const names = [...byIndex.keys()].sort((a, b) =>
+      a === '#' ? -1 : b === '#' ? 1 : a.localeCompare(b)
+    );
+    return {
+      artists: {
+        ignoredArticles: IGNORED_ARTICLES,
+        index: names.map((name) => ({ name, artist: byIndex.get(name)! })),
+      },
+    };
+  },
+
+  getArtist: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const artist = await context.app.library.getArtist(id);
+    if (artist === null) return notFound(context);
+    const albums = await context.app.library.albumsByArtist(id);
+    return {
+      artist: {
+        ...artistId3Of(artist),
+        album: albums.map(albumId3Of),
+      },
+    };
+  },
+
+  getAlbum: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const got = await context.app.library.getAlbum(id);
+    if (got === null) return notFound(context);
+    return {
+      album: {
+        ...albumId3Of(got.album),
+        song: got.songs.map((song) => childOf(song, context.app.cfg.library)),
+      },
+    };
+  },
+
+  getSong: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const song = await context.app.library.getSong(id);
+    if (song === null) return notFound(context);
+    return { song: childOf(song, context.app.cfg.library) };
+  },
+
+  search3: async (_request, context) => {
+    const params = context.state.params!;
+    const query = requiredParam(context, 'query');
+    if (query instanceof Response) return query;
+    const result = await context.app.library.search3(query, {
+      artistCount: intParam(params, 'artistCount', 20),
+      artistOffset: intParam(params, 'artistOffset', 0),
+      albumCount: intParam(params, 'albumCount', 20),
+      albumOffset: intParam(params, 'albumOffset', 0),
+      songCount: intParam(params, 'songCount', 20),
+      songOffset: intParam(params, 'songOffset', 0),
+    });
+    return {
+      searchResult3: {
+        artist: result.artists.map(artistId3Of),
+        album: result.albums.map(albumId3Of),
+        song: result.songs.map((song) =>
+          childOf(song, context.app.cfg.library)
+        ),
+      },
+    };
+  },
+
+  getAlbumList2: async (_request, context) => {
+    const params = context.state.params!;
+    const type = requiredParam(context, 'type');
+    if (type instanceof Response) return type;
+    const sort = type === 'alphabeticalByName'
+      ? 'name'
+      : type === 'random'
+      ? 'random'
+      : type === 'newest'
+      ? 'newest'
+      : null;
+    if (sort === null) {
+      return failResponse(
+        context,
+        0,
+        `getAlbumList2 type not implemented: ${type}`,
+      );
+    }
+    const albums = await context.app.library.listAlbums({
+      sort,
+      size: intParam(params, 'size', 10),
+      offset: intParam(params, 'offset', 0),
+    });
+    return { albumList2: { album: albums.map(albumId3Of) } };
+  },
 };
 
 export async function dispatch(
@@ -194,5 +451,6 @@ export async function dispatch(
   if (handler === undefined) {
     return failResponse(context, 0, `Not implemented: ${op}`);
   }
-  return okResponse(context, await handler(request, context));
+  const result = await handler(request, context);
+  return result instanceof Response ? result : okResponse(context, result);
 }

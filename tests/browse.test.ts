@@ -1,0 +1,280 @@
+// tests/browse.test.ts — browse + search ops over the fixture library:
+// getArtists (ID3 index), getArtist, getAlbum, getSong, search3, plus the
+// Feishin pull-forwards (getMusicFolders, getOpenSubsonicExtensions,
+// getAlbumList2). JSON shapes and XML spot-checks.
+import { assert, assertEquals } from '@std/assert';
+import { pathfinder } from '@pathfinder/pathfinder';
+import { openDb } from '../src/db.ts';
+import { seedFirstUser } from '../src/users.ts';
+import { scanLibrary } from '../src/scan.ts';
+import { createUserService } from '../src/user.ts';
+import { createLibrary } from '../src/library.ts';
+
+const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
+
+async function setup() {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-browse-' });
+  const db = await openDb(dir);
+  const cfg = {
+    listen: undefined,
+    dataDir: dir,
+    library: 'tests/fixtures/library',
+    user: 'admin',
+    password: 'test',
+    secret: 's3cret',
+    version: '0.0.0-test',
+  };
+  await seedFirstUser(db, cfg);
+  await scanLibrary(db, cfg.library);
+  const bag = {
+    cfg,
+    user: createUserService(db, cfg),
+    library: createLibrary(db),
+  };
+  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  return {
+    db,
+    dir,
+    app,
+    close: async () => {
+      db.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
+}
+
+type Envelope = Record<string, unknown> & { status: string };
+
+async function get(
+  app: (req: Request) => Promise<Response>,
+  op: string,
+  extra = '',
+): Promise<Envelope> {
+  const res = await app(
+    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+  );
+  assertEquals(res.status, 200);
+  const body = (await res.json()) as Record<string, Envelope>;
+  return body['subsonic-response'];
+}
+
+Deno.test('getArtists returns the ID3 index of album artists', async () => {
+  const { app, close } = await setup();
+  try {
+    const body = await get(app, 'getArtists');
+    const artists = body.artists as {
+      ignoredArticles: string;
+      index: { name: string; artist: { name: string; albumCount: number }[] }[];
+    };
+    assertEquals(typeof artists.ignoredArticles, 'string');
+    assertEquals(
+      artists.index.map((i) => [i.name, i.artist.map((a) => a.name)]),
+      [
+        ['F', ['Fixture Artist']],
+        ['V', ['Various Artists']],
+      ],
+    );
+    assertEquals(artists.index[0].artist[0].albumCount, 1);
+
+    const xml = await app(new Request(`http://x/rest/getArtists.view?${AUTH}`));
+    const text = await xml.text();
+    assert(text.includes('<artists ignoredArticles='));
+    assert(text.includes('<index name="F">'));
+    assert(text.includes('name="Fixture Artist" albumCount="1"'));
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getArtist returns the artist with their albums', async () => {
+  const { app, close } = await setup();
+  try {
+    const artists = await get(app, 'getArtists');
+    const index = (artists.artists as { index: { artist: { id: string }[] }[] })
+      .index;
+    const id = index[0].artist[0].id;
+    const body = await get(app, 'getArtist', `&id=${id}`);
+    const artist = body.artist as {
+      name: string;
+      album: { name: string; songCount: number }[];
+    };
+    assertEquals(artist.name, 'Fixture Artist');
+    assertEquals(artist.album.map((a) => [a.name, a.songCount]), [
+      ['Fixture Album', 2],
+    ]);
+
+    const missing = await get(app, 'getArtist', '&id=nope');
+    assertEquals((missing.error as { code: number }).code, 70);
+    const noId = await get(app, 'getArtist');
+    assertEquals((noId.error as { code: number }).code, 10);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getAlbum returns the album with ordered child songs', async () => {
+  const { app, close } = await setup();
+  try {
+    const found = await get(app, 'search3', '&query=Fixture%20Album');
+    const albumId = (found.searchResult3 as { album: { id: string }[] })
+      .album[0].id;
+    const body = await get(app, 'getAlbum', `&id=${albumId}`);
+    const album = body.album as {
+      name: string;
+      artist: string;
+      artistId: string;
+      coverArt: string;
+      songCount: number;
+      duration: number;
+      song: Record<string, unknown>[];
+    };
+    assertEquals(album.name, 'Fixture Album');
+    assertEquals(album.artist, 'Fixture Artist');
+    assertEquals(album.coverArt, albumId);
+    assertEquals(album.songCount, 2);
+    assert(album.duration >= 2);
+    assertEquals(album.song.map((s) => [s.track, s.title]), [
+      [1, 'First Song'],
+      [2, 'Second Song'],
+    ]);
+    const first = album.song[0];
+    assertEquals(first.isDir, false);
+    assertEquals(first.type, 'music');
+    assertEquals(first.isVideo, false);
+    assertEquals(first.contentType, 'audio/mpeg');
+    assertEquals(first.suffix, 'mp3');
+    assertEquals(first.albumId, albumId);
+    assertEquals(typeof first.artistId, 'string');
+    assertEquals(typeof first.duration, 'number');
+    assertEquals(typeof first.size, 'number');
+    assertEquals(
+      first.path,
+      'Fixture Artist/Fixture Album/01 - First Song.mp3',
+    );
+
+    const xml = await app(
+      new Request(`http://x/rest/getAlbum.view?${AUTH}&id=${albumId}`),
+    );
+    const text = await xml.text();
+    assert(text.includes('<album id="'));
+    assert((text.match(/<song /g) ?? []).length === 2);
+
+    const missing = await get(app, 'getAlbum', '&id=nope');
+    assertEquals((missing.error as { code: number }).code, 70);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getSong returns one Child', async () => {
+  const { app, close } = await setup();
+  try {
+    const found = await get(app, 'search3', '&query=Theme');
+    const songId = (found.searchResult3 as { song: { id: string }[] }).song[0]
+      .id;
+    const body = await get(app, 'getSong', `&id=${songId}`);
+    const song = body.song as Record<string, unknown>;
+    assertEquals(song.id, songId);
+    assertEquals(song.title, 'Theme');
+    assertEquals(song.artist, 'Probe Performer');
+    assertEquals(song.album, 'Fixture OST');
+
+    const missing = await get(app, 'getSong', '&id=nope');
+    assertEquals((missing.error as { code: number }).code, 70);
+    const noId = await get(app, 'getSong');
+    assertEquals((noId.error as { code: number }).code, 10);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('search3 matches artists, albums, songs; counts limit results', async () => {
+  const { app, close } = await setup();
+  try {
+    const body = await get(app, 'search3', '&query=fixture');
+    const result = body.searchResult3 as {
+      artist: { name: string }[];
+      album: { name: string }[];
+      song: { title: string }[];
+    };
+    assertEquals(result.artist.map((a) => a.name), ['Fixture Artist']);
+    assertEquals(result.album.map((a) => a.name), [
+      'Fixture Album',
+      'Fixture OST',
+    ]);
+    assertEquals(result.song.length, 0);
+
+    const songsOnly = await get(
+      app,
+      'search3',
+      '&query=fixture&artistCount=0&albumCount=0&songCount=5',
+    );
+    const limited = songsOnly.searchResult3 as {
+      artist: unknown[];
+      album: unknown[];
+      song: unknown[];
+    };
+    assertEquals(limited.artist.length, 0);
+    assertEquals(limited.album.length, 0);
+
+    const noQuery = await get(app, 'search3');
+    assertEquals((noQuery.error as { code: number }).code, 10);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getMusicFolders and getOpenSubsonicExtensions answer Feishin probes', async () => {
+  const { app, close } = await setup();
+  try {
+    const folders = await get(app, 'getMusicFolders');
+    assertEquals(
+      (folders.musicFolders as { musicFolder: { id: number; name: string }[] })
+        .musicFolder,
+      [{ id: 0, name: 'Music' }],
+    );
+    const extensions = await get(app, 'getOpenSubsonicExtensions');
+    assertEquals(
+      (extensions.openSubsonicExtensions as {
+        openSubsonicExtension: unknown[];
+      })
+        .openSubsonicExtension,
+      [],
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getAlbumList2 supports name/random/newest, rejects other types', async () => {
+  const { app, close } = await setup();
+  try {
+    const byName = await get(app, 'getAlbumList2', '&type=alphabeticalByName');
+    assertEquals(
+      (byName.albumList2 as { album: { name: string }[] }).album.map((a) =>
+        a.name
+      ),
+      ['Fixture Album', 'Fixture OST'],
+    );
+
+    const random = await get(app, 'getAlbumList2', '&type=random&size=1');
+    assertEquals(
+      (random.albumList2 as { album: unknown[] }).album.length,
+      1,
+    );
+
+    const newest = await get(app, 'getAlbumList2', '&type=newest');
+    assertEquals(
+      (newest.albumList2 as { album: unknown[] }).album.length,
+      2,
+    );
+
+    const starred = await get(app, 'getAlbumList2', '&type=starred');
+    assertEquals((starred.error as { code: number }).code, 0);
+
+    const noType = await get(app, 'getAlbumList2');
+    assertEquals((noType.error as { code: number }).code, 10);
+  } finally {
+    await close();
+  }
+});
