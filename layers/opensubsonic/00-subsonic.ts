@@ -181,6 +181,7 @@ export interface HatContext {
     };
     artwork: {
       cover(id: string): Promise<Response>;
+      placeholder(): Response;
     };
   };
   state: {
@@ -998,8 +999,37 @@ const OPS: Record<string, OpHandler> = {
     return {};
   },
 
-  // Stub: now-playing state is M3.
+  // Stub: now-playing state is not tracked (submission=false is ignored
+  // above; a real now-playing list is not in the M3 plan).
   getNowPlaying: () => ({ nowPlaying: { entry: [] } }),
+
+  // --- M3: empty-ok stubs ---------------------------------------------------
+  // Features melofon is not building (plan: don't-die beats
+  // implement-for-real). Each returns the correct empty payload — an app
+  // renders "no podcasts / no chat / nothing similar", never an error.
+  // Mutations for these surfaces (createPodcastChannel, addChatMessage,
+  // createShare, …) stay on the dispatch fallback's clean code-0 envelope.
+
+  getPodcasts: () => ({ podcasts: { channel: [] } }),
+  getNewestPodcasts: () => ({ newestPodcasts: { episode: [] } }),
+  getChatMessages: () => ({ chatMessages: { chatMessage: [] } }),
+  getShares: () => ({ shares: { share: [] } }),
+  getInternetRadioStations: () => ({
+    internetRadioStations: { internetRadioStation: [] },
+  }),
+
+  // No Last.fm, no recommendations (plan: do not add a network agent).
+  getSimilarSongs: () => ({ similarSongs: { song: [] } }),
+  getSimilarSongs2: () => ({ similarSongs2: { song: [] } }),
+  getTopSongs: () => ({ topSongs: { song: [] } }),
+  getArtistInfo: () => ({ artistInfo: {} }),
+  getArtistInfo2: () => ({ artistInfo2: {} }),
+  getAlbumInfo: () => ({ albumInfo: {} }),
+  getAlbumInfo2: () => ({ albumInfo2: {} }),
+
+  // No avatars (no Gravatar, no uploads): the same placeholder tile as
+  // getCoverArt's fallback. The username param is ignored, Navidrome-style.
+  getAvatar: (_request, context) => context.app.artwork.placeholder(),
 
   // Navidrome quirk: the authenticated user, not a directory lookup.
   getUser: (_request, context) => ({

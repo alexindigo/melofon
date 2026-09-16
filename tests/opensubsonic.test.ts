@@ -221,7 +221,7 @@ Deno.test('unknown op fails as envelope code 0; bare /rest/<op> dispatches too',
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getPodcasts.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/jukeboxControl.view?${AUTH}&f=json`),
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'failed');

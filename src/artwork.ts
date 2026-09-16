@@ -9,6 +9,8 @@ import type { Library } from './library.ts';
 export interface ArtworkService {
   /** Cover image for an album ID — always an image, never an error page. */
   cover(id: string): Promise<Response>;
+  /** The missing-cover tile, for callers with no cover concept (getAvatar). */
+  placeholder(): Response;
 }
 
 // 128×128 solid gray PNG (generated with ffmpeg), the missing-cover tile.
@@ -24,6 +26,7 @@ function placeholder(): Response {
 
 export function createArtwork(library: Library): ArtworkService {
   return {
+    placeholder,
     async cover(id) {
       const path = await library.albumCoverPath(id);
       if (path === null) return placeholder();
