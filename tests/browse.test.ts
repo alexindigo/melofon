@@ -281,7 +281,10 @@ Deno.test('getAlbumList2 supports name/random/newest, rejects other types', asyn
     );
 
     const byYear = await get(app, 'getAlbumList2', '&type=byYear');
-    assertEquals((byYear.error as { code: number }).code, 0);
+    assertEquals((byYear.error as { code: number }).code, 10);
+
+    const unknown = await get(app, 'getAlbumList2', '&type=notAType');
+    assertEquals((unknown.error as { code: number }).code, 0);
 
     const noType = await get(app, 'getAlbumList2');
     assertEquals((noType.error as { code: number }).code, 10);

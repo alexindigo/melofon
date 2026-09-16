@@ -61,12 +61,15 @@ export interface HatContext {
           | 'highest'
           | 'frequent'
           | 'recent'
-          | 'genre';
+          | 'genre'
+          | 'year';
         size: number;
         offset: number;
         folderId?: string;
         genre?: string;
         username?: string;
+        fromYear?: number;
+        toYear?: number;
       }): Promise<AlbumRow[]>;
       getAlbum(
         id: string,
@@ -219,6 +222,7 @@ export interface AlbumRow {
   artistName: string;
   songCount: number;
   durationMs: number;
+  year: number | null;
 }
 
 export interface SongRow {
@@ -236,6 +240,7 @@ export interface SongRow {
   durationMs: number | null;
   size: number | null;
   genre: string | null;
+  year: number | null;
   suffix: string;
   contentType: string;
 }
@@ -459,6 +464,7 @@ function albumId3Of(album: AlbumRow): Record<string, unknown> {
     coverArt: album.id, // getCoverArt resolves album IDs
     songCount: album.songCount,
     duration: Math.round(album.durationMs / 1000),
+    year: album.year ?? undefined,
   };
 }
 
@@ -495,6 +501,7 @@ function childOf(song: SongRow): Record<string, unknown> {
       ? undefined
       : Math.round(song.durationMs / 1000),
     genre: song.genre ?? undefined,
+    year: song.year ?? undefined,
     path,
     albumId: song.albumId ?? undefined,
     artistId: song.artistId ?? undefined,
@@ -515,9 +522,8 @@ function intParam(
   return value;
 }
 
-// getAlbumList/getAlbumList2 share the type table. byYear is the only
-// documented type without data behind it (no year tag in the catalog) — it
-// gets the same clean "not implemented" envelope as unknown types.
+// getAlbumList/getAlbumList2 share the type table. Every documented type is
+// implemented; unknown types get the same clean "not implemented" envelope.
 const ALBUM_LIST_SORTS: Record<
   string,
   | 'name'
@@ -529,6 +535,7 @@ const ALBUM_LIST_SORTS: Record<
   | 'frequent'
   | 'recent'
   | 'genre'
+  | 'year'
 > = {
   alphabeticalByName: 'name',
   alphabeticalByArtist: 'artist',
@@ -539,6 +546,7 @@ const ALBUM_LIST_SORTS: Record<
   frequent: 'frequent',
   recent: 'recent',
   byGenre: 'genre',
+  byYear: 'year',
 };
 
 async function albumListAlbums(
@@ -562,6 +570,21 @@ async function albumListAlbums(
     const genre = requiredParam(context, 'genre');
     if (genre instanceof Response) return genre;
     opts.genre = genre;
+  }
+  if (sort === 'year') {
+    // Spec: fromYear/toYear are required for byYear; from > to is reverse
+    // chronological.
+    const fromYear = requiredParam(context, 'fromYear');
+    if (fromYear instanceof Response) return fromYear;
+    const toYear = requiredParam(context, 'toYear');
+    if (toYear instanceof Response) return toYear;
+    const from = Number(fromYear);
+    const to = Number(toYear);
+    if (!Number.isInteger(from) || !Number.isInteger(to)) {
+      return failResponse(context, 10, 'fromYear/toYear must be integers');
+    }
+    opts.fromYear = from;
+    opts.toYear = to;
   }
   return await context.app.library.listAlbums(opts);
 }

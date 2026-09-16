@@ -37,12 +37,15 @@ CREATE TABLE IF NOT EXISTS files (
   track INTEGER,
   disc INTEGER,
   duration_ms INTEGER,
-  genre VARCHAR
+  genre VARCHAR,
+  year INTEGER
 );
 -- M3: existing M2 databases gain library_id without a rebuild.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS library_id VARCHAR;
 -- M3: genre is the first TCON value (single-valued, like the track artist).
 ALTER TABLE files ADD COLUMN IF NOT EXISTS genre VARCHAR;
+-- M3 amendment: year from TDRC/TYER (byYear album lists).
+ALTER TABLE files ADD COLUMN IF NOT EXISTS year INTEGER;
 
 -- M2 user state (keep-on-rescan: scan never deletes from these).
 CREATE TABLE IF NOT EXISTS listens (

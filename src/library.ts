@@ -19,6 +19,8 @@ export interface AlbumRow {
   artistName: string;
   songCount: number;
   durationMs: number;
+  /** Newest song year on the album (null when no song carries a year). */
+  year: number | null;
 }
 
 export interface SongRow {
@@ -38,6 +40,7 @@ export interface SongRow {
   durationMs: number | null;
   size: number | null;
   genre: string | null;
+  year: number | null;
   suffix: string;
   contentType: string;
 }
@@ -80,12 +83,16 @@ export interface Library {
       | 'highest'
       | 'frequent'
       | 'recent'
-      | 'genre';
+      | 'genre'
+      | 'year';
     size: number;
     offset: number;
     folderId?: string;
     genre?: string;
     username?: string;
+    /** `year` sort: range bounds (either order; from > to is newest-first). */
+    fromYear?: number;
+    toYear?: number;
   }): Promise<AlbumRow[]>;
   getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
   getSong(id: string): Promise<SongRow | null>;
@@ -157,6 +164,7 @@ interface SongSqlRow {
   duration_ms: number | bigint | null;
   size: number | bigint | null;
   genre: string | null;
+  year: number | null;
 }
 
 function songOf(row: SongSqlRow): SongRow {
@@ -176,6 +184,7 @@ function songOf(row: SongSqlRow): SongRow {
     durationMs: num(row.duration_ms),
     size: num(row.size),
     genre: row.genre,
+    year: num(row.year),
     suffix,
     contentType: CONTENT_TYPES[suffix] ?? 'application/octet-stream',
   };
@@ -185,7 +194,7 @@ const SONG_SELECT = `
   SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title,
          f.album_id, al.name AS album_name, f.artist_id,
          ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
-         f.genre
+         f.genre, f.year
   FROM files f
   LEFT JOIN albums al ON al.id = f.album_id
   LEFT JOIN artists ar ON ar.id = f.artist_id
@@ -198,6 +207,7 @@ interface AlbumSqlRow {
   artist_name: string;
   song_count: number | bigint;
   duration_ms: number | bigint | null;
+  year: number | bigint | null;
 }
 
 function albumOf(row: AlbumSqlRow): AlbumRow {
@@ -208,6 +218,7 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
     artistName: row.artist_name,
     songCount: Number(row.song_count),
     durationMs: Number(row.duration_ms ?? 0),
+    year: num(row.year),
   };
 }
 
@@ -222,6 +233,8 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
 interface AlbumQuery {
   folderId?: string;
   genre?: string;
+  yearFrom?: number;
+  yearTo?: number;
   starredBy?: string; // users.id
   ratedBy?: string; // users.id
   listenAgg?: string; // users.id
@@ -257,9 +270,13 @@ function albumSelect(q: AlbumQuery = {}): string {
     wheres.push(`f.library_id = ${esc(q.folderId)}`);
   }
   if (q.genre !== undefined) wheres.push(`f.genre = ${esc(q.genre)}`);
+  if (q.yearFrom !== undefined && q.yearTo !== undefined) {
+    wheres.push(`f.year BETWEEN ${q.yearFrom} AND ${q.yearTo}`);
+  }
   return `
   SELECT al.id, al.name, al.album_artist_id, ar.name AS artist_name,
-         COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms
+         COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
+         MAX(f.year) AS year
   FROM albums al
   JOIN artists ar ON ar.id = al.album_artist_id
   LEFT JOIN files f ON f.album_id = al.id
@@ -367,6 +384,18 @@ export function createLibrary(db: Db): Library {
           query.genre = opts.genre;
           order = 'ORDER BY al.name';
           break;
+        case 'year': {
+          if (opts.fromYear === undefined || opts.toYear === undefined) {
+            return [];
+          }
+          query.yearFrom = Math.min(opts.fromYear, opts.toYear);
+          query.yearTo = Math.max(opts.fromYear, opts.toYear);
+          // Subsonic: fromYear > toYear is a reverse chronological list.
+          order = opts.fromYear > opts.toYear
+            ? 'ORDER BY MAX(f.year) DESC, al.name'
+            : 'ORDER BY MAX(f.year), al.name';
+          break;
+        }
         default:
           order = 'ORDER BY al.name';
       }

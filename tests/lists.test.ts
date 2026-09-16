@@ -199,6 +199,53 @@ Deno.test('getSongsByGenre filters by genre and musicFolderId', async () => {
   }
 });
 
+Deno.test('byYear lists albums in range, both directions, with the year field', async () => {
+  const { app, close } = await setup();
+  try {
+    const names = (body: Envelope) =>
+      (body.albumList2 as { album: { name: string }[] }).album.map((a) =>
+        a.name
+      );
+    const all = await get(
+      app,
+      'getAlbumList2',
+      '&type=byYear&fromYear=1900&toYear=2100',
+    );
+    assertEquals(names(all), ['Fixture Album', 'Fixture OST']);
+    const years = (all.albumList2 as { album: { year: number }[] }).album.map(
+      (a) => a.year,
+    );
+    assertEquals(years, [2001, 2019]);
+
+    // fromYear > toYear is reverse chronological (spec).
+    const reverse = await get(
+      app,
+      'getAlbumList2',
+      '&type=byYear&fromYear=2100&toYear=1900',
+    );
+    assertEquals(names(reverse), ['Fixture OST', 'Fixture Album']);
+
+    const narrow = await get(
+      app,
+      'getAlbumList2',
+      '&type=byYear&fromYear=2000&toYear=2010',
+    );
+    assertEquals(names(narrow), ['Fixture Album']);
+
+    const v1 = await get(
+      app,
+      'getAlbumList',
+      '&type=byYear&fromYear=1900&toYear=2100',
+    );
+    assertEquals(
+      (v1.albumList as { album: { name: string }[] }).album.length,
+      2,
+    );
+  } finally {
+    await close();
+  }
+});
+
 Deno.test('search2 answers with the v1 envelope', async () => {
   const { app, close } = await setup();
   try {
