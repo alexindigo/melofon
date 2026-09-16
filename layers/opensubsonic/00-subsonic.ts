@@ -47,10 +47,21 @@ export interface HatContext {
       getArtist(id: string): Promise<ArtistRow | null>;
       albumsByArtist(artistId: string): Promise<AlbumRow[]>;
       listAlbums(opts: {
-        sort: 'name' | 'random' | 'newest';
+        sort:
+          | 'name'
+          | 'artist'
+          | 'random'
+          | 'newest'
+          | 'starred'
+          | 'highest'
+          | 'frequent'
+          | 'recent'
+          | 'genre';
         size: number;
         offset: number;
         folderId?: string;
+        genre?: string;
+        username?: string;
       }): Promise<AlbumRow[]>;
       getAlbum(
         id: string,
@@ -74,6 +85,11 @@ export interface HatContext {
       songPath(id: string): Promise<string | null>;
       /** Random songs from the catalog (getRandomSongs pull-forward). */
       randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
+      listGenres(): Promise<GenreRow[]>;
+      songsByGenre(
+        genre: string,
+        opts: { size: number; offset: number; folderId?: string },
+      ): Promise<SongRow[]>;
     };
     annotation: {
       star(
@@ -190,8 +206,15 @@ export interface SongRow {
   disc: number | null;
   durationMs: number | null;
   size: number | null;
+  genre: string | null;
   suffix: string;
   contentType: string;
+}
+
+export interface GenreRow {
+  name: string;
+  songCount: number;
+  albumCount: number;
 }
 
 export interface StarredRow {
@@ -278,7 +301,9 @@ function isScalar(value: unknown): value is string | number | boolean {
 
 // Subsonic XML convention: objects are elements, scalar fields are
 // attributes, arrays repeat the key as the item element (`index`, `artist`,
-// `album`, `song` all name their items after the key).
+// `album`, `song` all name their items after the key). One exception: a
+// scalar `value` key is mixed content — the element's text, not an attribute
+// (genre, lyrics).
 function xmlElement(tag: string, value: unknown): string {
   if (Array.isArray(value)) {
     return value.map((item) => xmlElement(tag, item)).join('');
@@ -289,14 +314,20 @@ function xmlElement(tag: string, value: unknown): string {
   const obj = value as Record<string, unknown>;
   let attrs = '';
   let children = '';
+  let text: string | null = null;
   for (const [key, val] of Object.entries(obj)) {
     if (val === null || val === undefined) continue;
+    if (key === 'value' && isScalar(val)) {
+      text = String(val);
+      continue;
+    }
     if (isScalar(val)) attrs += ` ${key}="${escapeXml(String(val))}"`;
     else children += xmlElement(key, val);
   }
-  return children === ''
+  const inner = children + (text === null ? '' : escapeXml(text));
+  return inner === ''
     ? `<${tag}${attrs}/>`
-    : `<${tag}${attrs}>${children}</${tag}>`;
+    : `<${tag}${attrs}>${inner}</${tag}>`;
 }
 
 function render(
@@ -373,6 +404,17 @@ function albumId3Of(album: AlbumRow): Record<string, unknown> {
   };
 }
 
+// Pre-ID3 album shape (getAlbumList / search2): the ID3 fields plus the
+// legacy duplicates old clients read.
+function albumV1Of(album: AlbumRow): Record<string, unknown> {
+  return {
+    ...albumId3Of(album),
+    album: album.name,
+    title: album.name,
+    isDir: true,
+  };
+}
+
 // The wire `path` is relative to the song's own source root — the simulated
 // Navidrome tree ("Artist/Album/01 - Song.mp3"), never the absolute path.
 function childOf(song: SongRow): Record<string, unknown> {
@@ -394,6 +436,7 @@ function childOf(song: SongRow): Record<string, unknown> {
     duration: song.durationMs === null
       ? undefined
       : Math.round(song.durationMs / 1000),
+    genre: song.genre ?? undefined,
     path,
     albumId: song.albumId ?? undefined,
     artistId: song.artistId ?? undefined,
@@ -412,6 +455,57 @@ function intParam(
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) return fallback;
   return value;
+}
+
+// getAlbumList/getAlbumList2 share the type table. byYear is the only
+// documented type without data behind it (no year tag in the catalog) — it
+// gets the same clean "not implemented" envelope as unknown types.
+const ALBUM_LIST_SORTS: Record<
+  string,
+  | 'name'
+  | 'artist'
+  | 'random'
+  | 'newest'
+  | 'starred'
+  | 'highest'
+  | 'frequent'
+  | 'recent'
+  | 'genre'
+> = {
+  alphabeticalByName: 'name',
+  alphabeticalByArtist: 'artist',
+  random: 'random',
+  newest: 'newest',
+  starred: 'starred',
+  highest: 'highest',
+  frequent: 'frequent',
+  recent: 'recent',
+  byGenre: 'genre',
+};
+
+async function albumListAlbums(
+  context: HatContext,
+): Promise<AlbumRow[] | Response> {
+  const params = context.state.params!;
+  const type = requiredParam(context, 'type');
+  if (type instanceof Response) return type;
+  const sort = ALBUM_LIST_SORTS[type];
+  if (sort === undefined) {
+    return failResponse(context, 0, `album list type not implemented: ${type}`);
+  }
+  const opts: Parameters<HatContext['app']['library']['listAlbums']>[0] = {
+    sort,
+    size: intParam(params, 'size', 10),
+    offset: intParam(params, 'offset', 0),
+    folderId: params.get('musicFolderId') ?? undefined,
+    username: context.state.user!.username,
+  };
+  if (sort === 'genre') {
+    const genre = requiredParam(context, 'genre');
+    if (genre instanceof Response) return genre;
+    opts.genre = genre;
+  }
+  return await context.app.library.listAlbums(opts);
 }
 
 // Subsonic playlist payload. No coverArt: getCoverArt does not resolve
@@ -572,30 +666,62 @@ const OPS: Record<string, OpHandler> = {
     };
   },
 
-  getAlbumList2: async (_request, context) => {
+  search2: async (_request, context) => {
     const params = context.state.params!;
-    const type = requiredParam(context, 'type');
-    if (type instanceof Response) return type;
-    const sort = type === 'alphabeticalByName'
-      ? 'name'
-      : type === 'random'
-      ? 'random'
-      : type === 'newest'
-      ? 'newest'
-      : null;
-    if (sort === null) {
-      return failResponse(
-        context,
-        0,
-        `getAlbumList2 type not implemented: ${type}`,
-      );
-    }
-    const albums = await context.app.library.listAlbums({
-      sort,
-      size: intParam(params, 'size', 10),
+    const query = requiredParam(context, 'query');
+    if (query instanceof Response) return query;
+    const result = await context.app.library.search3(query, {
+      artistCount: intParam(params, 'artistCount', 20),
+      artistOffset: intParam(params, 'artistOffset', 0),
+      albumCount: intParam(params, 'albumCount', 20),
+      albumOffset: intParam(params, 'albumOffset', 0),
+      songCount: intParam(params, 'songCount', 20),
+      songOffset: intParam(params, 'songOffset', 0),
+      folderId: params.get('musicFolderId') ?? undefined,
+    });
+    return {
+      searchResult2: {
+        artist: result.artists.map(artistId3Of),
+        album: result.albums.map(albumV1Of),
+        song: result.songs.map(childOf),
+      },
+    };
+  },
+
+  getGenres: async (_request, context) => {
+    const genres = await context.app.library.listGenres();
+    return {
+      genres: {
+        genre: genres.map((g) => ({
+          value: g.name,
+          songCount: g.songCount,
+          albumCount: g.albumCount,
+        })),
+      },
+    };
+  },
+
+  getSongsByGenre: async (_request, context) => {
+    const params = context.state.params!;
+    const genre = requiredParam(context, 'genre');
+    if (genre instanceof Response) return genre;
+    const songs = await context.app.library.songsByGenre(genre, {
+      size: intParam(params, 'count', 10),
       offset: intParam(params, 'offset', 0),
       folderId: params.get('musicFolderId') ?? undefined,
     });
+    return { songsByGenre: { song: songs.map(childOf) } };
+  },
+
+  getAlbumList: async (_request, context) => {
+    const albums = await albumListAlbums(context);
+    if (albums instanceof Response) return albums;
+    return { albumList: { album: albums.map(albumV1Of) } };
+  },
+
+  getAlbumList2: async (_request, context) => {
+    const albums = await albumListAlbums(context);
+    if (albums instanceof Response) return albums;
     return { albumList2: { album: albums.map(albumId3Of) } };
   },
 

@@ -48,6 +48,7 @@ interface FileIn {
   track: number | null;
   disc: number | null;
   durationMs: number | null;
+  genre: string | null;
 }
 
 async function stableId(kind: string, key: string): Promise<string> {
@@ -126,6 +127,7 @@ export async function scanLibrary(db: Db): Promise<ScanCounts> {
         let trackNo: number | null = null;
         let discNo: number | null = null;
         let durationMs: number | null = null;
+        let genre: string | null = null;
         try {
           const meta = await parseFile(abs);
           // Garbage bytes resolve with an empty format (no container, no codec)
@@ -147,6 +149,9 @@ export async function scanLibrary(db: Db): Promise<ScanCounts> {
           if (meta.format.duration && meta.format.duration > 0) {
             durationMs = Math.round(meta.format.duration * 1000);
           }
+          // TCON is multi-valued; the catalog keeps the first (single-valued,
+          // like the track artist fallback).
+          genre = meta.common.genre?.[0]?.trim() || null;
         } catch {
           skipped++;
           continue; // unreadable tags — skip the file, keep scanning
@@ -181,6 +186,7 @@ export async function scanLibrary(db: Db): Promise<ScanCounts> {
           track: trackNo,
           disc: discNo,
           durationMs,
+          genre,
         });
       }
     } catch (err) {
@@ -228,7 +234,8 @@ export async function scanLibrary(db: Db): Promise<ScanCounts> {
 
     const fileStmt = await db.conn.prepare(
       `INSERT INTO files (id, path, library_id, mtime, size, title, album_id,
-        artist_id, track, disc, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        artist_id, track, disc, duration_ms, genre)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const file of files) {
       fileStmt.bindVarchar(1, file.id);
@@ -249,6 +256,8 @@ export async function scanLibrary(db: Db): Promise<ScanCounts> {
       else fileStmt.bindInteger(10, file.disc);
       if (file.durationMs === null) fileStmt.bindNull(11);
       else fileStmt.bindInteger(11, file.durationMs);
+      if (file.genre === null) fileStmt.bindNull(12);
+      else fileStmt.bindVarchar(12, file.genre);
       await fileStmt.run();
     }
     fileStmt.destroySync();

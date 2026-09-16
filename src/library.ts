@@ -3,6 +3,7 @@
 // are the hats' job. No DuckDB handle ever leaves core: layers get this
 // namespace on context.app.library.
 import type { Db } from './db.ts';
+import { userIdForName } from './user.ts';
 
 export interface ArtistRow {
   id: string;
@@ -35,8 +36,15 @@ export interface SongRow {
   disc: number | null;
   durationMs: number | null;
   size: number | null;
+  genre: string | null;
   suffix: string;
   contentType: string;
+}
+
+export interface GenreRow {
+  name: string;
+  songCount: number;
+  albumCount: number;
 }
 
 export interface Search3Result {
@@ -52,12 +60,25 @@ export interface Library {
   getArtist(id: string): Promise<ArtistRow | null>;
   /** Albums of one album artist, alphabetically. */
   albumsByArtist(artistId: string): Promise<AlbumRow[]>;
-  /** Album lists for getAlbumList2-shaped hats. */
+  /** Album lists for getAlbumList/getAlbumList2-shaped hats. The user-scoped
+   * sorts (starred / highest / frequent / recent) need `username`; `genre`
+   * sort needs `genre`. */
   listAlbums(opts: {
-    sort: 'name' | 'random' | 'newest';
+    sort:
+      | 'name'
+      | 'artist'
+      | 'random'
+      | 'newest'
+      | 'starred'
+      | 'highest'
+      | 'frequent'
+      | 'recent'
+      | 'genre';
     size: number;
     offset: number;
     folderId?: string;
+    genre?: string;
+    username?: string;
   }): Promise<AlbumRow[]>;
   getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
   getSong(id: string): Promise<SongRow | null>;
@@ -77,6 +98,13 @@ export interface Library {
   songPath(id: string): Promise<string | null>;
   /** Random songs from the catalog (getRandomSongs pull-forward). */
   randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
+  /** All genres with song/album counts (getGenres). */
+  listGenres(): Promise<GenreRow[]>;
+  /** Songs of one genre (getSongsByGenre). */
+  songsByGenre(
+    genre: string,
+    opts: { size: number; offset: number; folderId?: string },
+  ): Promise<SongRow[]>;
   /** Absolute path of an album's cover.jpg, for app.artwork (null if none). */
   albumCoverPath(id: string): Promise<string | null>;
 }
@@ -118,6 +146,7 @@ interface SongSqlRow {
   disc: number | null;
   duration_ms: number | bigint | null;
   size: number | bigint | null;
+  genre: string | null;
 }
 
 function songOf(row: SongSqlRow): SongRow {
@@ -136,6 +165,7 @@ function songOf(row: SongSqlRow): SongRow {
     disc: num(row.disc),
     durationMs: num(row.duration_ms),
     size: num(row.size),
+    genre: row.genre,
     suffix,
     contentType: CONTENT_TYPES[suffix] ?? 'application/octet-stream',
   };
@@ -144,7 +174,8 @@ function songOf(row: SongSqlRow): SongRow {
 const SONG_SELECT = `
   SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title,
          f.album_id, al.name AS album_name, f.artist_id,
-         ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size
+         ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
+         f.genre
   FROM files f
   LEFT JOIN albums al ON al.id = f.album_id
   LEFT JOIN artists ar ON ar.id = f.artist_id
@@ -170,17 +201,60 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
   };
 }
 
-// folderId restricts to albums having at least one file in that source
-// (musicFolderId). The WHERE goes before the GROUP BY, so it composes with
-// the callers' HAVING / ORDER BY / LIMIT.
-function albumSelect(folderId?: string): string {
+// Album query builder. folderId restricts to albums having at least one file
+// in that source (musicFolderId); genre restricts to albums with a file of
+// that genre; starredBy / ratedBy inner-join the user's stars / ratings;
+// listenAgg left-joins per-album play aggregates for frequent / recent. The
+// WHERE goes before the GROUP BY, so it composes with callers' HAVING /
+// ORDER BY / LIMIT. Stars and ratings join at most one row per album (their
+// PKs), and the listen aggregate is one row per album, so song_count and
+// duration stay exact.
+interface AlbumQuery {
+  folderId?: string;
+  genre?: string;
+  starredBy?: string; // users.id
+  ratedBy?: string; // users.id
+  listenAgg?: string; // users.id
+}
+
+function albumSelect(q: AlbumQuery = {}): string {
+  const joins: string[] = [];
+  if (q.starredBy !== undefined) {
+    joins.push(
+      `JOIN stars s ON s.target_id = al.id AND s.target_type = 'album'
+         AND s.user_id = ${esc(q.starredBy)}`,
+    );
+  }
+  if (q.ratedBy !== undefined) {
+    joins.push(
+      `JOIN ratings r ON r.target_id = al.id AND r.user_id = ${esc(q.ratedBy)}`,
+    );
+  }
+  if (q.listenAgg !== undefined) {
+    joins.push(
+      `LEFT JOIN (
+         SELECT f2.album_id AS album_id, COUNT(li.track_id) AS play_count,
+                MAX(li.played_at) AS last_played
+         FROM files f2
+         JOIN listens li ON li.track_id = f2.id
+           AND li.user_id = ${esc(q.listenAgg)}
+         GROUP BY f2.album_id
+       ) agg ON agg.album_id = al.id`,
+    );
+  }
+  const wheres: string[] = [];
+  if (q.folderId !== undefined) {
+    wheres.push(`f.library_id = ${esc(q.folderId)}`);
+  }
+  if (q.genre !== undefined) wheres.push(`f.genre = ${esc(q.genre)}`);
   return `
   SELECT al.id, al.name, al.album_artist_id, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms
   FROM albums al
   JOIN artists ar ON ar.id = al.album_artist_id
   LEFT JOIN files f ON f.album_id = al.id
-  ${folderId === undefined ? '' : `WHERE f.library_id = ${esc(folderId)}`}
+  ${joins.join('\n')}
+  ${wheres.length === 0 ? '' : `WHERE ${wheres.join(' AND ')}`}
   GROUP BY al.id, al.name, al.album_artist_id, ar.name`;
 }
 
@@ -245,13 +319,49 @@ export function createLibrary(db: Db): Library {
     },
 
     async listAlbums(opts) {
-      const order = opts.sort === 'random'
-        ? 'ORDER BY RANDOM()'
-        : opts.sort === 'newest'
-        ? 'ORDER BY MAX(f.mtime) DESC NULLS LAST'
-        : 'ORDER BY al.name';
+      const query: AlbumQuery = { folderId: opts.folderId };
+      let order: string;
+      switch (opts.sort) {
+        case 'random':
+          order = 'ORDER BY RANDOM()';
+          break;
+        case 'newest':
+          order = 'ORDER BY MAX(f.mtime) DESC NULLS LAST';
+          break;
+        case 'artist':
+          order = 'ORDER BY ar.name, al.name';
+          break;
+        case 'starred':
+        case 'highest':
+        case 'frequent':
+        case 'recent': {
+          if (opts.username === undefined) return [];
+          const userId = await userIdForName(db, opts.username);
+          if (userId === null) return [];
+          if (opts.sort === 'starred') {
+            query.starredBy = userId;
+            order = 'ORDER BY MAX(s.starred_at) DESC';
+          } else if (opts.sort === 'highest') {
+            query.ratedBy = userId;
+            order = 'ORDER BY MAX(r.rating) DESC, al.name';
+          } else {
+            query.listenAgg = userId;
+            order = opts.sort === 'frequent'
+              ? 'ORDER BY MAX(agg.play_count) DESC NULLS LAST, al.name'
+              : 'ORDER BY MAX(agg.last_played) DESC NULLS LAST, al.name';
+          }
+          break;
+        }
+        case 'genre':
+          if (opts.genre === undefined) return [];
+          query.genre = opts.genre;
+          order = 'ORDER BY al.name';
+          break;
+        default:
+          order = 'ORDER BY al.name';
+      }
       const res = await db.conn.runAndReadAll(
-        `${albumSelect(opts.folderId)} ${order}
+        `${albumSelect(query)} ${order}
          LIMIT ${opts.size} OFFSET ${opts.offset}`,
       );
       return (res.getRowObjects() as unknown as AlbumSqlRow[]).map(albumOf);
@@ -295,7 +405,8 @@ export function createLibrary(db: Db): Library {
            LIMIT ${opts.artistCount} OFFSET ${opts.artistOffset}`,
         ),
         db.conn.runAndReadAll(
-          `${albumSelect(opts.folderId)} HAVING al.name ILIKE ${like}
+          `${albumSelect({ folderId: opts.folderId })}
+           HAVING al.name ILIKE ${like}
            ORDER BY al.name
            LIMIT ${opts.albumCount} OFFSET ${opts.albumOffset}`,
         ),
@@ -339,6 +450,40 @@ export function createLibrary(db: Db): Library {
         `${SONG_SELECT}${
           folderId === undefined ? '' : ` WHERE f.library_id = ${esc(folderId)}`
         } ORDER BY RANDOM() LIMIT ${Math.trunc(size)}`,
+      );
+      return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async listGenres(): Promise<GenreRow[]> {
+      const res = await db.conn.runAndReadAll(
+        `SELECT genre, COUNT(*) AS song_count,
+                COUNT(DISTINCT album_id) AS album_count
+         FROM files
+         WHERE genre IS NOT NULL
+         GROUP BY genre
+         ORDER BY genre`,
+      );
+      return (res.getRowObjects() as {
+        genre: string;
+        song_count: number | bigint;
+        album_count: number | bigint;
+      }[]).map((row) => ({
+        name: row.genre,
+        songCount: Number(row.song_count),
+        albumCount: Number(row.album_count),
+      }));
+    },
+
+    async songsByGenre(genre, opts) {
+      const res = await db.conn.runAndReadAll(
+        `${SONG_SELECT}
+         WHERE f.genre = ${esc(genre)}${
+          opts.folderId === undefined
+            ? ''
+            : ` AND f.library_id = ${esc(opts.folderId)}`
+        }
+         ORDER BY f.title
+         LIMIT ${opts.size} OFFSET ${opts.offset}`,
       );
       return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
     },

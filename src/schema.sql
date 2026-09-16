@@ -36,10 +36,13 @@ CREATE TABLE IF NOT EXISTS files (
   artist_id VARCHAR,
   track INTEGER,
   disc INTEGER,
-  duration_ms INTEGER
+  duration_ms INTEGER,
+  genre VARCHAR
 );
 -- M3: existing M2 databases gain library_id without a rebuild.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS library_id VARCHAR;
+-- M3: genre is the first TCON value (single-valued, like the track artist).
+ALTER TABLE files ADD COLUMN IF NOT EXISTS genre VARCHAR;
 
 -- M2 user state (keep-on-rescan: scan never deletes from these).
 CREATE TABLE IF NOT EXISTS listens (
