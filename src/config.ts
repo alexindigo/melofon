@@ -1,0 +1,49 @@
+// src/config.ts — env → config. Listen, data dir, library path, first-boot
+// user, and the server secret all come from the environment; the Settings UI
+// (M5) does not exist yet, so env is the only settings channel.
+export interface Config {
+  // MELOFON_LISTEN parsed to {hostname, port} or undefined (Deno.serve default).
+  listen: { hostname: string; port: number } | undefined;
+  // MELOFON_DATA — directory for melofon.duckdb (default ./data).
+  dataDir: string;
+  // MELOFON_LIBRARY — recorded now, scanned in M1. May be unset in M0.
+  library: string | undefined;
+  user: string | undefined;
+  password: string | undefined;
+  secret: string | undefined;
+}
+
+export function loadConfig(
+  env: (name: string) => string | undefined = (n) => Deno.env.get(n),
+): Config {
+  const listenRaw = env('MELOFON_LISTEN');
+  let listen: Config['listen'];
+  if (listenRaw !== undefined && listenRaw.trim() !== '') {
+    const idx = listenRaw.lastIndexOf(':');
+    if (idx <= 0 || idx === listenRaw.length - 1) {
+      throw new Error(
+        `MELOFON_LISTEN must look like host:port, got ${
+          JSON.stringify(listenRaw)
+        }`,
+      );
+    }
+    const hostname = listenRaw.slice(0, idx);
+    const port = Number(listenRaw.slice(idx + 1));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(
+        `MELOFON_LISTEN port must be an integer 1..65535, got ${
+          JSON.stringify(listenRaw)
+        }`,
+      );
+    }
+    listen = { hostname, port };
+  }
+  return {
+    listen,
+    dataDir: env('MELOFON_DATA') ?? './data',
+    library: env('MELOFON_LIBRARY'),
+    user: env('MELOFON_USER'),
+    password: env('MELOFON_PASSWORD'),
+    secret: env('MELOFON_SECRET'),
+  };
+}
