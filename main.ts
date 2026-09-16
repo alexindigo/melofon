@@ -15,6 +15,7 @@ import { createListens } from './src/listens.ts';
 import { createPlaylists } from './src/playlists.ts';
 import { createClientQueue } from './src/clientqueue.ts';
 import { createBookmarks } from './src/bookmarks.ts';
+import { createNowPlaying } from './src/nowplaying.ts';
 import { createStream } from './src/stream.ts';
 import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
@@ -44,6 +45,7 @@ const bag = {
   playlists: createPlaylists(db),
   clientQueue: createClientQueue(db),
   bookmarks: createBookmarks(db),
+  nowPlaying: createNowPlaying(db),
   stream: createStream(),
   artwork: createArtwork(library),
 };

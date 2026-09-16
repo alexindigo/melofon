@@ -96,3 +96,14 @@ CREATE TABLE IF NOT EXISTS bookmarks (
   changed_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (user_id, track_id)
 );
+-- M3 amendment: now-playing, one row per (user, client) like Navidrome's
+-- player-keyed NowPlaying. scrobble submission=false replaces the row;
+-- submission=true never touches it (that path is append-only listens).
+CREATE TABLE IF NOT EXISTS now_playing (
+  user_id VARCHAR NOT NULL,
+  client VARCHAR NOT NULL,
+  track_id VARCHAR NOT NULL,
+  position_ms BIGINT,
+  started_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, client)
+);

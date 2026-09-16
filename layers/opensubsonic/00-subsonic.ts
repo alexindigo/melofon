@@ -176,6 +176,15 @@ export interface HatContext {
       ): Promise<void>;
       remove(username: string, trackId: string): Promise<void>;
     };
+    nowPlaying: {
+      set(
+        username: string,
+        client: string,
+        trackId: string,
+        positionMs?: number,
+      ): Promise<void>;
+      list(): Promise<NowPlayingRow[]>;
+    };
     stream: {
       file(request: Request, path: string): Promise<Response>;
     };
@@ -283,6 +292,14 @@ export interface LyricsRow {
   artist: string | null;
   title: string | null;
   text: string;
+}
+
+export interface NowPlayingRow {
+  username: string;
+  client: string;
+  trackId: string;
+  positionMs: number | null;
+  startedAtMs: number;
 }
 
 // --- Params ------------------------------------------------------------------
@@ -976,16 +993,29 @@ const OPS: Record<string, OpHandler> = {
     return {};
   },
 
-  // Append-only: submission=true inserts one listens row per id (never a
-  // play_count update; never from stream). submission=false is a now-playing
-  // notification — ignored until M3 (getNowPlaying stays empty).
+  // submission=true (or omitted — Navidrome defaults to true) is append-only:
+  // one listens row per id (never a play_count update; never from stream).
+  // submission=false is a now-playing notification: it replaces the
+  // (user, client) now_playing row and never appends listens. Navidrome
+  // takes only the first id on this path; `position` is seconds.
   scrobble: async (_request, context) => {
     const params = context.state.params!;
     const ids = params.getAll('id');
     if (ids.length === 0) {
       return failResponse(context, 10, 'Required parameter is missing');
     }
-    if (params.get('submission') === 'false') return {};
+    if (params.get('submission') === 'false') {
+      const rawPosition = Number(params.get('position') ?? '0');
+      await context.app.nowPlaying.set(
+        context.state.user!.username,
+        params.get('c')!,
+        ids[0],
+        Number.isFinite(rawPosition) && rawPosition >= 0
+          ? rawPosition * 1000
+          : undefined,
+      );
+      return {};
+    }
     const times = params.getAll('time').map((t) => Number(t));
     for (let i = 0; i < ids.length; i++) {
       const playedAtMs = Number.isFinite(times[i]) && times[i] > 0
@@ -999,9 +1029,29 @@ const OPS: Record<string, OpHandler> = {
     return {};
   },
 
-  // Stub: now-playing state is not tracked (submission=false is ignored
-  // above; a real now-playing list is not in the M3 plan).
-  getNowPlaying: () => ({ nowPlaying: { entry: [] } }),
+  // Server-wide current plays (Subsonic: "all users"), newest first. Entries
+  // are the Child payload plus username/minutesAgo/playerId/playerName — the
+  // OpenSubsonic playbackReport fields (state/positionMs/playbackRate) stay
+  // out: that extension is not advertised.
+  getNowPlaying: async (_request, context) => {
+    const rows = await context.app.nowPlaying.list();
+    const entries: Record<string, unknown>[] = [];
+    for (const row of rows) {
+      const song = await context.app.library.getSong(row.trackId);
+      if (song === null) continue; // track vanished since the notification
+      entries.push({
+        ...childOf(song),
+        username: row.username,
+        minutesAgo: Math.max(
+          0,
+          Math.floor((Date.now() - row.startedAtMs) / 60000),
+        ),
+        playerId: 0,
+        playerName: row.client,
+      });
+    }
+    return { nowPlaying: { entry: entries } };
+  },
 
   // --- M3: empty-ok stubs ---------------------------------------------------
   // Features melofon is not building (plan: don't-die beats

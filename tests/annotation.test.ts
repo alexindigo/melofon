@@ -1,7 +1,7 @@
 // tests/annotation.test.ts — M2 annotation + listens over the opensubsonic
-// hat: star/unstar (song/album/artist), setRating, scrobble (append-only,
-// submission=false ignored), getStarred2, getNowPlaying stub, getUser,
-// getRandomSongs. Fixture library + seeded admin/test user per test.
+// hat: star/unstar (song/album/artist), setRating, scrobble (append-only;
+// submission=false goes to now-playing, never listens), getStarred2,
+// getUser, getRandomSongs. Fixture library + seeded admin/test user per test.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
@@ -12,6 +12,7 @@ import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
+import { createNowPlaying } from '../src/nowplaying.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -37,6 +38,7 @@ async function setup() {
     library: createLibrary(db),
     annotation: createAnnotation(db),
     listens: createListens(db),
+    nowPlaying: createNowPlaying(db),
   };
   const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
   const songs = await db.conn.runAndReadAll(
@@ -259,7 +261,7 @@ Deno.test('scrobble honors the time parameter for offline scrobbles', async () =
   }
 });
 
-Deno.test('scrobble submission=false writes nothing', async () => {
+Deno.test('scrobble submission=false does not append listens', async () => {
   const { app, db, songIds, close } = await setup();
   try {
     const res = await app(
@@ -279,7 +281,7 @@ Deno.test('scrobble submission=false writes nothing', async () => {
   }
 });
 
-Deno.test('getNowPlaying is an empty list until M3', async () => {
+Deno.test('getNowPlaying is an empty list when nobody is playing', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
