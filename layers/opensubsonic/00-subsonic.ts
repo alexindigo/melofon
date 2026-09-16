@@ -101,6 +101,31 @@ export interface HatContext {
         },
       ): Promise<void>;
     };
+    playlists: {
+      list(username: string): Promise<PlaylistRow[]>;
+      get(username: string, id: string): Promise<PlaylistWithTracks | null>;
+      create(
+        username: string,
+        name: string,
+        trackIds: string[],
+      ): Promise<PlaylistWithTracks>;
+      setTracks(
+        username: string,
+        id: string,
+        trackIds: string[],
+      ): Promise<PlaylistWithTracks | null>;
+      update(
+        username: string,
+        id: string,
+        opts: {
+          name?: string;
+          comment?: string;
+          addTrackIds?: string[];
+          removeAtPositions?: number[];
+        },
+      ): Promise<PlaylistWithTracks | null>;
+      delete(username: string, id: string): Promise<boolean>;
+    };
     stream: {
       file(request: Request, path: string): Promise<Response>;
     };
@@ -150,6 +175,20 @@ export interface StarredRow {
   targetId: string;
   targetType: string; // 'song' | 'album' | 'artist'
   starredAtMs: number; // epoch milliseconds
+}
+
+export interface PlaylistRow {
+  id: string;
+  name: string;
+  comment: string | null;
+  createdAtMs: number;
+  changedAtMs: number;
+  songCount: number;
+  durationMs: number;
+}
+
+export interface PlaylistWithTracks extends PlaylistRow {
+  trackIds: string[];
 }
 
 // --- Params ------------------------------------------------------------------
@@ -340,6 +379,39 @@ function intParam(
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) return fallback;
   return value;
+}
+
+// Subsonic playlist payload. No coverArt: getCoverArt does not resolve
+// playlist IDs in M2. `public` is always false (single-household server).
+function playlistOf(
+  playlist: PlaylistRow,
+  owner: string,
+): Record<string, unknown> {
+  return {
+    id: playlist.id,
+    name: playlist.name,
+    comment: playlist.comment ?? undefined,
+    owner,
+    public: false,
+    songCount: playlist.songCount,
+    duration: Math.round(playlist.durationMs / 1000),
+    created: new Date(playlist.createdAtMs).toISOString(),
+    changed: new Date(playlist.changedAtMs).toISOString(),
+  };
+}
+
+async function playlistEntries(
+  context: HatContext,
+  trackIds: string[],
+): Promise<Record<string, unknown>[]> {
+  const entries: Record<string, unknown>[] = [];
+  for (const trackId of trackIds) {
+    const song = await context.app.library.getSong(trackId);
+    if (song !== null) {
+      entries.push(childOf(song, context.app.cfg.library));
+    }
+  }
+  return entries;
 }
 
 function indexName(name: string): string {
@@ -660,6 +732,98 @@ const OPS: Record<string, OpHandler> = {
         song: songs.map((song) => childOf(song, context.app.cfg.library)),
       },
     };
+  },
+
+  // --- M2: playlists ------------------------------------------------------------
+
+  // Navidrome quirk: the `username` param is ignored — always the caller's.
+  getPlaylists: async (_request, context) => {
+    const username = context.state.user!.username;
+    const rows = await context.app.playlists.list(username);
+    return {
+      playlists: { playlist: rows.map((p) => playlistOf(p, username)) },
+    };
+  },
+
+  getPlaylist: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const username = context.state.user!.username;
+    const playlist = await context.app.playlists.get(username, id);
+    if (playlist === null) return notFound(context);
+    return {
+      playlist: {
+        ...playlistOf(playlist, username),
+        entry: await playlistEntries(context, playlist.trackIds),
+      },
+    };
+  },
+
+  // With `playlistId`: replace that playlist's tracks. With `name`: create.
+  createPlaylist: async (_request, context) => {
+    const params = context.state.params!;
+    const username = context.state.user!.username;
+    const trackIds = params.getAll('songId');
+    const playlistId = params.get('playlistId');
+    if (playlistId !== null && playlistId !== '') {
+      const updated = await context.app.playlists.setTracks(
+        username,
+        playlistId,
+        trackIds,
+      );
+      if (updated === null) return notFound(context);
+      return {
+        playlist: {
+          ...playlistOf(updated, username),
+          entry: await playlistEntries(context, updated.trackIds),
+        },
+      };
+    }
+    const name = requiredParam(context, 'name');
+    if (name instanceof Response) return name;
+    const created = await context.app.playlists.create(
+      username,
+      name,
+      trackIds,
+    );
+    return {
+      playlist: {
+        ...playlistOf(created, username),
+        entry: await playlistEntries(context, created.trackIds),
+      },
+    };
+  },
+
+  updatePlaylist: async (_request, context) => {
+    const params = context.state.params!;
+    const playlistId = requiredParam(context, 'playlistId');
+    if (playlistId instanceof Response) return playlistId;
+    const removeAtPositions = params.getAll('songIndexToRemove')
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n >= 0);
+    const updated = await context.app.playlists.update(
+      context.state.user!.username,
+      playlistId,
+      {
+        name: params.get('name') ?? undefined,
+        comment: params.get('comment') ?? undefined,
+        addTrackIds: params.getAll('songIdToAdd'),
+        removeAtPositions,
+      },
+    );
+    if (updated === null) return notFound(context);
+    return {};
+  },
+
+  deletePlaylist: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const deleted = await context.app.playlists.delete(
+      context.state.user!.username,
+      id,
+    );
+    if (!deleted) return notFound(context);
+    return {};
   },
 };
 
