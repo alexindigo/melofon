@@ -126,6 +126,17 @@ export interface HatContext {
       ): Promise<PlaylistWithTracks | null>;
       delete(username: string, id: string): Promise<boolean>;
     };
+    clientQueue: {
+      get(username: string): Promise<PlayQueueRow | null>;
+      save(
+        username: string,
+        queue: {
+          trackIds: string[];
+          currentId?: string;
+          positionMs?: number;
+        },
+      ): Promise<void>;
+    };
     stream: {
       file(request: Request, path: string): Promise<Response>;
     };
@@ -189,6 +200,13 @@ export interface PlaylistRow {
 
 export interface PlaylistWithTracks extends PlaylistRow {
   trackIds: string[];
+}
+
+export interface PlayQueueRow {
+  trackIds: string[];
+  currentId: string | null;
+  positionMs: number | null;
+  changedAtMs: number;
 }
 
 // --- Params ------------------------------------------------------------------
@@ -400,7 +418,7 @@ function playlistOf(
   };
 }
 
-async function playlistEntries(
+async function entriesFor(
   context: HatContext,
   trackIds: string[],
 ): Promise<Record<string, unknown>[]> {
@@ -754,7 +772,7 @@ const OPS: Record<string, OpHandler> = {
     return {
       playlist: {
         ...playlistOf(playlist, username),
-        entry: await playlistEntries(context, playlist.trackIds),
+        entry: await entriesFor(context, playlist.trackIds),
       },
     };
   },
@@ -775,7 +793,7 @@ const OPS: Record<string, OpHandler> = {
       return {
         playlist: {
           ...playlistOf(updated, username),
-          entry: await playlistEntries(context, updated.trackIds),
+          entry: await entriesFor(context, updated.trackIds),
         },
       };
     }
@@ -789,7 +807,7 @@ const OPS: Record<string, OpHandler> = {
     return {
       playlist: {
         ...playlistOf(created, username),
-        entry: await playlistEntries(context, created.trackIds),
+        entry: await entriesFor(context, created.trackIds),
       },
     };
   },
@@ -823,6 +841,39 @@ const OPS: Record<string, OpHandler> = {
       id,
     );
     if (!deleted) return notFound(context);
+    return {};
+  },
+
+  // --- M2: Subsonic play queue (the client's saved playback state) -----------
+
+  // Navidrome quirk: `current` is a string. Nothing saved → bare ok envelope
+  // (no playQueue key). No changedBy: the schema keeps no per-save client.
+  getPlayQueue: async (_request, context) => {
+    const queue = await context.app.clientQueue.get(
+      context.state.user!.username,
+    );
+    if (queue === null) return {};
+    return {
+      playQueue: {
+        entry: await entriesFor(context, queue.trackIds),
+        current: queue.currentId ?? undefined,
+        position: queue.positionMs ?? undefined,
+        changed: new Date(queue.changedAtMs).toISOString(),
+      },
+    };
+  },
+
+  savePlayQueue: async (_request, context) => {
+    const params = context.state.params!;
+    const rawPosition = params.get('position');
+    const position = rawPosition === null ? NaN : Number(rawPosition);
+    await context.app.clientQueue.save(context.state.user!.username, {
+      trackIds: params.getAll('id'),
+      currentId: params.get('current') ?? undefined,
+      positionMs: Number.isFinite(position) && position >= 0
+        ? position
+        : undefined,
+    });
     return {};
   },
 };

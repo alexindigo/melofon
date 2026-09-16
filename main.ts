@@ -12,6 +12,7 @@ import { createLibrary } from './src/library.ts';
 import { createAnnotation } from './src/annotation.ts';
 import { createListens } from './src/listens.ts';
 import { createPlaylists } from './src/playlists.ts';
+import { createClientQueue } from './src/clientqueue.ts';
 import { createStream } from './src/stream.ts';
 import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
@@ -37,6 +38,7 @@ const bag = {
   annotation: createAnnotation(db),
   listens: createListens(db),
   playlists: createPlaylists(db),
+  clientQueue: createClientQueue(db),
   stream: createStream(),
   artwork: createArtwork(library),
 };
