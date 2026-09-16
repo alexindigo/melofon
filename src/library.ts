@@ -69,6 +69,8 @@ export interface Library {
   ): Promise<Search3Result>;
   /** Absolute path of a song's audio file, for app.stream. */
   songPath(id: string): Promise<string | null>;
+  /** Random songs from the catalog (getRandomSongs pull-forward). */
+  randomSongs(size: number): Promise<SongRow[]>;
   /** Absolute path of an album's cover.jpg, for app.artwork (null if none). */
   albumCoverPath(id: string): Promise<string | null>;
 }
@@ -298,6 +300,13 @@ export function createLibrary(db: Db): Library {
       );
       const row = (res.getRowObjects() as { path: string }[])[0];
       return row?.path ?? null;
+    },
+
+    async randomSongs(size) {
+      const res = await db.conn.runAndReadAll(
+        `${SONG_SELECT} ORDER BY RANDOM() LIMIT ${Math.trunc(size)}`,
+      );
+      return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
     },
 
     async albumCoverPath(id) {

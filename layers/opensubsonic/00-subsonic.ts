@@ -68,6 +68,38 @@ export interface HatContext {
       >;
       /** Absolute path of a song's audio file (null when unknown). */
       songPath(id: string): Promise<string | null>;
+      /** Random songs from the catalog (getRandomSongs pull-forward). */
+      randomSongs(size: number): Promise<SongRow[]>;
+    };
+    annotation: {
+      star(
+        username: string,
+        targetId: string,
+        targetType: string,
+      ): Promise<void>;
+      unstar(
+        username: string,
+        targetId: string,
+        targetType: string,
+      ): Promise<void>;
+      /** Subsonic 1..5; 0 clears. */
+      setRating(
+        username: string,
+        targetId: string,
+        rating: number,
+      ): Promise<void>;
+      starred(username: string): Promise<StarredRow[]>;
+    };
+    listens: {
+      record(
+        username: string,
+        trackId: string,
+        opts: {
+          source: string;
+          playedAtMs?: number;
+          durationMs?: number;
+        },
+      ): Promise<void>;
     };
     stream: {
       file(request: Request, path: string): Promise<Response>;
@@ -112,6 +144,12 @@ export interface SongRow {
   size: number | null;
   suffix: string;
   contentType: string;
+}
+
+export interface StarredRow {
+  targetId: string;
+  targetType: string; // 'song' | 'album' | 'artist'
+  starredAtMs: number; // epoch milliseconds
 }
 
 // --- Params ------------------------------------------------------------------
@@ -466,6 +504,162 @@ const OPS: Record<string, OpHandler> = {
     const id = requiredParam(context, 'id');
     if (id instanceof Response) return id;
     return await context.app.artwork.cover(id);
+  },
+
+  // --- M2: annotation (star / rate / scrobble) --------------------------------
+
+  // star/unstar targets: repeated `id` = songs, `albumId` = albums,
+  // `artistId` = artists (modern Subsonic split).
+  star: async (_request, context) => {
+    const params = context.state.params!;
+    const targets: [string, string][] = [
+      ...params.getAll('id').map((id): [string, string] => [id, 'song']),
+      ...params.getAll('albumId').map((id): [string, string] => [id, 'album']),
+      ...params.getAll('artistId').map((
+        id,
+      ): [string, string] => [id, 'artist']),
+    ];
+    if (targets.length === 0) {
+      return failResponse(context, 10, 'Required parameter is missing');
+    }
+    for (const [targetId, targetType] of targets) {
+      await context.app.annotation.star(
+        context.state.user!.username,
+        targetId,
+        targetType,
+      );
+    }
+    return {};
+  },
+
+  unstar: async (_request, context) => {
+    const params = context.state.params!;
+    const targets: [string, string][] = [
+      ...params.getAll('id').map((id): [string, string] => [id, 'song']),
+      ...params.getAll('albumId').map((id): [string, string] => [id, 'album']),
+      ...params.getAll('artistId').map((
+        id,
+      ): [string, string] => [id, 'artist']),
+    ];
+    if (targets.length === 0) {
+      return failResponse(context, 10, 'Required parameter is missing');
+    }
+    for (const [targetId, targetType] of targets) {
+      await context.app.annotation.unstar(
+        context.state.user!.username,
+        targetId,
+        targetType,
+      );
+    }
+    return {};
+  },
+
+  // rating 1..5; 0 clears (Subsonic convention).
+  setRating: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const raw = context.state.params!.get('rating');
+    const rating = raw === null ? NaN : Number(raw);
+    if (!Number.isInteger(rating) || rating < 0 || rating > 5) {
+      return failResponse(context, 10, 'rating must be an integer 0-5');
+    }
+    await context.app.annotation.setRating(
+      context.state.user!.username,
+      id,
+      rating,
+    );
+    return {};
+  },
+
+  // Append-only: submission=true inserts one listens row per id (never a
+  // play_count update; never from stream). submission=false is a now-playing
+  // notification — ignored until M3 (getNowPlaying stays empty).
+  scrobble: async (_request, context) => {
+    const params = context.state.params!;
+    const ids = params.getAll('id');
+    if (ids.length === 0) {
+      return failResponse(context, 10, 'Required parameter is missing');
+    }
+    if (params.get('submission') === 'false') return {};
+    const times = params.getAll('time').map((t) => Number(t));
+    for (let i = 0; i < ids.length; i++) {
+      const playedAtMs = Number.isFinite(times[i]) && times[i] > 0
+        ? times[i]
+        : undefined;
+      await context.app.listens.record(context.state.user!.username, ids[i], {
+        source: 'opensubsonic',
+        playedAtMs,
+      });
+    }
+    return {};
+  },
+
+  // Stub: now-playing state is M3.
+  getNowPlaying: () => ({ nowPlaying: { entry: [] } }),
+
+  // Navidrome quirk: the authenticated user, not a directory lookup.
+  getUser: (_request, context) => ({
+    user: {
+      username: context.state.user!.username,
+      scrobblingEnabled: true,
+      adminRole: true,
+      settingsRole: true,
+      downloadRole: true,
+      uploadRole: false,
+      playlistRole: true,
+      coverArtRole: true,
+      commentRole: false,
+      podcastRole: false,
+      streamRole: true,
+      jukeboxRole: false,
+      shareRole: false,
+      videoConversionRole: false,
+      folder: [0],
+    },
+  }),
+
+  getStarred2: async (_request, context) => {
+    const rows = await context.app.annotation.starred(
+      context.state.user!.username,
+    );
+    const artists: Record<string, unknown>[] = [];
+    const albums: Record<string, unknown>[] = [];
+    const songs: Record<string, unknown>[] = [];
+    for (const row of rows) {
+      const starred = new Date(row.starredAtMs).toISOString();
+      if (row.targetType === 'song') {
+        const song = await context.app.library.getSong(row.targetId);
+        if (song !== null) {
+          songs.push({
+            ...childOf(song, context.app.cfg.library),
+            starred,
+          });
+        }
+      } else if (row.targetType === 'album') {
+        const got = await context.app.library.getAlbum(row.targetId);
+        if (got !== null) albums.push({ ...albumId3Of(got.album), starred });
+      } else if (row.targetType === 'artist') {
+        const artist = await context.app.library.getArtist(row.targetId);
+        if (artist !== null) {
+          artists.push({ ...artistId3Of(artist), starred });
+        }
+      }
+    }
+    return { starred2: { artist: artists, album: albums, song: songs } };
+  },
+
+  // Pull-forward for Symfonium: random songs from the catalog. genre/year
+  // filters are not implemented in M2.
+  getRandomSongs: async (_request, context) => {
+    const params = context.state.params!;
+    const songs = await context.app.library.randomSongs(
+      intParam(params, 'size', 10),
+    );
+    return {
+      randomSongs: {
+        song: songs.map((song) => childOf(song, context.app.cfg.library)),
+      },
+    };
   },
 };
 

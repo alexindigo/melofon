@@ -9,6 +9,8 @@ import { seedFirstUser } from './src/users.ts';
 import { scanLibrary } from './src/scan.ts';
 import { createUserService } from './src/user.ts';
 import { createLibrary } from './src/library.ts';
+import { createAnnotation } from './src/annotation.ts';
+import { createListens } from './src/listens.ts';
 import { createStream } from './src/stream.ts';
 import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
@@ -31,6 +33,8 @@ const bag = {
   cfg,
   user: createUserService(db, cfg),
   library,
+  annotation: createAnnotation(db),
+  listens: createListens(db),
   stream: createStream(),
   artwork: createArtwork(library),
 };

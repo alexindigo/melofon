@@ -28,6 +28,18 @@ function esc(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
+/** Internal user id for a state username — user-state tables key on id. */
+export async function userIdForName(
+  db: Db,
+  username: string,
+): Promise<string | null> {
+  const res = await db.conn.runAndReadAll(
+    `SELECT id FROM users WHERE name = ${esc(username)}`,
+  );
+  const row = (res.getRowObjects() as { id: string }[])[0];
+  return row?.id ?? null;
+}
+
 export function createUserService(db: Db, cfg: Config): UserService {
   async function passwordOf(username: string): Promise<string | null> {
     if (cfg.secret === undefined) return null;
