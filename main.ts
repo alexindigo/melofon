@@ -6,7 +6,7 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { loadConfig } from './src/config.ts';
 import { openDb } from './src/db.ts';
 import { seedFirstUser } from './src/users.ts';
-import { scanLibrary } from './src/scan.ts';
+import { createScan } from './src/scan.ts';
 import { createUserService } from './src/user.ts';
 import { createLibraries } from './src/libraries.ts';
 import { createLibrary } from './src/library.ts';
@@ -14,6 +14,7 @@ import { createAnnotation } from './src/annotation.ts';
 import { createListens } from './src/listens.ts';
 import { createPlaylists } from './src/playlists.ts';
 import { createClientQueue } from './src/clientqueue.ts';
+import { createBookmarks } from './src/bookmarks.ts';
 import { createStream } from './src/stream.ts';
 import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
@@ -23,7 +24,8 @@ const cfg = loadConfig();
 const db = await openDb(cfg.dataDir);
 await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
-const counts = await scanLibrary(db);
+const scan = createScan(db);
+const counts = await scan.run();
 console.log(
   `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
     `${counts.artists} artists, ${counts.albums} albums`,
@@ -34,12 +36,14 @@ const library = createLibrary(db);
 const bag = {
   cfg,
   libraries,
+  scan,
   user: createUserService(db, cfg),
   library,
   annotation: createAnnotation(db),
   listens: createListens(db),
   playlists: createPlaylists(db),
   clientQueue: createClientQueue(db),
+  bookmarks: createBookmarks(db),
   stream: createStream(),
   artwork: createArtwork(library),
 };

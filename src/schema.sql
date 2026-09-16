@@ -86,3 +86,13 @@ CREATE TABLE IF NOT EXISTS play_queues (
   changed_at TIMESTAMPTZ NOT NULL,
   track_ids VARCHAR[] NOT NULL
 );
+-- M3: per-user playback-position bookmarks (keep-on-rescan).
+CREATE TABLE IF NOT EXISTS bookmarks (
+  user_id VARCHAR NOT NULL,
+  track_id VARCHAR NOT NULL,
+  position_ms BIGINT NOT NULL,
+  comment VARCHAR,
+  created_at TIMESTAMPTZ NOT NULL,
+  changed_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, track_id)
+);

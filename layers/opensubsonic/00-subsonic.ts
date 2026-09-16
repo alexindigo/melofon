@@ -42,6 +42,11 @@ export interface HatContext {
     libraries: {
       list(): Promise<LibraryFolderRow[]>;
     };
+    scan: {
+      status(): Promise<ScanStatusRow>;
+      /** Background scan; resolves when done (the op does not await it). */
+      start(): Promise<void>;
+    };
     library: {
       listArtists(folderId?: string): Promise<ArtistRow[]>;
       getArtist(id: string): Promise<ArtistRow | null>;
@@ -90,6 +95,10 @@ export interface HatContext {
         genre: string,
         opts: { size: number; offset: number; folderId?: string },
       ): Promise<SongRow[]>;
+      lyrics(query: {
+        artist?: string;
+        title?: string;
+      }): Promise<LyricsRow | null>;
     };
     annotation: {
       star(
@@ -156,6 +165,16 @@ export interface HatContext {
           positionMs?: number;
         },
       ): Promise<void>;
+    };
+    bookmarks: {
+      list(username: string): Promise<BookmarkRow[]>;
+      set(
+        username: string,
+        trackId: string,
+        positionMs: number,
+        comment?: string,
+      ): Promise<void>;
+      remove(username: string, trackId: string): Promise<void>;
     };
     stream: {
       file(request: Request, path: string): Promise<Response>;
@@ -242,6 +261,27 @@ export interface PlayQueueRow {
   currentId: string | null;
   positionMs: number | null;
   changedAtMs: number;
+}
+
+export interface ScanStatusRow {
+  scanning: boolean;
+  count: number;
+  folderCount: number;
+  lastScanMs: number | null;
+}
+
+export interface BookmarkRow {
+  trackId: string;
+  positionMs: number;
+  comment: string | null;
+  createdAtMs: number;
+  changedAtMs: number;
+}
+
+export interface LyricsRow {
+  artist: string | null;
+  title: string | null;
+  text: string;
 }
 
 // --- Params ------------------------------------------------------------------
@@ -573,6 +613,20 @@ function notFound(context: HatContext): Response {
   return failResponse(context, 70, 'The requested data was not found');
 }
 
+async function scanStatusOf(
+  context: HatContext,
+): Promise<Record<string, unknown>> {
+  const s = await context.app.scan.status();
+  return {
+    scanning: s.scanning,
+    count: s.count,
+    folderCount: s.folderCount,
+    lastScan: s.lastScanMs === null
+      ? undefined
+      : new Date(s.lastScanMs).toISOString(),
+  };
+}
+
 const OPS: Record<string, OpHandler> = {
   ping: () => ({}),
   getLicense: () => ({ license: { valid: true } }),
@@ -801,6 +855,51 @@ const OPS: Record<string, OpHandler> = {
     const path = await context.app.library.songPath(id);
     if (path === null) return notFound(context);
     return await context.app.stream.file(request._raw, path);
+  },
+
+  // Song ids only in M3: Navidrome also accepts album/artist/playlist ids
+  // (zipped), but the household apps only download songs — zip can wait.
+  // Same bytes as stream, plus Content-Disposition so the client saves a
+  // file instead of playing it.
+  download: async (request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const path = await context.app.library.songPath(id);
+    if (path === null) return notFound(context);
+    const res = await context.app.stream.file(request._raw, path);
+    const name = (path.split('/').pop() ?? 'download').replaceAll('"', '');
+    const headers = new Headers(res.headers);
+    headers.set('content-disposition', `attachment; filename="${name}"`);
+    return new Response(res.body, { status: res.status, headers });
+  },
+
+  // Embedded (USLT) lyrics only — no external agent. Empty lyrics element
+  // when the song or the tag is missing (Subsonic's own "no lyrics" shape).
+  getLyrics: async (_request, context) => {
+    const params = context.state.params!;
+    const row = await context.app.library.lyrics({
+      artist: params.get('artist') ?? undefined,
+      title: params.get('title') ?? undefined,
+    });
+    if (row === null) return { lyrics: {} };
+    return {
+      lyrics: {
+        artist: row.artist ?? undefined,
+        title: row.title ?? undefined,
+        value: row.text,
+      },
+    };
+  },
+
+  // Navidrome extras ride along: folderCount, lastScan.
+  getScanStatus: async (_request, context) => {
+    return { scanStatus: await scanStatusOf(context) };
+  },
+
+  // fullScan is accepted and ignored: every scan is a full rebuild.
+  startScan: async (_request, context) => {
+    void context.app.scan.start(); // answers while the scan runs
+    return { scanStatus: await scanStatusOf(context) };
   },
 
   // Album cover.jpg or the placeholder — always an image. `size` is ignored
@@ -1090,6 +1189,57 @@ const OPS: Record<string, OpHandler> = {
         ? position
         : undefined,
     });
+    return {};
+  },
+
+  // --- M3: bookmarks (per-user playback positions) ---------------------------
+
+  getBookmarks: async (_request, context) => {
+    const username = context.state.user!.username;
+    const rows = await context.app.bookmarks.list(username);
+    const bookmarks: Record<string, unknown>[] = [];
+    for (const row of rows) {
+      const song = await context.app.library.getSong(row.trackId);
+      if (song === null) continue; // starred-then-removed track — skip
+      bookmarks.push({
+        entry: childOf(song),
+        position: row.positionMs,
+        username,
+        comment: row.comment ?? undefined,
+        created: new Date(row.createdAtMs).toISOString(),
+        changed: new Date(row.changedAtMs).toISOString(),
+      });
+    }
+    return { bookmarks: { bookmark: bookmarks } };
+  },
+
+  createBookmark: async (_request, context) => {
+    const params = context.state.params!;
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const rawPosition = params.get('position');
+    const position = rawPosition === null ? NaN : Number(rawPosition);
+    if (!Number.isFinite(position) || position < 0) {
+      return failResponse(
+        context,
+        10,
+        'position must be a non-negative number',
+      );
+    }
+    await context.app.bookmarks.set(
+      context.state.user!.username,
+      id,
+      position,
+      params.get('comment') ?? undefined,
+    );
+    return {};
+  },
+
+  // Unknown ids are ok, not 404: delete is idempotent (don't-die).
+  deleteBookmark: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    await context.app.bookmarks.remove(context.state.user!.username, id);
     return {};
   },
 };

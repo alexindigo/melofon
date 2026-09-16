@@ -2,6 +2,7 @@
 // index. Returns domain rows only — protocol shapes (ID3 payloads, XML/JSON)
 // are the hats' job. No DuckDB handle ever leaves core: layers get this
 // namespace on context.app.library.
+import { parseFile } from 'music-metadata';
 import type { Db } from './db.ts';
 import { userIdForName } from './user.ts';
 
@@ -45,6 +46,12 @@ export interface GenreRow {
   name: string;
   songCount: number;
   albumCount: number;
+}
+
+export interface LyricsRow {
+  artist: string | null;
+  title: string | null;
+  text: string;
 }
 
 export interface Search3Result {
@@ -105,6 +112,9 @@ export interface Library {
     genre: string,
     opts: { size: number; offset: number; folderId?: string },
   ): Promise<SongRow[]>;
+  /** Embedded (USLT) lyrics of the best artist/title match (null when the
+   * match or the tag is missing). Parsed on demand — no lyrics column. */
+  lyrics(query: { artist?: string; title?: string }): Promise<LyricsRow | null>;
   /** Absolute path of an album's cover.jpg, for app.artwork (null if none). */
   albumCoverPath(id: string): Promise<string | null>;
 }
@@ -486,6 +496,33 @@ export function createLibrary(db: Db): Library {
          LIMIT ${opts.size} OFFSET ${opts.offset}`,
       );
       return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async lyrics(query) {
+      const wheres: string[] = [];
+      if (query.artist !== undefined) {
+        wheres.push(`ar.name ILIKE ${esc(query.artist)}`);
+      }
+      if (query.title !== undefined) {
+        wheres.push(`f.title ILIKE ${esc(query.title)}`);
+      }
+      if (wheres.length === 0) return null;
+      const res = await db.conn.runAndReadAll(
+        `${SONG_SELECT} WHERE ${wheres.join(' AND ')}
+         ORDER BY f.title LIMIT 1`,
+      );
+      const row = (res.getRowObjects() as unknown as SongSqlRow[])[0];
+      if (!row) return null;
+      const song = songOf(row);
+      let text: string | undefined;
+      try {
+        const meta = await parseFile(song.path);
+        text = meta.common.lyrics?.[0]?.text?.trim() || undefined;
+      } catch {
+        return null; // unreadable file — treated as no lyrics
+      }
+      if (text === undefined) return null;
+      return { artist: song.artistName, title: song.title, text };
     },
 
     async albumCoverPath(id) {

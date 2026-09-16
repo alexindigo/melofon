@@ -275,3 +275,58 @@ export async function scanLibrary(db: Db): Promise<ScanCounts> {
     albums: albums.size,
   };
 }
+
+// --- Scan state (getScanStatus / startScan) ----------------------------------
+
+export interface ScanStatus {
+  scanning: boolean;
+  /** Files indexed by the last completed scan (0 before the first). */
+  count: number;
+  /** Configured sources (Navidrome's folderCount extra). */
+  folderCount: number;
+  /** Completion time of the last scan (Navidrome's lastScan extra). */
+  lastScanMs: number | null;
+}
+
+export interface ScanService {
+  /** Foreground scan (boot); refreshes count/lastScanMs on completion. */
+  run(): Promise<ScanCounts>;
+  status(): Promise<ScanStatus>;
+  /** Background scan (startScan); no-op while one runs. Resolves when done. */
+  start(): Promise<void>;
+}
+
+export function createScan(db: Db): ScanService {
+  let scanning = false;
+  let count = 0;
+  let lastScanMs: number | null = null;
+  const run = async (): Promise<ScanCounts> => {
+    const counts = await scanLibrary(db);
+    count = counts.files;
+    lastScanMs = Date.now();
+    return counts;
+  };
+  return {
+    run,
+    async status(): Promise<ScanStatus> {
+      const res = await db.conn.runAndReadAll(
+        'SELECT COUNT(*) AS n FROM libraries',
+      );
+      const folderCount = Number(
+        (res.getRowObjects() as { n: bigint }[])[0].n,
+      );
+      return { scanning, count, folderCount, lastScanMs };
+    },
+    async start(): Promise<void> {
+      if (scanning) return;
+      scanning = true;
+      try {
+        await run();
+      } catch (err) {
+        console.error('[melofon] scan failed:', err);
+      } finally {
+        scanning = false;
+      }
+    },
+  };
+}
