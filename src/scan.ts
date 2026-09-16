@@ -1,0 +1,239 @@
+// src/scan.ts — walk MELOFON_LIBRARY, read tags, rebuild the catalog tables
+// (artists / albums / files) from disk. The users table is never touched:
+// catalog IDs are stable content hashes, so a rescan of the same paths keeps
+// every ID (M2's stars/playlists survive). Unreadable files are skipped and
+// counted, never fatal. ffprobe is the duration fallback only (when
+// music-metadata parsed but found no duration).
+import { parseFile } from 'music-metadata';
+import { encodeHex } from '@std/encoding/hex';
+import type { Db } from './db.ts';
+
+const AUDIO_EXTENSIONS = new Set([
+  '.mp3',
+  '.flac',
+  '.m4a',
+  '.ogg',
+  '.opus',
+  '.wav',
+]);
+
+export interface ScanCounts {
+  files: number;
+  skipped: number;
+  artists: number;
+  albums: number;
+}
+
+interface ArtistIn {
+  id: string;
+  name: string;
+}
+
+interface AlbumIn {
+  id: string;
+  name: string;
+  albumArtistId: string;
+}
+
+interface FileIn {
+  id: string;
+  path: string;
+  mtime: number | null;
+  size: number | null;
+  title: string;
+  albumId: string | null;
+  artistId: string | null;
+  track: number | null;
+  disc: number | null;
+  durationMs: number | null;
+}
+
+async function stableId(kind: string, key: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`${kind}\n${key}`),
+  );
+  return encodeHex(new Uint8Array(digest)).slice(0, 32);
+}
+
+function extOf(name: string): string {
+  const idx = name.lastIndexOf('.');
+  return idx === -1 ? '' : name.slice(idx).toLowerCase();
+}
+
+async function* walkAudio(
+  dir: string,
+): AsyncGenerator<{ abs: string; rel: string }> {
+  for await (const entry of Deno.readDir(dir)) {
+    const abs = `${dir}/${entry.name}`;
+    if (entry.isDirectory) {
+      yield* walkAudio(abs);
+    } else if (entry.isFile && AUDIO_EXTENSIONS.has(extOf(entry.name))) {
+      yield { abs, rel: abs.slice(dir.length + 1) };
+    }
+  }
+}
+
+async function ffprobeDurationMs(path: string): Promise<number | null> {
+  try {
+    const out = await new Deno.Command('ffprobe', {
+      args: [
+        '-v',
+        'error',
+        '-show_entries',
+        'format=duration',
+        '-of',
+        'default=noprint_wrappers=1:nokey=1',
+        path,
+      ],
+      stdout: 'piped',
+      stderr: 'null',
+    }).output();
+    if (!out.success) return null;
+    const seconds = Number(new TextDecoder().decode(out.stdout).trim());
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    return Math.round(seconds * 1000);
+  } catch {
+    return null; // ffprobe not installed / spawn failed — duration stays null
+  }
+}
+
+export async function scanLibrary(
+  db: Db,
+  libraryRoot: string,
+): Promise<ScanCounts> {
+  const root = libraryRoot.replace(/\/+$/, '');
+  const artists = new Map<string, ArtistIn>(); // name → row
+  const albums = new Map<string, AlbumIn>(); // id → row
+  const files: FileIn[] = [];
+  let skipped = 0;
+
+  for await (const { abs, rel } of walkAudio(root)) {
+    let title: string | undefined;
+    let trackArtist: string | undefined;
+    let albumName: string | undefined;
+    let albumArtist: string | undefined;
+    let trackNo: number | null = null;
+    let discNo: number | null = null;
+    let durationMs: number | null = null;
+    try {
+      const meta = await parseFile(abs);
+      // Garbage bytes resolve with an empty format (no container, no codec)
+      // rather than throwing — unrecognized audio is unreadable too.
+      if (
+        meta.format.container === undefined && meta.format.codec === undefined
+      ) {
+        throw new Error('unrecognized audio format');
+      }
+      title = meta.common.title?.trim() || undefined;
+      trackArtist = meta.common.artist?.trim() || undefined;
+      albumName = meta.common.album?.trim() || undefined;
+      // TPE2 (album artist) wins — household VA/OST rule; TPE1 is the track
+      // artist. Fallback: album-level artist = track artist.
+      albumArtist = meta.common.albumartist?.trim() || trackArtist;
+      trackNo = meta.common.track.no;
+      discNo = meta.common.disk.no;
+      if (meta.format.duration && meta.format.duration > 0) {
+        durationMs = Math.round(meta.format.duration * 1000);
+      }
+    } catch {
+      skipped++;
+      continue; // unreadable tags — skip the file, keep scanning
+    }
+    if (durationMs === null) durationMs = await ffprobeDurationMs(abs);
+
+    const stat = await Deno.stat(abs).catch(() => null);
+    const name = rel.split('/').pop()!.replace(/\.[^.]*$/, '');
+    let artistId: string | null = null;
+    if (trackArtist !== undefined) {
+      artistId = await stableId('artist', trackArtist);
+      artists.set(trackArtist, { id: artistId, name: trackArtist });
+    }
+    let albumId: string | null = null;
+    if (albumName !== undefined && albumArtist !== undefined) {
+      albumId = await stableId('album', `${albumArtist}\n${albumName}`);
+      const albumArtistId = await stableId('artist', albumArtist);
+      artists.set(albumArtist, { id: albumArtistId, name: albumArtist });
+      albums.set(albumId, { id: albumId, name: albumName, albumArtistId });
+    }
+    files.push({
+      id: await stableId('file', rel),
+      path: abs,
+      mtime: stat?.mtime?.getTime() ?? null,
+      size: stat?.size ?? null,
+      title: title ?? name,
+      albumId,
+      artistId,
+      track: trackNo,
+      disc: discNo,
+      durationMs,
+    });
+  }
+
+  // Rebuild catalog tables from disk; users/listens are never touched.
+  await db.conn.run('BEGIN TRANSACTION');
+  try {
+    await db.conn.run('DELETE FROM files');
+    await db.conn.run('DELETE FROM albums');
+    await db.conn.run('DELETE FROM artists');
+
+    const artistStmt = await db.conn.prepare(
+      'INSERT INTO artists (id, name) VALUES (?, ?)',
+    );
+    for (const artist of artists.values()) {
+      artistStmt.bindVarchar(1, artist.id);
+      artistStmt.bindVarchar(2, artist.name);
+      await artistStmt.run();
+    }
+    artistStmt.destroySync();
+
+    const albumStmt = await db.conn.prepare(
+      'INSERT INTO albums (id, name, album_artist_id) VALUES (?, ?, ?)',
+    );
+    for (const album of albums.values()) {
+      albumStmt.bindVarchar(1, album.id);
+      albumStmt.bindVarchar(2, album.name);
+      albumStmt.bindVarchar(3, album.albumArtistId);
+      await albumStmt.run();
+    }
+    albumStmt.destroySync();
+
+    const fileStmt = await db.conn.prepare(
+      `INSERT INTO files (id, path, mtime, size, title, album_id, artist_id,
+        track, disc, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const file of files) {
+      fileStmt.bindVarchar(1, file.id);
+      fileStmt.bindVarchar(2, file.path);
+      if (file.mtime === null) fileStmt.bindNull(3);
+      else fileStmt.bindBigInt(3, BigInt(file.mtime));
+      if (file.size === null) fileStmt.bindNull(4);
+      else fileStmt.bindBigInt(4, BigInt(file.size));
+      fileStmt.bindVarchar(5, file.title);
+      if (file.albumId === null) fileStmt.bindNull(6);
+      else fileStmt.bindVarchar(6, file.albumId);
+      if (file.artistId === null) fileStmt.bindNull(7);
+      else fileStmt.bindVarchar(7, file.artistId);
+      if (file.track === null) fileStmt.bindNull(8);
+      else fileStmt.bindInteger(8, file.track);
+      if (file.disc === null) fileStmt.bindNull(9);
+      else fileStmt.bindInteger(9, file.disc);
+      if (file.durationMs === null) fileStmt.bindNull(10);
+      else fileStmt.bindInteger(10, file.durationMs);
+      await fileStmt.run();
+    }
+    fileStmt.destroySync();
+
+    await db.conn.run('COMMIT');
+  } catch (err) {
+    await db.conn.run('ROLLBACK');
+    throw err;
+  }
+
+  return {
+    files: files.length,
+    skipped,
+    artists: artists.size,
+    albums: albums.size,
+  };
+}
