@@ -11,7 +11,10 @@ import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createBookmarks } from '../src/bookmarks.ts';
+import { createPlaylists } from '../src/playlists.ts';
 import { createStream } from '../src/stream.ts';
+import { createZip } from '../src/zip.ts';
+import { BlobReader, Uint8ArrayWriter, ZipReader } from '@zip-js/zip-js';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -38,7 +41,9 @@ async function setup() {
     user: createUserService(db, cfg),
     library: createLibrary(db),
     bookmarks: createBookmarks(db),
+    playlists: createPlaylists(db),
     stream: createStream(),
+    zip: createZip(),
   };
   const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
   const songIds = (await db.conn.runAndReadAll(
@@ -114,6 +119,86 @@ Deno.test('download serves the original bytes as an attachment', async () => {
 
     const bogus = await get(app, 'download', '&id=no-such-song');
     assertEquals((bogus.error as { code: number }).code, 70);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('download zips albums, artists, and playlists', async () => {
+  const { app, db, songIds, close } = await setup();
+  try {
+    const unzip = async (res: Response) => {
+      const blob = await res.blob();
+      const reader = new ZipReader(new BlobReader(blob));
+      const entries = await reader.getEntries();
+      const out: { name: string; bytes: Uint8Array }[] = [];
+      for (const entry of entries) {
+        if (entry.directory) continue;
+        out.push({
+          name: entry.filename,
+          bytes: await entry.getData(new Uint8ArrayWriter()),
+        });
+      }
+      await reader.close();
+      return out;
+    };
+
+    const albumId = (await db.conn.runAndReadAll(
+      "SELECT id FROM albums WHERE name = 'Fixture Album'",
+    )).getRowObjects() as { id: string }[];
+    const albumRes = await app(
+      new Request(`http://x/rest/download.view?${AUTH}&id=${albumId[0].id}`),
+    );
+    assertEquals(albumRes.status, 200);
+    assertEquals(albumRes.headers.get('content-type'), 'application/zip');
+    assertEquals(
+      albumRes.headers.get('content-disposition'),
+      'attachment; filename="Fixture Album.zip"',
+    );
+    const albumEntries = await unzip(albumRes);
+    assertEquals(
+      albumEntries.map((e) => e.name),
+      [
+        'Fixture Artist/Fixture Album/01 - First Song.mp3',
+        'Fixture Artist/Fixture Album/02 - Second Song.mp3',
+      ],
+    );
+    const original = await Deno.readFile(
+      `tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3`,
+    );
+    assertEquals(albumEntries[0].bytes, original);
+
+    const artistId = (await db.conn.runAndReadAll(
+      "SELECT id FROM artists WHERE name = 'Various Artists'",
+    )).getRowObjects() as { id: string }[];
+    const artistRes = await app(
+      new Request(`http://x/rest/download.view?${AUTH}&id=${artistId[0].id}`),
+    );
+    const artistEntries = await unzip(artistRes);
+    assertEquals(
+      artistEntries.map((e) => e.name),
+      ['Various Artists/Fixture OST/01 - Probe Performer - Theme.mp3'],
+    );
+
+    const created = await get(
+      app,
+      'createPlaylist',
+      `&name=dl&songId=${songIds[0].id}`,
+    );
+    const playlistId = (created.playlist as { id: string }).id;
+    const playlistRes = await app(
+      new Request(`http://x/rest/download.view?${AUTH}&id=${playlistId}`),
+    );
+    assertEquals(
+      playlistRes.headers.get('content-disposition'),
+      'attachment; filename="dl.zip"',
+    );
+    const playlistEntries = await unzip(playlistRes);
+    assertEquals(playlistEntries.length, 1);
+    assertEquals(
+      playlistEntries[0].name,
+      'Fixture Artist/Fixture Album/01 - First Song.mp3',
+    );
   } finally {
     await close();
   }

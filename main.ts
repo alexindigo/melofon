@@ -17,6 +17,7 @@ import { createClientQueue } from './src/clientqueue.ts';
 import { createBookmarks } from './src/bookmarks.ts';
 import { createNowPlaying } from './src/nowplaying.ts';
 import { createStream } from './src/stream.ts';
+import { createZip } from './src/zip.ts';
 import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
 import { facade } from './src/facade.ts';
@@ -47,6 +48,7 @@ const bag = {
   bookmarks: createBookmarks(db),
   nowPlaying: createNowPlaying(db),
   stream: createStream(),
+  zip: createZip(),
   artwork: createArtwork(library),
 };
 const layers = await loadLayers({ app: bag });

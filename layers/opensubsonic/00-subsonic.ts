@@ -191,6 +191,9 @@ export interface HatContext {
     stream: {
       file(request: Request, path: string): Promise<Response>;
     };
+    zip: {
+      archive(entries: { name: string; path: string }[]): Promise<Blob>;
+    };
     artwork: {
       cover(id: string): Promise<Response>;
       placeholder(): Response;
@@ -481,11 +484,15 @@ function albumV1Of(album: AlbumRow): Record<string, unknown> {
 
 // The wire `path` is relative to the song's own source root — the simulated
 // Navidrome tree ("Artist/Album/01 - Song.mp3"), never the absolute path.
-function childOf(song: SongRow): Record<string, unknown> {
+function relativePathOf(song: SongRow): string {
   const root = song.libraryPath;
-  const path = root !== null && song.path.startsWith(root)
+  return root !== null && song.path.startsWith(root)
     ? song.path.slice(root.length).replace(/^\/+/, '')
     : song.path;
+}
+
+function childOf(song: SongRow): Record<string, unknown> {
+  const path = relativePathOf(song);
   return {
     id: song.id,
     isDir: false,
@@ -620,6 +627,52 @@ async function entriesFor(
     }
   }
   return entries;
+}
+
+// Resolve an album / artist / playlist id to a zip entry list plus the
+// download filename (null when the id is none of those). Entry names are
+// the simulated tree paths; the filename is the entity's name, sanitized
+// for Content-Disposition.
+async function zipEntriesFor(
+  context: HatContext,
+  id: string,
+): Promise<
+  { entries: { name: string; path: string }[]; filename: string } | null
+> {
+  const sanitize = (name: string) =>
+    name.replaceAll('"', '').replaceAll(/[/\\]/g, '_');
+  const entriesOf = (songs: SongRow[]) =>
+    songs.map((song) => ({ name: relativePathOf(song), path: song.path }));
+
+  const album = await context.app.library.getAlbum(id);
+  if (album !== null) {
+    return {
+      entries: entriesOf(album.songs),
+      filename: sanitize(album.album.name),
+    };
+  }
+  const artist = await context.app.library.getArtist(id);
+  if (artist !== null) {
+    const songs: SongRow[] = [];
+    for (const a of await context.app.library.albumsByArtist(id)) {
+      const got = await context.app.library.getAlbum(a.id);
+      if (got !== null) songs.push(...got.songs);
+    }
+    return { entries: entriesOf(songs), filename: sanitize(artist.name) };
+  }
+  const playlist = await context.app.playlists.get(
+    context.state.user!.username,
+    id,
+  );
+  if (playlist !== null) {
+    const songs: SongRow[] = [];
+    for (const trackId of playlist.trackIds) {
+      const song = await context.app.library.getSong(trackId);
+      if (song !== null) songs.push(song);
+    }
+    return { entries: entriesOf(songs), filename: sanitize(playlist.name) };
+  }
+  return null;
 }
 
 function indexName(name: string): string {
@@ -898,20 +951,29 @@ const OPS: Record<string, OpHandler> = {
     return await context.app.stream.file(request._raw, path);
   },
 
-  // Song ids only in M3: Navidrome also accepts album/artist/playlist ids
-  // (zipped), but the household apps only download songs — zip can wait.
-  // Same bytes as stream, plus Content-Disposition so the client saves a
-  // file instead of playing it.
+  // Song id → the single file (unchanged). Album / artist / playlist id →
+  // a zip of its songs (Navidrome shape), entries named by the simulated
+  // tree path. Missing id → code 70.
   download: async (request, context) => {
     const id = requiredParam(context, 'id');
     if (id instanceof Response) return id;
     const path = await context.app.library.songPath(id);
-    if (path === null) return notFound(context);
-    const res = await context.app.stream.file(request._raw, path);
-    const name = (path.split('/').pop() ?? 'download').replaceAll('"', '');
-    const headers = new Headers(res.headers);
-    headers.set('content-disposition', `attachment; filename="${name}"`);
-    return new Response(res.body, { status: res.status, headers });
+    if (path !== null) {
+      const res = await context.app.stream.file(request._raw, path);
+      const name = (path.split('/').pop() ?? 'download').replaceAll('"', '');
+      const headers = new Headers(res.headers);
+      headers.set('content-disposition', `attachment; filename="${name}"`);
+      return new Response(res.body, { status: res.status, headers });
+    }
+    const named = await zipEntriesFor(context, id);
+    if (named === null) return notFound(context);
+    const blob = await context.app.zip.archive(named.entries);
+    return new Response(blob, {
+      headers: {
+        'content-type': 'application/zip',
+        'content-disposition': `attachment; filename="${named.filename}.zip"`,
+      },
+    });
   },
 
   // Embedded (USLT) lyrics only — no external agent. Empty lyrics element

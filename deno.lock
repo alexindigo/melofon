@@ -18,6 +18,7 @@
     "jsr:@std/path@^1.1.3": "1.1.6",
     "jsr:@std/path@^1.1.6": "1.1.6",
     "jsr:@std/streams@^1.1.2": "1.1.2",
+    "jsr:@zip-js/zip-js@2": "2.8.57",
     "npm:@duckdb/node-api@1.5.5-r.5": "1.5.5-r.5",
     "npm:music-metadata@11": "11.15.0"
   },
@@ -83,6 +84,9 @@
     },
     "@std/streams@1.1.2": {
       "integrity": "0249bf9b78a999f57032ca4d8e7ccaa57579090242640b35ddc948fbb745d3af"
+    },
+    "@zip-js/zip-js@2.8.57": {
+      "integrity": "b47584b43bc629eeee4b57ac4301ac01afb42347d1dd6c3499de7ea33762bb9b"
     }
   },
   "npm": {
@@ -233,6 +237,7 @@
       "jsr:@std/assert@1",
       "jsr:@std/encoding@^1.0.11",
       "jsr:@std/http@1",
+      "jsr:@zip-js/zip-js@2",
       "npm:@duckdb/node-api@1.5.5-r.5",
       "npm:music-metadata@11"
     ]
