@@ -1,0 +1,4 @@
+.envrc
+.env
+data/
+node_modules/

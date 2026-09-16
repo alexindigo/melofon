@@ -1,0 +1,24 @@
+{
+  "name": "melofon",
+  "description": "Household music server: library + HTTP streamer + speaker control",
+  "license": "AGPL-3.0-or-later",
+  "tasks": {
+    "check": "deno fmt --check && deno lint && deno check main.ts src/config.ts src/db.ts src/users.ts src/layers.ts src/facade.ts layers/ui/health/get.ts tests/*.ts",
+    "fmt": "deno fmt",
+    "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --node-modules-dir=auto --watch main.ts",
+    "start": "deno --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --node-modules-dir=auto main.ts",
+    "test": "deno test --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --node-modules-dir=auto tests/*.ts"
+  },
+  "imports": {
+    "@duckdb/node-api": "npm:@duckdb/node-api@1.5.5-r.5",
+    "@pathfinder/pathfinder": "jsr:@pathfinder/pathfinder@0.2.2",
+    "@std/assert": "jsr:@std/assert@1"
+  },
+  "nodeModulesDir": "auto",
+  "fmt": {
+    "options": {
+      "singleQuote": true,
+      "proseWrap": "preserve"
+    }
+  }
+}
