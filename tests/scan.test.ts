@@ -77,6 +77,58 @@ Deno.test('rescan keeps users and stable IDs', async () => {
   }
 });
 
+Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_queues)', async () => {
+  const { db, close } = await setup();
+  try {
+    await scanLibrary(db, FIXTURE_LIBRARY);
+    await db.conn.run(
+      "INSERT INTO listens (user_id, track_id, played_at, duration_ms, source) VALUES ('u1', 't1', now(), 1000, 'opensubsonic')",
+    );
+    await db.conn.run(
+      "INSERT INTO stars (user_id, target_id, target_type, starred_at) VALUES ('u1', 't1', 'song', now())",
+    );
+    await db.conn.run(
+      "INSERT INTO ratings (user_id, target_id, rating) VALUES ('u1', 't1', 5)",
+    );
+    await db.conn.run(
+      "INSERT INTO playlists (id, user_id, name, created_at, changed_at) VALUES ('p1', 'u1', 'Mix', now(), now())",
+    );
+    await db.conn.run(
+      "INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES ('p1', 0, 't1')",
+    );
+    await db.conn.run(
+      "INSERT INTO play_queues (user_id, current_id, position_ms, changed_at, track_ids) VALUES ('u1', 't1', 0, now(), ['t1'])",
+    );
+
+    await scanLibrary(db, FIXTURE_LIBRARY);
+
+    const res = await db.conn.runAndReadAll(
+      `SELECT
+        (SELECT count(*) FROM listens) AS listens,
+        (SELECT count(*) FROM stars) AS stars,
+        (SELECT count(*) FROM ratings) AS ratings,
+        (SELECT count(*) FROM playlists) AS playlists,
+        (SELECT count(*) FROM playlist_tracks) AS playlist_tracks,
+        (SELECT count(*) FROM play_queues) AS play_queues`,
+    );
+    const row = res.getRowObjects()[0] as Record<string, bigint | number>;
+    for (
+      const table of [
+        'listens',
+        'stars',
+        'ratings',
+        'playlists',
+        'playlist_tracks',
+        'play_queues',
+      ]
+    ) {
+      assertEquals(Number(row[table]), 1, `${table} lost rows on rescan`);
+    }
+  } finally {
+    await close();
+  }
+});
+
 Deno.test('library.listArtists returns album artists with album counts', async () => {
   const { db, close } = await setup();
   try {

@@ -28,6 +28,20 @@ Deno.test('openDb creates melofon.duckdb with the M0 tables', async () => {
   }
 });
 
+Deno.test('openDb creates the M2 user-state tables', async () => {
+  const dir = await tmpdir();
+  const db = await openDb(dir);
+  try {
+    const res = await db.conn.runAndReadAll(
+      "SELECT table_name FROM information_schema.tables WHERE table_name IN ('listens', 'stars', 'ratings', 'playlists', 'playlist_tracks', 'play_queues')",
+    );
+    assertEquals(res.getRowObjects().length, 6);
+  } finally {
+    db.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('seedFirstUser inserts one row with an encrypted password', async () => {
   const dir = await tmpdir();
   const db = await openDb(dir);

@@ -1,5 +1,8 @@
--- users + empty catalog tables. listens / stars / playlists wait for M2.
+-- users + catalog tables + M2 user-state tables. The scan rebuilds only the
+-- catalog (files/albums/artists). User state is keep-on-rescan.
 -- No play_count column anywhere: stats are GROUP BY at read time.
+-- NB: db.ts splits this file on the semicolon character, so comments must
+-- never contain one.
 CREATE TABLE IF NOT EXISTS users (
   id VARCHAR PRIMARY KEY,
   name VARCHAR UNIQUE NOT NULL,
@@ -26,4 +29,47 @@ CREATE TABLE IF NOT EXISTS files (
   track INTEGER,
   disc INTEGER,
   duration_ms INTEGER
+);
+
+-- M2 user state (keep-on-rescan: scan never deletes from these).
+CREATE TABLE IF NOT EXISTS listens (
+  user_id VARCHAR NOT NULL,
+  track_id VARCHAR NOT NULL,
+  played_at TIMESTAMPTZ NOT NULL,
+  duration_ms INTEGER,
+  source VARCHAR NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stars (
+  user_id VARCHAR NOT NULL,
+  target_id VARCHAR NOT NULL,
+  target_type VARCHAR NOT NULL,
+  starred_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, target_id, target_type)
+);
+CREATE TABLE IF NOT EXISTS ratings (
+  user_id VARCHAR NOT NULL,
+  target_id VARCHAR NOT NULL,
+  rating INTEGER NOT NULL,
+  PRIMARY KEY (user_id, target_id)
+);
+CREATE TABLE IF NOT EXISTS playlists (
+  id VARCHAR PRIMARY KEY,
+  user_id VARCHAR NOT NULL,
+  name VARCHAR NOT NULL,
+  comment VARCHAR,
+  created_at TIMESTAMPTZ NOT NULL,
+  changed_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+  playlist_id VARCHAR NOT NULL,
+  position INTEGER NOT NULL,
+  track_id VARCHAR NOT NULL,
+  PRIMARY KEY (playlist_id, position)
+);
+CREATE TABLE IF NOT EXISTS play_queues (
+  user_id VARCHAR PRIMARY KEY,
+  current_id VARCHAR,
+  position_ms INTEGER,
+  changed_at TIMESTAMPTZ NOT NULL,
+  track_ids VARCHAR[] NOT NULL
 );
