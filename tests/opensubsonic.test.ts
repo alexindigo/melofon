@@ -81,7 +81,11 @@ Deno.test('ping defaults to the XML envelope', async () => {
     assert(res.headers.get('content-type')?.startsWith('application/xml'));
     const text = await res.text();
     assert(text.startsWith('<?xml version="1.0" encoding="UTF-8"?>'));
-    assert(text.includes('<subsonic-response status="ok"'));
+    assert(
+      text.includes(
+        '<subsonic-response xmlns="http://subsonic.org/restapi" status="ok"',
+      ),
+    );
     assert(text.includes('type="melofon"'));
     assert(text.includes('openSubsonic="true"'));
   } finally {

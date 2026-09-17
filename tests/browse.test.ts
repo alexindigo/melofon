@@ -81,6 +81,10 @@ Deno.test('getArtists returns the ID3 index of album artists', async () => {
 
     const xml = await app(new Request(`http://x/rest/getArtists.view?${AUTH}`));
     const text = await xml.text();
+    // The envelope carries the Subsonic namespace (strict parsers need it).
+    assert(
+      text.includes('<subsonic-response xmlns="http://subsonic.org/restapi"'),
+    );
     assert(text.includes('<artists ignoredArticles='));
     assert(text.includes('<index name="F">'));
     assert(text.includes('name="Fixture Artist" albumCount="1"'));

@@ -413,8 +413,13 @@ function render(
   if (f === 'json') {
     return Response.json({ 'subsonic-response': envelope }, { status });
   }
+  // The XML envelope carries the Subsonic namespace (Navidrome/Subsonic
+  // always send it; strict namespace-aware parsers find nothing without it).
   const xml = `<?xml version="1.0" encoding="UTF-8"?>\n${
-    xmlElement('subsonic-response', envelope)
+    xmlElement('subsonic-response', {
+      xmlns: 'http://subsonic.org/restapi',
+      ...envelope,
+    })
   }`;
   return new Response(xml, {
     status,

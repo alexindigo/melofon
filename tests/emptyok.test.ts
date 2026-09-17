@@ -52,7 +52,8 @@ async function setup() {
 }
 
 const XML_HEAD = '<?xml version="1.0" encoding="UTF-8"?>\n' +
-  '<subsonic-response status="ok" version="1.16.1" type="melofon" ' +
+  '<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" ' +
+  'version="1.16.1" type="melofon" ' +
   'serverVersion="0.0.0-test" openSubsonic="true">';
 
 // op → [JSON payload, XML element]
