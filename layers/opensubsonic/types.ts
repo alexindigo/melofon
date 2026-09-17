@@ -162,6 +162,7 @@ export interface HatContext {
           trackIds: string[];
           currentId?: string;
           positionMs?: number;
+          changedBy?: string;
         },
       ): Promise<void>;
     };
@@ -283,6 +284,8 @@ export interface PlayQueueRow {
   currentId: string | null;
   positionMs: number | null;
   changedAtMs: number;
+  /** Name of the client that saved the queue (null on pre-M4.5 rows). */
+  changedBy: string | null;
 }
 
 export interface ScanStatusRow {

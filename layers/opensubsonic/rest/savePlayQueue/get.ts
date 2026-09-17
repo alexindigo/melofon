@@ -12,6 +12,7 @@ export default async (_request: HatRequest, context: HatContext) => {
     positionMs: Number.isFinite(position) && position >= 0
       ? position
       : undefined,
+    changedBy: params.get('c') ?? undefined,
   });
   return ok(context, {});
 };

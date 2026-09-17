@@ -22,7 +22,9 @@ interface PlayQueuePayload {
   entry: { id: string }[];
   current?: string;
   position?: number;
+  username: string;
   changed?: string;
+  changedBy: string;
 }
 
 async function setup() {
@@ -108,7 +110,11 @@ Deno.test('savePlayQueue then getPlayQueue round-trips the queue', async () => {
     assertEquals(queue.entry.map((s) => s.id), [a, b, c]);
     assertEquals(queue.current, b); // Navidrome quirk: a string
     assertEquals(queue.position, 42000);
+    // Required by the OpenSubsonic schema.
+    assertEquals(queue.username, 'admin');
     assertEquals(typeof queue.changed, 'string');
+    // The saving client's name (the `c` param), Navidrome-style.
+    assertEquals(queue.changedBy, 'melofon-test');
   } finally {
     await close();
   }

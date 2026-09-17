@@ -9,6 +9,8 @@ export interface PlayQueueRow {
   currentId: string | null;
   positionMs: number | null;
   changedAtMs: number;
+  /** Name of the client that saved the queue (null on pre-M4.5 rows). */
+  changedBy: string | null;
 }
 
 export interface ClientQueue {
@@ -19,6 +21,7 @@ export interface ClientQueue {
       trackIds: string[];
       currentId?: string;
       positionMs?: number;
+      changedBy?: string;
     },
   ): Promise<void>;
 }
@@ -34,7 +37,8 @@ export function createClientQueue(db: Db): ClientQueue {
       if (userId === null) throw new Error(`unknown user: ${username}`);
       const res = await db.conn.runAndReadAll(
         `SELECT current_id, position_ms,
-                epoch_ms(changed_at)::BIGINT AS changed_ms, track_ids
+                epoch_ms(changed_at)::BIGINT AS changed_ms, track_ids,
+                changed_by
          FROM play_queues WHERE user_id = ${esc(userId)}`,
       );
       const row = (res.getRowObjects() as {
@@ -42,6 +46,7 @@ export function createClientQueue(db: Db): ClientQueue {
         position_ms: number | bigint | null;
         changed_ms: bigint | number;
         track_ids: { items: string[] };
+        changed_by: string | null;
       }[])[0];
       if (!row) return null;
       return {
@@ -49,6 +54,7 @@ export function createClientQueue(db: Db): ClientQueue {
         currentId: row.current_id,
         positionMs: row.position_ms === null ? null : Number(row.position_ms),
         changedAtMs: Number(row.changed_ms),
+        changedBy: row.changed_by,
       };
     },
 
@@ -61,16 +67,22 @@ export function createClientQueue(db: Db): ClientQueue {
       const position = queue.positionMs === undefined
         ? 'NULL'
         : String(Math.trunc(queue.positionMs));
+      const changedBy = queue.changedBy === undefined
+        ? 'NULL'
+        : esc(queue.changedBy);
       const trackIds = `[${queue.trackIds.map(esc).join(', ')}]`;
       await db.conn.run(
         `INSERT INTO play_queues
-           (user_id, current_id, position_ms, changed_at, track_ids)
-         VALUES (${esc(userId)}, ${current}, ${position}, now(), ${trackIds})
+           (user_id, current_id, position_ms, changed_at, track_ids,
+            changed_by)
+         VALUES (${esc(userId)}, ${current}, ${position}, now(), ${trackIds},
+                 ${changedBy})
          ON CONFLICT (user_id) DO UPDATE SET
            current_id = excluded.current_id,
            position_ms = excluded.position_ms,
            changed_at = excluded.changed_at,
-           track_ids = excluded.track_ids`,
+           track_ids = excluded.track_ids,
+           changed_by = excluded.changed_by`,
       );
     },
   };

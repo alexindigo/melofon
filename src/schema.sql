@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS play_queues (
   changed_at TIMESTAMPTZ NOT NULL,
   track_ids VARCHAR[] NOT NULL
 );
+-- M4.5: the saving client's name (the Subsonic `c` param), for the required
+-- PlayQueue.changedBy wire field. NULL on rows saved before M4.5.
+ALTER TABLE play_queues ADD COLUMN IF NOT EXISTS changed_by VARCHAR;
 -- M3: per-user playback-position bookmarks (keep-on-rescan).
 CREATE TABLE IF NOT EXISTS bookmarks (
   user_id VARCHAR NOT NULL,
