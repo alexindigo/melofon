@@ -525,7 +525,10 @@ function childOf(song: SongRow): Record<string, unknown> {
     path,
     albumId: song.albumId ?? undefined,
     artistId: song.artistId ?? undefined,
-    type: 'music',
+    // GenericMediaType enum: music | video | podcast | audiobook. Videos say
+    // video (spec enum) — audio clients that never browse getVideos still
+    // stream the same id as audio via ExtractAudio.
+    type: song.isVideo ? 'video' : 'music',
     isVideo: song.isVideo,
   };
 }

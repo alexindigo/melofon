@@ -86,6 +86,7 @@ Deno.test('getVideos lists the fixture video as a Child with isVideo', async () 
     const clip = videos[0];
     assertEquals(clip.title, 'Clip');
     assertEquals(clip.isVideo, true);
+    assertEquals(clip.type, 'video');
     assertEquals(clip.isDir, false);
     assertEquals(clip.album, 'Fixture Album');
     assertEquals(clip.artist, 'Fixture Artist');
