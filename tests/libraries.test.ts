@@ -182,18 +182,26 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
     };
 
     const folders = await get('getMusicFolders');
+    // Folder ids are spec ints on the wire; storage hashes stay server-side.
     const musicFolder = (
-      folders.musicFolders as { musicFolder: { id: string; name: string }[] }
+      folders.musicFolders as { musicFolder: { id: number; name: string }[] }
     ).musicFolder;
-    assertEquals(musicFolder, [
-      { id: a.id, name: 'A root' },
-      { id: b.id, name: 'B root' },
-    ]);
+    assertEquals(
+      musicFolder.map((f) => [f.name, typeof f.id]),
+      [
+        ['A root', 'number'],
+        ['B root', 'number'],
+      ],
+    );
 
-    // getUser.folder carries the same real source ids (never a synthetic 0).
+    // getUser.folder carries the same wire ids (never a synthetic 0).
     const user = await get('getUser');
-    const folder = (user.user as { folder: string[] }).folder;
-    assertEquals([...folder].sort(), [a.id, b.id].sort());
+    const folder = (user.user as { folder: number[] }).folder;
+    const byNum = (x: number, y: number) => x - y;
+    assertEquals(
+      [...folder].sort(byNum),
+      musicFolder.map((f) => f.id).sort(byNum),
+    );
 
     const artistNames = (body: Record<string, unknown>) => {
       const artists = body.artists as {
@@ -201,10 +209,16 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
       };
       return artists.index.flatMap((i) => i.artist.map((a) => a.name));
     };
-    const onlyA = await get('getArtists', `&musicFolderId=${a.id}`);
+    const idA = musicFolder.find((f) => f.name === 'A root')!.id;
+    const idB = musicFolder.find((f) => f.name === 'B root')!.id;
+    // The wire int round-trips back to the right source.
+    const onlyA = await get('getArtists', `&musicFolderId=${idA}`);
     assertEquals(artistNames(onlyA), ['Fixture Artist']);
-    const onlyB = await get('getArtists', `&musicFolderId=${b.id}`);
+    const onlyB = await get('getArtists', `&musicFolderId=${idB}`);
     assertEquals(artistNames(onlyB), ['Various Artists']);
+    // Stale-client grace: a raw storage hash still filters.
+    const byHash = await get('getArtists', `&musicFolderId=${a.id}`);
+    assertEquals(artistNames(byHash), ['Fixture Artist']);
     const combined = await get('getArtists');
     assertEquals(artistNames(combined), ['Fixture Artist', 'Various Artists']);
   } finally {

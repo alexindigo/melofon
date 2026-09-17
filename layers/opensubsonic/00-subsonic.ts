@@ -542,6 +542,27 @@ function intParam(
   return value;
 }
 
+// The spec types musicFolder.id and user.folder as int (OpenSubsonic type
+// tables); melofon's storage ids are stable content hashes. The hat maps
+// deterministically at the wire boundary: the same int in getMusicFolders,
+// getUser.folder, and accepted back in musicFolderId. Deriving from the hash
+// (not list position) keeps wire ids stable across source add/remove.
+function folderWireId(id: string): number {
+  return Number(BigInt(`0x${id.slice(0, 8)}`) & 0x7fffffffn);
+}
+
+// musicFolderId arrives as the wire int; resolve to the storage hash. A
+// non-integer value passes through unchanged (a stale client holding a hash);
+// an unmatched int stays unmatched (empty results, Navidrome-like).
+async function folderIdParam(context: HatContext): Promise<string | undefined> {
+  const raw = context.state.params!.get('musicFolderId');
+  if (raw === null || raw === '') return undefined;
+  if (!/^\d+$/.test(raw)) return raw;
+  const n = Number(raw);
+  const folders = await context.app.libraries.list();
+  return (folders.find((f) => folderWireId(f.id) === n) ?? { id: raw }).id;
+}
+
 // getAlbumList/getAlbumList2 share the type table. Every documented type is
 // implemented; unknown types get the same clean "not implemented" envelope.
 const ALBUM_LIST_SORTS: Record<
@@ -583,7 +604,7 @@ async function albumListAlbums(
     sort,
     size: intParam(params, 'size', 10),
     offset: intParam(params, 'offset', 0),
-    folderId: params.get('musicFolderId') ?? undefined,
+    folderId: await folderIdParam(context),
     username: context.state.user!.username,
   };
   if (sort === 'genre') {
@@ -741,7 +762,10 @@ const OPS: Record<string, OpHandler> = {
     const folders = await context.app.libraries.list();
     return {
       musicFolders: {
-        musicFolder: folders.map((f) => ({ id: f.id, name: f.name })),
+        musicFolder: folders.map((f) => ({
+          id: folderWireId(f.id),
+          name: f.name,
+        })),
       },
     };
   },
@@ -750,7 +774,7 @@ const OPS: Record<string, OpHandler> = {
   }),
 
   getArtists: async (_request, context) => {
-    const folderId = context.state.params!.get('musicFolderId') ?? undefined;
+    const folderId = await folderIdParam(context);
     const artists = await context.app.library.listArtists(folderId);
     const byIndex = new Map<string, Record<string, unknown>[]>();
     for (const artist of artists) {
@@ -778,7 +802,7 @@ const OPS: Record<string, OpHandler> = {
   // in the tree (no Album dir to hang them under) — they stay reachable via
   // search3/getSong/stream. No shortcuts, no top-level child elements.
   getIndexes: async (_request, context) => {
-    const folderId = context.state.params!.get('musicFolderId') ?? undefined;
+    const folderId = await folderIdParam(context);
     const artists = await context.app.library.listArtists(folderId);
     const byIndex = new Map<string, Record<string, unknown>[]>();
     for (const artist of artists) {
@@ -901,7 +925,7 @@ const OPS: Record<string, OpHandler> = {
       albumOffset: intParam(params, 'albumOffset', 0),
       songCount: intParam(params, 'songCount', 20),
       songOffset: intParam(params, 'songOffset', 0),
-      folderId: params.get('musicFolderId') ?? undefined,
+      folderId: await folderIdParam(context),
     });
     return {
       searchResult3: {
@@ -923,7 +947,7 @@ const OPS: Record<string, OpHandler> = {
       albumOffset: intParam(params, 'albumOffset', 0),
       songCount: intParam(params, 'songCount', 20),
       songOffset: intParam(params, 'songOffset', 0),
-      folderId: params.get('musicFolderId') ?? undefined,
+      folderId: await folderIdParam(context),
     });
     return {
       searchResult2: {
@@ -954,7 +978,7 @@ const OPS: Record<string, OpHandler> = {
     const songs = await context.app.library.songsByGenre(genre, {
       size: intParam(params, 'count', 10),
       offset: intParam(params, 'offset', 0),
-      folderId: params.get('musicFolderId') ?? undefined,
+      folderId: await folderIdParam(context),
     });
     return { songsByGenre: { song: songs.map(childOf) } };
   },
@@ -1206,9 +1230,9 @@ const OPS: Record<string, OpHandler> = {
   getAvatar: (_request, context) => context.app.artwork.placeholder(),
 
   // Navidrome quirk: the authenticated user, not a directory lookup.
-  // folder is the real source ids (same strings as getMusicFolders) — every
-  // user gets every source until per-user access exists; empty sources →
-  // empty folder, never a synthetic 0.
+  // folder is the wire ints of every source (same values as getMusicFolders)
+  // — every user gets every source until per-user access exists; empty
+  // sources → empty folder, never a synthetic 0.
   getUser: async (_request, context) => {
     const folders = await context.app.libraries.list();
     return {
@@ -1227,7 +1251,7 @@ const OPS: Record<string, OpHandler> = {
         jukeboxRole: false,
         shareRole: false,
         videoConversionRole: false,
-        folder: folders.map((f) => f.id),
+        folder: folders.map((f) => folderWireId(f.id)),
       },
     };
   },
@@ -1268,7 +1292,7 @@ const OPS: Record<string, OpHandler> = {
     const params = context.state.params!;
     const songs = await context.app.library.randomSongs(
       intParam(params, 'size', 10),
-      params.get('musicFolderId') ?? undefined,
+      await folderIdParam(context),
     );
     return {
       randomSongs: {

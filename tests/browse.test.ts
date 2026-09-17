@@ -237,11 +237,12 @@ Deno.test('getMusicFolders and getOpenSubsonicExtensions answer Feishin probes',
   try {
     const folders = await get(app, 'getMusicFolders');
     const musicFolder = (
-      folders.musicFolders as { musicFolder: { id: string; name: string }[] }
+      folders.musicFolders as { musicFolder: { id: number; name: string }[] }
     ).musicFolder;
     assertEquals(musicFolder.length, 1);
     assertEquals(musicFolder[0].name, 'Music');
-    assert(/^[0-9a-f]{32}$/.test(musicFolder[0].id));
+    // Folder ids are spec ints on the wire (storage hashes never leave core).
+    assertEquals(typeof musicFolder[0].id, 'number');
     const extensions = await get(app, 'getOpenSubsonicExtensions');
     assertEquals(
       (extensions.openSubsonicExtensions as {

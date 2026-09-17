@@ -313,10 +313,11 @@ Deno.test('getUser returns the authenticated user', async () => {
     };
     assertEquals(user.username, 'admin');
     assertEquals(user.playlistRole, true);
-    // folder is the real source ids (one in this setup), never [0].
+    // folder carries the wire ints of the real sources (one in this setup),
+    // never [0] — spec types folder as an array of int.
     assert(Array.isArray(user.folder));
     assertEquals((user.folder as unknown[]).length, 1);
-    assertEquals(typeof (user.folder as string[])[0], 'string');
+    assertEquals(typeof (user.folder as number[])[0], 'number');
   } finally {
     await close();
   }
