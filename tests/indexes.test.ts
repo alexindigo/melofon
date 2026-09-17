@@ -6,7 +6,7 @@ import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
 import { seedFirstUser } from '../src/users.ts';
-import { scanLibrary } from '../src/scan.ts';
+import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
@@ -29,10 +29,12 @@ async function setup() {
   await seedFirstUser(db, cfg);
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
-  await scanLibrary(db);
+  const scan = createScan(db);
+  await scan.run();
   const bag = {
     cfg,
     libraries,
+    scan,
     user: createUserService(db, cfg),
     library: createLibrary(db),
   };
@@ -69,9 +71,13 @@ Deno.test('getIndexes buckets album artists; musicFolderId filters', async () =>
     const body = await get(app, 'getIndexes');
     const indexes = body.indexes as {
       ignoredArticles: string;
+      lastModified: number;
       index: { name: string; artist: { id: string; name: string }[] }[];
     };
     assertEquals(typeof indexes.ignoredArticles, 'string');
+    // Required by the OpenSubsonic schema: epoch ms of the last scan.
+    assertEquals(typeof indexes.lastModified, 'number');
+    assert(indexes.lastModified > 0);
     assertEquals(
       indexes.index.map((i) => [i.name, i.artist.map((a) => a.name)]),
       [['F', ['Fixture Artist']], ['V', ['Various Artists']]],

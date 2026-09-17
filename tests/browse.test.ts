@@ -136,6 +136,7 @@ Deno.test('getAlbum returns the album with ordered child songs', async () => {
       coverArt: string;
       songCount: number;
       duration: number;
+      created: string;
       song: Record<string, unknown>[];
     };
     assertEquals(album.name, 'Fixture Album');
@@ -143,6 +144,10 @@ Deno.test('getAlbum returns the album with ordered child songs', async () => {
     assertEquals(album.coverArt, albumId);
     assertEquals(album.songCount, 3);
     assert(album.duration >= 2);
+    // Required by the OpenSubsonic schema: ISO 8601 "date the album was
+    // added" (derived from the newest file mtime).
+    assertEquals(typeof album.created, 'string');
+    assert(album.created.endsWith('Z'));
     assertEquals(album.song.map((s) => [s.track, s.title]), [
       [1, 'First Song'],
       [2, 'Second Song'],

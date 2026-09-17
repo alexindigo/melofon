@@ -21,6 +21,10 @@ export interface AlbumRow {
   durationMs: number;
   /** Newest song year on the album (null when no song carries a year). */
   year: number | null;
+  /** Newest file mtime on the album — the wire's AlbumID3.created ("date the
+   * album was added"; the catalog rebuild makes a row-creation time
+   * meaningless). Null only when the album has no files. */
+  createdAtMs: number | null;
 }
 
 export interface SongRow {
@@ -223,6 +227,7 @@ interface AlbumSqlRow {
   song_count: number | bigint;
   duration_ms: number | bigint | null;
   year: number | bigint | null;
+  created_ms: number | bigint | null;
 }
 
 function albumOf(row: AlbumSqlRow): AlbumRow {
@@ -234,6 +239,7 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
     songCount: Number(row.song_count),
     durationMs: Number(row.duration_ms ?? 0),
     year: num(row.year),
+    createdAtMs: num(row.created_ms),
   };
 }
 
@@ -291,7 +297,7 @@ function albumSelect(q: AlbumQuery = {}): string {
   return `
   SELECT al.id, al.name, al.album_artist_id, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
-         MAX(f.year) AS year
+         MAX(f.year) AS year, MAX(f.mtime) AS created_ms
   FROM albums al
   JOIN artists ar ON ar.id = al.album_artist_id
   LEFT JOIN files f ON f.album_id = al.id

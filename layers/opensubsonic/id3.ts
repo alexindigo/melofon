@@ -35,6 +35,12 @@ export function albumId3Of(album: AlbumRow): Record<string, unknown> {
     coverArt: album.id, // getCoverArt resolves album IDs
     songCount: album.songCount,
     duration: Math.round(album.durationMs / 1000),
+    // Required by the OpenSubsonic schema: "date the album was added" — the
+    // newest file mtime stands in for it (the catalog rebuild makes a
+    // row-creation time meaningless).
+    created: album.createdAtMs === null
+      ? undefined
+      : new Date(album.createdAtMs).toISOString(),
     year: album.year ?? undefined,
   };
 }

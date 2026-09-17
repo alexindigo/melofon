@@ -227,6 +227,8 @@ export interface AlbumRow {
   songCount: number;
   durationMs: number;
   year: number | null;
+  /** Newest file mtime on the album (null only when it has no files). */
+  createdAtMs: number | null;
 }
 
 export interface SongRow {

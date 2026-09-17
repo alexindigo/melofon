@@ -24,9 +24,13 @@ export default async (_request: HatRequest, context: HatContext) => {
   const names = [...byIndex.keys()].sort((a, b) =>
     a === '#' ? -1 : b === '#' ? 1 : a.localeCompare(b)
   );
+  // Required by the OpenSubsonic schema: last time the index was modified,
+  // epoch milliseconds (Navidrome answers the last scan time too).
+  const scan = await context.app.scan.status();
   return ok(context, {
     indexes: {
       ignoredArticles: IGNORED_ARTICLES,
+      lastModified: scan.lastScanMs ?? 0,
       index: names.map((name) => ({ name, artist: byIndex.get(name)! })),
     },
   });
