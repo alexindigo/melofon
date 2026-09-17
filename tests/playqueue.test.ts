@@ -13,6 +13,8 @@ import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createClientQueue } from '../src/clientqueue.ts';
+import { loadLayers } from '../src/layers.ts';
+import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -48,7 +50,8 @@ async function setup() {
     playlists: createPlaylists(db),
     clientQueue: createClientQueue(db),
   };
-  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const app = facade(core, await loadLayers({ app: bag }));
   const songs = await db.conn.runAndReadAll(
     "SELECT id FROM files WHERE title != '' ORDER BY path",
   );

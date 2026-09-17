@@ -16,6 +16,8 @@ import { createStream } from '../src/stream.ts';
 import { createMedia } from '../src/media.ts';
 import { createZip } from '../src/zip.ts';
 import { BlobReader, Uint8ArrayWriter, ZipReader } from '@zip-js/zip-js';
+import { loadLayers } from '../src/layers.ts';
+import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -46,7 +48,8 @@ async function setup() {
     stream: createStream(createMedia()),
     zip: createZip(),
   };
-  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const app = facade(core, await loadLayers({ app: bag }));
   const songIds = (await db.conn.runAndReadAll(
     "SELECT id, title FROM files WHERE title = 'First Song'",
   )).getRowObjects() as { id: string; title: string }[];

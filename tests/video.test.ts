@@ -23,6 +23,8 @@ import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createStream } from '../src/stream.ts';
 import { createMedia } from '../src/media.ts';
+import { loadLayers } from '../src/layers.ts';
+import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -49,7 +51,8 @@ async function setup() {
     library,
     stream: createStream(createMedia()),
   };
-  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const app = facade(core, await loadLayers({ app: bag }));
   return {
     db,
     dir,

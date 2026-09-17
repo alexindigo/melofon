@@ -1,8 +1,12 @@
 // src/facade.ts — one HTTP entry point over core + N layers. The grammar:
-//   1. /_<name>/… → that layer's tree, prefix stripped. /_/ = no layer =
-//      core's own tree (core/, never globbed, named by core).
-//   2. Each layer's lookup(method, path): one hit → that app; several → first
-//      whose manifest headers match; none → bare 404 from core.
+//   1. /_<name>/… → that layer, prefix stripped, then mount rules below.
+//      /_/ = no layer = core's own tree (core/, never globbed, named by core).
+//   2. Each layer's mounts: a path that is a mount's prefix or prefix/… is
+//      claimed by that mount and the app sees the path relative to it
+//      (/rest/ping → /ping; /restping is NOT the /rest mount). A path no
+//      prefix matches falls back to a direct lookup in each mount app.
+//   3. Lookup across candidates: one hit → that app; several → first whose
+//      manifest headers match; none → bare 404 from core.
 // A layer's routes are 100% the layer's responsibility — core never lends,
 // pins, or backstops a route for any layer, and has no opinion on /_status
 // (pathfinder's per-hat Layer 0, in that hat's own format).
@@ -17,6 +21,37 @@ function headersMatch(request: Request, layer: Layer): boolean {
     layer.headers.every((h) =>
       request.headers.get(h.name)?.includes(h.includes) ?? false
     );
+}
+
+// The mount a path belongs to, plus the path relative to it. Prefix claim
+// first (/rest/ping → /ping); a bare remainder no prefix matches falls back
+// to a lookup in each mount app, so /_opensubsonic/ping works too.
+function layerDispatch(
+  layer: Layer,
+  method: string,
+  path: string,
+): { app: PathfinderApp; path: string } | null {
+  for (const mount of layer.mounts) {
+    if (
+      mount.prefix !== '' &&
+      (path === mount.prefix || path.startsWith(`${mount.prefix}/`))
+    ) {
+      return { app: mount.app, path: path.slice(mount.prefix.length) || '/' };
+    }
+  }
+  for (const mount of layer.mounts) {
+    if (mount.app.lookup(method, path).kind === 'match') {
+      return { app: mount.app, path };
+    }
+  }
+  return null;
+}
+
+// Re-path the request, keeping the query string (credentials ride it).
+function repath(request: Request, path: string): Request {
+  const url = new URL(request.url);
+  url.pathname = path;
+  return new Request(url, request);
 }
 
 export function facade(
@@ -80,34 +115,44 @@ export function facade(
     // /_/ — the "no layer" prefix: core's own tree.
     if (path === '/_' || path.startsWith('/_/')) {
       const rest = path.slice(2) || '/';
-      return await respond(coreApp(
-        new Request(new URL(rest, request.url), request),
-        info,
-      ));
+      return await respond(coreApp(repath(request, rest), info));
     }
 
-    // Force prefix: /_<name> strip → that layer.
+    // Force prefix: /_<name> strip → that layer, then mount rules.
     for (const layer of candidates) {
       const prefix = `/_${layer.name}`;
       if (path === prefix || path.startsWith(`${prefix}/`)) {
         const rest = path.slice(prefix.length) || '/';
-        return await respond(layer.app(
-          new Request(new URL(rest, request.url), request),
-          info,
-        ));
+        const dispatch = layerDispatch(layer, request.method, rest);
+        if (dispatch !== null) {
+          return await respond(
+            dispatch.app(repath(request, dispatch.path), info),
+          );
+        }
+        return respond(
+          Promise.resolve(
+            Response.json({ detail: 'Not Found' }, { status: 404 }),
+          ),
+        );
       }
     }
 
     // Lookup across candidates.
-    const hits: Layer[] = [];
+    const hits: { layer: Layer; app: PathfinderApp; path: string }[] = [];
     for (const layer of candidates) {
-      const result = layer.app.lookup(request.method, path);
-      if (result.kind === 'match') hits.push(layer);
+      const dispatch = layerDispatch(layer, request.method, path);
+      if (dispatch !== null) hits.push({ layer, ...dispatch });
     }
-    if (hits.length === 1) return await respond(hits[0].app(request, info));
+    if (hits.length === 1) {
+      return await respond(
+        hits[0].app(repath(request, hits[0].path), info),
+      );
+    }
     if (hits.length > 1) {
-      const match = hits.find((l) => headersMatch(request, l));
-      if (match) return await respond(match.app(request, info));
+      const match = hits.find((h) => headersMatch(request, h.layer));
+      if (match) {
+        return await respond(match.app(repath(request, match.path), info));
+      }
     }
     return respond(
       Promise.resolve(Response.json({ detail: 'Not Found' }, { status: 404 })),

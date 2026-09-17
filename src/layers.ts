@@ -1,7 +1,15 @@
 // src/layers.ts — glob layers/*/, read the optional manifest.json, boot one
-// pathfinder app per folder. The layer name is the folder name; core never
-// imports a layer by name. Layers get the injected service bag (app.user,
-// app.library, …, cfg) — never a DuckDB handle.
+// pathfinder app per declared mount. The layer name is the folder name; core
+// never imports a layer by name. Layers get the injected service bag
+// (app.user, app.library, …, cfg) — never a DuckDB handle.
+//
+// manifest.json: `port` and `headers` are reserved sniff keys; every other
+// key declares a mount — folder (under the layer dir) → URL prefix:
+//
+//   { "rest": "/rest" }   →   layers/<name>/rest/ answered at /rest/…
+//
+// A layer with no mount keys keeps the old shape: the whole layer dir is the
+// pathfinder root (prefix '').
 import { pathfinder } from '@pathfinder/pathfinder';
 import type { PathfinderApp } from '@pathfinder/pathfinder';
 
@@ -10,13 +18,23 @@ export interface HeaderMatch {
   includes: string;
 }
 
+export interface Mount {
+  /** Directory walked for this mount (inside the layer dir). */
+  folder: string;
+  /** URL prefix the mount answers ('' = the layer dir itself is the root). */
+  prefix: string;
+  app: PathfinderApp;
+}
+
 export interface Layer {
   name: string;
-  app: PathfinderApp;
+  mounts: Mount[];
   port: number | undefined;
   headers: HeaderMatch[];
   dir: string;
 }
+
+const RESERVED = new Set(['port', 'headers']);
 
 export async function loadLayers(opts: {
   app: object;
@@ -30,19 +48,45 @@ export async function loadLayers(opts: {
   for (const entry of entries) {
     if (!entry.isDirectory) continue;
     const dir = `${root}/${entry.name}`;
-    let manifest: { port?: number; headers?: HeaderMatch[] } = {};
+    let manifest:
+      & { port?: number; headers?: HeaderMatch[] }
+      & Record<
+        string,
+        unknown
+      > = {};
     try {
       manifest = JSON.parse(await Deno.readTextFile(`${dir}/manifest.json`));
     } catch (err) {
       if (!(err instanceof Deno.errors.NotFound)) throw err;
     }
-    const app = await pathfinder({
-      roots: [dir],
-      app: opts.app,
-    });
+    const mountKeys = Object.keys(manifest).filter((k) => !RESERVED.has(k))
+      .sort();
+    const mounts: Mount[] = [];
+    if (mountKeys.length === 0) {
+      mounts.push({
+        folder: dir,
+        prefix: '',
+        app: await pathfinder({ roots: [dir], app: opts.app }),
+      });
+    } else {
+      for (const key of mountKeys) {
+        const prefix = manifest[key];
+        if (typeof prefix !== 'string') {
+          throw new Error(
+            `${dir}/manifest.json — mount "${key}" must map to a URL prefix string`,
+          );
+        }
+        const folder = `${dir}/${key}`;
+        mounts.push({
+          folder,
+          prefix,
+          app: await pathfinder({ roots: [folder], app: opts.app }),
+        });
+      }
+    }
     layers.push({
       name: entry.name,
-      app,
+      mounts,
       port: manifest.port,
       headers: manifest.headers ?? [],
       dir,

@@ -12,6 +12,8 @@ import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
+import { loadLayers } from '../src/layers.ts';
+import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -38,7 +40,8 @@ async function setup() {
     annotation: createAnnotation(db),
     listens: createListens(db),
   };
-  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const app = facade(core, await loadLayers({ app: bag }));
   const albumIds = (await db.conn.runAndReadAll(
     'SELECT id, name FROM albums ORDER BY name',
   )).getRowObjects() as { id: string; name: string }[];

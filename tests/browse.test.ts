@@ -10,6 +10,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { loadLayers } from '../src/layers.ts';
+import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -34,7 +36,8 @@ async function setup() {
     user: createUserService(db, cfg),
     library: createLibrary(db),
   };
-  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const app = facade(core, await loadLayers({ app: bag }));
   return {
     db,
     dir,

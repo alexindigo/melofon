@@ -1,12 +1,14 @@
 // tests/facade.test.ts — dispatch grammar: /_/ → core tree, /_<name>/ → that
 // layer stripped, lookup pass-through on a hit, bare 404 from core on a miss.
-// The fixture layer (tests/fixtures/layer-a) is a real endpoint tree: an
-// empty tree is not representable (pathfinder rejects zero-file roots), so
-// dispatch into a layer is proven by its own endpoint, never by a fake
-// product route.
+// The fixture layer (tests/fixtures/layers/layer-a) is a real endpoint tree
+// booted through loadLayers (no manifest → the layer dir itself is the one
+// root): an empty tree is not representable (pathfinder rejects zero-file
+// roots), so dispatch into a layer is proven by its own endpoint, never by a
+// fake product route.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
+import { loadLayers } from '../src/layers.ts';
 import { openDb } from '../src/db.ts';
 
 async function makeApps() {
@@ -14,18 +16,12 @@ async function makeApps() {
   const db = await openDb(dir);
   const app = { db, cfg: {} };
   const core = await pathfinder({ roots: ['core/'], app });
-  const layerA = {
-    name: 'a',
-    app: await pathfinder({ roots: ['tests/fixtures/layer-a/'], app }),
-    port: undefined,
-    headers: [],
-    dir: 'tests/fixtures/layer-a',
-  };
+  const layers = await loadLayers({ app, layersRoot: 'tests/fixtures/layers' });
   const close = async () => {
     db.close();
     await Deno.remove(dir, { recursive: true });
   };
-  return { core, layers: [layerA], close };
+  return { core, layers, close };
 }
 
 Deno.test('/_/health routes to the core tree', async () => {
@@ -42,7 +38,9 @@ Deno.test('/_/health routes to the core tree', async () => {
 Deno.test('/_<name>/ strips the prefix and dispatches into the layer', async () => {
   const { core, layers, close } = await makeApps();
   try {
-    const res = await facade(core, layers)(new Request('http://x/_a/echo'));
+    const res = await facade(core, layers)(
+      new Request('http://x/_layer-a/echo'),
+    );
     assertEquals(res.status, 200);
     assertEquals(await res.json(), { layer: 'a', route: '/echo' });
   } finally {

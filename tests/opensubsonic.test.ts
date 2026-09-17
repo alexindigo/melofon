@@ -11,6 +11,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { facade } from '../src/facade.ts';
+import { loadLayers } from '../src/layers.ts';
 import { normalizeOp } from '../layers/opensubsonic/00-subsonic.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -36,7 +37,8 @@ async function setup() {
     user: createUserService(db, cfg),
     library: createLibrary(db),
   };
-  const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const app = facade(core, await loadLayers({ app: bag }));
   return {
     db,
     dir,
@@ -260,24 +262,44 @@ Deno.test('normalizeOp strips .view under any route registration order', () => {
 });
 
 Deno.test('facade dispatches /rest/ping.view into the opensubsonic layer', async () => {
-  const { app, db, close } = await setup();
+  const { app, close } = await setup();
   try {
-    const core = await pathfinder({
-      roots: ['core/'],
-      app: { db, cfg: {} },
-    });
-    const layer = {
-      name: 'opensubsonic',
-      app,
-      port: undefined,
-      headers: [],
-      dir: 'layers/opensubsonic',
-    };
-    const res = await facade(core, [layer])(
+    const res = await app(
       new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
     );
     assertEquals(res.status, 200);
     assertEquals((await jsonBody(res)).status, 'ok');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('loadLayers mounts rest at /rest: bare /rest/ping answers through the facade', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(new Request(`http://x/rest/ping?${AUTH}&f=json`));
+    assertEquals(res.status, 200);
+    assertEquals((await jsonBody(res)).status, 'ok');
+
+    // The force prefix composes with the mount: /_opensubsonic/rest/ping.
+    const forced = await app(
+      new Request(`http://x/_opensubsonic/rest/ping?${AUTH}&f=json`),
+    );
+    assertEquals(forced.status, 200);
+    assertEquals((await jsonBody(forced)).status, 'ok');
+
+    // /restping is not the /rest mount: the app sees the whole segment
+    // (the #op catch-all answers it as an unknown op until M4.1 commit 2
+    // replaces it with per-op routes, when this becomes a 404).
+    const notMount = await app(
+      new Request(`http://x/restping?${AUTH}&f=json`),
+    );
+    const notMountBody = await jsonBody(notMount);
+    assertEquals(notMountBody.status, 'failed');
+    assertEquals(
+      (notMountBody.error as { message: string }).message,
+      'Not implemented: restping',
+    );
   } finally {
     await close();
   }

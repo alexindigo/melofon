@@ -12,6 +12,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { loadLayers } from '../src/layers.ts';
+import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 const ROOT_A = 'tests/fixtures/library/Fixture Artist';
@@ -161,7 +163,7 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
   const { db, cfg, core, libraries, close } = await setup();
   try {
     const a = await addViaApi(core, 'A root', ROOT_A);
-    const b = await addViaApi(core, 'B root', ROOT_B);
+    await addViaApi(core, 'B root', ROOT_B);
     await scanLibrary(db);
     const bag = {
       cfg,
@@ -169,7 +171,7 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
       user: createUserService(db, cfg),
       library: createLibrary(db),
     };
-    const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
+    const app = facade(core, await loadLayers({ app: bag }));
     const get = async (op: string, extra = '') => {
       const res = await app(
         new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
