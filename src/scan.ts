@@ -3,10 +3,12 @@
 // table is never touched: catalog IDs are stable content hashes, so a rescan
 // of the same paths keeps every ID (M2's stars/playlists survive). Unreadable
 // files are skipped and counted, never fatal; an unreadable source root is
-// warned about and skipped, never fatal. ffprobe is the duration fallback
-// only (when music-metadata parsed but found no duration).
+// warned about and skipped, never fatal. app.media.probe is the duration
+// fallback only (when music-metadata parsed but found no duration) — the
+// ffprobe CLI is gone.
 import { parseFile } from 'music-metadata';
 import { encodeHex } from '@std/encoding/hex';
+import { createMedia, type Media } from './media.ts';
 import type { Db } from './db.ts';
 
 const AUDIO_EXTENSIONS = new Set([
@@ -81,31 +83,20 @@ async function* walkAudio(
   }
 }
 
-async function ffprobeDurationMs(path: string): Promise<number | null> {
-  try {
-    const out = await new Deno.Command('ffprobe', {
-      args: [
-        '-v',
-        'error',
-        '-show_entries',
-        'format=duration',
-        '-of',
-        'default=noprint_wrappers=1:nokey=1',
-        path,
-      ],
-      stdout: 'piped',
-      stderr: 'null',
-    }).output();
-    if (!out.success) return null;
-    const seconds = Number(new TextDecoder().decode(out.stdout).trim());
-    if (!Number.isFinite(seconds) || seconds <= 0) return null;
-    return Math.round(seconds * 1000);
-  } catch {
-    return null; // ffprobe not installed / spawn failed — duration stays null
-  }
+async function probeDurationMs(
+  media: Media,
+  path: string,
+): Promise<number | null> {
+  const probe = await media.probe(path);
+  return probe.durationMs;
 }
 
-export async function scanLibrary(db: Db): Promise<ScanCounts> {
+export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
+  // node-av (the native addon) is only loaded if some file actually needs the
+  // duration fallback — a library whose tags all carry duration never touches
+  // it.
+  let media_: Media | undefined = media;
+  const fallbackMedia = () => (media_ ??= createMedia());
   const sources = await db.conn.runAndReadAll(
     'SELECT id, name, path FROM libraries ORDER BY name',
   );
@@ -162,7 +153,9 @@ export async function scanLibrary(db: Db): Promise<ScanCounts> {
           skipped++;
           continue; // unreadable tags — skip the file, keep scanning
         }
-        if (durationMs === null) durationMs = await ffprobeDurationMs(abs);
+        if (durationMs === null) {
+          durationMs = await probeDurationMs(fallbackMedia(), abs);
+        }
 
         const stat = await Deno.stat(abs).catch(() => null);
         const name = rel.split('/').pop()!.replace(/\.[^.]*$/, '');
@@ -305,12 +298,12 @@ export interface ScanService {
   start(): Promise<void>;
 }
 
-export function createScan(db: Db): ScanService {
+export function createScan(db: Db, media?: Media): ScanService {
   let scanning = false;
   let count = 0;
   let lastScanMs: number | null = null;
   const run = async (): Promise<ScanCounts> => {
-    const counts = await scanLibrary(db);
+    const counts = await scanLibrary(db, media);
     count = counts.files;
     lastScanMs = Date.now();
     return counts;

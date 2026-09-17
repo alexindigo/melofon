@@ -18,6 +18,7 @@ import { createBookmarks } from './src/bookmarks.ts';
 import { createNowPlaying } from './src/nowplaying.ts';
 import { createStream } from './src/stream.ts';
 import { createZip } from './src/zip.ts';
+import { createMedia } from './src/media.ts';
 import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
 import { facade } from './src/facade.ts';
@@ -26,7 +27,8 @@ const cfg = loadConfig();
 const db = await openDb(cfg.dataDir);
 await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
-const scan = createScan(db);
+const media = createMedia();
+const scan = createScan(db, media);
 const counts = await scan.run();
 console.log(
   `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
@@ -39,6 +41,7 @@ const bag = {
   cfg,
   libraries,
   scan,
+  media,
   user: createUserService(db, cfg),
   library,
   annotation: createAnnotation(db),

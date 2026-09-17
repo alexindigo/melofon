@@ -18,7 +18,8 @@
     "@std/encoding": "jsr:@std/encoding@^1.0.11",
     "@std/http": "jsr:@std/http@1",
     "@zip-js/zip-js": "jsr:@zip-js/zip-js@2",
-    "music-metadata": "npm:music-metadata@11"
+    "music-metadata": "npm:music-metadata@11",
+    "node-av": "npm:node-av@6.1.1"
   },
   "nodeModulesDir": "auto",
   "fmt": {
