@@ -66,14 +66,17 @@ function extOf(name: string): string {
 }
 
 async function* walkAudio(
-  dir: string,
+  root: string,
+  dir: string = root,
 ): AsyncGenerator<{ abs: string; rel: string }> {
   for await (const entry of Deno.readDir(dir)) {
     const abs = `${dir}/${entry.name}`;
     if (entry.isDirectory) {
-      yield* walkAudio(abs);
+      yield* walkAudio(root, abs);
     } else if (entry.isFile && AUDIO_EXTENSIONS.has(extOf(entry.name))) {
-      yield { abs, rel: abs.slice(dir.length + 1) };
+      // rel is anchored at the source ROOT, not the recursion dir — two
+      // same-named files in different subdirs must not share an id.
+      yield { abs, rel: abs.slice(root.length + 1) };
     }
   }
 }

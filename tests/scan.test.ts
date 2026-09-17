@@ -47,6 +47,35 @@ Deno.test('scanLibrary reads tags, honors TPE2, skips corrupt files', async () =
   }
 });
 
+Deno.test('same-named files in different dirs get distinct ids', async () => {
+  // Regression: walkAudio's rel must be anchored at the source root — a
+  // basename-only rel makes <dirA>/same.mp3 and <dirB>/same.mp3 collide on
+  // the files PRIMARY KEY and rolls back the whole scan.
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-dupes-db-' });
+  const root = await Deno.makeTempDir({ prefix: 'melofon-dupes-' });
+  const db = await openDb(dir);
+  try {
+    const fixture =
+      'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3';
+    await Deno.mkdir(`${root}/a`);
+    await Deno.mkdir(`${root}/b`);
+    await Deno.copyFile(fixture, `${root}/a/same.mp3`);
+    await Deno.copyFile(fixture, `${root}/b/same.mp3`);
+    await createLibraries(db).add('Dupes', root);
+    const counts = await scanLibrary(db);
+    assertEquals(counts.files, 2);
+    const rows = (await db.conn.runAndReadAll(
+      'SELECT id, path FROM files ORDER BY path',
+    )).getRowObjects() as { id: string; path: string }[];
+    assertEquals(rows.length, 2);
+    assertNotEquals(rows[0].id, rows[1].id);
+  } finally {
+    db.close();
+    await Deno.remove(dir, { recursive: true });
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('rescan keeps users and stable IDs', async () => {
   const { db, close } = await setup();
   try {
