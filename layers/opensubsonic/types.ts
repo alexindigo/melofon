@@ -24,6 +24,8 @@ export interface HatContext {
   app: {
     cfg: {
       version?: string;
+      /** Data dir root — the HLS segment cache lives under it. */
+      dataDir?: string;
     };
     user: {
       auth(username: string, password: string): Promise<StateUser | null>;
@@ -192,6 +194,11 @@ export interface HatContext {
         file: { path: string; isVideo: boolean },
         format?: string,
       ): Promise<Response | null>;
+    };
+    media: {
+      /** Remux to 10s MPEG-TS HLS segments in outDir (stream copy);
+       *  null when the file is not remuxable or the mux fails. */
+      hlsRemux(path: string, outDir: string): Promise<number | null>;
     };
     zip: {
       archive(entries: { name: string; path: string }[]): Promise<Blob>;
