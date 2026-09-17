@@ -209,7 +209,7 @@ Deno.test('download zips albums, artists, and playlists', async () => {
   }
 });
 
-Deno.test('getLyrics returns embedded lyrics, empty element when none', async () => {
+Deno.test('getLyrics returns embedded lyrics, empty value when none', async () => {
   const { app, close } = await setup();
   try {
     const body = await get(
@@ -224,9 +224,9 @@ Deno.test('getLyrics returns embedded lyrics, empty element when none', async ()
     });
 
     const noTag = await get(app, 'getLyrics', '&title=First%20Song');
-    assertEquals(noTag.lyrics, {});
+    assertEquals(noTag.lyrics, { value: '' });
     const noSong = await get(app, 'getLyrics', '&title=No%20Such%20Song');
-    assertEquals(noSong.lyrics, {});
+    assertEquals(noSong.lyrics, { value: '' });
 
     const res = await app(
       new Request(
