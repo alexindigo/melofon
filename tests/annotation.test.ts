@@ -306,9 +306,17 @@ Deno.test('getUser returns the authenticated user', async () => {
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'ok');
-    const user = body.user as { username: string; playlistRole: boolean };
+    const user = body.user as {
+      username: string;
+      playlistRole: boolean;
+      folder: unknown;
+    };
     assertEquals(user.username, 'admin');
     assertEquals(user.playlistRole, true);
+    // folder is the real source ids (one in this setup), never [0].
+    assert(Array.isArray(user.folder));
+    assertEquals((user.folder as unknown[]).length, 1);
+    assertEquals(typeof (user.folder as string[])[0], 'string');
   } finally {
     await close();
   }

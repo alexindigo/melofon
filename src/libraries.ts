@@ -2,7 +2,8 @@
 // keep-on-rescan; each row is one OpenSubsonic music folder (id, name, one
 // path). Hats ask this namespace instead of inventing their own list from
 // filesystem paths. Core exposes the same CRUD under /_/ so the Settings UI
-// (M5) is a form, not a second store. MELOFON_LIBRARY is not the live list.
+// (M5) is a form, not a second store. This table is the only source list —
+// no env var names one.
 import { encodeHex } from '@std/encoding/hex';
 import type { Db } from './db.ts';
 

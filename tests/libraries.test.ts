@@ -1,8 +1,9 @@
 // tests/libraries.test.ts — M3 scan sources: app.libraries add/list/remove
 // (remove cleans the catalog), the core /_/libraries CRUD the Settings UI
 // will form over, and the two-fixture-roots flow the plan demands: sources
-// are created through the HTTP API (never MELOFON_LIBRARY), getMusicFolders
-// returns both, and musicFolderId filters the browse ops.
+// are created through the HTTP API (never an env var), getMusicFolders
+// returns both, getUser.folder carries the same ids, and musicFolderId
+// filters the browse ops.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
@@ -188,6 +189,11 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
       { id: a.id, name: 'A root' },
       { id: b.id, name: 'B root' },
     ]);
+
+    // getUser.folder carries the same real source ids (never a synthetic 0).
+    const user = await get('getUser');
+    const folder = (user.user as { folder: string[] }).folder;
+    assertEquals([...folder].sort(), [a.id, b.id].sort());
 
     const artistNames = (body: Record<string, unknown>) => {
       const artists = body.artists as {

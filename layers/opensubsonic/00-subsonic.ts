@@ -1167,25 +1167,31 @@ const OPS: Record<string, OpHandler> = {
   getAvatar: (_request, context) => context.app.artwork.placeholder(),
 
   // Navidrome quirk: the authenticated user, not a directory lookup.
-  getUser: (_request, context) => ({
-    user: {
-      username: context.state.user!.username,
-      scrobblingEnabled: true,
-      adminRole: true,
-      settingsRole: true,
-      downloadRole: true,
-      uploadRole: false,
-      playlistRole: true,
-      coverArtRole: true,
-      commentRole: false,
-      podcastRole: false,
-      streamRole: true,
-      jukeboxRole: false,
-      shareRole: false,
-      videoConversionRole: false,
-      folder: [0],
-    },
-  }),
+  // folder is the real source ids (same strings as getMusicFolders) — every
+  // user gets every source until per-user access exists; empty sources →
+  // empty folder, never a synthetic 0.
+  getUser: async (_request, context) => {
+    const folders = await context.app.libraries.list();
+    return {
+      user: {
+        username: context.state.user!.username,
+        scrobblingEnabled: true,
+        adminRole: true,
+        settingsRole: true,
+        downloadRole: true,
+        uploadRole: false,
+        playlistRole: true,
+        coverArtRole: true,
+        commentRole: false,
+        podcastRole: false,
+        streamRole: true,
+        jukeboxRole: false,
+        shareRole: false,
+        videoConversionRole: false,
+        folder: folders.map((f) => f.id),
+      },
+    };
+  },
 
   getStarred2: async (_request, context) => {
     const rows = await context.app.annotation.starred(
