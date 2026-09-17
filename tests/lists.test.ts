@@ -68,7 +68,7 @@ async function get(
   extra = '',
 ): Promise<Envelope> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
   );
   assertEquals(res.status, 200);
   const body = await res.json();
@@ -154,7 +154,7 @@ Deno.test('getGenres lists tag genres with counts, XML uses mixed content', asyn
     ]);
 
     const res = await app(
-      new Request(`http://x/rest/getGenres.view?${AUTH}`),
+      new Request(`http://x/rest/getGenres?${AUTH}`),
     );
     const xml = await res.text();
     assert(

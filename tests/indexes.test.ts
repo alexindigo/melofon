@@ -56,7 +56,7 @@ async function get(
   extra = '',
 ): Promise<Envelope> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
   );
   assertEquals(res.status, 200);
   const body = await res.json();
@@ -163,7 +163,7 @@ Deno.test('getIndexes renders as XML', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getIndexes.view?${AUTH}`),
+      new Request(`http://x/rest/getIndexes?${AUTH}`),
     );
     assertEquals(res.status, 200);
     const xml = await res.text();

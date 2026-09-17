@@ -80,7 +80,7 @@ async function call(
   extra = '',
 ): Promise<Record<string, unknown>> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
   );
   return await jsonBody(res);
 }

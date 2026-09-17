@@ -73,7 +73,7 @@ async function call(
   extra = '',
 ): Promise<Record<string, unknown>> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
   );
   const body = await res.json();
   return (body as Record<string, Record<string, unknown>>)[

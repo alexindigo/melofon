@@ -66,7 +66,7 @@ async function get(
   auth = AUTH,
 ): Promise<Envelope> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${auth}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${auth}&f=json${extra}`),
   );
   assertEquals(res.status, 200);
   const body = await res.json();
@@ -153,7 +153,7 @@ Deno.test('getNowPlaying renders entries as XML', async () => {
   try {
     await get(app, 'scrobble', `&id=${songIds[0].id}&submission=false`);
     const res = await app(
-      new Request(`http://x/rest/getNowPlaying.view?${AUTH}`),
+      new Request(`http://x/rest/getNowPlaying?${AUTH}`),
     );
     const xml = await res.text();
     assert(xml.includes('<nowPlaying>'));

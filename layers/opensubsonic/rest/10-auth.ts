@@ -4,13 +4,9 @@
 // Navidrome-shaped: HTTP 200, status="failed", code 40 with a generic
 // message (unknown user and bad password are indistinguishable); missing
 // u/v/c → code 10. Success sets context.state.user = { username, displayName }.
-import {
-  failResponse,
-  type HatContext,
-  type HatRequest,
-  hexDecode,
-  params,
-} from '../00-subsonic.ts';
+import { fail } from '#opensubsonic/envelope.ts';
+import { hexDecode, params } from '#opensubsonic/params.ts';
+import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 // Subsonic POSTs are small form bodies — the middleware reads them.
 export const disableStreaming = true;
@@ -20,7 +16,7 @@ export default async function (request: HatRequest, context: HatContext) {
   context.state.params = p;
   const username = p.get('u');
   if (username === null || p.get('v') === null || p.get('c') === null) {
-    return failResponse(context, 10, 'Required parameter is missing');
+    return fail(context, 10, 'Required parameter is missing');
   }
   let password = p.get('p');
   const token = p.get('t');
@@ -31,7 +27,7 @@ export default async function (request: HatRequest, context: HatContext) {
       try {
         password = hexDecode(password.slice(4));
       } catch {
-        return failResponse(context, 40, 'Wrong username or password');
+        return fail(context, 40, 'Wrong username or password');
       }
     }
     user = await context.app.user.auth(username, password);
@@ -39,7 +35,7 @@ export default async function (request: HatRequest, context: HatContext) {
     user = await context.app.user.authMd5(username, token, salt);
   }
   if (user === null) {
-    return failResponse(context, 40, 'Wrong username or password');
+    return fail(context, 40, 'Wrong username or password');
   }
   context.state.user = user;
 }

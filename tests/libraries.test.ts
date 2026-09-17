@@ -174,7 +174,7 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
     const app = facade(core, await loadLayers({ app: bag }));
     const get = async (op: string, extra = '') => {
       const res = await app(
-        new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+        new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
       );
       assertEquals(res.status, 200);
       const body = await res.json();

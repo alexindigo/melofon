@@ -73,7 +73,7 @@ async function get(
   extra = '',
 ): Promise<Envelope> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
   );
   assertEquals(res.status, 200);
   const body = await res.json();
@@ -110,7 +110,7 @@ Deno.test('download serves the original bytes as an attachment', async () => {
   try {
     const song = songIds[0];
     const res = await app(
-      new Request(`http://x/rest/download.view?${AUTH}&id=${song.id}`),
+      new Request(`http://x/rest/download?${AUTH}&id=${song.id}`),
     );
     assertEquals(res.status, 200);
     const disposition = res.headers.get('content-disposition') ?? '';
@@ -151,7 +151,7 @@ Deno.test('download zips albums, artists, and playlists', async () => {
       "SELECT id FROM albums WHERE name = 'Fixture Album'",
     )).getRowObjects() as { id: string }[];
     const albumRes = await app(
-      new Request(`http://x/rest/download.view?${AUTH}&id=${albumId[0].id}`),
+      new Request(`http://x/rest/download?${AUTH}&id=${albumId[0].id}`),
     );
     assertEquals(albumRes.status, 200);
     assertEquals(albumRes.headers.get('content-type'), 'application/zip');
@@ -177,7 +177,7 @@ Deno.test('download zips albums, artists, and playlists', async () => {
       "SELECT id FROM artists WHERE name = 'Various Artists'",
     )).getRowObjects() as { id: string }[];
     const artistRes = await app(
-      new Request(`http://x/rest/download.view?${AUTH}&id=${artistId[0].id}`),
+      new Request(`http://x/rest/download?${AUTH}&id=${artistId[0].id}`),
     );
     const artistEntries = await unzip(artistRes);
     assertEquals(
@@ -192,7 +192,7 @@ Deno.test('download zips albums, artists, and playlists', async () => {
     );
     const playlistId = (created.playlist as { id: string }).id;
     const playlistRes = await app(
-      new Request(`http://x/rest/download.view?${AUTH}&id=${playlistId}`),
+      new Request(`http://x/rest/download?${AUTH}&id=${playlistId}`),
     );
     assertEquals(
       playlistRes.headers.get('content-disposition'),
@@ -230,7 +230,7 @@ Deno.test('getLyrics returns embedded lyrics, empty element when none', async ()
 
     const res = await app(
       new Request(
-        `http://x/rest/getLyrics.view?${AUTH}&artist=Probe%20Performer&title=Theme`,
+        `http://x/rest/getLyrics?${AUTH}&artist=Probe%20Performer&title=Theme`,
       ),
     );
     const xml = await res.text();

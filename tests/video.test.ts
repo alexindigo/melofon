@@ -73,7 +73,7 @@ async function get(
   extra = '',
 ): Promise<Envelope> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
   );
   assertEquals(res.status, 200);
   const body = await res.json();
@@ -99,7 +99,7 @@ Deno.test('getVideos lists the fixture video as a Child with isVideo', async () 
     assertEquals(typeof clip.id, 'string');
 
     const xml = await app(
-      new Request(`http://x/rest/getVideos.view?${AUTH}`),
+      new Request(`http://x/rest/getVideos?${AUTH}`),
     );
     const text = await xml.text();
     assert(text.includes('<videos>'));
@@ -161,7 +161,7 @@ Deno.test('stream on a video id DirectPlays the original container', async () =>
   try {
     const id = await videoId(app);
     const res = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`),
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}`),
     );
     assertEquals(res.status, 200);
     assertEquals(res.headers.get('content-type'), 'video/mp4');
@@ -175,7 +175,7 @@ Deno.test('stream on a video id DirectPlays the original container', async () =>
 
     // Range still applies (DirectPlay keeps serveFile semantics).
     const partial = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`, {
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}`, {
         headers: { range: 'bytes=0-99' },
       }),
     );
@@ -191,7 +191,7 @@ Deno.test('stream with format=mp3 ExtractsAudio: audio, not a container', async 
   try {
     const id = await videoId(app);
     const res = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}&format=mp3`),
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}&format=mp3`),
     );
     assertEquals(res.status, 200);
     assertEquals(res.headers.get('content-type'), 'audio/mpeg');
@@ -215,14 +215,14 @@ Deno.test('stream decision boundaries: raw/unknown formats and audio files', asy
     const id = await videoId(app);
     // format=raw is Subsonic's "no transcode" — DirectPlay the container.
     const raw = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}&format=raw`),
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}&format=raw`),
     );
     assertEquals(raw.headers.get('content-type'), 'video/mp4');
     await raw.body?.cancel();
 
     // An unknown format is not an audio codec — DirectPlay, not an error.
     const unknown = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}&format=mkv`),
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}&format=mkv`),
     );
     assertEquals(unknown.headers.get('content-type'), 'video/mp4');
     await unknown.body?.cancel();
@@ -233,7 +233,7 @@ Deno.test('stream decision boundaries: raw/unknown formats and audio files', asy
     const songId = (song.searchResult3 as { song: { id: string }[] }).song[0]
       .id;
     const res = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${songId}&format=mp3`),
+      new Request(`http://x/rest/stream?${AUTH}&id=${songId}&format=mp3`),
     );
     assertEquals(res.status, 200);
     const bytes = new Uint8Array(await res.arrayBuffer());

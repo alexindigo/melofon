@@ -88,7 +88,7 @@ Deno.test('empty-ok ops return the golden empty payload as JSON and XML', async 
   try {
     for (const [op, jsonPayload, xmlElement] of EMPTY_OK) {
       const jsonRes = await app(
-        new Request(`http://x/rest/${op}.view?${AUTH}&f=json`),
+        new Request(`http://x/rest/${op}?${AUTH}&f=json`),
       );
       assertEquals(jsonRes.status, 200, `${op} JSON status`);
       const json = await jsonRes.json();
@@ -108,7 +108,7 @@ Deno.test('empty-ok ops return the golden empty payload as JSON and XML', async 
       );
 
       const xmlRes = await app(
-        new Request(`http://x/rest/${op}.view?${AUTH}`),
+        new Request(`http://x/rest/${op}?${AUTH}`),
       );
       assertEquals(xmlRes.status, 200, `${op} XML status`);
       assertEquals(
@@ -126,7 +126,7 @@ Deno.test('getAvatar serves the cover placeholder tile', async () => {
   const { app, close } = await setup();
   try {
     const avatar = await app(
-      new Request(`http://x/rest/getAvatar.view?${AUTH}&username=admin`),
+      new Request(`http://x/rest/getAvatar?${AUTH}&username=admin`),
     );
     assertEquals(avatar.status, 200);
     assertEquals(avatar.headers.get('content-type'), 'image/png');
@@ -135,7 +135,7 @@ Deno.test('getAvatar serves the cover placeholder tile', async () => {
     assertEquals([...avatarBytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
 
     const cover = await app(
-      new Request(`http://x/rest/getCoverArt.view?${AUTH}&id=no-such-cover`),
+      new Request(`http://x/rest/getCoverArt?${AUTH}&id=no-such-cover`),
     );
     assertEquals(
       avatarBytes,

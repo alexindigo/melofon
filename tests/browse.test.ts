@@ -57,7 +57,7 @@ async function get(
   extra = '',
 ): Promise<Envelope> {
   const res = await app(
-    new Request(`http://x/rest/${op}.view?${AUTH}&f=json${extra}`),
+    new Request(`http://x/rest/${op}?${AUTH}&f=json${extra}`),
   );
   assertEquals(res.status, 200);
   const body = (await res.json()) as Record<string, Envelope>;
@@ -82,7 +82,7 @@ Deno.test('getArtists returns the ID3 index of album artists', async () => {
     );
     assertEquals(artists.index[0].artist[0].albumCount, 1);
 
-    const xml = await app(new Request(`http://x/rest/getArtists.view?${AUTH}`));
+    const xml = await app(new Request(`http://x/rest/getArtists?${AUTH}`));
     const text = await xml.text();
     // The envelope carries the Subsonic namespace (strict parsers need it).
     assert(
@@ -164,7 +164,7 @@ Deno.test('getAlbum returns the album with ordered child songs', async () => {
     );
 
     const xml = await app(
-      new Request(`http://x/rest/getAlbum.view?${AUTH}&id=${albumId}`),
+      new Request(`http://x/rest/getAlbum?${AUTH}&id=${albumId}`),
     );
     const text = await xml.text();
     assert(text.includes('<album id="'));

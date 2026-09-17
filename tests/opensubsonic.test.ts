@@ -12,7 +12,6 @@ import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
-import { normalizeOp } from '../layers/opensubsonic/00-subsonic.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -61,7 +60,7 @@ Deno.test('ping returns the ok envelope as JSON', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/ping?${AUTH}&f=json`),
     );
     assertEquals(res.status, 200);
     const body = await jsonBody(res);
@@ -78,7 +77,7 @@ Deno.test('ping returns the ok envelope as JSON', async () => {
 Deno.test('ping defaults to the XML envelope', async () => {
   const { app, close } = await setup();
   try {
-    const res = await app(new Request(`http://x/rest/ping.view?${AUTH}`));
+    const res = await app(new Request(`http://x/rest/ping?${AUTH}`));
     assertEquals(res.status, 200);
     assert(res.headers.get('content-type')?.startsWith('application/xml'));
     const text = await res.text();
@@ -100,7 +99,7 @@ Deno.test('wrong password and unknown user share the generic code-40 body', asyn
   try {
     const badPass = await app(
       new Request(
-        'http://x/rest/ping.view?u=admin&p=wrong&v=1.16.1&c=t&f=json',
+        'http://x/rest/ping?u=admin&p=wrong&v=1.16.1&c=t&f=json',
       ),
     );
     assertEquals(badPass.status, 200); // Navidrome: errors ride HTTP 200
@@ -116,7 +115,7 @@ Deno.test('wrong password and unknown user share the generic code-40 body', asyn
     );
 
     const noUser = await app(
-      new Request('http://x/rest/ping.view?u=ghost&p=test&v=1.16.1&c=t&f=json'),
+      new Request('http://x/rest/ping?u=ghost&p=test&v=1.16.1&c=t&f=json'),
     );
     assertEquals(await jsonBody(noUser), badPassBody); // no user enumeration
   } finally {
@@ -128,14 +127,14 @@ Deno.test('missing u/v/c is code 10; no credentials at all is code 40', async ()
   const { app, close } = await setup();
   try {
     const noUser = await app(
-      new Request('http://x/rest/ping.view?v=1.16.1&c=t&f=json'),
+      new Request('http://x/rest/ping?v=1.16.1&c=t&f=json'),
     );
     assertEquals(
       ((await jsonBody(noUser)).error as { code: number }).code,
       10,
     );
     const noCreds = await app(
-      new Request('http://x/rest/ping.view?u=admin&v=1.16.1&c=t&f=json'),
+      new Request('http://x/rest/ping?u=admin&v=1.16.1&c=t&f=json'),
     );
     assertEquals(
       ((await jsonBody(noCreds)).error as { code: number }).code,
@@ -152,7 +151,7 @@ Deno.test('enc: hex password authenticates', async () => {
     // hex('test') = 74657374
     const res = await app(
       new Request(
-        'http://x/rest/ping.view?u=admin&p=enc:74657374&v=1.16.1&c=t&f=json',
+        'http://x/rest/ping?u=admin&p=enc:74657374&v=1.16.1&c=t&f=json',
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
@@ -170,14 +169,14 @@ Deno.test('md5 token+salt authenticates; a bad token fails', async () => {
     const token = (res.getRowObjects() as { h: string }[])[0].h;
     const ok = await app(
       new Request(
-        `http://x/rest/ping.view?u=admin&t=${token}&s=c19b2d&v=1.16.1&c=t&f=json`,
+        `http://x/rest/ping?u=admin&t=${token}&s=c19b2d&v=1.16.1&c=t&f=json`,
       ),
     );
     assertEquals((await jsonBody(ok)).status, 'ok');
 
     const bad = await app(
       new Request(
-        'http://x/rest/ping.view?u=admin&t=00000000000000000000000000000000&s=c19b2d&v=1.16.1&c=t&f=json',
+        'http://x/rest/ping?u=admin&t=00000000000000000000000000000000&s=c19b2d&v=1.16.1&c=t&f=json',
       ),
     );
     assertEquals(
@@ -193,13 +192,13 @@ Deno.test('getLicense is valid in both formats', async () => {
   const { app, close } = await setup();
   try {
     const json = await app(
-      new Request(`http://x/rest/getLicense.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/getLicense?${AUTH}&f=json`),
     );
     assertEquals(
       ((await jsonBody(json)).license as { valid: boolean }).valid,
       true,
     );
-    const xml = await app(new Request(`http://x/rest/getLicense.view?${AUTH}`));
+    const xml = await app(new Request(`http://x/rest/getLicense?${AUTH}`));
     assert((await xml.text()).includes('<license valid="true"/>'));
   } finally {
     await close();
@@ -210,7 +209,7 @@ Deno.test('POST form credentials authenticate (formpost model)', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request('http://x/rest/ping.view', {
+      new Request('http://x/rest/ping', {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: `${AUTH}&f=json`,
@@ -223,18 +222,16 @@ Deno.test('POST form credentials authenticate (formpost model)', async () => {
   }
 });
 
-Deno.test('unknown op fails as envelope code 0; bare /rest/<op> dispatches too', async () => {
+Deno.test('unknown op is a 404 envelope, not code 0', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/jukeboxControl.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/jukeboxControl?${AUTH}&f=json`),
     );
+    assertEquals(res.status, 404);
     const body = await jsonBody(res);
     assertEquals(body.status, 'failed');
-    assertEquals((body.error as { code: number }).code, 0);
-
-    const bare = await app(new Request(`http://x/rest/ping?${AUTH}&f=json`));
-    assertEquals((await jsonBody(bare)).status, 'ok');
+    assertEquals(body.type, 'melofon');
   } finally {
     await close();
   }
@@ -255,23 +252,38 @@ Deno.test('a miss under /rest/ renders the Subsonic envelope, not pathfinder JSO
   }
 });
 
-Deno.test('normalizeOp strips .view under any route registration order', () => {
-  assertEquals(normalizeOp('ping'), 'ping');
-  assertEquals(normalizeOp('ping.view'), 'ping');
-  assertEquals(normalizeOp('getArtists.view'), 'getArtists');
-});
-
-Deno.test('facade dispatches /rest/ping.view into the opensubsonic layer', async () => {
+Deno.test('facade dispatches /rest/ping into the opensubsonic layer', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/ping?${AUTH}&f=json`),
     );
     assertEquals(res.status, 200);
     assertEquals((await jsonBody(res)).status, 'ok');
   } finally {
     await close();
   }
+});
+
+// .view is paused until pathfinder ships the optional suffix (pathfinder
+// TODO.md): one route directory must accept both /rest/ping and
+// /rest/ping.view without a greedy capture. Un-ignore when the dependency
+// bumps; do not add ping.view/ twin folders.
+Deno.test({
+  name: 'GET /rest/ping.view dispatches like /rest/ping',
+  ignore: true,
+  fn: async () => {
+    const { app, close } = await setup();
+    try {
+      const res = await app(
+        new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
+      );
+      assertEquals(res.status, 200);
+      assertEquals((await jsonBody(res)).status, 'ok');
+    } finally {
+      await close();
+    }
+  },
 });
 
 Deno.test('loadLayers mounts rest at /rest: bare /rest/ping answers through the facade', async () => {
@@ -288,18 +300,12 @@ Deno.test('loadLayers mounts rest at /rest: bare /rest/ping answers through the 
     assertEquals(forced.status, 200);
     assertEquals((await jsonBody(forced)).status, 'ok');
 
-    // /restping is not the /rest mount: the app sees the whole segment
-    // (the #op catch-all answers it as an unknown op until M4.1 commit 2
-    // replaces it with per-op routes, when this becomes a 404).
+    // /restping is not the /rest mount: no per-op route matches the whole
+    // segment, so it falls to the layer's 404 envelope.
     const notMount = await app(
       new Request(`http://x/restping?${AUTH}&f=json`),
     );
-    const notMountBody = await jsonBody(notMount);
-    assertEquals(notMountBody.status, 'failed');
-    assertEquals(
-      (notMountBody.error as { message: string }).message,
-      'Not implemented: restping',
-    );
+    assertEquals(notMount.status, 404);
   } finally {
     await close();
   }

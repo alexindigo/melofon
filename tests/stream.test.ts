@@ -74,7 +74,7 @@ Deno.test('stream returns the original file bytes', async () => {
   try {
     const id = await songId(library, 'First');
     const res = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`),
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}`),
     );
     assertEquals(res.status, 200);
     assertEquals(res.headers.get('content-type'), 'audio/mpeg');
@@ -94,7 +94,7 @@ Deno.test('stream honors Range with a 206 partial response', async () => {
   try {
     const id = await songId(library, 'First');
     const res = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`, {
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}`, {
         headers: { range: 'bytes=0-99' },
       }),
     );
@@ -113,7 +113,7 @@ Deno.test('stream with an unknown id is envelope code 70; missing id is 10', asy
   const { app, close } = await setup();
   try {
     const unknown = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&id=nope&f=json`),
+      new Request(`http://x/rest/stream?${AUTH}&id=nope&f=json`),
     );
     const body = (await unknown.json()) as Record<
       string,
@@ -122,7 +122,7 @@ Deno.test('stream with an unknown id is envelope code 70; missing id is 10', asy
     assertEquals(body['subsonic-response'].error.code, 70);
 
     const missing = await app(
-      new Request(`http://x/rest/stream.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/stream?${AUTH}&f=json`),
     );
     const missingBody = (await missing.json()) as Record<
       string,
@@ -147,7 +147,7 @@ Deno.test('getCoverArt serves cover.jpg when the album has one', async () => {
     });
     const res = await app(
       new Request(
-        `http://x/rest/getCoverArt.view?${AUTH}&id=${found.albums[0].id}`,
+        `http://x/rest/getCoverArt?${AUTH}&id=${found.albums[0].id}`,
       ),
     );
     assertEquals(res.status, 200);
@@ -189,7 +189,7 @@ Deno.test('getCoverArt serves embedded art for album, song, and artist ids', asy
     ];
     for (const id of ids) {
       const res = await app(
-        new Request(`http://x/rest/getCoverArt.view?${AUTH}&id=${id}`),
+        new Request(`http://x/rest/getCoverArt?${AUTH}&id=${id}`),
       );
       assertEquals(res.status, 200);
       assertEquals(res.headers.get('content-type'), 'image/jpeg');
@@ -206,7 +206,7 @@ Deno.test('getCoverArt falls back to the placeholder for unknown covers', async 
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getCoverArt.view?${AUTH}&id=no-such-id`),
+      new Request(`http://x/rest/getCoverArt?${AUTH}&id=no-such-id`),
     );
     assertEquals(res.status, 200);
     assertEquals(res.headers.get('content-type'), 'image/png');

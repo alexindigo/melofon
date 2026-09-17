@@ -75,12 +75,12 @@ Deno.test('star a song, then getStarred2 lists it with a starred date', async ()
   try {
     const id = songIds[0].id;
     const star = await app(
-      new Request(`http://x/rest/star.view?${AUTH}&f=json&id=${id}`),
+      new Request(`http://x/rest/star?${AUTH}&f=json&id=${id}`),
     );
     assertEquals((await jsonBody(star)).status, 'ok');
 
     const res = await app(
-      new Request(`http://x/rest/getStarred2.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/getStarred2?${AUTH}&f=json`),
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'ok');
@@ -101,13 +101,13 @@ Deno.test('star accepts albumId/artistId and unstar removes them', async () => {
     const { album_id, artist_id } = songIds[0];
     const star = await app(
       new Request(
-        `http://x/rest/star.view?${AUTH}&f=json&albumId=${album_id}&artistId=${artist_id}`,
+        `http://x/rest/star?${AUTH}&f=json&albumId=${album_id}&artistId=${artist_id}`,
       ),
     );
     assertEquals((await jsonBody(star)).status, 'ok');
 
     let res = await app(
-      new Request(`http://x/rest/getStarred2.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/getStarred2?${AUTH}&f=json`),
     );
     let starred2 = (await jsonBody(res)).starred2 as {
       album: { id: string }[];
@@ -118,12 +118,12 @@ Deno.test('star accepts albumId/artistId and unstar removes them', async () => {
 
     const unstar = await app(
       new Request(
-        `http://x/rest/unstar.view?${AUTH}&f=json&albumId=${album_id}&artistId=${artist_id}`,
+        `http://x/rest/unstar?${AUTH}&f=json&albumId=${album_id}&artistId=${artist_id}`,
       ),
     );
     assertEquals((await jsonBody(unstar)).status, 'ok');
     res = await app(
-      new Request(`http://x/rest/getStarred2.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/getStarred2?${AUTH}&f=json`),
     );
     starred2 = (await jsonBody(res)).starred2 as {
       album: { id: string }[];
@@ -140,7 +140,7 @@ Deno.test('star works via POST form too', async () => {
   const { app, songIds, close } = await setup();
   try {
     const res = await app(
-      new Request('http://x/rest/star.view', {
+      new Request('http://x/rest/star', {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: `${AUTH}&f=json&id=${songIds[0].id}`,
@@ -158,7 +158,7 @@ Deno.test('setRating upserts and 0 clears', async () => {
     const id = songIds[0].id;
     let res = await app(
       new Request(
-        `http://x/rest/setRating.view?${AUTH}&f=json&id=${id}&rating=4`,
+        `http://x/rest/setRating?${AUTH}&f=json&id=${id}&rating=4`,
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
@@ -172,7 +172,7 @@ Deno.test('setRating upserts and 0 clears', async () => {
 
     res = await app(
       new Request(
-        `http://x/rest/setRating.view?${AUTH}&f=json&id=${id}&rating=2`,
+        `http://x/rest/setRating?${AUTH}&f=json&id=${id}&rating=2`,
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
@@ -185,7 +185,7 @@ Deno.test('setRating upserts and 0 clears', async () => {
 
     res = await app(
       new Request(
-        `http://x/rest/setRating.view?${AUTH}&f=json&id=${id}&rating=0`,
+        `http://x/rest/setRating?${AUTH}&f=json&id=${id}&rating=0`,
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
@@ -201,9 +201,7 @@ Deno.test('setRating rejects out-of-range values', async () => {
   try {
     const res = await app(
       new Request(
-        `http://x/rest/setRating.view?${AUTH}&f=json&id=${
-          songIds[0].id
-        }&rating=9`,
+        `http://x/rest/setRating?${AUTH}&f=json&id=${songIds[0].id}&rating=9`,
       ),
     );
     const body = await jsonBody(res);
@@ -221,7 +219,7 @@ Deno.test('scrobble submission=true appends listens rows, never updates', async 
     for (let i = 0; i < 2; i++) {
       const res = await app(
         new Request(
-          `http://x/rest/scrobble.view?${AUTH}&f=json&id=${id}&submission=true`,
+          `http://x/rest/scrobble?${AUTH}&f=json&id=${id}&submission=true`,
         ),
       );
       assertEquals((await jsonBody(res)).status, 'ok');
@@ -246,7 +244,7 @@ Deno.test('scrobble honors the time parameter for offline scrobbles', async () =
   try {
     const res = await app(
       new Request(
-        `http://x/rest/scrobble.view?${AUTH}&f=json&id=${
+        `http://x/rest/scrobble?${AUTH}&f=json&id=${
           songIds[0].id
         }&submission=true&time=1700000000000`,
       ),
@@ -269,7 +267,7 @@ Deno.test('scrobble submission=false does not append listens', async () => {
   try {
     const res = await app(
       new Request(
-        `http://x/rest/scrobble.view?${AUTH}&f=json&id=${
+        `http://x/rest/scrobble?${AUTH}&f=json&id=${
           songIds[0].id
         }&submission=false`,
       ),
@@ -288,7 +286,7 @@ Deno.test('getNowPlaying is an empty list when nobody is playing', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getNowPlaying.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/getNowPlaying?${AUTH}&f=json`),
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'ok');
@@ -305,7 +303,7 @@ Deno.test('getUser returns the authenticated user', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getUser.view?${AUTH}&f=json`),
+      new Request(`http://x/rest/getUser?${AUTH}&f=json`),
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'ok');
@@ -330,7 +328,7 @@ Deno.test('getRandomSongs returns catalog songs, size honored', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getRandomSongs.view?${AUTH}&f=json&size=2`),
+      new Request(`http://x/rest/getRandomSongs?${AUTH}&f=json&size=2`),
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'ok');
