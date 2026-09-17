@@ -83,3 +83,18 @@ Deno.test('/_/ answers the core tree even when no layers exist', async () => {
     await close();
   }
 });
+
+Deno.test('/ answers 200 (client reachability probes; UI lands with M5)', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const res = await facade(core, layers)(new Request('http://x/'));
+    assertEquals(res.status, 200);
+    assertEquals(
+      res.headers.get('content-type'),
+      'text/plain; charset=utf-8',
+    );
+    assertEquals(await res.text(), 'Hello World!\n');
+  } finally {
+    await close();
+  }
+});

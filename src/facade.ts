@@ -27,6 +27,15 @@ export function facade(
   return async (request: Request, info?: unknown): Promise<Response> => {
     const path = new URL(request.url).pathname;
 
+    // Amperfy-style reachability probes GET the server root before login and
+    // abort on any >= 400 — answer 200. The real UI claims / with M5; until
+    // then it's a plain-text hello.
+    if (path === '/') {
+      return new Response('Hello World!\n', {
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      });
+    }
+
     // /_/ — the "no layer" prefix: core's own tree.
     if (path === '/_' || path.startsWith('/_/')) {
       const rest = path.slice(2) || '/';
