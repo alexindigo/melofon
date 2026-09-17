@@ -13,6 +13,7 @@ import { createLibrary } from '../src/library.ts';
 import { createBookmarks } from '../src/bookmarks.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createStream } from '../src/stream.ts';
+import { createMedia } from '../src/media.ts';
 import { createZip } from '../src/zip.ts';
 import { BlobReader, Uint8ArrayWriter, ZipReader } from '@zip-js/zip-js';
 
@@ -42,7 +43,7 @@ async function setup() {
     library: createLibrary(db),
     bookmarks: createBookmarks(db),
     playlists: createPlaylists(db),
-    stream: createStream(),
+    stream: createStream(createMedia()),
     zip: createZip(),
   };
   const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });

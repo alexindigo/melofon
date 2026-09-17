@@ -50,7 +50,7 @@ const bag = {
   clientQueue: createClientQueue(db),
   bookmarks: createBookmarks(db),
   nowPlaying: createNowPlaying(db),
-  stream: createStream(),
+  stream: createStream(media),
   zip: createZip(),
   artwork: createArtwork(library),
 };

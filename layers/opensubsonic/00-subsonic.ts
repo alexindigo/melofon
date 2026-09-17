@@ -192,6 +192,11 @@ export interface HatContext {
     };
     stream: {
       file(request: Request, path: string): Promise<Response>;
+      play(
+        request: Request,
+        file: { path: string; isVideo: boolean },
+        format?: string,
+      ): Promise<Response | null>;
     };
     zip: {
       archive(entries: { name: string; path: string }[]): Promise<Blob>;
@@ -961,14 +966,23 @@ const OPS: Record<string, OpHandler> = {
     return { albumList2: { album: albums.map(albumId3Of) } };
   },
 
-  // Original file bytes, Range-aware; transcode params are ignored in M1.
+  // app.stream decides (M4): DirectPlay = original bytes, Range-aware;
+  // ExtractAudio = a video id + an audio `format` → in-process audio track.
   // Not a scrobble — playing does not mark anything.
   stream: async (request, context) => {
     const id = requiredParam(context, 'id');
     if (id instanceof Response) return id;
-    const path = await context.app.library.songPath(id);
-    if (path === null) return notFound(context);
-    return await context.app.stream.file(request._raw, path);
+    const song = await context.app.library.getSong(id);
+    if (song === null) return notFound(context);
+    const res = await context.app.stream.play(
+      request._raw,
+      { path: song.path, isVideo: song.isVideo },
+      context.state.params!.get('format') ?? undefined,
+    );
+    if (res === null) {
+      return failResponse(context, 0, 'audio extraction failed');
+    }
+    return res;
   },
 
   // Song id → the single file (unchanged). Album / artist / playlist id →

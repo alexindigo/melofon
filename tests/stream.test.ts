@@ -9,6 +9,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createStream } from '../src/stream.ts';
+import { createMedia } from '../src/media.ts';
 import { createArtwork } from '../src/artwork.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -34,7 +35,7 @@ async function setup() {
     libraries,
     user: createUserService(db, cfg),
     library,
-    stream: createStream(),
+    stream: createStream(createMedia()),
     artwork: createArtwork(library),
   };
   const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });

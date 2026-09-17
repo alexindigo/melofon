@@ -14,12 +14,15 @@
 // Authoring only: product code never spawns ffmpeg/ffprobe (plan §8).
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
+import { parseBuffer } from 'music-metadata';
 import { openDb } from '../src/db.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { createStream } from '../src/stream.ts';
+import { createMedia } from '../src/media.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -44,6 +47,7 @@ async function setup() {
     libraries,
     user: createUserService(db, cfg),
     library,
+    stream: createStream(createMedia()),
   };
   const app = await pathfinder({ roots: ['layers/opensubsonic/'], app: bag });
   return {
@@ -136,6 +140,103 @@ Deno.test('the video id resolves as a song child with isVideo (one namespace)', 
     assertEquals(song.id, id);
     assertEquals(song.isVideo, true);
     assertEquals(song.title, 'Clip');
+  } finally {
+    await close();
+  }
+});
+
+async function videoId(
+  app: (req: Request) => Promise<Response>,
+): Promise<string> {
+  const videos = await get(app, 'getVideos');
+  return (videos.videos as { video: { id: string }[] }).video[0].id;
+}
+
+Deno.test('stream on a video id DirectPlays the original container', async () => {
+  const { app, close } = await setup();
+  try {
+    const id = await videoId(app);
+    const res = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(res.headers.get('content-type'), 'video/mp4');
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const onDisk = await Deno.readFile(
+      'tests/fixtures/library/Fixture Artist/Fixture Album/03 - Clip.mp4',
+    );
+    assertEquals(bytes.length, onDisk.length);
+    // ISO BMFF magic: bytes 4..8 are 'ftyp'.
+    assertEquals(new TextDecoder().decode(bytes.slice(4, 8)), 'ftyp');
+
+    // Range still applies (DirectPlay keeps serveFile semantics).
+    const partial = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}`, {
+        headers: { range: 'bytes=0-99' },
+      }),
+    );
+    assertEquals(partial.status, 206);
+    assertEquals((await partial.arrayBuffer()).byteLength, 100);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('stream with format=mp3 ExtractsAudio: audio, not a container', async () => {
+  const { app, close } = await setup();
+  try {
+    const id = await videoId(app);
+    const res = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}&format=mp3`),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(res.headers.get('content-type'), 'audio/mpeg');
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    // ID3v2 magic (tags carried over) or an MPEG frame sync.
+    const isId3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33;
+    const isSync = bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0;
+    assert(isId3 || isSync, 'mp3 magic missing');
+    // Stronger than magic: the bytes really parse as audio with a duration.
+    const meta = await parseBuffer(bytes, 'audio/mpeg');
+    assert(meta.format.duration !== undefined && meta.format.duration > 0);
+    assertEquals(meta.common.title, 'Clip'); // tags carried over the transcode
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('stream decision boundaries: raw/unknown formats and audio files', async () => {
+  const { app, close } = await setup();
+  try {
+    const id = await videoId(app);
+    // format=raw is Subsonic's "no transcode" — DirectPlay the container.
+    const raw = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}&format=raw`),
+    );
+    assertEquals(raw.headers.get('content-type'), 'video/mp4');
+    await raw.body?.cancel();
+
+    // An unknown format is not an audio codec — DirectPlay, not an error.
+    const unknown = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${id}&format=mkv`),
+    );
+    assertEquals(unknown.headers.get('content-type'), 'video/mp4');
+    await unknown.body?.cancel();
+
+    // format=mp3 on an AUDIO file is not ExtractAudio (that branch needs a
+    // video) — the original mp3 ships untouched.
+    const song = await get(app, 'search3', '&query=First&songCount=1');
+    const songId = (song.searchResult3 as { song: { id: string }[] }).song[0]
+      .id;
+    const res = await app(
+      new Request(`http://x/rest/stream.view?${AUTH}&id=${songId}&format=mp3`),
+    );
+    assertEquals(res.status, 200);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const onDisk = await Deno.readFile(
+      'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3',
+    );
+    assertEquals(bytes, onDisk);
   } finally {
     await close();
   }
