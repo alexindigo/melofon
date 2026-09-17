@@ -103,7 +103,7 @@ Deno.test('getArtist returns the artist with their albums', async () => {
     };
     assertEquals(artist.name, 'Fixture Artist');
     assertEquals(artist.album.map((a) => [a.name, a.songCount]), [
-      ['Fixture Album', 2],
+      ['Fixture Album', 3],
     ]);
 
     const missing = await get(app, 'getArtist', '&id=nope');
@@ -134,11 +134,12 @@ Deno.test('getAlbum returns the album with ordered child songs', async () => {
     assertEquals(album.name, 'Fixture Album');
     assertEquals(album.artist, 'Fixture Artist');
     assertEquals(album.coverArt, albumId);
-    assertEquals(album.songCount, 2);
+    assertEquals(album.songCount, 3);
     assert(album.duration >= 2);
     assertEquals(album.song.map((s) => [s.track, s.title]), [
       [1, 'First Song'],
       [2, 'Second Song'],
+      [3, 'Clip'],
     ]);
     const first = album.song[0];
     assertEquals(first.isDir, false);
@@ -160,7 +161,7 @@ Deno.test('getAlbum returns the album with ordered child songs', async () => {
     );
     const text = await xml.text();
     assert(text.includes('<album id="'));
-    assert((text.match(/<song /g) ?? []).length === 2);
+    assert((text.match(/<song /g) ?? []).length === 3);
 
     const missing = await get(app, 'getAlbum', '&id=nope');
     assertEquals((missing.error as { code: number }).code, 70);

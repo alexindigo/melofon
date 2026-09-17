@@ -82,7 +82,7 @@ Deno.test('getScanStatus reports the boot scan; startScan rescans', async () => 
     const before = await get(app, 'getScanStatus');
     const beforeStatus = before.scanStatus as Record<string, unknown>;
     assertEquals(beforeStatus.scanning, false);
-    assertEquals(beforeStatus.count, 3);
+    assertEquals(beforeStatus.count, 4);
     assertEquals(beforeStatus.folderCount, 1);
     assertEquals(typeof beforeStatus.lastScan, 'string');
 
@@ -95,7 +95,7 @@ Deno.test('getScanStatus reports the boot scan; startScan rescans', async () => 
     const after = await get(app, 'getScanStatus');
     const afterStatus = after.scanStatus as Record<string, unknown>;
     assertEquals(afterStatus.scanning, false);
-    assertEquals(afterStatus.count, 3);
+    assertEquals(afterStatus.count, 4);
   } finally {
     await close();
   }
@@ -161,6 +161,7 @@ Deno.test('download zips albums, artists, and playlists', async () => {
       [
         'Fixture Artist/Fixture Album/01 - First Song.mp3',
         'Fixture Artist/Fixture Album/02 - Second Song.mp3',
+        'Fixture Artist/Fixture Album/03 - Clip.mp4',
       ],
     );
     const original = await Deno.readFile(

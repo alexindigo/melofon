@@ -41,6 +41,8 @@ export interface SongRow {
   size: number | null;
   genre: string | null;
   year: number | null;
+  /** M4: row is a music video (probe-decided at scan), else an audio file. */
+  isVideo: boolean;
   suffix: string;
   contentType: string;
 }
@@ -138,6 +140,10 @@ const CONTENT_TYPES: Record<string, string> = {
   ogg: 'audio/ogg',
   opus: 'audio/ogg',
   wav: 'audio/wav',
+  mp4: 'video/mp4',
+  m4v: 'video/mp4',
+  mkv: 'video/x-matroska',
+  webm: 'video/webm',
 };
 
 function suffixOf(path: string): string {
@@ -170,6 +176,7 @@ interface SongSqlRow {
   size: number | bigint | null;
   genre: string | null;
   year: number | null;
+  is_video: boolean | null;
 }
 
 function songOf(row: SongSqlRow): SongRow {
@@ -190,6 +197,7 @@ function songOf(row: SongSqlRow): SongRow {
     size: num(row.size),
     genre: row.genre,
     year: num(row.year),
+    isVideo: row.is_video ?? false,
     suffix,
     contentType: CONTENT_TYPES[suffix] ?? 'application/octet-stream',
   };
@@ -199,7 +207,7 @@ const SONG_SELECT = `
   SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title,
          f.album_id, al.name AS album_name, f.artist_id,
          ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
-         f.genre, f.year
+         f.genre, f.year, f.is_video
   FROM files f
   LEFT JOIN albums al ON al.id = f.album_id
   LEFT JOIN artists ar ON ar.id = f.artist_id

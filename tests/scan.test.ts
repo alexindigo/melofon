@@ -30,18 +30,30 @@ Deno.test('scanLibrary reads tags, honors TPE2, skips corrupt files', async () =
   const { db, close } = await setup();
   try {
     const counts = await scanLibrary(db);
-    assertEquals(counts, { files: 3, skipped: 1, artists: 3, albums: 2 });
+    assertEquals(counts, { files: 4, skipped: 1, artists: 3, albums: 2 });
 
     const songs = await db.conn.runAndReadAll(
-      'SELECT title, track, duration_ms FROM files ORDER BY album_id, track',
+      'SELECT title, track, duration_ms, is_video FROM files ORDER BY album_id, track',
     );
     const rows = songs.getRowObjects() as {
       title: string;
       track: number;
       duration_ms: number;
+      is_video: boolean;
     }[];
-    assertEquals(rows.length, 3);
+    assertEquals(rows.length, 4);
     for (const row of rows) assert(Number(row.duration_ms) > 0);
+    // M4: the fixture mp4 is the only video row (probe-decided). album_id
+    // order is hash order — sort by title for a deterministic assertion.
+    assertEquals(
+      rows.map((r) => [r.title, r.is_video]).sort(),
+      [
+        ['Clip', true],
+        ['First Song', false],
+        ['Second Song', false],
+        ['Theme', false],
+      ],
+    );
   } finally {
     await close();
   }
@@ -199,14 +211,20 @@ Deno.test('library.getAlbum returns the album with ordered songs', async () => {
     assert(got !== null);
     assertEquals(got.album.name, 'Fixture Album');
     assertEquals(got.album.artistId, fixtureArtist.id);
-    assertEquals(got.album.songCount, 2);
+    assertEquals(got.album.songCount, 3);
     assertEquals(got.songs.map((s) => [s.track, s.title]), [
       [1, 'First Song'],
       [2, 'Second Song'],
+      [3, 'Clip'],
     ]);
     assertEquals(got.songs[0].suffix, 'mp3');
     assertEquals(got.songs[0].contentType, 'audio/mpeg');
     assertNotEquals(got.songs[0].durationMs, null);
+    // M4: the music video rides the same album row set, flagged isVideo.
+    assertEquals(got.songs[0].isVideo, false);
+    assertEquals(got.songs[2].isVideo, true);
+    assertEquals(got.songs[2].suffix, 'mp4');
+    assertEquals(got.songs[2].contentType, 'video/mp4');
   } finally {
     await close();
   }

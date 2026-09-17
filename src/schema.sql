@@ -46,6 +46,9 @@ ALTER TABLE files ADD COLUMN IF NOT EXISTS library_id VARCHAR;
 ALTER TABLE files ADD COLUMN IF NOT EXISTS genre VARCHAR;
 -- M3 amendment: year from TDRC/TYER (byYear album lists).
 ALTER TABLE files ADD COLUMN IF NOT EXISTS year INTEGER;
+-- M4: music videos share the files row with audio (probe-decided, M3.5
+-- app.media). NULL on rows scanned before M4 reads as not-video.
+ALTER TABLE files ADD COLUMN IF NOT EXISTS is_video BOOLEAN;
 
 -- M2 user state (keep-on-rescan: scan never deletes from these).
 CREATE TABLE IF NOT EXISTS listens (

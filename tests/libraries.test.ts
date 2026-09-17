@@ -90,7 +90,7 @@ Deno.test('app.libraries remove drops the source and its catalog rows', async ()
       const res = await db.conn.runAndReadAll(sql);
       return Number((res.getRowObjects() as { n: bigint }[])[0].n);
     };
-    assertEquals(await count('SELECT COUNT(*) AS n FROM files'), 3);
+    assertEquals(await count('SELECT COUNT(*) AS n FROM files'), 4);
     assertEquals(await libraries.remove(a.id), true);
     assertEquals(await count('SELECT COUNT(*) AS n FROM files'), 1);
     // Orphan albums/artists of the removed source are gone; B's remain.

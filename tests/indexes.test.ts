@@ -140,6 +140,12 @@ Deno.test('getMusicDirectory walks artist → album → songs', async () => {
           false,
           album.id,
         ],
+        [
+          'Clip',
+          'Fixture Artist/Fixture Album/03 - Clip.mp4',
+          false,
+          album.id,
+        ],
       ],
     );
 

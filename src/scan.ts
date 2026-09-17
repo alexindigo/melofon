@@ -5,7 +5,9 @@
 // files are skipped and counted, never fatal; an unreadable source root is
 // warned about and skipped, never fatal. app.media.probe is the duration
 // fallback only (when music-metadata parsed but found no duration) — the
-// ffprobe CLI is gone.
+// ffprobe CLI is gone. M4: video containers are walked alongside audio; for
+// those, probe also decides is_video (an audio-only .mp4 stays a song) and a
+// file with neither audio nor video streams is skipped as not-media.
 import { parseFile } from 'music-metadata';
 import { encodeHex } from '@std/encoding/hex';
 import { createMedia, type Media } from './media.ts';
@@ -18,6 +20,15 @@ const AUDIO_EXTENSIONS = new Set([
   '.ogg',
   '.opus',
   '.wav',
+]);
+
+// M4: music videos live in the same sources as audio (Blue Tattoo: MP3s and
+// the videos in one album folder).
+const VIDEO_EXTENSIONS = new Set([
+  '.mp4',
+  '.mkv',
+  '.webm',
+  '.m4v',
 ]);
 
 export interface ScanCounts {
@@ -52,6 +63,7 @@ interface FileIn {
   durationMs: number | null;
   genre: string | null;
   year: number | null;
+  isVideo: boolean;
 }
 
 async function stableId(kind: string, key: string): Promise<string> {
@@ -67,15 +79,19 @@ function extOf(name: string): string {
   return idx === -1 ? '' : name.slice(idx).toLowerCase();
 }
 
-async function* walkAudio(
+async function* walkMedia(
   root: string,
   dir: string = root,
 ): AsyncGenerator<{ abs: string; rel: string }> {
   for await (const entry of Deno.readDir(dir)) {
     const abs = `${dir}/${entry.name}`;
     if (entry.isDirectory) {
-      yield* walkAudio(root, abs);
-    } else if (entry.isFile && AUDIO_EXTENSIONS.has(extOf(entry.name))) {
+      yield* walkMedia(root, abs);
+    } else if (
+      entry.isFile &&
+      (AUDIO_EXTENSIONS.has(extOf(entry.name)) ||
+        VIDEO_EXTENSIONS.has(extOf(entry.name)))
+    ) {
       // rel is anchored at the source ROOT, not the recursion dir — two
       // same-named files in different subdirs must not share an id.
       yield { abs, rel: abs.slice(root.length + 1) };
@@ -114,7 +130,7 @@ export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
   ) {
     const root = source.path.replace(/\/+$/, '');
     try {
-      for await (const { abs, rel } of walkAudio(root)) {
+      for await (const { abs, rel } of walkMedia(root)) {
         let title: string | undefined;
         let trackArtist: string | undefined;
         let albumName: string | undefined;
@@ -124,6 +140,7 @@ export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
         let durationMs: number | null = null;
         let genre: string | null = null;
         let year: number | null = null;
+        let isVideo = false;
         try {
           const meta = await parseFile(abs);
           // Garbage bytes resolve with an empty format (no container, no codec)
@@ -153,7 +170,19 @@ export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
           skipped++;
           continue; // unreadable tags — skip the file, keep scanning
         }
-        if (durationMs === null) {
+        if (VIDEO_EXTENSIONS.has(extOf(abs))) {
+          // Video containers: probe decides video-ness (an audio-only .mp4
+          // stays a song) and backfills the duration when tags didn't carry
+          // one. Neither stream type → not media at all — skip like
+          // unreadable audio.
+          const probe = await fallbackMedia().probe(abs);
+          if (!probe.hasVideo && !probe.hasAudio) {
+            skipped++;
+            continue;
+          }
+          isVideo = probe.hasVideo;
+          durationMs ??= probe.durationMs;
+        } else if (durationMs === null) {
           durationMs = await probeDurationMs(fallbackMedia(), abs);
         }
 
@@ -187,6 +216,7 @@ export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
           durationMs,
           genre,
           year,
+          isVideo,
         });
       }
     } catch (err) {
@@ -234,8 +264,8 @@ export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
 
     const fileStmt = await db.conn.prepare(
       `INSERT INTO files (id, path, library_id, mtime, size, title, album_id,
-        artist_id, track, disc, duration_ms, genre, year)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        artist_id, track, disc, duration_ms, genre, year, is_video)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const file of files) {
       fileStmt.bindVarchar(1, file.id);
@@ -260,6 +290,7 @@ export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
       else fileStmt.bindVarchar(12, file.genre);
       if (file.year === null) fileStmt.bindNull(13);
       else fileStmt.bindInteger(13, file.year);
+      fileStmt.bindBoolean(14, file.isVideo);
       await fileStmt.run();
     }
     fileStmt.destroySync();
