@@ -122,6 +122,11 @@ export interface Library {
   /** Embedded (USLT) lyrics of the best artist/title match (null when the
    * match or the tag is missing). Parsed on demand — no lyrics column. */
   lyrics(query: { artist?: string; title?: string }): Promise<LyricsRow | null>;
+  /** Embedded (APIC) cover of an album's first song, or of a song id itself
+   * (null when neither resolves or no picture is embedded). */
+  embeddedCover(
+    id: string,
+  ): Promise<{ bytes: Uint8Array; format: string } | null>;
   /** Absolute path of an album's cover.jpg, for app.artwork (null if none). */
   albumCoverPath(id: string): Promise<string | null>;
 }
@@ -552,6 +557,29 @@ export function createLibrary(db: Db): Library {
       }
       if (text === undefined) return null;
       return { artist: song.artistName, title: song.title, text };
+    },
+
+    async embeddedCover(id) {
+      let res = await db.conn.runAndReadAll(
+        `SELECT path FROM files WHERE album_id = ${esc(id)}
+         ORDER BY path LIMIT 1`,
+      );
+      let row = (res.getRowObjects() as { path: string }[])[0];
+      if (!row) {
+        res = await db.conn.runAndReadAll(
+          `SELECT path FROM files WHERE id = ${esc(id)}`,
+        );
+        row = (res.getRowObjects() as { path: string }[])[0];
+      }
+      if (!row) return null;
+      try {
+        const meta = await parseFile(row.path);
+        const picture = meta.common.picture?.[0];
+        if (!picture) return null;
+        return { bytes: picture.data, format: picture.format };
+      } catch {
+        return null; // unreadable file — treated as no embedded cover
+      }
     },
 
     async albumCoverPath(id) {

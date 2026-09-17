@@ -158,28 +158,58 @@ Deno.test('getCoverArt serves cover.jpg when the album has one', async () => {
   }
 });
 
-Deno.test('getCoverArt falls back to the placeholder for missing or unknown covers', async () => {
+Deno.test('getCoverArt serves embedded art for album, song, and artist ids', async () => {
   const { app, library, close } = await setup();
   try {
     const ost = await library.search3('Fixture OST', {
-      artistCount: 0,
+      artistCount: 1,
       artistOffset: 0,
       albumCount: 1,
       albumOffset: 0,
-      songCount: 0,
+      songCount: 1,
       songOffset: 0,
     });
-    for (const id of [ost.albums[0].id, 'no-such-id']) {
+    const ostSong = await library.search3('Theme', {
+      artistCount: 0,
+      artistOffset: 0,
+      albumCount: 0,
+      albumOffset: 0,
+      songCount: 1,
+      songOffset: 0,
+    });
+    // Album id, song id, and the album artist's id (artist tile).
+    const ids = [
+      ost.albums[0].id,
+      ostSong.songs[0].id,
+      ost.albums[0].artistId,
+    ];
+    for (const id of ids) {
       const res = await app(
         new Request(`http://x/rest/getCoverArt.view?${AUTH}&id=${id}`),
       );
       assertEquals(res.status, 200);
-      assertEquals(res.headers.get('content-type'), 'image/png');
+      assertEquals(res.headers.get('content-type'), 'image/jpeg');
       const bytes = new Uint8Array(await res.arrayBuffer());
-      assert(bytes.length > 100);
-      // PNG magic bytes
-      assertEquals(Array.from(bytes.slice(0, 4)), [0x89, 0x50, 0x4e, 0x47]);
+      // JPEG magic (the fixture's APIC), not the placeholder PNG.
+      assertEquals(Array.from(bytes.slice(0, 2)), [0xff, 0xd8]);
     }
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('getCoverArt falls back to the placeholder for unknown covers', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(
+      new Request(`http://x/rest/getCoverArt.view?${AUTH}&id=no-such-id`),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(res.headers.get('content-type'), 'image/png');
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    assert(bytes.length > 100);
+    // PNG magic bytes
+    assertEquals(Array.from(bytes.slice(0, 4)), [0x89, 0x50, 0x4e, 0x47]);
   } finally {
     await close();
   }
