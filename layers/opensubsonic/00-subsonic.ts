@@ -91,6 +91,8 @@ export interface HatContext {
       >;
       /** Absolute path of a song's audio file (null when unknown). */
       songPath(id: string): Promise<string | null>;
+      /** All music videos in the catalog (getVideos). */
+      videos(): Promise<SongRow[]>;
       /** Random songs from the catalog (getRandomSongs pull-forward). */
       randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
       listGenres(): Promise<GenreRow[]>;
@@ -244,6 +246,7 @@ export interface SongRow {
   size: number | null;
   genre: string | null;
   year: number | null;
+  isVideo: boolean;
   suffix: string;
   contentType: string;
 }
@@ -513,7 +516,7 @@ function childOf(song: SongRow): Record<string, unknown> {
     albumId: song.albumId ?? undefined,
     artistId: song.artistId ?? undefined,
     type: 'music',
-    isVideo: false,
+    isVideo: song.isVideo,
   };
 }
 
@@ -858,6 +861,23 @@ const OPS: Record<string, OpHandler> = {
     const song = await context.app.library.getSong(id);
     if (song === null) return notFound(context);
     return { song: childOf(song) };
+  },
+
+  // M4: music videos are files rows with isVideo — same id namespace as
+  // songs, so any client can resolve the same id. No hls (plan §8).
+  getVideos: async (_request, context) => {
+    const videos = await context.app.library.videos();
+    return { videos: { video: videos.map(childOf) } };
+  },
+
+  // Minimal videoInfo: the id only — no captions/audioTrack/conversion
+  // lists (those exist for Subsonic's own player; M4 ships none).
+  getVideoInfo: async (_request, context) => {
+    const id = requiredParam(context, 'id');
+    if (id instanceof Response) return id;
+    const video = await context.app.library.getSong(id);
+    if (video === null || !video.isVideo) return notFound(context);
+    return { videoInfo: { id: video.id } };
   },
 
   search3: async (_request, context) => {

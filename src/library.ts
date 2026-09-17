@@ -112,6 +112,8 @@ export interface Library {
   ): Promise<Search3Result>;
   /** Absolute path of a song's audio file, for app.stream. */
   songPath(id: string): Promise<string | null>;
+  /** All music videos in the catalog (getVideos). */
+  videos(): Promise<SongRow[]>;
   /** Random songs from the catalog (getRandomSongs pull-forward). */
   randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
   /** All genres with song/album counts (getGenres). */
@@ -495,6 +497,13 @@ export function createLibrary(db: Db): Library {
       );
       const row = (res.getRowObjects() as { path: string }[])[0];
       return row?.path ?? null;
+    },
+
+    async videos() {
+      const res = await db.conn.runAndReadAll(
+        `${SONG_SELECT} WHERE f.is_video ORDER BY f.path`,
+      );
+      return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
     },
 
     async randomSongs(size, folderId) {
