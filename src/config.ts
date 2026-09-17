@@ -14,6 +14,10 @@ export interface Config {
   // Server version for protocol envelopes (OpenSubsonic serverVersion), read
   // from deno.json at load — not an env knob.
   version?: string;
+  // MELOFON_DEBUG_LOG_REQUEST=1|true — one line per HTTP request (method,
+  // path, credential-redacted query, headers, status) for client-compat
+  // debugging. Off by default.
+  debugLogRequests?: boolean;
 }
 
 export function loadConfig(
@@ -57,5 +61,8 @@ export function loadConfig(
     password: env('MELOFON_PASSWORD'),
     secret: env('MELOFON_SECRET'),
     version,
+    debugLogRequests: ['1', 'true'].includes(
+      env('MELOFON_DEBUG_LOG_REQUEST') ?? '',
+    ),
   };
 }

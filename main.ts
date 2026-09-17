@@ -55,4 +55,7 @@ const bag = {
   artwork: createArtwork(library),
 };
 const layers = await loadLayers({ app: bag });
-Deno.serve(cfg.listen ?? {}, facade(core, layers));
+Deno.serve(
+  cfg.listen ?? {},
+  facade(core, layers, { debugLogRequests: cfg.debugLogRequests }),
+);

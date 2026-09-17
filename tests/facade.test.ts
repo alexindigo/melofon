@@ -4,7 +4,7 @@
 // empty tree is not representable (pathfinder rejects zero-file roots), so
 // dispatch into a layer is proven by its own endpoint, never by a fake
 // product route.
-import { assertEquals } from '@std/assert';
+import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { openDb } from '../src/db.ts';
@@ -94,6 +94,43 @@ Deno.test('/ answers 200 (client reachability probes; UI lands with M5)', async 
       'text/plain; charset=utf-8',
     );
     assertEquals(await res.text(), 'Hello World!\n');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('request logging is gated by debugLogRequests and redacts credentials', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const lines: string[] = [];
+    const orig = console.log;
+    console.log = (line: unknown) => {
+      lines.push(String(line));
+    };
+    try {
+      await facade(core, layers)(new Request('http://x/echo?c=test'));
+      assertEquals(lines.length, 0);
+      await facade(core, layers, { debugLogRequests: true })(
+        new Request('http://x/echo?c=test&u=admin&p=hunter2&apiKey=sekrit', {
+          headers: {
+            'user-agent': 'facade-test',
+            cookie: 'session=abc123',
+            'x-api-key': 'alsosomething',
+          },
+        }),
+      );
+      assertEquals(lines.length, 1);
+      assert(lines[0].startsWith('[http] GET /echo?'));
+      assert(lines[0].includes('c=test'));
+      assert(lines[0].includes('user-agent: facade-test'));
+      assert(!lines[0].includes('hunter2')); // credentials redacted
+      assert(!lines[0].includes('u=admin'));
+      assert(!lines[0].includes('sekrit'));
+      assert(!lines[0].includes('abc123'));
+      assert(!lines[0].includes('alsosomething'));
+    } finally {
+      console.log = orig;
+    }
   } finally {
     await close();
   }

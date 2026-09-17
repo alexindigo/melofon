@@ -22,27 +22,68 @@ function headersMatch(request: Request, layer: Layer): boolean {
 export function facade(
   coreApp: PathfinderApp,
   layers: Layer[],
+  opts: { debugLogRequests?: boolean } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
   const candidates = layers.filter((l) => l.port === undefined);
   return async (request: Request, info?: unknown): Promise<Response> => {
     const path = new URL(request.url).pathname;
 
+    // MELOFON_DEBUG_LOG_REQUEST: one line per request — method, path,
+    // credential-redacted query, response status, and all request headers
+    // (authorization-family redacted) — for client-compat debugging.
+    const respond = async (res: Promise<Response>): Promise<Response> => {
+      if (!opts.debugLogRequests) return await res;
+      const r = await res;
+      const url = new URL(request.url);
+      const q: string[] = [];
+      url.searchParams.forEach((v, k) => {
+        // Subsonic credentials: u/p, enc:hex p, t+s token, apiKey extension.
+        q.push(
+          `${k}=${['u', 'p', 't', 's', 'apiKey'].includes(k) ? '•••' : v}`,
+        );
+      });
+      const hdrs = [...request.headers.entries()]
+        .map(([k, v]) =>
+          `${k}: ${
+            [
+                'authorization',
+                'proxy-authorization',
+                'cookie',
+                'x-api-key',
+              ].includes(k)
+              ? '•••'
+              : v
+          }`
+        )
+        .join(' | ');
+      console.log(
+        `[http] ${request.method} ${path}?${
+          q.join('&')
+        } -> ${r.status} {${hdrs}}`,
+      );
+      return r;
+    };
+
     // Amperfy-style reachability probes GET the server root before login and
     // abort on any >= 400 — answer 200. The real UI claims / with M5; until
     // then it's a plain-text hello.
     if (path === '/') {
-      return new Response('Hello World!\n', {
-        headers: { 'content-type': 'text/plain; charset=utf-8' },
-      });
+      return respond(
+        Promise.resolve(
+          new Response('Hello World!\n', {
+            headers: { 'content-type': 'text/plain; charset=utf-8' },
+          }),
+        ),
+      );
     }
 
     // /_/ — the "no layer" prefix: core's own tree.
     if (path === '/_' || path.startsWith('/_/')) {
       const rest = path.slice(2) || '/';
-      return await coreApp(
+      return await respond(coreApp(
         new Request(new URL(rest, request.url), request),
         info,
-      );
+      ));
     }
 
     // Force prefix: /_<name> strip → that layer.
@@ -50,10 +91,10 @@ export function facade(
       const prefix = `/_${layer.name}`;
       if (path === prefix || path.startsWith(`${prefix}/`)) {
         const rest = path.slice(prefix.length) || '/';
-        return await layer.app(
+        return await respond(layer.app(
           new Request(new URL(rest, request.url), request),
           info,
-        );
+        ));
       }
     }
 
@@ -63,11 +104,13 @@ export function facade(
       const result = layer.app.lookup(request.method, path);
       if (result.kind === 'match') hits.push(layer);
     }
-    if (hits.length === 1) return await hits[0].app(request, info);
+    if (hits.length === 1) return await respond(hits[0].app(request, info));
     if (hits.length > 1) {
       const match = hits.find((l) => headersMatch(request, l));
-      if (match) return await match.app(request, info);
+      if (match) return await respond(match.app(request, info));
     }
-    return Response.json({ detail: 'Not Found' }, { status: 404 });
+    return respond(
+      Promise.resolve(Response.json({ detail: 'Not Found' }, { status: 404 })),
+    );
   };
 }
