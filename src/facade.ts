@@ -122,6 +122,10 @@ export function facade(
     opts.defaultPort,
     opts.env ?? {},
   );
+  // The `/` hello answers on the default listen only; on an extra bind `/`
+  // belongs to the bind's hats (the owntone hat serves no Vue → 404).
+  const isDefaultListen = opts.listenPort === undefined ||
+    opts.listenPort === opts.defaultPort;
   let nextReqId = 0;
   let inflight = 0;
   return async (request: Request, info?: unknown): Promise<Response> => {
@@ -179,9 +183,10 @@ export function facade(
     };
 
     // Amperfy-style reachability probes GET the server root before login and
-    // abort on any >= 400 — answer 200 (the M5 UI replaces this stub on
-    // branch `owntone`; master keeps the plain-text hello).
-    if (path === '/') {
+    // abort on any >= 400 — answer 200 on the default listen (the M5 UI
+    // replaces this stub on branch `owntone`; master keeps the plain-text
+    // hello). Extra binds leave `/` to their hats.
+    if (isDefaultListen && path === '/') {
       return respond(
         Promise.resolve(
           new Response('Hello World!\n', {
