@@ -57,5 +57,8 @@ const bag = {
 const layers = await loadLayers({ app: bag });
 Deno.serve(
   cfg.listen ?? {},
-  facade(core, layers, { debugLogRequests: cfg.debugLogRequests }),
+  facade(core, layers, {
+    debugLogRequests: cfg.debugLogRequests,
+    debugLogHeaders: cfg.debugLogHeaders,
+  }),
 );

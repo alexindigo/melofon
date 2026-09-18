@@ -13,6 +13,14 @@
 // `info` (Deno.serve's second handler argument, carrying remoteAddr) must be
 // forwarded into every app call, or pathfinder's Layer 0 loopback guard sees
 // no peer and fails closed.
+//
+// MELOFON_DEBUG_LOG_REQUEST: a three-event trace per request (diagnosing
+// stream-vs-browse stalls — see plans/diag-request-trace). `accept` at
+// facade entry, `headers` when the handler returns a Response (waitMs),
+// `done` when Deno.serve's info.completed settles (bodyMs; skipped when the
+// caller fakes info without completed — tests). Credentials (u/p/t/s/apiKey)
+// are always redacted. Compact by default: the full header dump stays
+// behind MELOFON_DEBUG_LOG_HEADERS and rides the accept line.
 import type { PathfinderApp } from '@pathfinder/pathfinder';
 import type { Layer } from './layers.ts';
 
@@ -54,54 +62,109 @@ function repath(request: Request, path: string): Request {
   return new Request(url, request);
 }
 
+// Subsonic credentials: u/p, enc:hex p, t+s token, apiKey extension.
+const REDACT_KEYS = ['u', 'p', 't', 's', 'apiKey'];
+
+function redactedQuery(url: URL): string {
+  const q: string[] = [];
+  url.searchParams.forEach((v, k) => {
+    q.push(`${k}=${REDACT_KEYS.includes(k) ? '•••' : v}`);
+  });
+  return q.join('&');
+}
+
+function redactedHeaders(request: Request): string {
+  return [...request.headers.entries()]
+    .map(([k, v]) =>
+      `${k}: ${
+        [
+            'authorization',
+            'proxy-authorization',
+            'cookie',
+            'x-api-key',
+          ].includes(k)
+          ? '•••'
+          : v
+      }`
+    )
+    .join(' | ');
+}
+
+// ISO time-of-day with milliseconds: 12:34:56.789.
+function timeOfDay(): string {
+  return new Date().toISOString().slice(11, 23);
+}
+
+interface TraceInfo {
+  remoteAddr?: { hostname?: string };
+  completed?: Promise<void>;
+}
+
 export function facade(
   coreApp: PathfinderApp,
   layers: Layer[],
-  opts: { debugLogRequests?: boolean } = {},
+  opts: { debugLogRequests?: boolean; debugLogHeaders?: boolean } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
   const candidates = layers.filter((l) => l.port === undefined);
+  let nextReqId = 0;
+  let inflight = 0;
   return async (request: Request, info?: unknown): Promise<Response> => {
+    const debug = opts.debugLogRequests === true;
     const path = new URL(request.url).pathname;
-
-    // MELOFON_DEBUG_LOG_REQUEST: one line per request — method, path,
-    // credential-redacted query, response status, and all request headers
-    // (authorization-family redacted) — for client-compat debugging.
-    const respond = async (res: Promise<Response>): Promise<Response> => {
-      if (!opts.debugLogRequests) return await res;
-      const r = await res;
-      const url = new URL(request.url);
-      const q: string[] = [];
-      url.searchParams.forEach((v, k) => {
-        // Subsonic credentials: u/p, enc:hex p, t+s token, apiKey extension.
-        q.push(
-          `${k}=${['u', 'p', 't', 's', 'apiKey'].includes(k) ? '•••' : v}`,
-        );
-      });
-      const hdrs = [...request.headers.entries()]
-        .map(([k, v]) =>
-          `${k}: ${
-            [
-                'authorization',
-                'proxy-authorization',
-                'cookie',
-                'x-api-key',
-              ].includes(k)
-              ? '•••'
-              : v
-          }`
-        )
-        .join(' | ');
+    const url = new URL(request.url);
+    let reqId = 0;
+    const started = performance.now();
+    if (debug) {
+      reqId = ++nextReqId;
+      inflight++;
+      const peer = (info as TraceInfo | undefined)?.remoteAddr?.hostname ??
+        '?';
+      const dump = opts.debugLogHeaders === true
+        ? ` ${redactedQuery(url)} {${redactedHeaders(request)}}`
+        : '';
       console.log(
-        `[http] ${request.method} ${path}?${
-          q.join('&')
-        } -> ${r.status} {${hdrs}}`,
+        `[http ${timeOfDay()}] accept req=${reqId} inflight=${inflight} ` +
+          `${request.method} ${path} peer=${peer}${dump}`,
       );
-      return r;
+    }
+
+    // Wraps each dispatch branch: with debug off it is the identity.
+    const respond = (res: Promise<Response>): Promise<Response> => {
+      if (!debug) return res;
+      return res.then((response) => {
+        const waitMs = Math.round(performance.now() - started);
+        console.log(
+          `[http ${timeOfDay()}] headers req=${reqId} inflight=${inflight} ` +
+            `${request.method} ${path} -> ${response.status} waitMs=${waitMs}`,
+        );
+        const completed = (info as TraceInfo | undefined)?.completed;
+        if (completed === undefined) {
+          // Tests calling the facade without Deno.serve's info: no `done`.
+          inflight--;
+        } else {
+          const done = (aborted: boolean) => {
+            inflight--;
+            const bodyMs = Math.round(
+              performance.now() - started - waitMs,
+            );
+            console.log(
+              `[http ${timeOfDay()}] done req=${reqId} inflight=${inflight} ` +
+                `${request.method} ${path} bodyMs=${bodyMs}` +
+                (aborted ? ' aborted' : ''),
+            );
+          };
+          void completed.then(
+            () => done(false),
+            () => done(true), // client disconnected mid-body
+          );
+        }
+        return response;
+      });
     };
 
     // Amperfy-style reachability probes GET the server root before login and
-    // abort on any >= 400 — answer 200. The real UI claims / with M5; until
-    // then it's a plain-text hello.
+    // abort on any >= 400 — answer 200 (the M5 UI replaces this stub on
+    // branch `owntone`; master keeps the plain-text hello).
     if (path === '/') {
       return respond(
         Promise.resolve(

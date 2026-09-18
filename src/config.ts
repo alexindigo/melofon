@@ -14,10 +14,12 @@ export interface Config {
   // Server version for protocol envelopes (OpenSubsonic serverVersion), read
   // from deno.json at load — not an env knob.
   version?: string;
-  // MELOFON_DEBUG_LOG_REQUEST=1|true — one line per HTTP request (method,
-  // path, credential-redacted query, headers, status) for client-compat
-  // debugging. Off by default.
+  // MELOFON_DEBUG_LOG_REQUEST=1|true — a compact three-event trace per HTTP
+  // request (accept/headers/done; credentials always redacted). Off by default.
   debugLogRequests?: boolean;
+  // MELOFON_DEBUG_LOG_HEADERS=1|true — additionally dump the request's
+  // redacted query + headers on the accept line. Off by default.
+  debugLogHeaders?: boolean;
 }
 
 export function loadConfig(
@@ -63,6 +65,9 @@ export function loadConfig(
     version,
     debugLogRequests: ['1', 'true'].includes(
       env('MELOFON_DEBUG_LOG_REQUEST') ?? '',
+    ),
+    debugLogHeaders: ['1', 'true'].includes(
+      env('MELOFON_DEBUG_LOG_HEADERS') ?? '',
     ),
   };
 }
