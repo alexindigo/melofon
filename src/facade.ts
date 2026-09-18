@@ -105,7 +105,7 @@ export function facade(
   layers: Layer[],
   opts: { debugLogRequests?: boolean; debugLogHeaders?: boolean } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
-  const candidates = layers.filter((l) => l.port === undefined);
+  const candidates = layers.filter((l) => l.ports.length === 0);
   let nextReqId = 0;
   let inflight = 0;
   return async (request: Request, info?: unknown): Promise<Response> => {

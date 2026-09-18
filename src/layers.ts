@@ -8,6 +8,10 @@
 //
 //   { "rest": "/rest" }   →   layers/<name>/rest/ answered at /rest/…
 //
+// `port` is a number or a list of numbers — the layer's CLAIMED default
+// ports (hooks, never binds; src/binds.ts maps claims to actual sockets).
+// Omitted or [] means unported: a candidate on the default listen only.
+//
 // A layer with no mount keys keeps the old shape: the whole layer dir is the
 // pathfinder root (prefix '').
 import { pathfinder } from '@pathfinder/pathfinder';
@@ -29,12 +33,30 @@ export interface Mount {
 export interface Layer {
   name: string;
   mounts: Mount[];
-  port: number | undefined;
+  /** Claimed default ports from the manifest (hooks, not binds). [] = unported. */
+  ports: number[];
   headers: HeaderMatch[];
   dir: string;
 }
 
 const RESERVED = new Set(['port', 'headers']);
+
+// Manifest `port`: number | number[] | undefined → number[]. Anything else
+// (non-int, 0, >65535, mixed junk) is a load-time error naming the file.
+function parsePortClaim(dir: string, raw: unknown): number[] {
+  if (raw === undefined) return [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  for (const p of list) {
+    if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 65535) {
+      throw new Error(
+        `${dir}/manifest.json — "port" must be an integer 1..65535 or a list of them, got ${
+          JSON.stringify(raw)
+        }`,
+      );
+    }
+  }
+  return list;
+}
 
 export async function loadLayers(opts: {
   app: object;
@@ -49,7 +71,7 @@ export async function loadLayers(opts: {
     if (!entry.isDirectory) continue;
     const dir = `${root}/${entry.name}`;
     let manifest:
-      & { port?: number; headers?: HeaderMatch[] }
+      & { port?: number | number[]; headers?: HeaderMatch[] }
       & Record<
         string,
         unknown
@@ -87,7 +109,7 @@ export async function loadLayers(opts: {
     layers.push({
       name: entry.name,
       mounts,
-      port: manifest.port,
+      ports: parsePortClaim(dir, manifest.port),
       headers: manifest.headers ?? [],
       dir,
     });
