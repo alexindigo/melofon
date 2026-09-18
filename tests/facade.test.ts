@@ -1,10 +1,11 @@
 // tests/facade.test.ts — dispatch grammar: /_/ → core tree, /_<name>/ → that
 // layer stripped, lookup pass-through on a hit, bare 404 from core on a miss.
-// The fixture layer (tests/fixtures/layers/layer-a) is a real endpoint tree
-// booted through loadLayers (no manifest → the layer dir itself is the one
-// root): an empty tree is not representable (pathfinder rejects zero-file
-// roots), so dispatch into a layer is proven by its own endpoint, never by a
-// fake product route.
+// The fixture layers (tests/fixtures/layers/) are real endpoint trees booted
+// through loadLayers: layer-a is unported (default listen); layer-p and
+// layer-q share the 3689 claim mounted at /alpha and /beta; layer-two claims
+// [3689, 3688] at /ws-hook. An empty tree is not representable (pathfinder
+// rejects zero-file roots), so dispatch into a layer is proven by its own
+// endpoint, never by a fake product route.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
@@ -92,6 +93,166 @@ Deno.test('/ answers 200 (client reachability probes; UI lands with M5)', async 
       'text/plain; charset=utf-8',
     );
     assertEquals(await res.text(), 'Hello World!\n');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('bind filter: unported /echo on the default facade, 404 on an extra bind', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const res = await facade(core, layers)(new Request('http://x/echo'));
+    assertEquals(res.status, 200);
+    const extra = facade(core, layers, {
+      listenPort: 3689,
+      defaultPort: 4534,
+    });
+    assertEquals((await extra(new Request('http://x/echo'))).status, 404);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('default facade does not serve ported hats', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const def = facade(core, layers);
+    assertEquals((await def(new Request('http://x/alpha'))).status, 404);
+    assertEquals((await def(new Request('http://x/beta'))).status, 404);
+    assertEquals((await def(new Request('http://x/ws-hook'))).status, 404);
+    assertEquals(
+      (await def(new Request('http://x/_layer-p/alpha'))).status,
+      404,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('shared extra bind: /alpha and /beta split by path on 3689 (claimed as-is)', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const extra = facade(core, layers, {
+      listenPort: 3689,
+      defaultPort: 4534,
+    });
+    const alpha = await extra(new Request('http://x/alpha'));
+    assertEquals(alpha.status, 200);
+    assertEquals(await alpha.json(), { layer: 'p', route: '/alpha' });
+    const beta = await extra(new Request('http://x/beta'));
+    assertEquals(beta.status, 200);
+    assertEquals(await beta.json(), { layer: 'q', route: '/beta' });
+    // Force prefix works for candidates on the extra bind…
+    const forced = await extra(new Request('http://x/_layer-p/alpha'));
+    assertEquals(forced.status, 200);
+    assertEquals(await forced.json(), { layer: 'p', route: '/alpha' });
+    // …but not for a layer that is not a candidate on this bind.
+    assertEquals(
+      (await extra(new Request('http://x/_layer-a/echo'))).status,
+      404,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('extra bind: a two-claim layer answers on each claimed port', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    for (const listenPort of [3689, 3688]) {
+      const app = facade(core, layers, { listenPort, defaultPort: 4534 });
+      const res = await app(new Request('http://x/ws-hook'));
+      assertEquals(res.status, 200);
+      assertEquals(await res.json(), { layer: 'two', route: '/ws-hook' });
+    }
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('REPLACE_ moves the shared claim: hats answer on 4000, not 3689', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const env = { MELOFON_LISTEN_REPLACE_3689: '4000' };
+    const moved = facade(core, layers, {
+      listenPort: 4000,
+      defaultPort: 4534,
+      env,
+    });
+    assertEquals((await moved(new Request('http://x/alpha'))).status, 200);
+    assertEquals((await moved(new Request('http://x/beta'))).status, 200);
+    const quiet = facade(core, layers, {
+      listenPort: 3689,
+      defaultPort: 4534,
+      env,
+    });
+    assertEquals((await quiet(new Request('http://x/alpha'))).status, 404);
+    assertEquals((await quiet(new Request('http://x/beta'))).status, 404);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('per-layer listen env peels one hat off the shared claim', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const env = { 'MELOFON_LISTEN_layer-p': '3690' };
+    const own = facade(core, layers, {
+      listenPort: 3690,
+      defaultPort: 4534,
+      env,
+    });
+    const alpha = await own(new Request('http://x/alpha'));
+    assertEquals(alpha.status, 200);
+    assertEquals(await alpha.json(), { layer: 'p', route: '/alpha' });
+    assertEquals((await own(new Request('http://x/beta'))).status, 404);
+    const shared = facade(core, layers, {
+      listenPort: 3689,
+      defaultPort: 4534,
+      env,
+    });
+    assertEquals((await shared(new Request('http://x/beta'))).status, 200);
+    assertEquals((await shared(new Request('http://x/alpha'))).status, 404);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('per-layer listen env wins over REPLACE_ for that hat', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const env = {
+      MELOFON_LISTEN_REPLACE_3689: '4000',
+      'MELOFON_LISTEN_layer-p': '3690',
+    };
+    const own = facade(core, layers, {
+      listenPort: 3690,
+      defaultPort: 4534,
+      env,
+    });
+    assertEquals((await own(new Request('http://x/alpha'))).status, 200);
+    const shared = facade(core, layers, {
+      listenPort: 4000,
+      defaultPort: 4534,
+      env,
+    });
+    assertEquals((await shared(new Request('http://x/beta'))).status, 200);
+    assertEquals((await shared(new Request('http://x/alpha'))).status, 404);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('/_/ answers the core tree on an extra bind too', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const extra = facade(core, layers, {
+      listenPort: 3689,
+      defaultPort: 4534,
+    });
+    const res = await extra(new Request('http://x/_/health'));
+    assertEquals(res.status, 200);
+    assertEquals(await res.json(), { ok: true });
   } finally {
     await close();
   }

@@ -10,6 +10,10 @@
 // A layer's routes are 100% the layer's responsibility — core never lends,
 // pins, or backstops a route for any layer, and has no opinion on /_status
 // (pathfinder's per-hat Layer 0, in that hat's own format).
+// Candidates are filtered by the bind this facade serves (src/binds.ts): the
+// default listen (no listenPort, or listenPort === defaultPort) serves
+// unported layers only; an extra bind serves the layers whose claimed ports
+// map to it after MELOFON_LISTEN_<layer> / MELOFON_LISTEN_REPLACE_<claimed>.
 // `info` (Deno.serve's second handler argument, carrying remoteAddr) must be
 // forwarded into every app call, or pathfinder's Layer 0 loopback guard sees
 // no peer and fails closed.
@@ -23,6 +27,7 @@
 // behind MELOFON_DEBUG_LOG_HEADERS and rides the accept line.
 import type { PathfinderApp } from '@pathfinder/pathfinder';
 import type { Layer } from './layers.ts';
+import { candidatesForBind } from './binds.ts';
 
 function headersMatch(request: Request, layer: Layer): boolean {
   return layer.headers.length > 0 &&
@@ -103,9 +108,20 @@ interface TraceInfo {
 export function facade(
   coreApp: PathfinderApp,
   layers: Layer[],
-  opts: { debugLogRequests?: boolean; debugLogHeaders?: boolean } = {},
+  opts: {
+    listenPort?: number;
+    defaultPort?: number;
+    env?: Record<string, string>;
+    debugLogRequests?: boolean;
+    debugLogHeaders?: boolean;
+  } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
-  const candidates = layers.filter((l) => l.ports.length === 0);
+  const candidates = candidatesForBind(
+    layers,
+    opts.listenPort,
+    opts.defaultPort,
+    opts.env ?? {},
+  );
   let nextReqId = 0;
   let inflight = 0;
   return async (request: Request, info?: unknown): Promise<Response> => {
