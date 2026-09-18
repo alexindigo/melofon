@@ -265,25 +265,35 @@ Deno.test('facade dispatches /rest/ping into the opensubsonic layer', async () =
   }
 });
 
-// .view is paused until pathfinder ships the optional suffix (pathfinder
-// TODO.md): one route directory must accept both /rest/ping and
-// /rest/ping.view without a greedy capture. Un-ignore when the dependency
-// bumps; do not add ping.view/ twin folders.
-Deno.test({
-  name: 'GET /rest/ping.view dispatches like /rest/ping',
-  ignore: true,
-  fn: async () => {
-    const { app, close } = await setup();
-    try {
-      const res = await app(
-        new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
-      );
-      assertEquals(res.status, 200);
-      assertEquals((await jsonBody(res)).status, 'ok');
-    } finally {
-      await close();
-    }
-  },
+// .view is live: pathfinder 0.2.3 empty-ok captures (`<op>##ext`) answer
+// both /rest/ping and /rest/ping.view from one folder. /rest/pingXYZ is not
+// an op — the 20-suffix gate answers the 404 envelope.
+Deno.test('GET /rest/ping.view dispatches like /rest/ping', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(
+      new Request(`http://x/rest/ping.view?${AUTH}&f=json`),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await jsonBody(res)).status, 'ok');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('/rest/pingXYZ is the 404 envelope, not ping', async () => {
+  const { app, close } = await setup();
+  try {
+    const res = await app(
+      new Request(`http://x/rest/pingXYZ?${AUTH}&f=json`),
+    );
+    assertEquals(res.status, 404);
+    const body = await jsonBody(res);
+    assertEquals(body.status, 'failed');
+    assertEquals(body.type, 'melofon');
+  } finally {
+    await close();
+  }
 });
 
 Deno.test('loadLayers mounts rest at /rest: bare /rest/ping answers through the facade', async () => {

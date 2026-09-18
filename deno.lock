@@ -1,11 +1,10 @@
 {
   "version": "5",
   "specifiers": {
-    "jsr:@pathfinder/pathfinder@0.2.2": "0.2.2",
+    "jsr:@pathfinder/pathfinder@0.2.3": "0.2.3",
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/cli@^1.0.32": "1.0.32",
     "jsr:@std/crypto@1": "1.1.0",
-    "jsr:@std/encoding@1": "1.0.11",
     "jsr:@std/encoding@^1.0.11": "1.0.11",
     "jsr:@std/fmt@^1.0.10": "1.0.10",
     "jsr:@std/fs@^1.0.24": "1.0.24",
@@ -24,8 +23,8 @@
     "npm:node-av@6.1.1": "6.1.1"
   },
   "jsr": {
-    "@pathfinder/pathfinder@0.2.2": {
-      "integrity": "5480fe871c08928b099b2e9317464472a37f54604cdc05c71e73d9a4e393d33b",
+    "@pathfinder/pathfinder@0.2.3": {
+      "integrity": "8be5c1340e5d74c43a936a4351683bf11dd8aa6f4fe5516b202cc88e4bd0064b",
       "dependencies": [
         "jsr:@std/path@^1.1.3"
       ]
@@ -58,7 +57,7 @@
       "integrity": "73a98e05ff58aa18bea562d286172e6c815b1eddd4fcab194beda19e3683b88c",
       "dependencies": [
         "jsr:@std/cli",
-        "jsr:@std/encoding@^1.0.11",
+        "jsr:@std/encoding",
         "jsr:@std/fmt",
         "jsr:@std/fs",
         "jsr:@std/html",
@@ -707,7 +706,7 @@
   },
   "workspace": {
     "dependencies": [
-      "jsr:@pathfinder/pathfinder@0.2.2",
+      "jsr:@pathfinder/pathfinder@0.2.3",
       "jsr:@std/assert@1",
       "jsr:@std/encoding@^1.0.11",
       "jsr:@std/http@1",
