@@ -1,7 +1,9 @@
 // main.ts — load config, open DB, seed the first-boot user, scan the library
 // sources into the catalog, boot the core tree + glob layers, serve the facade
-// on the process default listen. Layers get the injected service bag
-// (app.user, app.library, app.libraries, cfg) — never a DuckDB handle.
+// on the process default listen plus one Deno.serve per distinct actual extra
+// port the layers' claims map to (src/binds.ts). Layers get the injected
+// service bag (app.user, app.library, app.libraries, cfg) — never a DuckDB
+// handle.
 import { pathfinder } from '@pathfinder/pathfinder';
 import { loadConfig } from './src/config.ts';
 import { openDb } from './src/db.ts';
@@ -21,6 +23,7 @@ import { createZip } from './src/zip.ts';
 import { createMedia } from './src/media.ts';
 import { createArtwork } from './src/artwork.ts';
 import { loadLayers } from './src/layers.ts';
+import { actualPorts } from './src/binds.ts';
 import { facade } from './src/facade.ts';
 
 const cfg = loadConfig();
@@ -57,10 +60,37 @@ const bag = {
   artwork: createArtwork(library),
 };
 const layers = await loadLayers({ app: bag });
+
+// Extra binds: the distinct actual ports every layer's claims map to after
+// MELOFON_LISTEN_<layer> / MELOFON_LISTEN_REPLACE_<claimed> — minus the
+// default listen port, which is never bound twice. Deno.serve with no port
+// argument binds 8000, so the default port is known even without
+// MELOFON_LISTEN.
+const env = Deno.env.toObject();
+const defaultPort = cfg.listen?.port ?? 8000;
+const extraBinds = new Set<number>();
+for (const layer of layers) {
+  for (const port of actualPorts(layer, env)) {
+    if (port !== defaultPort) extraBinds.add(port);
+  }
+}
+
+const hostname = cfg.listen?.hostname;
+const debug = {
+  debugLogRequests: cfg.debugLogRequests,
+  debugLogHeaders: cfg.debugLogHeaders,
+};
 Deno.serve(
   cfg.listen ?? {},
-  facade(core, layers, {
-    debugLogRequests: cfg.debugLogRequests,
-    debugLogHeaders: cfg.debugLogHeaders,
-  }),
+  facade(core, layers, { defaultPort, env, ...debug }),
 );
+console.log(
+  `[melofon] listen ${hostname ?? '0.0.0.0'}:${defaultPort} (default)`,
+);
+for (const port of extraBinds) {
+  Deno.serve(
+    { hostname, port },
+    facade(core, layers, { listenPort: port, defaultPort, env, ...debug }),
+  );
+  console.log(`[melofon] listen ${hostname ?? '0.0.0.0'}:${port} (extra)`);
+}
