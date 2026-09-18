@@ -22,6 +22,7 @@ import { createStream } from './src/stream.ts';
 import { createZip } from './src/zip.ts';
 import { createMedia } from './src/media.ts';
 import { createArtwork } from './src/artwork.ts';
+import { createOutputs, createPlayer } from './src/player.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts } from './src/binds.ts';
 import { facade } from './src/facade.ts';
@@ -58,6 +59,8 @@ const bag = {
   stream: createStream(media),
   zip: createZip(),
   artwork: createArtwork(library),
+  player: createPlayer(),
+  outputs: createOutputs(),
 };
 const layers = await loadLayers({ app: bag });
 
