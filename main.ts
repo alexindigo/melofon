@@ -24,7 +24,9 @@ import { loadLayers } from './src/layers.ts';
 import { facade } from './src/facade.ts';
 
 const cfg = loadConfig();
-const db = await openDb(cfg.dataDir);
+const db = await openDb(cfg.dataDir, {
+  debugLogQueries: cfg.debugLogRequests,
+});
 await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();

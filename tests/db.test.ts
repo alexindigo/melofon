@@ -1,7 +1,8 @@
 // tests/db.test.ts — openDb creates the file + schema; seedFirstUser inserts
 // once, encrypts the password, never overwrites existing users.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
-import { openDb } from '../src/db.ts';
+import { instrumentConn, openDb } from '../src/db.ts';
+import type * as duckdb from '@duckdb/node-api';
 import {
   decryptPassword,
   encryptPassword,
@@ -91,6 +92,37 @@ Deno.test('seedFirstUser does not overwrite existing users', async () => {
   } finally {
     db.close();
     await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('query spans log begin/end and qinflight on overlap', async () => {
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (line: unknown) => {
+    lines.push(String(line));
+  };
+  try {
+    let release!: () => void;
+    const gate = new Promise<unknown>((
+      resolve,
+    ) => (release = () => resolve(null)));
+    const fake = {
+      run: (sql: string) => sql.includes('SLOW') ? gate : Promise.resolve(null),
+      runAndReadAll: (_sql: string) => Promise.resolve({ rows: [] }),
+    };
+    instrumentConn(fake as unknown as duckdb.DuckDBConnection);
+    const slow = fake.run('SELECT SLOW');
+    const fast = fake.run('SELECT 1');
+    release();
+    await Promise.all([slow, fast]);
+    assertEquals(lines.length, 5);
+    assertEquals(lines[0], '[db] begin sql=SELECT SLOW qinflight=1');
+    assertEquals(lines[1], '[db] overlap qinflight=2');
+    assertEquals(lines[2], '[db] begin sql=SELECT 1 qinflight=2');
+    assert(lines[3].startsWith('[db] end sql=SELECT 1 waitMs='));
+    assert(lines[4].startsWith('[db] end sql=SELECT SLOW waitMs='));
+  } finally {
+    console.log = orig;
   }
 });
 
