@@ -3,8 +3,9 @@
 import {
   badRequest,
   findAlbumByWire,
-  intParam,
   notFound,
+  paged,
+  pagingParams,
   trackPayload,
 } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
@@ -15,21 +16,12 @@ export default async (request: HatRequest, context: HatContext) => {
   if (album === null) return notFound();
   const got = await context.app.library.getAlbum(album.id);
   if (got === null) return notFound();
-  const rawOffset = request.query.get('offset');
-  const rawLimit = request.query.get('limit');
-  const offset = rawOffset === null ? 0 : intParam(rawOffset);
-  const limit = rawLimit === null ? -1 : intParam(rawLimit);
-  if (offset === null || limit === null || offset < 0 || limit < -1) {
-    return badRequest();
-  }
+  const paging = pagingParams(request.query);
+  if (paging instanceof Response) return paging;
   const albumArtist = { id: got.album.artistId, name: got.album.artistName };
-  const page = limit === -1
-    ? got.songs.slice(offset)
-    : got.songs.slice(offset, offset + limit);
-  return {
-    items: page.map((song) => trackPayload(song, albumArtist)),
-    total: got.songs.length,
-    offset,
-    limit,
-  };
+  return paged(
+    got.songs.map((song) => trackPayload(song, albumArtist)),
+    paging.offset,
+    paging.limit,
+  );
 };

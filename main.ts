@@ -48,6 +48,7 @@ const notify = createNotify();
 const env = Deno.env.toObject();
 const bag = {
   cfg,
+  startedAt: new Date().toISOString(),
   libraries,
   scan,
   media,

@@ -6,8 +6,10 @@
 // `track_id` on the item is the library (wire) id.
 import type {
   AlbumRow,
+  ArtistRow,
   HatContext,
   OutputRow,
+  PlaylistRow,
   QueueEntryRow,
   SongRow,
 } from './types.ts';
@@ -44,6 +46,29 @@ export async function findSongByWire(
   const n = Number(wire);
   const songs = await app.library.randomSongs(ALL);
   return songs.find((s) => wireInt(s.id) === n) ?? null;
+}
+
+/** Wire int → artist row (null when unknown or not digits). */
+export async function findArtistByWire(
+  app: HatContext['app'],
+  wire: string,
+): Promise<ArtistRow | null> {
+  if (!/^\d+$/.test(wire)) return null;
+  const n = Number(wire);
+  const artists = await app.library.listArtists();
+  return artists.find((a) => wireInt(a.id) === n) ?? null;
+}
+
+/** Wire int → playlist row for the seeded user (null when unknown, not
+ * digits, or no user configured). */
+export async function findPlaylistByWire(
+  app: HatContext['app'],
+  wire: string,
+): Promise<PlaylistRow | null> {
+  if (!/^\d+$/.test(wire) || app.cfg.user === undefined) return null;
+  const n = Number(wire);
+  const playlists = await app.playlists.list(app.cfg.user);
+  return playlists.find((p) => wireInt(p.id) === n) ?? null;
 }
 
 /** Album artist for payload building, cached per request (one getAlbum per
@@ -140,6 +165,44 @@ export function outputPayload(output: OutputRow) {
   };
 }
 
+/** OwnTone artist object. track_count/length_ms are summed over the artist's
+ * albums in the hat (app.library has no per-artist aggregate — thin, N+1 by
+ * design at this slice's scale). */
+export async function artistPayload(
+  app: HatContext['app'],
+  artist: ArtistRow,
+) {
+  const albums = await app.library.albumsByArtist(artist.id);
+  return {
+    id: String(wireInt(artist.id)),
+    name: artist.name,
+    name_sort: artist.name, // the catalog keeps no sort names
+    album_count: artist.albumCount,
+    track_count: albums.reduce((n, a) => n + a.songCount, 0),
+    length_ms: albums.reduce((n, a) => n + a.durationMs, 0),
+    uri: `library:artist:${wireInt(artist.id)}`,
+  };
+}
+
+/** OwnTone playlist object (plain only — no smart playlists, no folders).
+ * `id` is a number like theirs; `path` carries the name (Melofon playlists
+ * have no file path). */
+export function playlistPayload(playlist: PlaylistRow) {
+  return {
+    id: wireInt(playlist.id),
+    name: playlist.name,
+    path: playlist.name,
+    parent_id: 0,
+    type: 'plain',
+    smart_playlist: false,
+    random: false,
+    folder: false,
+    item_count: playlist.songCount,
+    stream_count: 0,
+    uri: `library:playlist:${wireInt(playlist.id)}`,
+  };
+}
+
 // --- Small shared bits for the route files ---
 
 export const noContent = () => new Response(null, { status: 204 });
@@ -160,4 +223,29 @@ export function intParam(value: string | null): number | null {
   if (value === null) return null;
   const n = Number(value);
   return Number.isInteger(n) ? n : null;
+}
+
+/** OwnTone paging params: offset ≥ 0, limit ≥ -1 (-1 = all). 400 on junk. */
+export function pagingParams(
+  query: URLSearchParams,
+): { offset: number; limit: number } | Response {
+  const rawOffset = query.get('offset');
+  const rawLimit = query.get('limit');
+  const offset = rawOffset === null ? 0 : intParam(rawOffset);
+  const limit = rawLimit === null ? -1 : intParam(rawLimit);
+  if (offset === null || limit === null || offset < 0 || limit < -1) {
+    return badRequest();
+  }
+  return { offset, limit };
+}
+
+/** OwnTone paging object: { items, total, offset, limit }. The caller passes
+ * the FULL list (thin slice: no count queries in app.library). */
+export function paged<T>(all: T[], offset: number, limit: number) {
+  return {
+    items: limit === -1 ? all.slice(offset) : all.slice(offset, offset + limit),
+    total: all.length,
+    offset,
+    limit,
+  };
 }

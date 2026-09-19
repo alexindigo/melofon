@@ -27,7 +27,12 @@ export interface HatContext {
   app: {
     cfg: {
       version?: string;
+      /** Seeded account — OwnTone playlists are global, Melofon's are
+       * per-user; the hat reads this user's. Unset → empty list. */
+      user?: string;
     };
+    /** Boot time (ISO) — /api/library's started_at. */
+    startedAt?: string;
     notify: {
       /** Listen for core change events (OwnTone names); returns unsubscribe. */
       subscribe(fn: (types: string[]) => void): () => void;
@@ -36,6 +41,13 @@ export interface HatContext {
       /** The actual bind of one of this hat's claimed ports (after env
        * remaps) — /api/config's websocket_port. */
       actual(layerName: string, claimed: number): number;
+    };
+    scan: {
+      status(): Promise<ScanStatusRow>;
+    };
+    playlists: {
+      list(username: string): Promise<PlaylistRow[]>;
+      get(username: string, id: string): Promise<PlaylistWithTracks | null>;
     };
     player: {
       status(): PlayerStatusRow;
@@ -76,6 +88,24 @@ export interface HatContext {
       /** Borrowed as the all-songs scan for wire-id resolution (app.library
        * has no list-all; a ceiling size returns the whole catalog). */
       randomSongs(size: number): Promise<SongRow[]>;
+      listArtists(): Promise<ArtistRow[]>;
+      getArtist(id: string): Promise<ArtistRow | null>;
+      albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+      getSong(id: string): Promise<SongRow | null>;
+      listGenres(): Promise<GenreRow[]>;
+      search3(
+        query: string,
+        opts: {
+          artistCount: number;
+          artistOffset: number;
+          albumCount: number;
+          albumOffset: number;
+          songCount: number;
+          songOffset: number;
+        },
+      ): Promise<
+        { artists: ArtistRow[]; albums: AlbumRow[]; songs: SongRow[] }
+      >;
     };
   };
 }
@@ -128,4 +158,37 @@ export interface OutputRow {
   type: string;
   selected: boolean;
   volume: number;
+}
+
+export interface ArtistRow {
+  id: string;
+  name: string;
+  albumCount: number;
+}
+
+export interface GenreRow {
+  name: string;
+  songCount: number;
+  albumCount: number;
+}
+
+export interface PlaylistRow {
+  id: string;
+  name: string;
+  comment: string | null;
+  createdAtMs: number;
+  changedAtMs: number;
+  songCount: number;
+  durationMs: number;
+}
+
+export interface PlaylistWithTracks extends PlaylistRow {
+  trackIds: string[];
+}
+
+export interface ScanStatusRow {
+  scanning: boolean;
+  count: number;
+  folderCount: number;
+  lastScanMs: number | null;
 }
