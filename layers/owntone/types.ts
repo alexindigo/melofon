@@ -93,9 +93,8 @@ export interface HatContext {
       getAlbum(
         id: string,
       ): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
-      /** Borrowed as the all-songs scan for wire-id resolution (app.library
-       * has no list-all; a ceiling size returns the whole catalog). */
-      randomSongs(size: number): Promise<SongRow[]>;
+      /** Stable-order catalog walk for deterministic wire-id resolution. */
+      listSongs(opts: { offset: number; size: number }): Promise<SongRow[]>;
       listArtists(): Promise<ArtistRow[]>;
       getArtist(id: string): Promise<ArtistRow | null>;
       albumsByArtist(artistId: string): Promise<AlbumRow[]>;

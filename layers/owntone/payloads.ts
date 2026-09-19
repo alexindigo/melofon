@@ -36,15 +36,16 @@ export async function findAlbumByWire(
   return albums.find((a) => wireInt(a.id) === n) ?? null;
 }
 
-/** Wire int → song row (null when unknown or not digits). randomSongs with a
- * ceiling size is the all-songs scan (app.library has no list-all). */
+/** Wire int → song row (null when unknown or not digits). listSongs with a
+ * ceiling size is the catalog walk — stable path order, so wire→song
+ * resolution is deterministic. */
 export async function findSongByWire(
   app: HatContext['app'],
   wire: string,
 ): Promise<SongRow | null> {
   if (!/^\d+$/.test(wire)) return null;
   const n = Number(wire);
-  const songs = await app.library.randomSongs(ALL);
+  const songs = await app.library.listSongs({ offset: 0, size: ALL });
   return songs.find((s) => wireInt(s.id) === n) ?? null;
 }
 

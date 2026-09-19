@@ -16,6 +16,8 @@ import { createListens } from '../src/listens.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
+import { createStream } from '../src/stream.ts';
+import { createMedia } from '../src/media.ts';
 import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
@@ -57,6 +59,7 @@ async function setup() {
     player,
     outputs: createOutputs({ notify }),
     playback,
+    stream: createStream(createMedia(), playback),
     notify,
     binds: createBinds(() => layers, {}),
   };
@@ -128,6 +131,36 @@ Deno.test('client report: getNowPlaying has it; OwnTone player stays engine; not
     const entries2 = await npEntry(onDefault);
     assertEquals(entries2.length, 1);
     assertEquals(entries2[0].title, songs[1].title);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('a stream open reports the play (no listens; player stays engine)', async () => {
+  const { db, onDefault, onHook, songs, close } = await setup();
+  try {
+    const res = await get(
+      onDefault,
+      `/rest/stream?${NARJO}&f=json&id=${songs[0].id}`,
+    );
+    assertEquals(res.status, 200);
+    await res.body?.cancel();
+
+    // The session shows on getNowPlaying…
+    const entries = await npEntry(onDefault);
+    assertEquals(entries.length, 1);
+    assertEquals(entries[0].title, songs[0].title);
+
+    // …but stream is not a scrobble: no listens row.
+    const listens = (await db.conn.runAndReadAll(
+      'SELECT count(*) AS n FROM listens',
+    )).getRowObjects() as { n: bigint }[];
+    assertEquals(Number(listens[0].n), 0);
+
+    // …and the OwnTone player is still the idle engine.
+    const player = await (await get(onHook, '/api/player')).json();
+    assertEquals(player.state, 'stop');
+    assertEquals(player.item_id, 0);
   } finally {
     await close();
   }

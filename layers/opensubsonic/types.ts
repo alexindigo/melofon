@@ -193,11 +193,16 @@ export interface HatContext {
       nowPlayingView(): Promise<NowPlayingViewRow[]>;
     };
     stream: {
-      file(request: Request, path: string): Promise<Response>;
+      file(
+        request: Request,
+        path: string,
+        identity?: StreamIdentity,
+      ): Promise<Response>;
       play(
         request: Request,
         file: { path: string; isVideo: boolean },
         format?: string,
+        identity?: StreamIdentity,
       ): Promise<Response | null>;
     };
     media: {
@@ -313,6 +318,15 @@ export interface BookmarkRow {
   comment: string | null;
   createdAtMs: number;
   changedAtMs: number;
+}
+
+/** One id per stream open (each Range hit mints its own) — core hooks
+ * start/complete into playback.reportPlaying/reportStopped. */
+export interface StreamIdentity {
+  username: string;
+  client: string;
+  trackId: string;
+  streamId: string;
 }
 
 export interface LyricsRow {
