@@ -23,6 +23,7 @@ import { createZip } from './src/zip.ts';
 import { createMedia } from './src/media.ts';
 import { createArtwork } from './src/artwork.ts';
 import { createOutputs, createPlayer } from './src/player.ts';
+import { createPlayback } from './src/playback.ts';
 import { createNotify } from './src/notify.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts, createBinds } from './src/binds.ts';
@@ -46,6 +47,9 @@ const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const notify = createNotify();
 const env = Deno.env.toObject();
+const player = createPlayer({ notify });
+const outputs = createOutputs({ notify });
+const nowPlaying = createNowPlaying(db, { notify });
 const bag = {
   cfg,
   startedAt: new Date().toISOString(),
@@ -59,12 +63,13 @@ const bag = {
   playlists: createPlaylists(db),
   clientQueue: createClientQueue(db),
   bookmarks: createBookmarks(db),
-  nowPlaying: createNowPlaying(db),
+  nowPlaying,
+  playback: createPlayback({ player, nowPlaying, library, cfg }),
   stream: createStream(media),
   zip: createZip(),
   artwork: createArtwork(library),
-  player: createPlayer({ notify }),
-  outputs: createOutputs({ notify }),
+  player,
+  outputs,
   notify,
   binds: createBinds(() => layers, env),
 };

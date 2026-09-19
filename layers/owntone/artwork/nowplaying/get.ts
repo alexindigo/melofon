@@ -1,11 +1,13 @@
 // layers/owntone/artwork/nowplaying/get.ts — GET /artwork/nowplaying: the
-// wire-reported current item's cover (the queue head when stopped, per the
-// player status fallback). 404 when the queue is empty.
+// current item's cover from app.playback.playerView() — THE shared read, so
+// a mirrored client report's cover answers too (the engine wins when it has
+// a current item). 404 when neither plane has anything.
 import { notFound } from '#owntone/payloads.ts';
 import type { HatContext } from '#owntone/types.ts';
 
-export default (_request: unknown, context: HatContext) => {
-  const current = context.app.player.status().current;
-  if (current === null) return notFound();
-  return context.app.artwork.cover(current.song.albumId ?? current.song.id);
+export default async (_request: unknown, context: HatContext) => {
+  const view = await context.app.playback.playerView();
+  if (view.current === null) return notFound();
+  const song = view.current.song;
+  return context.app.artwork.cover(song.albumId ?? song.id);
 };

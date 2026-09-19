@@ -45,6 +45,11 @@ export interface HatContext {
     scan: {
       status(): Promise<ScanStatusRow>;
     };
+    playback: {
+      /** THE shared player read (engine wins, else mirrored client report).
+       * The hat encodes; it never merges stores itself. */
+      playerView(): Promise<PlayerViewRow>;
+    };
     artwork: {
       /** Cover image for an album/song/artist id — always an image. */
       cover(id: string): Promise<Response>;
@@ -195,4 +200,17 @@ export interface ScanStatusRow {
   count: number;
   folderCount: number;
   lastScanMs: number | null;
+}
+
+export interface PlayerViewRow {
+  state: 'play' | 'pause' | 'stop';
+  repeat: 'off' | 'all' | 'single';
+  consume: boolean;
+  shuffle: boolean;
+  volume: number;
+  /** Engine entry, or a synthetic current (id −1) for a mirrored client
+   * report; null when neither plane has anything. */
+  current: { id: number; song: SongRow } | null;
+  itemLengthMs: number;
+  itemProgressMs: number;
 }

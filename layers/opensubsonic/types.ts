@@ -187,6 +187,11 @@ export interface HatContext {
       ): Promise<void>;
       list(): Promise<NowPlayingRow[]>;
     };
+    playback: {
+      /** THE shared now-playing read (client rows + the engine's current).
+       * The hat encodes; it never merges stores itself. */
+      nowPlayingView(): Promise<NowPlayingViewRow[]>;
+    };
     stream: {
       file(request: Request, path: string): Promise<Response>;
       play(
@@ -320,6 +325,16 @@ export interface NowPlayingRow {
   username: string;
   client: string;
   trackId: string;
+  positionMs: number | null;
+  startedAtMs: number;
+}
+
+/** app.playback.nowPlayingView() row: a now-playing entry with the song
+ * already resolved by core (client rows plus the engine's current). */
+export interface NowPlayingViewRow {
+  username: string;
+  client: string;
+  song: SongRow;
   positionMs: number | null;
   startedAtMs: number;
 }

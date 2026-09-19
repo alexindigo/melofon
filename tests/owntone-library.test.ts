@@ -13,6 +13,8 @@ import { createLibrary } from '../src/library.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createArtwork } from '../src/artwork.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
+import { createPlayback } from '../src/playback.ts';
+import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
@@ -53,6 +55,8 @@ async function setup(
     await playlists.create('admin', 'Mix', [got!.songs[0].id]);
   }
   const notify = createNotify();
+  const player = createPlayer({ notify });
+  const nowPlaying = createNowPlaying(db);
   const bag = {
     cfg,
     startedAt: STARTED_AT,
@@ -61,8 +65,9 @@ async function setup(
     scan,
     playlists,
     artwork: createArtwork(library),
-    player: createPlayer({ notify }),
+    player,
     outputs: createOutputs({ notify }),
+    playback: createPlayback({ player, nowPlaying, library, cfg }),
     notify,
     binds: createBinds(() => layers, {}),
   };

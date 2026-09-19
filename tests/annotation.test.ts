@@ -13,6 +13,8 @@ import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
+import { createPlayer } from '../src/player.ts';
+import { createPlayback } from '../src/playback.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
 
@@ -33,14 +35,19 @@ async function setup() {
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
+  const library = createLibrary(db);
+  const player = createPlayer();
+  const nowPlaying = createNowPlaying(db);
   const bag = {
     cfg,
     libraries,
     user: createUserService(db, cfg),
-    library: createLibrary(db),
+    library,
     annotation: createAnnotation(db),
     listens: createListens(db),
-    nowPlaying: createNowPlaying(db),
+    nowPlaying,
+    player,
+    playback: createPlayback({ player, nowPlaying, library, cfg }),
   };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));

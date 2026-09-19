@@ -10,6 +10,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
+import { createPlayback } from '../src/playback.ts';
+import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
@@ -34,14 +36,22 @@ async function setup(env: Record<string, string> = {}) {
   await scanLibrary(db);
   const notify = createNotify();
   const outputs = createOutputs({ notify });
+  const player = createPlayer({ notify });
+  const library = createLibrary(db);
   const bag = {
     cfg,
     libraries,
-    library: createLibrary(db),
-    player: createPlayer({ notify }),
+    library,
+    player,
     outputs,
     notify,
     binds: createBinds(() => layers, env),
+    playback: createPlayback({
+      player,
+      nowPlaying: createNowPlaying(db),
+      library,
+      cfg,
+    }),
   };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
   const layers = await loadLayers({ app: bag });

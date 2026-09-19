@@ -2,8 +2,10 @@
 // Navidrome's player-keyed NowPlaying. scrobble submission=false replaces the
 // row; submission=true never touches it (that path is append-only listens);
 // stream never writes here. Keep-on-rescan user state. Hats pass the state
-// username; core keys rows by internal user_id.
+// username; core keys rows by internal user_id. A successful set emits
+// `player` on app.notify — core owns the hub; hats never emit.
 import type { Db } from './db.ts';
+import type { Notify } from './notify.ts';
 import { userIdForName } from './user.ts';
 
 export interface NowPlayingRow {
@@ -30,7 +32,10 @@ function esc(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-export function createNowPlaying(db: Db): NowPlaying {
+export function createNowPlaying(
+  db: Db,
+  { notify }: { notify?: Notify } = {},
+): NowPlaying {
   return {
     async set(username, client, trackId, positionMs) {
       const userId = await userIdForName(db, username);
@@ -42,10 +47,11 @@ export function createNowPlaying(db: Db): NowPlaying {
            ${positionMs === undefined ? 'NULL' : Math.trunc(positionMs)},
            now())
          ON CONFLICT (user_id, client) DO UPDATE SET
-           track_id = excluded.track_id,
-           position_ms = excluded.position_ms,
-           started_at = excluded.started_at`,
+            track_id = excluded.track_id,
+            position_ms = excluded.position_ms,
+            started_at = excluded.started_at`,
       );
+      notify?.emit(['player']);
     },
 
     async list() {

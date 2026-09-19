@@ -13,6 +13,9 @@ import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createListens } from '../src/listens.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
+import { createPlayer } from '../src/player.ts';
+import { createPlayback } from '../src/playback.ts';
+import { createNotify } from '../src/notify.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
 
@@ -33,13 +36,20 @@ async function setup() {
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
+  const library = createLibrary(db);
+  const notify = createNotify();
+  const player = createPlayer({ notify });
+  const nowPlaying = createNowPlaying(db, { notify });
   const bag = {
     cfg,
     libraries,
     user: createUserService(db, cfg),
-    library: createLibrary(db),
+    library,
     listens: createListens(db),
-    nowPlaying: createNowPlaying(db),
+    nowPlaying,
+    player,
+    playback: createPlayback({ player, nowPlaying, library, cfg }),
+    notify,
   };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
@@ -162,5 +172,35 @@ Deno.test('getNowPlaying renders entries as XML', async () => {
     assert(xml.includes('playerName="melofon-test"'));
   } finally {
     await close();
+  }
+});
+
+Deno.test('nowPlaying.set emits player on app.notify (core owns the hub)', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-np-emit-' });
+  const db = await openDb(dir);
+  try {
+    const cfg = {
+      listen: undefined,
+      dataDir: dir,
+      user: 'admin',
+      password: 'test',
+      secret: 's3cret',
+      version: '0.0.0-test',
+    };
+    await seedFirstUser(db, cfg);
+    const events: string[][] = [];
+    const notify = createNotify();
+    notify.subscribe((types) => events.push(types));
+    const nowPlaying = createNowPlaying(db, { notify });
+
+    await nowPlaying.set('admin', 'narjo', 'some-track-id');
+    assertEquals(events, [['player']]);
+
+    // A failed set (unknown user) emits nothing.
+    await nowPlaying.set('ghost', 'narjo', 'some-track-id').catch(() => {});
+    assertEquals(events, [['player']]);
+  } finally {
+    db.close();
+    await Deno.remove(dir, { recursive: true });
   }
 });
