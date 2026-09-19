@@ -23,6 +23,7 @@ import { createZip } from './src/zip.ts';
 import { createMedia } from './src/media.ts';
 import { createArtwork } from './src/artwork.ts';
 import { createOutputs, createPlayer } from './src/player.ts';
+import { createNotify } from './src/notify.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts } from './src/binds.ts';
 import { facade } from './src/facade.ts';
@@ -43,6 +44,7 @@ console.log(
 const app = { db, cfg, libraries };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
+const notify = createNotify();
 const bag = {
   cfg,
   libraries,
@@ -59,8 +61,9 @@ const bag = {
   stream: createStream(media),
   zip: createZip(),
   artwork: createArtwork(library),
-  player: createPlayer(),
-  outputs: createOutputs(),
+  player: createPlayer({ notify }),
+  outputs: createOutputs({ notify }),
+  notify,
 };
 const layers = await loadLayers({ app: bag });
 

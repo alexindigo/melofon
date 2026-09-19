@@ -6,12 +6,19 @@
 // the truth, not a placeholder. Hats (OwnTone JSON, later the Melofon UI)
 // drive this engine; they never hold player state themselves.
 //
+// Every mutation emits on app.notify (OwnTone's event names): player for
+// playback, options for shuffle/repeat/consume, volume for master volume,
+// queue for queue changes, outputs (plus volume when an output's own volume
+// changes) for the outputs list. Emits are hints — "this may have changed,
+// re-read it" — and fire only on mutations that act.
+//
 // No audio means progress is wall-clock: while state is 'play' the position
 // advances in real time from the last seek/start base, clamped at the item
 // length. There is no auto-advance at the end of a track — the repeat /
 // consume / shuffle modes are stored and reported on the wire, but their
 // playback-order effects arrive with real playback (M6).
 import type { SongRow } from './library.ts';
+import type { Notify } from './notify.ts';
 
 export interface QueueEntry {
   /** Queue-local int id (monotonic within the process, never reused). */
@@ -90,7 +97,8 @@ function clampVolume(n: number): number {
   return Math.min(100, Math.max(0, Math.trunc(n)));
 }
 
-export function createPlayer(): Player {
+export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
+  const emit = (types: string[]) => notify?.emit(types);
   let items: QueueEntry[] = [];
   let version = 0;
   let nextId = 1;
@@ -165,13 +173,28 @@ export function createPlayer(): Player {
       };
     },
 
-    play: doPlay,
-    pause: doPause,
-    stop: doStop,
+    play() {
+      if (items.length === 0) return; // empty queue: 204, state stays stop
+      doPlay();
+      emit(['player']);
+    },
+
+    pause() {
+      if (state !== 'play') return;
+      doPause();
+      emit(['player']);
+    },
+
+    stop() {
+      doStop();
+      emit(['player']);
+    },
 
     toggle() {
+      if (items.length === 0) return;
       if (state === 'play') doPause();
       else doPlay();
+      emit(['player']);
     },
 
     next() {
@@ -179,33 +202,40 @@ export function createPlayer(): Player {
       const index = (currentIndex ?? -1) + 1;
       if (index >= items.length) {
         doStop();
+        emit(['player']);
         return;
       }
       startAt(index);
+      emit(['player']);
     },
 
     previous() {
       if (items.length === 0) return;
       startAt(Math.max(0, (currentIndex ?? 0) - 1));
+      emit(['player']);
     },
 
     setShuffle(on) {
       shuffle = on;
+      emit(['options']);
     },
 
     setConsume(on) {
       consume = on;
+      emit(['options']);
     },
 
     setRepeat(mode) {
       repeat = mode;
+      emit(['options']);
     },
 
     setVolume(opts) {
       if (opts.volume !== undefined) volume = clampVolume(opts.volume);
       else if (opts.step !== undefined) {
         volume = clampVolume(volume + opts.step);
-      }
+      } else return;
+      emit(['volume']);
     },
 
     seek(opts) {
@@ -220,6 +250,7 @@ export function createPlayer(): Player {
       baseProgressMs = Math.min(Math.max(0, Math.round(target)), length);
       startedAt = performance.now();
       state = 'play'; // OwnTone starts playback after a seek
+      emit(['player']);
       return true;
     },
 
@@ -231,6 +262,7 @@ export function createPlayer(): Player {
       const added = songs.map((song) => ({ id: nextId++, song }));
       items = [...items, ...added];
       version++;
+      emit(['queue']);
       return added;
     },
 
@@ -238,11 +270,14 @@ export function createPlayer(): Player {
       items = [];
       version++;
       doStop();
+      // The clear also stopped playback — both reads changed.
+      emit(['queue', 'player']);
     },
   };
 }
 
-export function createOutputs(): Outputs {
+export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
+  const emit = (types: string[]) => notify?.emit(types);
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
@@ -257,22 +292,26 @@ export function createOutputs(): Outputs {
       const idx = outputs.findIndex((o) => o.id === output.id);
       if (idx === -1) outputs.push({ ...output });
       else outputs[idx] = { ...output };
+      emit(['outputs']);
     },
     unregister(id) {
       const idx = outputs.findIndex((o) => o.id === id);
       if (idx === -1) return false;
       outputs.splice(idx, 1);
+      emit(['outputs']);
       return true;
     },
     setEnabled(ids) {
       if (ids.some((id) => find(id) === null)) return false;
       for (const o of outputs) o.selected = ids.includes(o.id);
+      emit(['outputs']);
       return true;
     },
     toggle(id) {
       const found = find(id);
       if (found === null) return null;
       found.selected = !found.selected;
+      emit(['outputs']);
       return { ...found };
     },
     update(id, opts) {
@@ -280,6 +319,7 @@ export function createOutputs(): Outputs {
       if (found === null) return null;
       if (opts.selected !== undefined) found.selected = opts.selected;
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
+      emit(opts.volume === undefined ? ['outputs'] : ['outputs', 'volume']);
       return { ...found };
     },
   };
