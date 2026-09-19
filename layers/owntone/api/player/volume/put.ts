@@ -19,11 +19,11 @@ export default (request: HatRequest, context: HatContext) => {
     return noContent();
   }
   if (volume !== null) {
-    context.app.player.setVolume({ volume });
+    context.app.playback.setVolume({ volume });
     return noContent();
   }
   if (step !== null) {
-    context.app.player.setVolume({ step });
+    context.app.playback.setVolume({ step });
     return noContent();
   }
   return badRequest();

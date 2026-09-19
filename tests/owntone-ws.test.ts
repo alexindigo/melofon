@@ -10,6 +10,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
+import { createPlayback } from '../src/playback.ts';
+import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
@@ -33,12 +35,16 @@ async function setup(env: Record<string, string> = {}) {
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
   const notify = createNotify();
+  const player = createPlayer();
+  const nowPlaying = createNowPlaying(db);
+  const library = createLibrary(db);
   const bag = {
     cfg,
     libraries,
-    library: createLibrary(db),
-    player: createPlayer({ notify }),
+    library,
+    player,
     outputs: createOutputs({ notify }),
+    playback: createPlayback({ player, nowPlaying, library, cfg, notify }),
     notify,
     binds: createBinds(() => layers, env),
   };

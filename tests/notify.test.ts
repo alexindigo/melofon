@@ -4,6 +4,7 @@
 import { assertEquals } from '@std/assert';
 import { createNotify, type Notify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
+import { createPlayback } from '../src/playback.ts';
 import type { SongRow } from '../src/library.ts';
 
 function recorder(): { notify: Notify; events: string[][] } {
@@ -80,25 +81,34 @@ Deno.test('hub: a throwing listener breaks neither the emitter nor others', () =
   assertEquals(seen, [['player']]);
 });
 
-Deno.test('player emits: playback → player, modes → options, volume → volume, queue → queue', () => {
+Deno.test('playback commands emit: engine → player/options/volume/queue', () => {
   const { notify, events } = recorder();
-  const player = createPlayer({ notify });
+  const player = createPlayer();
+  const playback = createPlayback({
+    player,
+    nowPlaying: {
+      set: () => Promise.resolve(),
+      clearByStreamId: () => Promise.resolve(true),
+      list: () => Promise.resolve([]),
+    },
+    library: {} as never, // views under test here don't touch the library
+    cfg: {},
+    notify,
+  });
 
-  player.play(); // empty queue: no-op, no emit
-  player.next(); // empty queue: no-op, no emit
-  assertEquals(events, []);
+  playback.play(); // empty queue: engine no-op, but the command fired
+  playback.queueAdd([song(), song()]);
+  assertEquals(events, [['player'], ['queue']]);
 
-  player.queueAdd([song(), song()]);
-  assertEquals(events, [['queue']]);
-
-  player.play();
-  player.pause();
-  player.toggle();
-  player.toggle();
-  player.next();
-  player.previous();
-  player.stop();
-  assertEquals(events.slice(1), [
+  events.length = 0;
+  playback.play();
+  playback.pause();
+  playback.toggle();
+  playback.toggle();
+  playback.next();
+  playback.previous();
+  playback.stop();
+  assertEquals(events, [
     ['player'],
     ['player'],
     ['player'],
@@ -109,24 +119,24 @@ Deno.test('player emits: playback → player, modes → options, volume → volu
   ]);
 
   events.length = 0;
-  player.setShuffle(true);
-  player.setRepeat('all');
-  player.setConsume(true);
+  playback.setShuffle(true);
+  playback.setRepeat('all');
+  playback.setConsume(true);
   assertEquals(events, [['options'], ['options'], ['options']]);
 
   events.length = 0;
-  player.setVolume({ volume: 70 });
-  player.setVolume({ step: -5 });
-  player.setVolume({}); // neither knob: no-op, no emit
+  playback.setVolume({ volume: 70 });
+  playback.setVolume({ step: -5 });
+  playback.setVolume({}); // neither knob: no-op, no emit
   assertEquals(events, [['volume'], ['volume']]);
 
   events.length = 0;
-  player.seek({ positionMs: 1000 });
+  playback.seek({ positionMs: 1000 });
   assertEquals(events, [['player']]);
 
-  // queueClear stops playback too — both reads changed.
+  // queueClear stops the engine too — both reads changed.
   events.length = 0;
-  player.queueClear();
+  playback.queueClear();
   assertEquals(events, [['queue', 'player']]);
 });
 

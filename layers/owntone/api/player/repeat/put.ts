@@ -8,6 +8,6 @@ export default (request: HatRequest, context: HatContext) => {
   if (state !== 'off' && state !== 'all' && state !== 'single') {
     return badRequest();
   }
-  context.app.player.setRepeat(state);
+  context.app.playback.setRepeat(state);
   return noContent();
 };

@@ -1,38 +1,33 @@
-// src/playback.ts — app.playback: THE shared playback read. Two planes stay
-// real (ARCHITECTURE §4): Subsonic clients pull and play themselves (their
-// rows live in app.nowPlaying); the server engine (app.player queue + state)
-// is for boots. What is shared is the NOW-PLAYING READ — and it lives here,
-// in core, because hats never merge stores themselves: they call this and
-// encode the result (wire shaping is theirs; deciding what is playing is
-// not).
+// src/playback.ts — app.playback: THE playback core. Two planes
+// (ARCHITECTURE §4): A, the server engine (one queue, real item ids — drives
+// boots in M6); B, client sessions (the app plays; rows in app.nowPlaying).
+// Hats parse inbound protocol into ONE command here and encode views back
+// out. They keep no playback state, never merge stores, never emit — core
+// mutates, then emits on app.notify after every successful command.
 //
-// playerView() (OwnTone /api/player): the engine wins whenever it has a
-// current item (play/pause, or stop-with-queue-head — today's fallback).
-// Else the newest nowPlaying row is mirrored as state 'play' with a
-// synthetic current so item_id/progress exist. The queue is NOT mirrored:
-// /api/queue stays the server engine's, and a client report never enqueues.
-//
-// nowPlayingView() (OpenSubsonic getNowPlaying): the client rows plus a
-// synthetic entry for the engine's current item, so an OwnTone/HA play is
-// visible on /rest too.
+// Commands:
+//   reportPlaying / reportStopped      plane B session writes
+//   play/pause/stop/toggle/next/       plane A engine writes
+//   previous/seek/setVolume/setShuffle/setRepeat/setConsume
+//   queueAdd/queueClear
+// Views:
+//   playerView()      engine only (HA/OwnTone media_player; stop ⇒ no current)
+//   queueView()       the engine queue (real queue-local ids)
+//   nowPlayingView()  all B sessions + the engine's current when play/pause
 import type { Library, SongRow } from './library.ts';
 import type { NowPlaying } from './nowplaying.ts';
-import type { Player } from './player.ts';
+import type { Notify } from './notify.ts';
+import type { Player, PlayerStatus, QueueEntry, RepeatMode } from './player.ts';
 
-/** item_id for a mirrored client report — never a real queue item id. */
-export const SYNTHETIC_ITEM_ID = -1;
-
-export interface PlayerView {
-  state: 'play' | 'pause' | 'stop';
-  repeat: 'off' | 'all' | 'single';
-  consume: boolean;
-  shuffle: boolean;
-  volume: number;
-  /** Engine entry, or { id: SYNTHETIC_ITEM_ID, song } for a mirrored client
-   * report; null when neither plane has anything. */
-  current: { id: number; song: SongRow } | null;
-  itemLengthMs: number;
-  itemProgressMs: number;
+export interface ReportPlaying {
+  username: string;
+  client: string;
+  trackId: string;
+  /** The stream/report minting this session — reportStopped only clears a
+   * session whose streamId is still current (an older Range completing must
+   * not clear a newer stream). */
+  streamId: string;
+  positionMs?: number;
 }
 
 export interface NowPlayingViewRow {
@@ -44,7 +39,25 @@ export interface NowPlayingViewRow {
 }
 
 export interface Playback {
-  playerView(): Promise<PlayerView>;
+  reportPlaying(report: ReportPlaying): Promise<void>;
+  reportStopped(opts: { streamId: string }): Promise<void>;
+
+  play(): void;
+  pause(): void;
+  stop(): void;
+  toggle(): void;
+  next(): void;
+  previous(): void;
+  setShuffle(on: boolean): void;
+  setConsume(on: boolean): void;
+  setRepeat(mode: RepeatMode): void;
+  setVolume(opts: { volume?: number; step?: number }): void;
+  seek(opts: { positionMs?: number; seekMs?: number }): boolean;
+  queueAdd(songs: SongRow[]): QueueEntry[];
+  queueClear(): void;
+
+  playerView(): PlayerStatus;
+  queueView(): { version: number; items: QueueEntry[] };
   nowPlayingView(): Promise<NowPlayingViewRow[]>;
 }
 
@@ -53,31 +66,86 @@ export function createPlayback(deps: {
   nowPlaying: NowPlaying;
   library: Library;
   cfg: { user?: string };
+  notify?: Notify;
 }): Playback {
-  const { player, nowPlaying, library, cfg } = deps;
+  const { player, nowPlaying, library, cfg, notify } = deps;
+  const emit = (types: string[]) => notify?.emit(types);
   return {
-    async playerView() {
-      const status = player.status();
-      if (status.current !== null) {
-        return { ...status, current: status.current };
-      }
-      // Engine idle: mirror the newest client report that still resolves.
-      for (const row of await nowPlaying.list()) {
-        const song = await library.getSong(row.trackId);
-        if (song === null) continue; // track vanished since the report
-        return {
-          state: 'play',
-          repeat: status.repeat,
-          consume: status.consume,
-          shuffle: status.shuffle,
-          volume: status.volume,
-          current: { id: SYNTHETIC_ITEM_ID, song },
-          itemLengthMs: song.durationMs ?? 0,
-          itemProgressMs: row.positionMs ?? 0,
-        };
-      }
-      return { ...status, current: null };
+    async reportPlaying(report) {
+      await nowPlaying.set(
+        report.username,
+        report.client,
+        report.trackId,
+        report.streamId,
+        report.positionMs,
+      );
+      emit(['player']);
     },
+
+    async reportStopped({ streamId }) {
+      // Clears only when this streamId is still the session's current one.
+      if (await nowPlaying.clearByStreamId(streamId)) emit(['player']);
+    },
+
+    play() {
+      player.play();
+      emit(['player']);
+    },
+    pause() {
+      player.pause();
+      emit(['player']);
+    },
+    stop() {
+      player.stop();
+      emit(['player']);
+    },
+    toggle() {
+      player.toggle();
+      emit(['player']);
+    },
+    next() {
+      player.next();
+      emit(['player']);
+    },
+    previous() {
+      player.previous();
+      emit(['player']);
+    },
+    setShuffle(on) {
+      player.setShuffle(on);
+      emit(['options']);
+    },
+    setConsume(on) {
+      player.setConsume(on);
+      emit(['options']);
+    },
+    setRepeat(mode) {
+      player.setRepeat(mode);
+      emit(['options']);
+    },
+    setVolume(opts) {
+      if (opts.volume === undefined && opts.step === undefined) return;
+      player.setVolume(opts);
+      emit(['volume']);
+    },
+    seek(opts) {
+      const ok = player.seek(opts);
+      if (ok) emit(['player']);
+      return ok;
+    },
+    queueAdd(songs) {
+      const added = player.queueAdd(songs);
+      emit(['queue']);
+      return added;
+    },
+    queueClear() {
+      player.queueClear();
+      // The clear also stopped the engine — both reads changed.
+      emit(['queue', 'player']);
+    },
+
+    playerView: () => player.status(),
+    queueView: () => player.queue(),
 
     async nowPlayingView() {
       const out: NowPlayingViewRow[] = [];
@@ -93,7 +161,7 @@ export function createPlayback(deps: {
       }
       for (const row of await nowPlaying.list()) {
         const song = await library.getSong(row.trackId);
-        if (song === null) continue;
+        if (song === null) continue; // track vanished since the report
         out.push({
           username: row.username,
           client: row.client,

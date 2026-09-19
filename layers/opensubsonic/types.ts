@@ -178,18 +178,18 @@ export interface HatContext {
       ): Promise<void>;
       remove(username: string, trackId: string): Promise<void>;
     };
-    nowPlaying: {
-      set(
-        username: string,
-        client: string,
-        trackId: string,
-        positionMs?: number,
-      ): Promise<void>;
-      list(): Promise<NowPlayingRow[]>;
-    };
     playback: {
-      /** THE shared now-playing read (client rows + the engine's current).
-       * The hat encodes; it never merges stores itself. */
+      /** THE playback core the hat calls: report a client play/stop (the
+       * session table is core's), read the shared now-playing view. The hat
+       * never merges stores and never touches the session table itself. */
+      reportPlaying(report: {
+        username: string;
+        client: string;
+        trackId: string;
+        streamId: string;
+        positionMs?: number;
+      }): Promise<void>;
+      reportStopped(opts: { streamId: string }): Promise<void>;
       nowPlayingView(): Promise<NowPlayingViewRow[]>;
     };
     stream: {
@@ -319,14 +319,6 @@ export interface LyricsRow {
   artist: string | null;
   title: string | null;
   text: string;
-}
-
-export interface NowPlayingRow {
-  username: string;
-  client: string;
-  trackId: string;
-  positionMs: number | null;
-  startedAtMs: number;
 }
 
 /** app.playback.nowPlayingView() row: a now-playing entry with the song

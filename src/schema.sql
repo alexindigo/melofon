@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 -- M3 amendment: now-playing, one row per (user, client) like Navidrome's
 -- player-keyed NowPlaying. scrobble submission=false replaces the row;
 -- submission=true never touches it (that path is append-only listens).
+-- stream_id (playback-core): the stream/report that minted this row —
+-- reportStopped clears only when its streamId is still the current one
+-- (an older Range completing must not clear a newer stream).
 CREATE TABLE IF NOT EXISTS now_playing (
   user_id VARCHAR NOT NULL,
   client VARCHAR NOT NULL,
@@ -116,3 +119,4 @@ CREATE TABLE IF NOT EXISTS now_playing (
   started_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (user_id, client)
 );
+ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS stream_id VARCHAR;

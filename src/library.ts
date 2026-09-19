@@ -120,6 +120,9 @@ export interface Library {
   videos(): Promise<SongRow[]>;
   /** Random songs from the catalog (getRandomSongs pull-forward). */
   randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
+  /** Paged catalog walk in a STABLE order (path) — for deterministic
+   * wire-id resolution (OwnTone find-by-wire-int). */
+  listSongs(opts: { offset: number; size: number }): Promise<SongRow[]>;
   /** All genres with song/album counts (getGenres). */
   listGenres(): Promise<GenreRow[]>;
   /** Songs of one genre (getSongsByGenre). */
@@ -517,6 +520,14 @@ export function createLibrary(db: Db): Library {
         `${SONG_SELECT}${
           folderId === undefined ? '' : ` WHERE f.library_id = ${esc(folderId)}`
         } ORDER BY RANDOM() LIMIT ${Math.trunc(size)}`,
+      );
+      return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async listSongs(opts) {
+      const res = await db.conn.runAndReadAll(
+        `${SONG_SELECT} ORDER BY f.path
+         LIMIT ${Math.trunc(opts.size)} OFFSET ${Math.trunc(opts.offset)}`,
       );
       return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
     },

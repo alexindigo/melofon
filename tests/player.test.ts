@@ -69,15 +69,15 @@ Deno.test('queue add appends with monotonic ids and bumps the version', () => {
   assertEquals(player.queue().items.length, 3);
 });
 
-Deno.test('play/pause/toggle/stop transitions and the stopped status fallback', () => {
+Deno.test('play/pause/toggle/stop transitions; stop clears current', () => {
   const player = createPlayer();
   player.queueAdd([song(1000), song(2000)]);
 
-  // Stopped: the wire shows the first queued item with progress 0.
+  // Stopped from the start: no current, no length (no queue-head fallback).
   let status = player.status();
   assertEquals(status.state, 'stop');
-  assertEquals(status.current?.id, 1);
-  assertEquals(status.itemLengthMs, 1000);
+  assertEquals(status.current, null);
+  assertEquals(status.itemLengthMs, 0);
   assertEquals(status.itemProgressMs, 0);
 
   player.play();
@@ -98,8 +98,8 @@ Deno.test('play/pause/toggle/stop transitions and the stopped status fallback', 
   player.stop();
   status = player.status();
   assertEquals(status.state, 'stop');
+  assertEquals(status.current, null);
   assertEquals(status.itemProgressMs, 0);
-  assertEquals(status.current?.id, 1); // fallback to the queue head
 
   // Play after stop restarts the queue head.
   player.play();

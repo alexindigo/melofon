@@ -55,7 +55,7 @@ async function setup(
     await playlists.create('admin', 'Mix', [got!.songs[0].id]);
   }
   const notify = createNotify();
-  const player = createPlayer({ notify });
+  const player = createPlayer();
   const nowPlaying = createNowPlaying(db);
   const bag = {
     cfg,
@@ -397,6 +397,13 @@ Deno.test('artwork: item/group/nowplaying, artwork_url on payloads, listen isola
       ),
     );
     assertEquals(add.status, 200);
+    // Queued but stopped: still no current (no queue-head fallback).
+    assertEquals((await get(app, '/artwork/nowplaying')).status, 404);
+    assertEquals(
+      (await app(new Request('http://x/api/player/play', { method: 'PUT' })))
+        .status,
+      204,
+    );
     const np = await get(app, '/artwork/nowplaying');
     assertEquals(np.status, 200);
     assertEquals(np.headers.get('content-type'), 'image/jpeg');

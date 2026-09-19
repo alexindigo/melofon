@@ -36,7 +36,7 @@ async function setup(env: Record<string, string> = {}) {
   await scanLibrary(db);
   const notify = createNotify();
   const outputs = createOutputs({ notify });
-  const player = createPlayer({ notify });
+  const player = createPlayer();
   const library = createLibrary(db);
   const bag = {
     cfg,
@@ -307,7 +307,7 @@ Deno.test('player flow: add by track uri → play → status reports play + item
     status = await (await get(onHook, '/api/player')).json();
     assertEquals(status.state, 'stop');
     assertEquals(status.item_progress_ms, 0);
-    assertEquals(status.item_id, itemId); // stopped: queue head fallback
+    assertEquals(status.item_id, 0); // stopped: no current (no fallback)
 
     // Clear.
     assertEquals((await put(onHook, '/api/queue/clear')).status, 204);

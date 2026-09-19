@@ -46,20 +46,12 @@ export interface HatContext {
       status(): Promise<ScanStatusRow>;
     };
     playback: {
-      /** THE shared player read (engine wins, else mirrored client report).
-       * The hat encodes; it never merges stores itself. */
-      playerView(): Promise<PlayerViewRow>;
-    };
-    artwork: {
-      /** Cover image for an album/song/artist id — always an image. */
-      cover(id: string): Promise<Response>;
-    };
-    playlists: {
-      list(username: string): Promise<PlaylistRow[]>;
-      get(username: string, id: string): Promise<PlaylistWithTracks | null>;
-    };
-    player: {
-      status(): PlayerStatusRow;
+      /** THE playback core: every player/queue mutation and the engine
+       * views. The hat parses into one command and encodes views back out —
+       * it never merges stores, never emits. playerView is ENGINE ONLY
+       * (stop ⇒ no current). */
+      playerView(): PlayerViewRow;
+      queueView(): { version: number; items: QueueEntryRow[] };
       play(): void;
       pause(): void;
       stop(): void;
@@ -71,9 +63,16 @@ export interface HatContext {
       setRepeat(mode: 'off' | 'all' | 'single'): void;
       setVolume(opts: { volume?: number; step?: number }): void;
       seek(opts: { positionMs?: number; seekMs?: number }): boolean;
-      queue(): { version: number; items: QueueEntryRow[] };
       queueAdd(songs: SongRow[]): QueueEntryRow[];
       queueClear(): void;
+    };
+    artwork: {
+      /** Cover image for an album/song/artist id — always an image. */
+      cover(id: string): Promise<Response>;
+    };
+    playlists: {
+      list(username: string): Promise<PlaylistRow[]>;
+      get(username: string, id: string): Promise<PlaylistWithTracks | null>;
     };
     outputs: {
       list(): OutputRow[];
@@ -148,17 +147,6 @@ export interface AlbumRow {
 export interface QueueEntryRow {
   id: number;
   song: SongRow;
-}
-
-export interface PlayerStatusRow {
-  state: 'play' | 'pause' | 'stop';
-  repeat: 'off' | 'all' | 'single';
-  consume: boolean;
-  shuffle: boolean;
-  volume: number;
-  current: QueueEntryRow | null;
-  itemLengthMs: number;
-  itemProgressMs: number;
 }
 
 export interface OutputRow {

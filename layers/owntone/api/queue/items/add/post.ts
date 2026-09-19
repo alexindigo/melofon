@@ -34,17 +34,17 @@ export default async (request: HatRequest, context: HatContext) => {
     }
   }
 
-  if (boolParam(request.query.get('clear'))) context.app.player.queueClear();
+  if (boolParam(request.query.get('clear'))) context.app.playback.queueClear();
   const shuffle = request.query.get('shuffle');
-  if (shuffle !== null) context.app.player.setShuffle(boolParam(shuffle));
+  if (shuffle !== null) context.app.playback.setShuffle(boolParam(shuffle));
 
-  const base = context.app.player.queue().items.length;
-  const added = context.app.player.queueAdd(songs);
-  if (request.query.get('playback') === 'start') context.app.player.play();
+  const base = context.app.playback.queueView().items.length;
+  const added = context.app.playback.queueAdd(songs);
+  if (request.query.get('playback') === 'start') context.app.playback.play();
 
   const albumArtist = albumArtistResolver(context.app);
   return {
-    version: context.app.player.queue().version,
+    version: context.app.playback.queueView().version,
     count: added.length,
     items: await Promise.all(
       added.map(async (entry, i) =>

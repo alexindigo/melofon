@@ -47,9 +47,10 @@ const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const notify = createNotify();
 const env = Deno.env.toObject();
-const player = createPlayer({ notify });
+const player = createPlayer();
 const outputs = createOutputs({ notify });
-const nowPlaying = createNowPlaying(db, { notify });
+const nowPlaying = createNowPlaying(db);
+const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
 const bag = {
   cfg,
   startedAt: new Date().toISOString(),
@@ -64,8 +65,8 @@ const bag = {
   clientQueue: createClientQueue(db),
   bookmarks: createBookmarks(db),
   nowPlaying,
-  playback: createPlayback({ player, nowPlaying, library, cfg }),
-  stream: createStream(media),
+  playback,
+  stream: createStream(media, playback),
   zip: createZip(),
   artwork: createArtwork(library),
   player,

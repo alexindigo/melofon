@@ -4,7 +4,7 @@ import { albumArtistResolver, queueItemPayload } from '#owntone/payloads.ts';
 import type { HatContext } from '#owntone/types.ts';
 
 export default async (_request: unknown, context: HatContext) => {
-  const { version, items } = context.app.player.queue();
+  const { version, items } = context.app.playback.queueView();
   const albumArtist = albumArtistResolver(context.app);
   return {
     version,

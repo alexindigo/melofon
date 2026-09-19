@@ -4,6 +4,6 @@ import { noContent } from '#owntone/payloads.ts';
 import type { HatContext } from '#owntone/types.ts';
 
 export default (_request: unknown, context: HatContext) => {
-  context.app.player.queueClear();
+  context.app.playback.queueClear();
   return noContent();
 };

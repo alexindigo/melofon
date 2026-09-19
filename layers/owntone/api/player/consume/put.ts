@@ -5,6 +5,6 @@ import type { HatContext, HatRequest } from '#owntone/types.ts';
 export default (request: HatRequest, context: HatContext) => {
   const state = request.query.get('state');
   if (state === null) return badRequest();
-  context.app.player.setConsume(boolParam(state));
+  context.app.playback.setConsume(boolParam(state));
   return noContent();
 };

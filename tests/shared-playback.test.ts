@@ -1,8 +1,9 @@
-// tests/shared-playback.test.ts — the shared now-playing read across hats:
-// an OpenSubsonic-shaped report (real /rest/scrobble) shows on OwnTone
-// /api/player as a mirrored synthetic current (engine wins when it has one);
-// the engine's play shows on /rest/getNowPlaying; the server queue stays
-// server-only. Hats never merge — the projection is core's app.playback.
+// tests/shared-playback.test.ts — two planes, one playback core. Plane B
+// (client reports) shows on OpenSubsonic getNowPlaying and emits `player` —
+// but OwnTone /api/player stays ENGINE (stop/empty when idle; no mirrored
+// lie). reportStopped clears a session only when its streamId is still
+// current. Plane A (the engine) shows on /rest too, and HA's album select
+// yields a real queue item. Hats never merge — the projection is core's.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
@@ -42,9 +43,10 @@ async function setup() {
   const events: string[][] = [];
   const notify = createNotify();
   notify.subscribe((types) => events.push(types));
-  const player = createPlayer({ notify });
-  const nowPlaying = createNowPlaying(db, { notify });
+  const player = createPlayer();
+  const nowPlaying = createNowPlaying(db);
   const library = createLibrary(db);
+  const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
   const bag = {
     cfg,
     libraries,
@@ -54,7 +56,7 @@ async function setup() {
     nowPlaying,
     player,
     outputs: createOutputs({ notify }),
-    playback: createPlayback({ player, nowPlaying, library, cfg }),
+    playback,
     notify,
     binds: createBinds(() => layers, {}),
   };
@@ -73,6 +75,7 @@ async function setup() {
     db,
     onDefault,
     onHook,
+    playback,
     events,
     songs,
     close: async () => {
@@ -89,93 +92,116 @@ const put = (app: (r: Request) => Promise<Response>, path: string) =>
 const post = (app: (r: Request) => Promise<Response>, path: string) =>
   app(new Request(`http://x${path}`, { method: 'POST' }));
 
-Deno.test('a client report mirrors onto OwnTone /api/player; the queue stays server-only', async () => {
+async function npEntry(app: (r: Request) => Promise<Response>) {
+  const res = await get(app, `/rest/getNowPlaying?${NARJO}&f=json`);
+  const body = await res.json();
+  return body['subsonic-response'].nowPlaying.entry;
+}
+
+Deno.test('client report: getNowPlaying has it; OwnTone player stays engine; notify fires', async () => {
   const { onDefault, onHook, events, songs, close } = await setup();
   try {
-    // Narjo reports a play (the real OpenSubsonic path).
     const scrobble = await get(
       onDefault,
       `/rest/scrobble?${NARJO}&f=json&id=${songs[0].id}&submission=false`,
     );
     assertEquals(scrobble.status, 200);
-
-    // Core emitted on the hub.
     assertEquals(events, [['player']]);
 
-    // OwnTone /api/player mirrors it: play, synthetic item id, real length.
-    const player = await (await get(onHook, '/api/player')).json();
-    assertEquals(player.state, 'play');
-    assertEquals(player.item_id, -1);
-    assertEquals(player.item_length_ms, songs[0].duration_ms);
+    const entries = await npEntry(onDefault);
+    assertEquals(entries.length, 1);
+    assertEquals(entries[0].title, songs[0].title);
+    assertEquals(entries[0].playerName, 'narjo');
 
-    // The server queue is untouched.
-    const queue = await (await get(onHook, '/api/queue')).json();
-    assertEquals(queue.count, 0);
+    // The OwnTone player is the ENGINE — idle here: no mirrored lie.
+    const player = await (await get(onHook, '/api/player')).json();
+    assertEquals(player.state, 'stop');
+    assertEquals(player.item_id, 0);
+    assertEquals(player.item_length_ms, 0);
+
+    // A second report supersedes the session and emits again.
+    await get(
+      onDefault,
+      `/rest/scrobble?${NARJO}&f=json&id=${songs[1].id}&submission=false`,
+    );
+    assertEquals(events, [['player'], ['player']]);
+    const entries2 = await npEntry(onDefault);
+    assertEquals(entries2.length, 1);
+    assertEquals(entries2[0].title, songs[1].title);
   } finally {
     await close();
   }
 });
 
-Deno.test('the engine wins when it has a current item; /rest sees the engine too', async () => {
-  const { onDefault, onHook, songs, close } = await setup();
+Deno.test('reportStopped clears only the current streamId', async () => {
+  const { onDefault, playback, events, songs, close } = await setup();
   try {
-    // A client report is present…
-    await get(
-      onDefault,
-      `/rest/scrobble?${NARJO}&f=json&id=${songs[0].id}&submission=false`,
-    );
-    // …but once the engine plays, it wins the player view.
+    await playback.reportPlaying({
+      username: 'admin',
+      client: 'narjo',
+      trackId: songs[0].id,
+      streamId: 'stream-1',
+    });
+    // A newer report supersedes: stream-1 is stale now.
+    await playback.reportPlaying({
+      username: 'admin',
+      client: 'narjo',
+      trackId: songs[1].id,
+      streamId: 'stream-2',
+    });
+    events.length = 0;
+
+    // Stale completion: session untouched, no emit.
+    await playback.reportStopped({ streamId: 'stream-1' });
+    assertEquals((await npEntry(onDefault)).length, 1);
+    assertEquals(events, []);
+
+    // Current completion: session gone, one emit.
+    await playback.reportStopped({ streamId: 'stream-2' });
+    assertEquals((await npEntry(onDefault)).length, 0);
+    assertEquals(events, [['player']]);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('engine: play shows on /rest; HA album select yields a real queue item', async () => {
+  const { onDefault, onHook, close } = await setup();
+  try {
+    // HA select: clear, add the album, start playback.
     const albums = await (await get(onHook, '/api/library/albums')).json();
-    const tracks = await (await get(
+    const add = await post(
       onHook,
-      `/api/library/albums/${albums.items[0].id}/tracks`,
-    )).json();
-    await post(
-      onHook,
-      `/api/queue/items/add?uris=library:track:${tracks.items[1].id}`,
+      `/api/queue/items/add?uris=library:album:${albums.items[0].id}` +
+        '&playback=start&clear=true',
     );
-    await put(onHook, '/api/player/play');
+    assertEquals(add.status, 200);
+
+    const queue = await (await get(onHook, '/api/queue')).json();
+    assert(queue.count > 0, 'queue populated');
+    const queueIds = queue.items.map((i: { id: number }) => i.id);
+
     const player = await (await get(onHook, '/api/player')).json();
     assertEquals(player.state, 'play');
+    assert(queueIds.includes(player.item_id), 'item_id is a real queue id');
+
+    // The engine's current appears on /rest as the 'melofon' client.
+    const entries = await npEntry(onDefault);
     assert(
-      player.item_id > 0,
-      `engine item id, not the sentinel: ${player.item_id}`,
+      entries.some((e: { playerName: string }) => e.playerName === 'melofon'),
+      'engine entry on /rest',
     );
 
-    // And the engine's play is visible on /rest/getNowPlaying alongside Narjo.
-    const np = await (await get(
-      onDefault,
-      `/rest/getNowPlaying?${NARJO}&f=json`,
-    )).json();
-    const entries = np['subsonic-response'].nowPlaying.entry;
-    const melofon = entries.find(
-      (e: { playerName: string }) => e.playerName === 'melofon',
-    );
-    assert(melofon !== undefined, 'engine entry on /rest');
-    assertEquals(melofon.title, tracks.items[1].title);
-    assert(
-      entries.some((e: { playerName: string }) => e.playerName === 'narjo'),
-      'client row still listed',
-    );
-
-    // OwnTone stop+clear touches the server engine only: the mirror returns.
+    // Stop: engine current gone from both views.
     await put(onHook, '/api/player/stop');
-    await put(onHook, '/api/queue/clear');
-    const after = await (await get(onHook, '/api/player')).json();
-    assertEquals(after.state, 'play');
-    assertEquals(after.item_id, -1);
-    const np2 = await (await get(
-      onDefault,
-      `/rest/getNowPlaying?${NARJO}&f=json`,
-    )).json();
-    const entries2 = np2['subsonic-response'].nowPlaying.entry;
+    const stopped = await (await get(onHook, '/api/player')).json();
+    assertEquals(stopped.state, 'stop');
+    assertEquals(stopped.item_id, 0);
     assert(
-      !entries2.some((e: { playerName: string }) => e.playerName === 'melofon'),
-      'engine entry gone after clear',
-    );
-    assert(
-      entries2.some((e: { playerName: string }) => e.playerName === 'narjo'),
-      'client row survives server clear',
+      !(await npEntry(onDefault)).some(
+        (e: { playerName: string }) => e.playerName === 'melofon',
+      ),
+      'engine entry gone after stop',
     );
   } finally {
     await close();

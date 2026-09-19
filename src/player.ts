@@ -4,13 +4,8 @@
 // list starts EMPTY — no dummy sink; a boot registers real outputs
 // (app.outputs.register, M6: Chromecast / AirPlay / FS) and an empty list is
 // the truth, not a placeholder. Hats (OwnTone JSON, later the Melofon UI)
-// drive this engine; they never hold player state themselves.
-//
-// Every mutation emits on app.notify (OwnTone's event names): player for
-// playback, options for shuffle/repeat/consume, volume for master volume,
-// queue for queue changes, outputs (plus volume when an output's own volume
-// changes) for the outputs list. Emits are hints — "this may have changed,
-// re-read it" — and fire only on mutations that act.
+// drive this engine; they never hold player state themselves. The engine
+// emits nothing itself — app.playback commands do (core owns the hub).
 //
 // No audio means progress is wall-clock: while state is 'play' the position
 // advances in real time from the last seek/start base, clamped at the item
@@ -36,8 +31,8 @@ export interface PlayerStatus {
   shuffle: boolean;
   /** Master volume, 0–100. */
   volume: number;
-  /** Entry the wire reports: the current one while playing/paused; the first
-   * queued one when stopped (OwnTone's status fallback); null when empty. */
+  /** Entry the wire reports: the current one while playing/paused; null
+   * when stopped (no queue-head fallback) or the queue is empty. */
   current: QueueEntry | null;
   itemLengthMs: number;
   itemProgressMs: number;
@@ -97,8 +92,7 @@ function clampVolume(n: number): number {
   return Math.min(100, Math.max(0, Math.trunc(n)));
 }
 
-export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
-  const emit = (types: string[]) => notify?.emit(types);
+export function createPlayer(): Player {
   let items: QueueEntry[] = [];
   let version = 0;
   let nextId = 1;
@@ -160,7 +154,10 @@ export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
 
   return {
     status(): PlayerStatus {
-      const entry = state === 'stop' ? items[0] ?? null : currentEntry();
+      // Stopped means no current — not the queue head. A queue-head-as-
+      // current fallback makes a stale item look played everywhere the
+      // status is read (and made the now-playing mirror immortal).
+      const entry = state === 'stop' ? null : currentEntry();
       return {
         state,
         repeat,
@@ -176,25 +173,21 @@ export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
     play() {
       if (items.length === 0) return; // empty queue: 204, state stays stop
       doPlay();
-      emit(['player']);
     },
 
     pause() {
       if (state !== 'play') return;
       doPause();
-      emit(['player']);
     },
 
     stop() {
       doStop();
-      emit(['player']);
     },
 
     toggle() {
       if (items.length === 0) return;
       if (state === 'play') doPause();
       else doPlay();
-      emit(['player']);
     },
 
     next() {
@@ -202,32 +195,26 @@ export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
       const index = (currentIndex ?? -1) + 1;
       if (index >= items.length) {
         doStop();
-        emit(['player']);
         return;
       }
       startAt(index);
-      emit(['player']);
     },
 
     previous() {
       if (items.length === 0) return;
       startAt(Math.max(0, (currentIndex ?? 0) - 1));
-      emit(['player']);
     },
 
     setShuffle(on) {
       shuffle = on;
-      emit(['options']);
     },
 
     setConsume(on) {
       consume = on;
-      emit(['options']);
     },
 
     setRepeat(mode) {
       repeat = mode;
-      emit(['options']);
     },
 
     setVolume(opts) {
@@ -235,7 +222,6 @@ export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
       else if (opts.step !== undefined) {
         volume = clampVolume(volume + opts.step);
       } else return;
-      emit(['volume']);
     },
 
     seek(opts) {
@@ -250,7 +236,6 @@ export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
       baseProgressMs = Math.min(Math.max(0, Math.round(target)), length);
       startedAt = performance.now();
       state = 'play'; // OwnTone starts playback after a seek
-      emit(['player']);
       return true;
     },
 
@@ -262,7 +247,6 @@ export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
       const added = songs.map((song) => ({ id: nextId++, song }));
       items = [...items, ...added];
       version++;
-      emit(['queue']);
       return added;
     },
 
@@ -271,7 +255,6 @@ export function createPlayer({ notify }: { notify?: Notify } = {}): Player {
       version++;
       doStop();
       // The clear also stopped playback — both reads changed.
-      emit(['queue', 'player']);
     },
   };
 }

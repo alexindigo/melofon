@@ -38,8 +38,8 @@ async function setup() {
   await scanLibrary(db);
   const library = createLibrary(db);
   const notify = createNotify();
-  const player = createPlayer({ notify });
-  const nowPlaying = createNowPlaying(db, { notify });
+  const player = createPlayer();
+  const nowPlaying = createNowPlaying(db);
   const bag = {
     cfg,
     libraries,
@@ -175,7 +175,7 @@ Deno.test('getNowPlaying renders entries as XML', async () => {
   }
 });
 
-Deno.test('nowPlaying.set emits player on app.notify (core owns the hub)', async () => {
+Deno.test('playback.reportPlaying emits player; a failed report emits nothing', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-np-emit-' });
   const db = await openDb(dir);
   try {
@@ -191,13 +191,29 @@ Deno.test('nowPlaying.set emits player on app.notify (core owns the hub)', async
     const events: string[][] = [];
     const notify = createNotify();
     notify.subscribe((types) => events.push(types));
-    const nowPlaying = createNowPlaying(db, { notify });
+    const playback = createPlayback({
+      player: createPlayer(),
+      nowPlaying: createNowPlaying(db),
+      library: createLibrary(db),
+      cfg,
+      notify,
+    });
 
-    await nowPlaying.set('admin', 'narjo', 'some-track-id');
+    await playback.reportPlaying({
+      username: 'admin',
+      client: 'narjo',
+      trackId: 'some-track-id',
+      streamId: 'stream-1',
+    });
     assertEquals(events, [['player']]);
 
-    // A failed set (unknown user) emits nothing.
-    await nowPlaying.set('ghost', 'narjo', 'some-track-id').catch(() => {});
+    // A failed report (unknown user) emits nothing.
+    await playback.reportPlaying({
+      username: 'ghost',
+      client: 'narjo',
+      trackId: 'some-track-id',
+      streamId: 'stream-2',
+    }).catch(() => {});
     assertEquals(events, [['player']]);
   } finally {
     db.close();
