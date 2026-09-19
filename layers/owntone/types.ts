@@ -45,6 +45,10 @@ export interface HatContext {
     scan: {
       status(): Promise<ScanStatusRow>;
     };
+    artwork: {
+      /** Cover image for an album/song/artist id — always an image. */
+      cover(id: string): Promise<Response>;
+    };
     playlists: {
       list(username: string): Promise<PlaylistRow[]>;
       get(username: string, id: string): Promise<PlaylistWithTracks | null>;

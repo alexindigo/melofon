@@ -100,6 +100,7 @@ export function albumPayload(album: AlbumRow) {
     track_count: album.songCount,
     length_ms: album.durationMs,
     uri: `library:album:${wireInt(album.id)}`,
+    artwork_url: `./artwork/group/${wireInt(album.id)}`,
   };
 }
 
@@ -131,6 +132,7 @@ export function trackPayload(
     data_kind: 'file',
     path: song.path,
     uri: `library:track:${wireInt(song.id)}`,
+    artwork_url: `./artwork/item/${wireInt(song.id)}`,
   };
 }
 
@@ -181,6 +183,10 @@ export async function artistPayload(
     track_count: albums.reduce((n, a) => n + a.songCount, 0),
     length_ms: albums.reduce((n, a) => n + a.durationMs, 0),
     uri: `library:artist:${wireInt(artist.id)}`,
+    // Artist tile: the first album's cover stands in (omitted with no albums).
+    ...(albums.length > 0 && {
+      artwork_url: `./artwork/group/${wireInt(albums[0].id)}`,
+    }),
   };
 }
 

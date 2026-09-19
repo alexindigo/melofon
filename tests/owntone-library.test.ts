@@ -11,6 +11,7 @@ import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createPlaylists } from '../src/playlists.ts';
+import { createArtwork } from '../src/artwork.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
@@ -59,6 +60,7 @@ async function setup(
     library,
     scan,
     playlists,
+    artwork: createArtwork(library),
     player: createPlayer({ notify }),
     outputs: createOutputs({ notify }),
     notify,
@@ -71,8 +73,10 @@ async function setup(
     defaultPort: DEFAULT_PORT,
     env: {},
   });
+  const onDefault = facade(core, layers);
   return {
     app,
+    onDefault,
     close: async () => {
       db.close();
       await Deno.remove(dir, { recursive: true });
@@ -339,6 +343,73 @@ Deno.test('search: type substring matching (track ≡ tracks), all result kinds'
     );
     assertEquals((await get(app, '/api/search?query=x')).status, 400);
     assertEquals((await get(app, '/api/search?type=tracks')).status, 400);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('artwork: item/group/nowplaying, artwork_url on payloads, listen isolation', async () => {
+  const { app, onDefault, close } = await setup();
+  try {
+    // Payloads carry the relative urls.
+    const albums = await (await get(app, '/api/library/albums')).json();
+    const album = albums.items[0]; // Fixture Album (has cover.jpg)
+    assertEquals(album.artwork_url, `./artwork/group/${album.id}`);
+
+    const tracks = await (await get(
+      app,
+      `/api/library/albums/${album.id}/tracks`,
+    )).json();
+    const track = tracks.items[0];
+    assertEquals(track.artwork_url, `./artwork/item/${track.id}`);
+
+    const artists = await (await get(app, '/api/library/artists')).json();
+    assertEquals(
+      artists.items[0].artwork_url,
+      `./artwork/group/${album.id}`, // first album's cover stands in
+    );
+
+    // item: the track's cover (its album's cover.jpg → image/jpeg).
+    const item = await get(app, `/artwork/item/${track.id}`);
+    assertEquals(item.status, 200);
+    assertEquals(item.headers.get('content-type'), 'image/jpeg');
+    await item.body?.cancel();
+
+    // group: the album's cover.
+    const group = await get(app, `/artwork/group/${album.id}`);
+    assertEquals(group.status, 200);
+    assertEquals(group.headers.get('content-type'), 'image/jpeg');
+    await group.body?.cancel();
+
+    // nowplaying: 404 on an empty queue; the queued track's cover after add.
+    assertEquals((await get(app, '/artwork/nowplaying')).status, 404);
+    const add = await app(
+      new Request(
+        `http://x/api/queue/items/add?uris=library:track:${track.id}`,
+        {
+          method: 'POST',
+        },
+      ),
+    );
+    assertEquals(add.status, 200);
+    const np = await get(app, '/artwork/nowplaying');
+    assertEquals(np.status, 200);
+    assertEquals(np.headers.get('content-type'), 'image/jpeg');
+    await np.body?.cancel();
+
+    // Queue payloads inherit the track artwork_url.
+    const queue = await (await get(app, '/api/queue')).json();
+    assertEquals(queue.items[0].artwork_url, `./artwork/item/${track.id}`);
+
+    // Unknown / malformed ids.
+    assertEquals((await get(app, '/artwork/item/1')).status, 404);
+    assertEquals((await get(app, '/artwork/item/abc')).status, 400);
+    assertEquals((await get(app, '/artwork/group/1')).status, 404);
+
+    // The artwork mount is the owntone hat's — not on the default listen.
+    assertEquals((await get(onDefault, '/artwork/item/1')).status, 404);
+    // …and the opensubsonic hat is still not on the hook.
+    assertEquals((await get(app, '/rest/ping')).status, 404);
   } finally {
     await close();
   }
