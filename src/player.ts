@@ -1,10 +1,10 @@
 // src/player.ts — app.player / app.outputs: the server-side player engine
 // (the OwnTone control plane). One in-memory queue (restart-lossy is fine),
-// play/pause/stop state, master volume, and the outputs list. M5 ships one
-// dummy output ({ id: "0", type: "fifo", name: "this server" }) — selecting
-// it is a no-op; no audio leaves the box until M6 boots register real
-// outputs. Hats (OwnTone JSON, later the Melofon UI) drive this engine; they
-// never hold player state themselves.
+// play/pause/stop state, master volume, and the outputs list. The outputs
+// list starts EMPTY — no dummy sink; a boot registers real outputs
+// (app.outputs.register, M6: Chromecast / AirPlay / FS) and an empty list is
+// the truth, not a placeholder. Hats (OwnTone JSON, later the Melofon UI)
+// drive this engine; they never hold player state themselves.
 //
 // No audio means progress is wall-clock: while state is 'play' the position
 // advances in real time from the last seek/start base, clamped at the item
@@ -73,6 +73,10 @@ export interface Output {
 export interface Outputs {
   list(): Output[];
   get(id: string): Output | null;
+  /** Adds a boot's output; last-wins when the id is already registered. */
+  register(output: Output): void;
+  /** Removes a registered output; false when the id was never registered. */
+  unregister(id: string): boolean;
   /** Enables exactly the given ids; false when any id is unknown. */
   setEnabled(ids: string[]): boolean;
   toggle(id: string): Output | null;
@@ -239,10 +243,8 @@ export function createPlayer(): Player {
 }
 
 export function createOutputs(): Outputs {
-  // The one M5 output: a dummy fifo that swallows nothing (no audio yet).
-  const outputs: Output[] = [
-    { id: '0', name: 'this server', type: 'fifo', selected: true, volume: 100 },
-  ];
+  // Empty until a boot registers a real output — no dummy row.
+  const outputs: Output[] = [];
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
 
   return {
@@ -250,6 +252,17 @@ export function createOutputs(): Outputs {
     get: (id) => {
       const found = find(id);
       return found === null ? null : { ...found };
+    },
+    register(output) {
+      const idx = outputs.findIndex((o) => o.id === output.id);
+      if (idx === -1) outputs.push({ ...output });
+      else outputs[idx] = { ...output };
+    },
+    unregister(id) {
+      const idx = outputs.findIndex((o) => o.id === id);
+      if (idx === -1) return false;
+      outputs.splice(idx, 1);
+      return true;
     },
     setEnabled(ids) {
       if (ids.some((id) => find(id) === null)) return false;

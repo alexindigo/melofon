@@ -30,7 +30,7 @@ function song(durationMs = 180_000): SongRow {
   };
 }
 
-Deno.test('initial state: stopped, empty queue, dummy fifo selected', () => {
+Deno.test('initial state: stopped, empty queue, no outputs', () => {
   const player = createPlayer();
   const status = player.status();
   assertEquals(status.state, 'stop');
@@ -42,10 +42,12 @@ Deno.test('initial state: stopped, empty queue, dummy fifo selected', () => {
   assertEquals(status.itemProgressMs, 0);
   assertEquals(player.queue(), { version: 0, items: [] });
 
+  // No dummy sink: the outputs list is empty until a boot registers.
   const outputs = createOutputs();
-  assertEquals(outputs.list(), [
-    { id: '0', name: 'this server', type: 'fifo', selected: true, volume: 100 },
-  ]);
+  assertEquals(outputs.list(), []);
+  assertEquals(outputs.get('0'), null);
+  assertEquals(outputs.setEnabled([]), true); // no unknown ids on an empty list
+  assertEquals(outputs.setEnabled(['0']), false);
 });
 
 Deno.test('play on an empty queue is a no-op (state stays stop)', () => {
@@ -189,10 +191,28 @@ Deno.test('queue clear empties, stops, and bumps the version', () => {
   assertEquals(status.current, null);
 });
 
-Deno.test('outputs: get/update/toggle/setEnabled and unknown ids', () => {
+Deno.test('outputs: register, get/update/toggle/setEnabled, unregister', () => {
   const outputs = createOutputs();
-  assertEquals(outputs.get('0')?.type, 'fifo');
+  outputs.register({
+    id: '0',
+    name: 'test speaker',
+    type: 'AirPlay',
+    selected: true,
+    volume: 100,
+  });
+  assertEquals(outputs.get('0')?.type, 'AirPlay');
   assertEquals(outputs.get('nope'), null);
+
+  // Register is last-wins on the id.
+  outputs.register({
+    id: '0',
+    name: 'renamed speaker',
+    type: 'AirPlay',
+    selected: true,
+    volume: 100,
+  });
+  assertEquals(outputs.list().length, 1);
+  assertEquals(outputs.get('0')?.name, 'renamed speaker');
 
   assertEquals(outputs.update('0', { volume: 42 })?.volume, 42);
   assertEquals(outputs.update('0', { volume: 500 })?.volume, 100);
@@ -208,4 +228,9 @@ Deno.test('outputs: get/update/toggle/setEnabled and unknown ids', () => {
   assertEquals(outputs.get('0')?.selected, false);
   assertEquals(outputs.setEnabled(['0']), true);
   assertEquals(outputs.get('0')?.selected, true);
+
+  // Unregister returns to the empty truth.
+  assertEquals(outputs.unregister('0'), true);
+  assertEquals(outputs.list(), []);
+  assertEquals(outputs.unregister('0'), false);
 });

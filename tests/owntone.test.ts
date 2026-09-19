@@ -30,12 +30,13 @@ async function setup(env: Record<string, string> = {}) {
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
+  const outputs = createOutputs();
   const bag = {
     cfg,
     libraries,
     library: createLibrary(db),
     player: createPlayer(),
-    outputs: createOutputs(),
+    outputs,
   };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
   const layers = await loadLayers({ app: bag });
@@ -56,6 +57,7 @@ async function setup(env: Record<string, string> = {}) {
     onDefault,
     onHook,
     forBind,
+    outputs,
     close: async () => {
       db.close();
       await Deno.remove(dir, { recursive: true });
@@ -113,28 +115,29 @@ Deno.test('GET /api/config answers on 4000 when REPLACE_3689=4000 (and 3689 stay
   }
 });
 
-Deno.test('GET /api/outputs lists the dummy fifo, selected', async () => {
+Deno.test('GET /api/outputs is an empty list until a boot registers', async () => {
   const { onHook, close } = await setup();
   try {
     const res = await get(onHook, '/api/outputs');
     assertEquals(res.status, 200);
-    const body = await res.json();
-    assertEquals(body.outputs.length, 1);
-    const fifo = body.outputs[0];
-    assertEquals(fifo.id, '0');
-    assertEquals(fifo.type, 'fifo');
-    assertEquals(fifo.name, 'this server');
-    assertEquals(fifo.selected, true);
-    assertEquals(fifo.has_password, false);
-    assertEquals(fifo.supported_formats, ['pcm']);
+    assertEquals(await res.json(), { outputs: [] });
+    // No dummy sink: id 0 is just an unknown id.
+    assertEquals((await get(onHook, '/api/outputs/0')).status, 400);
   } finally {
     await close();
   }
 });
 
-Deno.test('outputs: get/put/toggle/set and the unknown-id 400s', async () => {
-  const { onHook, close } = await setup();
+Deno.test('outputs: get/put/toggle/set on a registered output; unknown-id 400s', async () => {
+  const { onHook, outputs, close } = await setup();
   try {
+    outputs.register({
+      id: '0',
+      name: 'test speaker',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+    });
     const one = await get(onHook, '/api/outputs/0');
     assertEquals(one.status, 200);
     assertEquals((await one.json()).id, '0');
@@ -322,7 +325,7 @@ Deno.test('player flow: add a whole album uri; next/previous walk it', async () 
 });
 
 Deno.test('player knobs: volume (master + output), seek, shuffle/repeat/consume', async () => {
-  const { onHook, close } = await setup();
+  const { onHook, outputs, close } = await setup();
   try {
     assertEquals(
       (await put(onHook, '/api/player/volume?volume=33')).status,
@@ -331,6 +334,13 @@ Deno.test('player knobs: volume (master + output), seek, shuffle/repeat/consume'
     assertEquals((await (await get(onHook, '/api/player')).json()).volume, 33);
     assertEquals((await put(onHook, '/api/player/volume?step=-3')).status, 204);
     assertEquals((await (await get(onHook, '/api/player')).json()).volume, 30);
+    outputs.register({
+      id: '0',
+      name: 'test speaker',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+    });
     assertEquals(
       (await put(onHook, '/api/player/volume?volume=42&output_id=0')).status,
       204,
