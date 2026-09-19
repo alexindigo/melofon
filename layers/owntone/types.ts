@@ -12,6 +12,14 @@ export interface HatRequest {
   body: {
     json(): Promise<unknown>;
   };
+  /** pathfinder's managed WebSocket upgrade (0.2.4): the params bag declares
+   * the RFC 6455 handshake fields — `protocol` is stamped as
+   * Sec-WebSocket-Protocol on the 101. The handler owns the socket
+   * lifecycle; it must return the placeholder `response`. */
+  upgrade(params: { protocol?: string }): {
+    response: Response;
+    socket: Promise<WebSocket>;
+  };
   _raw: Request;
 }
 
@@ -19,6 +27,15 @@ export interface HatContext {
   app: {
     cfg: {
       version?: string;
+    };
+    notify: {
+      /** Listen for core change events (OwnTone names); returns unsubscribe. */
+      subscribe(fn: (types: string[]) => void): () => void;
+    };
+    binds: {
+      /** The actual bind of one of this hat's claimed ports (after env
+       * remaps) — /api/config's websocket_port. */
+      actual(layerName: string, claimed: number): number;
     };
     player: {
       status(): PlayerStatusRow;

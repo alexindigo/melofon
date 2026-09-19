@@ -61,8 +61,12 @@ function layerDispatch(
 }
 
 // Re-path the request, keeping the query string (credentials ride it).
+// Path unchanged → the ORIGINAL request, not a clone: Deno binds a WebSocket
+// upgrade to the original Request object — a clone's 101 completes (headers,
+// subprotocol) but the socket never delivers data.
 function repath(request: Request, path: string): Request {
   const url = new URL(request.url);
+  if (url.pathname === path) return request;
   url.pathname = path;
   return new Request(url, request);
 }

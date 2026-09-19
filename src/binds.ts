@@ -101,3 +101,28 @@ export function candidatesForBind(
   const parsed = parseListensEnv(env);
   return layers.filter((l) => actualPortsParsed(l, parsed).includes(bindPort));
 }
+
+export interface Binds {
+  /** The actual port a layer's claim is bound to, after
+   * MELOFON_LISTEN_<layer> / REPLACE_ — for hats that must name their own
+   * port on the wire (OwnTone's /api/config websocket_port). The hat passes
+   * its own folder name; core never hardcodes it. Unresolvable (unknown
+   * layer, unclaimed port) → the claim itself. */
+  actual(layerName: string, claimed: number): number;
+}
+
+// getLayers is lazy: the bag is built before loadLayers runs.
+export function createBinds(
+  getLayers: () => Layer[],
+  env: Record<string, string>,
+): Binds {
+  return {
+    actual(layerName, claimed) {
+      const layer = getLayers().find((l) => l.name === layerName);
+      if (layer === undefined) return claimed;
+      const idx = layer.ports.indexOf(claimed);
+      if (idx === -1) return claimed;
+      return actualPorts(layer, env)[idx];
+    },
+  };
+}

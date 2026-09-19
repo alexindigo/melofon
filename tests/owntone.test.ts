@@ -10,6 +10,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
+import { createNotify } from '../src/notify.ts';
+import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 
@@ -30,13 +32,16 @@ async function setup(env: Record<string, string> = {}) {
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
-  const outputs = createOutputs();
+  const notify = createNotify();
+  const outputs = createOutputs({ notify });
   const bag = {
     cfg,
     libraries,
     library: createLibrary(db),
-    player: createPlayer(),
+    player: createPlayer({ notify }),
     outputs,
+    notify,
+    binds: createBinds(() => layers, env),
   };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
   const layers = await loadLayers({ app: bag });
@@ -83,16 +88,17 @@ const put = (
 const post = (app: (r: Request) => Promise<Response>, path: string) =>
   app(new Request(`http://x${path}`, { method: 'POST' }));
 
-Deno.test('GET /api/config on the 3689 hook: websocket_port 0, reduced buildoptions', async () => {
+Deno.test('GET /api/config on the 3689 hook: websocket_port is the claimed 3688', async () => {
   const { onHook, close } = await setup();
   try {
     const res = await get(onHook, '/api/config');
     assertEquals(res.status, 200);
     const body = await res.json();
-    assertEquals(body.websocket_port, 0);
+    assertEquals(body.websocket_port, 3688); // the claim, no env remap
+    assertEquals(body.library_name, 'Melofon'); // HA test_connection needs it
     assertEquals(body.version, '0.0.0-test');
-    assert(Array.isArray(body.buildoptions));
-    for (const absent of ['Websockets', 'Spotify', 'ALSA']) {
+    assert(body.buildoptions.includes('Websockets'));
+    for (const absent of ['Spotify', 'ALSA']) {
       assert(!body.buildoptions.includes(absent), `no ${absent}`);
     }
   } finally {
@@ -106,7 +112,9 @@ Deno.test('GET /api/config answers on 4000 when REPLACE_3689=4000 (and 3689 stay
   try {
     const res = await get(onHook, '/api/config');
     assertEquals(res.status, 200);
-    assertEquals((await res.json()).websocket_port, 0);
+    const configBody = await res.json();
+    // The HTTP hook moved to 4000; the WS claim 3688 is untouched by it.
+    assertEquals(configBody.websocket_port, 3688);
     // The claimed port has no candidates under the same env.
     const quiet = await get(forBind(HOOK, env), '/api/config');
     assertEquals(quiet.status, 404);

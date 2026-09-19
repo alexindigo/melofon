@@ -25,7 +25,7 @@ import { createArtwork } from './src/artwork.ts';
 import { createOutputs, createPlayer } from './src/player.ts';
 import { createNotify } from './src/notify.ts';
 import { loadLayers } from './src/layers.ts';
-import { actualPorts } from './src/binds.ts';
+import { actualPorts, createBinds } from './src/binds.ts';
 import { facade } from './src/facade.ts';
 
 const cfg = loadConfig();
@@ -45,6 +45,7 @@ const app = { db, cfg, libraries };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const notify = createNotify();
+const env = Deno.env.toObject();
 const bag = {
   cfg,
   libraries,
@@ -64,6 +65,7 @@ const bag = {
   player: createPlayer({ notify }),
   outputs: createOutputs({ notify }),
   notify,
+  binds: createBinds(() => layers, env),
 };
 const layers = await loadLayers({ app: bag });
 
@@ -72,7 +74,6 @@ const layers = await loadLayers({ app: bag });
 // default listen port, which is never bound twice. Deno.serve with no port
 // argument binds 8000, so the default port is known even without
 // MELOFON_LISTEN.
-const env = Deno.env.toObject();
 const defaultPort = cfg.listen?.port ?? 8000;
 const extraBinds = new Set<number>();
 for (const layer of layers) {
