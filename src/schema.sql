@@ -120,3 +120,9 @@ CREATE TABLE IF NOT EXISTS now_playing (
   PRIMARY KEY (user_id, client)
 );
 ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS stream_id VARCHAR;
+-- M6: internal state (app.state) — operator-owned live config. The /_/config
+-- endpoints are its face, and the Settings UI (M5) will be a form on them.
+CREATE TABLE IF NOT EXISTS state (
+  key VARCHAR PRIMARY KEY,
+  value VARCHAR NOT NULL
+);

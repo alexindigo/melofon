@@ -25,6 +25,7 @@ import { createArtwork } from './src/artwork.ts';
 import { createOutputs, createPlayer } from './src/player.ts';
 import { createPlayback } from './src/playback.ts';
 import { createNotify } from './src/notify.ts';
+import { createState } from './src/state.ts';
 import { airplayOutputId, createAirplayBoot } from './src/boots/airplay.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts, createBinds } from './src/binds.ts';
@@ -39,13 +40,14 @@ const libraries = createLibraries(db);
 const media = createMedia();
 const notify = createNotify();
 const outputs = createOutputs({ notify });
+const state = createState(db);
 const scan = createScan(db, media, { notify });
 const counts = await scan.run();
 console.log(
   `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
     `${counts.artists} artists, ${counts.albums} albums`,
 );
-const app = { db, cfg, libraries, outputs };
+const app = { db, cfg, libraries, outputs, state };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const env = Deno.env.toObject();
@@ -73,12 +75,22 @@ const bag = {
   player,
   outputs,
   notify,
+  state,
   binds: createBinds(() => layers, env),
 };
 const layers = await loadLayers({ app: bag });
 
 // Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
 createAirplayBoot({ outputs, playback, media, notify });
+
+// Internal-state first-boot seeds: env/toml is a default, never an override —
+// a key the operator already set (via /_/config) is left alone.
+if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
+  await state.seedIfUnset(
+    'airplay.mdns',
+    env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
+  );
+}
 
 // MELOFON_AIRPLAY_HOST=<ip>[:port] — register a device without the UI; the
 // CRUD twin is POST /_/outputs. The boot picks it up from the outputs list.
