@@ -4,4 +4,5 @@ data/
 node_modules/
 helper/raop/*.o
 helper/raop/**/*.o
-helper/raop/melofon-raop
+helper/raop/libmelofon_raop.so
+helper/raop/test/driver

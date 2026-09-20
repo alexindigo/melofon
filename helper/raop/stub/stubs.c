@@ -204,32 +204,32 @@ free_queue_item(struct db_queue_item *qi, int content_only)
 
 /* -------------------------------- outputs --------------------------------- */
 
-/* main.c owns the one device and the state-event hook. */
-extern struct output_device *helper_device;
-extern void helper_on_state(enum output_device_state state);
+/* ffi.c owns the device registry (one output_device per raop_t handle) and
+ * the per-handle state-event hook. */
+extern struct output_device *raop_ffi_device_find(uint64_t device_id);
+extern void raop_ffi_on_state(uint64_t device_id, enum output_device_state state);
 
 struct output_device *
 outputs_device_get(uint64_t device_id)
 {
-  (void)device_id;
-  return helper_device;
+  return raop_ffi_device_find(device_id);
 }
 
 int
 outputs_device_session_add(uint64_t device_id, void *session)
 {
-  (void)device_id;
-  if (helper_device)
-    helper_device->session = session;
+  struct output_device *device = raop_ffi_device_find(device_id);
+  if (device)
+    device->session = session;
   return 0;
 }
 
 void
 outputs_device_session_remove(uint64_t device_id)
 {
-  (void)device_id;
-  if (helper_device)
-    helper_device->session = NULL;
+  struct output_device *device = raop_ffi_device_find(device_id);
+  if (device)
+    device->session = NULL;
 }
 
 int
@@ -262,8 +262,7 @@ void
 outputs_cb(int callback_id, uint64_t device_id, enum output_device_state state)
 {
   (void)callback_id;
-  (void)device_id;
-  helper_on_state(state);
+  raop_ffi_on_state(device_id, state);
 }
 
 void

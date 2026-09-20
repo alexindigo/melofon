@@ -1,21 +1,24 @@
-# helper/raop/Makefile — build melofon-raop, the AirPlay 1 (RAOP) sender
-# helper wrapping OwnTone's raop.c (see VENDORING.md).
+# helper/raop/Makefile — build libmelofon_raop, OwnTone's RAOP (raop.c,
+# vendored) as an in-process shared library for Melofon's Deno FFI. See
+# VENDORING.md.
 #
-# Deps (Arch/Debian names): libevent, ffmpeg (libavcodec/libavformat/
-# libavfilter/libavutil), json-c, libgcrypt + libgpg-error, libsodium,
-# libplist-2.0, libunistring, util-linux (uuid), curl.
+# Deps (Arch/Debian names): libevent (+pthreads), ffmpeg (libavcodec/
+# libavformat/libavfilter/libavutil), json-c, libgcrypt + libgpg-error,
+# libsodium, libplist-2.0, libunistring, util-linux (uuid), curl.
 
 PKGS    = libevent libavcodec libavformat libavfilter libavutil json-c \
           libsodium libplist-2.0 libgcrypt uuid libcurl
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-CFLAGS  += -DHAVE_CONFIG_H -D_GNU_SOURCE -DCONFIG_GCRYPT=1 -Wall -Wno-unused \
+CFLAGS  += -fPIC -DHAVE_CONFIG_H -D_GNU_SOURCE -DCONFIG_GCRYPT=1 \
+           -Wall -Wno-unused \
            -I stub -I vendor -I vendor/outputs -I vendor/evrtsp \
            $(shell pkg-config --cflags $(PKGS))
-LDLIBS  = $(shell pkg-config --libs $(PKGS)) -lgpg-error -lunistring -lpthread -lm
+LDLIBS  = $(shell pkg-config --libs $(PKGS)) -levent_pthreads -lgpg-error \
+          -lunistring -lpthread -lm
 
-SRC = main.c \
+SRC = ffi.c \
       stub/stubs.c \
       vendor/outputs/raop.c \
       vendor/outputs/rtp_common.c \
@@ -29,14 +32,18 @@ SRC = main.c \
 
 OBJ = $(SRC:.c=.o)
 
-melofon-raop: $(OBJ)
-	$(CC) -o $@ $(OBJ) $(LDLIBS)
+libmelofon_raop.so: $(OBJ)
+	$(CC) -shared -o $@ $(OBJ) $(LDLIBS)
 
-# Functional smoke test: a fake RAOP device (no Apple hardware needed).
-test: melofon-raop
+# Functional smoke test: driver links the library; a fake RAOP device (no
+# Apple hardware needed) asserts the wire.
+test/driver: test/driver.o libmelofon_raop.so
+	$(CC) -o $@ test/driver.o -L. -lmelofon_raop -Wl,-rpath,'$$ORIGIN/..'
+
+test: libmelofon_raop.so test/driver
 	python3 test/run_fake_device_test.py
 
 clean:
-	rm -f $(OBJ) melofon-raop
+	rm -f $(OBJ) test/driver.o libmelofon_raop.so test/driver
 
 .PHONY: test clean

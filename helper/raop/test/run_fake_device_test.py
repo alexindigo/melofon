@@ -1,86 +1,28 @@
 #!/usr/bin/env python3
-"""Functional test for melofon-raop against a fake RAOP device (no Apple
-hardware): drives the stdin protocol, then asserts on both the helper's
-stdout events and what the fake device observed (RTSP sequence, RTP pacing,
-volume, flush, teardown)."""
+"""Functional test for libmelofon_raop against a fake RAOP device (no Apple
+hardware): test/driver (linked against the .so) drives start → PCM → volume
+→ flush → teardown; this script asserts what the fake device observed (RTSP
+sequence, RTP pacing, volume, flush, teardown)."""
 import ast
-import json
 import os
-import struct
 import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-HELPER = os.path.join(HERE, '..', 'melofon-raop')
-
-
-def frame(cmd):
-    payload = json.dumps(cmd).encode()
-    return struct.pack('>I', len(payload)) + b'J' + payload
-
-
-def pcm(data):
-    return struct.pack('>I', len(data)) + b'P' + data
-
-
-def read_event(proc, timeout=10.0):
-    """Read one JSON event line from the helper's stdout."""
-    import select
-    fd = proc.stdout.fileno()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        r, _, _ = select.select([fd], [], [], deadline - time.monotonic())
-        if r:
-            line = proc.stdout.readline()
-            if line:
-                return json.loads(line)
-    raise AssertionError('timed out waiting for a helper event')
+DRIVER = os.path.join(HERE, 'driver')
 
 
 def main():
     fake = subprocess.Popen(
         [sys.executable, '-u', os.path.join(HERE, 'fake_raop.py')],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    port = int(fake.stdout.readline().split()[1])
+    port = fake.stdout.readline().split()[1]
 
-    helper = subprocess.Popen([HELPER], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE)
-    try:
-        assert read_event(helper)['event'] == 'ready'
-
-        helper.stdin.write(frame({
-            'cmd': 'start', 'host': '127.0.0.1', 'port': port,
-            'name': 'Fake ATV', 'volume': 80}))
-        helper.stdin.flush()
-        assert read_event(helper)['value'] == 'starting'
-        assert read_event(helper, timeout=15)['value'] == 'connected'
-
-        # One second of PCM (silence): 44100 * 2ch * 2B = 176400 bytes.
-        helper.stdin.write(pcm(bytes(176400)))
-        helper.stdin.flush()
-        time.sleep(2.0)  # paced out in real time
-
-        helper.stdin.write(frame({'cmd': 'volume', 'volume': 42}))
-        helper.stdin.write(frame({'cmd': 'flush'}))
-        helper.stdin.flush()
-        time.sleep(0.5)
-
-        helper.stdin.write(frame({'cmd': 'teardown'}))
-        helper.stdin.flush()
-        deadline = time.monotonic() + 10
-        stopped = False
-        while time.monotonic() < deadline and not stopped:
-            ev = read_event(helper)
-            stopped = ev.get('value') == 'stopped'
-        assert stopped, 'teardown did not reach stopped state'
-
-        helper.stdin.close()
-        assert helper.wait(timeout=10) == 0, 'clean exit on stdin EOF'
-    finally:
-        if helper.poll() is None:
-            helper.kill()
-        fake.stdin.close()
+    driver = subprocess.run([DRIVER, port], capture_output=True, text=True,
+                            timeout=45)
+    fake.stdin.close()
+    time.sleep(0.3)
 
     report = None
     deadline = time.monotonic() + 5
@@ -90,6 +32,9 @@ def main():
             report = ast.literal_eval(line[7:])
             break
     fake.kill()
+
+    assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+        f'driver failed: {driver.returncode} {driver.stdout} {driver.stderr}'
     assert report is not None, 'fake device produced no report'
 
     # RTSP sequence: handshake, then volume, flush, teardown.
