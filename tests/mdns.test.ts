@@ -12,114 +12,19 @@ import {
   parseTxt,
   type UdpSocketLike,
 } from '../src/mdns.ts';
-
-// --------------------------------------------------------------------------
-// Canned-packet builder (compresses suffixes automatically, like real devices)
-
-class MsgBuilder {
-  bytes: number[] = [];
-  private offsets = new Map<string, number>();
-
-  header(ancount: number) {
-    this.bytes.push(
-      0,
-      0, // id
-      0x84,
-      0x00, // flags: response, authoritative
-      0,
-      0, // qd
-      (ancount >> 8) & 0xff,
-      ancount & 0xff,
-      0,
-      0,
-      0,
-      0, // ns, ar
-    );
-  }
-
-  name(fqdn: string) {
-    const labels = fqdn.split('.');
-    for (let i = 0; i < labels.length; i++) {
-      const suffix = labels.slice(i).join('.');
-      const existing = this.offsets.get(suffix);
-      if (existing !== undefined) {
-        this.bytes.push(0xc0 | (existing >> 8), existing & 0xff);
-        return;
-      }
-      this.offsets.set(suffix, this.bytes.length);
-      this.bytes.push(
-        labels[i].length,
-        ...[...labels[i]].map((c) => c.charCodeAt(0)),
-      );
-    }
-    this.bytes.push(0);
-  }
-
-  u16(v: number) {
-    this.bytes.push((v >> 8) & 0xff, v & 0xff);
-  }
-
-  u32(v: number) {
-    this.bytes.push(
-      (v >>> 24) & 0xff,
-      (v >>> 16) & 0xff,
-      (v >>> 8) & 0xff,
-      v & 0xff,
-    );
-  }
-
-  record(
-    fqdn: string,
-    type: number,
-    ttl: number,
-    writeRdata: (b: MsgBuilder) => void,
-  ) {
-    this.name(fqdn);
-    this.u16(type);
-    this.u16(1); // IN
-    this.u32(ttl);
-    const lenPos = this.bytes.length;
-    this.u16(0);
-    const start = this.bytes.length;
-    writeRdata(this);
-    const len = this.bytes.length - start;
-    this.bytes[lenPos] = (len >> 8) & 0xff;
-    this.bytes[lenPos + 1] = len & 0xff;
-  }
-
-  build(): Uint8Array {
-    return new Uint8Array(this.bytes);
-  }
-}
+import { airplayAnswer, MsgBuilder } from './mdns-builder.ts';
 
 const INSTANCE = 'A4B2C1D2E3F4@Kitchen ATV._raop._tcp.local';
-
-function airplayAnswer(opts: { ttl?: number; address?: number[] } = {}) {
-  const ttl = opts.ttl ?? 120;
-  const address = opts.address ?? [192, 168, 1, 50];
-  const b = new MsgBuilder();
-  b.header(4);
-  b.record('_raop._tcp.local', 12, ttl, (bb) => bb.name(INSTANCE));
-  b.record(INSTANCE, 16, ttl, (bb) => {
-    for (const kv of ['tp=UDP', 'am=AppleTV3,1', 'ek=1', 'sf=0x200']) {
-      bb.bytes.push(kv.length, ...[...kv].map((c) => c.charCodeAt(0)));
-    }
-  });
-  b.record(INSTANCE, 33, ttl, (bb) => {
-    bb.u16(0);
-    bb.u16(0);
-    bb.u16(7000);
-    bb.name('kitchen-atv.local');
-  });
-  b.record('kitchen-atv.local', 1, ttl, (bb) => bb.bytes.push(...address));
-  return b.build();
-}
 
 // --------------------------------------------------------------------------
 // Parser tests
 
 Deno.test('parser: full AirPlay answer (compression everywhere)', () => {
-  const msg = airplayAnswer();
+  const msg = airplayAnswer({
+    instance: INSTANCE,
+    host: 'kitchen-atv.local',
+    address: [192, 168, 1, 50],
+  });
   const records = parseDnsMessage(msg);
   assert(records !== null);
   assertEquals(records.length, 4);
@@ -142,7 +47,11 @@ Deno.test('parser: full AirPlay answer (compression everywhere)', () => {
 });
 
 Deno.test('parser: truncation and compression loops return null, never throw', () => {
-  const good = airplayAnswer();
+  const good = airplayAnswer({
+    instance: INSTANCE,
+    host: 'kitchen-atv.local',
+    address: [192, 168, 1, 50],
+  });
   assertEquals(parseDnsMessage(good.subarray(0, 20)), null);
   assertEquals(parseDnsMessage(good.subarray(0, good.length - 2)), null);
   // A name that pointer-loops onto itself.
@@ -267,7 +176,10 @@ Deno.test('browser: sends a standing PTR query and joins the group', () => {
       ...[...'local'].map((c) => c.charCodeAt(0)),
       0,
     ];
-    assertEquals([...q.subarray(12, 12 + expectedQname.length)], expectedQname);
+    assertEquals(
+      [...q.subarray(12, 12 + expectedQname.length)],
+      expectedQname,
+    );
     assertEquals(q[12 + expectedQname.length], 0); // qtype hi
     assertEquals(q[12 + expectedQname.length + 1], 0x0c); // qtype lo (PTR)
   } finally {
@@ -278,7 +190,11 @@ Deno.test('browser: sends a standing PTR query and joins the group', () => {
 Deno.test('browser: up on a complete answer, deduped refresh, change re-ups', () => {
   const { browser, socket, events, services } = setup();
   try {
-    socket.receive(airplayAnswer());
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: 'kitchen-atv.local',
+      address: [192, 168, 1, 50],
+    }));
     assertEquals(events, [['up', INSTANCE]]);
     const svc = services.get(INSTANCE)!;
     assertEquals(svc.host, 'kitchen-atv.local');
@@ -288,27 +204,20 @@ Deno.test('browser: up on a complete answer, deduped refresh, change re-ups', ()
     assertEquals(svc.txt.ek, '1');
 
     // A refresh with identical data is not a new 'up'.
-    socket.receive(airplayAnswer());
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: 'kitchen-atv.local',
+      address: [192, 168, 1, 50],
+    }));
     assertEquals(events.length, 1);
 
     // A change (different port) re-announces.
-    const changed = new MsgBuilder();
-    changed.header(4);
-    changed.record('_raop._tcp.local', 12, 120, (bb) => bb.name(INSTANCE));
-    changed.record(INSTANCE, 16, 120, () => {});
-    changed.record(INSTANCE, 33, 120, (bb) => {
-      bb.u16(0);
-      bb.u16(0);
-      bb.u16(7001);
-      bb.name('kitchen-atv.local');
-    });
-    changed.record(
-      'kitchen-atv.local',
-      1,
-      120,
-      (bb) => bb.bytes.push(192, 168, 1, 50),
-    );
-    socket.receive(changed.build());
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: 'kitchen-atv.local',
+      address: [192, 168, 1, 50],
+      port: 7001,
+    }));
     assertEquals(events.length, 2);
     assertEquals(events[1], ['up', INSTANCE]);
     assertEquals(services.get(INSTANCE)!.port, 7001);
@@ -320,7 +229,11 @@ Deno.test('browser: up on a complete answer, deduped refresh, change re-ups', ()
 Deno.test('browser: goodbye (TTL 0) and TTL expiry emit down', async () => {
   const { browser, socket, events } = setup();
   try {
-    socket.receive(airplayAnswer());
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: 'kitchen-atv.local',
+      address: [192, 168, 1, 50],
+    }));
     assertEquals(events.length, 1);
 
     const bye = new MsgBuilder();
@@ -330,7 +243,12 @@ Deno.test('browser: goodbye (TTL 0) and TTL expiry emit down', async () => {
     assertEquals(events[1], ['down', INSTANCE]);
 
     // And a quiet device whose TTL runs out.
-    socket.receive(airplayAnswer({ ttl: 1 }));
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: 'kitchen-atv.local',
+      address: [192, 168, 1, 50],
+      ttl: 1,
+    }));
     assertEquals(events.length, 3); // the second up
     await new Promise((resolve) => setTimeout(resolve, 1300));
     assertEquals(events[events.length - 1], ['down', INSTANCE]);
@@ -342,7 +260,11 @@ Deno.test('browser: goodbye (TTL 0) and TTL expiry emit down', async () => {
 Deno.test('browser: link-local-only devices never come up', () => {
   const { browser, socket, events } = setup();
   try {
-    socket.receive(airplayAnswer({ address: [169, 254, 1, 1] }));
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: 'kitchen-atv.local',
+      address: [169, 254, 1, 1],
+    }));
     assertEquals(events, []);
   } finally {
     browser.close();

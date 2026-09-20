@@ -49,7 +49,7 @@ main(int argc, char **argv)
       return 1;
     }
 
-  if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80) < 0)
+  if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0) < 0) /* appletv, unencrypted */
     return 1;
   if (wait_event(h, "\"connected\"", 15000) < 0)
     return 1;

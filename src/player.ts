@@ -80,6 +80,11 @@ export interface Output {
   host?: string;
   /** Boot port (RAOP defaults to 7000). */
   port?: number;
+  /** RAOP device type token (appletv/apex1/...; from mDNS `am`) — passed to
+   * the helper's start. */
+  devtype?: string;
+  /** Encrypt the RTP stream (mDNS `ek=1`). */
+  encrypt?: boolean;
   /** The device wants a PIN/password (OwnTone needs_auth_key on the wire);
    * set by the boot when its helper reports the auth/verification path. */
   needsAuthKey?: boolean;

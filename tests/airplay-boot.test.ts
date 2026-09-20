@@ -283,6 +283,29 @@ Deno.test('deselect and unregister tear the helper down', async () => {
   }
 });
 
+Deno.test('mDNS-derived devtype/encrypt ride the start command', async () => {
+  const { outputs, playback, spawned, close } = await setup();
+  try {
+    outputs.register({
+      id: ID,
+      name: 'Kitchen ATV',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+      host: HOST,
+      devtype: 'apex3',
+      encrypt: true,
+    });
+    playback.queueAdd([fixtureSong()], { play: true });
+    await until('helper spawned', () => spawned.length === 1);
+    const start = spawned[0].cmds().find((c) => c.cmd === 'start')!;
+    assertEquals(start.devtype, 'apex3');
+    assertEquals(start.encrypt, true);
+  } finally {
+    await close();
+  }
+});
+
 Deno.test('a failed session from the helper tears the runtime down', async () => {
   const { outputs, playback, spawned, close } = await setup();
   try {

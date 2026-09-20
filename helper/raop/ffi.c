@@ -93,6 +93,8 @@ typedef struct cmd
   int port;
   char name[256];
   int volume;
+  int devtype;                  /* RDEV_* (raop.c enum raop_devtype) */
+  int encrypt;
   char pin[32];
   struct cmd *next;
 } cmd;
@@ -356,9 +358,9 @@ device_start(raop_t *h, const cmd *c)
       return -1;
     }
 
-  re->devtype = RDEV_APPLETV;         /* the household target (old ATV) */
+  re->devtype = c->devtype;           /* from mDNS am (default appletv) */
   re->wanted_metadata = 0;            /* no artwork/text source in-process */
-  re->encrypt = false;
+  re->encrypt = c->encrypt ? true : false;
   re->supports_auth_setup = true;     /* allow the PIN verification flow */
 
   dev->id = h->id;
@@ -632,7 +634,8 @@ raop_new(void)
 }
 
 int
-raop_start(raop_t *h, const char *host, int port, const char *name, int volume)
+raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
+           int devtype, int encrypt)
 {
   cmd *c;
 
@@ -651,6 +654,8 @@ raop_start(raop_t *h, const char *host, int port, const char *name, int volume)
   c->port = port;
   snprintf(c->name, sizeof(c->name), "%s", name);
   c->volume = volume < 0 ? 0 : (volume > 100 ? 100 : volume);
+  c->devtype = devtype < 0 || devtype > 6 ? RDEV_APPLETV : devtype;
+  c->encrypt = encrypt ? 1 : 0;
 
   return cmd_push(h, c);
 }

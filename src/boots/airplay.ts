@@ -224,6 +224,10 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
           port: output.port ?? RAOP_PORT_DEFAULT,
           name: output.name,
           volume: output.volume,
+          // mDNS-derived session knobs (absent on manual registrations —
+          // the helper defaults then: appletv, unencrypted).
+          ...(output.devtype !== undefined && { devtype: output.devtype }),
+          ...(output.encrypt !== undefined && { encrypt: output.encrypt }),
         }).catch(() => {});
         // Pump right away: the helper buffers PCM during the RTSP handshake.
         pump(rt, entry.id, entry.song.path, view.itemProgressMs);

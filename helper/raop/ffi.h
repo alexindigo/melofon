@@ -17,10 +17,13 @@ typedef struct raop_handle raop_t;
 raop_t *raop_new(void);
 
 /* Queue a session start: RTSP OPTIONS/ANNOUNCE/SETUP/RECORD to host:port
- * (RAOP default 7000), name for logs, volume 0-100. Events arrive via
- * raop_poll: starting|connected|streaming|stopped|failed|password. */
+ * (RAOP default 7000), name for logs, volume 0-100. devtype is the raop.c
+ * device enum (0=apex1 1=apex2 2=apex3 3=appletv 4=appletv4 5=homepod
+ * 6=other; out of range defaults to appletv); encrypt != 0 encrypts the
+ * RTP stream. Events arrive via raop_poll:
+ * starting|connected|streaming|stopped|failed|password. */
 int raop_start(raop_t *h, const char *host, int port,
-               const char *name, int volume);
+               const char *name, int volume, int devtype, int encrypt);
 
 /* Append s16le/44100/stereo PCM to the pacing buffer. Returns bytes
  * accepted; < len means the buffer is at the high-water mark (caller

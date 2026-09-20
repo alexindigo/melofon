@@ -20,7 +20,7 @@ import type { AirplayTransport, HelperEventFn } from './airplay.ts';
 const SYMBOLS = {
   raop_new: { parameters: [], result: 'pointer' },
   raop_start: {
-    parameters: ['pointer', 'buffer', 'i32', 'buffer', 'i32'],
+    parameters: ['pointer', 'buffer', 'i32', 'buffer', 'i32', 'i32', 'i32'],
     result: 'i32',
   },
   raop_write: { parameters: ['pointer', 'buffer', 'usize'], result: 'i32' },
@@ -69,6 +69,17 @@ function loadLibrary(): RaopLibrary {
 
 const text = new TextEncoder();
 const decode = new TextDecoder();
+
+/** raop.c enum raop_devtype values for raop_start's devtype param. */
+const DEVTYPE: Record<string, number> = {
+  apex1: 0,
+  apex2: 1,
+  apex3: 2,
+  appletv: 3,
+  appletv4: 4,
+  homepod: 5,
+  other: 6,
+};
 
 function cstr(value: string): Uint8Array {
   const out = new Uint8Array(text.encode(value).length + 1);
@@ -135,6 +146,8 @@ class FfiTransport implements AirplayTransport {
           Number(cmd.port) || 7000,
           cstr(String(cmd.name ?? cmd.host)),
           Number(cmd.volume) || 0,
+          DEVTYPE[String(cmd.devtype)] ?? DEVTYPE.appletv,
+          cmd.encrypt === true ? 1 : 0,
         );
         break;
       case 'volume':

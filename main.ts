@@ -27,6 +27,7 @@ import { createPlayback } from './src/playback.ts';
 import { createNotify } from './src/notify.ts';
 import { createState } from './src/state.ts';
 import { airplayOutputId, createAirplayBoot } from './src/boots/airplay.ts';
+import { createAirplayDiscovery } from './src/boots/airplay-mdns.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts, createBinds } from './src/binds.ts';
 import { facade } from './src/facade.ts';
@@ -91,6 +92,10 @@ if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
     env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
   );
 }
+
+// AirPlay 1 discovery: browses _raop._tcp and registers devices as outputs
+// (default on; PUT /_/config/airplay.mdns {"value":"off"} toggles live).
+createAirplayDiscovery({ outputs, state });
 
 // MELOFON_AIRPLAY_HOST=<ip>[:port] — register a device without the UI; the
 // CRUD twin is POST /_/outputs. The boot picks it up from the outputs list.
