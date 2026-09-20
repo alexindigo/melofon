@@ -53,7 +53,10 @@ async function setup(env: Record<string, string> = {}) {
       cfg,
     }),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({
+    roots: ['core/'],
+    app: { db, cfg, outputs },
+  });
   const layers = await loadLayers({ app: bag });
   const forBind = (listenPort: number | undefined, env = {}) =>
     facade(core, layers, {
@@ -195,6 +198,44 @@ Deno.test('outputs: get/put/toggle/set on a registered output; unknown-id 400s',
     assertEquals(
       (await put(onHook, '/api/outputs/0', 'not json')).status,
       400,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('POST /_/outputs registers an AirPlay output that /api/outputs lists', async () => {
+  const { onHook, close } = await setup();
+  try {
+    const res = await onHook(
+      new Request('http://x/_/outputs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Kitchen ATV',
+          type: 'AirPlay',
+          host: '192.0.2.10',
+        }),
+      }),
+    );
+    assertEquals(res.status, 200);
+    const { output } = await res.json();
+    assert(/^\d+$/.test(output.id));
+
+    const list = await get(onHook, '/api/outputs');
+    assertEquals(list.status, 200);
+    const body = await list.json();
+    assertEquals(body.outputs.length, 1);
+    assertEquals(body.outputs[0].type, 'AirPlay');
+    assertEquals(body.outputs[0].name, 'Kitchen ATV');
+    assertEquals(body.outputs[0].selected, false);
+
+    // The all-digit id round-trips on the OwnTone routes.
+    assertEquals((await get(onHook, `/api/outputs/${output.id}`)).status, 200);
+    assertEquals(
+      (await put(onHook, `/api/outputs/${output.id}`, '{"selected":true}'))
+        .status,
+      204,
     );
   } finally {
     await close();

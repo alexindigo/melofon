@@ -37,18 +37,18 @@ await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();
 const notify = createNotify();
+const outputs = createOutputs({ notify });
 const scan = createScan(db, media, { notify });
 const counts = await scan.run();
 console.log(
   `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
     `${counts.artists} artists, ${counts.albums} albums`,
 );
-const app = { db, cfg, libraries };
+const app = { db, cfg, libraries, outputs };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const env = Deno.env.toObject();
 const player = createPlayer();
-const outputs = createOutputs({ notify });
 const nowPlaying = createNowPlaying(db);
 const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
 const bag = {

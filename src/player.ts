@@ -75,6 +75,11 @@ export interface Output {
   type: string;
   selected: boolean;
   volume: number;
+  /** Boot address (e.g. an AirPlay device's IP) — internal boot config,
+   * never part of the OwnTone wire payload. */
+  host?: string;
+  /** Boot port (RAOP defaults to 7000). */
+  port?: number;
 }
 
 export interface Outputs {
