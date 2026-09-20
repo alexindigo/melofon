@@ -45,6 +45,10 @@ export interface HatContext {
     scan: {
       status(): Promise<ScanStatusRow>;
     };
+    libraries: {
+      /** The configured scan sources (files roots live here, not in the hat). */
+      list(): Promise<{ id: string; name: string; path: string }[]>;
+    };
     playback: {
       /** THE playback core: every player/queue mutation and the engine
        * views. The hat parses into one command and encodes views back out —
@@ -97,9 +101,10 @@ export interface HatContext {
     };
     library: {
       listAlbums(opts: {
-        sort: 'name';
+        sort: 'name' | 'genre';
         size: number;
         offset: number;
+        genre?: string;
       }): Promise<AlbumRow[]>;
       getAlbum(
         id: string,

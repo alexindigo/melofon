@@ -26,6 +26,7 @@ export default async (request: HatRequest, context: HatContext) => {
   }
   const paging = pagingParams(request.query);
   if (paging instanceof Response) return paging;
+  const ALL = Number.MAX_SAFE_INTEGER;
   const wants = (kind: string) => type.includes(kind);
   const empty = {
     items: [] as unknown[],
@@ -36,13 +37,69 @@ export default async (request: HatRequest, context: HatContext) => {
   const reply: Record<string, unknown> = {};
 
   if (expression !== null) {
-    if (expression.trim().toLowerCase() !== 'data_kind is pipe') {
-      return badRequest();
+    const trimmed = expression.trim();
+    if (trimmed.toLowerCase() === 'data_kind is pipe') {
+      // No pipes of any kind: every requested type is an empty paging object.
+      if (wants('track')) reply.tracks = empty;
+      if (wants('artist')) reply.artists = empty;
+      if (wants('album')) reply.albums = empty;
+      if (wants('playlist')) reply.playlists = empty;
+      if (wants('genre')) reply.genres = empty;
+      if (wants('composer')) reply.composers = empty;
+      return reply;
     }
-    // No pipes of any kind: every requested type is an empty paging object.
-    if (wants('track')) reply.tracks = empty;
-    if (wants('artist')) reply.artists = empty;
-    if (wants('album')) reply.albums = empty;
+    // The one smart-playlist shape we speak: genre is "<name>" (HA's
+    // get_genre). Anything more is the full language — still 400.
+    const gm = /^genre is "(.+)"$/i.exec(trimmed);
+    if (gm === null) return badRequest();
+    const genre = gm[1];
+    if (wants('track')) {
+      const albumArtist = albumArtistResolver(context.app);
+      const songs = await context.app.library.songsByGenre(genre, {
+        size: ALL,
+        offset: 0,
+      });
+      reply.tracks = paged(
+        await Promise.all(
+          songs.map(async (s) => trackPayload(s, await albumArtist(s.albumId))),
+        ),
+        paging.offset,
+        paging.limit,
+      );
+    }
+    if (wants('album')) {
+      const albums = await context.app.library.listAlbums({
+        sort: 'genre',
+        genre,
+        size: ALL,
+        offset: 0,
+      });
+      reply.albums = paged(
+        albums.map(albumPayload),
+        paging.offset,
+        paging.limit,
+      );
+    }
+    if (wants('artist')) {
+      const albums = await context.app.library.listAlbums({
+        sort: 'genre',
+        genre,
+        size: ALL,
+        offset: 0,
+      });
+      const artistIds = new Set(albums.map((a) => a.artistId));
+      const artists = (await context.app.library.listArtists()).filter((a) =>
+        artistIds.has(a.id)
+      );
+      reply.artists = paged(
+        await Promise.all(
+          artists.map((a) => artistPayload(context.app, a)),
+        ),
+        paging.offset,
+        paging.limit,
+      );
+    }
+    // Playlists/genres/composers have no genre-expression meaning here.
     if (wants('playlist')) reply.playlists = empty;
     if (wants('genre')) reply.genres = empty;
     if (wants('composer')) reply.composers = empty;
@@ -50,7 +107,6 @@ export default async (request: HatRequest, context: HatContext) => {
   }
 
   const q = (query ?? '').toLowerCase();
-  const ALL = Number.MAX_SAFE_INTEGER;
   if (wants('track') || wants('artist') || wants('album')) {
     const found = await context.app.library.search3(query ?? '', {
       artistCount: ALL,

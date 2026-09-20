@@ -12,6 +12,7 @@ import { parseFile } from 'music-metadata';
 import { encodeHex } from '@std/encoding/hex';
 import { createMedia, type Media } from './media.ts';
 import type { Db } from './db.ts';
+import type { Notify } from './notify.ts';
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
@@ -329,7 +330,11 @@ export interface ScanService {
   start(): Promise<void>;
 }
 
-export function createScan(db: Db, media?: Media): ScanService {
+export function createScan(
+  db: Db,
+  media?: Media,
+  opts?: { notify?: Notify },
+): ScanService {
   let scanning = false;
   let count = 0;
   let lastScanMs: number | null = null;
@@ -337,6 +342,9 @@ export function createScan(db: Db, media?: Media): ScanService {
     const counts = await scanLibrary(db, media);
     count = counts.files;
     lastScanMs = Date.now();
+    // A completed scan changed the library DB — clients re-read (OwnTone
+    // playlist/library refresh). Core emits; no hat involvement.
+    opts?.notify?.emit(['database']);
     return counts;
   };
   return {

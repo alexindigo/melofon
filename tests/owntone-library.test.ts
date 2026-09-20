@@ -342,12 +342,118 @@ Deno.test('search: type substring matching (track ≡ tracks), all result kinds'
       limit: -1,
     });
     assertEquals(
-      (await get(app, '/api/search?type=tracks&expression=genre+is+%22Pop%22'))
+      (await get(
+        app,
+        '/api/search?type=tracks&expression=media_kind+is+music',
+      ))
         .status,
       400,
     );
     assertEquals((await get(app, '/api/search?query=x')).status, 400);
     assertEquals((await get(app, '/api/search?type=tracks')).status, 400);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('files: roots without directory, children by directory, no escape', async () => {
+  const { app, close } = await setup();
+  try {
+    // No directory → the configured source roots.
+    const roots = await (await get(app, '/api/library/files')).json();
+    assertEquals(roots.directories, [{ path: 'tests/fixtures/library' }]);
+    assertEquals(roots.tracks.total, 0);
+    assertEquals(roots.playlists.total, 0);
+
+    // At a root: immediate subdirectories, no immediate tracks.
+    const root = await (await get(
+      app,
+      `/api/library/files?directory=${
+        encodeURIComponent('tests/fixtures/library')
+      }`,
+    )).json();
+    assertEquals(root.directories, [
+      { path: 'tests/fixtures/library/Fixture Artist' },
+      { path: 'tests/fixtures/library/Various Artists' },
+    ]);
+    assertEquals(root.tracks.total, 0);
+
+    // One level down: the album dir. Inside it: the media files.
+    const artist = await (await get(
+      app,
+      `/api/library/files?directory=${
+        encodeURIComponent('tests/fixtures/library/Fixture Artist')
+      }`,
+    )).json();
+    assertEquals(artist.directories, [
+      { path: 'tests/fixtures/library/Fixture Artist/Fixture Album' },
+    ]);
+    const albumDir = await (await get(
+      app,
+      `/api/library/files?directory=${
+        encodeURIComponent(
+          'tests/fixtures/library/Fixture Artist/Fixture Album',
+        )
+      }`,
+    )).json();
+    assertEquals(albumDir.directories, []);
+    assertEquals(albumDir.tracks.total, 3);
+    assertEquals(
+      albumDir.tracks.items.map((t: { title: string }) => t.title).sort(),
+      ['Clip', 'First Song', 'Second Song'],
+    );
+
+    // Outside every source root → 404 (no escape).
+    assertEquals(
+      (await get(app, '/api/library/files?directory=%2Fetc')).status,
+      404,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('genre expression: tracks/albums/artists of a genre; other expressions 400', async () => {
+  const { app, close } = await setup();
+  try {
+    const expr = encodeURIComponent('genre is "Fixture Rock"');
+    const res = await get(
+      app,
+      `/api/search?type=tracks,albums,artists&expression=${expr}`,
+    );
+    assertEquals(res.status, 200);
+    const body = await res.json();
+    assertEquals(
+      body.tracks.items.map((t: { title: string }) => t.title).sort(),
+      ['First Song', 'Second Song'],
+    );
+    assertEquals(
+      body.albums.items.map((a: { name: string }) => a.name),
+      ['Fixture Album'],
+    );
+    assertEquals(
+      body.artists.items.map((a: { name: string }) => a.name),
+      ['Fixture Artist'],
+    );
+
+    // The genre URI shape HA's get_genre uses per media type.
+    const albumsOnly = await get(
+      app,
+      `/api/search?type=albums&expression=${expr}`,
+    );
+    const abody = await albumsOnly.json();
+    assertEquals(abody.albums.total, 1);
+    assertEquals(abody.tracks, undefined);
+
+    // Still not the smart-playlist language.
+    assertEquals(
+      (await get(
+        app,
+        '/api/search?type=tracks&expression=genre+is+%22Pop%22+order+by+random',
+      ))
+        .status,
+      400,
+    );
   } finally {
     await close();
   }

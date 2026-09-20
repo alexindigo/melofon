@@ -36,7 +36,8 @@ const db = await openDb(cfg.dataDir, {
 await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();
-const scan = createScan(db, media);
+const notify = createNotify();
+const scan = createScan(db, media, { notify });
 const counts = await scan.run();
 console.log(
   `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
@@ -45,7 +46,6 @@ console.log(
 const app = { db, cfg, libraries };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
-const notify = createNotify();
 const env = Deno.env.toObject();
 const player = createPlayer();
 const outputs = createOutputs({ notify });

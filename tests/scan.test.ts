@@ -6,9 +6,10 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { openDb } from '../src/db.ts';
 import { seedFirstUser } from '../src/users.ts';
-import { scanLibrary } from '../src/scan.ts';
+import { createScan, scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
+import { createNotify } from '../src/notify.ts';
 
 const FIXTURE_LIBRARY = 'tests/fixtures/library';
 
@@ -25,6 +26,20 @@ async function setup() {
     },
   };
 }
+
+Deno.test('a completed scan emits database on app.notify', async () => {
+  const { db, close } = await setup();
+  try {
+    const events: string[][] = [];
+    const notify = createNotify();
+    notify.subscribe((types) => events.push(types));
+    const scan = createScan(db, undefined, { notify });
+    await scan.run();
+    assertEquals(events, [['database']]);
+  } finally {
+    await close();
+  }
+});
 
 Deno.test('scanLibrary reads tags, honors TPE2, skips corrupt files', async () => {
   const { db, close } = await setup();
