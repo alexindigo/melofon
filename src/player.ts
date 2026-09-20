@@ -40,8 +40,10 @@ export interface PlayerStatus {
 
 export interface Player {
   status(): PlayerStatus;
-  /** No-op on an empty queue (state stays 'stop'). */
-  play(): void;
+  /** No-op on an empty queue (state stays 'stop'). `fromPosition` starts
+   * the queue item at that 0-based index (OwnTone playback_from_position),
+   * clamped into range; omitted → current (or queue head after stop). */
+  play(fromPosition?: number): void;
   pause(): void;
   stop(): void;
   toggle(): void;
@@ -59,7 +61,10 @@ export interface Player {
    * starts playback (OwnTone semantics). False when the queue is empty. */
   seek(opts: { positionMs?: number; seekMs?: number }): boolean;
   queue(): { version: number; items: QueueEntry[] };
-  queueAdd(songs: SongRow[]): QueueEntry[];
+  /** Appends — or inserts at 0-based `position` (OwnTone queue add
+   * semantics: omit = append). Inserting at/before the current item shifts
+   * it so it stays current. */
+  queueAdd(songs: SongRow[], position?: number): QueueEntry[];
   /** Clears the queue and stops playback. */
   queueClear(): void;
 }
@@ -128,8 +133,16 @@ export function createPlayer(): Player {
     state = 'play';
   };
 
-  const doPlay = () => {
+  const doPlay = (fromPosition?: number) => {
     if (items.length === 0) return; // empty queue: 204, state stays stop
+    if (fromPosition !== undefined) {
+      const at = Math.min(
+        Math.max(0, Math.trunc(fromPosition)),
+        items.length - 1,
+      );
+      startAt(at);
+      return;
+    }
     if (state === 'pause') {
       // Resume from the frozen position.
       baseProgressMs = progressMs();
@@ -170,9 +183,8 @@ export function createPlayer(): Player {
       };
     },
 
-    play() {
-      if (items.length === 0) return; // empty queue: 204, state stays stop
-      doPlay();
+    play(fromPosition?: number) {
+      doPlay(fromPosition);
     },
 
     pause() {
@@ -243,9 +255,18 @@ export function createPlayer(): Player {
       return { version, items: [...items] };
     },
 
-    queueAdd(songs) {
+    queueAdd(songs, position) {
       const added = songs.map((song) => ({ id: nextId++, song }));
-      items = [...items, ...added];
+      if (position === undefined || position >= items.length) {
+        items = [...items, ...added];
+      } else {
+        const at = Math.max(0, Math.trunc(position));
+        items = [...items.slice(0, at), ...added, ...items.slice(at)];
+        // Inserted at/before the current item: shift so it stays current.
+        if (currentIndex !== null && at <= currentIndex) {
+          currentIndex += added.length;
+        }
+      }
       version++;
       return added;
     },

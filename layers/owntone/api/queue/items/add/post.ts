@@ -1,46 +1,108 @@
 // layers/owntone/api/queue/items/add/post.ts — POST
-// /api/queue/items/add?uris=library:track:<id>|library:album:<id>[,…]
-// uris only: no smart-playlist `expression` in M5. The clear=true, shuffle=…
-// and playback=start modifiers are honored (OwnTone's); position/limit are
-// not. Response { version, count, items } counts/lists the ADDED items.
+// /api/queue/items/add?uris=…&position=&playback=&playback_from_position=&clear=&shuffle=
+// uris: library:track|album|artist|playlist:<digits> or library:genre:<name>
+// (comma-separated). The hat translates each uri to songs (a facade's one
+// job); core's playback.queueAdd owns clear/insert/shuffle/play and emits.
+// expression stays unsupported (genre plays use the genre URI); unknown id
+// or genre → 404; malformed uri → 400; http/DLNA stays 400.
 import {
   albumArtistResolver,
   badRequest,
   boolParam,
   findAlbumByWire,
+  findArtistByWire,
+  findPlaylistByWire,
   findSongByWire,
+  intParam,
   notFound,
   queueItemPayload,
 } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest, SongRow } from '#owntone/types.ts';
 
+const ALL = Number.MAX_SAFE_INTEGER;
+
+async function songsForUri(
+  context: HatContext,
+  kind: string,
+  id: string,
+): Promise<SongRow[] | null> {
+  const app = context.app;
+  if (kind === 'track') {
+    const song = await findSongByWire(app, id);
+    return song === null ? null : [song];
+  }
+  if (kind === 'album') {
+    const album = await findAlbumByWire(app, id);
+    if (album === null) return null;
+    return (await app.library.getAlbum(album.id))?.songs ?? null;
+  }
+  if (kind === 'artist') {
+    const artist = await findArtistByWire(app, id);
+    if (artist === null) return null;
+    const songs: SongRow[] = [];
+    for (const album of await app.library.albumsByArtist(artist.id)) {
+      const got = await app.library.getAlbum(album.id);
+      if (got !== null) songs.push(...got.songs);
+    }
+    return songs;
+  }
+  // playlist — OwnTone's are global, Melofon's are the seeded user's
+  if (app.cfg.user === undefined) return null;
+  const playlist = await findPlaylistByWire(app, id);
+  if (playlist === null) return null;
+  const full = await app.playlists.get(app.cfg.user, playlist.id);
+  if (full === null) return null;
+  return (
+    await Promise.all(full.trackIds.map((tid) => app.library.getSong(tid)))
+  ).filter((s): s is SongRow => s !== null);
+}
+
 export default async (request: HatRequest, context: HatContext) => {
   const uris = request.query.get('uris');
-  if (uris === null) return badRequest(); // expression: not supported in M5
+  if (uris === null) return badRequest(); // expression: not supported
   const songs: SongRow[] = [];
   for (const raw of uris.split(',')) {
-    const m = /^library:(track|album):(\d+)$/.exec(raw.trim());
-    if (m === null) return badRequest();
-    if (m[1] === 'track') {
-      const song = await findSongByWire(context.app, m[2]);
-      if (song === null) return notFound();
-      songs.push(song);
-    } else {
-      const album = await findAlbumByWire(context.app, m[2]);
-      if (album === null) return notFound();
-      const got = await context.app.library.getAlbum(album.id);
-      if (got === null) return notFound();
-      songs.push(...got.songs);
+    const uri = raw.trim();
+    const m = /^library:(track|album|artist|playlist):(\d+)$/.exec(uri);
+    if (m !== null) {
+      const found = await songsForUri(context, m[1], m[2]);
+      if (found === null) return notFound();
+      songs.push(...found);
+      continue;
     }
+    const g = /^library:genre:(.+)$/.exec(uri);
+    if (g !== null) {
+      const found = await context.app.library.songsByGenre(g[1], {
+        size: ALL,
+        offset: 0,
+      });
+      if (found.length === 0) return notFound();
+      songs.push(...found);
+      continue;
+    }
+    return badRequest();
   }
 
-  if (boolParam(request.query.get('clear'))) context.app.playback.queueClear();
-  const shuffle = request.query.get('shuffle');
-  if (shuffle !== null) context.app.playback.setShuffle(boolParam(shuffle));
+  const rawPosition = request.query.get('position');
+  const position = rawPosition === null ? undefined : intParam(rawPosition);
+  if (position === null) return badRequest();
+  const rawFrom = request.query.get('playback_from_position');
+  const playbackFromPosition = rawFrom === null ? undefined : intParam(rawFrom);
+  if (playbackFromPosition === null) return badRequest();
+  const shuffleParam = request.query.get('shuffle');
 
   const base = context.app.playback.queueView().items.length;
-  const added = context.app.playback.queueAdd(songs);
-  if (request.query.get('playback') === 'start') context.app.playback.play();
+  const startPos = Math.min(
+    position ?? (boolParam(request.query.get('clear')) ? 0 : base),
+    base,
+  );
+  const added = context.app.playback.queueAdd(songs, {
+    position,
+    playbackFromPosition,
+    play: request.query.get('playback') === 'start',
+    clear: boolParam(request.query.get('clear')),
+    shuffle: shuffleParam === null ? undefined : boolParam(shuffleParam),
+  });
 
   const albumArtist = albumArtistResolver(context.app);
   return {
@@ -50,7 +112,7 @@ export default async (request: HatRequest, context: HatContext) => {
       added.map(async (entry, i) =>
         queueItemPayload(
           entry,
-          base + i,
+          startPos + i,
           await albumArtist(entry.song.albumId),
         )
       ),

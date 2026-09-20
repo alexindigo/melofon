@@ -53,7 +53,19 @@ export interface Playback {
   setRepeat(mode: RepeatMode): void;
   setVolume(opts: { volume?: number; step?: number }): void;
   seek(opts: { positionMs?: number; seekMs?: number }): boolean;
-  queueAdd(songs: SongRow[]): QueueEntry[];
+  /** OwnTone queue add: `clear` first, then insert at `position` (omit =
+   * append), `shuffle` mode set when given, and `play` starts playback (at
+   * `playbackFromPosition` when given). One command, one emit. */
+  queueAdd(
+    songs: SongRow[],
+    opts?: {
+      position?: number;
+      playbackFromPosition?: number;
+      play?: boolean;
+      clear?: boolean;
+      shuffle?: boolean;
+    },
+  ): QueueEntry[];
   queueClear(): void;
 
   playerView(): PlayerStatus;
@@ -133,9 +145,15 @@ export function createPlayback(deps: {
       if (ok) emit(['player']);
       return ok;
     },
-    queueAdd(songs) {
-      const added = player.queueAdd(songs);
-      emit(['queue']);
+    queueAdd(songs, opts = {}) {
+      if (opts.clear) player.queueClear();
+      const added = player.queueAdd(songs, opts.position);
+      if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
+      if (opts.play) player.play(opts.playbackFromPosition);
+      const types = ['queue'];
+      if (opts.clear || opts.play) types.push('player');
+      if (opts.shuffle !== undefined) types.push('options');
+      emit(types);
       return added;
     },
     queueClear() {

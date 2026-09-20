@@ -63,7 +63,18 @@ export interface HatContext {
       setRepeat(mode: 'off' | 'all' | 'single'): void;
       setVolume(opts: { volume?: number; step?: number }): void;
       seek(opts: { positionMs?: number; seekMs?: number }): boolean;
-      queueAdd(songs: SongRow[]): QueueEntryRow[];
+      /** OwnTone queue add: clear first, insert at position (omit = append),
+       * shuffle when given, play (at playbackFromPosition) when asked. */
+      queueAdd(
+        songs: SongRow[],
+        opts?: {
+          position?: number;
+          playbackFromPosition?: number;
+          play?: boolean;
+          clear?: boolean;
+          shuffle?: boolean;
+        },
+      ): QueueEntryRow[];
       queueClear(): void;
     };
     artwork: {
@@ -95,6 +106,11 @@ export interface HatContext {
       ): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
       /** Stable-order catalog walk for deterministic wire-id resolution. */
       listSongs(opts: { offset: number; size: number }): Promise<SongRow[]>;
+      /** Songs of one genre (genre URI expansion + genre search). */
+      songsByGenre(
+        genre: string,
+        opts: { size: number; offset: number },
+      ): Promise<SongRow[]>;
       listArtists(): Promise<ArtistRow[]>;
       getArtist(id: string): Promise<ArtistRow | null>;
       albumsByArtist(artistId: string): Promise<AlbumRow[]>;
