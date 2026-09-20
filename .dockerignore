@@ -3,3 +3,7 @@ node_modules
 data
 .env
 .envrc
+helper/raop/*.o
+helper/raop/**/*.o
+helper/raop/libmelofon_raop.so
+helper/raop/test/driver

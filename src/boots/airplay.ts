@@ -1,26 +1,28 @@
 // src/boots/airplay.ts — the AirPlay 1 boot (M6). Boots are core: they
-// app.outputs.register their outputs and this one drives the native RAOP
-// helper (helper/raop/melofon-raop — OwnTone's raop.c, see VENDORING.md)
-// for every registered AirPlay output. Deno decodes the engine's current
-// track to PCM via app.media (44100/16-bit/stereo, the RAOP default); the
-// helper owns RTSP + RTP + ALAC + pacing. IPC is the helper's stdin:
-// length-prefixed frames, 'J' JSON commands (start/volume/flush/teardown/
-// pin) and 'P' raw PCM; the helper reports state as JSON lines on stdout.
+// app.outputs.register their outputs and this one drives OwnTone's RAOP
+// in-process (helper/raop/libmelofon_raop.so via Deno FFI — see
+// raop-ffi.ts) for every registered AirPlay output. Deno decodes the
+// engine's current track to PCM via app.media (44100/16-bit/stereo, the
+// RAOP contract); the library owns RTSP + RTP + ALAC + pacing on its own
+// background thread. Commands are start/volume/flush/teardown/pin; state
+// events come back polled (starting/connected/streaming/stopped/failed/
+// password).
 //
 // Notify-driven (hats never touch this): reconcile on every player/outputs/
-// volume event. Selected + engine play ⇒ helper start + PCM flows. Pause ⇒
-// flush (the helper drops its read-ahead; resume re-decodes from the
-// engine's progress). Stop / deselect / unregister ⇒ teardown + the helper
-// exits on stdin EOF. A track change or a position jump flushes first
-// because the helper reads a whole track ahead — the stale read-ahead must
-// go (this is the one place we are not gapless).
+// volume event. Selected + engine play ⇒ session start + PCM flows. Pause ⇒
+// flush (the library drops its read-ahead; resume re-decodes from the
+// engine's progress). Stop / deselect / unregister ⇒ teardown + free. A
+// track change or a position jump flushes first because the library reads a
+// whole track ahead — the stale read-ahead must go (this is the one place
+// we are not gapless).
 //
-// The transport is injectable: tests fake it and assert on the frame stream
-// without a helper binary or an AirPlay device.
+// The transport is injectable: tests fake it and assert on the command
+// stream without the library or an AirPlay device.
 import type { Media } from '../media.ts';
 import type { Notify } from '../notify.ts';
 import type { Outputs } from '../player.ts';
 import type { Playback } from '../playback.ts';
+import { createFfiSpawn } from './raop-ffi.ts';
 
 /** Stable output id for an AirPlay device: FNV-1a 64-bit of the host,
  * decimal — all digits so the OwnTone wire id regex /^\d+$/ accepts it. */
@@ -48,81 +50,14 @@ export interface AirplayBootDeps {
   playback: Playback;
   media: Media;
   notify: Notify;
-  /** Helper binary path; default helper/raop/melofon-raop next to the repo. */
-  helperPath?: string;
-  /** Injectable for tests; default spawns the helper with piped stdio. */
-  spawn?: (helperPath: string, onEvent: HelperEventFn) => AirplayTransport;
+  /** Injectable for tests; the default is the FFI transport (raop-ffi.ts). */
+  spawn?: (onEvent: HelperEventFn) => AirplayTransport;
 }
 
-const DEFAULT_HELPER_PATH = decodeURIComponent(
-  new URL('../../helper/raop/melofon-raop', import.meta.url).pathname,
-);
 const RAOP_PORT_DEFAULT = 7000;
 /** Engine progress must move more than this (ms) mid-play to count as a
  * seek; below it, event-latency jitter would cause flush hiccups. */
 const SEEK_JUMP_MS = 1500;
-
-function defaultSpawn(
-  helperPath: string,
-  onEvent: HelperEventFn,
-): AirplayTransport {
-  const proc = new Deno.Command(helperPath, {
-    stdin: 'piped',
-    stdout: 'piped',
-    stderr: 'inherit', // helper logs (DPRINTF) go to our stderr
-  }).spawn();
-  const writer = proc.stdin.getWriter();
-  const encode = new TextEncoder();
-
-  // stdout: one JSON event per line.
-  void (async () => {
-    const decoder = new TextDecoder();
-    let buf = '';
-    for await (const chunk of proc.stdout) {
-      buf += decoder.decode(chunk, { stream: true });
-      let idx = buf.indexOf('\n');
-      while (idx >= 0) {
-        const line = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
-        idx = buf.indexOf('\n');
-        try {
-          const ev = JSON.parse(line) as { event?: string; value?: string };
-          if (typeof ev.event === 'string') onEvent(ev.event, ev.value);
-        } catch {
-          // Not JSON — helper noise; ignore.
-        }
-      }
-    }
-  })().catch(() => {}); // stdout ends with the process
-
-  // One write per frame (header+payload combined) so concurrent send/pcm
-  // callers can never interleave on the wire.
-  const frame = (type: number, payload: Uint8Array) => {
-    const out = new Uint8Array(5 + payload.length);
-    new DataView(out.buffer).setUint32(0, payload.length); // BE length
-    out[4] = type;
-    out.set(payload, 5);
-    return writer.write(out);
-  };
-
-  return {
-    send: (cmd) => frame(0x4a, encode.encode(JSON.stringify(cmd))), // 'J'
-    pcm: (chunk) => frame(0x50, chunk), // 'P'
-    close: async () => {
-      await writer.close().catch(() => {});
-      const status = await Promise.race([
-        proc.status.then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), 3000)),
-      ]);
-      if (!status) {
-        try {
-          proc.kill();
-        } catch { /* already gone */ }
-        await proc.status.catch(() => {});
-      }
-    },
-  };
-}
 
 interface Runtime {
   transport: AirplayTransport | null;
@@ -144,8 +79,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
   close(): Promise<void>;
 } {
   const { outputs, playback, media, notify } = deps;
-  const helperPath = deps.helperPath ?? DEFAULT_HELPER_PATH;
-  const spawn = deps.spawn ?? defaultSpawn;
+  const spawn = deps.spawn ?? createFfiSpawn();
   const runtimes = new Map<string, Runtime>();
   let closed = false;
 
@@ -270,15 +204,13 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       if (rt.transport === null) {
         try {
           rt.transport = spawn(
-            helperPath,
             (event, value) => onHelperEvent(output.id, event, value),
           );
         } catch (err) {
           if (!rt.warned) {
             rt.warned = true;
             console.warn(
-              `[melofon] airplay: cannot start helper ${helperPath} ` +
-                `(make -C helper/raop): ${err}`,
+              `[melofon] airplay: cannot start the RAOP session: ${err}`,
             );
           }
           continue;

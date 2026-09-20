@@ -18,6 +18,11 @@ CFLAGS  += -fPIC -DHAVE_CONFIG_H -D_GNU_SOURCE -DCONFIG_GCRYPT=1 \
 LDLIBS  = $(shell pkg-config --libs $(PKGS)) -levent_pthreads -lgpg-error \
           -lunistring -lpthread -lm
 
+# -z nodelete: the library's background loop thread can outlive the dlopen
+# handle (a consumer that drops it without raop_free must not get the code
+# unmapped from under the thread — dlclose becomes a no-op).
+LDFLAGS  = -Wl,-z,nodelete
+
 SRC = ffi.c \
       stub/stubs.c \
       vendor/outputs/raop.c \
@@ -33,7 +38,7 @@ SRC = ffi.c \
 OBJ = $(SRC:.c=.o)
 
 libmelofon_raop.so: $(OBJ)
-	$(CC) -shared -o $@ $(OBJ) $(LDLIBS)
+	$(CC) -shared -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
 # Functional smoke test: driver links the library; a fake RAOP device (no
 # Apple hardware needed) asserts the wire.

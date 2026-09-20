@@ -99,7 +99,7 @@ async function setup() {
     playback,
     media: createMedia(),
     notify,
-    spawn: (_path, onEvent) => {
+    spawn: (onEvent) => {
       const t = new FakeTransport(onEvent);
       spawned.push(t);
       return t;
