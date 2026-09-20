@@ -7,12 +7,17 @@
 // re-encode to the requested audio format, buffered in memory — music
 // videos are minutes, so an mp3 fits in a few MB. M4.6 adds hlsRemux:
 // stream-copy (H.264 + AAC, no re-encode) into 10s MPEG-TS HLS segments in
-// a caller-chosen cache dir.
+// a caller-chosen cache dir. M6 adds decodePcm for the boots: the engine's
+// current track decoded to raw interleaved PCM (44100/16-bit/stereo, the
+// RAOP default quality in raop.c), streamed frame by frame.
 import {
+  AV_CHANNEL_LAYOUT_STEREO,
   AV_CODEC_ID_AAC,
   AV_CODEC_ID_H264,
+  AV_SAMPLE_FMT_S16,
   AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
+  AVSEEK_FLAG_BACKWARD,
   Decoder,
   Demuxer,
   Encoder,
@@ -45,6 +50,17 @@ export interface Media {
    * count, or null when the file is not remuxable or the mux fails.
    * Concurrent calls for the same target share one run. */
   hlsRemux(path: string, outDir: string): Promise<number | null>;
+  /** Audio track of `path` decoded to raw interleaved PCM — 44100 Hz,
+   * 16-bit, stereo, the RAOP default quality (raop.c). Boots stream the
+   * chunks to their sink; each chunk is one decoded frame's bytes (a copy,
+   * safe after the frame is freed). `startMs` seeks (keyframe granularity)
+   * for a pause → resume. Null when the file has no audio or the decoder
+   * cannot be created; mid-stream errors propagate to the consumer. Breaking
+   * out of the iteration cancels the decode and frees everything. */
+  decodePcm(
+    path: string,
+    opts?: { startMs?: number },
+  ): Promise<AsyncIterable<Uint8Array> | null>;
 }
 
 // ExtractAudio profiles: format → encoder + muxer + wire content type.
@@ -61,6 +77,11 @@ const EXTRACT_PROFILES: Record<
 };
 
 const EMPTY: Probe = { durationMs: null, hasVideo: false, hasAudio: false };
+
+// The PCM contract every boot decodes to (RAOP's default quality).
+const PCM_RATE = 44100;
+const PCM_CHANNELS = 2;
+const PCM_BYTES_PER_SAMPLE = 2 * PCM_CHANNELS; // s16le interleaved
 
 // HLS segment length in seconds (Airsonic's SEGMENT_DURATION, probed).
 const HLS_SEGMENT_SECONDS = 10;
@@ -203,6 +224,65 @@ export function createMedia(): Media {
         inflight.set(key, pending);
       }
       return pending;
+    },
+
+    async decodePcm(path, opts = {}) {
+      let input: Demuxer;
+      try {
+        input = await Demuxer.open(path);
+      } catch {
+        return null; // not a media file FFmpeg recognizes
+      }
+      let decoder: Decoder;
+      try {
+        const audio = input.audio();
+        if (audio === undefined) {
+          await input.close();
+          return null; // no audio track to decode
+        }
+        decoder = await Decoder.create(audio, {
+          resample: {
+            sampleRate: PCM_RATE,
+            sampleFormat: AV_SAMPLE_FMT_S16,
+            channelLayout: AV_CHANNEL_LAYOUT_STEREO,
+          },
+        });
+        if (opts.startMs !== undefined && opts.startMs > 0) {
+          // Keyframe granularity (AVSEEK_FLAG_BACKWARD): resume is allowed a
+          // small overlap. Failure still decodes — from the start.
+          await input.seek(
+            opts.startMs / 1000,
+            audio.index,
+            AVSEEK_FLAG_BACKWARD,
+          )
+            .catch(() => -1);
+        }
+      } catch (err) {
+        console.warn(`[melofon] media: decodePcm failed for ${path}: ${err}`);
+        await input.close().catch(() => {});
+        return null;
+      }
+      const frames = decoder.frames(input.packets());
+      return (async function* () {
+        try {
+          for await (const frame of frames) {
+            if (frame === null) continue; // flush signal, not media
+            const plane = frame.data?.[0];
+            if (plane !== undefined && frame.nbSamples > 0) {
+              // Packed s16 stereo: nbSamples * 4 bytes (the plane can be
+              // linesize-padded); copy — frame.free() reuses native memory.
+              const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
+              const chunk = new Uint8Array(Math.min(bytes, plane.length));
+              chunk.set(plane.subarray(0, chunk.length));
+              yield chunk;
+            }
+            frame.free();
+          }
+        } finally {
+          decoder[Symbol.dispose]();
+          await input.close().catch(() => {});
+        }
+      })();
     },
   };
 }
