@@ -80,6 +80,9 @@ export interface Output {
   host?: string;
   /** Boot port (RAOP defaults to 7000). */
   port?: number;
+  /** The device wants a PIN/password (OwnTone needs_auth_key on the wire);
+   * set by the boot when its helper reports the auth/verification path. */
+  needsAuthKey?: boolean;
 }
 
 export interface Outputs {
@@ -92,10 +95,20 @@ export interface Outputs {
   /** Enables exactly the given ids; false when any id is unknown. */
   setEnabled(ids: string[]): boolean;
   toggle(id: string): Output | null;
+  /** selected/volume/needsAuthKey are state (stored, emitted); pin is a
+   * command — delivered synchronously to onCommand listeners (the boots),
+   * never stored. */
   update(
     id: string,
-    opts: { selected?: boolean; volume?: number },
+    opts: {
+      selected?: boolean;
+      volume?: number;
+      pin?: string;
+      needsAuthKey?: boolean;
+    },
   ): Output | null;
+  /** Boots subscribe here for pin commands routed through update(). */
+  onCommand(fn: (id: string, cmd: { pin?: string }) => void): void;
 }
 
 function clampVolume(n: number): number {
@@ -290,6 +303,9 @@ export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
+  const commandListeners = new Set<
+    (id: string, cmd: { pin?: string }) => void
+  >();
 
   return {
     list: () => outputs.map((o) => ({ ...o })),
@@ -328,8 +344,24 @@ export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
       if (found === null) return null;
       if (opts.selected !== undefined) found.selected = opts.selected;
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
+      if (opts.needsAuthKey !== undefined) {
+        found.needsAuthKey = opts.needsAuthKey;
+      }
+      if (opts.pin !== undefined) {
+        // A command, not state: straight to the boot, never stored.
+        for (const fn of [...commandListeners]) {
+          try {
+            fn(id, { pin: opts.pin });
+          } catch (err) {
+            console.debug('[melofon] outputs command listener threw:', err);
+          }
+        }
+      }
       emit(opts.volume === undefined ? ['outputs'] : ['outputs', 'volume']);
       return { ...found };
+    },
+    onCommand(fn) {
+      commandListeners.add(fn);
     },
   };
 }

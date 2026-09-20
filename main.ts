@@ -25,6 +25,7 @@ import { createArtwork } from './src/artwork.ts';
 import { createOutputs, createPlayer } from './src/player.ts';
 import { createPlayback } from './src/playback.ts';
 import { createNotify } from './src/notify.ts';
+import { airplayOutputId, createAirplayBoot } from './src/boots/airplay.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts, createBinds } from './src/binds.ts';
 import { facade } from './src/facade.ts';
@@ -75,6 +76,28 @@ const bag = {
   binds: createBinds(() => layers, env),
 };
 const layers = await loadLayers({ app: bag });
+
+// Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
+createAirplayBoot({ outputs, playback, media, notify });
+
+// MELOFON_AIRPLAY_HOST=<ip>[:port] — register a device without the UI; the
+// CRUD twin is POST /_/outputs. The boot picks it up from the outputs list.
+const airplayHost = env.MELOFON_AIRPLAY_HOST?.trim();
+if (airplayHost) {
+  const match = airplayHost.match(/^(.+?)(?::(\d+))?$/);
+  const host = match?.[1] ?? airplayHost;
+  const port = match?.[2] === undefined ? undefined : Number(match[2]);
+  outputs.register({
+    id: airplayOutputId(host),
+    name: host,
+    type: 'AirPlay',
+    selected: false,
+    volume: 100,
+    host,
+    ...(port === undefined ? {} : { port }),
+  });
+  console.log(`[melofon] airplay: registered ${host}${port ? `:${port}` : ''}`);
+}
 
 // Extra binds: the distinct actual ports every layer's claims map to after
 // MELOFON_LISTEN_<layer> / MELOFON_LISTEN_REPLACE_<claimed> — minus the

@@ -160,7 +160,7 @@ export function outputPayload(output: OutputRow) {
     selected: output.selected,
     has_password: false,
     requires_auth: false,
-    needs_auth_key: false,
+    needs_auth_key: output.needsAuthKey ?? false,
     volume: output.volume,
     offset_ms: 0,
     format: 'pcm',

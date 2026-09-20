@@ -132,3 +132,48 @@ Deno.test('core /_/outputs register/list/delete round-trip', async () => {
     1,
   );
 });
+
+Deno.test('core /_/outputs/<id>/pin delivers the pin to the boot', async () => {
+  const { core, outputs } = await setup();
+  const res = await post(
+    core,
+    JSON.stringify({
+      name: 'Kitchen ATV',
+      type: 'AirPlay',
+      host: '192.0.2.10',
+    }),
+  );
+  const { output } = (await res.json()) as { output: { id: string } };
+
+  const pins: [string, string][] = [];
+  outputs.onCommand((id, cmd) => {
+    if (cmd.pin !== undefined) pins.push([id, cmd.pin]);
+  });
+
+  const ok = await core(
+    new Request(`http://x/outputs/${output.id}/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: '1234' }),
+    }),
+  );
+  assertEquals(ok.status, 200);
+  assertEquals(pins, [[output.id, '1234']]);
+
+  const unknown = await core(
+    new Request('http://x/outputs/999/pin', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: '1234' }),
+    }),
+  );
+  assertEquals(unknown.status, 404);
+  const empty = await core(
+    new Request(`http://x/outputs/${output.id}/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: '' }),
+    }),
+  );
+  assertEquals(empty.status, 400);
+});

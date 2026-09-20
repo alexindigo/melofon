@@ -2,3 +2,6 @@
 .env
 data/
 node_modules/
+helper/raop/*.o
+helper/raop/**/*.o
+helper/raop/melofon-raop

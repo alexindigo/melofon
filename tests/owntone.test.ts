@@ -199,6 +199,19 @@ Deno.test('outputs: get/put/toggle/set on a registered output; unknown-id 400s',
       (await put(onHook, '/api/outputs/0', 'not json')).status,
       400,
     );
+
+    // pin passes through to the boot (never stored on the output row).
+    const pins: [string, string][] = [];
+    outputs.onCommand((id, cmd) => {
+      if (cmd.pin !== undefined) pins.push([id, cmd.pin]);
+    });
+    assertEquals(
+      (await put(onHook, '/api/outputs/0', '{"pin":"1234"}')).status,
+      204,
+    );
+    assertEquals(pins, [['0', '1234']]);
+    const pinless = await get(onHook, '/api/outputs/0');
+    assert(!('pin' in await pinless.json()));
   } finally {
     await close();
   }

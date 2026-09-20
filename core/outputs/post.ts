@@ -3,6 +3,8 @@
 // { "name", "type": "AirPlay", "host", "port"? }. The id is stable from the
 // host (FNV-1a 64-bit, decimal — all digits so the OwnTone wire id regex
 // /^\d+$/ accepts it), so re-registering the same device is idempotent.
+import { airplayOutputId } from '../../src/boots/airplay.ts';
+
 interface OutputsApp {
   app: {
     outputs: {
@@ -21,15 +23,6 @@ interface OutputsApp {
 
 function badRequest(message: string): Response {
   return Response.json({ error: message }, { status: 400 });
-}
-
-/** FNV-1a 64-bit of `host`, decimal string. Stable across restarts. */
-export function outputIdFromHost(host: string): string {
-  let hash = 0xcbf29ce484222325n;
-  for (const byte of new TextEncoder().encode(host)) {
-    hash = BigInt.asUintN(64, (hash ^ BigInt(byte)) * 0x100000001b3n);
-  }
-  return hash.toString(10);
 }
 
 export default async function (
@@ -61,7 +54,7 @@ export default async function (
     return badRequest('port must be a positive integer');
   }
   const output = {
-    id: outputIdFromHost(host.trim()),
+    id: airplayOutputId(host.trim()),
     name: name.trim(),
     type,
     selected: false,

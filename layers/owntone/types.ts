@@ -96,7 +96,7 @@ export interface HatContext {
       toggle(id: string): OutputRow | null;
       update(
         id: string,
-        opts: { selected?: boolean; volume?: number },
+        opts: { selected?: boolean; volume?: number; pin?: string },
       ): OutputRow | null;
     };
     library: {
@@ -175,6 +175,8 @@ export interface OutputRow {
   type: string;
   selected: boolean;
   volume: number;
+  /** Set by a boot when the device wants a PIN/password (needs_auth_key). */
+  needsAuthKey?: boolean;
 }
 
 export interface ArtistRow {
