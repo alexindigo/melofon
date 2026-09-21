@@ -70,7 +70,7 @@ const bag = {
   bookmarks: createBookmarks(db),
   nowPlaying,
   playback,
-  stream: createStream(media, playback),
+  stream: createStream(media, playback, cfg),
   zip: createZip(),
   artwork: createArtwork(library),
   player,

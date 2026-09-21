@@ -20,6 +20,10 @@ export interface Config {
   // MELOFON_DEBUG_LOG_HEADERS=1|true — additionally dump the request's
   // redacted query + headers on the accept line. Off by default.
   debugLogHeaders?: boolean;
+  // MELOFON_STREAM_ABSENT_TO_MP3=1|true — when the client sends no `format`,
+  // transcode to mp3 anyway (dumb clients; DS Audio's checklist maps onto the
+  // /_/config key + Settings UI later). Off by default (DirectPlay).
+  absentToMp3?: boolean;
 }
 
 export function loadConfig(
@@ -68,6 +72,9 @@ export function loadConfig(
     ),
     debugLogHeaders: ['1', 'true'].includes(
       env('MELOFON_DEBUG_LOG_HEADERS') ?? '',
+    ),
+    absentToMp3: ['1', 'true'].includes(
+      env('MELOFON_STREAM_ABSENT_TO_MP3') ?? '',
     ),
   };
 }

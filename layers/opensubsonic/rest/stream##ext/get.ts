@@ -14,6 +14,10 @@ export default async (request: HatRequest, context: HatContext) => {
   if (id instanceof Response) return id;
   const song = await context.app.library.getSong(id);
   if (song === null) return notFound(context);
+  const rawBitRate = context.state.params!.get('maxBitRate');
+  const maxBitRateKbps = rawBitRate !== null && /^\d+$/.test(rawBitRate)
+    ? Number(rawBitRate)
+    : undefined;
   const res = await context.app.stream.play(
     request._raw,
     { path: song.path, isVideo: song.isVideo },
@@ -24,6 +28,7 @@ export default async (request: HatRequest, context: HatContext) => {
       trackId: song.id,
       streamId: crypto.randomUUID(),
     },
+    maxBitRateKbps,
   );
   if (res === null) {
     return fail(context, 0, 'audio extraction failed');

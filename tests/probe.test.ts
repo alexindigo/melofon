@@ -16,10 +16,22 @@ Deno.test('probe on the fixture mp3: audio, no video, duration', async () => {
 
 Deno.test('probe on undecodable input returns nulls instead of throwing', async () => {
   const probe = await createMedia().probe('tests/fixtures/library/corrupt.mp3');
-  assertEquals(probe, { durationMs: null, hasVideo: false, hasAudio: false });
+  assertEquals(probe, {
+    durationMs: null,
+    hasVideo: false,
+    hasAudio: false,
+    bitrateKbps: null,
+    audioCodec: null,
+  });
 });
 
 Deno.test('probe on a missing file returns nulls instead of throwing', async () => {
   const probe = await createMedia().probe('/no/such/file.mp3');
-  assertEquals(probe, { durationMs: null, hasVideo: false, hasAudio: false });
+  assertEquals(probe, {
+    durationMs: null,
+    hasVideo: false,
+    hasAudio: false,
+    bitrateKbps: null,
+    audioCodec: null,
+  });
 });

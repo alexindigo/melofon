@@ -203,6 +203,7 @@ export interface HatContext {
         file: { path: string; isVideo: boolean },
         format?: string,
         identity?: StreamIdentity,
+        maxBitRateKbps?: number,
       ): Promise<Response | null>;
     };
     media: {
