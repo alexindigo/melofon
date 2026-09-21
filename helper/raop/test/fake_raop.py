@@ -2,6 +2,7 @@
 """Fake AirPlay 1 (RAOP) device for the helper's functional test: answers
 enough RTSP to get melofon-raop streaming, then counts RTP audio packets on
 the UDP server port. Prints one REPORT line on stdin EOF."""
+import os
 import select
 import socket
 import socketserver
@@ -9,6 +10,9 @@ import struct
 import sys
 import threading
 import time
+
+# The wedge: hold the RECORD reply this long (a stuck-then-late session).
+RECORD_DELAY_MS = int(os.environ.get('FAKE_RECORD_DELAY_MS', '0'))
 
 state = {
     'requests': [],
@@ -83,6 +87,8 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     buf += chunk
                 body, buf = buf[:clen], buf[clen:]
 
+                if method == 'RECORD' and RECORD_DELAY_MS > 0:
+                    time.sleep(RECORD_DELAY_MS / 1000)
                 state['requests'].append(method)
                 cseq = headers.get('cseq', '0')
                 if method == 'ANNOUNCE':

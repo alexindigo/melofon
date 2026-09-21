@@ -5,6 +5,7 @@ hardware): test/driver (linked against the .so) drives start → PCM → volume
 sequence, RTP pacing, volume, flush, teardown)."""
 import ast
 import os
+import re
 import subprocess
 import sys
 import time
@@ -13,24 +14,31 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVER = os.path.join(HERE, 'driver')
 
 
-def main():
+def start_fake(env_extra=None):
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
     fake = subprocess.Popen(
         [sys.executable, '-u', os.path.join(HERE, 'fake_raop.py')],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    port = fake.stdout.readline().split()[1]
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
+    return fake, fake.stdout.readline().split()[1]
 
-    driver = subprocess.run([DRIVER, port], capture_output=True, text=True,
-                            timeout=45)
+
+def read_report(fake):
     fake.stdin.close()
-    time.sleep(0.3)
-
-    report = None
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         line = fake.stdout.readline()
         if line.startswith('REPORT '):
-            report = ast.literal_eval(line[7:])
-            break
+            return ast.literal_eval(line[7:])
+    return None
+
+
+def standard_scenario():
+    fake, port = start_fake()
+    driver = subprocess.run([DRIVER, port], capture_output=True, text=True,
+                            timeout=45)
+    report = read_report(fake)
     fake.kill()
 
     assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
@@ -67,6 +75,42 @@ def main():
     print('fake-device test: OK '
           f"({report['audio_packets']} RTP packets in {span:.2f}s, "
           f'{len(seq)} RTSP requests)')
+
+
+def backlog_scenario():
+    """The wedge: fake's RECORD reply is delayed 3.5 s while the pump feeds
+    6 s of PCM. The ~2 s read-ahead cap must hold pre-connect, and
+    flush-on-connect must reopen the flow — no stale-backlog burst."""
+    fake, port = start_fake({'FAKE_RECORD_DELAY_MS': '3500'})
+    driver = subprocess.run([DRIVER, port, 'backlog', '6'],
+                            capture_output=True, text=True, timeout=60)
+    report = read_report(fake)
+    fake.kill()
+
+    assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+        f'driver failed: {driver.returncode} {driver.stdout} {driver.stderr}'
+    m = re.search(r'PRE=(\d+) TOTAL=(\d+)', driver.stdout)
+    assert m, f'no PRE/TOTAL in driver output: {driver.stdout}'
+    pre, total = int(m.group(1)), int(m.group(2))
+
+    cap = 2 * 44100 * 4
+    assert pre <= cap + 8192, \
+        f'cap did not hold: accepted {pre} by connect, cap is {cap}'
+    assert total == 6 * 176400, \
+        f'flow did not reopen after flush-on-connect: TOTAL={total}'
+
+    assert report is not None and report['audio_packets'] > 0
+    span = report['last_rtp_at'] - report['first_rtp_at']
+    rate = report['audio_packets'] / max(span, 0.001)
+    assert 30 < rate < 400, \
+        f'not realtime pacing (backlog burst?): {rate:.0f} pkt/s'
+    print(f'backlog test: OK (PRE={pre} <= {cap}, '
+          f'{report["audio_packets"]} packets at {rate:.0f}/s)')
+
+
+def main():
+    standard_scenario()
+    backlog_scenario()
     return 0
 
 

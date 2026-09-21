@@ -73,8 +73,10 @@ void helper_logger_set_severity(int severity);
 #define TICK_BYTES   (TICK_SAMPLES * 4) /* s16 stereo */
 
 /* Per-handle PCM read-ahead cap; raop_write accepts what fits (the Deno
- * pump's backpressure). 256 MB ≈ 24 min of 44.1k/s16/stereo. */
-#define PCM_CAP (256 * 1024 * 1024)
+ * pump's backpressure). ~2 s of 44.1k/s16/stereo: a wedged-then-late session
+ * must never dump a stale backlog (the old 256 MB cap let ~24 min pile up —
+ * the "57 min late" bug). */
+#define PCM_CAP (2 * 44100 * 4)
 
 /* Event ring per handle (state events are tiny and rare). */
 #define EVENT_RING 16
@@ -193,6 +195,17 @@ raop_ffi_on_state(uint64_t device_id, enum output_device_state state)
     if (h->id == device_id)
       {
         h->state = state;
+        if (state == OUTPUT_STATE_CONNECTED)
+          {
+            /* Backlog policy: the session just came up — drop anything
+             * buffered during startup (stale on the wedged-then-late path)
+             * and start the stream clock fresh. */
+            pthread_mutex_lock(&h->pcm_lock);
+            evbuffer_drain(h->pcm, evbuffer_get_length(h->pcm));
+            pthread_mutex_unlock(&h->pcm_lock);
+            h->pts_samples = 0;
+            h->fed_samples = 0;
+          }
         event_push(h, value);
         break;
       }
