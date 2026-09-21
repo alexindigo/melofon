@@ -58,6 +58,11 @@ const RAOP_PORT_DEFAULT = 7000;
 /** Engine progress must move more than this (ms) mid-play to count as a
  * seek; below it, event-latency jitter would cause flush hiccups. */
 const SEEK_JUMP_MS = 1500;
+/** Diagnostics (plan airplay-silence): pump first-chunk + generator-end
+ * lines, off unless MELOFON_RAOP_DEBUG=1|true. */
+const RAOP_DEBUG = ['1', 'true'].includes(
+  Deno.env.get('MELOFON_RAOP_DEBUG') ?? '',
+);
 
 interface Runtime {
   transport: AirplayTransport | null;
@@ -151,13 +156,27 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         console.warn(`[melofon] airplay: no decodable audio in ${path}`);
         return;
       }
+      let total = 0;
       for await (const chunk of stream) {
         if (rt.pumpGen !== gen || rt.transport === null || closed) return;
+        if (RAOP_DEBUG && total === 0) {
+          console.warn(
+            `[melofon] airplay debug: pump first chunk ${chunk.length}B ` +
+              `(${path})`,
+          );
+        }
+        total += chunk.length;
         try {
           await rt.transport.pcm(chunk);
         } catch {
           return; // the helper went away mid-track
         }
+      }
+      if (RAOP_DEBUG) {
+        console.warn(
+          `[melofon] airplay debug: pump generator end, total ${total}B ` +
+            `(${path})`,
+        );
       }
     })().catch((err) => {
       console.warn(`[melofon] airplay: pump failed for ${path}: ${err}`);

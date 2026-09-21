@@ -55,6 +55,9 @@ extern struct output_definition output_raop;
 /* Globals the vendored code expects (see stubs.c). */
 struct event_base *evbase_player;
 
+/* stubs.c — the debug knob (MELOFON_RAOP_DEBUG raises severity to E_DBG). */
+void helper_logger_set_severity(int severity);
+
 /* raop.c enum raop_devtype values. */
 #define RDEV_APEX1   0
 #define RDEV_APEX2   1
@@ -110,6 +113,13 @@ struct raop_handle
   struct evbuffer *pcm;
   pthread_mutex_t pcm_lock;
   uint64_t pts_samples;            /* stream clock (loop thread only) */
+
+  /* Diagnostics (MELOFON_RAOP_DEBUG): cumulative samples the tick has fed
+   * into raop_write — the library's view of "audio is leaving". Compare
+   * against /proc/net/snmp OutDatagrams (the kernel's view). */
+  uint64_t fed_samples;
+  uint64_t fed_bytes_pending;
+  struct timeval last_debug;
 
   /* Event ring for raop_poll. */
   char events[EVENT_RING][EVENT_LEN];
@@ -211,6 +221,46 @@ raop_ffi_device_find(uint64_t device_id)
 
 /* 10 ms tick on the loop thread: feed up to one tick's worth of PCM per
  * handle to the RAOP sessions, stream clock advancing per handle. */
+static const char *
+state_name(enum output_device_state state)
+{
+  switch (state)
+    {
+      case OUTPUT_STATE_STOPPED:   return "stopped";
+      case OUTPUT_STATE_STARTUP:   return "startup";
+      case OUTPUT_STATE_CONNECTED: return "connected";
+      case OUTPUT_STATE_STREAMING: return "streaming";
+      case OUTPUT_STATE_FAILED:    return "failed";
+      case OUTPUT_STATE_PASSWORD:  return "password";
+      default:                     return "unknown";
+    }
+}
+
+/* Once per second per handle at E_DBG: state machine, buffered PCM, and the
+ * cumulative samples fed into raop_write (frames, not RTP packets). */
+static void
+tick_debug(raop_t *h)
+{
+  struct timeval now;
+  size_t buffered;
+
+  gettimeofday(&now, NULL);
+  if (now.tv_sec == h->last_debug.tv_sec)
+    return;
+  h->last_debug = now;
+
+  pthread_mutex_lock(&h->pcm_lock);
+  buffered = evbuffer_get_length(h->pcm);
+  pthread_mutex_unlock(&h->pcm_lock);
+
+  /* RAOP packets are 352 samples; fed_samples/352 approximates RTP audio. */
+  DPRINTF(E_DBG, L_RAOP,
+          "tick: state=%s pcm_buffered=%zu fed_samples=%llu (~%llu rtp)\n",
+          state_name(h->state), buffered,
+          (unsigned long long)h->fed_samples,
+          (unsigned long long)(h->fed_samples / 352));
+}
+
 static void
 tick_cb(evutil_socket_t fd, short what, void *arg)
 {
@@ -227,7 +277,10 @@ tick_cb(evutil_socket_t fd, short what, void *arg)
     {
       if (h->state != OUTPUT_STATE_CONNECTED
           && h->state != OUTPUT_STATE_STREAMING)
-        continue;
+        {
+          tick_debug(h);
+          continue;
+        }
 
       pthread_mutex_lock(&h->pcm_lock);
       avail = evbuffer_get_length(h->pcm);
@@ -258,7 +311,9 @@ tick_cb(evutil_socket_t fd, short what, void *arg)
 
       output_raop.write(&obuf);
 
+      h->fed_samples += (uint64_t)(n / 4);
       h->pts_samples += (uint64_t)(n / 4);
+      tick_debug(h);
     }
   pthread_mutex_unlock(&rt.lock);
 }
@@ -449,6 +504,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             if (h->device)
               device_teardown(h);
             h->pts_samples = 0;
+            h->fed_samples = 0;
             device_start(h, c);
             break;
 
@@ -548,6 +604,10 @@ runtime_acquire(void)
   pthread_mutex_lock(&rt.lock);
   if (!rt.running)
     {
+      const char *debug = getenv("MELOFON_RAOP_DEBUG");
+      if (debug && (strcmp(debug, "1") == 0 || strcmp(debug, "true") == 0))
+        helper_logger_set_severity(E_DBG);
+
       gcry_check_version(NULL);
       if (evthread_use_pthreads() != 0)
         {
