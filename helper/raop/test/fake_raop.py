@@ -13,6 +13,9 @@ import time
 
 # The wedge: hold the RECORD reply this long (a stuck-then-late session).
 RECORD_DELAY_MS = int(os.environ.get('FAKE_RECORD_DELAY_MS', '0'))
+# The JBL: refuse the ANNOUNCE (403) — the session fails and teardown+free
+# must stay clean (the evbuffer UAF crash).
+ANNOUNCE_403 = os.environ.get('FAKE_ANNOUNCE_403') == '1'
 
 state = {
     'requests': [],
@@ -136,8 +139,12 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                              f'timing_port={timing_port}\r\n')
                 if method == 'RECORD':
                     extra = 'Audio-Latency: 11025\r\n'
-                res = (f'RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n{extra}'
-                       f'Server: fake-raop\r\nContent-Length: 0\r\n\r\n')
+                if method == 'ANNOUNCE' and ANNOUNCE_403:
+                    res = (f'RTSP/1.0 403 Forbidden\r\nCSeq: {cseq}\r\n'
+                           f'Content-Length: 0\r\n\r\n')
+                else:
+                    res = (f'RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n{extra}'
+                           f'Server: fake-raop\r\nContent-Length: 0\r\n\r\n')
                 self.request.sendall(res.encode())
 
 

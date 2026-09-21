@@ -92,16 +92,18 @@ main(int argc, char **argv)
   static unsigned char silence[PCM_BYTES];
   size_t written;
   bool backlog;
+  bool fail;
   int port;
   int feed_seconds = 0;
 
   if (argc < 2)
     {
-      fprintf(stderr, "usage: driver <port> [backlog <feed_seconds>]\n");
+      fprintf(stderr, "usage: driver <port> [backlog <feed_seconds> | fail]\n");
       return 2;
     }
   port = atoi(argv[1]);
   backlog = argc > 3 && strcmp(argv[2], "backlog") == 0;
+  fail = argc > 2 && strcmp(argv[2], "fail") == 0;
   if (backlog)
     feed_seconds = atoi(argv[3]);
 
@@ -114,6 +116,18 @@ main(int argc, char **argv)
 
   if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0) < 0) /* appletv, unencrypted */
     return 1;
+
+  if (fail)
+    {
+      /* The fake refuses ANNOUNCE: the session must fail, and teardown+free
+       * must be clean (no crash — the JBL regression). */
+      if (wait_event(h, "\"failed\"", 15000) < 0)
+        return 1;
+      raop_teardown(h);
+      raop_free(h);
+      printf("DRIVER-OK\n");
+      return 0;
+    }
 
   if (backlog)
     {

@@ -89,7 +89,17 @@ typedef enum
   CMD_FLUSH,
   CMD_TEARDOWN,
   CMD_PIN,
+  CMD_FREE,
 } cmd_type;
+
+/* raop_free ↔ the loop thread: the free happens on the loop thread (the only
+ * place nothing can be mid-callback on the handle), then it signals done. */
+typedef struct free_sync
+{
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  int done;
+} free_sync;
 
 typedef struct cmd
 {
@@ -101,6 +111,7 @@ typedef struct cmd
   int devtype;                  /* RDEV_* (raop.c enum raop_devtype) */
   int encrypt;
   char pin[32];
+  free_sync *sync;              /* CMD_FREE only */
   struct cmd *next;
 } cmd;
 
@@ -138,6 +149,7 @@ struct raop_handle
   cmd *cmds_head;
   cmd *cmds_tail;
   pthread_mutex_t cmds_lock;
+  int cmds_scheduled;           /* one pending once-callback at a time */
 
   struct raop_handle *next;
 };
@@ -291,9 +303,21 @@ tick_cb(evutil_socket_t fd, short what, void *arg)
 
   (void)fd; (void)what; (void)arg;
 
+  /* Snapshot the handles under rt.lock, then iterate WITHOUT it: raop code
+   * reached via output_raop.write re-enters the registry (rt.lock) — holding
+   * it here would deadlock this thread. Handles cannot be freed mid-iteration
+   * because free happens on this same loop thread (see CMD_FREE). */
+  raop_t *snapshot[64];
+  int count = 0;
+
   pthread_mutex_lock(&rt.lock);
-  for (h = rt.handles_list; h; h = h->next)
+  for (h = rt.handles_list; h && count < 64; h = h->next)
+    snapshot[count++] = h;
+  pthread_mutex_unlock(&rt.lock);
+
+  for (int i = 0; i < count; i++)
     {
+      h = snapshot[i];
       if (h->state != OUTPUT_STATE_CONNECTED
           && h->state != OUTPUT_STATE_STREAMING)
         {
@@ -338,7 +362,6 @@ tick_cb(evutil_socket_t fd, short what, void *arg)
       h->pts_samples += (uint64_t)(n / 4);
       tick_debug(h);
     }
-  pthread_mutex_unlock(&rt.lock);
 }
 
 /* ----------------------------------------------------------------- commands */
@@ -517,6 +540,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
   pthread_mutex_lock(&h->cmds_lock);
   list = h->cmds_head;
   h->cmds_head = h->cmds_tail = NULL;
+  h->cmds_scheduled = 0;
   pthread_mutex_unlock(&h->cmds_lock);
 
   while ((c = list) != NULL)
@@ -557,16 +581,35 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             if (h->device)
               output_raop.device_authorize(h->device, c->pin, 0);
             break;
+
+          case CMD_FREE:
+            /* Free on the loop thread: the queue is drained and every
+             * earlier once-callback for this handle has already run (FIFO) —
+             * nothing pending references h any more. The tick cannot see it
+             * (unlinked before CMD_FREE was queued). */
+            evbuffer_free(h->pcm);
+            pthread_mutex_destroy(&h->pcm_lock);
+            pthread_mutex_destroy(&h->events_lock);
+            pthread_mutex_destroy(&h->cmds_lock);
+            pthread_mutex_lock(&c->sync->lock);
+            c->sync->done = 1;
+            pthread_cond_signal(&c->sync->cond);
+            pthread_mutex_unlock(&c->sync->lock);
+            free(h);
+            break;
         }
       free(c);
     }
 }
 
-/* API thread: queue a command onto the loop. */
+/* API thread: queue a command onto the loop. At most one drain callback is
+ * pending per handle at a time (cmds_scheduled) — a second pending callback
+ * could run after a CMD_FREE freed the handle (the JBL-403 crash). */
 static int
 cmd_push(raop_t *h, cmd *c)
 {
   struct timeval zero = { 0, 0 };
+  int schedule;
 
   pthread_mutex_lock(&h->cmds_lock);
   c->next = NULL;
@@ -575,7 +618,12 @@ cmd_push(raop_t *h, cmd *c)
   else
     h->cmds_head = c;
   h->cmds_tail = c;
+  schedule = !h->cmds_scheduled;
+  h->cmds_scheduled = 1;
   pthread_mutex_unlock(&h->cmds_lock);
+
+  if (!schedule)
+    return 0; /* the pending drain will see this command */
 
   /* Wakes the loop (evthread). Executes the queue ASAP. */
   return event_base_once(rt.base, -1, EV_TIMEOUT, cmds_drain_cb, h, &zero);
@@ -854,6 +902,8 @@ void
 raop_free(raop_t *h)
 {
   raop_t **link;
+  free_sync sync;
+  cmd *c;
 
   if (!h)
     return;
@@ -867,6 +917,7 @@ raop_free(raop_t *h)
         usleep(1000);
     }
 
+  /* Out of the tick's view. */
   pthread_mutex_lock(&rt.lock);
   for (link = &rt.handles_list; *link; link = &(*link)->next)
     if (*link == h)
@@ -876,18 +927,40 @@ raop_free(raop_t *h)
       }
   pthread_mutex_unlock(&rt.lock);
 
-  while (h->cmds_head)
-    {
-      cmd *c = h->cmds_head;
-      h->cmds_head = c->next;
-      free(c);
-    }
+  /* Free ON the loop thread, after every queued command and every pending
+   * drain callback for this handle (CMD_FREE is last-in, FIFO). */
+  memset(&sync, 0, sizeof(sync));
+  pthread_mutex_init(&sync.lock, NULL);
+  pthread_cond_init(&sync.cond, NULL);
 
-  evbuffer_free(h->pcm);
-  pthread_mutex_destroy(&h->pcm_lock);
-  pthread_mutex_destroy(&h->events_lock);
-  pthread_mutex_destroy(&h->cmds_lock);
-  free(h);
+  c = calloc(1, sizeof(*c));
+  if (!c)
+    {
+      /* Can't queue the free — leak the handle rather than UAF (the process
+       * is on its way out anyway in that world). */
+      pthread_mutex_destroy(&sync.lock);
+      pthread_cond_destroy(&sync.cond);
+      runtime_release();
+      return;
+    }
+  c->type = CMD_FREE;
+  c->sync = &sync;
+
+  pthread_mutex_lock(&sync.lock);
+  if (cmd_push(h, c) < 0)
+    {
+      pthread_mutex_unlock(&sync.lock);
+      free(c);
+      pthread_mutex_destroy(&sync.lock);
+      pthread_cond_destroy(&sync.cond);
+      runtime_release();
+      return;
+    }
+  while (!sync.done)
+    pthread_cond_wait(&sync.cond, &sync.lock);
+  pthread_mutex_unlock(&sync.lock);
+  pthread_mutex_destroy(&sync.lock);
+  pthread_cond_destroy(&sync.cond);
 
   runtime_release();
 }

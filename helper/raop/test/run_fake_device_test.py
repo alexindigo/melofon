@@ -117,9 +117,23 @@ def backlog_scenario():
           f'{report["audio_packets"]} packets at {rate:.0f}/s)')
 
 
+def fail_scenario():
+    """The JBL: ANNOUNCE refused (403) -> session fails -> teardown+free
+    must exit cleanly (the evbuffer UAF crash regression)."""
+    fake, port = start_fake({'FAKE_ANNOUNCE_403': '1'})
+    driver = subprocess.run([DRIVER, port, 'fail'],
+                            capture_output=True, text=True, timeout=45)
+    fake.kill()
+    assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+        f'crash on failing session: rc={driver.returncode} ' \
+        f'stderr={driver.stderr[-400:]}'
+    print('fail scenario: OK (session failure -> free is clean)')
+
+
 def main():
     standard_scenario()
     backlog_scenario()
+    fail_scenario()
     return 0
 
 
