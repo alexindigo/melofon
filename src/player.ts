@@ -9,9 +9,10 @@
 //
 // No audio means progress is wall-clock: while state is 'play' the position
 // advances in real time from the last seek/start base, clamped at the item
-// length. There is no auto-advance at the end of a track — the repeat /
-// consume / shuffle modes are stored and reported on the wire, but their
-// playback-order effects arrive with real playback (M6).
+// length. Progress reaching the item length ENDS the item: advanceEnded()
+// (driven by the playback core's clock) replays/advances/drops/stops per the
+// repeat/consume modes — "no auto-advance" was fine for a queue-less mirror,
+// it is a lie with boots attached (HA extrapolates past the end).
 import type { SongRow } from './library.ts';
 import type { Notify } from './notify.ts';
 
@@ -23,6 +24,9 @@ export interface QueueEntry {
 
 export type PlayerState = 'play' | 'pause' | 'stop';
 export type RepeatMode = 'off' | 'all' | 'single';
+
+/** What an end-of-item transition touched (the playback core emits on it). */
+export type AdvanceResult = 'none' | 'player' | 'player+queue';
 
 export interface PlayerStatus {
   state: PlayerState;
@@ -67,6 +71,12 @@ export interface Player {
   queueAdd(songs: SongRow[], position?: number): QueueEntry[];
   /** Clears the queue and stops playback. */
   queueClear(): void;
+  /** End-of-item transition (the engine's clock — driven by the playback
+   * core): progress at item length means the item ENDED. repeat `single`
+   * replays; `all` wraps to the head past the last item; consume drops the
+   * finished item and the next plays; otherwise next, stopping past the
+   * last. Unknown length (null duration) never ends. */
+  advanceEnded(): AdvanceResult;
 }
 
 export interface Output {
@@ -299,6 +309,44 @@ export function createPlayer(): Player {
       version++;
       doStop();
       // The clear also stopped playback — both reads changed.
+    },
+
+    advanceEnded() {
+      if (state !== 'play') return 'none';
+      const entry = currentEntry();
+      if (entry === null) return 'none';
+      const length = entry.song.durationMs ?? 0;
+      if (length <= 0 || progressMs() < length) return 'none';
+
+      if (repeat === 'single') {
+        // Replay the same item: reset the clock, keep playing.
+        startAt(currentIndex!);
+        return 'player';
+      }
+      if (repeat === 'all') {
+        // Next, wrapping to the head past the last item.
+        startAt((currentIndex! + 1) % items.length);
+        return 'player';
+      }
+      if (consume) {
+        // Drop the finished item; whatever lands at the index plays.
+        const at = currentIndex!;
+        items = [...items.slice(0, at), ...items.slice(at + 1)];
+        version++;
+        if (at >= items.length) {
+          doStop();
+          return 'player+queue';
+        }
+        startAt(at);
+        return 'player+queue';
+      }
+      // repeat off: next; past the last item stops (next() semantics).
+      if (currentIndex! + 1 >= items.length) {
+        doStop();
+        return 'player';
+      }
+      startAt(currentIndex! + 1);
+      return 'player';
     },
   };
 }

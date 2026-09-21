@@ -84,6 +84,12 @@ const layers = await loadLayers({ app: bag });
 // Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
 createAirplayBoot({ outputs, playback, media, notify });
 
+// The engine's clock: wall-clock progress reaching an item's length ends it
+// (advance/replay/drop/stop per repeat/consume). Without this the engine sat
+// at track-end in 'play' forever and HA extrapolated ("57 min of a 3 min
+// track").
+setInterval(() => playback.advanceEnded(), 500);
+
 // Internal-state first-boot seeds: env/toml is a default, never an override —
 // a key the operator already set (via /_/config) is left alone.
 if (env.MELOFON_AIRPLAY_MDNS !== undefined) {

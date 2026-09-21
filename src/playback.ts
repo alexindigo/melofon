@@ -68,6 +68,11 @@ export interface Playback {
   ): QueueEntry[];
   queueClear(): void;
 
+  /** The engine's clock: end-of-item transition when progress reached the
+   * item length (main.ts drives it on an interval; tests drive it directly).
+   * Emits player (+queue when consume dropped the finished item). */
+  advanceEnded(): void;
+
   playerView(): PlayerStatus;
   queueView(): { version: number; items: QueueEntry[] };
   nowPlayingView(): Promise<NowPlayingViewRow[]>;
@@ -160,6 +165,12 @@ export function createPlayback(deps: {
       player.queueClear();
       // The clear also stopped the engine — both reads changed.
       emit(['queue', 'player']);
+    },
+
+    advanceEnded() {
+      const result = player.advanceEnded();
+      if (result === 'none') return;
+      emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
     },
 
     playerView: () => player.status(),
