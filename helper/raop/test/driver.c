@@ -114,7 +114,7 @@ main(int argc, char **argv)
       return 1;
     }
 
-  if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0) < 0) /* appletv, unencrypted */
+  if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0, 0, 1000) < 0) /* appletv, unencrypted, 1 s */
     return 1;
 
   if (fail)

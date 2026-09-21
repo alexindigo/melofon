@@ -20,7 +20,17 @@ import type { AirplayTransport, HelperEventFn } from './airplay.ts';
 const SYMBOLS = {
   raop_new: { parameters: [], result: 'pointer' },
   raop_start: {
-    parameters: ['pointer', 'buffer', 'i32', 'buffer', 'i32', 'i32', 'i32'],
+    parameters: [
+      'pointer',
+      'buffer',
+      'i32',
+      'buffer',
+      'i32',
+      'i32',
+      'i32',
+      'u32',
+      'u32',
+    ],
     result: 'i32',
   },
   raop_write: { parameters: ['pointer', 'buffer', 'usize'], result: 'i32' },
@@ -148,6 +158,8 @@ class FfiTransport implements AirplayTransport {
           Number(cmd.volume) || 0,
           DEVTYPE[String(cmd.devtype)] ?? DEVTYPE.appletv,
           cmd.encrypt === true ? 1 : 0,
+          Number(cmd.pos_ms) || 0,
+          Number(cmd.len_ms) || 0,
         );
         break;
       case 'volume':

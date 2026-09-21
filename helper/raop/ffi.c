@@ -111,6 +111,8 @@ typedef struct cmd
   int devtype;                  /* RDEV_* (raop.c enum raop_devtype) */
   int encrypt;
   char pin[32];
+  uint32_t pos_ms;              /* keep-alive metadata: item position/length */
+  uint32_t len_ms;
   free_sync *sync;              /* CMD_FREE only */
   struct cmd *next;
 } cmd;
@@ -433,6 +435,17 @@ struct raop_extra_mirror
   bool supports_auth_setup;
 };
 
+/* raop.c's private struct raop_metadata (outputs/raop.c), mirrored — needed
+ * for the keep-alive progress posts: arbat closes the RTSP connection ~19 s
+ * in without them ("Device closed RTSP connection"). */
+#define RAOP_MD_WANTS_PROGRESS 4
+struct raop_metadata_mirror
+{
+  struct evbuffer *metadata;
+  struct evbuffer *artwork;
+  int artwork_fmt;
+};
+
 /* Loop thread: create the device for h and open the RAOP session. */
 static int
 device_start(raop_t *h, const cmd *c)
@@ -480,6 +493,7 @@ device_start(raop_t *h, const cmd *c)
   dev->supported_formats = MEDIA_FORMAT_PCM;
   dev->default_format = MEDIA_FORMAT_PCM;
   dev->extra_device_info = re;
+  re->wanted_metadata = RAOP_MD_WANTS_PROGRESS;
 
   if (strchr(address, ':'))
     {
@@ -495,6 +509,33 @@ device_start(raop_t *h, const cmd *c)
   h->device = dev;
   h->state = OUTPUT_STATE_STARTUP;
   event_push(h, "starting");
+
+  /* Seed raop_cur_metadata so the keep-alive timer has content: without any
+   * progress posts the device times the controller out and closes RTSP. */
+  {
+    struct output_metadata *md = calloc(1, sizeof(*md));
+    struct raop_metadata_mirror *rmd = calloc(1, sizeof(*rmd));
+
+    if (md && rmd)
+      {
+        rmd->metadata = evbuffer_new();
+        rmd->artwork = evbuffer_new();
+        rmd->artwork_fmt = -1;
+        md->type = OUTPUT_TYPE_RAOP;
+        md->item_id = (uint32_t)h->id;
+        md->pos_ms = c->pos_ms;
+        md->len_ms = c->len_ms;
+        md->pts = h->pts_base;
+        md->startup = true;
+        md->priv = rmd;
+        output_raop.metadata_send(md);
+      }
+    else
+      {
+        free(md);
+        free(rmd);
+      }
+  }
 
   if (output_raop.device_start(dev, 0) < 0)
     {
@@ -768,7 +809,7 @@ raop_new(void)
 
 int
 raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
-           int devtype, int encrypt)
+           int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms)
 {
   cmd *c;
 
@@ -789,6 +830,8 @@ raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
   c->volume = volume < 0 ? 0 : (volume > 100 ? 100 : volume);
   c->devtype = devtype < 0 || devtype > 6 ? RDEV_APPLETV : devtype;
   c->encrypt = encrypt ? 1 : 0;
+  c->pos_ms = pos_ms;
+  c->len_ms = len_ms;
 
   return cmd_push(h, c);
 }

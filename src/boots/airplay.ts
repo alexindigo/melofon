@@ -247,6 +247,10 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
           // the helper defaults then: appletv, unencrypted).
           ...(output.devtype !== undefined && { devtype: output.devtype }),
           ...(output.encrypt !== undefined && { encrypt: output.encrypt }),
+          // Keep-alive progress: the device times the controller out and
+          // closes RTSP ~19 s in without periodic progress posts.
+          pos_ms: 0,
+          len_ms: entry.song.durationMs ?? 0,
         }).catch(() => {});
         // Pump right away: the helper buffers PCM during the RTSP handshake.
         pump(rt, entry.id, entry.song.path, view.itemProgressMs);

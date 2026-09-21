@@ -22,8 +22,10 @@ raop_t *raop_new(void);
  * 6=other; out of range defaults to appletv); encrypt != 0 encrypts the
  * RTP stream. Events arrive via raop_poll:
  * starting|connected|streaming|stopped|failed|password. */
+/* pos_ms/len_ms seed the keep-alive progress posts (progress: d/p/e). */
 int raop_start(raop_t *h, const char *host, int port,
-               const char *name, int volume, int devtype, int encrypt);
+               const char *name, int volume, int devtype, int encrypt,
+               uint32_t pos_ms, uint32_t len_ms);
 
 /* Append s16le/44100/stereo PCM to the pacing buffer. Returns bytes
  * accepted; < len means the buffer is at the high-water mark (caller
