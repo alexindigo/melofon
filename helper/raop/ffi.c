@@ -114,13 +114,18 @@ struct raop_handle
    * called from the caller's thread, the tick from the loop thread). */
   struct evbuffer *pcm;
   pthread_mutex_t pcm_lock;
-  uint64_t pts_samples;            /* stream clock (loop thread only) */
+  /* The pts stream clock, OwnTone's shape (player.c: pb_session.pts =
+   * CLOCK_MONOTONIC at start + samples written): the sync packets' NTP
+   * timestamps must share a base with the timing service's (which answers
+   * with CLOCK_MONOTONIC) or the device schedules playout ~forever late —
+   * receives the stream, asks retransmits, never renders. */
+  struct timespec pts_base;        /* CLOCK_MONOTONIC at the last (re)start */
+  uint64_t pts_samples;            /* samples fed since that base */
 
   /* Diagnostics (MELOFON_RAOP_DEBUG): cumulative samples the tick has fed
    * into raop_write — the library's view of "audio is leaving". Compare
    * against /proc/net/snmp OutDatagrams (the kernel's view). */
   uint64_t fed_samples;
-  uint64_t fed_bytes_pending;
   struct timeval last_debug;
 
   /* Event ring for raop_poll. */
@@ -205,6 +210,7 @@ raop_ffi_on_state(uint64_t device_id, enum output_device_state state)
             pthread_mutex_unlock(&h->pcm_lock);
             h->pts_samples = 0;
             h->fed_samples = 0;
+            clock_gettime(CLOCK_MONOTONIC, &h->pts_base);
           }
         event_push(h, value);
         break;
@@ -318,9 +324,13 @@ tick_cb(evutil_socket_t fd, short what, void *arg)
       obuf.data[0].quality.bits_per_sample = 16;
       obuf.data[0].quality.channels = 2;
       /* obuf.data[1].buffer = NULL terminates the quality array. */
-      obuf.pts.tv_sec = (time_t)(h->pts_samples / 44100);
-      obuf.pts.tv_nsec =
-        (long)((h->pts_samples % 44100) * 1000000000ULL / 44100);
+      {
+        uint64_t sec = (uint64_t)h->pts_base.tv_sec + h->pts_samples / 44100;
+        uint64_t nsec = (uint64_t)h->pts_base.tv_nsec
+                      + (h->pts_samples % 44100) * 1000000000ULL / 44100;
+        obuf.pts.tv_sec = (time_t)(sec + nsec / 1000000000ULL);
+        obuf.pts.tv_nsec = (long)(nsec % 1000000000ULL);
+      }
 
       output_raop.write(&obuf);
 
@@ -489,6 +499,7 @@ device_teardown(raop_t *h)
   pthread_mutex_unlock(&h->pcm_lock);
 
   h->pts_samples = 0;
+  h->fed_samples = 0;
   h->state = OUTPUT_STATE_STOPPED;
   event_push(h, "stopped");
 }
@@ -518,6 +529,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
               device_teardown(h);
             h->pts_samples = 0;
             h->fed_samples = 0;
+            clock_gettime(CLOCK_MONOTONIC, &h->pts_base);
             device_start(h, c);
             break;
 

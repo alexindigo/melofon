@@ -25,7 +25,10 @@ state = {
     'flushes': 0,
     'teardowns': 0,
     'sdp': None,
+    'sync_ntp_secs': [],
 }
+
+NTP_EPOCH_DELTA = 2208988800
 
 
 def udp_socket():
@@ -54,9 +57,30 @@ class UDPCollector(threading.Thread):
 
 
 audio_sock, audio_port = udp_socket()
-_, control_port = udp_socket()
+control_sock, control_port = udp_socket()
 _, timing_port = udp_socket()
 UDPCollector(audio_sock).start()
+
+
+class ControlCollector(threading.Thread):
+    """RTCP sync packets: 0x80 0xd4 + rtptime(4) + NTP(sec,frac) + rtptime.
+    The NTP seconds must be on the sender's CLOCK_MONOTONIC timeline — a
+    zero-based stream clock breaks the device's playout schedule."""
+
+    def __init__(self, sock):
+        super().__init__(daemon=True)
+        self.sock = sock
+
+    def run(self):
+        while True:
+            data, _ = self.sock.recvfrom(4096)
+            # 0x90 = init sync at session start, 0x80 = periodic.
+            if len(data) >= 20 and data[0] in (0x80, 0x90) and data[1] == 0xD4:
+                sec = struct.unpack('>I', data[8:12])[0]
+                state['sync_ntp_secs'].append(sec)
+
+
+ControlCollector(control_sock).start()
 
 
 class RTSPHandler(socketserver.BaseRequestHandler):

@@ -72,6 +72,15 @@ def standard_scenario():
 
     assert report['flushes'] == 1 and report['teardowns'] == 1
 
+    # Sync packets schedule playout on the CLOCK_MONOTONIC timeline (a
+    # zero-based pts puts them ~boot-uptime in the past — the device holds
+    # audio forever: the "silent while receiving" bug).
+    assert report['sync_ntp_secs'], 'no RTCP sync packets seen'
+    expected = 2208988800 + time.monotonic()
+    for sec in report['sync_ntp_secs']:
+        assert abs(sec - expected) < 120, \
+            f'sync NTP timestamp off the monotonic timeline: {sec} vs {expected:.0f}'
+
     print('fake-device test: OK '
           f"({report['audio_packets']} RTP packets in {span:.2f}s, "
           f'{len(seq)} RTSP requests)')
