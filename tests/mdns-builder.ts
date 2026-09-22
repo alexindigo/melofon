@@ -78,7 +78,15 @@ export class MsgBuilder {
   }
 }
 
-/** A full AirPlay advertisement: PTR + TXT + SRV + A. */
+/** PTR-only: the instance name, no SRV/TXT/A. */
+export function ptrOnlyAnswer(instance: string, ttl = 120): Uint8Array {
+  const b = new MsgBuilder();
+  b.header(1);
+  b.record('_raop._tcp.local', 12, ttl, (bb) => bb.name(instance));
+  return b.build();
+}
+
+/** A full AirPlay advertisement: PTR + TXT + SRV + A (A/AAAA optional). */
 export function airplayAnswer(opts: {
   instance: string;
   host: string;
@@ -86,12 +94,17 @@ export function airplayAnswer(opts: {
   port?: number;
   ttl?: number;
   txt?: string[];
+  omitA?: boolean;
+  aaaa?: number[];
 }): Uint8Array {
   const ttl = opts.ttl ?? 120;
   const port = opts.port ?? 7000;
   const txt = opts.txt ?? ['tp=UDP', 'am=AppleTV3,1', 'ek=1', 'sf=0x200'];
   const b = new MsgBuilder();
-  b.header(4);
+  let ancount = 3;
+  if (!opts.omitA) ancount++;
+  if (opts.aaaa !== undefined) ancount++;
+  b.header(ancount);
   b.record('_raop._tcp.local', 12, ttl, (bb) => bb.name(opts.instance));
   b.record(opts.instance, 16, ttl, (bb) => {
     for (const kv of txt) {
@@ -104,6 +117,11 @@ export function airplayAnswer(opts: {
     bb.u16(port);
     bb.name(opts.host);
   });
-  b.record(opts.host, 1, ttl, (bb) => bb.bytes.push(...opts.address));
+  if (!opts.omitA) {
+    b.record(opts.host, 1, ttl, (bb) => bb.bytes.push(...opts.address));
+  }
+  if (opts.aaaa !== undefined) {
+    b.record(opts.host, 28, ttl, (bb) => bb.bytes.push(...opts.aaaa!));
+  }
   return b.build();
 }

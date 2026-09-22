@@ -149,7 +149,7 @@ Deno.test('up registers with TXT-derived fields; down unregisters', async () => 
 });
 
 Deno.test('non-AirTunes (no UDP in tp) and odd instance names are skipped', async () => {
-  const { outputs, browsers, discovery } = await setup();
+  const { outputs, browsers, logs, discovery } = await setup();
   try {
     await settle();
     browsers[0].onService!('up', svc({ txt: { tp: 'RAOP' } }));
@@ -157,13 +157,15 @@ Deno.test('non-AirTunes (no UDP in tp) and odd instance names are skipped', asyn
     browsers[0].onService!('up', svc({ name: '@no id' }));
     browsers[0].onService!('up', svc({ name: 'zz@bad hex' }));
     assertEquals(outputs.list(), []);
+    assert(logs.some((l) => l.includes('no UDP in tp')));
+    assert(logs.some((l) => l.includes('odd instance name')));
   } finally {
     discovery.close();
   }
 });
 
 Deno.test('manual registration wins the host; discovery does not duplicate', async () => {
-  const { outputs, browsers, discovery } = await setup();
+  const { outputs, browsers, logs, discovery } = await setup();
   try {
     await settle();
     outputs.register({
@@ -178,6 +180,7 @@ Deno.test('manual registration wins the host; discovery does not duplicate', asy
     const list = outputs.list();
     assertEquals(list.length, 1);
     assertEquals(list[0].id, 'manual');
+    assert(logs.some((l) => l.includes('host already owned')));
   } finally {
     discovery.close();
   }

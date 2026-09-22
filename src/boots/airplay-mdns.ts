@@ -116,10 +116,17 @@ export function createAirplayDiscovery(
       log(`airplay discovery: skipping odd instance name '${svc.name}'`);
       return;
     }
-    if (!(svc.txt.tp ?? '').includes('UDP')) return; // not AirTunes v2
+    if (!(svc.txt.tp ?? '').includes('UDP')) {
+      log(
+        `airplay discovery: skipping '${parsed.name}': no UDP in tp`,
+      );
+      return;
+    }
 
     if (outputs.list().some((o) => o.host === svc.address)) {
-      // Manual registration (or another output) already owns this address.
+      log(
+        `airplay discovery: skipping '${parsed.name}': host already owned`,
+      );
       return;
     }
     if (svc.txt.pw !== undefined && svc.txt.pw !== 'false') {

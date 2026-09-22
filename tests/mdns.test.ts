@@ -12,9 +12,67 @@ import {
   parseTxt,
   type UdpSocketLike,
 } from '../src/mdns.ts';
-import { airplayAnswer, MsgBuilder } from './mdns-builder.ts';
+import { airplayAnswer, MsgBuilder, ptrOnlyAnswer } from './mdns-builder.ts';
+import os from 'node:os';
 
 const INSTANCE = 'A4B2C1D2E3F4@Kitchen ATV._raop._tcp.local';
+const HOST = 'kitchen-atv.local';
+const TYPE_A = 1;
+const TYPE_TXT = 16;
+const TYPE_AAAA = 28;
+const TYPE_SRV = 33;
+
+function ipv4Addresses(): string[] {
+  const out: string[] = [];
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    if (addrs === undefined) continue;
+    for (const a of addrs) {
+      if (a.family === 'IPv4' && !a.internal) {
+        out.push(a.address);
+      }
+    }
+  }
+  return out;
+}
+
+function readQname(
+  msg: Uint8Array,
+  offset: number,
+): { name: string; next: number } {
+  const labels: string[] = [];
+  let pos = offset;
+  let end = -1;
+  const decoder = new TextDecoder();
+  for (;;) {
+    const len = msg[pos];
+    if ((len & 0xc0) === 0xc0) {
+      if (end === -1) end = pos + 2;
+      pos = ((len & 0x3f) << 8) | msg[pos + 1];
+      continue;
+    }
+    if (len === 0) {
+      if (end === -1) end = pos + 1;
+      return { name: labels.join('.'), next: end };
+    }
+    labels.push(decoder.decode(msg.subarray(pos + 1, pos + 1 + len)));
+    pos += 1 + len;
+  }
+}
+
+function parseQuestions(
+  msg: Uint8Array,
+): { name: string; type: number }[] {
+  const view = new DataView(msg.buffer, msg.byteOffset, msg.length);
+  const qd = view.getUint16(4);
+  let offset = 12;
+  const out: { name: string; type: number }[] = [];
+  for (let i = 0; i < qd; i++) {
+    const q = readQname(msg, offset);
+    out.push({ name: q.name, type: view.getUint16(q.next) });
+    offset = q.next + 4;
+  }
+  return out;
+}
 
 // --------------------------------------------------------------------------
 // Parser tests
@@ -93,7 +151,7 @@ Deno.test('parser: truncation and compression loops return null, never throw', (
 
 class FakeSocket implements UdpSocketLike {
   sent: { buf: Uint8Array; port: number; address: string }[] = [];
-  memberships: string[] = [];
+  memberships: { address: string; iface?: string }[] = [];
   closed = false;
   failMembership = false;
   private listener:
@@ -102,9 +160,11 @@ class FakeSocket implements UdpSocketLike {
   bind(_port: number, cb?: () => void) {
     cb?.();
   }
-  addMembership(address: string) {
+  addMembership(address: string, iface?: string) {
     if (this.failMembership) throw new Error('no multicast route');
-    this.memberships.push(address);
+    this.memberships.push(
+      iface === undefined ? { address } : { address, iface },
+    );
   }
   setMulticastTTL() {}
   send(buf: Uint8Array, port: number, address: string) {
@@ -159,7 +219,13 @@ function setup(socket = new FakeSocket()) {
 Deno.test('browser: sends a standing PTR query and joins the group', () => {
   const { browser, socket } = setup();
   try {
-    assertEquals(socket.memberships, ['224.0.0.251']);
+    const ifaces = ipv4Addresses();
+    assertEquals(
+      socket.memberships,
+      ifaces.length === 0
+        ? [{ address: '224.0.0.251' }]
+        : ifaces.map((iface) => ({ address: '224.0.0.251', iface })),
+    );
     assert(socket.sent.length >= 1);
     const query = socket.sent[0];
     assertEquals(query.port, 5353);
@@ -279,6 +345,92 @@ Deno.test('browser: no multicast route is one error, not a crash', () => {
     assertEquals(errors.length, 1);
     assertEquals((errors[0] as Error).message, 'no multicast route');
   } finally {
+    browser.close();
+  }
+});
+
+Deno.test('browser: PTR-only triggers SRV+TXT follow-up, then up', () => {
+  const { browser, socket, events, services } = setup();
+  try {
+    const before = socket.sent.length;
+    socket.receive(ptrOnlyAnswer(INSTANCE));
+    const followUps = socket.sent.slice(before);
+    assert(
+      followUps.some((s) => {
+        const qs = parseQuestions(s.buf);
+        return s.address === '224.0.0.251' && s.port === 5353 &&
+          qs.some((q) => q.name === INSTANCE && q.type === TYPE_SRV) &&
+          qs.some((q) => q.name === INSTANCE && q.type === TYPE_TXT);
+      }),
+      'expected multicast SRV+TXT questions for the instance',
+    );
+    assertEquals(events, []);
+
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: HOST,
+      address: [192, 168, 1, 50],
+    }));
+    assertEquals(events, [['up', INSTANCE]]);
+    assertEquals(services.get(INSTANCE)!.address, '192.168.1.50');
+  } finally {
+    browser.close();
+  }
+});
+
+Deno.test('browser: SRV without A triggers A+AAAA follow-up, then up', () => {
+  const { browser, socket, events } = setup();
+  try {
+    const before = socket.sent.length;
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: HOST,
+      address: [192, 168, 1, 50],
+      omitA: true,
+    }));
+    const followUps = socket.sent.slice(before);
+    assert(
+      followUps.some((s) => {
+        const qs = parseQuestions(s.buf);
+        return s.address === '224.0.0.251' && s.port === 5353 &&
+          qs.some((q) => q.name === HOST && q.type === TYPE_A) &&
+          qs.some((q) => q.name === HOST && q.type === TYPE_AAAA);
+      }),
+      'expected multicast A+AAAA questions for the SRV target',
+    );
+    assertEquals(events, []);
+
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: HOST,
+      address: [192, 168, 1, 50],
+    }));
+    assertEquals(events, [['up', INSTANCE]]);
+  } finally {
+    browser.close();
+  }
+});
+
+Deno.test('browser: AAAA-only logs no usable v4 and stays down', () => {
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (...args: unknown[]) => warns.push(args.join(' '));
+  const { browser, socket, events } = setup();
+  try {
+    socket.receive(airplayAnswer({
+      instance: INSTANCE,
+      host: HOST,
+      address: [192, 168, 1, 50],
+      omitA: true,
+      aaaa: [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    }));
+    assertEquals(events, []);
+    assert(
+      warns.some((w) => w.includes('no usable v4')),
+      `missing no usable v4 log: ${warns.join(' | ')}`,
+    );
+  } finally {
+    console.warn = orig;
     browser.close();
   }
 });

@@ -3,13 +3,18 @@
 // role only: standing PTR query out, answers/announcements in. No responder
 // role (no answering others' queries, no probing, no announcing).
 //
-// createMdnsBrowser({ type, onService }) binds UDP 5353, joins 224.0.0.251,
-// queries for `type` at start and on a refresh interval, tracks per-instance
-// records (PTR/SRV/TXT/A) with TTLs, and emits 'up' when an instance becomes
-// complete (SRV + usable v4) or its address/port/host/txt changes, 'down' on
-// goodbye (TTL 0) or TTL expiry. IPv4 only; link-local A records don't count
-// as usable. The socket is injectable so tests drive packets deterministically.
+// createMdnsBrowser({ type, onService }) binds UDP 5353, joins 224.0.0.251
+// on every non-internal IPv4 iface, queries for `type` at start and on a
+// refresh interval, tracks per-instance records (PTR/SRV/TXT/A) with TTLs,
+// and emits 'up' when an instance becomes complete (SRV + usable v4) or its
+// address/port/host/txt changes, 'down' on goodbye (TTL 0) or TTL expiry.
+// Incomplete PTRs get follow-up SRV+TXT (and A/AAAA once the SRV target is
+// known), throttled to one burst per instance per 1 s. IPv4 only; link-local
+// A records don't count as usable. AAAA is parsed; v6-only stays down with a
+// `no usable v4` log. The socket is injectable so tests drive packets
+// deterministically.
 import dgram from 'node:dgram';
+import os from 'node:os';
 
 const MDNS_GROUP = '224.0.0.251';
 const MDNS_PORT = 5353;
@@ -19,7 +24,9 @@ const SWEEP_INTERVAL_MS = 10_000;
 const TYPE_A = 1;
 const TYPE_PTR = 12;
 const TYPE_TXT = 16;
+const TYPE_AAAA = 28;
 const TYPE_SRV = 33;
+const FOLLOW_UP_MS = 1000;
 
 export interface MdnsService {
   /** Instance name (FQDN, e.g. "A4B2C1@Kitchen ATV._raop._tcp.local"). */
@@ -35,7 +42,7 @@ export interface MdnsService {
 
 export interface UdpSocketLike {
   bind(port: number, cb?: () => void): void;
-  addMembership(address: string): void;
+  addMembership(address: string, iface?: string): void;
   setMulticastTTL(ttl: number): void;
   send(buf: Uint8Array, port: number, address: string): void;
   on(
@@ -181,22 +188,48 @@ export function parseA(record: DnsRecord): string | null {
 
 // --------------------------------------------------------------------------
 
-function encodeQuery(type: string): Uint8Array {
-  const parts = `${type}.local`.split('.');
+function encodeQuery(name: string, types: number[]): Uint8Array {
+  const parts = name.replace(/\.+$/, '').split('.').filter((p) => p.length > 0);
   const qnameLen = parts.reduce((n, p) => n + 1 + p.length, 1);
-  const out = new Uint8Array(12 + qnameLen + 4);
+  const rest = types.length === 0 ? 0 : 4 + (types.length - 1) * 6;
+  const out = new Uint8Array(12 + (types.length === 0 ? 0 : qnameLen + rest));
   const view = new DataView(out.buffer);
-  // id 0, flags 0, qdcount 1
-  view.setUint16(4, 1);
+  view.setUint16(4, types.length);
+  if (types.length === 0) return out;
   let offset = 12;
   for (const part of parts) {
     out[offset++] = part.length;
     for (let i = 0; i < part.length; i++) out[offset++] = part.charCodeAt(i);
   }
-  // root label 0 already zeroed
-  view.setUint16(offset + 1, TYPE_PTR);
-  view.setUint16(offset + 3, 1); // IN
+  offset++; // root 0
+  view.setUint16(offset, types[0]);
+  view.setUint16(offset + 2, 1); // IN
+  offset += 4;
+  for (let i = 1; i < types.length; i++) {
+    out[offset] = 0xc0;
+    out[offset + 1] = 12;
+    view.setUint16(offset + 2, types[i]);
+    view.setUint16(offset + 4, 1);
+    offset += 6;
+  }
   return out;
+}
+
+function ipv4Addresses(): string[] {
+  try {
+    const out: string[] = [];
+    for (const addrs of Object.values(os.networkInterfaces())) {
+      if (addrs === undefined) continue;
+      for (const a of addrs) {
+        if (a.family === 'IPv4' && !a.internal) {
+          out.push(a.address);
+        }
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 const isLinkLocal = (address: string) => address.startsWith('169.254.');
@@ -207,6 +240,10 @@ interface Instance {
   port: number | null;
   address: string | null;
   txt: Record<string, string>;
+  gotTxt: boolean;
+  sawAaaa: boolean;
+  loggedNoV4: boolean;
+  lastFollowUpAt: number;
   expiresAt: number;
   /** Signature of the last 'up' we announced (dedupe: refresh ≠ re-up). */
   upKey: string | null;
@@ -274,6 +311,29 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
     }
   };
 
+  const sendEncoded = (name: string, types: number[], dest: string) => {
+    if (dead) return;
+    try {
+      socket.send(encodeQuery(name, types), MDNS_PORT, dest);
+    } catch { /* transient send failure — the interval retries */ }
+  };
+
+  const maybeFollowUp = (instance: Instance, dest = MDNS_GROUP) => {
+    const missingSrv = instance.host === null || instance.port === null;
+    const missingTxt = !instance.gotTxt;
+    const missingA = instance.address === null;
+    if (!missingSrv && !missingTxt && !missingA) return;
+    const now = Date.now();
+    if (now - instance.lastFollowUpAt < FOLLOW_UP_MS) return;
+    instance.lastFollowUpAt = now;
+    if (missingSrv || missingTxt) {
+      sendEncoded(instance.name, [TYPE_SRV, TYPE_TXT], dest);
+    }
+    if (!missingSrv && missingA) {
+      sendEncoded(instance.host!, [TYPE_A, TYPE_AAAA], dest);
+    }
+  };
+
   const handlePacket = (msg: Uint8Array) => {
     // Only responses/announcements (qr bit set, flags byte 2 bit 7).
     if (msg.length < 12 || (msg[2] & 0x80) === 0) return;
@@ -299,6 +359,10 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
           port: null,
           address: null,
           txt: {},
+          gotTxt: false,
+          sawAaaa: false,
+          loggedNoV4: false,
+          lastFollowUpAt: 0,
           expiresAt: 0,
           upKey: null,
         };
@@ -320,6 +384,7 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
         instance.expiresAt = now + record.ttl * 1000;
       } else if (record.type === TYPE_TXT && instance !== undefined) {
         instance.txt = parseTxt(record);
+        instance.gotTxt = true;
         instance.expiresAt = now + record.ttl * 1000;
       } else if (record.type === TYPE_A) {
         // The A record's name is the SRV target's hostname, not the instance.
@@ -335,17 +400,53 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
             inst.expiresAt = now + record.ttl * 1000;
           }
         }
+      } else if (record.type === TYPE_AAAA) {
+        const hostName = record.name.replace(/\.+$/, '').toLowerCase();
+        for (const inst of instances.values()) {
+          if (inst.host !== null && inst.host.toLowerCase() === hostName) {
+            inst.sawAaaa = true;
+          }
+        }
       }
     }
 
-    for (const instance of instances.values()) emit(instance);
+    for (const instance of instances.values()) {
+      emit(instance);
+      if (
+        instance.host !== null && instance.address === null &&
+        instance.sawAaaa && !instance.loggedNoV4
+      ) {
+        instance.loggedNoV4 = true;
+        console.warn(`[melofon] mdns: ${instance.name} no usable v4`);
+      }
+      maybeFollowUp(instance);
+    }
   };
 
   try {
     socket.on('message', (msg) => handlePacket(msg));
     socket.bind(MDNS_PORT, () => {
       try {
-        socket.addMembership(MDNS_GROUP);
+        const ifaces = ipv4Addresses();
+        let joined = false;
+        let lastErr: unknown;
+        if (ifaces.length === 0) {
+          socket.addMembership(MDNS_GROUP);
+          joined = true;
+        } else {
+          for (const iface of ifaces) {
+            try {
+              socket.addMembership(MDNS_GROUP, iface);
+              joined = true;
+            } catch (err) {
+              lastErr = err;
+            }
+          }
+        }
+        if (!joined) {
+          fail(lastErr);
+          return;
+        }
         socket.setMulticastTTL(255);
       } catch (err) {
         fail(err);
@@ -356,12 +457,7 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
     return { close() {} };
   }
 
-  const sendQuery = () => {
-    if (dead) return;
-    try {
-      socket.send(encodeQuery(opts.type), MDNS_PORT, MDNS_GROUP);
-    } catch { /* transient send failure — the interval retries */ }
-  };
+  const sendQuery = () => sendEncoded(typeName, [TYPE_PTR], MDNS_GROUP);
   sendQuery();
   const queryTimer = setInterval(
     sendQuery,
