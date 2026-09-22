@@ -24,6 +24,7 @@ LDLIBS  = $(shell pkg-config --libs $(PKGS)) -levent_pthreads -lgpg-error \
 LDFLAGS  = -Wl,-z,nodelete
 
 SRC = ffi.c \
+      player.c \
       stub/stubs.c \
       vendor/outputs/raop.c \
       vendor/outputs/rtp_common.c \

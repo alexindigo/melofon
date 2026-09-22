@@ -9,12 +9,14 @@
 // password).
 //
 // Notify-driven (hats never touch this): reconcile on every player/outputs/
-// volume event. Selected + engine play ⇒ session start + PCM flows. Pause ⇒
-// flush (the library drops its read-ahead; resume re-decodes from the
-// engine's progress). Stop / deselect / unregister ⇒ teardown + free. A
-// track change or a position jump flushes first because the library reads a
-// whole track ahead — the stale read-ahead must go (this is the one place
-// we are not gapless).
+// volume event. Selected + engine play ⇒ session start; PCM flows only once
+// the helper reports connected — OwnTone arms its playback timer when the
+// device connects, so the first PCM is the track start (or the engine
+// position), never handshake-time filler. Pause ⇒ flush (the library drops
+// its read-ahead; resume re-decodes from the engine's progress). Stop /
+// deselect / unregister ⇒ teardown + free. A track change or a position
+// jump flushes first because the library reads a whole track ahead — the
+// stale read-ahead must go (this is the one place we are not gapless).
 //
 // The transport is injectable: tests fake it and assert on the command
 // stream without the library or an AirPlay device.
@@ -68,6 +70,9 @@ interface Runtime {
   transport: AirplayTransport | null;
   /** Queue-entry id the helper is (or was last) streaming. */
   entryId: number | null;
+  /** The helper reported connected — the pump may start (OwnTone's shape:
+   * the playback timer arms at CONNECTED, never during the handshake). */
+  helperConnected: boolean;
   /** Engine progress snapshot for seek detection. */
   lastProgressMs: number;
   lastEventAt: number;
@@ -78,6 +83,8 @@ interface Runtime {
   pumpGen: number;
   paused: boolean;
   warned: boolean;
+  /** Logged the once-per-session "waiting for connected" line. */
+  waitingLogged: boolean;
 }
 
 export function createAirplayBoot(deps: AirplayBootDeps): {
@@ -94,6 +101,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       rt = {
         transport: null,
         entryId: null,
+        helperConnected: false,
         lastProgressMs: 0,
         lastEventAt: performance.now(),
         lastState: 'stop',
@@ -101,6 +109,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         pumpGen: 0,
         paused: false,
         warned: false,
+        waitingLogged: false,
       };
       runtimes.set(id, rt);
     }
@@ -133,6 +142,23 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       console.warn(`[melofon] airplay: output ${id} session failed`);
       const rt = runtimes.get(id);
       if (rt !== undefined) stopRuntime(id, rt);
+    } else if (event === 'state' && value === 'connected') {
+      // OwnTone arms the playback timer when the device reports CONNECTED:
+      // the session is up, NOW the first PCM goes out — the track start (or
+      // the engine position), never handshake-time filler the library would
+      // have to dump.
+      const rt = runtimes.get(id);
+      if (rt === undefined) return;
+      rt.helperConnected = true;
+      const view = playback.playerView();
+      const output = outputs.get(id);
+      if (
+        rt.transport !== null && rt.entryId === null &&
+        view.state === 'play' && view.current !== null &&
+        output?.selected === true
+      ) {
+        pump(rt, view.current.id, view.current.song.path, view.itemProgressMs);
+      }
     }
   };
 
@@ -252,8 +278,18 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
           pos_ms: 0,
           len_ms: entry.song.durationMs ?? 0,
         }).catch(() => {});
-        // Pump right away: the helper buffers PCM during the RTSP handshake.
-        pump(rt, entry.id, entry.song.path, view.itemProgressMs);
+        // No pump here: the helper's connected event starts it.
+      } else if (!rt.helperConnected) {
+        // The RTSP handshake is still in flight. Do not fill a buffer the
+        // library cannot pace out yet — if connected never arrives, nothing
+        // was pumped and nothing needs dumping. Log once per session.
+        if (!rt.waitingLogged) {
+          rt.waitingLogged = true;
+          console.warn(
+            `[melofon] airplay: output ${output.id} waiting for the session ` +
+              'to connect before PCM',
+          );
+        }
       } else if (rt.entryId !== entry.id) {
         // Track change: the helper holds read-ahead of the old track.
         flush(rt);

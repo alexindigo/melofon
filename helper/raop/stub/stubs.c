@@ -245,11 +245,16 @@ outputs_quality_unsubscribe(struct media_quality *quality)
   (void)quality;
 }
 
-/* How much audio (ms) the output buffer holds — OwnTone's default. */
+/* How much audio (ms) the output buffer holds — OwnTone's default
+ * (outputs.c:1326): 2250 = the 2000 ms sender-side delay iTunes/Apple Music
+ * signal in the first sync packet (88200 samples at 44.1k) plus the 250 ms
+ * the device adds itself. raop.c:1925 turns this into output_buffer_samples
+ * — a shorter value shifts the whole playout schedule earlier and some
+ * AirPlay devices ignore the given values and stick to 2.25 seconds. */
 uint64_t
 outputs_buffer_duration_ms_get(void)
 {
-  return 1000;
+  return 2250; /* OwnTone default (outputs.c:1326). Not 1000. */
 }
 
 bool

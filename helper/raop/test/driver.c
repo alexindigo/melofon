@@ -6,8 +6,8 @@
  *                                  (fake's RECORD is delayed), report
  *                                  PRE=<accepted-by-connect> and
  *                                  TOTAL=<accepted> so the test can assert
- *                                  the ~2 s cap held and the flush-on-connect
- *                                  let post-connect audio flow again.
+ *                                  the ~2 s cap held and the pacing that
+ *                                  starts at connect let the flow resume.
  * Prints DRIVER-OK on success. */
 #include <stdbool.h>
 #include <stdio.h>
@@ -133,7 +133,7 @@ main(int argc, char **argv)
     {
       size_t pre = 0;
       /* Feed during startup — the fake's RECORD is delayed; the ~2 s cap
-       * must hold pre-connect, flush-on-connect must reopen the flow. */
+       * must hold pre-connect, pacing at connect must reopen the flow. */
       if (feed_through_connect(h, silence, (size_t)feed_seconds * PCM_BYTES,
                                &pre, 30000) < 0)
         return 1;

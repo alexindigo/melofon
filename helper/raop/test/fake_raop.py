@@ -29,6 +29,7 @@ state = {
     'teardowns': 0,
     'sdp': None,
     'sync_ntp_secs': [],
+    'sync_first': None,
     'timing_answered': None,
 }
 
@@ -67,9 +68,11 @@ UDPCollector(audio_sock).start()
 
 
 class ControlCollector(threading.Thread):
-    """RTCP sync packets: 0x80 0xd4 + rtptime(4) + NTP(sec,frac) + rtptime.
+    """RTCP sync packets: 0x80 0xd4 + cur_pos(4) + NTP(sec,frac) + rtptime.
     The NTP seconds must be on the sender's CLOCK_MONOTONIC timeline — a
-    zero-based stream clock breaks the device's playout schedule."""
+    zero-based stream clock breaks the device's playout schedule. The first
+    packet's rtptime - cur_pos is the sender's start buffer in samples
+    (OwnTone: 2250 ms - 250 ms device latency = 88200)."""
 
     def __init__(self, sock):
         super().__init__(daemon=True)
@@ -82,6 +85,12 @@ class ControlCollector(threading.Thread):
             if len(data) >= 20 and data[0] in (0x80, 0x90) and data[1] == 0xD4:
                 sec = struct.unpack('>I', data[8:12])[0]
                 state['sync_ntp_secs'].append(sec)
+                if state['sync_first'] is None:
+                    state['sync_first'] = {
+                        'type': data[0],
+                        'cur_pos': struct.unpack('>I', data[4:8])[0],
+                        'rtptime': struct.unpack('>I', data[16:20])[0],
+                    }
 
 
 ControlCollector(control_sock).start()

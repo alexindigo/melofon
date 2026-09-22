@@ -1,14 +1,17 @@
 /* ffi.c — libmelofon_raop: OwnTone's RAOP (raop.c, vendored under vendor/)
  * as an in-process library for Melofon's Deno FFI — no helper binary, no
  * stdin protocol (that was the old main.c). Flat opaque-handle C API, no
- * callbacks into JS; Deno polls events (raop_poll).
+ * callbacks into JS; Deno polls events (raop_poll). This file is only the
+ * dlopen surface: command queue, PCM hand-off, event ring. The pacing —
+ * the 10 ms tick, the pts clock, the start buffer, starting only after
+ * CONNECTED — lives in player.c, the stand-in for OwnTone's player.c.
  *
  * Threading: raop.c is process-global (OwnTone runs one RAOP module per
  * process), so the library owns ONE runtime — a background pthread with the
- * libevent base and the 10 ms pacing tick — ref-counted by handles
- * (raop_new starts it, the last raop_free stops and joins it). Each handle
- * is one AirPlay device: a command queue onto the loop (event_base_once,
- * evthread), a PCM buffer the tick drains, and an event ring Deno drains.
+ * libevent base — ref-counted by handles (raop_new starts it, the last
+ * raop_free stops and joins it). Each handle is one AirPlay device: a
+ * command queue onto the loop (event_base_once, evthread), a player.c
+ * instance the PCM flows through, and an event ring Deno drains.
  * Several selected outputs of one format share raop.c's master session —
  * OwnTone's synced multi-speaker model; the Deno side feeds PCM through a
  * single designated handle so the shared stream is never double-fed.
@@ -52,6 +55,17 @@
 /* The RAOP output backend (raop.c). */
 extern struct output_definition output_raop;
 
+/* player.c — the stand-in for OwnTone src/player.c's RAOP calling
+ * convention: the 10 ms pacing tick (timerfd, armed at CONNECTED), the pts
+ * stream clock, and the PCM read-ahead with its backpressure cap. */
+struct raop_player;
+struct raop_player *raop_player_new(struct event_base *evbase);
+void raop_player_free(struct raop_player *p);
+int raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len);
+void raop_player_flush(struct raop_player *p);
+void raop_player_session_started(struct raop_player *p);
+void raop_player_session_stopped(struct raop_player *p);
+
 /* Globals the vendored code expects (see stubs.c). */
 struct event_base *evbase_player;
 
@@ -66,17 +80,6 @@ void helper_logger_set_severity(int severity);
 #define RDEV_APPLETV4 4
 #define RDEV_HOMEPOD 5
 #define RDEV_OTHER   6
-
-/* OwnTone player's tick (player.c): 10 ms. */
-#define TICK_MS      10
-#define TICK_SAMPLES 441  /* 44100 Hz * 10 ms */
-#define TICK_BYTES   (TICK_SAMPLES * 4) /* s16 stereo */
-
-/* Per-handle PCM read-ahead cap; raop_write accepts what fits (the Deno
- * pump's backpressure). ~2 s of 44.1k/s16/stereo: a wedged-then-late session
- * must never dump a stale backlog (the old 256 MB cap let ~24 min pile up —
- * the "57 min late" bug). */
-#define PCM_CAP (2 * 44100 * 4)
 
 /* Event ring per handle (state events are tiny and rare). */
 #define EVENT_RING 16
@@ -123,23 +126,8 @@ struct raop_handle
   struct output_device *device;    /* NULL until the start command runs */
   enum output_device_state state;
 
-  /* PCM read-ahead the 10 ms tick paces out; mutex-guarded (raop_write is
-   * called from the caller's thread, the tick from the loop thread). */
-  struct evbuffer *pcm;
-  pthread_mutex_t pcm_lock;
-  /* The pts stream clock, OwnTone's shape (player.c: pb_session.pts =
-   * CLOCK_MONOTONIC at start + samples written): the sync packets' NTP
-   * timestamps must share a base with the timing service's (which answers
-   * with CLOCK_MONOTONIC) or the device schedules playout ~forever late —
-   * receives the stream, asks retransmits, never renders. */
-  struct timespec pts_base;        /* CLOCK_MONOTONIC at the last (re)start */
-  uint64_t pts_samples;            /* samples fed since that base */
-
-  /* Diagnostics (MELOFON_RAOP_DEBUG): cumulative samples the tick has fed
-   * into raop_write — the library's view of "audio is leaving". Compare
-   * against /proc/net/snmp OutDatagrams (the kernel's view). */
-  uint64_t fed_samples;
-  struct timeval last_debug;
+  /* The player stand-in: PCM read-ahead, pacing tick, pts clock (player.c). */
+  struct raop_player *player;
 
   /* Event ring for raop_poll. */
   char events[EVENT_RING][EVENT_LEN];
@@ -164,7 +152,6 @@ static struct
 {
   pthread_t thread;
   struct event_base *base;
-  struct event *tick;
   int handles;                 /* live handle count (runtime_lock) */
   bool running;
   pthread_mutex_t lock;
@@ -214,18 +201,14 @@ raop_ffi_on_state(uint64_t device_id, enum output_device_state state)
     if (h->id == device_id)
       {
         h->state = state;
-        if (state == OUTPUT_STATE_CONNECTED)
-          {
-            /* Backlog policy: the session just came up — drop anything
-             * buffered during startup (stale on the wedged-then-late path)
-             * and start the stream clock fresh. */
-            pthread_mutex_lock(&h->pcm_lock);
-            evbuffer_drain(h->pcm, evbuffer_get_length(h->pcm));
-            pthread_mutex_unlock(&h->pcm_lock);
-            h->pts_samples = 0;
-            h->fed_samples = 0;
-            clock_gettime(CLOCK_MONOTONIC, &h->pts_base);
-          }
+        /* OwnTone arms the playback timer when the device reports
+         * CONNECTED and disarms it on teardown/failure — no PCM leaves
+         * during the handshake, and nothing buffered earlier is dumped
+         * (Deno waits for the connected event before feeding). */
+        if (state == OUTPUT_STATE_CONNECTED || state == OUTPUT_STATE_STREAMING)
+          raop_player_session_started(h->player);
+        else if (state == OUTPUT_STATE_STOPPED || state == OUTPUT_STATE_FAILED)
+          raop_player_session_stopped(h->player);
         event_push(h, value);
         break;
       }
@@ -248,122 +231,6 @@ raop_ffi_device_find(uint64_t device_id)
       }
   pthread_mutex_unlock(&rt.lock);
   return device;
-}
-
-/* ------------------------------------------------------------------- pacing */
-
-/* 10 ms tick on the loop thread: feed up to one tick's worth of PCM per
- * handle to the RAOP sessions, stream clock advancing per handle. */
-static const char *
-state_name(enum output_device_state state)
-{
-  switch (state)
-    {
-      case OUTPUT_STATE_STOPPED:   return "stopped";
-      case OUTPUT_STATE_STARTUP:   return "startup";
-      case OUTPUT_STATE_CONNECTED: return "connected";
-      case OUTPUT_STATE_STREAMING: return "streaming";
-      case OUTPUT_STATE_FAILED:    return "failed";
-      case OUTPUT_STATE_PASSWORD:  return "password";
-      default:                     return "unknown";
-    }
-}
-
-/* Once per second per handle at E_DBG: state machine, buffered PCM, and the
- * cumulative samples fed into raop_write (frames, not RTP packets). */
-static void
-tick_debug(raop_t *h)
-{
-  struct timeval now;
-  size_t buffered;
-
-  gettimeofday(&now, NULL);
-  if (now.tv_sec == h->last_debug.tv_sec)
-    return;
-  h->last_debug = now;
-
-  pthread_mutex_lock(&h->pcm_lock);
-  buffered = evbuffer_get_length(h->pcm);
-  pthread_mutex_unlock(&h->pcm_lock);
-
-  /* RAOP packets are 352 samples; fed_samples/352 approximates RTP audio. */
-  DPRINTF(E_DBG, L_RAOP,
-          "tick: state=%s pcm_buffered=%zu fed_samples=%llu (~%llu rtp)\n",
-          state_name(h->state), buffered,
-          (unsigned long long)h->fed_samples,
-          (unsigned long long)(h->fed_samples / 352));
-}
-
-static void
-tick_cb(evutil_socket_t fd, short what, void *arg)
-{
-  struct output_buffer obuf;
-  uint8_t scratch[TICK_BYTES];
-  raop_t *h;
-  size_t avail;
-  size_t n;
-
-  (void)fd; (void)what; (void)arg;
-
-  /* Snapshot the handles under rt.lock, then iterate WITHOUT it: raop code
-   * reached via output_raop.write re-enters the registry (rt.lock) — holding
-   * it here would deadlock this thread. Handles cannot be freed mid-iteration
-   * because free happens on this same loop thread (see CMD_FREE). */
-  raop_t *snapshot[64];
-  int count = 0;
-
-  pthread_mutex_lock(&rt.lock);
-  for (h = rt.handles_list; h && count < 64; h = h->next)
-    snapshot[count++] = h;
-  pthread_mutex_unlock(&rt.lock);
-
-  for (int i = 0; i < count; i++)
-    {
-      h = snapshot[i];
-      if (h->state != OUTPUT_STATE_CONNECTED
-          && h->state != OUTPUT_STATE_STREAMING)
-        {
-          tick_debug(h);
-          continue;
-        }
-
-      pthread_mutex_lock(&h->pcm_lock);
-      avail = evbuffer_get_length(h->pcm);
-      if (avail < 4)
-        {
-          pthread_mutex_unlock(&h->pcm_lock);
-          continue;
-        }
-      n = avail > TICK_BYTES ? TICK_BYTES : (avail & ~(size_t)3);
-      if (evbuffer_remove(h->pcm, scratch, n) < 0)
-        {
-          pthread_mutex_unlock(&h->pcm_lock);
-          continue;
-        }
-      pthread_mutex_unlock(&h->pcm_lock);
-
-      memset(&obuf, 0, sizeof(obuf));
-      obuf.data[0].buffer = scratch;
-      obuf.data[0].bufsize = n;
-      obuf.data[0].samples = (int)(n / 4);
-      obuf.data[0].quality.sample_rate = 44100;
-      obuf.data[0].quality.bits_per_sample = 16;
-      obuf.data[0].quality.channels = 2;
-      /* obuf.data[1].buffer = NULL terminates the quality array. */
-      {
-        uint64_t sec = (uint64_t)h->pts_base.tv_sec + h->pts_samples / 44100;
-        uint64_t nsec = (uint64_t)h->pts_base.tv_nsec
-                      + (h->pts_samples % 44100) * 1000000000ULL / 44100;
-        obuf.pts.tv_sec = (time_t)(sec + nsec / 1000000000ULL);
-        obuf.pts.tv_nsec = (long)(nsec % 1000000000ULL);
-      }
-
-      output_raop.write(&obuf);
-
-      h->fed_samples += (uint64_t)(n / 4);
-      h->pts_samples += (uint64_t)(n / 4);
-      tick_debug(h);
-    }
 }
 
 /* ----------------------------------------------------------------- commands */
@@ -528,7 +395,9 @@ device_start(raop_t *h, const cmd *c)
         md->item_id = (uint32_t)h->id;
         md->pos_ms = c->pos_ms;
         md->len_ms = c->len_ms;
-        md->pts = h->pts_base;
+        /* The stream clock (player.c) anchors at the first write after
+         * CONNECTED; until then "now" is the progress-post reference. */
+        clock_gettime(CLOCK_MONOTONIC, &md->pts);
         md->startup = true;
         md->priv = rmd;
         output_raop.metadata_send(md);
@@ -557,16 +426,14 @@ device_teardown(raop_t *h)
   if (!h->device)
     return;
 
+  raop_player_session_stopped(h->player);
+
   if (h->device->session)
     output_raop.device_stop(h->device, 0);
   device_free(h);
 
-  pthread_mutex_lock(&h->pcm_lock);
-  evbuffer_drain(h->pcm, evbuffer_get_length(h->pcm));
-  pthread_mutex_unlock(&h->pcm_lock);
+  raop_player_flush(h->player);
 
-  h->pts_samples = 0;
-  h->fed_samples = 0;
   h->state = OUTPUT_STATE_STOPPED;
   event_push(h, "stopped");
 }
@@ -595,9 +462,6 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
           case CMD_START:
             if (h->device)
               device_teardown(h);
-            h->pts_samples = 0;
-            h->fed_samples = 0;
-            clock_gettime(CLOCK_MONOTONIC, &h->pts_base);
             device_start(h, c);
             break;
 
@@ -610,9 +474,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             break;
 
           case CMD_FLUSH:
-            pthread_mutex_lock(&h->pcm_lock);
-            evbuffer_drain(h->pcm, evbuffer_get_length(h->pcm));
-            pthread_mutex_unlock(&h->pcm_lock);
+            raop_player_flush(h->player);
             if (h->device && h->device->session)
               output_raop.device_flush(h->device, 0);
             break;
@@ -629,10 +491,9 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
           case CMD_FREE:
             /* Free on the loop thread: the queue is drained and every
              * earlier once-callback for this handle has already run (FIFO) —
-             * nothing pending references h any more. The tick cannot see it
-             * (unlinked before CMD_FREE was queued). */
-            evbuffer_free(h->pcm);
-            pthread_mutex_destroy(&h->pcm_lock);
+             * nothing pending references h any more. The player's tick
+             * cannot see it (unlinked before CMD_FREE was queued). */
+            raop_player_free(h->player);
             pthread_mutex_destroy(&h->events_lock);
             pthread_mutex_destroy(&h->cmds_lock);
             pthread_mutex_lock(&c->sync->lock);
@@ -678,8 +539,6 @@ cmd_push(raop_t *h, cmd *c)
 static void *
 loop_main(void *arg)
 {
-  struct timeval tick;
-
   (void)arg;
 
   rt.base = event_base_new();
@@ -696,15 +555,9 @@ loop_main(void *arg)
       return NULL;
     }
 
-  rt.tick = event_new(rt.base, -1, EV_TIMEOUT | EV_PERSIST, tick_cb, NULL);
-  tick.tv_sec = 0;
-  tick.tv_usec = TICK_MS * 1000;
-  evtimer_add(rt.tick, &tick);
-
   event_base_dispatch(rt.base);
 
   output_raop.deinit();
-  event_free(rt.tick);
   event_base_free(rt.base);
   rt.base = NULL;
   evbase_player = NULL;
@@ -783,20 +636,20 @@ raop_new(void)
   if (!h)
     return NULL;
 
-  h->pcm = evbuffer_new();
-  if (!h->pcm)
-    {
-      free(h);
-      return NULL;
-    }
-  pthread_mutex_init(&h->pcm_lock, NULL);
   pthread_mutex_init(&h->events_lock, NULL);
   pthread_mutex_init(&h->cmds_lock, NULL);
   h->state = OUTPUT_STATE_STOPPED;
 
   if (runtime_acquire() < 0)
     {
-      evbuffer_free(h->pcm);
+      free(h);
+      return NULL;
+    }
+
+  h->player = raop_player_new(rt.base);
+  if (!h->player)
+    {
+      runtime_release();
       free(h);
       return NULL;
     }
@@ -842,23 +695,10 @@ raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
 int
 raop_write(raop_t *h, const uint8_t *pcm, size_t len)
 {
-  size_t avail;
-  size_t accept;
-
   if (!h || !pcm)
     return -1;
 
-  pthread_mutex_lock(&h->pcm_lock);
-  avail = evbuffer_get_length(h->pcm);
-  accept = len;
-  if (avail + accept > PCM_CAP)
-    accept = avail >= PCM_CAP ? 0 : PCM_CAP - avail;
-  accept &= ~(size_t)3; /* keep whole s16-stereo frames */
-  if (accept > 0 && evbuffer_add(h->pcm, pcm, accept) < 0)
-    accept = 0;
-  pthread_mutex_unlock(&h->pcm_lock);
-
-  return (int)accept;
+  return raop_player_write(h->player, pcm, len);
 }
 
 int
@@ -963,7 +803,7 @@ raop_free(raop_t *h)
         usleep(1000);
     }
 
-  /* Out of the tick's view. */
+  /* Out of the registry before the free is queued. */
   pthread_mutex_lock(&rt.lock);
   for (link = &rt.handles_list; *link; link = &(*link)->next)
     if (*link == h)

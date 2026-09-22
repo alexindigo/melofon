@@ -1,4 +1,6 @@
-/* ffi.h — libmelofon_raop public API (see ffi.c for the design notes). */
+/* ffi.h — libmelofon_raop public API: this is the dlopen surface (see ffi.c
+ * for the design notes). The OwnTone player.c stand-in — the pacing tick,
+ * the pts clock, the start buffer — is player.c, not part of the API. */
 #ifndef MELOFON_RAOP_FFI_H
 #define MELOFON_RAOP_FFI_H
 
@@ -12,8 +14,8 @@ extern "C" {
 typedef struct raop_handle raop_t;
 
 /* One handle per AirPlay device. The first handle starts the library's
- * background loop thread (libevent + 10 ms pacing tick); the last raop_free
- * stops and joins it. */
+ * background loop thread (libevent; player.c's 10 ms pacing tick arms when
+ * the session reports CONNECTED); the last raop_free stops and joins it. */
 raop_t *raop_new(void);
 
 /* Queue a session start: RTSP OPTIONS/ANNOUNCE/SETUP/RECORD to host:port

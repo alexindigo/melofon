@@ -1,9 +1,10 @@
 // tests/airplay-boot.test.ts — the AirPlay boot against a FAKE helper
 // transport (no helper binary, no device): unselected play spawns nothing,
-// selected + play starts the helper and PCM flows (real decodePcm on the
-// fixture), pause flushes, resume re-decodes from the engine position, stop
-// / deselect / unregister tear down, volume and pin reach the helper, and a
-// helper "password" event flips needsAuthKey on the output row.
+// selected + play starts the helper, PCM flows only after the helper
+// reports connected (real decodePcm on the fixture), pause flushes, resume
+// re-decodes from the engine position, stop / deselect / unregister tear
+// down, volume and pin reach the helper, and a helper "password" event
+// flips needsAuthKey on the output row.
 import { assert, assertEquals } from '@std/assert';
 import { openDb } from '../src/db.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
@@ -172,11 +173,33 @@ Deno.test('selected + play: start command, then the track as PCM', async () => {
     assertEquals(start.port, 7000);
     assertEquals(start.name, 'Kitchen ATV');
     assertEquals(start.volume, 100);
+    // The session is up: the pump starts (OwnTone's shape — PCM after
+    // CONNECTED, not during the handshake).
+    t.onEvent('state', 'connected');
     // Every PCM frame comes after the start command on the wire.
     const startIdx = t.frames.findIndex((f) => f.cmd?.cmd === 'start');
     const firstPcmIdx = t.frames.findIndex((f) => f.type === 'pcm');
     assert(firstPcmIdx === -1 || startIdx < firstPcmIdx);
     // The whole 1 s fixture decodes through.
+    await until('PCM streamed', () => t.pcmBytes() === FIXTURE_PCM_BYTES);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('no PCM before the helper reports connected', async () => {
+  const { outputs, playback, spawned, close } = await setup();
+  try {
+    registerSelected(outputs);
+    playback.queueAdd([fixtureSong()], { play: true });
+    await until('helper spawned', () => spawned.length === 1);
+    const t = spawned[0];
+    await until('start sent', () => t.cmds().some((c) => c.cmd === 'start'));
+    // Handshake in flight: nothing may be pumped into the buffer yet.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assertEquals(t.pcmBytes(), 0);
+    // The session connects: the track flows from the engine position.
+    t.onEvent('state', 'connected');
     await until('PCM streamed', () => t.pcmBytes() === FIXTURE_PCM_BYTES);
   } finally {
     await close();
@@ -198,6 +221,7 @@ Deno.test('select while playing starts streaming (the HA flow)', async () => {
     assertEquals(spawned.length, 0);
     outputs.update(ID, { selected: true });
     await until('helper spawned on select', () => spawned.length === 1);
+    spawned[0].onEvent('state', 'connected');
     await until('PCM streamed', () => spawned[0].pcmBytes() > 0);
   } finally {
     await close();
@@ -209,6 +233,8 @@ Deno.test('pause flushes; resume re-decodes; stop tears down', async () => {
   try {
     registerSelected(outputs);
     playback.queueAdd([fixtureSong()], { play: true });
+    await until('helper spawned', () => spawned.length === 1);
+    spawned[0].onEvent('state', 'connected');
     await until(
       'PCM streamed',
       () => spawned[0]?.pcmBytes() === FIXTURE_PCM_BYTES,

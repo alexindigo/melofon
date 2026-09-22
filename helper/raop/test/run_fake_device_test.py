@@ -86,6 +86,16 @@ def standard_scenario():
         assert abs(sec - expected) < 120, \
             f'sync NTP timestamp off the monotonic timeline: {sec} vs {expected:.0f}'
 
+    # The start buffer on the wire: the first sync packet's
+    # rtptime - cur_pos is output_buffer_samples = (start_buffer_ms - 250) *
+    # 44.1 — OwnTone's default 2250 ms -> 88200 (raop.c:1925, outputs.c:1326).
+    # 33075 here would mean the buffer is still 1000 ms.
+    first = report['sync_first']
+    assert first is not None, 'no sync packet captured'
+    offset = (first['rtptime'] - first['cur_pos']) & 0xFFFFFFFF
+    assert abs(offset - 88200) <= 352, \
+        f'sync rtptime-cur_pos is {offset}, not 88200 (start buffer is not 2250 ms)'
+
     print('fake-device test: OK '
           f"({report['audio_packets']} RTP packets in {span:.2f}s, "
           f'{len(seq)} RTSP requests)')
@@ -93,8 +103,9 @@ def standard_scenario():
 
 def backlog_scenario():
     """The wedge: fake's RECORD reply is delayed 3.5 s while the pump feeds
-    6 s of PCM. The ~2 s read-ahead cap must hold pre-connect, and
-    flush-on-connect must reopen the flow — no stale-backlog burst."""
+    6 s of PCM. The ~2 s read-ahead cap must hold pre-connect, and the
+    pacing that starts at connect must reopen the flow — the buffered audio
+    plays out in real time, no stale-backlog burst."""
     fake, port = start_fake({'FAKE_RECORD_DELAY_MS': '3500'})
     driver = subprocess.run([DRIVER, port, 'backlog', '6'],
                             capture_output=True, text=True, timeout=60)
@@ -111,7 +122,7 @@ def backlog_scenario():
     assert pre <= cap + 8192, \
         f'cap did not hold: accepted {pre} by connect, cap is {cap}'
     assert total == 6 * 176400, \
-        f'flow did not reopen after flush-on-connect: TOTAL={total}'
+        f'flow did not reopen when pacing started at connect: TOTAL={total}'
 
     assert report is not None and report['audio_packets'] > 0
     span = report['last_rtp_at'] - report['first_rtp_at']

@@ -1,0 +1,325 @@
+/* player.c — Melofon's stand-in for OwnTone src/player.c's RAOP calling
+ * convention, not the music server. Tick, pts, start-buffer, start-after-
+ * CONNECTED. Deno is the input thread; raop.c is the output.
+ *
+ * What this mirrors from OwnTone player.c:
+ *  - the playback timer is a timerfd on CLOCK_MONOTONIC, 10 ms, one
+ *    EV_READ|EV_PERSIST event (player.c:3986-3999);
+ *  - the timer is ARMED when the device reports CONNECTED and disarmed on
+ *    teardown/failure — never during the RTSP handshake
+ *    (outputs_start -> device_activate_cb(CONNECTED) -> pb_timer_start,
+ *    player.c:2105-2137 + playback_start_bh:2023-2036);
+ *  - playback_cb reads the timer overrun and writes 1+overrun 10 ms frames
+ *    to catch up after a stall (player.c:1272-1372);
+ *  - the pts stream clock anchors at CLOCK_MONOTONIC on the first write
+ *    after CONNECTED (OwnTone sets start_ts on the first source_read,
+ *    player.c:869-874) and advances by the samples written
+ *    (player.c:1366-1367).
+ *
+ * Deliberately not mirrored (Melofon owns that layer): source_read / the
+ * input thread (Deno feeds s16le via raop_player_write), queue/repeat/
+ * shuffle (the Melofon engine), multi-quality output buffering, speaker
+ * resurrect, scrobbling.
+ *
+ * Threading: raop_player_write is called from the API (Deno) thread;
+ * everything else runs on the runtime's libevent loop thread (ffi.c).
+ * The pcm evbuffer is mutex-guarded; the write path never holds pcm_lock
+ * while calling into raop.c (which re-enters ffi.c's registry).
+ */
+
+#ifdef HAVE_CONFIG_H
+# include <config.h>
+#endif
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/timerfd.h>
+
+#include <event2/event.h>
+#include <event2/buffer.h>
+
+#include "logger.h"
+#include "outputs.h"
+
+/* The RAOP output backend (raop.c). */
+extern struct output_definition output_raop;
+
+/* OwnTone player's tick (player.c): 10 ms. */
+#define TICK_MS      10
+#define TICK_SAMPLES 441  /* 44100 Hz * 10 ms */
+#define TICK_BYTES   (TICK_SAMPLES * 4) /* s16 stereo */
+
+/* Per-player PCM read-ahead cap; raop_player_write accepts what fits (the
+ * Deno pump's backpressure). ~2 s of 44.1k/s16/stereo: a wedged-then-late
+ * session must never dump a stale backlog (the old 256 MB cap let ~24 min
+ * pile up — the "57 min late" bug). Backpressure, not a handshake dump:
+ * the buffer is NOT drained when the session connects. */
+#define PCM_CAP (2 * 44100 * 4)
+
+struct raop_player
+{
+  struct event_base *evbase;     /* the runtime loop (ffi.c) */
+  int timer_fd;                  /* timerfd, CLOCK_MONOTONIC */
+  struct event *timer_ev;        /* EV_READ|EV_PERSIST on timer_fd */
+  bool streaming;                /* between CONNECTED and teardown/failed */
+
+  /* PCM read-ahead the 10 ms tick paces out; mutex-guarded (write is
+   * called from the caller's thread, the tick from the loop thread). */
+  struct evbuffer *pcm;
+  pthread_mutex_t pcm_lock;
+
+  /* The pts stream clock, OwnTone's shape (player.c: pb_session.pts =
+   * CLOCK_MONOTONIC at start + samples written): the sync packets' NTP
+   * timestamps must share a base with the timing service's (which answers
+   * with CLOCK_MONOTONIC) or the device schedules playout ~forever late —
+   * receives the stream, asks retransmits, never renders. Anchored on the
+   * first write after CONNECTED. */
+  struct timespec pts_base;      /* CLOCK_MONOTONIC at the first write */
+  uint64_t pts_samples;          /* samples fed since that base */
+  bool clock_started;            /* pts_base is valid */
+
+  /* Diagnostics (MELOFON_RAOP_DEBUG): cumulative samples the tick has fed
+   * into raop_write — the library's view of "audio is leaving". Compare
+   * against /proc/net/snmp OutDatagrams (the kernel's view). */
+  uint64_t fed_samples;
+  struct timeval last_debug;
+};
+
+/* Once per second at E_DBG: streaming state, buffered PCM, and the
+ * cumulative samples fed into raop_write (frames, not RTP packets). */
+static void
+player_debug(struct raop_player *p)
+{
+  struct timeval now;
+  size_t buffered;
+
+  gettimeofday(&now, NULL);
+  if (now.tv_sec == p->last_debug.tv_sec)
+    return;
+  p->last_debug = now;
+
+  pthread_mutex_lock(&p->pcm_lock);
+  buffered = evbuffer_get_length(p->pcm);
+  pthread_mutex_unlock(&p->pcm_lock);
+
+  /* RAOP packets are 352 samples; fed_samples/352 approximates RTP audio. */
+  DPRINTF(E_DBG, L_RAOP,
+          "tick: streaming=%d pcm_buffered=%zu fed_samples=%llu (~%llu rtp)\n",
+          p->streaming ? 1 : 0, buffered,
+          (unsigned long long)p->fed_samples,
+          (unsigned long long)(p->fed_samples / 352));
+}
+
+/* The 10 ms playback tick (OwnTone playback_cb, player.c:1272-1372): read
+ * the timer overrun, then write 1+overrun frames from the PCM buffer into
+ * the RAOP sessions, advancing the stream clock per sample written. */
+static void
+playback_cb(evutil_socket_t fd, short what, void *arg)
+{
+  struct raop_player *p = arg;
+  struct output_buffer obuf;
+  uint8_t scratch[TICK_BYTES];
+  uint64_t overrun = 0;
+  uint64_t frames;
+  ssize_t ret;
+
+  (void)fd; (void)what;
+
+  /* Check if we missed any timer expirations (OwnTone's overrun--: the
+   * first expiration is the tick itself). */
+  ret = read(p->timer_fd, &overrun, sizeof(overrun));
+  if (ret <= 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Error reading playback timer\n");
+      overrun = 0;
+    }
+  else if (overrun > 0)
+    overrun--;
+
+  /* The timer is only armed between CONNECTED and teardown, but a queued
+   * expiration can land right after disarm — never write then. */
+  if (!p->streaming)
+    return;
+
+  for (frames = 1 + overrun; frames > 0; frames--)
+    {
+      size_t avail;
+      size_t n;
+
+      pthread_mutex_lock(&p->pcm_lock);
+      avail = evbuffer_get_length(p->pcm);
+      if (avail < 4)
+        {
+          pthread_mutex_unlock(&p->pcm_lock);
+          break;
+        }
+      n = avail > TICK_BYTES ? TICK_BYTES : (avail & ~(size_t)3);
+      if (evbuffer_remove(p->pcm, scratch, n) < 0)
+        {
+          pthread_mutex_unlock(&p->pcm_lock);
+          break;
+        }
+      pthread_mutex_unlock(&p->pcm_lock);
+
+      if (!p->clock_started)
+        {
+          /* OwnTone anchors start_ts on the first source_read — which is
+           * after the timer starts, never during the handshake. */
+          clock_gettime(CLOCK_MONOTONIC, &p->pts_base);
+          p->pts_samples = 0;
+          p->clock_started = true;
+        }
+
+      memset(&obuf, 0, sizeof(obuf));
+      obuf.data[0].buffer = scratch;
+      obuf.data[0].bufsize = n;
+      obuf.data[0].samples = (int)(n / 4);
+      obuf.data[0].quality.sample_rate = 44100;
+      obuf.data[0].quality.bits_per_sample = 16;
+      obuf.data[0].quality.channels = 2;
+      /* obuf.data[1].buffer = NULL terminates the quality array. */
+      {
+        uint64_t sec = (uint64_t)p->pts_base.tv_sec + p->pts_samples / 44100;
+        uint64_t nsec = (uint64_t)p->pts_base.tv_nsec
+                      + (p->pts_samples % 44100) * 1000000000ULL / 44100;
+        obuf.pts.tv_sec = (time_t)(sec + nsec / 1000000000ULL);
+        obuf.pts.tv_nsec = (long)(nsec % 1000000000ULL);
+      }
+
+      output_raop.write(&obuf);
+
+      p->fed_samples += (uint64_t)(n / 4);
+      p->pts_samples += (uint64_t)(n / 4);
+    }
+
+  player_debug(p);
+}
+
+struct raop_player *
+raop_player_new(struct event_base *evbase)
+{
+  struct raop_player *p;
+
+  p = calloc(1, sizeof(*p));
+  if (!p)
+    return NULL;
+
+  p->evbase = evbase;
+  p->pcm = evbuffer_new();
+  p->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+  if (!p->pcm || p->timer_fd < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create the player (timerfd/buffer)\n");
+      if (p->pcm)
+        evbuffer_free(p->pcm);
+      if (p->timer_fd >= 0)
+        close(p->timer_fd);
+      free(p);
+      return NULL;
+    }
+  p->timer_ev = event_new(evbase, p->timer_fd, EV_READ | EV_PERSIST,
+                          playback_cb, p);
+  if (!p->timer_ev)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create the playback timer event\n");
+      close(p->timer_fd);
+      evbuffer_free(p->pcm);
+      free(p);
+      return NULL;
+    }
+  pthread_mutex_init(&p->pcm_lock, NULL);
+
+  return p;
+}
+
+/* Loop thread only (freed where no callback can be mid-flight on p). */
+void
+raop_player_free(struct raop_player *p)
+{
+  if (!p)
+    return;
+
+  if (p->timer_ev)
+    {
+      event_del(p->timer_ev);
+      event_free(p->timer_ev);
+    }
+  if (p->timer_fd >= 0)
+    close(p->timer_fd);
+  evbuffer_free(p->pcm);
+  pthread_mutex_destroy(&p->pcm_lock);
+  free(p);
+}
+
+/* API thread: append s16le/44100/stereo PCM to the read-ahead. Returns
+ * bytes accepted; < len means the cap is reached (caller retries — that is
+ * the backpressure). Accepted at any time; paced out only while streaming. */
+int
+raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len)
+{
+  size_t avail;
+  size_t accept;
+
+  pthread_mutex_lock(&p->pcm_lock);
+  avail = evbuffer_get_length(p->pcm);
+  accept = len;
+  if (avail + accept > PCM_CAP)
+    accept = avail >= PCM_CAP ? 0 : PCM_CAP - avail;
+  accept &= ~(size_t)3; /* keep whole s16-stereo frames */
+  if (accept > 0 && evbuffer_add(p->pcm, pcm, accept) < 0)
+    accept = 0;
+  pthread_mutex_unlock(&p->pcm_lock);
+
+  return (int)accept;
+}
+
+/* Loop thread: drop buffered PCM (pause/seek/track-change semantics; the
+ * stream clock continues — resume re-feeds from the engine position). */
+void
+raop_player_flush(struct raop_player *p)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  evbuffer_drain(p->pcm, evbuffer_get_length(p->pcm));
+  pthread_mutex_unlock(&p->pcm_lock);
+}
+
+/* Loop thread: the device reported CONNECTED — arm the 10 ms timer
+ * (OwnTone pb_timer_start from device_activate_cb). The pts clock
+ * re-anchors on the first write. Idempotent (STREAMING re-enters here). */
+void
+raop_player_session_started(struct raop_player *p)
+{
+  struct itimerspec tick;
+
+  if (p->streaming)
+    return;
+  p->streaming = true;
+  p->clock_started = false;
+
+  memset(&tick, 0, sizeof(tick));
+  tick.it_interval.tv_nsec = TICK_MS * 1000000;
+  tick.it_value.tv_nsec = TICK_MS * 1000000;
+  if (event_add(p->timer_ev, NULL) < 0
+      || timerfd_settime(p->timer_fd, 0, &tick, NULL) < 0)
+    DPRINTF(E_LOG, L_RAOP, "Could not arm the playback timer\n");
+}
+
+/* Loop thread: teardown or failure — disarm. Idempotent. */
+void
+raop_player_session_stopped(struct raop_player *p)
+{
+  struct itimerspec zero;
+
+  if (!p->streaming)
+    return;
+  p->streaming = false;
+
+  memset(&zero, 0, sizeof(zero));
+  timerfd_settime(p->timer_fd, 0, &zero, NULL);
+  event_del(p->timer_ev);
+}
