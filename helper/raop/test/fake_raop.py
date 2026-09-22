@@ -29,6 +29,7 @@ state = {
     'teardowns': 0,
     'sdp': None,
     'sync_ntp_secs': [],
+    'timing_answered': None,
 }
 
 NTP_EPOCH_DELTA = 2208988800
@@ -87,6 +88,8 @@ ControlCollector(control_sock).start()
 
 
 class RTSPHandler(socketserver.BaseRequestHandler):
+    timing_port = None
+
     def handle(self):
         buf = b''
         while True:
@@ -118,6 +121,8 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     time.sleep(RECORD_DELAY_MS / 1000)
                 state['requests'].append(method)
                 cseq = headers.get('cseq', '0')
+                if method == 'SETUP':
+                    print(f'SETUP headers: {headers!r}', file=sys.stderr, flush=True)
                 if method == 'ANNOUNCE':
                     state['sdp'] = body.decode(errors='replace')
                 if method == 'SET_PARAMETER' and body.startswith(b'volume'):
@@ -132,6 +137,8 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     extra = ('Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, '
                              'TEARDOWN, SET_PARAMETER, POST, GET_PARAMETER\r\n')
                 if method == 'SETUP':
+                    RTSPHandler.timing_port = int(
+                        headers['transport'].split('timing_port=')[1].split(';')[0])
                     extra = (f'Session: DEADBEEF\r\n'
                              f'Transport: RTP/AVP/UDP;unicast;mode=record;'
                              f'server_port={audio_port};'
@@ -139,6 +146,23 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                              f'timing_port={timing_port}\r\n')
                 if method == 'RECORD':
                     extra = 'Audio-Latency: 11025\r\n'
+                    # Probe the sender's timing service (device -> sender
+                    # clock sync): 0xd2 request to the SETUP-advertised port.
+                    try:
+                        tport = RTSPHandler.timing_port
+                        tq = bytearray(32)
+                        tq[0], tq[1] = 0x80, 0xD2
+                        tq[4:8] = struct.pack('>I', 7)
+                        tq[24:32] = struct.pack('>Q', 0x1234567890ABCDEF)
+                        ts = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        ts.settimeout(3)
+                        ts.sendto(bytes(tq), (self.client_address[0], tport))
+                        data, _ = ts.recvfrom(64)
+                        state['timing_answered'] = (len(data) >= 32 and data[1] == 0xD3)
+                        ts.close()
+                    except Exception as e:
+                        print(f'timing-probe: failed: {e!r}', file=sys.stderr, flush=True)
+                        state['timing_answered'] = False
                 if method == 'ANNOUNCE' and ANNOUNCE_403:
                     res = (f'RTSP/1.0 403 Forbidden\r\nCSeq: {cseq}\r\n'
                            f'Content-Length: 0\r\n\r\n')

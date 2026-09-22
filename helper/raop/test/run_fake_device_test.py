@@ -72,6 +72,11 @@ def standard_scenario():
 
     assert report['flushes'] == 1 and report['teardowns'] == 1
 
+    # The device syncs its clock to the sender via timing requests — the
+    # sender's timing service must answer 0xd3.
+    assert report['timing_answered'] is True, \
+        f'timing service did not answer: {report["timing_answered"]}'
+
     # Sync packets schedule playout on the CLOCK_MONOTONIC timeline (a
     # zero-based pts puts them ~boot-uptime in the past — the device holds
     # audio forever: the "silent while receiving" bug).
