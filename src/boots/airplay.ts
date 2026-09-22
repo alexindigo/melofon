@@ -186,9 +186,20 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       for await (const chunk of stream) {
         if (rt.pumpGen !== gen || rt.transport === null || closed) return;
         if (RAOP_DEBUG && total === 0) {
+          let peak = 0;
+          const view = new DataView(
+            chunk.buffer,
+            chunk.byteOffset,
+            chunk.byteLength,
+          );
+          for (let i = 0; i + 1 < chunk.length; i += 2) {
+            const s = view.getInt16(i, true);
+            const a = s < 0 ? -s : s;
+            if (a > peak) peak = a;
+          }
           console.warn(
             `[melofon] airplay debug: pump first chunk ${chunk.length}B ` +
-              `(${path})`,
+              `peak=${peak} (${path})`,
           );
         }
         total += chunk.length;
@@ -270,13 +281,24 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
           name: output.name,
           volume: output.volume,
           // mDNS-derived session knobs (absent on manual registrations —
-          // the helper defaults then: appletv, unencrypted).
+          // OwnTone-with-missing-TXT defaults: appletv, encrypt 0,
+          // metadata 0, authsetup 0).
           ...(output.devtype !== undefined && { devtype: output.devtype }),
           ...(output.encrypt !== undefined && { encrypt: output.encrypt }),
-          // Keep-alive progress: the device times the controller out and
-          // closes RTSP ~19 s in without periodic progress posts.
+          wanted_metadata: output.wantedMetadata ?? 0,
+          authsetup: output.supportsAuthSetup === true ? 1 : 0,
+          requires_auth: output.requiresAuth === true ? 1 : 0,
+          ...(output.sampleRate !== undefined &&
+            { sample_rate: output.sampleRate }),
+          ...(output.bitsPerSample !== undefined &&
+            { bits: output.bitsPerSample }),
+          ...(output.channels !== undefined && { channels: output.channels }),
+          // Item metadata — the helper sends it on the stream clock after
+          // 88200 samples (OwnTone event_play_start), not as a pre-start seed.
           pos_ms: 0,
           len_ms: entry.song.durationMs ?? 0,
+          title: entry.song.title ?? '',
+          artist: entry.song.artistName ?? '',
         }).catch(() => {});
         // No pump here: the helper's connected event starts it.
       } else if (!rt.helperConnected) {

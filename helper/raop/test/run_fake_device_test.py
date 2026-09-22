@@ -96,6 +96,14 @@ def standard_scenario():
     assert abs(offset - 88200) <= 352, \
         f'sync rtptime-cur_pos is {offset}, not 88200 (start buffer is not 2250 ms)'
 
+    # md absent → no DMAP, no progress (OwnTone with missing md is metadata 0).
+    assert not report['progress_bodies'], report['progress_bodies']
+    assert not report['dmap_bodies'], report['dmap_bodies']
+    assert report['auth_setups'] == 0
+    assert 'Adding AirPlay device' in driver.stderr
+    assert 'metadata: 0' in driver.stderr
+    assert 'authsetup: 0' in driver.stderr
+
     print('fake-device test: OK '
           f"({report['audio_packets']} RTP packets in {span:.2f}s, "
           f'{len(seq)} RTSP requests)')
@@ -146,10 +154,82 @@ def fail_scenario():
     print('fail scenario: OK (session failure -> free is clean)')
 
 
+def contract_scenario():
+    """OwnTone calling-convention contract: progress only after audio, after
+    88200 samples, on the stream timeline; DMAP minm when md=7; pcm_peak > 0;
+    the Adding AirPlay device log line."""
+    fake, port = start_fake()
+    driver = subprocess.run([DRIVER, port, 'contract'],
+                            capture_output=True, text=True, timeout=60)
+    report = read_report(fake)
+    fake.kill()
+
+    assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+        f'driver failed: {driver.returncode} {driver.stdout} {driver.stderr}'
+    assert report is not None, 'fake device produced no report'
+
+    m = re.search(r'pcm_peak=(\d+)', driver.stderr)
+    assert m and int(m.group(1)) > 0, \
+        f'first tick peak not > 0: {driver.stderr[-400:]}'
+    assert 'Adding AirPlay device' in driver.stderr
+    assert 'metadata: 7' in driver.stderr
+    assert 'encrypt: 0' in driver.stderr
+    assert 'authsetup: 0' in driver.stderr
+
+    assert report['progress_bodies'], 'no progress: after 88200 samples'
+    assert report['first_rtp_at'] is not None
+    assert report['first_progress_at'] is not None
+    assert report['first_progress_at'] >= report['first_rtp_at'] - 0.05, \
+        'progress posted before audio'
+
+    # Progress rtptimes live on the RECORD rtptime timeline, not a
+    # pre-start CLOCK_MONOTONIC converted badly.
+    rtp_m = re.search(r'rtptime=(\d+)', report['rtp_info'] or '')
+    assert rtp_m, f'no RECORD RTP-Info: {report["rtp_info"]}'
+    rec_rtp = int(rtp_m.group(1))
+    prog = re.search(r'progress: (\d+)/(\d+)/(\d+)', report['progress_bodies'][0])
+    assert prog, report['progress_bodies'][0]
+    for val in (int(prog.group(1)), int(prog.group(2)), int(prog.group(3))):
+        delta = abs((val - rec_rtp) & 0xFFFFFFFF)
+        if delta > 0x80000000:
+            delta = 0x100000000 - delta
+        assert delta < 500000, \
+            f'progress {val} not on RECORD rtptime timeline {rec_rtp}'
+
+    assert report['dmap_bodies'], 'md=0,1,2 should send DMAP text'
+    blob = b''.join(report['dmap_bodies'])
+    assert b'minm' in blob and b'Cool Vibes' in blob, blob[:80]
+    assert b'asar' in blob and b'Blue Tattoo' in blob, blob[:80]
+
+    print('contract test: OK '
+          f"(progress after audio, DMAP minm, pcm_peak={m.group(1)})")
+
+
+def authsetup_scenario():
+    """TXT et=4 → POST /auth-setup before ANNOUNCE. et absent → no POST
+    (covered by standard_scenario)."""
+    fake, port = start_fake()
+    driver = subprocess.run([DRIVER, port, 'authsetup'],
+                            capture_output=True, text=True, timeout=45)
+    report = read_report(fake)
+    fake.kill()
+
+    assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+        f'driver failed: {driver.returncode} {driver.stdout} {driver.stderr}'
+    assert report is not None
+    assert report['auth_setups'] >= 1, 'no POST /auth-setup'
+    assert report['auth_setup_before_announce'] is True, \
+        f'auth-setup not before ANNOUNCE: {report["requests"]}'
+    assert 'authsetup: 1' in driver.stderr
+    print('authsetup test: OK (POST /auth-setup before ANNOUNCE)')
+
+
 def main():
     standard_scenario()
     backlog_scenario()
     fail_scenario()
+    contract_scenario()
+    authsetup_scenario()
     return 0
 
 

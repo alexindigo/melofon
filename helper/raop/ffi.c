@@ -65,6 +65,9 @@ int raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_flush(struct raop_player *p);
 void raop_player_session_started(struct raop_player *p);
 void raop_player_session_stopped(struct raop_player *p);
+void raop_player_item_set(struct raop_player *p, const char *title,
+                          const char *artist, uint32_t pos_ms, uint32_t len_ms,
+                          uint16_t wanted_metadata);
 
 /* Globals the vendored code expects (see stubs.c). */
 struct event_base *evbase_player;
@@ -114,8 +117,13 @@ typedef struct cmd
   int devtype;                  /* RDEV_* (raop.c enum raop_devtype) */
   int encrypt;
   char pin[32];
-  uint32_t pos_ms;              /* keep-alive metadata: item position/length */
+  uint32_t pos_ms;
   uint32_t len_ms;
+  uint16_t wanted_metadata;     /* TXT md bitmask (raop_device_cb) */
+  int authsetup;                /* TXT et token 4 */
+  int requires_auth;            /* TXT sf bit 9 */
+  char title[256];
+  char artist[256];
   free_sync *sync;              /* CMD_FREE only */
   struct cmd *next;
 } cmd;
@@ -302,15 +310,16 @@ struct raop_extra_mirror
   bool supports_auth_setup;
 };
 
-/* raop.c's private struct raop_metadata (outputs/raop.c), mirrored — needed
- * for the keep-alive progress posts: arbat closes the RTSP connection ~19 s
- * in without them ("Device closed RTSP connection"). */
-#define RAOP_MD_WANTS_PROGRESS 4
-struct raop_metadata_mirror
+/* OwnTone raop.c:302-311 — grep-able vs "Adding AirPlay device". */
+static const char *raop_devtype_name[] =
 {
-  struct evbuffer *metadata;
-  struct evbuffer *artwork;
-  int artwork_fmt;
+  "AirPort Express 1 - 802.11g",
+  "AirPort Express 2 - 802.11n",
+  "AirPort Express 3 - 802.11n",
+  "AppleTV",
+  "AppleTV4",
+  "HomePod",
+  "Other",
 };
 
 /* Loop thread: create the device for h and open the RAOP session. */
@@ -340,12 +349,9 @@ device_start(raop_t *h, const cmd *c)
     }
 
   re->devtype = c->devtype;           /* from mDNS am (default appletv) */
-  re->wanted_metadata = 0;            /* no artwork/text source in-process */
+  re->wanted_metadata = c->wanted_metadata;
   re->encrypt = c->encrypt ? true : false;
-  /* OwnTone sets this from TXT et=4 (auth-setup support); arbat does NOT
-   * advertise it, so OwnTone never sends auth-setup. Sending it gets a 404
-   * the device does not "proceed anyway" from cleanly — match OwnTone. */
-  re->supports_auth_setup = false;
+  re->supports_auth_setup = c->authsetup ? true : false;
 
   dev->id = h->id;
   dev->name = strdup(c->name);
@@ -355,6 +361,7 @@ device_start(raop_t *h, const cmd *c)
   dev->advertised = 1;
   dev->volume = c->volume;
   dev->relvol = c->volume;
+  dev->requires_auth = c->requires_auth ? 1 : 0;
   /* OwnTone's RAOP_CONFIG_MAX_VOLUME: pct 100 maps to 0 dB, pct 0 to -30. */
   dev->max_volume = 11;
   dev->quality.sample_rate = 44100;
@@ -363,7 +370,6 @@ device_start(raop_t *h, const cmd *c)
   dev->supported_formats = MEDIA_FORMAT_PCM;
   dev->default_format = MEDIA_FORMAT_PCM;
   dev->extra_device_info = re;
-  re->wanted_metadata = RAOP_MD_WANTS_PROGRESS;
 
   if (strchr(address, ':'))
     {
@@ -380,34 +386,17 @@ device_start(raop_t *h, const cmd *c)
   h->state = OUTPUT_STATE_STARTUP;
   event_push(h, "starting");
 
-  /* Seed raop_cur_metadata so the keep-alive timer has content: without any
-   * progress posts the device times the controller out and closes RTSP. */
-  {
-    struct output_metadata *md = calloc(1, sizeof(*md));
-    struct raop_metadata_mirror *rmd = calloc(1, sizeof(*rmd));
+  raop_player_item_set(h->player, c->title, c->artist, c->pos_ms, c->len_ms,
+                       c->wanted_metadata);
 
-    if (md && rmd)
-      {
-        rmd->metadata = evbuffer_new();
-        rmd->artwork = evbuffer_new();
-        rmd->artwork_fmt = -1;
-        md->type = OUTPUT_TYPE_RAOP;
-        md->item_id = (uint32_t)h->id;
-        md->pos_ms = c->pos_ms;
-        md->len_ms = c->len_ms;
-        /* The stream clock (player.c) anchors at the first write after
-         * CONNECTED; until then "now" is the progress-post reference. */
-        clock_gettime(CLOCK_MONOTONIC, &md->pts);
-        md->startup = true;
-        md->priv = rmd;
-        output_raop.metadata_send(md);
-      }
-    else
-      {
-        free(md);
-        free(rmd);
-      }
-  }
+  /* OwnTone raop_device_cb (raop.c:4463). Contract test greps this. */
+  DPRINTF(E_LOG, L_RAOP,
+          "Adding AirPlay device '%s': password: 0, verification: %u, "
+          "encrypt: %u, authsetup: %u, metadata: %u, type %s, address %s:%d\n",
+          c->name, (unsigned)dev->requires_auth, (unsigned)re->encrypt,
+          (unsigned)re->supports_auth_setup, (unsigned)re->wanted_metadata,
+          raop_devtype_name[c->devtype < 0 || c->devtype > 6 ? 3 : c->devtype],
+          address, c->port);
 
   if (output_raop.device_start(dev, 0) < 0)
     {
@@ -665,7 +654,9 @@ raop_new(void)
 
 int
 raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
-           int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms)
+           int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms,
+           uint16_t wanted_metadata, int authsetup, int requires_auth,
+           const char *title, const char *artist)
 {
   cmd *c;
 
@@ -688,6 +679,13 @@ raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
   c->encrypt = encrypt ? 1 : 0;
   c->pos_ms = pos_ms;
   c->len_ms = len_ms;
+  c->wanted_metadata = wanted_metadata;
+  c->authsetup = authsetup ? 1 : 0;
+  c->requires_auth = requires_auth ? 1 : 0;
+  if (title)
+    snprintf(c->title, sizeof(c->title), "%s", title);
+  if (artist)
+    snprintf(c->artist, sizeof(c->artist), "%s", artist);
 
   return cmd_push(h, c);
 }

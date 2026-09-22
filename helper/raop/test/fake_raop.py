@@ -31,6 +31,12 @@ state = {
     'sync_ntp_secs': [],
     'sync_first': None,
     'timing_answered': None,
+    'progress_bodies': [],
+    'dmap_bodies': [],
+    'first_progress_at': None,
+    'auth_setups': 0,
+    'auth_setup_before_announce': None,
+    'rtp_info': None,
 }
 
 NTP_EPOCH_DELTA = 2208988800
@@ -112,7 +118,9 @@ class RTSPHandler(socketserver.BaseRequestHandler):
             while b'\r\n\r\n' in buf:
                 head, buf = buf.split(b'\r\n\r\n', 1)
                 lines = head.decode(errors='replace').split('\r\n')
-                method, _, _ = lines[0].split(' ', 2)
+                parts = lines[0].split(' ', 2)
+                method = parts[0]
+                url = parts[1] if len(parts) > 1 else ''
                 headers = {}
                 for line in lines[1:]:
                     if ': ' in line:
@@ -134,8 +142,22 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     print(f'SETUP headers: {headers!r}', file=sys.stderr, flush=True)
                 if method == 'ANNOUNCE':
                     state['sdp'] = body.decode(errors='replace')
+                if method == 'RECORD':
+                    state['rtp_info'] = headers.get('rtp-info', '')
+                if method == 'POST' and 'auth-setup' in url:
+                    state['auth_setups'] += 1
+                    if state['auth_setup_before_announce'] is None:
+                        state['auth_setup_before_announce'] = (
+                            'ANNOUNCE' not in state['requests'])
+                ctype = headers.get('content-type', '')
                 if method == 'SET_PARAMETER' and body.startswith(b'volume'):
                     state['volume_params'].append(body.decode().strip())
+                elif method == 'SET_PARAMETER' and body.startswith(b'progress:'):
+                    state['progress_bodies'].append(body.decode().strip())
+                    if state['first_progress_at'] is None:
+                        state['first_progress_at'] = time.monotonic()
+                elif method == 'SET_PARAMETER' and 'dmap' in ctype:
+                    state['dmap_bodies'].append(body)
                 if method == 'FLUSH':
                     state['flushes'] += 1
                 if method == 'TEARDOWN':

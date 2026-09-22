@@ -30,6 +30,11 @@ const SYMBOLS = {
       'i32',
       'u32',
       'u32',
+      'u16',
+      'i32',
+      'i32',
+      'buffer',
+      'buffer',
     ],
     result: 'i32',
   },
@@ -160,6 +165,11 @@ class FfiTransport implements AirplayTransport {
           cmd.encrypt === true ? 1 : 0,
           Number(cmd.pos_ms) || 0,
           Number(cmd.len_ms) || 0,
+          Number(cmd.wanted_metadata) || 0,
+          Number(cmd.authsetup) || 0,
+          Number(cmd.requires_auth) || 0,
+          cstr(String(cmd.title ?? '')),
+          cstr(String(cmd.artist ?? '')),
         );
         break;
       case 'volume':

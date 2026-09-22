@@ -95,6 +95,17 @@ export interface Output {
   devtype?: string;
   /** Encrypt the RTP stream (mDNS `ek=1`). */
   encrypt?: boolean;
+  /** OwnTone raop_device_cb wanted_metadata bitmask from TXT `md`
+   * (1=text 2=artwork 4=progress). Absent `md` ⇒ 0. */
+  wantedMetadata?: number;
+  /** TXT `et` contains token 4: the device supports (not requires) auth-setup. */
+  supportsAuthSetup?: boolean;
+  /** TXT `sf` bit 9: device verification. OwnTone `requires_auth`. */
+  requiresAuth?: boolean;
+  /** TXT `sr`/`ss`/`ch` when present; the helper defaults 44100/16/2. */
+  sampleRate?: number;
+  bitsPerSample?: number;
+  channels?: number;
   /** The device wants a PIN/password (OwnTone needs_auth_key on the wire);
    * set by the boot when its helper reports the auth/verification path. */
   needsAuthKey?: boolean;

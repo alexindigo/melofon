@@ -30,6 +30,28 @@ export function devtypeFromAm(am: string | undefined): string {
   return 'other';
 }
 
+/** OwnTone raop.c:96-98 / raop_device_cb md tokens: 0=text 1=artwork 2=progress. */
+export const RAOP_MD_TEXT = 1 << 0;
+export const RAOP_MD_ARTWORK = 1 << 1;
+export const RAOP_MD_PROGRESS = 1 << 2;
+
+export function wantedMetadataFromMd(md: string | undefined): number {
+  if (md === undefined || md === '') return 0;
+  let bits = 0;
+  for (const token of md.split(',')) {
+    if (token === '0') bits |= RAOP_MD_TEXT;
+    else if (token === '1') bits |= RAOP_MD_ARTWORK;
+    else if (token === '2') bits |= RAOP_MD_PROGRESS;
+  }
+  return bits;
+}
+
+/** TXT `et` token 4: the device supports (does not require) auth-setup. */
+export function supportsAuthSetupFromEt(et: string | undefined): boolean {
+  if (et === undefined) return false;
+  return et.split(',').includes('4');
+}
+
 /** Parse the mDNS instance name: <64-bit hex id>@<pretty name>, with the
  * `._raop._tcp.local` domain suffix stripped (the label is `id@name`). */
 function parseInstance(name: string): { id: string; name: string } | null {
@@ -106,6 +128,27 @@ export function createAirplayDiscovery(
           'unsupported, registration may fail on play',
       );
     }
+    const devtype = devtypeFromAm(svc.txt.am);
+    const encrypt = svc.txt.ek === '1';
+    const wantedMetadata = wantedMetadataFromMd(svc.txt.md);
+    const supportsAuthSetup = supportsAuthSetupFromEt(svc.txt.et);
+    const requiresAuth = wantsAuth(svc.txt.sf);
+    const sampleRate = Number.parseInt(svc.txt.sr ?? '', 10);
+    const bitsPerSample = Number.parseInt(svc.txt.ss ?? '', 10);
+    const channels = Number.parseInt(svc.txt.ch ?? '', 10);
+    // OwnTone raop_device_cb (raop.c:4463): one grep-able line vs the
+    // registration log so a live session can be A/B'd against OwnTone.
+    log(
+      `airplay discovery: Adding AirPlay device '${parsed.name}': ` +
+        `password: ${
+          svc.txt.pw !== undefined && svc.txt.pw !== 'false' ? 1 : 0
+        }, ` +
+        `verification: ${requiresAuth ? 1 : 0}, encrypt: ${encrypt ? 1 : 0}, ` +
+        `authsetup: ${
+          supportsAuthSetup ? 1 : 0
+        }, metadata: ${wantedMetadata}, ` +
+        `type ${devtype}, address ${svc.address}:${svc.port}`,
+    );
     outputs.register({
       id: parsed.id,
       name: parsed.name,
@@ -114,9 +157,16 @@ export function createAirplayDiscovery(
       volume: 100,
       host: svc.address,
       port: svc.port,
-      devtype: devtypeFromAm(svc.txt.am),
-      encrypt: svc.txt.ek === '1',
-      needsAuthKey: wantsAuth(svc.txt.sf),
+      devtype,
+      encrypt,
+      wantedMetadata,
+      supportsAuthSetup,
+      requiresAuth,
+      ...(Number.isFinite(sampleRate) && sampleRate > 0 && { sampleRate }),
+      ...(Number.isFinite(bitsPerSample) && bitsPerSample > 0 &&
+        { bitsPerSample }),
+      ...(Number.isFinite(channels) && channels > 0 && { channels }),
+      needsAuthKey: requiresAuth,
     });
     discovered.add(parsed.id);
   };

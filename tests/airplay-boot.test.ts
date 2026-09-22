@@ -173,6 +173,9 @@ Deno.test('selected + play: start command, then the track as PCM', async () => {
     assertEquals(start.port, 7000);
     assertEquals(start.name, 'Kitchen ATV');
     assertEquals(start.volume, 100);
+    assertEquals(start.wanted_metadata, 0);
+    assertEquals(start.title, 'First Song');
+    assertEquals(start.artist, 'Fixture Artist');
     // The session is up: the pump starts (OwnTone's shape — PCM after
     // CONNECTED, not during the handshake).
     t.onEvent('state', 'connected');

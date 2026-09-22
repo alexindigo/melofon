@@ -177,6 +177,8 @@ export interface OutputRow {
   volume: number;
   /** Set by a boot when the device wants a PIN/password (needs_auth_key). */
   needsAuthKey?: boolean;
+  /** TXT `sf` bit 9 — OwnTone `requires_auth` on the wire. */
+  requiresAuth?: boolean;
 }
 
 export interface ArtistRow {

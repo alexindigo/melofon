@@ -6,6 +6,8 @@ import { assert, assertEquals } from '@std/assert';
 import {
   createAirplayDiscovery,
   devtypeFromAm,
+  supportsAuthSetupFromEt,
+  wantedMetadataFromMd,
 } from '../src/boots/airplay-mdns.ts';
 import type { MdnsService } from '../src/mdns.ts';
 import { createOutputs } from '../src/player.ts';
@@ -60,7 +62,14 @@ function svc(overrides: Partial<MdnsService> = {}): MdnsService {
     host: 'kitchen-atv.local',
     port: 7000,
     address: '192.168.1.50',
-    txt: { tp: 'UDP', am: 'AppleTV3,1', ek: '1', sf: '0x200' },
+    txt: {
+      tp: 'UDP',
+      am: 'AppleTV3,1',
+      ek: '1',
+      sf: '0x200',
+      md: '0,1,2',
+      et: '0,3,5',
+    },
     ttlMs: 120_000,
     ...overrides,
   };
@@ -98,6 +107,16 @@ Deno.test('devtype mapping (OwnTone model strings → helper tokens)', () => {
   assertEquals(devtypeFromAm('SomethingElse'), 'other');
 });
 
+Deno.test('TXT md/et parse like raop_device_cb', () => {
+  assertEquals(wantedMetadataFromMd(undefined), 0);
+  assertEquals(wantedMetadataFromMd(''), 0);
+  assertEquals(wantedMetadataFromMd('0,1,2'), 7);
+  assertEquals(wantedMetadataFromMd('2'), 4);
+  assertEquals(supportsAuthSetupFromEt(undefined), false);
+  assertEquals(supportsAuthSetupFromEt('0,3,5'), false);
+  assertEquals(supportsAuthSetupFromEt('0,3,4,5'), true);
+});
+
 Deno.test('up registers with TXT-derived fields; down unregisters', async () => {
   const { outputs, browsers, discovery } = await setup();
   try {
@@ -117,6 +136,9 @@ Deno.test('up registers with TXT-derived fields; down unregisters', async () => 
     assertEquals(out.port, 7000);
     assertEquals(out.devtype, 'appletv');
     assertEquals(out.encrypt, true);
+    assertEquals(out.wantedMetadata, 7);
+    assertEquals(out.supportsAuthSetup, false);
+    assertEquals(out.requiresAuth, true);
     assertEquals(out.needsAuthKey, true);
 
     browsers[0].onService!('down', svc());
@@ -186,6 +208,25 @@ Deno.test('state preset off: no browser starts until flipped on', async () => {
     assertEquals(browsers.length, 0);
     state.change('airplay.mdns', 'on');
     assertEquals(browsers.length, 1);
+  } finally {
+    discovery.close();
+  }
+});
+
+Deno.test('discovery logs the OwnTone-shaped Adding AirPlay device line', async () => {
+  const { browsers, logs, discovery } = await setup();
+  try {
+    await settle();
+    browsers[0].onService!('up', svc());
+    assert(
+      logs.some((l) =>
+        l.includes('Adding AirPlay device') &&
+        l.includes('encrypt: 1') &&
+        l.includes('authsetup: 0') &&
+        l.includes('metadata: 7')
+      ),
+      `missing OwnTone-shaped line: ${logs.join(' | ')}`,
+    );
   } finally {
     discovery.close();
   }

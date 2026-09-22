@@ -24,10 +24,15 @@ raop_t *raop_new(void);
  * 6=other; out of range defaults to appletv); encrypt != 0 encrypts the
  * RTP stream. Events arrive via raop_poll:
  * starting|connected|streaming|stopped|failed|password. */
-/* pos_ms/len_ms seed the keep-alive progress posts (progress: d/p/e). */
+/* pos_ms/len_ms/title/artist are the current item; the player sends them
+ * on the stream clock after output_buffer_samples (not as a pre-start
+ * seed). wanted_metadata is the TXT md bitmask (1=text 2=artwork 4=progress);
+ * authsetup/requires_auth are the TXT et=4 / sf-bit-9 flags. */
 int raop_start(raop_t *h, const char *host, int port,
                const char *name, int volume, int devtype, int encrypt,
-               uint32_t pos_ms, uint32_t len_ms);
+               uint32_t pos_ms, uint32_t len_ms,
+               uint16_t wanted_metadata, int authsetup, int requires_auth,
+               const char *title, const char *artist);
 
 /* Append s16le/44100/stereo PCM to the pacing buffer. Returns bytes
  * accepted; < len means the buffer is at the high-water mark (caller
