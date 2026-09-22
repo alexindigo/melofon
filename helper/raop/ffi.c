@@ -475,7 +475,10 @@ device_start(raop_t *h, const cmd *c)
   re->devtype = c->devtype;           /* from mDNS am (default appletv) */
   re->wanted_metadata = 0;            /* no artwork/text source in-process */
   re->encrypt = c->encrypt ? true : false;
-  re->supports_auth_setup = true;     /* allow the PIN verification flow */
+  /* OwnTone sets this from TXT et=4 (auth-setup support); arbat does NOT
+   * advertise it, so OwnTone never sends auth-setup. Sending it gets a 404
+   * the device does not "proceed anyway" from cleanly — match OwnTone. */
+  re->supports_auth_setup = false;
 
   dev->id = h->id;
   dev->name = strdup(c->name);
