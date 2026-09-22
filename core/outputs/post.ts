@@ -1,22 +1,22 @@
 // POST /_/outputs — operator-registered outputs (M6: manual AirPlay host
-// first; mDNS discovery can come later). JSON body:
-// { "name", "type": "AirPlay", "host", "port"? }. The id is stable from the
-// host (FNV-1a 64-bit, decimal — all digits so the OwnTone wire id regex
-// /^\d+$/ accepts it), so re-registering the same device is idempotent.
+// first). JSON body: { "name", "type": "AirPlay", "host", "port"? }. Unicast-
+// resolves `_raop._tcp` at the host and copies device TXT when it answers;
+// a timeout still registers the row but without pretending md=7. The id is
+// stable from the host (or the discovered instance if that row exists).
 import { airplayOutputId } from '../../src/boots/airplay.ts';
+import { sessionFieldsFromTxt } from '../../src/boots/airplay-mdns.ts';
+import type { MdnsService } from '../../src/mdns.ts';
+import type { Output } from '../../src/player.ts';
 
 interface OutputsApp {
   app: {
     outputs: {
-      register(output: {
-        id: string;
-        name: string;
-        type: string;
-        selected: boolean;
-        volume: number;
-        host?: string;
-        port?: number;
-      }): void;
+      list(): Output[];
+      get(id: string): Output | null;
+      register(output: Output): void;
+    };
+    airplay?: {
+      resolve(address: string): Promise<MdnsService | null>;
     };
   };
 }
@@ -53,15 +53,32 @@ export default async function (
   if (port !== undefined && (!Number.isInteger(port) || port <= 0)) {
     return badRequest('port must be a positive integer');
   }
-  const output = {
-    id: airplayOutputId(host.trim()),
+  const address = host.trim();
+  const svc = context.app.airplay !== undefined
+    ? await context.app.airplay.resolve(address)
+    : null;
+  const existing = context.app.outputs.list().find((o) => o.host === address);
+  const id = existing?.id ?? airplayOutputId(address);
+  const base = {
+    id,
     name: name.trim(),
     type,
-    selected: false,
-    volume: 100,
-    host: host.trim(),
-    ...(port === undefined ? {} : { port }),
+    selected: existing?.selected ?? false,
+    volume: existing?.volume ?? 100,
   };
-  context.app.outputs.register(output);
-  return { output };
+  if (svc !== null && (svc.txt.tp ?? '').includes('UDP')) {
+    context.app.outputs.register({
+      ...base,
+      host: svc.address,
+      port: svc.port,
+      ...sessionFieldsFromTxt(svc.txt),
+    });
+  } else {
+    context.app.outputs.register({
+      ...base,
+      host: address,
+      ...(port === undefined ? {} : { port }),
+    });
+  }
+  return { output: context.app.outputs.get(id) };
 }

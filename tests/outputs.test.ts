@@ -4,6 +4,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { createOutputs } from '../src/player.ts';
+import type { MdnsService } from '../src/mdns.ts';
 
 async function setup() {
   const outputs = createOutputs();
@@ -131,6 +132,46 @@ Deno.test('core /_/outputs register/list/delete round-trip', async () => {
     ((await after.json()) as { outputs: unknown[] }).outputs.length,
     1,
   );
+});
+
+Deno.test('core /_/outputs copies TXT when unicast resolve answers', async () => {
+  const outputs = createOutputs();
+  const svc: MdnsService = {
+    name: 'A4B2C1D2E3F4@Kitchen ATV._raop._tcp.local',
+    host: 'kitchen-atv.local',
+    port: 7000,
+    address: '10.4.10.106',
+    txt: { tp: 'UDP', am: 'AppleTV3,1', md: '0,1,2', ek: '1' },
+    ttlMs: 120_000,
+  };
+  const core = await pathfinder({
+    roots: ['core/'],
+    app: {
+      cfg: {},
+      outputs,
+      airplay: {
+        resolve: (address: string) => {
+          assertEquals(address, '10.4.10.106');
+          return Promise.resolve(svc);
+        },
+      },
+    },
+  });
+  const res = await post(
+    core,
+    JSON.stringify({
+      name: 'arbat',
+      type: 'AirPlay',
+      host: '10.4.10.106',
+    }),
+  );
+  assertEquals(res.status, 200);
+  const { output } = (await res.json()) as {
+    output: { host: string; port: number; wantedMetadata: number };
+  };
+  assertEquals(output.host, '10.4.10.106');
+  assertEquals(output.port, 7000);
+  assertEquals(output.wantedMetadata, 7);
 });
 
 Deno.test('core /_/outputs/<id>/pin delivers the pin to the boot', async () => {

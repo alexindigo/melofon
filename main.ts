@@ -27,7 +27,10 @@ import { createPlayback } from './src/playback.ts';
 import { createNotify } from './src/notify.ts';
 import { createState } from './src/state.ts';
 import { airplayOutputId, createAirplayBoot } from './src/boots/airplay.ts';
-import { createAirplayDiscovery } from './src/boots/airplay-mdns.ts';
+import {
+  createAirplayDiscovery,
+  sessionFieldsFromTxt,
+} from './src/boots/airplay-mdns.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts, createBinds } from './src/binds.ts';
 import { facade } from './src/facade.ts';
@@ -48,10 +51,17 @@ console.log(
   `[melofon] scan: ${counts.files} files (${counts.skipped} skipped), ` +
     `${counts.artists} artists, ${counts.albums} albums`,
 );
-const app = { db, cfg, libraries, outputs, state };
+const env = Deno.env.toObject();
+if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
+  await state.seedIfUnset(
+    'airplay.mdns',
+    env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
+  );
+}
+const airplay = createAirplayDiscovery({ outputs, state });
+const app = { db, cfg, libraries, outputs, state, airplay };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
-const env = Deno.env.toObject();
 const player = createPlayer();
 const nowPlaying = createNowPlaying(db);
 const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
@@ -90,36 +100,44 @@ createAirplayBoot({ outputs, playback, media, notify });
 // track").
 setInterval(() => playback.advanceEnded(), 500);
 
-// Internal-state first-boot seeds: env/toml is a default, never an override —
-// a key the operator already set (via /_/config) is left alone.
-if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
-  await state.seedIfUnset(
-    'airplay.mdns',
-    env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
-  );
-}
-
-// AirPlay 1 discovery: browses _raop._tcp and registers devices as outputs
-// (default on; PUT /_/config/airplay.mdns {"value":"off"} toggles live).
-createAirplayDiscovery({ outputs, state });
-
-// MELOFON_AIRPLAY_HOST=<ip>[:port] — register a device without the UI; the
-// CRUD twin is POST /_/outputs. The boot picks it up from the outputs list.
+// MELOFON_AIRPLAY_HOST=<ip>[:port] — unicast-resolve TXT at that host, then
+// register. The CRUD twin is POST /_/outputs. Bare IP if resolve times out.
 const airplayHost = env.MELOFON_AIRPLAY_HOST?.trim();
 if (airplayHost) {
   const match = airplayHost.match(/^(.+?)(?::(\d+))?$/);
   const host = match?.[1] ?? airplayHost;
   const port = match?.[2] === undefined ? undefined : Number(match[2]);
-  outputs.register({
-    id: airplayOutputId(host),
-    name: host,
-    type: 'AirPlay',
-    selected: false,
-    volume: 100,
-    host,
-    ...(port === undefined ? {} : { port }),
-  });
-  console.log(`[melofon] airplay: registered ${host}${port ? `:${port}` : ''}`);
+  const svc = await airplay.resolve(host);
+  const existing = outputs.list().find((o) => o.host === host);
+  const id = existing?.id ?? airplayOutputId(host);
+  if (svc !== null && (svc.txt.tp ?? '').includes('UDP')) {
+    outputs.register({
+      id,
+      name: existing?.name ?? host,
+      type: 'AirPlay',
+      selected: existing?.selected ?? false,
+      volume: existing?.volume ?? 100,
+      host: svc.address,
+      port: svc.port,
+      ...sessionFieldsFromTxt(svc.txt),
+    });
+    console.log(
+      `[melofon] airplay: registered ${svc.address}:${svc.port} with TXT`,
+    );
+  } else {
+    outputs.register({
+      id,
+      name: host,
+      type: 'AirPlay',
+      selected: false,
+      volume: 100,
+      host,
+      ...(port === undefined ? {} : { port }),
+    });
+    console.log(
+      `[melofon] airplay: registered ${host}${port ? `:${port}` : ''} (no TXT)`,
+    );
+  }
 }
 
 // Extra binds: the distinct actual ports every layer's claims map to after

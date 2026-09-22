@@ -51,8 +51,12 @@ function fakeState(initial: Record<string, string> = {}): State & {
 class FakeBrowser {
   onService: ((event: 'up' | 'down', svc: MdnsService) => void) | null = null;
   closed = false;
+  resolved: string[] = [];
   close() {
     this.closed = true;
+  }
+  resolve(address: string) {
+    this.resolved.push(address);
   }
 }
 
@@ -230,6 +234,23 @@ Deno.test('discovery logs the OwnTone-shaped Adding AirPlay device line', async 
       ),
       `missing OwnTone-shaped line: ${logs.join(' | ')}`,
     );
+  } finally {
+    discovery.close();
+  }
+});
+
+Deno.test('known-host resolve registers wantedMetadata from TXT', async () => {
+  const { outputs, browsers, discovery } = await setup();
+  try {
+    await settle();
+    const pending = discovery.resolve('192.168.1.50');
+    await settle();
+    assertEquals(browsers[0].resolved, ['192.168.1.50']);
+    browsers[0].onService!('up', svc());
+    const got = await pending;
+    assertEquals(got?.txt.md, '0,1,2');
+    const out = outputs.list().find((o) => o.host === '192.168.1.50');
+    assertEquals(out?.wantedMetadata, 7);
   } finally {
     discovery.close();
   }

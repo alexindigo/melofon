@@ -251,11 +251,14 @@ interface Instance {
 
 export interface MdnsBrowser {
   close(): void;
+  /** Unicast the standing PTR (and later follow-ups) to `address:5353`. */
+  resolve(address: string): void;
 }
 
 export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
   const typeName = `${opts.type}.local`;
   const instances = new Map<string, Instance>();
+  const unicastTargets = new Set<string>();
   let dead = false;
 
   const fail = (err: unknown) => {
@@ -272,7 +275,7 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
     }) as unknown as UdpSocketLike;
   } catch (err) {
     fail(err);
-    return { close() {} };
+    return { close() {}, resolve() {} };
   }
 
   const emit = (instance: Instance) => {
@@ -334,7 +337,10 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
     }
   };
 
-  const handlePacket = (msg: Uint8Array) => {
+  const handlePacket = (
+    msg: Uint8Array,
+    rinfo?: { address: string; port: number },
+  ) => {
     // Only responses/announcements (qr bit set, flags byte 2 bit 7).
     if (msg.length < 12 || (msg[2] & 0x80) === 0) return;
     const records = parseDnsMessage(msg);
@@ -419,12 +425,15 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
         instance.loggedNoV4 = true;
         console.warn(`[melofon] mdns: ${instance.name} no usable v4`);
       }
-      maybeFollowUp(instance);
+      const dest = rinfo !== undefined && unicastTargets.has(rinfo.address)
+        ? rinfo.address
+        : MDNS_GROUP;
+      maybeFollowUp(instance, dest);
     }
   };
 
   try {
-    socket.on('message', (msg) => handlePacket(msg));
+    socket.on('message', (msg, rinfo) => handlePacket(msg, rinfo));
     socket.bind(MDNS_PORT, () => {
       try {
         const ifaces = ipv4Addresses();
@@ -454,7 +463,7 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
     });
   } catch (err) {
     fail(err);
-    return { close() {} };
+    return { close() {}, resolve() {} };
   }
 
   const sendQuery = () => sendEncoded(typeName, [TYPE_PTR], MDNS_GROUP);
@@ -478,6 +487,11 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
       try {
         socket.close();
       } catch { /* already closed */ }
+    },
+    resolve(address: string) {
+      if (dead || address.trim() === '') return;
+      unicastTargets.add(address);
+      sendEncoded(typeName, [TYPE_PTR], address);
     },
   };
 }

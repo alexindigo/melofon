@@ -71,6 +71,36 @@ function wantsAuth(sf: string | undefined): boolean {
   return ((BigInt(`0x${hex}`) >> 9n) & 1n) === 1n;
 }
 
+/** OwnTone raop_device_cb session knobs from a device TXT. */
+export function sessionFieldsFromTxt(txt: Record<string, string>): {
+  devtype: string;
+  encrypt: boolean;
+  wantedMetadata: number;
+  supportsAuthSetup: boolean;
+  requiresAuth: boolean;
+  needsAuthKey: boolean;
+  sampleRate?: number;
+  bitsPerSample?: number;
+  channels?: number;
+} {
+  const requiresAuth = wantsAuth(txt.sf);
+  const sampleRate = Number.parseInt(txt.sr ?? '', 10);
+  const bitsPerSample = Number.parseInt(txt.ss ?? '', 10);
+  const channels = Number.parseInt(txt.ch ?? '', 10);
+  return {
+    devtype: devtypeFromAm(txt.am),
+    encrypt: txt.ek === '1',
+    wantedMetadata: wantedMetadataFromMd(txt.md),
+    supportsAuthSetup: supportsAuthSetupFromEt(txt.et),
+    requiresAuth,
+    needsAuthKey: requiresAuth,
+    ...(Number.isFinite(sampleRate) && sampleRate > 0 && { sampleRate }),
+    ...(Number.isFinite(bitsPerSample) && bitsPerSample > 0 &&
+      { bitsPerSample }),
+    ...(Number.isFinite(channels) && channels > 0 && { channels }),
+  };
+}
+
 export interface AirplayDiscoveryDeps {
   outputs: Outputs;
   state: State;
@@ -83,7 +113,10 @@ export interface AirplayDiscoveryDeps {
 
 export function createAirplayDiscovery(
   deps: AirplayDiscoveryDeps,
-): { close(): void } {
+): {
+  close(): void;
+  resolve(address: string): Promise<MdnsService | null>;
+} {
   const { outputs, state } = deps;
   const log = deps.log ?? ((msg: string) => console.warn(`[melofon] ${msg}`));
   const createBrowser = deps.createBrowser ??
@@ -100,9 +133,14 @@ export function createAirplayDiscovery(
 
   let browser: MdnsBrowser | null = null;
   const discovered = new Set<string>();
+  const waiters = new Map<string, (svc: MdnsService) => void>();
   let closed = false;
 
   const onService = (event: 'up' | 'down', svc: MdnsService) => {
+    if (event === 'up') {
+      const waiter = waiters.get(svc.address);
+      if (waiter !== undefined) waiter(svc);
+    }
     if (event === 'down') {
       const parsed = parseInstance(svc.name);
       if (parsed !== null && discovered.delete(parsed.id)) {
@@ -135,14 +173,7 @@ export function createAirplayDiscovery(
           'unsupported, registration may fail on play',
       );
     }
-    const devtype = devtypeFromAm(svc.txt.am);
-    const encrypt = svc.txt.ek === '1';
-    const wantedMetadata = wantedMetadataFromMd(svc.txt.md);
-    const supportsAuthSetup = supportsAuthSetupFromEt(svc.txt.et);
-    const requiresAuth = wantsAuth(svc.txt.sf);
-    const sampleRate = Number.parseInt(svc.txt.sr ?? '', 10);
-    const bitsPerSample = Number.parseInt(svc.txt.ss ?? '', 10);
-    const channels = Number.parseInt(svc.txt.ch ?? '', 10);
+    const fields = sessionFieldsFromTxt(svc.txt);
     // OwnTone raop_device_cb (raop.c:4463): one grep-able line vs the
     // registration log so a live session can be A/B'd against OwnTone.
     log(
@@ -150,11 +181,11 @@ export function createAirplayDiscovery(
         `password: ${
           svc.txt.pw !== undefined && svc.txt.pw !== 'false' ? 1 : 0
         }, ` +
-        `verification: ${requiresAuth ? 1 : 0}, encrypt: ${encrypt ? 1 : 0}, ` +
-        `authsetup: ${
-          supportsAuthSetup ? 1 : 0
-        }, metadata: ${wantedMetadata}, ` +
-        `type ${devtype}, address ${svc.address}:${svc.port}`,
+        `verification: ${fields.requiresAuth ? 1 : 0}, ` +
+        `encrypt: ${fields.encrypt ? 1 : 0}, ` +
+        `authsetup: ${fields.supportsAuthSetup ? 1 : 0}, ` +
+        `metadata: ${fields.wantedMetadata}, ` +
+        `type ${fields.devtype}, address ${svc.address}:${svc.port}`,
     );
     outputs.register({
       id: parsed.id,
@@ -164,16 +195,7 @@ export function createAirplayDiscovery(
       volume: 100,
       host: svc.address,
       port: svc.port,
-      devtype,
-      encrypt,
-      wantedMetadata,
-      supportsAuthSetup,
-      requiresAuth,
-      ...(Number.isFinite(sampleRate) && sampleRate > 0 && { sampleRate }),
-      ...(Number.isFinite(bitsPerSample) && bitsPerSample > 0 &&
-        { bitsPerSample }),
-      ...(Number.isFinite(channels) && channels > 0 && { channels }),
-      needsAuthKey: requiresAuth,
+      ...fields,
     });
     discovered.add(parsed.id);
   };
@@ -190,7 +212,7 @@ export function createAirplayDiscovery(
     discovered.clear();
   };
 
-  void state.get(MDNS_KEY).then((value) => {
+  const started = state.get(MDNS_KEY).then((value) => {
     if (value !== 'off') start();
   });
   const unsubscribe = state.onChange((key, value) => {
@@ -204,6 +226,31 @@ export function createAirplayDiscovery(
       closed = true;
       unsubscribe();
       stop();
+    },
+    async resolve(address: string) {
+      await started;
+      if (closed || browser === null) {
+        log(
+          `airplay discovery: resolve ${address} skipped (browser not running)`,
+        );
+        return null;
+      }
+      return await new Promise<MdnsService | null>((resolvePromise) => {
+        const timer = setTimeout(() => {
+          waiters.delete(address);
+          log(
+            `airplay discovery: resolve ${address} timed out ` +
+              '(no TXT from the device)',
+          );
+          resolvePromise(null);
+        }, 2000);
+        waiters.set(address, (svc) => {
+          clearTimeout(timer);
+          waiters.delete(address);
+          resolvePromise(svc);
+        });
+        browser!.resolve(address);
+      });
     },
   };
 }

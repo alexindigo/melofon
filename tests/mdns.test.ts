@@ -176,8 +176,14 @@ class FakeSocket implements UdpSocketLike {
   ) {
     this.listener = fn;
   }
-  receive(msg: Uint8Array) {
-    this.listener?.(msg, { address: '192.168.1.50', port: 5353 });
+  receive(
+    msg: Uint8Array,
+    rinfo: { address: string; port: number } = {
+      address: '192.168.1.50',
+      port: 5353,
+    },
+  ) {
+    this.listener?.(msg, rinfo);
   }
   close() {
     this.closed = true;
@@ -431,6 +437,40 @@ Deno.test('browser: AAAA-only logs no usable v4 and stays down', () => {
     );
   } finally {
     console.warn = orig;
+    browser.close();
+  }
+});
+
+Deno.test('browser: resolve unicasts PTR to the known host', () => {
+  const { browser, socket } = setup();
+  try {
+    const before = socket.sent.length;
+    browser.resolve('10.4.10.106');
+    const unicasts = socket.sent.slice(before);
+    assert(
+      unicasts.some((s) => {
+        const qs = parseQuestions(s.buf);
+        return s.address === '10.4.10.106' && s.port === 5353 &&
+          qs.some((q) => q.type === 12);
+      }),
+      'expected unicast PTR to 10.4.10.106:5353',
+    );
+
+    const afterPtr = socket.sent.length;
+    socket.receive(ptrOnlyAnswer(INSTANCE), {
+      address: '10.4.10.106',
+      port: 5353,
+    });
+    assert(
+      socket.sent.slice(afterPtr).some((s) => {
+        const qs = parseQuestions(s.buf);
+        return s.address === '10.4.10.106' && s.port === 5353 &&
+          qs.some((q) => q.name === INSTANCE && q.type === TYPE_SRV) &&
+          qs.some((q) => q.name === INSTANCE && q.type === TYPE_TXT);
+      }),
+      'expected unicast SRV+TXT follow-up to the known host',
+    );
+  } finally {
     browser.close();
   }
 });
