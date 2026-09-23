@@ -92,7 +92,7 @@ const bag = {
 const layers = await loadLayers({ app: bag });
 
 // Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
-createAirplayBoot({ outputs, playback, media, notify });
+createAirplayBoot({ outputs, playback, media, notify, state });
 
 // The engine's clock: wall-clock progress reaching an item's length ends it
 // (advance/replay/drop/stop per repeat/consume). Without this the engine sat

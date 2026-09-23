@@ -24,6 +24,7 @@ import type { Media } from '../media.ts';
 import type { Notify } from '../notify.ts';
 import type { Outputs } from '../player.ts';
 import type { Playback } from '../playback.ts';
+import type { State } from '../state.ts';
 import { createFfiSpawn } from './raop-ffi.ts';
 
 /** Stable output id for an AirPlay device: FNV-1a 64-bit of the host,
@@ -54,9 +55,30 @@ export interface AirplayBootDeps {
   notify: Notify;
   /** Injectable for tests; the default is the FFI transport (raop-ffi.ts). */
   spawn?: (onEvent: HelperEventFn) => AirplayTransport;
+  /** Config for `airplay.retry` (no config means retries are on). */
+  state?: State;
+  /** Injectable backoff table (ms) — overrides the `airplay.retry` config. */
+  retryBackoffMs?: number[];
 }
 
 const RAOP_PORT_DEFAULT = 7000;
+export const AIRPLAY_RETRY_KEY = 'airplay.retry';
+/** Default failure-retry backoff (s): capped at 60 — a recovering session
+ * may not wait longer than a minute or the music surprises when it returns.
+ * `airplay.retry`: 'off', or a comma list of seconds (each clamped to 60). */
+const RETRY_BACKOFF_MS = [0, 2, 5, 10, 20, 30, 60];
+
+/** Parse the `airplay.retry` config: null means use `raw`'s list, 'off'
+ * disables retries. Exported for tests. Values clamped to 60 s each. */
+export function parseRetryBackoff(raw: string | null): number[] | null {
+  if (raw !== null && raw.trim().toLowerCase() === 'off') return null;
+  if (raw === null || raw.trim() === '') return [...RETRY_BACKOFF_MS];
+  return raw.split(',').map((token) =>
+    Math.min(60, Math.max(0, Number(token.trim()) || 0))
+  );
+}
+/** After a helper failure: retry selections on this schedule. The session
+ * binds to the device, never to an address — every attempt re-reads
 /** Engine progress must move more than this (ms) mid-play to count as a
  * seek; below it, event-latency jitter would cause flush hiccups. */
 const SEEK_JUMP_MS = 1500;
@@ -92,7 +114,29 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
 } {
   const { outputs, playback, media, notify } = deps;
   const spawn = deps.spawn ?? createFfiSpawn();
+  /** Backoff table in ms — the injection wins for tests, then the
+   * `airplay.retry` config (no config = retries on), cached live. */
+  let backoff: number[] | null = deps.retryBackoffMs ?? [
+    ...RETRY_BACKOFF_MS,
+  ];
+  const retryStateUnsubscribe = deps.retryBackoffMs !== undefined ||
+      deps.state === undefined
+    ? undefined
+    : deps.state!.onChange((key, value) => {
+      if (key !== AIRPLAY_RETRY_KEY) return;
+      backoff = parseRetryBackoff(value);
+    });
+  if (deps.retryBackoffMs === undefined && deps.state !== undefined) {
+    void deps.state.get(AIRPLAY_RETRY_KEY).then((value) => {
+      backoff = parseRetryBackoff(value);
+    });
+  }
   const runtimes = new Map<string, Runtime>();
+  /** Failure-retry bookkeeping, per output id — survives runtime teardown. */
+  const retries = new Map<
+    string,
+    { attempts: number; timer?: ReturnType<typeof setTimeout> }
+  >();
   let closed = false;
 
   const runtimeFor = (id: string): Runtime => {
@@ -114,6 +158,57 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       runtimes.set(id, rt);
     }
     return rt;
+  };
+
+  /** OwnTone pb_suspend: when a failure leaves no live session, the player
+   * pauses rather than lie about progress. Cleared on any 'connected'. */
+  let failurePaused = false;
+  const anyLiveSessions = (): boolean =>
+    [...runtimes.values()].some((rt) => rt.helperConnected);
+
+  const cancelRetry = (id: string) => {
+    const r = retries.get(id);
+    if (r?.timer !== undefined && r.timer !== null) clearTimeout(r.timer);
+    retries.delete(id);
+  };
+
+  const scheduleRetry = (id: string) => {
+    if (closed) return;
+    const table = backoff;
+    if (table !== null) {
+      let r = retries.get(id);
+      if (r === undefined) {
+        r = { attempts: 0 };
+        retries.set(id, r);
+      }
+      if (r.attempts >= table.length) {
+        retries.delete(id);
+        const output = outputs.get(id);
+        console.warn(
+          `[melofon] airplay: output ${id} gave up after ${r.attempts} session retries`,
+        );
+        if (
+          output?.selected === true && playback.playerView().state === 'play'
+        ) {
+          outputs.update(id, { selected: false });
+        }
+        return;
+      }
+      const wait = table[r.attempts];
+      r.attempts++;
+      r.timer = setTimeout(() => {
+        r.timer = undefined;
+        // OwnTone speaker_resurrect pb_resume: if the failure rested the
+        // player, lift it, then let reconcile re-spawn against discovery's
+        // current record (output.host re-read per attempt). A user pause in
+        // this window can be lifted once — accepted edge, same as upstream.
+        if (failurePaused) {
+          playback.play();
+          failurePaused = false;
+        }
+        reconcile();
+      }, wait);
+    }
   };
 
   const stopRuntime = (id: string, rt: Runtime) => {
@@ -142,6 +237,15 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       console.warn(`[melofon] airplay: output ${id} session failed`);
       const rt = runtimes.get(id);
       if (rt !== undefined) stopRuntime(id, rt);
+      // pb_suspend first: if nothing is live anywhere, pause the player —
+      // honest surface while the retry tries (OwnTone's exact cleanup move).
+      if (!anyLiveSessions()) {
+        playback.pause();
+        failurePaused = true;
+      }
+      // Links flap and devices move — retry with backoff unless disabled via
+      // `airplay.retry=off`; only persistent failure leaves this paused.
+      scheduleRetry(id);
     } else if (event === 'state' && value === 'connected') {
       // OwnTone arms the playback timer when the device reports CONNECTED:
       // the session is up, NOW the first PCM goes out — the track start (or
@@ -149,6 +253,8 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       // have to dump.
       const rt = runtimes.get(id);
       if (rt === undefined) return;
+      cancelRetry(id);
+      failurePaused = false;
       rt.helperConnected = true;
       const view = playback.playerView();
       const output = outputs.get(id);
@@ -238,6 +344,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
 
       // Stop / deselect: teardown and drop the runtime.
       if (!output.selected || view.state === 'stop' || view.current === null) {
+        cancelRetry(output.id);
         if (rt.transport !== null) stopRuntime(output.id, rt);
         rt.lastState = view.state;
         continue;
@@ -333,7 +440,6 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         pump(rt, entry.id, entry.song.path, view.itemProgressMs);
       }
 
-      // Volume follows the output row; the start command carried the first.
       if (rt.transport !== null && output.volume !== rt.lastVolume) {
         rt.lastVolume = output.volume;
         void rt.transport.send({ cmd: 'volume', volume: output.volume })
@@ -347,7 +453,10 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
 
     // Unregistered outputs: teardown whatever runtime is left.
     for (const [id, rt] of [...runtimes]) {
-      if (!known.has(id)) stopRuntime(id, rt);
+      if (!known.has(id)) {
+        cancelRetry(id);
+        stopRuntime(id, rt);
+      }
     }
   };
 
@@ -377,6 +486,11 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
   return {
     async close() {
       closed = true;
+      retryStateUnsubscribe?.();
+      for (const r of retries.values()) {
+        if (r.timer !== undefined && r.timer !== null) clearTimeout(r.timer);
+      }
+      retries.clear();
       unsubscribe();
       const pending = [...runtimes.values()].map((rt) => {
         rt.pumpGen++;

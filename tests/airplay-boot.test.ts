@@ -18,6 +18,7 @@ import {
   type AirplayTransport,
   createAirplayBoot,
   type HelperEventFn,
+  parseRetryBackoff,
 } from '../src/boots/airplay.ts';
 
 const FIXTURE_MP3 =
@@ -80,7 +81,7 @@ class FakeTransport implements AirplayTransport {
   }
 }
 
-async function setup() {
+async function setup(overrides: { retryBackoffMs?: number[] } = {}) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
   const db = await openDb(dir);
   const notify = createNotify();
@@ -105,6 +106,8 @@ async function setup() {
       spawned.push(t);
       return t;
     },
+    ...(overrides.retryBackoffMs !== undefined &&
+      { retryBackoffMs: overrides.retryBackoffMs }),
   });
   return {
     outputs,
@@ -117,6 +120,14 @@ async function setup() {
     },
   };
 }
+
+Deno.test('airplay.retry config parse: default, clamp at 60, off', () => {
+  assertEquals(parseRetryBackoff(null), [0, 2, 5, 10, 20, 30, 60]);
+  assertEquals(parseRetryBackoff(''), [0, 2, 5, 10, 20, 30, 60]);
+  assertEquals(parseRetryBackoff('0,2,700,40'), [0, 2, 60, 40]);
+  assertEquals(parseRetryBackoff('off'), null);
+  assertEquals(parseRetryBackoff(' OFF '), null);
+});
 
 function registerSelected(outputs: ReturnType<typeof createOutputs>) {
   outputs.register({
@@ -344,6 +355,52 @@ Deno.test('a failed session from the helper tears the runtime down', async () =>
     const t = spawned[0];
     t.onEvent('state', 'failed');
     await until('closed after failure', () => t.closed);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('session failure: pause, retry-resume, recover (OwnTone cycle)', async () => {
+  const { outputs, playback, spawned, close } = await setup({
+    retryBackoffMs: [0, 1, 1],
+  });
+  try {
+    registerSelected(outputs);
+    playback.queueAdd([fixtureSong()], { play: true });
+    await until('helper spawned', () => spawned.length === 1);
+    const first = spawned[0];
+    first.onEvent('state', 'connected');
+    await until('PCM streamed', () => first.pcmBytes() > 0);
+    // The link dies: the helper reports failure; with nothing else live the
+    // player pauses (OwnTone pb_suspend — no lying progress), the boot waits,
+    // resumes the player (pb_resume), and re-spawns over discovery's record.
+    first.onEvent('state', 'failed');
+    await until('player paused', () => playback.playerView().state === 'pause');
+    await until('retry spawned', () => spawned.length === 2);
+    assert(first.closed, 'failed helper torn down');
+    spawned[1].onEvent('state', 'connected');
+    await until('PCM re-streamed', () => spawned[1].pcmBytes() > 0);
+    assertEquals(playback.playerView().state, 'play');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('persistent failure: the player pauses and stays put (no storm)', async () => {
+  const { outputs, playback, spawned, close } = await setup({
+    retryBackoffMs: [0], // one retry; the next failure ends the table
+  });
+  try {
+    registerSelected(outputs);
+    playback.queueAdd([fixtureSong()], { play: true });
+    await until('helper spawned', () => spawned.length === 1);
+    spawned[0].onEvent('state', 'failed');
+    await until('retry spawned', () => spawned.length === 2);
+    spawned[1].onEvent('state', 'failed');
+    await until('player paused', () => playback.playerView().state === 'pause');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assertEquals(spawned.length, 2, 'no retry storm after the table ran out');
+    assertEquals(outputs.get(ID)?.selected, true, 'no forced deselect');
   } finally {
     await close();
   }
