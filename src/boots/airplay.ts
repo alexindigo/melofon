@@ -79,6 +79,11 @@ export function parseRetryBackoff(raw: string | null): number[] | null {
 }
 /** After a helper failure: retry selections on this schedule. The session
  * binds to the device, never to an address — every attempt re-reads
+/** OwnTone outputs.c rel_to_vol: output.volume is relative to master. */
+function sessionVolume(outputVolume: number, masterVolume: number): number {
+  if (outputVolume >= 100) return masterVolume;
+  return Math.round(outputVolume * masterVolume / 100);
+}
 /** Engine progress must move more than this (ms) mid-play to count as a
  * seek; below it, event-latency jitter would cause flush hiccups. */
 const SEEK_JUMP_MS = 1500;
@@ -364,6 +369,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
 
       // Playing to a selected output.
       const entry = view.current;
+      const volume = sessionVolume(output.volume, view.volume);
       if (rt.transport === null) {
         try {
           rt.transport = spawn(
@@ -380,13 +386,13 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         }
         rt.paused = false;
         rt.entryId = null;
-        rt.lastVolume = output.volume;
+        rt.lastVolume = volume;
         void rt.transport.send({
           cmd: 'start',
           host: output.host,
           port: output.port ?? RAOP_PORT_DEFAULT,
           name: output.name,
-          volume: output.volume,
+          volume,
           // mDNS-derived session knobs (absent on manual registrations —
           // OwnTone-with-missing-TXT defaults: appletv, encrypt 0,
           // metadata 0, authsetup 0).
@@ -440,9 +446,9 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         pump(rt, entry.id, entry.song.path, view.itemProgressMs);
       }
 
-      if (rt.transport !== null && output.volume !== rt.lastVolume) {
-        rt.lastVolume = output.volume;
-        void rt.transport.send({ cmd: 'volume', volume: output.volume })
+      if (rt.transport !== null && volume !== rt.lastVolume) {
+        rt.lastVolume = volume;
+        void rt.transport.send({ cmd: 'volume', volume })
           .catch(() => {});
       }
 

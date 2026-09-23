@@ -183,7 +183,7 @@ Deno.test('selected + play: start command, then the track as PCM', async () => {
     assertEquals(start.host, HOST);
     assertEquals(start.port, 7000);
     assertEquals(start.name, 'Kitchen ATV');
-    assertEquals(start.volume, 100);
+    assertEquals(start.volume, 50);
     assertEquals(start.wanted_metadata, 0);
     assertEquals(start.title, 'First Song');
     assertEquals(start.artist, 'Fixture Artist');
@@ -280,6 +280,17 @@ Deno.test('volume and pin reach the helper; password event sets needsAuthKey', a
     await until('helper spawned', () => spawned.length === 1);
     const t = spawned[0];
 
+    playback.setVolume({ volume: 33 });
+    await until(
+      'master volume cmd',
+      () => t.cmds().some((c) => c.cmd === 'volume' && c.volume === 33),
+    );
+
+    playback.setVolume({ volume: 100 });
+    await until(
+      'master 100',
+      () => t.cmds().some((c) => c.cmd === 'volume' && c.volume === 100),
+    );
     outputs.update(ID, { volume: 42 });
     await until(
       'volume cmd',
