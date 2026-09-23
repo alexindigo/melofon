@@ -37,6 +37,9 @@ state = {
     'auth_setups': 0,
     'auth_setup_before_announce': None,
     'rtp_info': None,
+    'dacp_ids': set(),
+    'client_instances': set(),
+    'active_remotes': set(),
 }
 
 NTP_EPOCH_DELTA = 2208988800
@@ -137,6 +140,12 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                 if method == 'RECORD' and RECORD_DELAY_MS > 0:
                     time.sleep(RECORD_DELAY_MS / 1000)
                 state['requests'].append(method)
+                if headers.get('dacp-id'):
+                    state['dacp_ids'].add(headers['dacp-id'])
+                if headers.get('client-instance'):
+                    state['client_instances'].add(headers['client-instance'])
+                if headers.get('active-remote'):
+                    state['active_remotes'].add(headers['active-remote'])
                 cseq = headers.get('cseq', '0')
                 if method == 'SETUP':
                     print(f'SETUP headers: {headers!r}', file=sys.stderr, flush=True)

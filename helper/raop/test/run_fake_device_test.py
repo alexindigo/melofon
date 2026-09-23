@@ -56,6 +56,19 @@ def standard_scenario():
     # SDP announces AppleLossless 44100.
     assert 'AppleLossless' in report['sdp'] and '44100' in report['sdp']
 
+    # Client identity: DACP-ID and Client-Instance must be a real non-zero
+    # 64-bit hex id (OwnTone: murmur_hash64 of the library name). A literal
+    # '0' (the stub's old libhash) is what arbat (AppleTV3,1) accepts at
+    # RTSP level but silently refuses to render — the wire-capture suspect
+    # from 2026-09-22.
+    assert report['dacp_ids'], 'no DACP-ID header captured'
+    for v in report['dacp_ids']:
+        assert len(v) == 16 and v != '0' and v != '0000000000000000' \
+            and all(c in '0123456789abcdefABCDEF' for c in v), \
+            f'DACP-ID is not a non-zero 64-bit hex id: {v!r}'
+    assert report['client_instances'] == report['dacp_ids'], \
+        (report['client_instances'], report['dacp_ids'])
+
     # 1 s of audio = 125 packets of 352 samples (44.1 kHz), payload type 96,
     # paced in real time (span within [0.5 s, 1.9 s]).
     assert report['audio_packets'] in range(120, 132), report['audio_packets']

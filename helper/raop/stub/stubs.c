@@ -97,7 +97,20 @@ helper_logger_set_severity(int severity)
 /* ------------------------------- conffile -------------------------------- */
 
 cfg_t *cfg = NULL;
-uint64_t libhash = 0;
+
+/* OwnTone hashes the library name into the 64-bit id sent as DACP-ID /
+ * Client-Instance on every RTSP request (conffile.c upstream). A zero id
+ * makes Apple devices (arbat, AppleTV3,1) accept the session yet never
+ * render — named by the 2026-09-22 wire capture vs owntone-ref. */
+uint64_t libhash;
+
+static void __attribute__((constructor))
+libhash_init(void)
+{
+  const char *libname = "Melofon";
+
+  libhash = murmur_hash64(libname, strlen(libname), 0);
+}
 
 cfg_t *cfg_getsec(cfg_t *c, const char *name) { (void)c; (void)name; return NULL; }
 cfg_t *cfg_gettsec(cfg_t *c, const char *name, const char *title) { (void)c; (void)name; (void)title; return NULL; }
