@@ -152,6 +152,29 @@ Deno.test('up registers with TXT-derived fields; down unregisters', async () => 
   }
 });
 
+Deno.test('re-announcement updates host without wiping user state', async () => {
+  const { outputs, browsers, discovery } = await setup();
+  try {
+    await settle();
+    browsers[0].onService!('up', svc());
+    outputs.update(ID, { selected: true, volume: 42 });
+    outputs.update(ID, { needsAuthKey: false }); // PIN completed
+    // The device moves (ethernet→wifi, DHCP change): same instance id,
+    // new address. The record is replaced — never duplicated — and the
+    // user's selection, volume, and PIN completion survive.
+    browsers[0].onService!('up', svc({ address: '192.168.1.77' }));
+    const out = outputs.get(ID)!;
+    assertEquals(outputs.list().length, 1, 'no duplicate');
+    assertEquals(out.host, '192.168.1.77', 'host refreshed');
+    assertEquals(out.selected, true, 'selection preserved');
+    assertEquals(out.volume, 42, 'volume preserved');
+    assertEquals(out.needsAuthKey, false, 'PIN completion preserved');
+    assertEquals(out.devtype, 'appletv');
+  } finally {
+    discovery.close();
+  }
+});
+
 Deno.test('non-AirTunes (no UDP in tp) and odd instance names are skipped', async () => {
   const { outputs, browsers, logs, discovery } = await setup();
   try {

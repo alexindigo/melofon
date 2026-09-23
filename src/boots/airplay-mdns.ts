@@ -174,6 +174,7 @@ export function createAirplayDiscovery(
       );
     }
     const fields = sessionFieldsFromTxt(svc.txt);
+    const existing = outputs.get(parsed.id);
     // OwnTone raop_device_cb (raop.c:4463): one grep-able line vs the
     // registration log so a live session can be A/B'd against OwnTone.
     log(
@@ -191,11 +192,16 @@ export function createAirplayDiscovery(
       id: parsed.id,
       name: parsed.name,
       type: 'AirPlay',
-      selected: false,
-      volume: 100,
+      // Re-announcement must never wipe user state: an ethernet→wifi move
+      // replaces the record (identity, address, TXT fields) but keeps
+      // selection, volume, and PIN completion.
+      selected: existing?.selected ?? false,
+      volume: existing?.volume ?? 100,
       host: svc.address,
       port: svc.port,
       ...fields,
+      ...(existing?.needsAuthKey !== undefined &&
+        { needsAuthKey: existing.needsAuthKey }),
     });
     discovered.add(parsed.id);
   };
