@@ -126,3 +126,23 @@ CREATE TABLE IF NOT EXISTS state (
   key VARCHAR PRIMARY KEY,
   value VARCHAR NOT NULL
 );
+-- Restart transparency (plan restart-transparency): the server engine's queue
+-- and player state, keep-on-rescan user state. The queue stores library song
+-- ids in order and rehydrates via the library at boot (missing tracks drop).
+CREATE TABLE IF NOT EXISTS server_queue (
+  pos INTEGER PRIMARY KEY,
+  song_id VARCHAR NOT NULL
+);
+-- One-row table (id = 1): the last persisted engine snapshot. updated_at
+-- (tz-aware, like now_playing.started_at) drives the resume-freshness
+-- window (MELOFON_RESUME_MAX_AGE_SEC).
+CREATE TABLE IF NOT EXISTS player_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  state VARCHAR NOT NULL,
+  current_index INTEGER,
+  position_ms BIGINT,
+  repeat VARCHAR,
+  shuffle BOOLEAN,
+  consume BOOLEAN,
+  updated_at TIMESTAMPTZ
+);

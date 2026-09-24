@@ -17,7 +17,13 @@
 import type { Library, SongRow } from './library.ts';
 import type { NowPlaying } from './nowplaying.ts';
 import type { Notify } from './notify.ts';
-import type { Player, PlayerStatus, QueueEntry, RepeatMode } from './player.ts';
+import type {
+  Player,
+  PlayerPersistence,
+  PlayerStatus,
+  QueueEntry,
+  RepeatMode,
+} from './player.ts';
 
 export interface ReportPlaying {
   username: string;
@@ -76,6 +82,8 @@ export interface Playback {
   playerView(): PlayerStatus;
   queueView(): { version: number; items: QueueEntry[] };
   nowPlayingView(): Promise<NowPlayingViewRow[]>;
+  /** Stop the position-persistence tick (tests; main.ts never closes). */
+  close(): void;
 }
 
 export function createPlayback(deps: {
@@ -84,9 +92,39 @@ export function createPlayback(deps: {
   library: Library;
   cfg: { user?: string };
   notify?: Notify;
+  /** Restart transparency (plan restart-transparency): when present, every
+   * state change flushes the engine snapshot and queue, and a 1 Hz tick
+   * keeps position_ms current while playing. */
+  persistence?: PlayerPersistence;
 }): Playback {
-  const { player, nowPlaying, library, cfg, notify } = deps;
+  const { player, nowPlaying, library, cfg, notify, persistence } = deps;
   const emit = (types: string[]) => notify?.emit(types);
+
+  // Persistence flushes: the same paths that emit. Fire-and-forget — the
+  // adapter serializes writes; the engine stays synchronous.
+  const flushQueue = () =>
+    persistence?.saveQueue(player.queue().items.map((e) => e.song.id));
+  const flushState = () => {
+    if (persistence === undefined) return;
+    const status = player.status();
+    const currentIndex = status.current === null
+      ? null
+      : player.queue().items.findIndex((e) => e.id === status.current!.id);
+    persistence.saveState({
+      state: status.state,
+      currentIndex: currentIndex === -1 ? null : currentIndex,
+      positionMs: status.itemProgressMs,
+      repeat: status.repeat,
+      shuffle: status.shuffle,
+      consume: status.consume,
+    });
+  };
+  // The position tick: writes only while the engine plays ("on while play,
+  // off otherwise"), so a restored play needs no extra wiring. SIGKILL
+  // loses at most ~1 s of position.
+  const tick = persistence === undefined ? null : setInterval(() => {
+    if (player.status().state === 'play') flushState();
+  }, 1000);
   return {
     async reportPlaying(report) {
       await nowPlaying.set(
@@ -106,38 +144,47 @@ export function createPlayback(deps: {
 
     play() {
       player.play();
+      flushState();
       emit(['player']);
     },
     pause() {
       player.pause();
+      flushState();
       emit(['player']);
     },
     stop() {
       player.stop();
+      flushState();
       emit(['player']);
     },
     toggle() {
       player.toggle();
+      flushState();
       emit(['player']);
     },
     next() {
       player.next();
+      flushState();
       emit(['player']);
     },
     previous() {
       player.previous();
+      flushState();
       emit(['player']);
     },
     setShuffle(on) {
       player.setShuffle(on);
+      flushState();
       emit(['options']);
     },
     setConsume(on) {
       player.setConsume(on);
+      flushState();
       emit(['options']);
     },
     setRepeat(mode) {
       player.setRepeat(mode);
+      flushState();
       emit(['options']);
     },
     setVolume(opts) {
@@ -147,7 +194,10 @@ export function createPlayback(deps: {
     },
     seek(opts) {
       const ok = player.seek(opts);
-      if (ok) emit(['player']);
+      if (ok) {
+        flushState();
+        emit(['player']);
+      }
       return ok;
     },
     queueAdd(songs, opts = {}) {
@@ -155,6 +205,10 @@ export function createPlayback(deps: {
       const added = player.queueAdd(songs, opts.position);
       if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
       if (opts.play) player.play(opts.playbackFromPosition);
+      // An insert can shift the current index, so the state row flushes
+      // with the queue even when playback did not start or stop.
+      flushQueue();
+      flushState();
       const types = ['queue'];
       if (opts.clear || opts.play) types.push('player');
       if (opts.shuffle !== undefined) types.push('options');
@@ -163,6 +217,8 @@ export function createPlayback(deps: {
     },
     queueClear() {
       player.queueClear();
+      flushQueue();
+      flushState();
       // The clear also stopped the engine — both reads changed.
       emit(['queue', 'player']);
     },
@@ -170,6 +226,8 @@ export function createPlayback(deps: {
     advanceEnded() {
       const result = player.advanceEnded();
       if (result === 'none') return;
+      if (result === 'player+queue') flushQueue();
+      flushState();
       emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
     },
 
@@ -200,6 +258,10 @@ export function createPlayback(deps: {
         });
       }
       return out;
+    },
+
+    close() {
+      if (tick !== null) clearInterval(tick);
     },
   };
 }

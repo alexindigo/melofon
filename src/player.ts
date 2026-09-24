@@ -42,6 +42,118 @@ export interface PlayerStatus {
   itemProgressMs: number;
 }
 
+/** The persisted engine snapshot (player_state row, minus updated_at). */
+export interface PlayerStateSnapshot {
+  state: PlayerState;
+  /** Queue position of the current entry; null when none. */
+  currentIndex: number | null;
+  positionMs: number;
+  repeat: RepeatMode;
+  shuffle: boolean;
+  consume: boolean;
+}
+
+/** Persistence port for restart transparency (plan restart-transparency).
+ * The engine is synchronous, so saves are fire-and-forget — the adapter
+ * (src/persistence.ts) serializes and logs failures. Implemented by the
+ * DuckDB store; playback drives the cadence (flush on every state change,
+ * 1 Hz position tick while playing). */
+export interface PlayerPersistence {
+  /** Rewrite the persisted queue (pos-ordered library song ids). */
+  saveQueue(songIds: string[]): void;
+  /** Upsert the singleton player_state row (updated_at = now). */
+  saveState(snapshot: PlayerStateSnapshot): void;
+}
+
+/** What restore() loads at boot: the rehydrated queue plus the snapshot. */
+export interface RestoreSnapshot extends PlayerStateSnapshot {
+  queue: SongRow[];
+}
+
+/** Auto-resume PLAY only when the save is fresh and the environment still
+ * matches (plan restart-transparency): last persist within the window in
+ * both directions (a wall-clock jump makes updated_at stale or future),
+ * the current track survived, and a saved-selected output exists. Anything
+ * else restores PAUSE at the saved place — no 3am speaker. */
+export function shouldAutoResume(opts: {
+  savedState: PlayerState;
+  updatedAtMs: number;
+  nowMs: number;
+  maxAgeMs: number;
+  currentTrackPresent: boolean;
+  selectedOutputPresent: boolean;
+}): boolean {
+  if (opts.savedState !== 'play') return false;
+  const ageMs = opts.nowMs - opts.updatedAtMs;
+  if (ageMs > opts.maxAgeMs || ageMs < -opts.maxAgeMs) return false;
+  return opts.currentTrackPresent && opts.selectedOutputPresent;
+}
+
+/** Build the boot-time RestoreSnapshot from the persisted rows: rehydrate
+ * the queue via the library (missing tracks drop with a warn), map the
+ * persisted current index onto the kept songs, and decide play-vs-pause
+ * per shouldAutoResume. Null when there is nothing to restore. */
+export async function planRestore(opts: {
+  queueIds: string[];
+  saved: (PlayerStateSnapshot & { updatedAtMs: number }) | null;
+  getSong: (id: string) => Promise<SongRow | null>;
+  nowMs: number;
+  maxAgeMs: number;
+  selectedOutputPresent: boolean;
+  warn?: (msg: string) => void;
+}): Promise<RestoreSnapshot | null> {
+  const warn = opts.warn ??
+    ((msg: string) => console.warn(`[melofon] ${msg}`));
+  const queue: SongRow[] = [];
+  const keptPositions: number[] = []; // original queue pos per kept song
+  for (const [pos, id] of opts.queueIds.entries()) {
+    const song = await opts.getSong(id);
+    if (song === null) {
+      warn(`restore: track ${id} no longer in the library, dropped`);
+      continue;
+    }
+    keptPositions.push(pos);
+    queue.push(song);
+  }
+  const { saved } = opts;
+  if (saved === null && queue.length === 0) return null;
+  // Map the persisted current index onto the rehydrated queue: subtract
+  // the missing tracks before it. The current track itself missing leaves
+  // the engine at the entry that shifted into its place, position 0.
+  let currentIndex: number | null = null;
+  let currentTrackPresent = false;
+  if (saved?.currentIndex !== null && saved?.currentIndex !== undefined) {
+    const keptBefore = keptPositions.filter(
+      (pos) => pos < saved.currentIndex!,
+    ).length;
+    currentTrackPresent = keptPositions.includes(saved.currentIndex);
+    currentIndex = currentTrackPresent
+      ? keptBefore
+      : Math.min(keptBefore, Math.max(0, queue.length - 1));
+  }
+  const resume = saved !== null && shouldAutoResume({
+    savedState: saved.state,
+    updatedAtMs: saved.updatedAtMs,
+    nowMs: opts.nowMs,
+    maxAgeMs: opts.maxAgeMs,
+    currentTrackPresent,
+    selectedOutputPresent: opts.selectedOutputPresent,
+  });
+  return {
+    queue,
+    state: saved === null || saved.state === 'stop'
+      ? 'stop'
+      : resume
+      ? 'play'
+      : 'pause',
+    currentIndex,
+    positionMs: currentTrackPresent ? saved?.positionMs ?? 0 : 0,
+    repeat: saved?.repeat ?? 'off',
+    shuffle: saved?.shuffle ?? false,
+    consume: saved?.consume ?? false,
+  };
+}
+
 export interface Player {
   status(): PlayerStatus;
   /** No-op on an empty queue (state stays 'stop'). `fromPosition` starts
@@ -77,6 +189,11 @@ export interface Player {
    * finished item and the next plays; otherwise next, stopping past the
    * last. Unknown length (null duration) never ends. */
   advanceEnded(): AdvanceResult;
+  /** Boot-time restore (plan restart-transparency): load the rehydrated
+   * queue plus the persisted snapshot in one shot. main.ts decides
+   * play-vs-pause per shouldAutoResume. Emits nothing and persists nothing
+   * — the values came from the store, so updated_at must not bump here. */
+  restore(snapshot: RestoreSnapshot): void;
 }
 
 export interface Output {
@@ -358,6 +475,30 @@ export function createPlayer(): Player {
       }
       startAt(currentIndex! + 1);
       return 'player';
+    },
+
+    restore(snapshot) {
+      items = snapshot.queue.map((song) => ({ id: nextId++, song }));
+      if (items.length > 0) version++;
+      repeat = snapshot.repeat;
+      consume = snapshot.consume;
+      shuffle = snapshot.shuffle;
+      const index = snapshot.currentIndex;
+      if (snapshot.state === 'stop' || index === null || items.length === 0) {
+        // Stopped (or nothing to point at): queue restored, playback not.
+        state = 'stop';
+        currentIndex = null;
+        baseProgressMs = 0;
+        return;
+      }
+      currentIndex = Math.min(Math.max(0, index), items.length - 1);
+      const length = items[currentIndex].song.durationMs ?? 0;
+      baseProgressMs = Math.min(
+        Math.max(0, Math.round(snapshot.positionMs)),
+        length,
+      );
+      startedAt = performance.now();
+      state = snapshot.state;
     },
   };
 }

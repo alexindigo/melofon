@@ -24,6 +24,11 @@ export interface Config {
   // transcode to mp3 anyway (dumb clients; DS Audio's checklist maps onto the
   // /_/config key + Settings UI later). Off by default (DirectPlay).
   absentToMp3?: boolean;
+  // MELOFON_RESUME_MAX_AGE_SEC — auto-resume PLAY after a restart only when
+  // the last persisted player state is at most this old (and the wall clock
+  // didn't jump past it); older saves restore PAUSED at the saved place.
+  // Default 300 (5 minutes).
+  resumeMaxAgeSec?: number;
 }
 
 export function loadConfig(
@@ -60,6 +65,10 @@ export function loadConfig(
     }
     listen = { hostname, port };
   }
+  const resumeMaxAgeRaw = env('MELOFON_RESUME_MAX_AGE_SEC');
+  const resumeMaxAgeParsed = resumeMaxAgeRaw === undefined
+    ? NaN
+    : Number(resumeMaxAgeRaw);
   return {
     listen,
     dataDir: env('MELOFON_DATA') ?? './data',
@@ -76,5 +85,9 @@ export function loadConfig(
     absentToMp3: ['1', 'true'].includes(
       env('MELOFON_STREAM_ABSENT_TO_MP3') ?? '',
     ),
+    resumeMaxAgeSec:
+      Number.isFinite(resumeMaxAgeParsed) && resumeMaxAgeParsed > 0
+        ? Math.trunc(resumeMaxAgeParsed)
+        : 300,
   };
 }

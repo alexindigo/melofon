@@ -22,7 +22,8 @@ import { createStream } from './src/stream.ts';
 import { createZip } from './src/zip.ts';
 import { createMedia } from './src/media.ts';
 import { createArtwork } from './src/artwork.ts';
-import { createOutputs, createPlayer } from './src/player.ts';
+import { createOutputs, createPlayer, planRestore } from './src/player.ts';
+import { createPersistence } from './src/persistence.ts';
 import { createPlayback } from './src/playback.ts';
 import { createNotify } from './src/notify.ts';
 import { createState } from './src/state.ts';
@@ -39,6 +40,7 @@ const cfg = loadConfig();
 const db = await openDb(cfg.dataDir, {
   debugLogQueries: cfg.debugLogRequests,
 });
+const persistence = createPersistence(db);
 await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();
@@ -64,7 +66,40 @@ const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const player = createPlayer();
 const nowPlaying = createNowPlaying(db);
-const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
+const playback = createPlayback({
+  player,
+  nowPlaying,
+  library,
+  cfg,
+  notify,
+  persistence,
+});
+
+// Restart transparency (plan restart-transparency): restore the engine —
+// the persisted queue rehydrated via the library (missing tracks drop with
+// a warn), then the snapshot. Auto-resume PLAY only inside the freshness
+// window with the environment still matching; anything else pauses at the
+// saved place, so a stale save can't surprise the household (3am speaker).
+const restoreSnapshot = await planRestore({
+  queueIds: await persistence.loadQueue(),
+  saved: await persistence.loadPlayerState(),
+  getSong: (id) => library.getSong(id),
+  nowMs: Date.now(),
+  maxAgeMs: (cfg.resumeMaxAgeSec ?? 300) * 1000,
+  selectedOutputPresent: outputs.list().some((o) => o.selected),
+});
+const restoredEngine = restoreSnapshot !== null;
+if (restoreSnapshot !== null) {
+  player.restore(restoreSnapshot);
+  console.log(
+    `[melofon] restore: ${restoreSnapshot.queue.length} queued, ` +
+      `state ${restoreSnapshot.state}` +
+      (restoreSnapshot.currentIndex !== null
+        ? ` at #${restoreSnapshot.currentIndex} ` +
+          `${restoreSnapshot.positionMs}ms`
+        : ''),
+  );
+}
 const bag = {
   cfg,
   startedAt: new Date().toISOString(),
@@ -138,6 +173,13 @@ if (airplayHost) {
       `[melofon] airplay: registered ${host}${port ? `:${port}` : ''} (no TXT)`,
     );
   }
+}
+
+// A restored engine announces itself once the boots exist: the AirPlay boot
+// reconciles (a resumed play spawns its session — audible without a client
+// action) and any connected hats pick up the restored state.
+if (restoredEngine) {
+  notify.emit(['player', 'queue', 'outputs', 'volume', 'options']);
 }
 
 // Extra binds: the distinct actual ports every layer's claims map to after
