@@ -161,7 +161,33 @@ export function createAirplayDiscovery(
       return;
     }
 
-    if (outputs.list().some((o) => o.host === svc.address)) {
+    const fields = sessionFieldsFromTxt(svc.txt);
+    const existing = outputs.get(parsed.id);
+    // An identical re-announcement is a catalog no-op: same device, same
+    // address, same session knobs. Skip the register so no outputs event
+    // fires — chatty devices must not wake the session layer for nothing.
+    if (
+      existing !== null &&
+      existing.host === svc.address &&
+      existing.port === svc.port &&
+      existing.devtype === fields.devtype &&
+      (existing.encrypt ?? false) === fields.encrypt &&
+      (existing.wantedMetadata ?? 0) === fields.wantedMetadata &&
+      (existing.supportsAuthSetup ?? false) === fields.supportsAuthSetup &&
+      (existing.requiresAuth ?? false) === fields.requiresAuth &&
+      existing.sampleRate === fields.sampleRate &&
+      existing.bitsPerSample === fields.bitsPerSample &&
+      existing.channels === fields.channels
+    ) {
+      return;
+    }
+
+    // Host dedupe is for a DIFFERENT device claiming an owned address (a
+    // manual registration wins over discovery). The same device updating
+    // its own record is not a conflict.
+    if (
+      outputs.list().some((o) => o.id !== parsed.id && o.host === svc.address)
+    ) {
       log(
         `airplay discovery: skipping '${parsed.name}': host already owned`,
       );
@@ -173,8 +199,6 @@ export function createAirplayDiscovery(
           'unsupported, registration may fail on play',
       );
     }
-    const fields = sessionFieldsFromTxt(svc.txt);
-    const existing = outputs.get(parsed.id);
     // OwnTone raop_device_cb (raop.c:4463): one grep-able line vs the
     // registration log so a live session can be A/B'd against OwnTone.
     log(

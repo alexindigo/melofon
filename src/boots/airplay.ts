@@ -112,6 +112,8 @@ interface Runtime {
   warned: boolean;
   /** Logged the once-per-session "waiting for connected" line. */
   waitingLogged: boolean;
+  /** Logged the once-per-outage "no hub decision, session stays down" line. */
+  noSpawnLogged: boolean;
 }
 
 export function createAirplayBoot(deps: AirplayBootDeps): {
@@ -142,6 +144,13 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
     string,
     { attempts: number; timer?: ReturnType<typeof setTimeout> }
   >();
+  /** Hub-and-spoke: sessions move only on a hub decision for that output —
+   * the player went to play, this output became selected, or its retry
+   * timer fired. A catalog event (another device registering) never starts
+   * or stops a session. */
+  const spawnAllow = new Set<string>();
+  let prevPlayerState: 'play' | 'pause' | 'stop' = 'stop';
+  const prevSelected = new Map<string, boolean>();
   let closed = false;
 
   const runtimeFor = (id: string): Runtime => {
@@ -159,6 +168,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         paused: false,
         warned: false,
         waitingLogged: false,
+        noSpawnLogged: false,
       };
       runtimes.set(id, rt);
     }
@@ -175,6 +185,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
     const r = retries.get(id);
     if (r?.timer !== undefined && r.timer !== null) clearTimeout(r.timer);
     retries.delete(id);
+    spawnAllow.delete(id);
   };
 
   const scheduleRetry = (id: string) => {
@@ -201,8 +212,15 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       }
       const wait = table[r.attempts];
       r.attempts++;
+      console.warn(
+        `[melofon] airplay: output ${id} retry ${r.attempts}/${table.length} ` +
+          `in ${wait}ms`,
+      );
       r.timer = setTimeout(() => {
         r.timer = undefined;
+        // The hub's decision: this output's session comes back. Catalog
+        // events for other devices never get here.
+        spawnAllow.add(id);
         // OwnTone speaker_resurrect pb_resume: if the failure rested the
         // player, lift it, then let reconcile re-spawn against discovery's
         // current record (output.host re-read per attempt). A user pause in
@@ -341,17 +359,26 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
     const view = playback.playerView();
     const now = performance.now();
     const known = new Set<string>();
+    // Hub decisions since the last reconcile: the player went to play…
+    const playEdge = view.state === 'play' && prevPlayerState !== 'play';
 
     for (const output of outputs.list()) {
       if (output.type !== 'AirPlay' || output.host === undefined) continue;
       known.add(output.id);
       const rt = runtimeFor(output.id);
+      // …or this output became selected. Catalog events (a register from
+      // discovery, another device's volume) produce neither.
+      const selectEdge = output.selected &&
+        prevSelected.get(output.id) !== true;
+      const retryEdge = spawnAllow.delete(output.id);
+      const maySpawn = playEdge || selectEdge || retryEdge;
 
       // Stop / deselect: teardown and drop the runtime.
       if (!output.selected || view.state === 'stop' || view.current === null) {
         cancelRetry(output.id);
         if (rt.transport !== null) stopRuntime(output.id, rt);
         rt.lastState = view.state;
+        prevSelected.set(output.id, output.selected);
         continue;
       }
 
@@ -364,6 +391,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         rt.lastState = 'pause';
         rt.lastProgressMs = view.itemProgressMs;
         rt.lastEventAt = now;
+        prevSelected.set(output.id, output.selected);
         continue;
       }
 
@@ -371,6 +399,26 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       const entry = view.current;
       const volume = sessionVolume(output.volume, view.volume);
       if (rt.transport === null) {
+        if (!maySpawn) {
+          // The session is down and the hub has not asked for it back —
+          // a catalog event brought us here, so the session stays down.
+          if (!rt.noSpawnLogged) {
+            rt.noSpawnLogged = true;
+            console.warn(
+              `[melofon] airplay: output ${output.id} session down, ` +
+                'no hub decision to restart it',
+            );
+          }
+          prevSelected.set(output.id, output.selected);
+          continue;
+        }
+        rt.noSpawnLogged = false;
+        if (RAOP_DEBUG) {
+          console.warn(
+            `[melofon] airplay: output ${output.id} session start ` +
+              `(hub: ${retryEdge ? 'retry' : selectEdge ? 'select' : 'play'})`,
+          );
+        }
         try {
           rt.transport = spawn(
             (event, value) => onHelperEvent(output.id, event, value),
@@ -455,6 +503,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       rt.lastState = 'play';
       rt.lastProgressMs = view.itemProgressMs;
       rt.lastEventAt = now;
+      prevSelected.set(output.id, output.selected);
     }
 
     // Unregistered outputs: teardown whatever runtime is left.
@@ -462,8 +511,10 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       if (!known.has(id)) {
         cancelRetry(id);
         stopRuntime(id, rt);
+        prevSelected.delete(id);
       }
     }
+    prevPlayerState = view.state;
   };
 
   // Pins are commands through app.outputs.update — deliver to the helper.

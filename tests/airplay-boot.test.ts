@@ -416,3 +416,112 @@ Deno.test('persistent failure: the player pauses and stays put (no storm)', asyn
     await close();
   }
 });
+
+Deno.test('catalog events do not move sessions: another device registering leaves a failed session down', async () => {
+  const { outputs, playback, spawned, close } = await setup({
+    retryBackoffMs: [150],
+  });
+  try {
+    registerSelected(outputs);
+    // A second selected speaker: its session stays live, so the player
+    // keeps playing when the first one fails.
+    const id2 = airplayOutputId('192.0.2.11');
+    outputs.register({
+      id: id2,
+      name: 'Bedroom ATV',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+      host: '192.0.2.11',
+    });
+    playback.queueAdd([fixtureSong()], { play: true });
+    await until('both spawned', () => spawned.length === 2);
+    spawned[0].onEvent('state', 'connected');
+    spawned[1].onEvent('state', 'connected');
+    await until(
+      'PCM on both',
+      () => spawned[0].pcmBytes() > 0 && spawned[1].pcmBytes() > 0,
+    );
+
+    // The first link dies. The second is live → no pause (hub keeps playing).
+    spawned[0].onEvent('state', 'failed');
+    await until('first torn down', () => spawned[0].closed);
+    assertEquals(
+      playback.playerView().state,
+      'play',
+      'a live session keeps the player playing',
+    );
+
+    // A third device appears on the network (a catalog event). It must not
+    // restart the failed session — sessions move on hub decisions only.
+    outputs.register({
+      id: airplayOutputId('192.0.2.12'),
+      name: 'okasan',
+      type: 'AirPlay',
+      selected: false,
+      volume: 100,
+      host: '192.0.2.12',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assertEquals(
+      spawned.length,
+      2,
+      'catalog event did not respawn the failed session',
+    );
+
+    // The hub's retry for that output does.
+    await until('retry respawned', () => spawned.length === 3);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('a re-announcement of the same device does not restart its failed session', async () => {
+  const { outputs, playback, spawned, close } = await setup({
+    retryBackoffMs: [150],
+  });
+  try {
+    registerSelected(outputs);
+    const id2 = airplayOutputId('192.0.2.11');
+    outputs.register({
+      id: id2,
+      name: 'Bedroom ATV',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+      host: '192.0.2.11',
+    });
+    playback.queueAdd([fixtureSong()], { play: true });
+    await until('both spawned', () => spawned.length === 2);
+    spawned[0].onEvent('state', 'connected');
+    spawned[1].onEvent('state', 'connected');
+    spawned[0].onEvent('state', 'failed');
+    await until('first torn down', () => spawned[0].closed);
+
+    // The same device re-announces at a new address (ethernet→wifi): the
+    // record is replaced and selection preserved — still not a hub decision
+    // to start the session.
+    outputs.register({
+      id: ID,
+      name: 'Kitchen ATV',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+      host: '192.0.2.99',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assertEquals(spawned.length, 2, 're-announcement did not respawn');
+
+    // The retry is the hub decision — and it dials the re-announced address
+    // (discovery owns the address; the session binds to the device).
+    await until('retry respawned', () => spawned.length === 3);
+    const start = spawned[2].cmds().find((c) => c.cmd === 'start')!;
+    assertEquals(
+      start.host,
+      '192.0.2.99',
+      'retry used the re-announced address',
+    );
+  } finally {
+    await close();
+  }
+});

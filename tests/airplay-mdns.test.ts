@@ -10,6 +10,7 @@ import {
   wantedMetadataFromMd,
 } from '../src/boots/airplay-mdns.ts';
 import type { MdnsService } from '../src/mdns.ts';
+import { createNotify } from '../src/notify.ts';
 import { createOutputs } from '../src/player.ts';
 import type { State } from '../src/state.ts';
 
@@ -80,7 +81,8 @@ function svc(overrides: Partial<MdnsService> = {}): MdnsService {
 }
 
 function setup(initial: Record<string, string> = {}) {
-  const outputs = createOutputs();
+  const notify = createNotify();
+  const outputs = createOutputs({ notify });
   const state = fakeState(initial);
   const browsers: FakeBrowser[] = [];
   const logs: string[] = [];
@@ -95,7 +97,7 @@ function setup(initial: Record<string, string> = {}) {
       return b;
     },
   });
-  return { outputs, state, browsers, logs, discovery };
+  return { outputs, state, browsers, logs, discovery, notify };
 }
 
 /** The initial state.get resolves asynchronously. */
@@ -170,6 +172,35 @@ Deno.test('re-announcement updates host without wiping user state', async () => 
     assertEquals(out.volume, 42, 'volume preserved');
     assertEquals(out.needsAuthKey, false, 'PIN completion preserved');
     assertEquals(out.devtype, 'appletv');
+  } finally {
+    discovery.close();
+  }
+});
+
+Deno.test('an identical re-announcement is a catalog no-op', async () => {
+  const { outputs, browsers, logs, discovery, notify } = await setup();
+  try {
+    await settle();
+    let outputsEvents = 0;
+    notify.subscribe((types) => {
+      if (types.includes('outputs')) outputsEvents++;
+    });
+    browsers[0].onService!('up', svc());
+    assertEquals(outputs.list().length, 1);
+    assertEquals(outputsEvents, 1, 'the first announcement registers');
+    const logsAfterFirst = logs.length;
+
+    // Same instance, same address, same TXT: nothing changed, no register,
+    // no outputs event, no log line — chatty devices stay quiet.
+    browsers[0].onService!('up', svc());
+    browsers[0].onService!('up', svc());
+    assertEquals(outputsEvents, 1, 'identical ups fired no outputs event');
+    assertEquals(logs.length, logsAfterFirst, 'identical ups logged nothing');
+
+    // A changed TXT (metadata knobs) is a real catalog update.
+    browsers[0].onService!('up', svc({ txt: { ...svc().txt, md: '0,1' } }));
+    assertEquals(outputsEvents, 2, 'changed TXT registers');
+    assertEquals(outputs.get(ID)!.wantedMetadata, 3);
   } finally {
     discovery.close();
   }
