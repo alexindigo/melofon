@@ -80,7 +80,10 @@ function svc(overrides: Partial<MdnsService> = {}): MdnsService {
   };
 }
 
-function setup(initial: Record<string, string> = {}) {
+function setup(
+  initial: Record<string, string> = {},
+  saved: Record<string, { selected: boolean; volume: number }> = {},
+) {
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const state = fakeState(initial);
@@ -89,6 +92,7 @@ function setup(initial: Record<string, string> = {}) {
   const discovery = createAirplayDiscovery({
     outputs,
     state,
+    savedOutput: (id) => saved[id],
     log: (msg) => logs.push(msg),
     createBrowser: (onService) => {
       const b = new FakeBrowser();
@@ -172,6 +176,36 @@ Deno.test('re-announcement updates host without wiping user state', async () => 
     assertEquals(out.volume, 42, 'volume preserved');
     assertEquals(out.needsAuthKey, false, 'PIN completion preserved');
     assertEquals(out.devtype, 'appletv');
+  } finally {
+    discovery.close();
+  }
+});
+
+Deno.test('a device coming back unregistered registers with the saved selection', async () => {
+  // No in-memory record (mDNS down→up, or a restart before the row
+  // re-registers): the persisted user state wins over discovery defaults.
+  const { outputs, browsers, discovery } = await setup({}, {
+    [ID]: { selected: true, volume: 42 },
+  });
+  try {
+    await settle();
+    browsers[0].onService!('up', svc());
+    const out = outputs.get(ID)!;
+    assertEquals(out.selected, true, 'saved selection applied');
+    assertEquals(out.volume, 42, 'saved volume applied');
+    assertEquals(out.host, '192.168.1.50', 'announcement refreshes the host');
+    assertEquals(out.port, 7000);
+    assertEquals(out.devtype, 'appletv', 'TXT knobs still derived');
+
+    // Without a saved row the discovery defaults stand.
+    browsers[0].onService!('down', svc());
+    browsers[0].onService!(
+      'up',
+      svc({ name: '001122334455@Patio._raop._tcp.local' }),
+    );
+    const patio = outputs.get(BigInt('0x001122334455').toString(10))!;
+    assertEquals(patio.selected, false);
+    assertEquals(patio.volume, 100);
   } finally {
     discovery.close();
   }

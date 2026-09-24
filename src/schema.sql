@@ -146,3 +146,17 @@ CREATE TABLE IF NOT EXISTS player_state (
   consume BOOLEAN,
   updated_at TIMESTAMPTZ
 );
+-- The outputs' remotes, mDNS-discovered and hand-added alike: id is the
+-- OwnTone digit id (airplayOutputId / mDNS id). unregister never deletes —
+-- the row is the last-seen state a re-announced or rebooted device falls
+-- back to. Session knobs (devtype/encrypt/…) are not here: discovery
+-- re-derives them from TXT.
+CREATE TABLE IF NOT EXISTS output_state (
+  id VARCHAR PRIMARY KEY,
+  host VARCHAR,
+  port INTEGER,
+  name VARCHAR,
+  type VARCHAR,
+  selected BOOLEAN NOT NULL,
+  volume INTEGER NOT NULL
+);

@@ -9,7 +9,12 @@ import { openDb } from '../src/db.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPersistence } from '../src/persistence.ts';
-import { createPlayer, planRestore, shouldAutoResume } from '../src/player.ts';
+import {
+  createOutputs,
+  createPlayer,
+  planRestore,
+  shouldAutoResume,
+} from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 
 let songN = 0;
@@ -325,6 +330,102 @@ Deno.test('the 1 Hz tick keeps position_ms current while playing only', async ()
     const still = await persistence.loadPlayerState();
     assert(still !== null);
     assertEquals(still.positionMs, paused.positionMs, 'no tick while paused');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('output selection and volume survive a restart', async () => {
+  const { dir, persistence, close } = await setup();
+  const outputs = createOutputs({ persistence });
+  outputs.register({
+    id: '111',
+    name: 'arbat',
+    type: 'AirPlay',
+    selected: false,
+    volume: 100,
+    host: '192.168.1.50',
+    port: 7000,
+  });
+  outputs.register({
+    id: '222',
+    name: 'kitchen',
+    type: 'AirPlay',
+    selected: false,
+    volume: 100,
+  });
+  outputs.update('111', { selected: true, volume: 42 });
+  outputs.toggle('222');
+  await persistence.drain();
+  await close(true); // keep the dir — the "restart" reopens it
+
+  const restarted = await reopen(dir);
+  try {
+    const rows = await restarted.persistence.loadOutputs();
+    assertEquals(rows.length, 2);
+    const arbat = rows.find((r) => r.id === '111')!;
+    assertEquals(arbat, {
+      id: '111',
+      host: '192.168.1.50',
+      port: 7000,
+      name: 'arbat',
+      type: 'AirPlay',
+      selected: true,
+      volume: 42,
+    });
+    const kitchen = rows.find((r) => r.id === '222')!;
+    assertEquals(kitchen.selected, true, 'the toggle persisted');
+    assertEquals(kitchen.host, undefined, 'no host on a hand-added row');
+
+    // The write-through cache serves discovery's saved-state lookups.
+    assertEquals(restarted.persistence.savedOutput('111')?.volume, 42);
+    assertEquals(restarted.persistence.savedOutput('999'), undefined);
+
+    // The boot path: re-register the persisted remotes, saved state intact.
+    const outputs2 = createOutputs();
+    for (const row of rows) {
+      if (row.host === undefined) continue;
+      outputs2.register({
+        id: row.id,
+        name: row.name,
+        type: row.type,
+        selected: row.selected,
+        volume: row.volume,
+        host: row.host,
+        ...(row.port === undefined ? {} : { port: row.port }),
+      });
+    }
+    const restored = outputs2.get('111')!;
+    assertEquals(restored.selected, true);
+    assertEquals(restored.volume, 42);
+    assertEquals(restored.host, '192.168.1.50');
+    assertEquals(outputs2.list().length, 1, 'hostless rows stay out');
+  } finally {
+    await restarted.close();
+  }
+});
+
+Deno.test('unregister keeps the persisted row (last-seen state)', async () => {
+  const { persistence, close } = await setup();
+  try {
+    const outputs = createOutputs({ persistence });
+    outputs.register({
+      id: '111',
+      name: 'arbat',
+      type: 'AirPlay',
+      selected: false,
+      volume: 100,
+      host: '192.168.1.50',
+      port: 7000,
+    });
+    outputs.update('111', { selected: true, volume: 42 });
+    assertEquals(outputs.unregister('111'), true, 'mDNS down unregisters');
+    await persistence.drain();
+
+    const rows = await persistence.loadOutputs();
+    assertEquals(rows.length, 1, 'the row survives the unregister');
+    assertEquals(rows[0].selected, true, 'last-seen user state');
+    assertEquals(rows[0].volume, 42);
   } finally {
     await close();
   }

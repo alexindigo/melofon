@@ -254,6 +254,27 @@ export interface Outputs {
   onCommand(fn: (id: string, cmd: { pin?: string }) => void): void;
 }
 
+/** The persisted output remote (output_state row): mDNS-discovered and
+ * hand-added alike. Session knobs (devtype/encrypt/…) are not persisted —
+ * discovery re-derives them from TXT. */
+export interface PersistedOutput {
+  id: string;
+  host?: string;
+  port?: number;
+  name: string;
+  type: string;
+  selected: boolean;
+  volume: number;
+}
+
+/** Persistence port for output remotes (plan restart-transparency):
+ * register/update/setEnabled/toggle upsert the full row; unregister keeps
+ * it — the row is the last-seen state a re-announced or rebooted device
+ * falls back to. Fire-and-forget like the player port. */
+export interface OutputPersistence {
+  saveOutput(row: PersistedOutput): void;
+}
+
 function clampVolume(n: number): number {
   return Math.min(100, Math.max(0, Math.trunc(n)));
 }
@@ -503,7 +524,12 @@ export function createPlayer(): Player {
   };
 }
 
-export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
+export function createOutputs(
+  { notify, persistence }: {
+    notify?: Notify;
+    persistence?: OutputPersistence;
+  } = {},
+): Outputs {
   const emit = (types: string[]) => notify?.emit(types);
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];
@@ -511,6 +537,16 @@ export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
   const commandListeners = new Set<
     (id: string, cmd: { pin?: string }) => void
   >();
+  const saveRow = (o: Output) =>
+    persistence?.saveOutput({
+      id: o.id,
+      host: o.host,
+      port: o.port,
+      name: o.name,
+      type: o.type,
+      selected: o.selected,
+      volume: o.volume,
+    });
 
   return {
     list: () => outputs.map((o) => ({ ...o })),
@@ -522,18 +558,21 @@ export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
       const idx = outputs.findIndex((o) => o.id === output.id);
       if (idx === -1) outputs.push({ ...output });
       else outputs[idx] = { ...output };
+      saveRow(find(output.id)!);
       emit(['outputs']);
     },
     unregister(id) {
       const idx = outputs.findIndex((o) => o.id === id);
       if (idx === -1) return false;
       outputs.splice(idx, 1);
+      // The persisted row stays: last-seen state for a re-announcement.
       emit(['outputs']);
       return true;
     },
     setEnabled(ids) {
       if (ids.some((id) => find(id) === null)) return false;
       for (const o of outputs) o.selected = ids.includes(o.id);
+      for (const o of outputs) saveRow(o);
       emit(['outputs']);
       return true;
     },
@@ -541,6 +580,7 @@ export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
       const found = find(id);
       if (found === null) return null;
       found.selected = !found.selected;
+      saveRow(found);
       emit(['outputs']);
       return { ...found };
     },
@@ -549,6 +589,9 @@ export function createOutputs({ notify }: { notify?: Notify } = {}): Outputs {
       if (found === null) return null;
       if (opts.selected !== undefined) found.selected = opts.selected;
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
+      if (opts.selected !== undefined || opts.volume !== undefined) {
+        saveRow(found);
+      }
       if (opts.needsAuthKey !== undefined) {
         found.needsAuthKey = opts.needsAuthKey;
       }

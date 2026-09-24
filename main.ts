@@ -45,7 +45,7 @@ await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();
 const notify = createNotify();
-const outputs = createOutputs({ notify });
+const outputs = createOutputs({ notify, persistence });
 const state = createState(db);
 const scan = createScan(db, media, { notify });
 const counts = await scan.run();
@@ -60,7 +60,11 @@ if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
     env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
   );
 }
-const airplay = createAirplayDiscovery({ outputs, state });
+const airplay = createAirplayDiscovery({
+  outputs,
+  state,
+  savedOutput: (id) => persistence.savedOutput(id),
+});
 const app = { db, cfg, libraries, outputs, state, airplay };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
@@ -80,6 +84,25 @@ const playback = createPlayback({
 // a warn), then the snapshot. Auto-resume PLAY only inside the freshness
 // window with the environment still matching; anything else pauses at the
 // saved place, so a stale save can't surprise the household (3am speaker).
+// First re-register persisted remotes (hand-added and last-seen mDNS
+// alike) so a saved selection is present for the resume decision.
+for (const row of await persistence.loadOutputs()) {
+  const existing = outputs.get(row.id);
+  if (existing !== null) {
+    // Discovery beat the restore: keep its fresh record, apply user state.
+    outputs.update(row.id, { selected: row.selected, volume: row.volume });
+  } else if (row.host !== undefined) {
+    outputs.register({
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      selected: row.selected,
+      volume: row.volume,
+      host: row.host,
+      ...(row.port === undefined ? {} : { port: row.port }),
+    });
+  }
+}
 const restoreSnapshot = await planRestore({
   queueIds: await persistence.loadQueue(),
   saved: await persistence.loadPlayerState(),

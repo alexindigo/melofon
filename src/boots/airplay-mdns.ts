@@ -108,6 +108,13 @@ export interface AirplayDiscoveryDeps {
   createBrowser?: (
     onService: (event: 'up' | 'down', service: MdnsService) => void,
   ) => MdnsBrowser;
+  /** Persisted user state per output id (plan restart-transparency): a
+   * device re-announcing while not registered (mDNS down→up, or a restart
+   * before its row re-registers) gets its saved selection and volume back.
+   * Absent ⇒ discovery defaults (selected: false, volume: 100). */
+  savedOutput?: (
+    id: string,
+  ) => { selected: boolean; volume: number } | undefined;
   log?: (msg: string) => void;
 }
 
@@ -163,6 +170,10 @@ export function createAirplayDiscovery(
 
     const fields = sessionFieldsFromTxt(svc.txt);
     const existing = outputs.get(parsed.id);
+    // A device re-announcing while not registered (mDNS down→up, or a
+    // restart before its row re-registers) gets its persisted user state
+    // back — selection and volume survive the gap.
+    const saved = existing === null ? deps.savedOutput?.(parsed.id) : undefined;
     // An identical re-announcement is a catalog no-op: same device, same
     // address, same session knobs. Skip the register so no outputs event
     // fires — chatty devices must not wake the session layer for nothing.
@@ -218,9 +229,10 @@ export function createAirplayDiscovery(
       type: 'AirPlay',
       // Re-announcement must never wipe user state: an ethernet→wifi move
       // replaces the record (identity, address, TXT fields) but keeps
-      // selection, volume, and PIN completion.
-      selected: existing?.selected ?? false,
-      volume: existing?.volume ?? 100,
+      // selection, volume, and PIN completion. A device that was gone gets
+      // the persisted state back instead of the discovery defaults.
+      selected: existing?.selected ?? saved?.selected ?? false,
+      volume: existing?.volume ?? saved?.volume ?? 100,
       host: svc.address,
       port: svc.port,
       ...fields,
