@@ -492,8 +492,8 @@
     "media-typer@2.0.0": {
       "integrity": "sha512-kOy3OxT2HH39N70UnKgu4NWDZjLOz8W/mfyvniHjRH/DrL3f2pOfvWQ4p60offbbtDAnXWp0v9LfMIqMec269Q=="
     },
-    "mediabunny@1.56.3": {
-      "integrity": "sha512-H3K0v/PNTaBdbjN3dVFcyS0grGOJQ50TT8WCgdj62AytTZSoL5DXmkdM4mfhzRUq3BTPfmiXDnlmI3Qun/dchg==",
+    "mediabunny@1.57.0": {
+      "integrity": "sha512-j6L4DutGEcb5DQkWshZjJk6cP7bfmFXfIP6URTRXExMM2WSEQjQxWEV+U+PmYjLFyjRLymNGHWllg2OjHVbdog==",
       "dependencies": [
         "@types/dom-mediacapture-transform",
         "@types/dom-webcodecs"
