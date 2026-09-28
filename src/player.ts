@@ -35,6 +35,10 @@ export interface CommandSource {
   peer?: string;
   userAgent?: string;
   user?: string;
+  /** X-Melofon-Client when the caller names itself (plan
+   * command-provenance-wire-fix) — a Melofon header, logged as client=,
+   * never an OwnTone wire field. */
+  client?: string;
 }
 
 /** The last engine mutation, for the /api/player last_command surface. */
@@ -57,6 +61,7 @@ export function logCmd(
   const by = source.kind === 'http'
     ? `http ${source.peer ?? '?'}` +
       (source.user ? ` user=${source.user}` : '') +
+      (source.client ? ` client=${source.client}` : '') +
       (source.userAgent ? ` (${source.userAgent})` : '')
     : `internal:${source.via ?? 'core'}`;
   console.log(
@@ -65,19 +70,21 @@ export function logCmd(
 }
 
 /** Build a CommandSource from a pathfinder request view (peer +
- * user-agent). Core endpoints use this; the owntone hat mirrors it
- * structurally (hats never import src/). */
+ * user-agent + X-Melofon-Client). Core endpoints use this; the owntone
+ * hat mirrors it structurally (hats never import src/). */
 export function sourceFromRequest(request: {
   headers?: { get(name: string): string | null };
   remoteAddr?: { hostname?: string };
 }): CommandSource {
   const userAgent = request.headers?.get('user-agent') ?? undefined;
+  const client = request.headers?.get('x-melofon-client')?.trim();
   return {
     kind: 'http',
     ...(request.remoteAddr?.hostname !== undefined
       ? { peer: request.remoteAddr.hostname }
       : {}),
     ...(userAgent !== undefined ? { userAgent: userAgent.slice(0, 80) } : {}),
+    ...(client ? { client: client.slice(0, 80) } : {}),
   };
 }
 

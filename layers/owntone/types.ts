@@ -12,6 +12,9 @@ export interface CommandSourceRow {
   peer?: string;
   userAgent?: string;
   user?: string;
+  /** X-Melofon-Client when the caller names itself — a Melofon header,
+   * never an OwnTone wire field (plan command-provenance-wire-fix). */
+  client?: string;
 }
 
 /** The last recorded engine mutation — /api/player's last_command. */

@@ -225,10 +225,17 @@ async function setupWire() {
     defaultPort: 4534,
     env: {},
   });
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
+  };
   return {
     playback,
     onHook,
+    logs,
     close: async () => {
+      console.log = originalLog;
       playback.close();
       db.close();
       await Deno.remove(dir, { recursive: true });
@@ -244,16 +251,15 @@ const HA_HEADERS = {
   'user-agent': 'HomeAssistant/2026.9.3 aiohttp/3.14.3 Python/3.14',
 };
 
-Deno.test('/api/player exposes last_command with the request peer and user-agent', async () => {
+Deno.test('OwnTone GET /api/player carries no last_command; core still records', async () => {
   const { playback, onHook, close } = await setupWire();
   try {
-    // Before any mutation the field is null.
+    // The wire is OwnTone: no last_command key, before or after mutations
+    // (plan command-provenance-wire-fix).
     let res = await onHook(new Request('http://x/api/player'));
     let body = await res.json();
-    assertEquals(body.last_command, null);
+    assertEquals('last_command' in body, false);
 
-    // Give the engine a queue item, then seek over the wire with HA's
-    // peer + user-agent on the request.
     playback.queueAdd([song(90_000_000)], { play: true });
     res = await onHook(
       new Request('http://x/api/player/seek?position_ms=30504000', {
@@ -266,7 +272,11 @@ Deno.test('/api/player exposes last_command with the request peer and user-agent
 
     res = await onHook(new Request('http://x/api/player'));
     body = await res.json();
-    const cmd = body.last_command;
+    assertEquals('last_command' in body, false);
+    assertEquals(body.item_progress_ms >= 30504000, true, 'the seek worked');
+
+    // …while the core keeps the full provenance record.
+    const cmd = playback.lastCommand()!;
     assertEquals(cmd.kind, 'seek');
     assertEquals(cmd.detail, 'position_ms=30504000');
     assertEquals(cmd.source.kind, 'http');
@@ -275,14 +285,44 @@ Deno.test('/api/player exposes last_command with the request peer and user-agent
       cmd.source.userAgent,
       'HomeAssistant/2026.9.3 aiohttp/3.14.3 Python/3.14',
     );
-    assert(typeof cmd.atMs === 'number' && cmd.atMs > 0);
+  } finally {
+    await close();
+  }
+});
 
-    // An internal mutation (no source) reads kind internal on the wire.
-    playback.pause();
-    res = await onHook(new Request('http://x/api/player'));
-    body = await res.json();
-    assertEquals(body.last_command.kind, 'pause');
-    assertEquals(body.last_command.source, { kind: 'internal' });
+Deno.test('X-Melofon-Client is scooped as source.client and logged as client=', async () => {
+  const { playback, onHook, logs, close } = await setupWire();
+  try {
+    playback.queueAdd([song(90_000_000)], { play: true });
+    const res = await onHook(
+      new Request('http://x/api/player/seek?position_ms=30504000', {
+        method: 'PUT',
+        headers: { ...HA_HEADERS, 'x-melofon-client': 'book-checkpoint' },
+      }),
+      HA_INFO,
+    );
+    assertEquals(res.status, 204);
+
+    const cmd = playback.lastCommand()!;
+    assertEquals(cmd.source.client, 'book-checkpoint');
+    const cmdLines = logs.filter((l) => l.startsWith('[cmd]'));
+    const seekLine = cmdLines.find((l) => l.startsWith('[cmd] seek '))!;
+    assertEquals(
+      seekLine,
+      '[cmd] seek position_ms=30504000 by http 10.4.20.172 ' +
+        'client=book-checkpoint ' +
+        '(HomeAssistant/2026.9.3 aiohttp/3.14.3 Python/3.14)',
+    );
+
+    // Header absent → no client field at all.
+    await onHook(
+      new Request('http://x/api/player/seek?position_ms=30505000', {
+        method: 'PUT',
+        headers: HA_HEADERS,
+      }),
+      HA_INFO,
+    );
+    assertEquals(playback.lastCommand()!.source.client, undefined);
   } finally {
     await close();
   }
@@ -300,11 +340,9 @@ Deno.test('sourceFrom edge cases: no peer, no UA; UA truncated at 80', async () 
       }),
     );
     assertEquals(res.status, 204);
-    let body = await (await onHook(new Request('http://x/api/player')))
-      .json();
-    assertEquals(body.last_command.source, { kind: 'http' });
+    assertEquals(playback.lastCommand()!.source, { kind: 'http' });
 
-    // A long user-agent is truncated to 80 chars on the wire.
+    // A long user-agent is truncated to 80 chars in the record.
     res = await onHook(
       new Request('http://x/api/player/seek?position_ms=2000', {
         method: 'PUT',
@@ -313,9 +351,9 @@ Deno.test('sourceFrom edge cases: no peer, no UA; UA truncated at 80', async () 
       HA_INFO,
     );
     assertEquals(res.status, 204);
-    body = await (await onHook(new Request('http://x/api/player'))).json();
-    assertEquals(body.last_command.source.peer, '10.4.20.172');
-    assertEquals(body.last_command.source.userAgent, 'X'.repeat(80));
+    const source = playback.lastCommand()!.source;
+    assertEquals(source.peer, '10.4.20.172');
+    assertEquals(source.userAgent, 'X'.repeat(80));
   } finally {
     await close();
   }

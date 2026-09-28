@@ -21,17 +21,19 @@ export function wireInt(hash: string): number {
 }
 
 /** Provenance for a mutating command (plan command-provenance): the
- * request's peer + user-agent, recorded by the core as lastCommand and
- * logged as one [cmd] line. Structural mirror of core's
- * sourceFromRequest (hats never import src/). */
+ * request's peer + user-agent + X-Melofon-Client, recorded by the core
+ * as lastCommand and logged as one [cmd] line. Structural mirror of
+ * core's sourceFromRequest (hats never import src/). */
 export function sourceFrom(request: HatRequest): CommandSourceRow {
   const userAgent = request.headers.get('user-agent') ?? undefined;
+  const client = request.headers.get('x-melofon-client')?.trim();
   return {
     kind: 'http',
     ...(request.remoteAddr?.hostname !== undefined
       ? { peer: request.remoteAddr.hostname }
       : {}),
     ...(userAgent !== undefined ? { userAgent: userAgent.slice(0, 80) } : {}),
+    ...(client ? { client: client.slice(0, 80) } : {}),
   };
 }
 
