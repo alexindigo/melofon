@@ -1,14 +1,25 @@
 // tests/command-provenance.test.ts — command provenance (plan
 // command-provenance): every engine mutation records its source as
 // lastCommand and logs one [cmd] line; unsourced callers read as internal;
-// restore is recorded with via 'restore'. The 2026-09-24 ghost-writer
-// incident is the motivation: attribution on every jump.
+// restore is recorded with via 'restore'; /api/player exposes
+// last_command with the request's peer/user-agent. The 2026-09-24
+// ghost-writer incident is the motivation: attribution on every jump.
 import { assert, assertEquals } from '@std/assert';
+import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
+import { createBinds } from '../src/binds.ts';
+import { facade } from '../src/facade.ts';
+import { loadLayers } from '../src/layers.ts';
+import { createLibraries } from '../src/libraries.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
+import { createListens } from '../src/listens.ts';
+import { createMedia } from '../src/media.ts';
+import { createNotify } from '../src/notify.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
-import { createPlayer } from '../src/player.ts';
+import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
+import { createStream } from '../src/stream.ts';
+import { createUserService } from '../src/user.ts';
 
 let songN = 0;
 function song(durationMs: number | null = 180_000): SongRow {
@@ -170,6 +181,141 @@ Deno.test('restore is recorded with via restore and keeps engine purity', async 
     const status = playback.playerView();
     assertEquals(status.state, 'pause');
     assert(status.itemProgressMs >= 71033416);
+  } finally {
+    await close();
+  }
+});
+
+/** Full facade harness: real hats, real core, in-memory requests. */
+async function setupWire() {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-prov-wire-' });
+  const db = await openDb(dir);
+  const cfg = {
+    listen: undefined,
+    dataDir: dir,
+    user: undefined,
+    password: undefined,
+    secret: undefined,
+    version: '0.0.0-test',
+  };
+  const libraries = createLibraries(db);
+  const notify = createNotify();
+  const player = createPlayer();
+  const nowPlaying = createNowPlaying(db);
+  const library = createLibrary(db);
+  const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
+  const bag = {
+    cfg,
+    libraries,
+    user: createUserService(db, cfg),
+    library,
+    listens: createListens(db),
+    nowPlaying,
+    player,
+    outputs: createOutputs({ notify }),
+    playback,
+    stream: createStream(createMedia(), playback),
+    notify,
+    binds: createBinds(() => layers, {}),
+  };
+  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const layers = await loadLayers({ app: bag });
+  const onHook = facade(core, layers, {
+    listenPort: 3689,
+    defaultPort: 4534,
+    env: {},
+  });
+  return {
+    playback,
+    onHook,
+    close: async () => {
+      playback.close();
+      db.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
+}
+
+const HA_INFO = {
+  remoteAddr: { transport: 'tcp', hostname: '10.4.20.172', port: 51234 },
+  completed: Promise.resolve(),
+};
+const HA_HEADERS = {
+  'user-agent': 'HomeAssistant/2026.9.3 aiohttp/3.14.3 Python/3.14',
+};
+
+Deno.test('/api/player exposes last_command with the request peer and user-agent', async () => {
+  const { playback, onHook, close } = await setupWire();
+  try {
+    // Before any mutation the field is null.
+    let res = await onHook(new Request('http://x/api/player'));
+    let body = await res.json();
+    assertEquals(body.last_command, null);
+
+    // Give the engine a queue item, then seek over the wire with HA's
+    // peer + user-agent on the request.
+    playback.queueAdd([song(90_000_000)], { play: true });
+    res = await onHook(
+      new Request('http://x/api/player/seek?position_ms=30504000', {
+        method: 'PUT',
+        headers: HA_HEADERS,
+      }),
+      HA_INFO,
+    );
+    assertEquals(res.status, 204);
+
+    res = await onHook(new Request('http://x/api/player'));
+    body = await res.json();
+    const cmd = body.last_command;
+    assertEquals(cmd.kind, 'seek');
+    assertEquals(cmd.detail, 'position_ms=30504000');
+    assertEquals(cmd.source.kind, 'http');
+    assertEquals(cmd.source.peer, '10.4.20.172');
+    assertEquals(
+      cmd.source.userAgent,
+      'HomeAssistant/2026.9.3 aiohttp/3.14.3 Python/3.14',
+    );
+    assert(typeof cmd.atMs === 'number' && cmd.atMs > 0);
+
+    // An internal mutation (no source) reads kind internal on the wire.
+    playback.pause();
+    res = await onHook(new Request('http://x/api/player'));
+    body = await res.json();
+    assertEquals(body.last_command.kind, 'pause');
+    assertEquals(body.last_command.source, { kind: 'internal' });
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('sourceFrom edge cases: no peer, no UA; UA truncated at 80', async () => {
+  const { playback, onHook, close } = await setupWire();
+  try {
+    playback.queueAdd([song(90_000_000)], { play: true });
+
+    // No info (no remoteAddr) and no user-agent header: source is bare http.
+    let res = await onHook(
+      new Request('http://x/api/player/seek?position_ms=1000', {
+        method: 'PUT',
+      }),
+    );
+    assertEquals(res.status, 204);
+    let body = await (await onHook(new Request('http://x/api/player')))
+      .json();
+    assertEquals(body.last_command.source, { kind: 'http' });
+
+    // A long user-agent is truncated to 80 chars on the wire.
+    res = await onHook(
+      new Request('http://x/api/player/seek?position_ms=2000', {
+        method: 'PUT',
+        headers: { 'user-agent': 'X'.repeat(120) },
+      }),
+      HA_INFO,
+    );
+    assertEquals(res.status, 204);
+    body = await (await onHook(new Request('http://x/api/player'))).json();
+    assertEquals(body.last_command.source.peer, '10.4.20.172');
+    assertEquals(body.last_command.source.userAgent, 'X'.repeat(80));
   } finally {
     await close();
   }

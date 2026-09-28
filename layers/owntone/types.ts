@@ -4,11 +4,32 @@
 // no src/ imports, no other hat's modules — core injects the service bag
 // declared here on context.app.
 
+/** Provenance for a mutating command (plan command-provenance) — the
+ * structural mirror of core's CommandSource (hats never import src/). */
+export interface CommandSourceRow {
+  kind: 'http' | 'internal';
+  via?: string;
+  peer?: string;
+  userAgent?: string;
+  user?: string;
+}
+
+/** The last recorded engine mutation — /api/player's last_command. */
+export interface LastCommandRow {
+  kind: string;
+  detail?: string;
+  source: CommandSourceRow;
+  atMs: number;
+}
+
 export interface HatRequest {
   params: Record<string, string>;
   query: URLSearchParams;
   method: string;
   headers: Headers;
+  /** The connection peer (pathfinder surfaces it from Deno.serve's info) —
+   * provenance for mutating commands (plan command-provenance). */
+  remoteAddr?: { transport: string; hostname: string; port: number };
   body: {
     json(): Promise<unknown>;
   };
@@ -53,20 +74,29 @@ export interface HatContext {
       /** THE playback core: every player/queue mutation and the engine
        * views. The hat parses into one command and encodes views back out —
        * it never merges stores, never emits. playerView is ENGINE ONLY
-       * (stop ⇒ no current). */
+       * (stop ⇒ no current). Mutations take a provenance source. */
       playerView(): PlayerViewRow;
       queueView(): { version: number; items: QueueEntryRow[] };
-      play(): void;
-      pause(): void;
-      stop(): void;
-      toggle(): void;
-      next(): void;
-      previous(): void;
-      setShuffle(on: boolean): void;
-      setConsume(on: boolean): void;
-      setRepeat(mode: 'off' | 'all' | 'single'): void;
-      setVolume(opts: { volume?: number; step?: number }): void;
-      seek(opts: { positionMs?: number; seekMs?: number }): boolean;
+      play(source?: CommandSourceRow): void;
+      pause(source?: CommandSourceRow): void;
+      stop(source?: CommandSourceRow): void;
+      toggle(source?: CommandSourceRow): void;
+      next(source?: CommandSourceRow): void;
+      previous(source?: CommandSourceRow): void;
+      setShuffle(on: boolean, source?: CommandSourceRow): void;
+      setConsume(on: boolean, source?: CommandSourceRow): void;
+      setRepeat(
+        mode: 'off' | 'all' | 'single',
+        source?: CommandSourceRow,
+      ): void;
+      setVolume(
+        opts: { volume?: number; step?: number },
+        source?: CommandSourceRow,
+      ): void;
+      seek(
+        opts: { positionMs?: number; seekMs?: number },
+        source?: CommandSourceRow,
+      ): boolean;
       /** OwnTone queue add: clear first, insert at position (omit = append),
        * shuffle when given, play (at playbackFromPosition) when asked. */
       queueAdd(
@@ -78,8 +108,11 @@ export interface HatContext {
           clear?: boolean;
           shuffle?: boolean;
         },
+        source?: CommandSourceRow,
       ): QueueEntryRow[];
-      queueClear(): void;
+      queueClear(source?: CommandSourceRow): void;
+      /** The last recorded engine mutation (provenance), null before any. */
+      lastCommand(): LastCommandRow | null;
     };
     artwork: {
       /** Cover image for an album/song/artist id — always an image. */
@@ -92,11 +125,12 @@ export interface HatContext {
     outputs: {
       list(): OutputRow[];
       get(id: string): OutputRow | null;
-      setEnabled(ids: string[]): boolean;
-      toggle(id: string): OutputRow | null;
+      setEnabled(ids: string[], source?: CommandSourceRow): boolean;
+      toggle(id: string, source?: CommandSourceRow): OutputRow | null;
       update(
         id: string,
         opts: { selected?: boolean; volume?: number; pin?: string },
+        source?: CommandSourceRow,
       ): OutputRow | null;
     };
     library: {

@@ -90,7 +90,10 @@ for (const row of await persistence.loadOutputs()) {
   const existing = outputs.get(row.id);
   if (existing !== null) {
     // Discovery beat the restore: keep its fresh record, apply user state.
-    outputs.update(row.id, { selected: row.selected, volume: row.volume });
+    outputs.update(row.id, { selected: row.selected, volume: row.volume }, {
+      kind: 'internal',
+      via: 'restore',
+    });
   } else if (row.host !== undefined) {
     outputs.register({
       id: row.id,
@@ -100,7 +103,7 @@ for (const row of await persistence.loadOutputs()) {
       volume: row.volume,
       host: row.host,
       ...(row.port === undefined ? {} : { port: row.port }),
-    });
+    }, { kind: 'internal', via: 'restore' });
   }
 }
 const restoreSnapshot = await planRestore({
@@ -178,7 +181,7 @@ if (airplayHost) {
       host: svc.address,
       port: svc.port,
       ...sessionFieldsFromTxt(svc.txt),
-    });
+    }, { kind: 'internal', via: 'airplay-host-env' });
     console.log(
       `[melofon] airplay: registered ${svc.address}:${svc.port} with TXT`,
     );
@@ -191,7 +194,7 @@ if (airplayHost) {
       volume: 100,
       host,
       ...(port === undefined ? {} : { port }),
-    });
+    }, { kind: 'internal', via: 'airplay-host-env' });
     console.log(
       `[melofon] airplay: registered ${host}${port ? `:${port}` : ''} (no TXT)`,
     );

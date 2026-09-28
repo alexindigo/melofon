@@ -206,7 +206,10 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         if (
           output?.selected === true && playback.playerView().state === 'play'
         ) {
-          outputs.update(id, { selected: false });
+          outputs.update(id, { selected: false }, {
+            kind: 'internal',
+            via: 'airplay-boot',
+          });
         }
         return;
       }
@@ -252,7 +255,10 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
     if (closed) return;
     if (event === 'state' && value === 'password') {
       // The device wants a password or shows a PIN (raop's pin-start path).
-      outputs.update(id, { needsAuthKey: true });
+      outputs.update(id, { needsAuthKey: true }, {
+        kind: 'internal',
+        via: 'airplay-boot',
+      });
       console.warn(
         `[melofon] airplay: output ${id} needs a PIN (POST /_/outputs/${id}/pin)`,
       );

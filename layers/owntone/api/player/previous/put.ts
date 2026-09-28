@@ -1,8 +1,8 @@
 // layers/owntone/api/player/previous/put.ts — PUT /api/player/previous (playback command).
-import { noContent } from '#owntone/payloads.ts';
-import type { HatContext } from '#owntone/types.ts';
+import { noContent, sourceFrom } from '#owntone/payloads.ts';
+import type { HatContext, HatRequest } from '#owntone/types.ts';
 
-export default (_request: unknown, context: HatContext) => {
-  context.app.playback.previous();
+export default (request: HatRequest, context: HatContext) => {
+  context.app.playback.previous(sourceFrom(request));
   return noContent();
 };

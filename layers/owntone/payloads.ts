@@ -7,7 +7,9 @@
 import type {
   AlbumRow,
   ArtistRow,
+  CommandSourceRow,
   HatContext,
+  HatRequest,
   OutputRow,
   PlaylistRow,
   QueueEntryRow,
@@ -16,6 +18,21 @@ import type {
 
 export function wireInt(hash: string): number {
   return Number(BigInt(`0x${hash.slice(0, 8)}`) & 0x7fffffffn);
+}
+
+/** Provenance for a mutating command (plan command-provenance): the
+ * request's peer + user-agent, recorded by the core as lastCommand and
+ * logged as one [cmd] line. Structural mirror of core's
+ * sourceFromRequest (hats never import src/). */
+export function sourceFrom(request: HatRequest): CommandSourceRow {
+  const userAgent = request.headers.get('user-agent') ?? undefined;
+  return {
+    kind: 'http',
+    ...(request.remoteAddr?.hostname !== undefined
+      ? { peer: request.remoteAddr.hostname }
+      : {}),
+    ...(userAgent !== undefined ? { userAgent: userAgent.slice(0, 80) } : {}),
+  };
 }
 
 const ALL = Number.MAX_SAFE_INTEGER;

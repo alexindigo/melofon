@@ -6,14 +6,18 @@
 import { airplayOutputId } from '../../src/boots/airplay.ts';
 import { sessionFieldsFromTxt } from '../../src/boots/airplay-mdns.ts';
 import type { MdnsService } from '../../src/mdns.ts';
-import type { Output } from '../../src/player.ts';
+import {
+  type CommandSource,
+  type Output,
+  sourceFromRequest,
+} from '../../src/player.ts';
 
 interface OutputsApp {
   app: {
     outputs: {
       list(): Output[];
       get(id: string): Output | null;
-      register(output: Output): void;
+      register(output: Output, source?: CommandSource): void;
     };
     airplay?: {
       resolve(address: string): Promise<MdnsService | null>;
@@ -26,9 +30,14 @@ function badRequest(message: string): Response {
 }
 
 export default async function (
-  request: { body: { json(): Promise<unknown> } },
+  request: {
+    body: { json(): Promise<unknown> };
+    headers?: { get(name: string): string | null };
+    remoteAddr?: { hostname?: string };
+  },
   context: OutputsApp,
 ) {
+  const source = sourceFromRequest(request);
   let body: unknown;
   try {
     body = await request.body.json();
@@ -72,13 +81,13 @@ export default async function (
       host: svc.address,
       port: svc.port,
       ...sessionFieldsFromTxt(svc.txt),
-    });
+    }, source);
   } else {
     context.app.outputs.register({
       ...base,
       host: address,
       ...(port === undefined ? {} : { port }),
-    });
+    }, source);
   }
   return { output: context.app.outputs.get(id) };
 }

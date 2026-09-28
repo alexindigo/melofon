@@ -1,7 +1,12 @@
 // layers/owntone/api/player/volume/put.ts — PUT /api/player/volume:
 // ?volume= absolute (wins) or ?step  = relative; ?output_id= targets one
 // output instead of the master. Missing both volume and step → 400.
-import { badRequest, intParam, noContent } from '#owntone/payloads.ts';
+import {
+  badRequest,
+  intParam,
+  noContent,
+  sourceFrom,
+} from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
 
 export default (request: HatRequest, context: HatContext) => {
@@ -15,15 +20,15 @@ export default (request: HatRequest, context: HatContext) => {
     }
     context.app.outputs.update(outputId, {
       volume: volume ?? output.volume + (step ?? 0),
-    });
+    }, sourceFrom(request));
     return noContent();
   }
   if (volume !== null) {
-    context.app.playback.setVolume({ volume });
+    context.app.playback.setVolume({ volume }, sourceFrom(request));
     return noContent();
   }
   if (step !== null) {
-    context.app.playback.setVolume({ step });
+    context.app.playback.setVolume({ step }, sourceFrom(request));
     return noContent();
   }
   return badRequest();

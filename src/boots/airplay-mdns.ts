@@ -151,7 +151,10 @@ export function createAirplayDiscovery(
     if (event === 'down') {
       const parsed = parseInstance(svc.name);
       if (parsed !== null && discovered.delete(parsed.id)) {
-        outputs.unregister(parsed.id);
+        outputs.unregister(parsed.id, {
+          kind: 'internal',
+          via: 'airplay-discovery',
+        });
       }
       return;
     }
@@ -238,7 +241,7 @@ export function createAirplayDiscovery(
       ...fields,
       ...(existing?.needsAuthKey !== undefined &&
         { needsAuthKey: existing.needsAuthKey }),
-    });
+    }, { kind: 'internal', via: 'airplay-discovery' });
     discovered.add(parsed.id);
   };
 
@@ -250,7 +253,9 @@ export function createAirplayDiscovery(
   const stop = () => {
     browser?.close();
     browser = null;
-    for (const id of discovered) outputs.unregister(id);
+    for (const id of discovered) {
+      outputs.unregister(id, { kind: 'internal', via: 'airplay-discovery' });
+    }
     discovered.clear();
   };
 

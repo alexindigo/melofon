@@ -16,6 +16,7 @@ import {
   intParam,
   notFound,
   queueItemPayload,
+  sourceFrom,
 } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest, SongRow } from '#owntone/types.ts';
 
@@ -102,7 +103,7 @@ export default async (request: HatRequest, context: HatContext) => {
     play: request.query.get('playback') === 'start',
     clear: boolParam(request.query.get('clear')),
     shuffle: shuffleParam === null ? undefined : boolParam(shuffleParam),
-  });
+  }, sourceFrom(request));
 
   const albumArtist = albumArtistResolver(context.app);
   return {

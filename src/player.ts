@@ -64,6 +64,23 @@ export function logCmd(
   );
 }
 
+/** Build a CommandSource from a pathfinder request view (peer +
+ * user-agent). Core endpoints use this; the owntone hat mirrors it
+ * structurally (hats never import src/). */
+export function sourceFromRequest(request: {
+  headers?: { get(name: string): string | null };
+  remoteAddr?: { hostname?: string };
+}): CommandSource {
+  const userAgent = request.headers?.get('user-agent') ?? undefined;
+  return {
+    kind: 'http',
+    ...(request.remoteAddr?.hostname !== undefined
+      ? { peer: request.remoteAddr.hostname }
+      : {}),
+    ...(userAgent !== undefined ? { userAgent: userAgent.slice(0, 80) } : {}),
+  };
+}
+
 /** What an end-of-item transition touched (the playback core emits on it). */
 export type AdvanceResult = 'none' | 'player' | 'player+queue';
 
@@ -270,13 +287,15 @@ export interface Output {
 export interface Outputs {
   list(): Output[];
   get(id: string): Output | null;
-  /** Adds a boot's output; last-wins when the id is already registered. */
-  register(output: Output): void;
+  /** Adds a boot's output; last-wins when the id is already registered.
+   * Mutations take a provenance source like the player commands (plan
+   * command-provenance): [cmd]-logged, no wire surface this round. */
+  register(output: Output, source?: CommandSource): void;
   /** Removes a registered output; false when the id was never registered. */
-  unregister(id: string): boolean;
+  unregister(id: string, source?: CommandSource): boolean;
   /** Enables exactly the given ids; false when any id is unknown. */
-  setEnabled(ids: string[]): boolean;
-  toggle(id: string): Output | null;
+  setEnabled(ids: string[], source?: CommandSource): boolean;
+  toggle(id: string, source?: CommandSource): Output | null;
   /** selected/volume/needsAuthKey are state (stored, emitted); pin is a
    * command — delivered synchronously to onCommand listeners (the boots),
    * never stored. */
@@ -288,6 +307,7 @@ export interface Outputs {
       pin?: string;
       needsAuthKey?: boolean;
     },
+    source?: CommandSource,
   ): Output | null;
   /** Boots subscribe here for pin commands routed through update(). */
   onCommand(fn: (id: string, cmd: { pin?: string }) => void): void;
@@ -593,43 +613,58 @@ export function createOutputs(
       const found = find(id);
       return found === null ? null : { ...found };
     },
-    register(output) {
+    register(output, source) {
       const idx = outputs.findIndex((o) => o.id === output.id);
       if (idx === -1) outputs.push({ ...output });
       else outputs[idx] = { ...output };
       saveRow(find(output.id)!);
+      logCmd('output.register', output.id, source ?? { kind: 'internal' });
       emit(['outputs']);
     },
-    unregister(id) {
+    unregister(id, source) {
       const idx = outputs.findIndex((o) => o.id === id);
       if (idx === -1) return false;
       outputs.splice(idx, 1);
       // The persisted row stays: last-seen state for a re-announcement.
+      logCmd('output.unregister', id, source ?? { kind: 'internal' });
       emit(['outputs']);
       return true;
     },
-    setEnabled(ids) {
+    setEnabled(ids, source) {
       if (ids.some((id) => find(id) === null)) return false;
       for (const o of outputs) o.selected = ids.includes(o.id);
       for (const o of outputs) saveRow(o);
+      logCmd(
+        'output.setEnabled',
+        ids.join(','),
+        source ?? { kind: 'internal' },
+      );
       emit(['outputs']);
       return true;
     },
-    toggle(id) {
+    toggle(id, source) {
       const found = find(id);
       if (found === null) return null;
       found.selected = !found.selected;
       saveRow(found);
+      logCmd('output.toggle', id, source ?? { kind: 'internal' });
       emit(['outputs']);
       return { ...found };
     },
-    update(id, opts) {
+    update(id, opts, source) {
       const found = find(id);
       if (found === null) return null;
       if (opts.selected !== undefined) found.selected = opts.selected;
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
       if (opts.selected !== undefined || opts.volume !== undefined) {
         saveRow(found);
+        logCmd(
+          'output.update',
+          id +
+            (opts.selected !== undefined ? ` selected=${opts.selected}` : '') +
+            (opts.volume !== undefined ? ` volume=${opts.volume}` : ''),
+          source ?? { kind: 'internal' },
+        );
       }
       if (opts.needsAuthKey !== undefined) {
         found.needsAuthKey = opts.needsAuthKey;
