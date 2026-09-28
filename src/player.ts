@@ -25,6 +25,45 @@ export interface QueueEntry {
 export type PlayerState = 'play' | 'pause' | 'stop';
 export type RepeatMode = 'off' | 'all' | 'single';
 
+/** Provenance for an engine-affecting command (plan command-provenance):
+ * who asked, from where. 'http' for hat/core requests; 'internal' for
+ * core-driven mutations (boot, retry, restore) with `via` naming who. */
+export interface CommandSource {
+  kind: 'http' | 'internal';
+  /** internal only: which core component drove it ('airplay-boot', …). */
+  via?: string;
+  peer?: string;
+  userAgent?: string;
+  user?: string;
+}
+
+/** The last engine mutation, for the /api/player last_command surface. */
+export interface LastCommand {
+  /** 'seek' | 'play' | 'pause' | 'queueAdd' | 'volume' | 'restore' | … */
+  kind: string;
+  /** e.g. 'position_ms=30504000' — never credentials. */
+  detail?: string;
+  source: CommandSource;
+  atMs: number;
+}
+
+/** One greppable line per engine mutation (plan command-provenance) — the
+ * 2026-09-24 ghost-writer incident would have been one such line each. */
+export function logCmd(
+  kind: string,
+  detail: string | undefined,
+  source: CommandSource,
+): void {
+  const by = source.kind === 'http'
+    ? `http ${source.peer ?? '?'}` +
+      (source.user ? ` user=${source.user}` : '') +
+      (source.userAgent ? ` (${source.userAgent})` : '')
+    : `internal:${source.via ?? 'core'}`;
+  console.log(
+    `[cmd] ${kind}${detail !== undefined ? ` ${detail}` : ''} by ${by}`,
+  );
+}
+
 /** What an end-of-item transition touched (the playback core emits on it). */
 export type AdvanceResult = 'none' | 'player' | 'player+queue';
 

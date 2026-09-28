@@ -226,7 +226,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
         // current record (output.host re-read per attempt). A user pause in
         // this window can be lifted once — accepted edge, same as upstream.
         if (failurePaused) {
-          playback.play();
+          playback.play({ kind: 'internal', via: 'airplay-boot' });
           failurePaused = false;
         }
         reconcile();
@@ -263,7 +263,7 @@ export function createAirplayBoot(deps: AirplayBootDeps): {
       // pb_suspend first: if nothing is live anywhere, pause the player —
       // honest surface while the retry tries (OwnTone's exact cleanup move).
       if (!anyLiveSessions()) {
-        playback.pause();
+        playback.pause({ kind: 'internal', via: 'airplay-boot' });
         failurePaused = true;
       }
       // Links flap and devices move — retry with backoff unless disabled via

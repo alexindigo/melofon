@@ -113,7 +113,7 @@ const restoreSnapshot = await planRestore({
 });
 const restoredEngine = restoreSnapshot !== null;
 if (restoreSnapshot !== null) {
-  player.restore(restoreSnapshot);
+  playback.restore(restoreSnapshot);
   console.log(
     `[melofon] restore: ${restoreSnapshot.queue.length} queued, ` +
       `state ${restoreSnapshot.state}` +
