@@ -8,6 +8,12 @@
  *                                  non-zero PCM (progress after 88200 samples).
  *   driver <port> authsetup      — supports_auth_setup → POST /auth-setup
  *                                  before ANNOUNCE.
+ *   driver <port> schedfail      — failure injection (LD_PRELOAD): the first
+ *                                  start's enqueue fails → API must reject →
+ *                                  retry must recover the queue and connect.
+ *   driver <port> teardownfail   — failure injection: the teardown enqueue
+ *                                  fails → raop_free must still fully release
+ *                                  the handle and RETURN (not hang).
  * Prints DRIVER-OK on success. */
 #include <stdbool.h>
 #include <stdint.h>
@@ -111,13 +117,15 @@ main(int argc, char **argv)
   bool fail;
   bool contract;
   bool authsetup;
+  bool schedfail;
+  bool teardownfail;
   int port;
   int feed_seconds = 0;
   int feed_bytes;
 
   if (argc < 2)
     {
-      fprintf(stderr, "usage: driver <port> [backlog <feed_seconds> | fail | contract | authsetup]\n");
+      fprintf(stderr, "usage: driver <port> [backlog <feed_seconds> | fail | contract | authsetup | schedfail | teardownfail]\n");
       return 2;
     }
   port = atoi(argv[1]);
@@ -125,6 +133,8 @@ main(int argc, char **argv)
   fail = argc > 2 && strcmp(argv[2], "fail") == 0;
   contract = argc > 2 && strcmp(argv[2], "contract") == 0;
   authsetup = argc > 2 && strcmp(argv[2], "authsetup") == 0;
+  schedfail = argc > 2 && strcmp(argv[2], "schedfail") == 0;
+  teardownfail = argc > 2 && strcmp(argv[2], "teardownfail") == 0;
   if (backlog)
     feed_seconds = atoi(argv[3]);
 
@@ -137,6 +147,34 @@ main(int argc, char **argv)
       return 1;
     }
 
+  if (schedfail)
+    {
+      /* The first start's command-queue scheduling is injected to fail
+       * (RAOP_FI_EBO_FAIL_AT=1): raop_start must reject it, and the retry
+       * must recover the queue — the fake device seeing the handshake is
+       * the wire-observable proof. On the pre-repair library the retry
+       * wedges (cmds_scheduled stuck) and connected never arrives. */
+      if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0, 0,
+                     1000, 0, 0, 0, "", "") >= 0)
+        {
+          fprintf(stderr, "driver: schedfail: first start was not rejected\n");
+          return 1;
+        }
+      if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0, 0,
+                     1000, 0, 0, 0, "", "") < 0)
+        {
+          fprintf(stderr, "driver: schedfail: retry rejected\n");
+          return 1;
+        }
+      if (wait_event(h, "\"connected\"", 15000) < 0)
+        return 1;
+      raop_teardown(h);
+      wait_event(h, "\"stopped\"", 10000);
+      raop_free(h);
+      printf("DRIVER-OK\n");
+      return 0;
+    }
+
   if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0, 0,
                  contract ? 3000 : 1000,
                  contract ? 7 : 0,
@@ -145,6 +183,26 @@ main(int argc, char **argv)
                  contract ? "Cool Vibes" : "",
                  contract ? "Blue Tattoo" : "") < 0)
     return 1;
+
+  if (teardownfail)
+    {
+      /* The teardown enqueue is injected to fail (RAOP_FI_EBO_FAIL_AT=2):
+       * raop_teardown must say so, and raop_free must still fully release
+       * the handle — the loop-thread free tears the still-attached device
+       * down — and RETURN. On the pre-repair library raop_free wedges the
+       * queue and blocks forever here (the runner's timeout is the red). */
+      if (wait_event(h, "\"connected\"", 15000) < 0)
+        return 1;
+      if (raop_teardown(h) >= 0)
+        {
+          fprintf(stderr,
+                  "driver: teardownfail: teardown was not rejected\n");
+          return 1;
+        }
+      raop_free(h);
+      printf("DRIVER-OK\n");
+      return 0;
+    }
 
   if (fail)
     {

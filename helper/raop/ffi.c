@@ -25,7 +25,7 @@
  *   int raop_teardown(raop_t *);
  *   int raop_pin(raop_t *, pin);
  *   int raop_poll(raop_t *, buf, cap)    — JSON bytes, 0 = none
- *   void raop_free(raop_t *);
+ *   int raop_free(raop_t *);             — 0 = released, -1 = leaked (said so)
  */
 
 #ifdef HAVE_CONFIG_H
@@ -481,7 +481,12 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             /* Free on the loop thread: the queue is drained and every
              * earlier once-callback for this handle has already run (FIFO) —
              * nothing pending references h any more. The player's tick
-             * cannot see it (unlinked before CMD_FREE was queued). */
+             * cannot see it (unlinked before CMD_FREE was queued). A device
+             * still attached (the caller's teardown enqueue failed) is torn
+             * down here, so a 0 from raop_free always means fully
+             * released. */
+            if (h->device)
+              device_teardown(h);
             raop_player_free(h->player);
             pthread_mutex_destroy(&h->events_lock);
             pthread_mutex_destroy(&h->cmds_lock);
@@ -498,7 +503,14 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
 
 /* API thread: queue a command onto the loop. At most one drain callback is
  * pending per handle at a time (cmds_scheduled) — a second pending callback
- * could run after a CMD_FREE freed the handle (the JBL-403 crash). */
+ * could run after a CMD_FREE freed the handle (the JBL-403 crash).
+ *
+ * Failure contract (plan atv3-session-recycle): if event_base_once fails,
+ * the push is ROLLED BACK — command unlinked, cmds_scheduled restored — and
+ * -1 is returned. Without the rollback the queue would be permanently
+ * undrainable: the command stays linked with no drain pending, the stuck
+ * cmds_scheduled blocks every later schedule, and raop_free would wait
+ * forever on its CMD_FREE. */
 static int
 cmd_push(raop_t *h, cmd *c)
 {
@@ -520,7 +532,37 @@ cmd_push(raop_t *h, cmd *c)
     return 0; /* the pending drain will see this command */
 
   /* Wakes the loop (evthread). Executes the queue ASAP. */
-  return event_base_once(rt.base, -1, EV_TIMEOUT, cmds_drain_cb, h, &zero);
+  if (event_base_once(rt.base, -1, EV_TIMEOUT, cmds_drain_cb, h, &zero) < 0)
+    {
+      cmd **link;
+
+      pthread_mutex_lock(&h->cmds_lock);
+      /* c is in the queue (we just linked it) and no drain callback is
+       * pending — schedule was true ⇔ cmds_scheduled was 0 — so nothing
+       * can have consumed it. Other threads may have appended behind it.
+       * The failed push owns c: unlink it, free it, restore the flag. */
+      link = &h->cmds_head;
+      while (*link && *link != c)
+        link = &(*link)->next;
+      if (*link == c)
+        {
+          cmd *tail;
+
+          *link = c->next;
+          if (h->cmds_tail == c)
+            {
+              tail = NULL;
+              for (link = &h->cmds_head; *link; link = &(*link)->next)
+                tail = *link;
+              h->cmds_tail = tail;
+            }
+        }
+      h->cmds_scheduled = 0;
+      pthread_mutex_unlock(&h->cmds_lock);
+      free(c);
+      return -1;
+    }
+  return 0;
 }
 
 /* ------------------------------------------------------------------ runtime */
@@ -782,7 +824,12 @@ raop_poll(raop_t *h, char *buf, size_t cap)
   return (int)len;
 }
 
-void
+/* Teardown (if needed), free, and release the shared runtime. Returns 0
+ * when the handle was provably released (the loop thread ran the free) and
+ * -1 when the free could not be queued — the handle is then leaked BY
+ * DESIGN (never a use-after-free), and the caller must treat cleanup as
+ * failed, not as success (plan atv3-session-recycle). */
+int
 raop_free(raop_t *h)
 {
   raop_t **link;
@@ -790,15 +837,19 @@ raop_free(raop_t *h)
   cmd *c;
 
   if (!h)
-    return;
+    return -1;
 
-  /* Teardown first if the caller didn't. */
+  /* Teardown first if the caller didn't. A failed teardown enqueue is not
+   * fatal: the STOPPED wait would just time out, so skip it — the CMD_FREE
+   * path tears a still-attached device down on the loop thread. */
   if (h->device)
     {
-      raop_teardown(h);
-      /* Wait for the loop to run the teardown (state -> stopped). */
-      for (int i = 0; i < 5000 && h->state != OUTPUT_STATE_STOPPED; i++)
-        usleep(1000);
+      if (raop_teardown(h) == 0)
+        {
+          /* Wait for the loop to run the teardown (state -> stopped). */
+          for (int i = 0; i < 5000 && h->state != OUTPUT_STATE_STOPPED; i++)
+            usleep(1000);
+        }
     }
 
   /* Out of the registry before the free is queued. */
@@ -820,12 +871,12 @@ raop_free(raop_t *h)
   c = calloc(1, sizeof(*c));
   if (!c)
     {
-      /* Can't queue the free — leak the handle rather than UAF (the process
-       * is on its way out anyway in that world). */
+      /* Can't queue the free — leak the handle rather than UAF, and SAY so
+       * (the caller cannot tell a leak from a release without the -1). */
       pthread_mutex_destroy(&sync.lock);
       pthread_cond_destroy(&sync.cond);
       runtime_release();
-      return;
+      return -1;
     }
   c->type = CMD_FREE;
   c->sync = &sync;
@@ -833,12 +884,12 @@ raop_free(raop_t *h)
   pthread_mutex_lock(&sync.lock);
   if (cmd_push(h, c) < 0)
     {
+      /* cmd_push owns (freed) c on a scheduling failure. */
       pthread_mutex_unlock(&sync.lock);
-      free(c);
       pthread_mutex_destroy(&sync.lock);
       pthread_cond_destroy(&sync.cond);
       runtime_release();
-      return;
+      return -1;
     }
   while (!sync.done)
     pthread_cond_wait(&sync.cond, &sync.lock);
@@ -847,4 +898,5 @@ raop_free(raop_t *h)
   pthread_cond_destroy(&sync.cond);
 
   runtime_release();
+  return 0;
 }

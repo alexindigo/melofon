@@ -54,8 +54,12 @@ int raop_pin(raop_t *h, const char *pin);
  * events), -1 on error. */
 int raop_poll(raop_t *h, char *buf, size_t cap);
 
-/* Teardown (if needed), free, and release the shared runtime. */
-void raop_free(raop_t *h);
+/* Teardown (if needed), free, and release the shared runtime. Returns 0
+ * when the handle was provably released (the loop thread ran the free) and
+ * -1 when the free could not be queued — the handle is then leaked BY
+ * DESIGN (never a use-after-free) and the caller must treat cleanup as
+ * failed, not report retirement success. */
+int raop_free(raop_t *h);
 
 #ifdef __cplusplus
 }

@@ -46,10 +46,16 @@ libmelofon_raop.so: $(OBJ)
 test/driver: test/driver.o libmelofon_raop.so
 	$(CC) -o $@ test/driver.o -L. -lmelofon_raop -Wl,-rpath,'$$ORIGIN/..'
 
-test: libmelofon_raop.so test/driver
+# Test-only failure-injection interposer (LD_PRELOAD; never linked into the
+# library or the driver) for the queue/cleanup failure-contract scenarios.
+test/faultinject.so: test/faultinject.c
+	$(CC) $(CFLAGS) -shared -o $@ $< -ldl
+
+test: libmelofon_raop.so test/driver test/faultinject.so
 	python3 test/run_fake_device_test.py
 
 clean:
-	rm -f $(OBJ) test/driver.o libmelofon_raop.so test/driver
+	rm -f $(OBJ) test/driver.o libmelofon_raop.so test/driver \
+	  test/faultinject.so test/probe_free_contract
 
 .PHONY: test clean

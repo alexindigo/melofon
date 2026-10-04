@@ -237,12 +237,123 @@ def authsetup_scenario():
     print('authsetup test: OK (POST /auth-setup before ANNOUNCE)')
 
 
+# --- Failure-injection scenarios (plan atv3-session-recycle) -------------
+# The queue/cleanup failure contract: cmd_push must roll back a failed
+# event_base_once (else the queue wedges permanently and raop_free hangs),
+# and raop_free must report whether the handle was provably released.
+# faultinject.so interposes event_base_once/calloc via LD_PRELOAD.
+
+FAULTINJECT = os.path.join(HERE, 'faultinject.so')
+PROBE_SRC = os.path.join(HERE, 'probe_free_contract.c')
+PROBE_BIN = os.path.join(HERE, 'probe_free_contract')
+LIBDIR = os.path.dirname(HERE)
+
+
+def injected_driver(args, env_extra, timeout=45):
+    env = dict(os.environ)
+    env['LD_PRELOAD'] = FAULTINJECT
+    env.update(env_extra)
+    return subprocess.run([DRIVER] + args, capture_output=True, text=True,
+                          timeout=timeout, env=env)
+
+
+def schedfail_scenario():
+    """The queue wedge: the START push's event_base_once fails. The API
+    must reject it, and the retry must recover the queue — the fake device
+    seeing the full handshake is the wire-observable recovery proof. Red on
+    the pre-repair base: the retry wedges (cmds_scheduled stuck at 1 with
+    no drain pending) and connected never arrives (runner timeout)."""
+    fake, port = start_fake()
+    driver = injected_driver([port, 'schedfail'], {'RAOP_FI_EBO_FAIL_AT': '1'})
+    report = read_report(fake)
+    fake.kill()
+
+    assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+        f'schedfail driver failed: {driver.returncode} ' \
+        f'{driver.stdout} {driver.stderr[-400:]}'
+    assert report is not None, 'fake device produced no report'
+    seq = report['requests']
+    for expected in ['OPTIONS', 'ANNOUNCE', 'SETUP', 'RECORD']:
+        assert expected in seq, f'retry did not reach the wire: {seq}'
+    print('schedfail test: OK (failed enqueue rejected, retry recovered '
+          'the queue)')
+
+
+def teardownfail_scenario():
+    """The cleanup wedge: the TEARDOWN push's event_base_once fails.
+    raop_teardown must reject it, and raop_free must still fully release
+    the handle — the loop-thread free tears the still-attached device
+    down — and RETURN. Red on the pre-repair base: raop_free wedges the
+    queue and blocks forever on its CMD_FREE wait (runner timeout)."""
+    fake, port = start_fake()
+    driver = injected_driver([port, 'teardownfail'], {'RAOP_FI_EBO_FAIL_AT': '2'})
+    fake.kill()
+
+    assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+        f'teardownfail driver failed (hang?): {driver.returncode} ' \
+        f'{driver.stdout} {driver.stderr[-400:]}'
+    print('teardownfail test: OK (failed teardown enqueue, free still '
+          'released and returned)')
+
+
+def free_contract_scenario():
+    """raop_free's result is observable: injected free-path failures — the
+    scheduling branch and the allocation branch alike — surface as -1, and
+    the process exits cleanly (the leaked handle is reported, not hidden).
+    The probe does not compile against the pre-repair void header: that
+    build failure is this scenario's red on the base."""
+    build = subprocess.run(
+        ['cc', '-O1', '-o', PROBE_BIN, PROBE_SRC,
+         '-L', LIBDIR, '-lmelofon_raop', '-Wl,-rpath', LIBDIR],
+        capture_output=True, text=True)
+    assert build.returncode == 0, \
+        f'probe build failed (pre-repair void raop_free?): {build.stderr}'
+
+    try:
+        # Scheduling branch: pushes are START(1), TEARDOWN(2), FREE(3).
+        fake, port = start_fake()
+        env = dict(os.environ)
+        env['LD_PRELOAD'] = FAULTINJECT
+        env['RAOP_FI_EBO_FAIL_AT'] = '3'
+        probe = subprocess.run([PROBE_BIN, port], capture_output=True,
+                               text=True, timeout=45, env=env)
+        fake.kill()
+        assert probe.returncode == 0 and 'FREE-RC=-1' in probe.stdout, \
+            f'scheduling-branch free failure not observed: ' \
+            f'{probe.returncode} {probe.stdout} {probe.stderr[-300:]}'
+
+        # Allocation branch: the armed one-shot fails the CMD_FREE calloc.
+        arm = os.path.join(HERE, '.fi-arm')
+        if os.path.exists(arm):
+            os.unlink(arm)
+        fake, port = start_fake()
+        env = dict(os.environ)
+        env['LD_PRELOAD'] = FAULTINJECT
+        env['RAOP_FI_CALLOC_ARM_FILE'] = arm
+        probe = subprocess.run([PROBE_BIN, port], capture_output=True,
+                               text=True, timeout=45, env=env)
+        fake.kill()
+        assert not os.path.exists(arm), 'the injected calloc never fired'
+        assert probe.returncode == 0 and 'FREE-RC=-1' in probe.stdout, \
+            f'allocation-branch free failure not observed: ' \
+            f'{probe.returncode} {probe.stdout} {probe.stderr[-300:]}'
+    finally:
+        if os.path.exists(PROBE_BIN):
+            os.unlink(PROBE_BIN)
+
+    print('free-contract test: OK (free failures observable as -1, both '
+          'branches)')
+
+
 def main():
     standard_scenario()
     backlog_scenario()
     fail_scenario()
     contract_scenario()
     authsetup_scenario()
+    schedfail_scenario()
+    teardownfail_scenario()
+    free_contract_scenario()
     return 0
 
 
