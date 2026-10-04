@@ -1,132 +1,18 @@
 // tests/raop-ffi.test.ts — the FFI transport end-to-end, all in-process:
-// Deno.dlopen loads libmelofon_raop, a fake RAOP device (Deno TCP/UDP, same
-// wire shape as helper/raop/test/fake_raop.py) answers RTSP and counts RTP
-// packets. start → connected → PCM streams → volume → teardown → stopped.
-// Gated on the built library existing, so dev machines without
-// `make -C helper/raop` still run the suite green. Sanitizers off: the
-// dlopen'd library is process-lifetime by design.
-import { assert, assertEquals } from '@std/assert';
-import dgram from 'node:dgram';
+// Deno.dlopen loads libmelofon_raop, a fake RAOP device (tests/helpers/
+// fake-raop.ts, same wire shape as helper/raop/test/fake_raop.py) answers
+// RTSP and counts RTP packets. start → connected → PCM streams → volume →
+// teardown → stopped. Gated on the built library existing, so dev machines
+// without `make -C helper/raop` still run the suite green. Sanitizers off:
+// the dlopen'd library is process-lifetime by design.
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
+import { startFakeRaop } from './helpers/fake-raop.ts';
 
 const LIB_PATH = decodeURIComponent(
   new URL('../helper/raop/libmelofon_raop.so', import.meta.url).pathname,
 );
 const HAVE_LIB = await Deno.stat(LIB_PATH).then(() => true).catch(() => false);
-
-/** Minimal fake AirPlay 1 device: enough RTSP to get the library streaming,
- * a UDP socket counting RTP audio packets. */
-async function startFakeRaop() {
-  const state = {
-    requests: [] as string[],
-    volumeParams: [] as string[],
-    flushes: 0,
-    teardowns: 0,
-    audioPackets: 0,
-  };
-
-  const udp = dgram.createSocket('udp4');
-  await new Promise<void>((resolve, reject) => {
-    udp.once('error', reject);
-    udp.bind(0, () => resolve());
-  });
-  const audioPort = udp.address().port;
-  udp.on('message', (msg) => {
-    if (msg.length >= 12) state.audioPackets++;
-  });
-
-  const tcp = Deno.listen({ port: 0 });
-  const port = (tcp.addr as Deno.NetAddr).port;
-
-  const respond = async (conn: Deno.TcpConn) => {
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
-    let buf = new Uint8Array(0);
-    const readSome = async () => {
-      const chunk = new Uint8Array(8192);
-      const n = await conn.read(chunk);
-      if (n === null) return false;
-      const next = new Uint8Array(buf.length + n);
-      next.set(buf);
-      next.set(chunk.subarray(0, n), buf.length);
-      buf = next;
-      return true;
-    };
-    const headerEnd = () => {
-      for (let i = 0; i + 3 < buf.length; i++) {
-        if (
-          buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 &&
-          buf[i + 3] === 10
-        ) return i + 4;
-      }
-      return -1;
-    };
-    try {
-      for (;;) {
-        while (headerEnd() === -1) {
-          if (!(await readSome())) return;
-        }
-        const headLen = headerEnd();
-        const head = decoder.decode(buf.subarray(0, headLen));
-        const lines = head.split('\r\n');
-        const method = lines[0].split(' ')[0];
-        const headers = new Map<string, string>();
-        for (const line of lines.slice(1)) {
-          const idx = line.indexOf(': ');
-          if (idx > 0) {
-            headers.set(line.slice(0, idx).toLowerCase(), line.slice(idx + 2));
-          }
-        }
-        const clen = Number(headers.get('content-length') ?? '0');
-        while (buf.length < headLen + clen) {
-          if (!(await readSome())) return;
-        }
-        const body = decoder.decode(buf.subarray(headLen, headLen + clen));
-        buf = buf.subarray(headLen + clen);
-
-        state.requests.push(method);
-        if (method === 'SET_PARAMETER' && body.startsWith('volume')) {
-          state.volumeParams.push(body.trim());
-        }
-        if (method === 'FLUSH') state.flushes++;
-        if (method === 'TEARDOWN') state.teardowns++;
-
-        const cseq = headers.get('cseq') ?? '0';
-        let extra = '';
-        if (method === 'OPTIONS') {
-          extra =
-            'Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, SET_PARAMETER, POST, GET_PARAMETER\r\n';
-        } else if (method === 'SETUP') {
-          extra =
-            `Session: DEADBEEF\r\nTransport: RTP/AVP/UDP;unicast;mode=record;server_port=${audioPort};control_port=${
-              audioPort + 1
-            };timing_port=${audioPort + 2}\r\n`;
-        } else if (method === 'RECORD') {
-          extra = 'Audio-Latency: 11025\r\n';
-        }
-        await conn.write(encoder.encode(
-          `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\n${extra}Server: fake-raop\r\nContent-Length: 0\r\n\r\n`,
-        ));
-      }
-    } catch { /* client went away */ }
-  };
-  void (async () => {
-    for await (const conn of tcp) void respond(conn);
-  })();
-
-  return {
-    port,
-    state,
-    close() {
-      try {
-        tcp.close();
-      } catch { /* already closed */ }
-      try {
-        udp.close();
-      } catch { /* already closed */ }
-    },
-  };
-}
 
 async function until(what: string, fn: () => boolean, timeoutMs = 15000) {
   const deadline = performance.now() + timeoutMs;
@@ -164,7 +50,10 @@ Deno.test({
       // The wire — not a 'streaming' event (raop.c raises it only on a
       // timing-dependent status path) — is the honest streaming signal.
       await transport.pcm(new Uint8Array(176400));
-      await until('RTP packets arrive', () => fake.state.audioPackets > 100);
+      await until(
+        'RTP packets arrive',
+        () => (fake.sessions[0]?.audioPackets ?? 0) > 100,
+      );
 
       await transport.send({ cmd: 'volume', volume: 42 });
       await transport.send({ cmd: 'teardown' });
@@ -173,6 +62,9 @@ Deno.test({
         () => events.some(([e, v]) => e === 'state' && v === 'stopped'),
       );
 
+      const session = fake.sessions[0];
+      assert(session !== undefined, 'one RTSP session');
+      const methods = session.requests.map((r) => r.method);
       for (
         const expected of [
           'OPTIONS',
@@ -184,17 +76,146 @@ Deno.test({
         ]
       ) {
         assert(
-          fake.state.requests.includes(expected),
-          `missing RTSP ${expected}: ${fake.state.requests}`,
+          methods.includes(expected),
+          `missing RTSP ${expected}: ${methods}`,
         );
       }
-      assertEquals(fake.state.teardowns, 1);
+      assertEquals(session.teardowns, 1);
       assert(
-        fake.state.volumeParams.some((v) => v.startsWith('volume: -17.')),
-        `volume command missing: ${fake.state.volumeParams}`,
+        session.volumeParams.some((v) => v.startsWith('volume: -17.')),
+        `volume command missing: ${session.volumeParams}`,
       );
     } finally {
       await transport.close().catch(() => {});
+      fake.close();
+    }
+  },
+});
+
+Deno.test({
+  name: 'FFI transport: send on a closed transport rejects; close is memoized',
+  ignore: !HAVE_LIB,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const fake = await startFakeRaop();
+    const transport = createFfiSpawn()(() => {});
+    try {
+      await transport.send({
+        cmd: 'start',
+        host: '127.0.0.1',
+        port: fake.port,
+        name: 'closed-contract',
+        volume: 50,
+      });
+      const first = transport.close();
+      const second = transport.close();
+      assert(first === second, 'close memoizes its promise');
+      await first; // resolves: native cleanup proven
+      await second; // a repeated close reuses the result
+      await assertRejects(
+        () => transport.send({ cmd: 'volume', volume: 10 }),
+        Error,
+        'closed transport',
+      );
+    } finally {
+      fake.close();
+    }
+  },
+});
+
+Deno.test({
+  name: 'FFI transport: a flush abandons a backpressured in-flight pcm write',
+  ignore: !HAVE_LIB,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const fake = await startFakeRaop();
+    const events: [string, string | undefined][] = [];
+    const transport = createFfiSpawn()((event, value) =>
+      events.push([event, value])
+    );
+    try {
+      await transport.send({
+        cmd: 'start',
+        host: '127.0.0.1',
+        port: fake.port,
+        name: 'writegen',
+        volume: 80,
+      });
+      await until(
+        'connected',
+        () => events.some(([e, v]) => e === 'state' && v === 'connected'),
+      );
+      // 4 s of PCM in one call: the ~2 s native cap parks the write in
+      // backpressure, and realtime pacing would drain it over ~4 s.
+      const started = performance.now();
+      const pending = transport.pcm(new Uint8Array(4 * 176400));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await transport.send({ cmd: 'flush' }); // bumps the write generation
+      await pending; // must return promptly, not after the realtime drain
+      const elapsed = performance.now() - started;
+      assert(
+        // The full drain would take ~4 s of realtime pacing; abandonment
+        // returns in a few hundred ms. 3 s keeps the discrimination under
+        // shared-host load.
+        elapsed < 3000,
+        `the flush abandoned the parked write (took ${elapsed}ms)`,
+      );
+      // The transport itself stays usable: only the stale call was cut.
+      await transport.send({ cmd: 'volume', volume: 40 });
+      await transport.send({ cmd: 'teardown' });
+      await until(
+        'stopped',
+        () => events.some(([e, v]) => e === 'state' && v === 'stopped'),
+      );
+    } finally {
+      await transport.close().catch(() => {});
+      fake.close();
+    }
+  },
+});
+
+Deno.test({
+  name: 'FFI transport: close abandons a backpressured in-flight pcm write',
+  ignore: !HAVE_LIB,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const fake = await startFakeRaop();
+    const events: [string, string | undefined][] = [];
+    const transport = createFfiSpawn()((event, value) =>
+      events.push([event, value])
+    );
+    try {
+      await transport.send({
+        cmd: 'start',
+        host: '127.0.0.1',
+        port: fake.port,
+        name: 'writegen-close',
+        volume: 80,
+      });
+      await until(
+        'connected',
+        () => events.some(([e, v]) => e === 'state' && v === 'connected'),
+      );
+      const started = performance.now();
+      const pending = transport.pcm(new Uint8Array(4 * 176400));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const closing = transport.close(); // bumps the write generation first
+      await pending;
+      const elapsed = performance.now() - started;
+      assert(
+        elapsed < 3000, // ~4 s would be a full realtime drain; see above
+        `the close abandoned the parked write (took ${elapsed}ms)`,
+      );
+      await closing; // native cleanup still proven
+      assertEquals(
+        fake.sessions[0]?.teardowns,
+        1,
+        'close tore the session down',
+      );
+    } finally {
       fake.close();
     }
   },

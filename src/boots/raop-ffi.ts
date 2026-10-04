@@ -14,7 +14,10 @@
 // multi-speaker model. The boot pumps PCM per output; this module designates
 // the first writer as THE FEED and silently accepts-and-drops the other
 // handles' writes (their decode is wasted CPU, the wire stays sane). When
-// the feed's handle closes, the next writer takes over.
+// the feed's handle closes, the next writer takes over — but only after the
+// close PROVES native cleanup: a failed free keeps the token, so no bytes
+// are optimistically routed through a broken native state (plan
+// atv3-session-recycle).
 import type { AirplayTransport, HelperEventFn } from './airplay.ts';
 
 const SYMBOLS = {
@@ -44,7 +47,9 @@ const SYMBOLS = {
   raop_teardown: { parameters: ['pointer'], result: 'i32' },
   raop_pin: { parameters: ['pointer', 'buffer'], result: 'i32' },
   raop_poll: { parameters: ['pointer', 'buffer', 'usize'], result: 'i32' },
-  raop_free: { parameters: ['pointer'], result: 'void' },
+  // -1 = the native free could not be queued; the handle is leaked by design
+  // and close() must report failure, not retirement success (ffi.h).
+  raop_free: { parameters: ['pointer'], result: 'i32' },
 } as const;
 
 type RaopLibrary = Deno.DynamicLibrary<typeof SYMBOLS>;
@@ -116,6 +121,12 @@ class FfiTransport implements AirplayTransport {
   private readonly onEvent: HelperEventFn;
   private readonly pollTimer: ReturnType<typeof setInterval>;
   private closed = false;
+  private closePromise: Promise<void> | null = null;
+  /** PCM write generation (plan atv3-session-recycle): bumped synchronously
+   * before every FLUSH/TEARDOWN/close, so a pcm() call already parked in
+   * backpressure from BEFORE the discontinuity abandons its remaining
+   * bytes instead of letting an old chunk cross into the new state. */
+  private writeGen = 0;
 
   constructor(lib: RaopLibrary, onEvent: HelperEventFn) {
     this.lib = lib;
@@ -133,6 +144,9 @@ class FfiTransport implements AirplayTransport {
   private drainEvents() {
     const buf = new Uint8Array(256);
     for (;;) {
+      // An event handler may have closed (and natively freed) this
+      // transport on the previous iteration — never poll the freed handle.
+      if (this.closed) return;
       let n: number;
       try {
         n = this.lib.symbols.raop_poll(this.handle, buf, BigInt(buf.length));
@@ -151,11 +165,18 @@ class FfiTransport implements AirplayTransport {
   }
 
   send(cmd: Record<string, unknown>): Promise<void> {
-    if (this.closed) return Promise.resolve();
+    // A send on a closed transport must not silently report a successful
+    // start — the caller learns the enqueue never happened.
+    if (this.closed) {
+      return Promise.reject(
+        new Error(`raop ${String(cmd.cmd)} on a closed transport`),
+      );
+    }
     const s = this.lib.symbols;
+    let rc = 0;
     switch (cmd.cmd) {
       case 'start':
-        s.raop_start(
+        rc = s.raop_start(
           this.handle,
           cstr(String(cmd.host)),
           Number(cmd.port) || 7000,
@@ -173,17 +194,28 @@ class FfiTransport implements AirplayTransport {
         );
         break;
       case 'volume':
-        s.raop_volume(this.handle, Number(cmd.volume) || 0);
+        rc = s.raop_volume(this.handle, Number(cmd.volume) || 0);
         break;
       case 'flush':
-        s.raop_flush(this.handle);
+        this.writeGen++; // before the native call — stale writers stop now
+        rc = s.raop_flush(this.handle);
         break;
       case 'teardown':
-        s.raop_teardown(this.handle);
+        this.writeGen++;
+        rc = s.raop_teardown(this.handle);
         break;
       case 'pin':
-        s.raop_pin(this.handle, cstr(String(cmd.pin)));
+        rc = s.raop_pin(this.handle, cstr(String(cmd.pin)));
         break;
+      default:
+        return Promise.resolve();
+    }
+    // Native contract: 0 = enqueued onto the loop; < 0 = rejected (the
+    // queue stays consistent — the promise rejects, never a silent lie).
+    if (rc < 0) {
+      return Promise.reject(
+        new Error(`raop ${String(cmd.cmd)} enqueue failed`),
+      );
     }
     return Promise.resolve();
   }
@@ -194,9 +226,13 @@ class FfiTransport implements AirplayTransport {
     // selected output's PCM is accepted and dropped (see the header).
     if (feed === null) feed = this.token;
     if (feed !== this.token) return;
+    const gen = this.writeGen;
     let offset = 0;
     while (offset < chunk.length) {
-      if (this.closed) return;
+      // Abandon the remaining bytes when a FLUSH/TEARDOWN/close landed
+      // while this call was parked in backpressure (plan
+      // atv3-session-recycle: no old chunk crosses the discontinuity).
+      if (this.closed || this.writeGen !== gen) return;
       const accepted = this.lib.symbols.raop_write(
         this.handle,
         chunk.subarray(offset),
@@ -213,15 +249,35 @@ class FfiTransport implements AirplayTransport {
   }
 
   close(): Promise<void> {
-    if (this.closed) return Promise.resolve();
+    // Memoized, including rejection: a repeated close must not turn a
+    // failed retirement into a success.
+    if (this.closePromise !== null) return this.closePromise;
     this.closed = true;
+    this.writeGen++; // cancel in-flight stale PCM writes before native free
     clearInterval(this.pollTimer);
-    if (feed === this.token) feed = null;
-    try {
-      this.lib.symbols.raop_teardown(this.handle);
-      this.lib.symbols.raop_free(this.handle);
-    } catch { /* the library is already gone */ }
-    return Promise.resolve();
+    this.closePromise = (() => {
+      try {
+        this.lib.symbols.raop_teardown(this.handle);
+      } catch { /* the library is already gone */ }
+      let rc: number;
+      try {
+        rc = this.lib.symbols.raop_free(this.handle);
+      } catch {
+        rc = -1;
+      }
+      if (rc < 0) {
+        // The handle is leaked by design (never a UAF). The feed token is
+        // NOT released: no optimistic rerouting through broken native
+        // state — the boot's blocked lifecycle record keeps this loud.
+        return Promise.reject(
+          new Error('raop_free failed: native cleanup not proven'),
+        );
+      }
+      // The feed token releases only at proven native cleanup.
+      if (feed === this.token) feed = null;
+      return Promise.resolve();
+    })();
+    return this.closePromise;
   }
 }
 
