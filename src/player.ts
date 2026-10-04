@@ -273,6 +273,11 @@ export interface Output {
   /** RAOP device type token (appletv/apex1/...; from mDNS `am`) — passed to
    * the helper's start. */
   devtype?: string;
+  /** The raw device model string (TXT `am`, e.g. 'AppleTV3,1') — identity,
+   * not a session knob: persisted, preserved across model-less
+   * re-registration, and what the boot's affected-model predicate matches
+   * (plan atv3-session-recycle). */
+  model?: string;
   /** Encrypt the RTP stream (mDNS `ek=1`). */
   encrypt?: boolean;
   /** OwnTone raop_device_cb wanted_metadata bitmask from TXT `md`
@@ -322,7 +327,8 @@ export interface Outputs {
 
 /** The persisted output remote (output_state row): mDNS-discovered and
  * hand-added alike. Session knobs (devtype/encrypt/…) are not persisted —
- * discovery re-derives them from TXT. */
+ * discovery re-derives them from TXT. The model IS persisted: it is
+ * identity, and the ATV3 recycle policy must survive a restart. */
 export interface PersistedOutput {
   id: string;
   host?: string;
@@ -331,6 +337,7 @@ export interface PersistedOutput {
   type: string;
   selected: boolean;
   volume: number;
+  model?: string;
 }
 
 /** Persistence port for output remotes (plan restart-transparency):
@@ -612,6 +619,7 @@ export function createOutputs(
       type: o.type,
       selected: o.selected,
       volume: o.volume,
+      model: o.model,
     });
 
   return {
@@ -623,7 +631,14 @@ export function createOutputs(
     register(output, source) {
       const idx = outputs.findIndex((o) => o.id === output.id);
       if (idx === -1) outputs.push({ ...output });
-      else outputs[idx] = { ...output };
+      else {
+        // Model is identity, not a session knob: a model-less same-id
+        // re-registration (resolve timeout, TXT without `am`) keeps the
+        // known model — only an explicit different model replaces it. No
+        // other old field is merged forward.
+        const model = output.model ?? outputs[idx].model;
+        outputs[idx] = { ...output, ...(model === undefined ? {} : { model }) };
+      }
       saveRow(find(output.id)!);
       logCmd('output.register', output.id, source ?? { kind: 'internal' });
       emit(['outputs']);

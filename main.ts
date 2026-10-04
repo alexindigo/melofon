@@ -60,6 +60,10 @@ if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
     env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
   );
 }
+// Load persisted remotes BEFORE discovery starts (plan atv3-session-recycle):
+// this populates the savedOutput cache discovery consults synchronously, and
+// the rows are the restore snapshot below — model identity included.
+const savedOutputs = await persistence.loadOutputs();
 const airplay = createAirplayDiscovery({
   outputs,
   state,
@@ -86,7 +90,7 @@ const playback = createPlayback({
 // saved place, so a stale save can't surprise the household (3am speaker).
 // First re-register persisted remotes (hand-added and last-seen mDNS
 // alike) so a saved selection is present for the resume decision.
-for (const row of await persistence.loadOutputs()) {
+for (const row of savedOutputs) {
   const existing = outputs.get(row.id);
   if (existing !== null) {
     // Discovery beat the restore: keep its fresh record, apply user state.
@@ -94,6 +98,18 @@ for (const row of await persistence.loadOutputs()) {
       kind: 'internal',
       via: 'restore',
     });
+    // Identity merge (plan atv3-session-recycle): discovery's fresh record
+    // keeps its address/TXT; only when it carries no model of its own does
+    // the saved identity fill in. A fresh explicit `am` always wins.
+    if (existing.model === undefined && row.model !== undefined) {
+      const fresh = outputs.get(row.id);
+      if (fresh !== null) {
+        outputs.register({ ...fresh, model: row.model }, {
+          kind: 'internal',
+          via: 'restore',
+        });
+      }
+    }
   } else if (row.host !== undefined) {
     outputs.register({
       id: row.id,
@@ -103,6 +119,7 @@ for (const row of await persistence.loadOutputs()) {
       volume: row.volume,
       host: row.host,
       ...(row.port === undefined ? {} : { port: row.port }),
+      ...(row.model === undefined ? {} : { model: row.model }),
     }, { kind: 'internal', via: 'restore' });
   }
 }
@@ -186,12 +203,15 @@ if (airplayHost) {
       `[melofon] airplay: registered ${svc.address}:${svc.port} with TXT`,
     );
   } else {
+    // No TXT (resolve timeout): register the bare host, but never clobber
+    // restored user state or a known model (plan atv3-session-recycle —
+    // register() preserves the model; selection/volume are kept here).
     outputs.register({
       id,
       name: host,
       type: 'AirPlay',
-      selected: false,
-      volume: 100,
+      selected: existing?.selected ?? false,
+      volume: existing?.volume ?? 100,
       host,
       ...(port === undefined ? {} : { port }),
     }, { kind: 'internal', via: 'airplay-host-env' });

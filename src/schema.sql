@@ -160,3 +160,7 @@ CREATE TABLE IF NOT EXISTS output_state (
   selected BOOLEAN NOT NULL,
   volume INTEGER NOT NULL
 );
+-- ATV3 session recycle (plan atv3-session-recycle): the raw device model
+-- (TXT `am`, e.g. AppleTV3,1) is identity, persisted so the recycle policy
+-- survives a restart. NULL on rows saved before this column reads unknown.
+ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR;

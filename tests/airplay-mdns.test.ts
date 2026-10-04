@@ -82,7 +82,8 @@ function svc(overrides: Partial<MdnsService> = {}): MdnsService {
 
 function setup(
   initial: Record<string, string> = {},
-  saved: Record<string, { selected: boolean; volume: number }> = {},
+  saved: Record<string, { selected: boolean; volume: number; model?: string }> =
+    {},
 ) {
   const notify = createNotify();
   const outputs = createOutputs({ notify });
@@ -150,6 +151,7 @@ Deno.test('up registers with TXT-derived fields; down unregisters', async () => 
     assertEquals(out.supportsAuthSetup, false);
     assertEquals(out.requiresAuth, true);
     assertEquals(out.needsAuthKey, true);
+    assertEquals(out.model, 'AppleTV3,1', 'TXT am is the output identity');
 
     browsers[0].onService!('down', svc());
     assertEquals(outputs.list(), []);
@@ -235,6 +237,65 @@ Deno.test('an identical re-announcement is a catalog no-op', async () => {
     browsers[0].onService!('up', svc({ txt: { ...svc().txt, md: '0,1' } }));
     assertEquals(outputsEvents, 2, 'changed TXT registers');
     assertEquals(outputs.get(ID)!.wantedMetadata, 3);
+  } finally {
+    discovery.close();
+  }
+});
+
+Deno.test('a changed model is a real catalog update even within one devtype', async () => {
+  const { outputs, browsers, discovery, notify } = await setup();
+  try {
+    await settle();
+    let outputsEvents = 0;
+    notify.subscribe((types) => {
+      if (types.includes('outputs')) outputsEvents++;
+    });
+    // AppleTV2,1 and AppleTV3,1 both map to devtype appletv: the model
+    // change alone must register.
+    browsers[0].onService!(
+      'up',
+      svc({ txt: { ...svc().txt, am: 'AppleTV2,1' } }),
+    );
+    assertEquals(outputs.get(ID)!.model, 'AppleTV2,1');
+    assertEquals(outputs.get(ID)!.devtype, 'appletv');
+    assertEquals(outputsEvents, 1);
+
+    browsers[0].onService!('up', svc()); // am AppleTV3,1
+    assertEquals(outputsEvents, 2, 'the model replacement registers');
+    assertEquals(outputs.get(ID)!.model, 'AppleTV3,1');
+    assertEquals(outputs.get(ID)!.devtype, 'appletv', 'devtype unchanged');
+
+    // Same model, same everything: a no-op again.
+    browsers[0].onService!('up', svc());
+    assertEquals(outputsEvents, 2, 'same-model re-announce stays quiet');
+  } finally {
+    discovery.close();
+  }
+});
+
+Deno.test('a re-announcement without am recovers the saved model identity', async () => {
+  // No in-memory record; the persisted row knows the model. A TXT without
+  // `am` neither erases nor hides it (plan atv3-session-recycle).
+  const { outputs, browsers, discovery } = await setup({}, {
+    [ID]: { selected: true, volume: 42, model: 'AppleTV3,1' },
+  });
+  try {
+    await settle();
+    browsers[0].onService!(
+      'up',
+      svc({
+        txt: { tp: 'UDP', ek: '1', sf: '0x200', md: '0,1,2', et: '0,3,5' },
+      }),
+    );
+    const out = outputs.get(ID)!;
+    assertEquals(out.model, 'AppleTV3,1', 'saved identity recovered');
+    assertEquals(out.selected, true, 'saved selection applied');
+    assertEquals(out.volume, 42, 'saved volume applied');
+    assertEquals(
+      out.devtype,
+      'apex1',
+      'session knobs re-derive from the actual TXT',
+    );
   } finally {
     discovery.close();
   }

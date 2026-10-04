@@ -174,6 +174,58 @@ Deno.test('core /_/outputs copies TXT when unicast resolve answers', async () =>
   assertEquals(output.wantedMetadata, 7);
 });
 
+Deno.test('core /_/outputs re-registration: model preserved on timeout, replaced by a fresh am', async () => {
+  const outputs = createOutputs();
+  const atv3: MdnsService = {
+    name: 'A4B2C1D2E3F4@arbat._raop._tcp.local',
+    host: 'arbat.local',
+    port: 7000,
+    address: '10.4.10.106',
+    txt: { tp: 'UDP', am: 'AppleTV3,1', md: '0,1,2' },
+    ttlMs: 120_000,
+  };
+  let answer: MdnsService | null = atv3;
+  const core = await pathfinder({
+    roots: ['core/'],
+    app: {
+      cfg: {},
+      outputs,
+      airplay: { resolve: () => Promise.resolve(answer) },
+    },
+  });
+  const body = JSON.stringify({
+    name: 'arbat',
+    type: 'AirPlay',
+    host: '10.4.10.106',
+  });
+
+  const first = await post(core, body);
+  assertEquals(first.status, 200);
+  const firstOut = (await first.json()) as {
+    output: { id: string; model?: string; devtype?: string };
+  };
+  // Melofon's own CRUD surface may carry the model (never the OwnTone wire).
+  assertEquals(firstOut.output.model, 'AppleTV3,1', 'TXT am is identity');
+  const id = firstOut.output.id;
+
+  // Resolve times out (null): the known model survives — no new parameter.
+  answer = null;
+  const second = await post(core, body);
+  assertEquals(second.status, 200);
+  assertEquals(outputs.get(id)!.model, 'AppleTV3,1', 'timeout keeps identity');
+
+  // A fresh, different explicit model replaces the old one.
+  answer = { ...atv3, txt: { ...atv3.txt, am: 'AppleTV2,1' } };
+  const third = await post(core, body);
+  assertEquals(third.status, 200);
+  assertEquals(
+    outputs.get(id)!.model,
+    'AppleTV2,1',
+    'an explicit different model wins',
+  );
+  assertEquals(outputs.get(id)!.devtype, 'appletv');
+});
+
 Deno.test('core /_/outputs/<id>/pin delivers the pin to the boot', async () => {
   const { core, outputs } = await setup();
   const res = await post(

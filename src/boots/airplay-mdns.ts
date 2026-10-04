@@ -71,9 +71,13 @@ function wantsAuth(sf: string | undefined): boolean {
   return ((BigInt(`0x${hex}`) >> 9n) & 1n) === 1n;
 }
 
-/** OwnTone raop_device_cb session knobs from a device TXT. */
+/** OwnTone raop_device_cb session knobs from a device TXT. `model` is NOT
+ * a knob: the nonempty trimmed `am` is the device's identity (plan
+ * atv3-session-recycle), persisted and preserved across model-less
+ * re-registration. */
 export function sessionFieldsFromTxt(txt: Record<string, string>): {
   devtype: string;
+  model?: string;
   encrypt: boolean;
   wantedMetadata: number;
   supportsAuthSetup: boolean;
@@ -87,8 +91,10 @@ export function sessionFieldsFromTxt(txt: Record<string, string>): {
   const sampleRate = Number.parseInt(txt.sr ?? '', 10);
   const bitsPerSample = Number.parseInt(txt.ss ?? '', 10);
   const channels = Number.parseInt(txt.ch ?? '', 10);
+  const model = txt.am?.trim();
   return {
     devtype: devtypeFromAm(txt.am),
+    ...(model ? { model } : {}),
     encrypt: txt.ek === '1',
     wantedMetadata: wantedMetadataFromMd(txt.md),
     supportsAuthSetup: supportsAuthSetupFromEt(txt.et),
@@ -111,10 +117,12 @@ export interface AirplayDiscoveryDeps {
   /** Persisted user state per output id (plan restart-transparency): a
    * device re-announcing while not registered (mDNS down→up, or a restart
    * before its row re-registers) gets its saved selection and volume back.
-   * Absent ⇒ discovery defaults (selected: false, volume: 100). */
+   * Absent ⇒ discovery defaults (selected: false, volume: 100). The saved
+   * model is identity (plan atv3-session-recycle): a re-announcement whose
+   * TXT omits `am` recovers it. */
   savedOutput?: (
     id: string,
-  ) => { selected: boolean; volume: number } | undefined;
+  ) => { selected: boolean; volume: number; model?: string } | undefined;
   log?: (msg: string) => void;
 }
 
@@ -178,8 +186,12 @@ export function createAirplayDiscovery(
     // back — selection and volume survive the gap.
     const saved = existing === null ? deps.savedOutput?.(parsed.id) : undefined;
     // An identical re-announcement is a catalog no-op: same device, same
-    // address, same session knobs. Skip the register so no outputs event
-    // fires — chatty devices must not wake the session layer for nothing.
+    // address, same session knobs, same effective model. Skip the register
+    // so no outputs event fires — chatty devices must not wake the session
+    // layer for nothing. Model identity precedence is fresh `am` → existing
+    // → saved: a TXT that newly carries `am` (or changes it) is a real
+    // catalog update even when both models map to the same devtype, while a
+    // TXT without `am` neither erases nor churns the known model.
     if (
       existing !== null &&
       existing.host === svc.address &&
@@ -191,7 +203,8 @@ export function createAirplayDiscovery(
       (existing.requiresAuth ?? false) === fields.requiresAuth &&
       existing.sampleRate === fields.sampleRate &&
       existing.bitsPerSample === fields.bitsPerSample &&
-      existing.channels === fields.channels
+      existing.channels === fields.channels &&
+      (fields.model === undefined || fields.model === existing.model)
     ) {
       return;
     }
@@ -239,6 +252,11 @@ export function createAirplayDiscovery(
       host: svc.address,
       port: svc.port,
       ...fields,
+      // Model identity: fresh `am` rides the ...fields spread; when the TXT
+      // omits it, a live record's model survives inside register() and a
+      // returning device's saved model is recovered here.
+      ...(existing === null && fields.model === undefined &&
+        saved?.model !== undefined && { model: saved.model }),
       ...(existing?.needsAuthKey !== undefined &&
         { needsAuthKey: existing.needsAuthKey }),
     }, { kind: 'internal', via: 'airplay-discovery' });

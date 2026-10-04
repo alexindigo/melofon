@@ -405,6 +405,70 @@ Deno.test('output selection and volume survive a restart', async () => {
   }
 });
 
+Deno.test('output model identity survives a restart; legacy rows read unknown', async () => {
+  const { dir, db, persistence, close } = await setup();
+  // Simulate a pre-change database: output_state without the model column,
+  // one legacy row written under it. The migration (run at every openDb)
+  // re-adds the column idempotently.
+  await db.conn.run('ALTER TABLE output_state DROP COLUMN model');
+  await db.conn.run(
+    'INSERT INTO output_state (id, host, port, name, type, selected, volume) ' +
+      "VALUES ('legacy', '10.4.10.200', 7000, 'old-atv', 'AirPlay', false, 100)",
+  );
+  await db.conn.run(
+    'ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR',
+  );
+
+  const outputs = createOutputs({ persistence });
+  outputs.register({
+    id: '111',
+    name: 'arbat',
+    type: 'AirPlay',
+    selected: true,
+    volume: 42,
+    host: '10.4.10.106',
+    port: 7000,
+    model: 'AppleTV3,1',
+  });
+  await persistence.drain();
+  await close(true); // keep the dir — the "restart" reopens it
+
+  const restarted = await reopen(dir);
+  try {
+    const rows = await restarted.persistence.loadOutputs();
+    const arbat = rows.find((r) => r.id === '111')!;
+    assertEquals(arbat.model, 'AppleTV3,1', 'the model survives the reopen');
+    assertEquals(arbat.selected, true);
+    assertEquals(arbat.volume, 42);
+    const legacy = rows.find((r) => r.id === 'legacy')!;
+    assert(!('model' in legacy), 'a legacy row reads as unknown model');
+    assertEquals(legacy.name, 'old-atv', 'legacy data intact');
+
+    // The write-through cache carries model for discovery's saved lookups.
+    assertEquals(
+      restarted.persistence.savedOutput('111')?.model,
+      'AppleTV3,1',
+    );
+    assertEquals(restarted.persistence.savedOutput('legacy')?.model, undefined);
+
+    // The boot restore path re-registers the row with its identity intact.
+    const outputs2 = createOutputs();
+    outputs2.register({
+      id: arbat.id,
+      name: arbat.name,
+      type: arbat.type,
+      selected: arbat.selected,
+      volume: arbat.volume,
+      host: arbat.host,
+      ...(arbat.port === undefined ? {} : { port: arbat.port }),
+      ...(arbat.model === undefined ? {} : { model: arbat.model }),
+    });
+    assertEquals(outputs2.get('111')!.model, 'AppleTV3,1');
+  } finally {
+    await restarted.close();
+  }
+});
+
 Deno.test('unregister keeps the persisted row (last-seen state)', async () => {
   const { persistence, close } = await setup();
   try {

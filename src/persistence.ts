@@ -140,26 +140,28 @@ export function createPersistence(db: Db): Persistence {
       enqueue(async () => {
         await db.conn.run(
           `INSERT INTO output_state (id, host, port, name, type, selected,
-             volume)
+             volume, model)
            VALUES (${esc(row.id)},
              ${row.host === undefined ? 'NULL' : esc(row.host)},
              ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
              ${esc(row.name)}, ${esc(row.type)},
-             ${row.selected}, ${Math.trunc(row.volume)})
+             ${row.selected}, ${Math.trunc(row.volume)},
+             ${row.model === undefined ? 'NULL' : esc(row.model)})
            ON CONFLICT (id) DO UPDATE SET
              host = excluded.host,
              port = excluded.port,
              name = excluded.name,
              type = excluded.type,
              selected = excluded.selected,
-             volume = excluded.volume`,
+             volume = excluded.volume,
+             model = excluded.model`,
         );
       });
     },
 
     async loadOutputs() {
       const res = await db.conn.runAndReadAll(
-        'SELECT id, host, port, name, type, selected, volume FROM output_state',
+        'SELECT id, host, port, name, type, selected, volume, model FROM output_state',
       );
       const rows = (res.getRowObjects() as {
         id: string;
@@ -169,6 +171,7 @@ export function createPersistence(db: Db): Persistence {
         type: string | null;
         selected: boolean;
         volume: number;
+        model: string | null;
       }[]).map((row) => ({
         id: row.id,
         ...(row.host === null ? {} : { host: row.host }),
@@ -177,6 +180,7 @@ export function createPersistence(db: Db): Persistence {
         type: row.type ?? '',
         selected: row.selected,
         volume: Number(row.volume),
+        ...(row.model === null ? {} : { model: row.model }),
       }));
       for (const row of rows) outputCache.set(row.id, row);
       return rows;
