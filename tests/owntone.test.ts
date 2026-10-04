@@ -149,6 +149,72 @@ Deno.test('GET /api/outputs is an empty list until a boot registers', async () =
   }
 });
 
+Deno.test('the OwnTone wire never carries model/recycle fields (plan atv3-session-recycle)', async () => {
+  const { onHook, outputs, close } = await setup();
+  try {
+    // A fully-identified AppleTV3,1: every identity/knob field set.
+    outputs.register({
+      id: '0',
+      name: 'arbat',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+      host: '10.4.10.106',
+      port: 7000,
+      devtype: 'appletv',
+      model: 'AppleTV3,1',
+      encrypt: false,
+      wantedMetadata: 7,
+      requiresAuth: true,
+    });
+    const listed = await get(onHook, '/api/outputs');
+    const payload =
+      ((await listed.json()) as { outputs: Record<string, unknown>[] })
+        .outputs[0];
+    assertEquals(
+      Object.keys(payload).sort(),
+      [
+        'format',
+        'has_password',
+        'id',
+        'name',
+        'needs_auth_key',
+        'offset_ms',
+        'requires_auth',
+        'selected',
+        'supported_formats',
+        'type',
+        'volume',
+      ].sort(),
+      'exactly the OwnTone output keys — no model, no recycle fields',
+    );
+    const one = await get(onHook, '/api/outputs/0');
+    assertEquals(
+      Object.keys((await one.json()) as Record<string, unknown>).sort(),
+      Object.keys(payload).sort(),
+      'the single-output payload matches the list shape',
+    );
+
+    const player = await get(onHook, '/api/player');
+    assertEquals(
+      Object.keys((await player.json()) as Record<string, unknown>).sort(),
+      [
+        'consume',
+        'item_id',
+        'item_length_ms',
+        'item_progress_ms',
+        'repeat',
+        'shuffle',
+        'state',
+        'volume',
+      ].sort(),
+      'exactly the eight OwnTone player keys — no last_command, nothing new',
+    );
+  } finally {
+    await close();
+  }
+});
+
 Deno.test('outputs: get/put/toggle/set on a registered output; unknown-id 400s', async () => {
   const { onHook, outputs, close } = await setup();
   try {

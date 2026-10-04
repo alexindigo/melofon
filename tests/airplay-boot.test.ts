@@ -8,7 +8,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { openDb } from '../src/db.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
-import { createMedia } from '../src/media.ts';
+import { createMedia, type Media } from '../src/media.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
@@ -60,6 +60,13 @@ interface FakeFrame {
 class FakeTransport implements AirplayTransport {
   frames: FakeFrame[] = [];
   closed = false;
+  /** Test knobs (plan atv3-session-recycle): a close GATE (a promise the
+   * test resolves — deterministic, no wall-clock luck) or a failing
+   * native close, to expose retirement-barrier races. Defaults resolve
+   * immediately, like the pre-recycle fake. */
+  closeGate: Promise<void> | null = null;
+  closeError: Error | null = null;
+  closeCalls = 0;
   constructor(public onEvent: HelperEventFn) {}
   send(cmd: Record<string, unknown>) {
     this.frames.push({ type: 'cmd', cmd });
@@ -70,8 +77,13 @@ class FakeTransport implements AirplayTransport {
     return Promise.resolve();
   }
   close() {
-    this.closed = true;
-    return Promise.resolve();
+    this.closeCalls++;
+    return (async () => {
+      if (this.closeGate !== null) await this.closeGate;
+      // An unproven native cleanup: the handle is leaked, never freed.
+      if (this.closeError !== null) throw this.closeError;
+      this.closed = true;
+    })();
   }
   cmds() {
     return this.frames.filter((f) => f.type === 'cmd').map((f) => f.cmd!);
@@ -79,6 +91,16 @@ class FakeTransport implements AirplayTransport {
   pcmBytes() {
     return this.frames.reduce((n, f) => n + (f.bytes ?? 0), 0);
   }
+}
+
+/** A test-controlled close gate: the transport's close() cannot complete
+ * until release() runs — retirement-window assertions become exact. */
+function closeGate(): { gate: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { gate, release };
 }
 
 async function setup(overrides: { retryBackoffMs?: number[] } = {}) {
@@ -520,6 +542,624 @@ Deno.test('a re-announcement of the same device does not restart its failed sess
       start.host,
       '192.0.2.99',
       'retry used the re-announced address',
+    );
+  } finally {
+    await close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ATV3 session recycle (plan atv3-session-recycle): the affected model
+// (model: 'AppleTV3,1') retires its RAOP session on every would-be FLUSH.
+// Deterministic synthetic media (hour-long entries keep seeks above the
+// 1500 ms detector) and the close-controllable fake expose the lifecycle
+// races: delayed close, failed close, stale events mid-retirement.
+
+const ATV3 = 'AppleTV3,1';
+
+interface DecodeCall {
+  path: string;
+  startMs?: number;
+}
+
+/** Deterministic synthetic decode: paced nonzero chunks, each filled with
+ * the 1-based call index so bytes from different decodes are
+ * distinguishable in a transport's pcm frames. */
+function syntheticMedia(
+  calls: DecodeCall[],
+  opts: { chunks?: number; chunkBytes?: number; paceMs?: number } = {},
+): Media {
+  const chunks = opts.chunks ?? 1000;
+  const chunkBytes = opts.chunkBytes ?? 8192;
+  const paceMs = opts.paceMs ?? 2;
+  return {
+    decodePcm: (path: string, o?: { startMs?: number }) => {
+      calls.push({ path, startMs: o?.startMs });
+      const tag = calls.length & 0xff;
+      let n = 0;
+      return Promise.resolve({
+        async *[Symbol.asyncIterator]() {
+          while (n++ < chunks) {
+            if (paceMs > 0) {
+              await new Promise((resolve) => setTimeout(resolve, paceMs));
+            }
+            yield new Uint8Array(chunkBytes).fill(tag);
+          }
+        },
+      });
+    },
+  } as unknown as Media;
+}
+
+let longSongN = 0;
+/** An hour-long entry: seeks of tens of seconds stay inside it. */
+function longSong(suffix?: string): SongRow {
+  longSongN++;
+  const id = `long-${suffix ?? longSongN}`;
+  return {
+    id,
+    path: `/music/${id}.mp3`,
+    libraryId: null,
+    libraryPath: null,
+    title: `Long ${id}`,
+    albumId: null,
+    albumName: 'Long Album',
+    artistId: null,
+    artistName: 'Long Artist',
+    track: 1,
+    disc: 1,
+    durationMs: 3_600_000,
+    size: 1,
+    genre: null,
+    year: null,
+    isVideo: false,
+    suffix: 'mp3',
+    contentType: 'audio/mpeg',
+  };
+}
+
+async function recycleSetup(
+  overrides: {
+    retryBackoffMs?: number[];
+    chunks?: number;
+    chunkBytes?: number;
+    paceMs?: number;
+  } = {},
+) {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
+  const db = await openDb(dir);
+  const notify = createNotify();
+  const outputs = createOutputs({ notify });
+  const player = createPlayer();
+  const library = createLibrary(db);
+  const playback = createPlayback({
+    player,
+    nowPlaying: createNowPlaying(db),
+    library,
+    cfg: {},
+    notify,
+  });
+  const decodeCalls: DecodeCall[] = [];
+  const spawned: FakeTransport[] = [];
+  const boot = createAirplayBoot({
+    outputs,
+    playback,
+    media: syntheticMedia(decodeCalls, overrides),
+    notify,
+    spawn: (onEvent) => {
+      const t = new FakeTransport(onEvent);
+      spawned.push(t);
+      return t;
+    },
+    ...(overrides.retryBackoffMs !== undefined &&
+      { retryBackoffMs: overrides.retryBackoffMs }),
+  });
+  return {
+    outputs,
+    playback,
+    spawned,
+    decodeCalls,
+    close: async () => {
+      await boot.close();
+      db.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
+}
+
+/** The affected output: mDNS-derived identity, model AppleTV3,1. */
+function registerAtv3(outputs: ReturnType<typeof createOutputs>): string {
+  outputs.register({
+    id: ID,
+    name: 'arbat',
+    type: 'AirPlay',
+    selected: true,
+    volume: 100,
+    host: HOST,
+    devtype: 'appletv',
+    model: ATV3,
+  });
+  return ID;
+}
+
+Deno.test('ATV3 pause: retires without FLUSH and stays down; resume connects a fresh session', async () => {
+  const { outputs, playback, spawned, decodeCalls, close } =
+    await recycleSetup();
+  try {
+    registerAtv3(outputs);
+    playback.queueAdd([longSong()], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+
+    playback.pause();
+    await until('retired', () => t1.closed);
+    assert(
+      !t1.cmds().some((c) => c.cmd === 'flush'),
+      'no FLUSH on the affected model',
+    );
+    assert(t1.cmds().some((c) => c.cmd === 'teardown'), 'teardown sent');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assertEquals(spawned.length, 1, 'no reconnect while paused');
+
+    playback.play(); // resume
+    await until('replacement', () => spawned.length === 2);
+    const t2 = spawned[1];
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assertEquals(t2.pcmBytes(), 0, 'no PCM before its own connected');
+    t2.onEvent('state', 'connected');
+    await until('resume pcm', () => t2.pcmBytes() > 0);
+    assertEquals(decodeCalls.length, 2, 'one decode per session');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3 seek: retires and replaces with the latest state — no FLUSH', async () => {
+  const { outputs, playback, spawned, decodeCalls, close } =
+    await recycleSetup();
+  try {
+    const id = registerAtv3(outputs);
+    playback.queueAdd([longSong('a'), longSong('b')], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+
+    playback.seek({ positionMs: 120_000 });
+    await until('old retired', () => t1.closed);
+    await until('replacement', () => spawned.length === 2);
+    assert(!t1.cmds().some((c) => c.cmd === 'flush'), 'no FLUSH');
+    const t2 = spawned[1];
+    const start = t2.cmds().find((c) => c.cmd === 'start')!;
+    assertEquals(start.host, HOST, 'replacement re-read the output record');
+    t2.onEvent('state', 'connected');
+    await until('pcm', () => t2.pcmBytes() > 0);
+    const last = decodeCalls[decodeCalls.length - 1];
+    assert(
+      Math.abs((last.startMs ?? 0) - 120_000) < 1500,
+      `replacement decodes at the requested position: ${last.startMs}`,
+    );
+    // Queue, selection and volume are not the recycle's business.
+    assertEquals(playback.playerView().state, 'play');
+    assertEquals(outputs.get(id)!.selected, true);
+    assertEquals(outputs.get(id)!.volume, 100);
+    assertEquals(playback.queueView().items.length, 2);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3 track change: retires; the replacement decodes the new entry from 0', async () => {
+  const { outputs, playback, spawned, decodeCalls, close } =
+    await recycleSetup();
+  try {
+    registerAtv3(outputs);
+    playback.queueAdd([longSong('a'), longSong('b')], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+
+    playback.next();
+    await until('old retired', () => t1.closed);
+    await until('replacement', () => spawned.length === 2);
+    assert(!t1.cmds().some((c) => c.cmd === 'flush'), 'no FLUSH');
+    const t2 = spawned[1];
+    t2.onEvent('state', 'connected');
+    await until('pcm', () => t2.pcmBytes() > 0);
+    const last = decodeCalls[decodeCalls.length - 1];
+    assert(last.path.includes('long-b'), `new entry decoded: ${last.path}`);
+    assert(
+      (last.startMs ?? 0) < 1500,
+      `the new entry decodes near its head, not an obsolete position: ${last.startMs}`,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('unaffected models (AppleTV2,1) keep FLUSH-based transitions', async () => {
+  const { outputs, playback, spawned, close } = await recycleSetup();
+  try {
+    outputs.register({
+      id: ID,
+      name: 'Old ATV',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+      host: HOST,
+      devtype: 'appletv',
+      model: 'AppleTV2,1',
+    });
+    playback.queueAdd([longSong()], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t = spawned[0];
+    t.onEvent('state', 'connected');
+    await until('pcm', () => t.pcmBytes() > 0);
+
+    playback.pause();
+    await until('flush', () => t.cmds().some((c) => c.cmd === 'flush'));
+    assert(!t.closed, 'no retirement on an unaffected model');
+    playback.play(); // resume re-decodes on the SAME session
+    const before = t.pcmBytes();
+    await until('resume pcm', () => t.pcmBytes() > before);
+
+    playback.seek({ positionMs: 120_000 });
+    await until(
+      'seek flush',
+      () => t.cmds().filter((c) => c.cmd === 'flush').length === 2,
+    );
+    assertEquals(spawned.length, 1, 'no replacement for an unaffected model');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3 rapid commands: a seek/next burst during a delayed close converges on one current replacement', async () => {
+  const { outputs, playback, spawned, decodeCalls, close } =
+    await recycleSetup();
+  try {
+    registerAtv3(outputs);
+    playback.queueAdd([longSong('a'), longSong('b')], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+    const gate = closeGate();
+    t1.closeGate = gate.gate; // the close cannot complete until released
+
+    playback.seek({ positionMs: 120_000 });
+    await until('close started', () => t1.closeCalls === 1);
+    playback.seek({ positionMs: 240_000 });
+    playback.next(); // entry change mid-close: coalesces
+    assertEquals(spawned.length, 1, 'no spawn while the gate holds');
+    gate.release();
+    await until('replacement', () => spawned.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assertEquals(spawned.length, 2, 'the burst converged on one replacement');
+    const t2 = spawned[1];
+    assertEquals(
+      t2.frames[0]?.type,
+      'cmd',
+      'no obsolete PCM ahead of the start command',
+    );
+    t2.onEvent('state', 'connected');
+    await until('pcm', () => t2.pcmBytes() > 0);
+    const last = decodeCalls[decodeCalls.length - 1];
+    assert(
+      last.path.includes('long-b'),
+      `the LATEST entry decoded: ${last.path}`,
+    );
+    assert(
+      (last.startMs ?? 0) < 1500,
+      `no obsolete 240000 ms snapshot: ${last.startMs}`,
+    );
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3 cancellation: pause during a pending replacement cancels it', async () => {
+  const { outputs, playback, spawned, close } = await recycleSetup();
+  try {
+    registerAtv3(outputs);
+    playback.queueAdd([longSong('a'), longSong('b')], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+    const gate = closeGate();
+    t1.closeGate = gate.gate;
+
+    playback.seek({ positionMs: 120_000 }); // retires, replacement pending
+    await until('close started', () => t1.closeCalls === 1);
+    playback.pause(); // cancels the pending replacement
+    gate.release();
+    await until('closed', () => t1.closed);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assertEquals(spawned.length, 1, 'the pause canceled the replacement');
+    assertEquals(playback.playerView().state, 'pause');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3 cancellation: a play edge during a pause retirement waits for the barrier', async () => {
+  const { outputs, playback, spawned, close } = await recycleSetup();
+  try {
+    registerAtv3(outputs);
+    playback.queueAdd([longSong()], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+    const gate = closeGate();
+    t1.closeGate = gate.gate;
+
+    playback.pause(); // retire starts
+    await until('close started', () => t1.closeCalls === 1);
+    playback.play(); // a valid play decision mid-close
+    assertEquals(
+      spawned.length,
+      1,
+      'no spawn before the close barrier released',
+    );
+    gate.release();
+    await until('replacement after close', () => spawned.length === 2);
+    spawned[1].onEvent('state', 'connected');
+    await until('pcm', () => spawned[1].pcmBytes() > 0);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3 stale events from the retired session cannot touch the replacement or the row', async () => {
+  const { outputs, playback, spawned, decodeCalls, close } =
+    await recycleSetup();
+  try {
+    const id = registerAtv3(outputs);
+    playback.queueAdd([longSong()], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+    const gate = closeGate();
+    t1.closeGate = gate.gate;
+
+    playback.seek({ positionMs: 120_000 });
+    await until('close started', () => t1.closeCalls === 1);
+    const decodesBefore = decodeCalls.length;
+    // Stale events DURING the gated retirement: all must be ignored.
+    t1.onEvent('state', 'connected');
+    t1.onEvent('state', 'password');
+    t1.onEvent('state', 'failed');
+    gate.release();
+    await until('replacement', () => spawned.length === 2);
+    assertEquals(
+      playback.playerView().state,
+      'play',
+      'a stale failed did not pause the engine',
+    );
+    assertEquals(
+      outputs.get(id)!.needsAuthKey,
+      undefined,
+      'a stale password did not touch the output row',
+    );
+    assertEquals(
+      decodeCalls.length,
+      decodesBefore,
+      'a stale connected did not start a decode',
+    );
+
+    const t2 = spawned[1];
+    t2.onEvent('state', 'connected');
+    t2.onEvent('state', 'connected'); // repeated valid connected
+    await until('pcm', () => t2.pcmBytes() > 0);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assertEquals(
+      decodeCalls.length,
+      decodesBefore + 1,
+      'no duplicate pump on repeated connected',
+    );
+
+    // Stale events from the OLD session after the replacement: still inert.
+    t1.onEvent('state', 'connected');
+    t1.onEvent('state', 'failed');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assertEquals(decodeCalls.length, decodesBefore + 1);
+    assertEquals(spawned.length, 2, 'no retry storm from stale events');
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3 failure: a failed close blocks the output — visibly, until restart', async () => {
+  const errors: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(' '));
+  };
+  try {
+    const { outputs, playback, spawned, close } = await recycleSetup();
+    try {
+      registerAtv3(outputs);
+      playback.queueAdd([longSong()], { play: true });
+      await until('spawned', () => spawned.length === 1);
+      const t1 = spawned[0];
+      t1.onEvent('state', 'connected');
+      await until('pcm', () => t1.pcmBytes() > 0);
+      t1.closeError = new Error('native free wedged');
+
+      playback.seek({ positionMs: 120_000 });
+      await until('close attempted', () => t1.closeCalls === 1);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assertEquals(
+        spawned.length,
+        1,
+        'a failed retirement authorizes no replacement',
+      );
+      assert(
+        errors.some((l) => l.includes('retirement') && l.includes('FAILED')),
+        `the failure is logged with output and generation: ${
+          errors.join(' | ')
+        }`,
+      );
+      assertEquals(
+        playback.playerView().state,
+        'play',
+        'no manufactured pause',
+      );
+      // Play, reselect and catalog events must not clear the block.
+      playback.pause();
+      playback.play();
+      outputs.update(ID, { selected: false });
+      outputs.update(ID, { selected: true });
+      outputs.register({
+        id: '999000',
+        name: 'okasan',
+        type: 'AirPlay',
+        selected: false,
+        volume: 100,
+        host: '192.0.2.12',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assertEquals(
+        spawned.length,
+        1,
+        'the block survived play/reselect/catalog events',
+      );
+    } finally {
+      await close();
+    }
+  } finally {
+    console.error = origError;
+  }
+});
+
+Deno.test('ATV3 provenance: a recycle fabricates no core commands; catalog/volume do not reconnect a down session', async () => {
+  const lines: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  };
+  try {
+    const { outputs, playback, spawned, close } = await recycleSetup();
+    try {
+      registerAtv3(outputs);
+      playback.queueAdd([longSong()], { play: true });
+      await until('spawned', () => spawned.length === 1);
+      spawned[0].onEvent('state', 'connected');
+      await until('pcm', () => spawned[0].pcmBytes() > 0);
+
+      lines.length = 0; // only the user's own command may follow
+      playback.seek({ positionMs: 120_000 });
+      await until('replacement', () => spawned.length === 2);
+      const cmds = lines.filter((l) => l.startsWith('[cmd]'));
+      assertEquals(
+        cmds,
+        ['[cmd] seek position_ms=120000 by internal:core'],
+        `the recycle manufactured no pause/play/selection: ${cmds.join(' | ')}`,
+      );
+
+      // A down session (paused, retired) is not resurrected by a volume
+      // update or an unrelated registration.
+      playback.pause();
+      await until('retired', () => spawned[1].closed);
+      outputs.update(ID, { volume: 42 });
+      outputs.register({
+        id: '999000',
+        name: 'okasan',
+        type: 'AirPlay',
+        selected: false,
+        volume: 100,
+        host: '192.0.2.12',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assertEquals(
+        spawned.length,
+        2,
+        'catalog/volume events did not reconnect a down session',
+      );
+      assertEquals(outputs.get(ID)!.volume, 42, 'the update itself landed');
+    } finally {
+      await close();
+    }
+  } finally {
+    console.log = origLog;
+  }
+});
+
+Deno.test('ATV3 detection: a 500 ms same-entry seek does not recycle; a large seek and an entry change do', async () => {
+  const { outputs, playback, spawned, close } = await recycleSetup();
+  try {
+    registerAtv3(outputs);
+    playback.queueAdd([longSong('a'), longSong('b')], { play: true });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+
+    // Below the 1500 ms detector: the pre-existing limitation stands.
+    const progress = playback.playerView().itemProgressMs;
+    playback.seek({ positionMs: progress + 500 });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assertEquals(spawned.length, 1, 'a small same-entry seek: no recycle');
+    assert(!t1.closed, 'small seek: not retired');
+    assert(
+      !t1.cmds().some((c) => c.cmd === 'flush'),
+      'small seek: not flushed either',
+    );
+
+    // A large detected seek recycles.
+    playback.seek({ positionMs: 90_000 });
+    await until('seek recycle', () => spawned.length === 2);
+    spawned[1].onEvent('state', 'connected');
+    await until('pcm2', () => spawned[1].pcmBytes() > 0);
+
+    // A different queue-entry id transitions even within one song length.
+    playback.next();
+    await until('track recycle', () => spawned.length === 3);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('ATV3: an entry change during the handshake is absorbed by the connecting session', async () => {
+  const { outputs, playback, spawned, decodeCalls, close } =
+    await recycleSetup();
+  try {
+    registerAtv3(outputs);
+    playback.queueAdd([longSong('a'), longSong('b'), longSong('c')], {
+      play: true,
+    });
+    await until('spawned', () => spawned.length === 1);
+    const t1 = spawned[0];
+    // Handshake still in flight (no connected yet): two entry changes.
+    playback.next();
+    playback.next();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assertEquals(
+      spawned.length,
+      1,
+      'no churn: the in-flight session absorbs the changes',
+    );
+    t1.onEvent('state', 'connected');
+    await until('pcm', () => t1.pcmBytes() > 0);
+    const last = decodeCalls[decodeCalls.length - 1];
+    assert(
+      last.path.includes('long-c'),
+      `the connected session decodes the LATEST entry: ${last.path}`,
+    );
+    // And a settled track change after connected recycles normally.
+    playback.previous(); // back to long-b: a full recycle
+    await until('recycled', () => spawned.length === 2);
+    spawned[1].onEvent('state', 'connected');
+    await until('pcm2', () => spawned[1].pcmBytes() > 0);
+    assert(
+      decodeCalls[decodeCalls.length - 1].path.includes('long-b'),
+      'the settled recycle decodes the current entry',
     );
   } finally {
     await close();
