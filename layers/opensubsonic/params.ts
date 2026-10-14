@@ -2,6 +2,7 @@
 // getters, the required-param failure, and the musicFolderId wire-int
 // mapping. Shared module at the layer root, outside the walked mount tree.
 import { fail } from '#opensubsonic/envelope.ts';
+import { legacyInteger, safeInteger } from '#opensubsonic/numbers.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 // Merged request params, Navidrome's postFormToQueryParams model: form body
@@ -11,7 +12,9 @@ export async function params(request: HatRequest): Promise<URLSearchParams> {
   const merged = new URLSearchParams();
   if (request.method === 'POST') {
     const contentType = request.headers.get('content-type') ?? '';
-    if (contentType.startsWith('application/x-www-form-urlencoded')) {
+    const essence = contentType.split(';', 1)[0]
+      .replace(/^[ \t]+|[ \t]+$/g, '').toLowerCase();
+    if (essence === 'application/x-www-form-urlencoded') {
       const form = await request.body.form();
       for (const [key, value] of form) {
         if (typeof value === 'string') merged.append(key, value);
@@ -22,16 +25,18 @@ export async function params(request: HatRequest): Promise<URLSearchParams> {
   return merged;
 }
 
+// Whole-number entry point for route-specific required/range/filter contracts.
+export function integerParam(raw: string | null): number | null {
+  return raw === null ? null : legacyInteger(raw);
+}
+
 export function intParam(
   params: URLSearchParams,
   name: string,
   fallback: number,
 ): number {
-  const raw = params.get(name);
-  if (raw === null) return fallback;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < 0) return fallback;
-  return value;
+  const value = integerParam(params.get(name));
+  return value !== null && value >= 0 ? value : fallback;
 }
 
 export function requiredParam(
@@ -64,8 +69,8 @@ export function safeIntParam(
 ): number {
   const raw = params.get(name);
   if (raw === null) return fallback;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+  const value = safeInteger(raw);
+  return value !== null && value >= 0 ? value : fallback;
 }
 
 // These documented limits belong to the wire, never whole-catalog core calls.
@@ -82,8 +87,8 @@ export function yearParam(
 ): number | undefined | Response {
   const raw = context.state.params!.get(name);
   if (raw === null) return undefined;
-  const value = Number(raw);
-  return raw.trim() !== '' && Number.isSafeInteger(value)
+  const value = safeInteger(raw);
+  return raw.trim() !== '' && value !== null
     ? value
     : fail(context, 10, `${name} must be a finite safe integer year`);
 }

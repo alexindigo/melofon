@@ -7,7 +7,7 @@
 // unused for serving. `size` (WxH from bitRate=1000@480x360) is accepted and
 // ignored (no rescale in M4.6).
 import { fail, notFound } from '#opensubsonic/envelope.ts';
-import { requiredParam } from '#opensubsonic/params.ts';
+import { integerParam, requiredParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
@@ -18,8 +18,8 @@ export default async (_request: HatRequest, context: HatContext) => {
   if (song === null) return notFound(context);
 
   const rawIndex = params.get('segmentIndex');
-  const segmentIndex = rawIndex === null ? NaN : Number(rawIndex);
-  if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
+  const segmentIndex = integerParam(rawIndex);
+  if (segmentIndex === null || segmentIndex < 0) {
     return fail(context, 10, 'segmentIndex must be a non-negative integer');
   }
   // bitRate becomes a cache path component — digits only, never raw input.

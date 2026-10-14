@@ -47,8 +47,13 @@ is advertised. This does not advertise missing operations or other extensions.
 
 Existing GET/POST operations accept `application/x-www-form-urlencoded` arguments,
 including percent-encoded credentials/text and repeated fields such as star `id`.
+The POST media-type essence is matched exactly and case-insensitively, allowing
+ordinary token/quoted parameters. Suffixed lookalikes and unrelated media types
+leave query parameters available and do not invoke the form decoder. The original
+header and body still go through the native form decoder.
 Form values precede query values: scalar getters use the first form value;
-repeated getters retain form values followed by query values. Both methods reach
+an empty first value stays empty. Repeated getters retain form values followed
+by query values, including duplicates and their order. Both methods reach
 the same injected core services and canonical state.
 
 ## OpenSubsonic catalog sync and selection
@@ -79,6 +84,22 @@ whole-catalog consumers are not subject to these OpenSubsonic wire caps.
 The existing physical-source integer/hash compatibility remains in place;
 unmatched folders return empty selections. This documents catalog selection,
 not complete source-qualified artist/album aggregate or date/history semantics.
+
+Whole-number request fields establish mathematical integrality before conversion
+to a JavaScript Number. Whole-valued decimal/exponent forms (`1.0`, `.1e1`,
+`1000e-3`) and unsigned hexadecimal/binary/octal integers remain valid where the
+field's range permits. Rounded fractions (`1.0000000000000001`) and nonzero
+underflow (`1e-400`) are invalid and follow that field's existing fallback/error
+policy. Required years still reject blanks; legacy blank-zero and negative-zero
+behavior is preserved in the fields that already allowed it.
+
+Safe-integer catalog fields retain their documented range. Legacy fields—search2
+counts/offsets, playlist removal indexes, HLS segment indexes and OwnTone integer
+arguments—continue accepting finite unsafe whole numbers with their previous
+rounded Number representation. This is not lossless representation or a new
+safe-only limit. OwnTone signed values, paging `-1` sentinel and first-valid
+absolute/relative command precedence remain in place. Fractional bookmark/client
+queue positions and scrobble seconds retain their separate number contracts.
 
 ## Native last-command snapshot
 

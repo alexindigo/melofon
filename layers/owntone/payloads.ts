@@ -4,6 +4,7 @@
 // boundary with a stable hash-derived int31 — the same formula as
 // OpenSubsonic's folderWireId. Queue item `id` is a queue-local int;
 // `track_id` on the item is the library (wire) id.
+import { legacyInteger } from './numbers.ts';
 import type {
   AlbumRow,
   ArtistRow,
@@ -246,9 +247,7 @@ export function boolParam(value: string | null): boolean {
 
 /** Integer query param; null when missing or not an integer. */
 export function intParam(value: string | null): number | null {
-  if (value === null) return null;
-  const n = Number(value);
-  return Number.isInteger(n) ? n : null;
+  return value === null ? null : legacyInteger(value);
 }
 
 /** OwnTone paging params: offset ≥ 0, limit ≥ -1 (-1 = all). 400 on junk. */
