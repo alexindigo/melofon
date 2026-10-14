@@ -37,11 +37,8 @@ import {
   createTestAirplayDevices,
   recordingSpawn,
 } from './helpers/airplay-devices.ts';
+import { NATIVE_CHANGED } from './helpers/native-changes.ts';
 
-const LIB_PATH = decodeURIComponent(
-  new URL('../helper/raop/libmelofon_raop.so', import.meta.url).pathname,
-);
-const HAVE_LIB = await Deno.stat(LIB_PATH).then(() => true).catch(() => false);
 // Optional test-only LD_PRELOAD observer. The explicit verification run loads
 // this same inode before Deno starts, so counters observe native connect/close,
 // independently of helper state and delayed receiver EOF.
@@ -777,7 +774,7 @@ async function seekBattery(
 Deno.test({
   name:
     'ATV3 recycle integration (feed: affected first): 40 seeks, pause/resume, track changes',
-  ignore: !HAVE_LIB,
+  ignore: !NATIVE_CHANGED,
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -859,7 +856,7 @@ Deno.test({
 Deno.test({
   name:
     'ATV3 recycle integration (feed: companion first; delayed old-session cleanup): 40 seeks',
-  ignore: !HAVE_LIB,
+  ignore: !NATIVE_CHANGED,
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {

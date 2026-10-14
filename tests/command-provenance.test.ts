@@ -391,21 +391,7 @@ const PLAYER_KEYS = [
   'item_progress_ms',
 ].sort();
 
-async function retainNative(name: string, receipt: unknown) {
-  const root = Deno.env.get('MELOFON_LOGGING_EVIDENCE');
-  if (!root) return;
-  assert(root.startsWith(
-    '/home/tester/melofon-output-preparation-01/shared-logging-01/evidence/',
-  ));
-  await Deno.mkdir(root, { recursive: true, mode: 0o700 });
-  await Deno.writeTextFile(
-    `${root}/native-last-command-${name}.json`,
-    JSON.stringify(receipt, null, 2) + '\n',
-    { createNew: true },
-  );
-}
-
-Deno.test('native last-command: detached allowlist, optionals and primitive values', async () => {
+Deno.test('native last-command: detached allowlist, optionals and primitive values', () => {
   let hiddenReads = 0;
   const source = {
     kind: 'http' as const,
@@ -530,12 +516,6 @@ Deno.test('native last-command: detached allowlist, optionals and primitive valu
   assertEquals(Object.hasOwn(malformed.playback!, 'detail'), false);
   assertEquals(malformed.playback!.source, { kind: 'internal' });
   assertEquals(coercions, 0);
-  await retainNative('projection', {
-    detached: true,
-    hiddenReads,
-    coercions,
-    bare,
-  });
 });
 
 Deno.test('native last-command: reads each owner once and missing injection fails', async () => {
@@ -583,7 +563,6 @@ Deno.test('native last-command: independently null owners through actual facade 
       playback: playback.lastCommand(),
       outputs: null,
     });
-    await retainNative('null-playback', { initial, onlyPlayback });
   } finally {
     await close();
   }
@@ -598,7 +577,6 @@ Deno.test('native last-command: independently null owners through actual facade 
       outputs: second.outputs.lastCommand(),
     });
     assertEquals(onlyOutputs.outputs.selection, []);
-    await retainNative('null-outputs', onlyOutputs);
   } finally {
     await second.close();
   }
@@ -681,7 +659,6 @@ Deno.test('native last-command: OwnTone seek, volume and selection share the rea
     const ownOutputs = await (await onHook(new Request('http://x/api/outputs')))
       .json();
     assertEquals(ownOutputs.outputs[0].selected, true);
-    await retainNative('owntone', { receipts, native, ownOutputs });
   } finally {
     await close();
   }
@@ -726,11 +703,6 @@ Deno.test('native last-command: internal pause and restore provenance stays visi
       via: 'airplay-boot',
     });
     assertEquals(paused.outputs, restored.outputs);
-    await retainNative('internal', {
-      restored,
-      paused,
-      simulatedInternalSource: true,
-    });
   } finally {
     await close();
   }
@@ -802,13 +774,6 @@ Deno.test('native last-command: observer GETs preserve records, state and notifi
     assertEquals(JSON.stringify(after), frozen);
     const own = await (await onHook(new Request('http://x/api/player'))).json();
     assertEquals(Object.keys(own).sort(), PLAYER_KEYS);
-    await retainNative('readonly', {
-      before,
-      after,
-      responses,
-      recordIdentityPreserved: true,
-      own,
-    });
   } finally {
     unsubscribe();
     await close();
@@ -850,11 +815,6 @@ Deno.test('native last-command: output update and PIN expose no inferred payload
       },
     });
     assertEquals(JSON.stringify(native).includes('private-pin-canary'), false);
-    await retainNative('pin', {
-      native,
-      pinDelivered: true,
-      volume: outputs.get('123')!.volume,
-    });
   } finally {
     await close();
   }
@@ -885,11 +845,6 @@ Deno.test('native last-command: default and extra binds follow GET-only Pathfind
     }
     assertEquals(playback.lastCommand(), null);
     assertEquals(outputs.lastCommand(), null);
-    await retainNative('routing', {
-      getStatus: 200,
-      postStatus: expected.status,
-      postBody: expectedBody,
-    });
   } finally {
     await close();
   }

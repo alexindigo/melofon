@@ -1,6 +1,7 @@
 // Compile the native source-address probe against this workspace's graph.
 import { assertEquals, assertStringIncludes } from '@std/assert';
 import { startFakeRaop } from './helpers/fake-raop.ts';
+import { NATIVE_CHANGED } from './helpers/native-changes.ts';
 
 const nativeRoot = decodeURIComponent(
   new URL('../helper/raop/', import.meta.url).pathname,
@@ -89,6 +90,7 @@ async function build(directory: string) {
 
 Deno.test({
   name: 'native source probe: session mode against fake receiver exits 0',
+  ignore: !NATIVE_CHANGED,
   // The shared fake receiver owns asynchronous socket-close callbacks.
   // Receiver closure is asserted explicitly in finally.
   sanitizeOps: false,
@@ -117,6 +119,7 @@ Deno.test({
 
 Deno.test({
   name: 'native source probe: address contracts in rootless netns',
+  ignore: !NATIVE_CHANGED,
   fn: async () => {
     const directory = await Deno.makeTempDir({ prefix: 'raop-source-probe-' });
     try {

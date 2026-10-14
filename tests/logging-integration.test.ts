@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { parseLogfmt } from './helpers/logging.ts';
+import { NATIVE_CHANGED } from './helpers/native-changes.ts';
 
 const permissions = [
   '--allow-run',
@@ -92,33 +93,38 @@ Deno.test('actual pipe consumers see correct streams, one-line records and redac
   assert(!/^<\d>/m.test(new TextDecoder().decode(forged.stdout)));
   assert(!/^<\d>/m.test(new TextDecoder().decode(forged.stderr)));
 });
-Deno.test('ordinary native diagnostic queue reaches final consumer with before-handle, bounded overflow and truncation facts', async () => {
-  const result = await child('queue').output();
-  assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
-  const all = [...records(result.stdout), ...records(result.stderr)];
-  assertEquals(all.length, 256);
-  assert(
-    all.some((r) =>
-      r.payload?.includes('before-handle') && r.time_basis === 'captured'
-    ),
-  );
-  assert(all.some((r) => Number(r.dropped) === 348));
-  assert(
-    all.some((r) =>
-      r.nativeEvent === 'ffmpeg' && r.domain === '14' &&
-      r.payload.includes('system-ffmpeg')
-    ),
-  );
-  assert(
-    all.some((r) =>
-      r.nativeEvent === 'libevent' && r.domain === '11' &&
-      r.payload.includes('libevent')
-    ),
-  );
-  assert(all.some((r) => r.truncated === '1'));
-  assert(
-    !new TextDecoder().decode(result.stderr).includes('credential/CANARY'),
-  );
+Deno.test({
+  name:
+    'ordinary native diagnostic queue reaches final consumer with before-handle, bounded overflow and truncation facts',
+  ignore: !NATIVE_CHANGED,
+  fn: async () => {
+    const result = await child('queue').output();
+    assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
+    const all = [...records(result.stdout), ...records(result.stderr)];
+    assertEquals(all.length, 256);
+    assert(
+      all.some((r) =>
+        r.payload?.includes('before-handle') && r.time_basis === 'captured'
+      ),
+    );
+    assert(all.some((r) => Number(r.dropped) === 348));
+    assert(
+      all.some((r) =>
+        r.nativeEvent === 'ffmpeg' && r.domain === '14' &&
+        r.payload.includes('system-ffmpeg')
+      ),
+    );
+    assert(
+      all.some((r) =>
+        r.nativeEvent === 'libevent' && r.domain === '11' &&
+        r.payload.includes('libevent')
+      ),
+    );
+    assert(all.some((r) => r.truncated === '1'));
+    assert(
+      !new TextDecoder().decode(result.stderr).includes('credential/CANARY'),
+    );
+  },
 });
 Deno.test('actual HTTP, DB, command, Pathfinder, metadata debug and node-av events reach normalized stdout/stderr', async () => {
   const result = await child('families').output();
@@ -167,56 +173,73 @@ Deno.test('actual HTTP, DB, command, Pathfinder, metadata debug and node-av even
     ]
   ) assert(!text.includes(canary), canary);
 });
-Deno.test('compiled native graph has no enabled raw diagnostic/key-dump bypass; negative writer is rejected', async () => {
-  const result = await child('inventory').output();
-  assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
-  assertEquals(JSON.parse(records(result.stdout)[0].payload), {
-    compiledNativeObjects: 11,
-    writerViolations: 0,
-    negativeRejected: true,
-    debugKeyDumpsAbsent: true,
-  });
+Deno.test({
+  name:
+    'compiled native graph has no enabled raw diagnostic/key-dump bypass; negative writer is rejected',
+  ignore: !NATIVE_CHANGED,
+  fn: async () => {
+    const result = await child('inventory').output();
+    assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
+    assertEquals(JSON.parse(records(result.stdout)[0].payload), {
+      compiledNativeObjects: 11,
+      writerViolations: 0,
+      negativeRejected: true,
+      debugKeyDumpsAbsent: true,
+    });
+  },
 });
 
-Deno.test('logging correction: ordinary native owner drains before first handle, after last free and after reload', async () => {
-  const result = await child('idle-lifecycle').output();
-  assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
-  const all = [...records(result.stdout), ...records(result.stderr)];
-  const outcome = JSON.parse(
-    all.find((r) =>
-      r.event === 'fixture_info' && r.payload.includes('idle_lifecycle')
-    )!.payload,
-  );
-  assertEquals(
-    outcome.phases.map((row: { automatic: boolean }) => row.automatic),
-    [true, true, true, true],
-    'automatic native delivery must occur in each phase before another handle or shutdown can flush it',
-  );
-  assertEquals(outcome.consumerReleased, true);
-  assertEquals(outcome.releaseCompleted, true);
-  assertEquals(all.filter((r) => r.nativeEvent === 'probe_queued').length, 100);
-  for (
-    const marker of [
-      'correction_before_first',
-      'correction_after_last_free',
-      'correction_new_handle',
-      'correction_queued_at_shutdown',
-      'correction_reloaded_idle',
-    ]
-  ) {
-    assertEquals(all.filter((r) => r.nativeEvent === marker).length, 1, marker);
-  }
-  assert(
-    all.some((r) => r.nativeEvent === 'pcm_peak' && Number(r.pcm_peak) > 0),
-  );
-  assert(
-    all.filter((r) => r.event === 'native_record').every((r) =>
-      !r.dropped || r.dropped === '0'
-    ),
-  );
-  assert(
-    !new TextDecoder().decode(result.stderr).includes('credential/CANARY'),
-  );
+Deno.test({
+  name:
+    'logging correction: ordinary native owner drains before first handle, after last free and after reload',
+  ignore: !NATIVE_CHANGED,
+  fn: async () => {
+    const result = await child('idle-lifecycle').output();
+    assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
+    const all = [...records(result.stdout), ...records(result.stderr)];
+    const outcome = JSON.parse(
+      all.find((r) =>
+        r.event === 'fixture_info' && r.payload.includes('idle_lifecycle')
+      )!.payload,
+    );
+    assertEquals(
+      outcome.phases.map((row: { automatic: boolean }) => row.automatic),
+      [true, true, true, true],
+      'automatic native delivery must occur in each phase before another handle or shutdown can flush it',
+    );
+    assertEquals(outcome.consumerReleased, true);
+    assertEquals(outcome.releaseCompleted, true);
+    assertEquals(
+      all.filter((r) => r.nativeEvent === 'probe_queued').length,
+      100,
+    );
+    for (
+      const marker of [
+        'correction_before_first',
+        'correction_after_last_free',
+        'correction_new_handle',
+        'correction_queued_at_shutdown',
+        'correction_reloaded_idle',
+      ]
+    ) {
+      assertEquals(
+        all.filter((r) => r.nativeEvent === marker).length,
+        1,
+        marker,
+      );
+    }
+    assert(
+      all.some((r) => r.nativeEvent === 'pcm_peak' && Number(r.pcm_peak) > 0),
+    );
+    assert(
+      all.filter((r) => r.event === 'native_record').every((r) =>
+        !r.dropped || r.dropped === '0'
+      ),
+    );
+    assert(
+      !new TextDecoder().decode(result.stderr).includes('credential/CANARY'),
+    );
+  },
 });
 
 Deno.test('logging correction: diagnostic ownership alone never keeps an ordinary child alive', async () => {

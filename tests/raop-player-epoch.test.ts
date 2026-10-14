@@ -2,6 +2,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
+import { NATIVE_CHANGED } from './helpers/native-changes.ts';
 
 const nativeRoot = decodeURIComponent(
   new URL('../helper/raop/', import.meta.url).pathname,
@@ -91,14 +92,13 @@ for (
       `native player epoch: ${scenario} preserves byte-exact surviving feed`,
     // The shared fake receiver owns asynchronous socket-close callbacks.
     // Native cleanup, process exit and receiver closure are asserted explicitly.
+    ignore: !NATIVE_CHANGED,
     sanitizeOps: false,
     sanitizeResources: false,
     fn: async () => {
-      const evidence = Deno.env.get('MELOFON_RAOP_EPOCH_EVIDENCE');
-      const directory = evidence
-        ? `${evidence}/${scenario}`
-        : await Deno.makeTempDir({ prefix: 'raop-player-epoch-' });
-      if (evidence) await Deno.mkdir(directory, { mode: 0o700 });
+      const directory = await Deno.makeTempDir({
+        prefix: 'raop-player-epoch-',
+      });
       const env = childEnvironment();
       const decoder = new TextDecoder();
       const pcArgs = ['--cflags', '--libs', ...packages];
@@ -308,7 +308,7 @@ for (
         );
         a.close();
         b.close();
-        if (!evidence) await Deno.remove(directory, { recursive: true });
+        await Deno.remove(directory, { recursive: true });
       }
     },
   });

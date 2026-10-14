@@ -2,19 +2,16 @@
 // Deno.dlopen loads libmelofon_raop, a fake RAOP device (tests/helpers/
 // fake-raop.ts, same wire shape as helper/raop/test/fake_raop.py) answers
 // RTSP and counts RTP packets. start → connected → PCM streams → volume →
-// teardown → stopped. Gated on the built library existing, so dev machines
-// without `make -C helper/raop` still run the suite green. Sanitizers off:
-// the dlopen'd library is process-lifetime by design.
+// teardown → stopped. Gated on NATIVE_CHANGED (helpers/native-changes.ts):
+// runs when helper/raop/ has uncommitted changes or git can't tell, and then
+// needs `make -C helper/raop` (or MELOFON_RAOP_LIB); a missing library fails.
+// Sanitizers off: the dlopen'd library is process-lifetime by design.
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { createOutputs } from '../src/player.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
-
-const LIB_PATH = decodeURIComponent(
-  new URL('../helper/raop/libmelofon_raop.so', import.meta.url).pathname,
-);
-const HAVE_LIB = await Deno.stat(LIB_PATH).then(() => true).catch(() => false);
+import { NATIVE_CHANGED } from './helpers/native-changes.ts';
 
 async function admittedTransport(
   fake: Awaited<ReturnType<typeof startFakeRaop>>,
@@ -61,7 +58,7 @@ async function until(what: string, fn: () => boolean, timeoutMs = 15000) {
 
 Deno.test({
   name: 'FFI transport streams to a fake RAOP device in-process',
-  ignore: !HAVE_LIB,
+  ignore: !NATIVE_CHANGED,
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -128,7 +125,7 @@ Deno.test({
 
 Deno.test({
   name: 'FFI transport: send on a closed transport rejects; close is memoized',
-  ignore: !HAVE_LIB,
+  ignore: !NATIVE_CHANGED,
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -159,7 +156,7 @@ Deno.test({
 
 Deno.test({
   name: 'FFI transport: a flush abandons a backpressured in-flight pcm write',
-  ignore: !HAVE_LIB,
+  ignore: !NATIVE_CHANGED,
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -208,7 +205,7 @@ Deno.test({
 
 Deno.test({
   name: 'FFI transport: close abandons a backpressured in-flight pcm write',
-  ignore: !HAVE_LIB,
+  ignore: !NATIVE_CHANGED,
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -251,7 +248,7 @@ Deno.test({
 Deno.test({
   name:
     'FFI cancelPcm fences parked writes while preserving connection, feed and no-FLUSH peer state',
-  ignore: !HAVE_LIB,
+  ignore: !NATIVE_CHANGED,
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {

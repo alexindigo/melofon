@@ -489,23 +489,7 @@ Deno.test('uninspectable raw event facts produce an explicit diagnostic without 
   assertEquals(capture.records()[0].failedEvent, 'fixture_info');
 });
 
-async function correctionReceipt(name: string, facts: unknown) {
-  const root = Deno.env.get('MELOFON_LOGGING_EVIDENCE');
-  if (!root) return;
-  assert(
-    root.startsWith(
-      '/home/tester/melofon-output-preparation-01/shared-logging-01/evidence/',
-    ),
-  );
-  await Deno.mkdir(root, { recursive: true, mode: 0o700 });
-  await Deno.writeTextFile(
-    `${root}/${name}.json`,
-    JSON.stringify(facts, null, 2),
-    { createNew: true },
-  );
-}
-
-Deno.test('logging correction: SQL executable tokens exclude escape strings and nested comments', async () => {
+Deno.test('logging correction: SQL executable tokens exclude escape strings and nested comments', () => {
   const capture = captureLogs();
   const canary = 'secret_canary'; // Deliberately never registered as a secret.
   const protectedRegions = [
@@ -587,11 +571,6 @@ Deno.test('logging correction: SQL executable tokens exclude escape strings and 
     capture.log.event('db_begin', { sql, qinflight: 1 });
     capture.log.event('db_end', { sql, waitMs: 1 });
   }
-  await correctionReceipt('sql', {
-    cases,
-    lines: capture.lines,
-    records: capture.records(),
-  });
   for (let i = 0; i < cases.length; i++) {
     for (const row of capture.records().slice(i * 2, i * 2 + 2)) {
       assert(
@@ -605,7 +584,7 @@ Deno.test('logging correction: SQL executable tokens exclude escape strings and 
   }
 });
 
-Deno.test('logging correction: exhausted Error field lookup never authorizes custom getters or coercion', async () => {
+Deno.test('logging correction: exhausted Error field lookup never authorizes custom getters or coercion', () => {
   const capture = captureLogs();
   const counts = { name: 0, message: 0, coercion: 0, proxy: 0 };
   for (const key of ['name', 'message'] as const) {
@@ -667,11 +646,6 @@ Deno.test('logging correction: exhausted Error field lookup never authorizes cus
     value: 'already-materialized',
   });
   capture.log.event('fixture_error', { payload: materialized });
-  await correctionReceipt('descriptors', {
-    counts,
-    lines: capture.lines,
-    records: capture.records(),
-  });
   assertEquals(counts, { name: 0, message: 0, coercion: 0, proxy: 0 });
   const payloads = capture.records().map((row) => JSON.parse(row.payload));
   for (const payload of payloads.slice(0, 4)) {
@@ -683,7 +657,7 @@ Deno.test('logging correction: exhausted Error field lookup never authorizes cus
   assertEquals(payloads[6].stack, 'already-materialized');
 });
 
-Deno.test('logging correction: exhausted constructor formatter lookup is uninspectable rather than absent', async () => {
+Deno.test('logging correction: exhausted constructor formatter lookup is uninspectable rather than absent', () => {
   const capture = captureLogs();
   let calls = 0;
   const original = Object.getPrototypeOf(Error);
@@ -709,11 +683,6 @@ Deno.test('logging correction: exhausted constructor formatter lookup is uninspe
     if (own) Object.defineProperty(Error, 'prepareStackTrace', own);
     else Reflect.deleteProperty(Error, 'prepareStackTrace');
   }
-  await correctionReceipt('formatter', {
-    calls,
-    lines: capture.lines,
-    records: capture.records(),
-  });
   assertEquals(calls, 0);
   const payload = JSON.parse(capture.records()[0].payload);
   assert(payload.stack_unavailable);
@@ -743,12 +712,6 @@ Deno.test('logging correction: normalization rejection cannot be attributed to a
   });
   capture.log.event('fixture_info', { payload: 'healthy-after' });
   await capture.log.flush();
-  await correctionReceipt('accounting', {
-    calls,
-    stats: capture.log.stats(),
-    lines: capture.lines,
-    records: capture.records(),
-  });
   assertEquals(calls, 0);
   const rows = capture.records();
   assertEquals(rows[0].event, 'normalization_failed');
@@ -797,11 +760,6 @@ Deno.test('logging correction: sync and async sink faults have independent cumul
   release();
   await log.flush();
   log.event('fixture_info', { payload: 'final' });
-  await correctionReceipt('combined-accounting', {
-    stats: log.stats(),
-    lines,
-    records: lines.map((line) => parseLogfmt(line.trimEnd())),
-  });
   assertEquals<Record<string, number>>(log.stats(), {
     failures: 3,
     dropped: 1,
