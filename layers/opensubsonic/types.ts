@@ -9,6 +9,12 @@ export interface StateUser {
   displayName: string;
 }
 
+/** How this request's envelopes render (resolved once by 10-auth). */
+export type ResponseFormat =
+  | { type: 'xml' }
+  | { type: 'json' }
+  | { type: 'jsonp'; callback: string };
+
 export interface HatRequest {
   params: Record<string, string>;
   query: URLSearchParams;
@@ -26,6 +32,10 @@ export interface HatContext {
       version?: string;
       /** Data dir root — the HLS segment cache lives under it. */
       dataDir?: string;
+    };
+    /** Operator-owned live config (`opensubsonic.jsonp`). */
+    state: {
+      get(key: string): Promise<string | null>;
     };
     user: {
       auth(username: string, password: string): Promise<StateUser | null>;
@@ -231,6 +241,9 @@ export interface HatContext {
   state: {
     user?: StateUser;
     params?: URLSearchParams;
+    format?: ResponseFormat;
+    /** Routed operation name (`stream`, `hls.m3u8`, …). */
+    operation?: string;
   };
 }
 

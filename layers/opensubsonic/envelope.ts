@@ -1,11 +1,16 @@
 // layers/opensubsonic/envelope.ts — the Subsonic response envelope (ok /
-// failed, XML+JSON). Shared module at the layer root, outside the walked
+// failed, XML+JSON+JSONP). Shared module at the layer root, outside the walked
 // mount tree. Subsonic errors ship in the envelope, Navidrome-style: HTTP 200
 // with status="failed" (auth failures, missing params). Outcome pages
-// (404/500) pass their own HTTP status.
+// (404/500) pass their own HTTP status. The format and operation come from
+// 10-auth's single resolution; without it (a page that ran without the
+// middleware) the plain json/xml choice applies, never JSONP.
+import {
+  API_VERSION,
+  BINARY_OPERATIONS,
+  plainFormat,
+} from '#opensubsonic/protocol.ts';
 import type { HatContext } from '#opensubsonic/types.ts';
-
-const API_VERSION = '1.16.1';
 
 function base(context: HatContext): Record<string, unknown> {
   return {
@@ -66,9 +71,22 @@ function render(
   envelope: Record<string, unknown>,
   status: number,
 ): Response {
-  const f = context.state.params?.get('f') ?? 'xml';
-  if (f === 'json') {
+  const format = context.state.format ?? plainFormat(context.state.params);
+  if (format.type === 'json') {
     return Response.json({ 'subsonic-response': envelope }, { status });
+  }
+  if (format.type === 'jsonp') {
+    // U+2028/U+2029 are valid JSON but line terminators in older JS parsers.
+    const json = JSON.stringify({ 'subsonic-response': envelope })
+      .replaceAll('\u2028', '\\u2028')
+      .replaceAll('\u2029', '\\u2029');
+    return new Response(`${format.callback}(${json})`, {
+      status,
+      headers: {
+        'content-type': 'application/javascript',
+        'x-content-type-options': 'nosniff',
+      },
+    });
   }
   // The XML envelope carries the Subsonic namespace (Navidrome/Subsonic
   // always send it; strict namespace-aware parsers find nothing without it).
@@ -78,9 +96,15 @@ function render(
       ...envelope,
     })
   }`;
+  // Binary operations document their XML errors as text/xml.
+  const binary = BINARY_OPERATIONS.has(context.state.operation ?? '');
   return new Response(xml, {
     status,
-    headers: { 'content-type': 'application/xml; charset=utf-8' },
+    headers: {
+      'content-type': binary
+        ? 'text/xml; charset=utf-8'
+        : 'application/xml; charset=utf-8',
+    },
   });
 }
 

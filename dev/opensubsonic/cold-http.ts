@@ -12,10 +12,48 @@ function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(`OpenSubsonic cold consumer: ${message}`);
 }
 
+// H1C common-protocol socket ledger: literal names, compared as an exact
+// multiset here and by the cold-h1c observer oracle. Never part of the
+// original or parsing ledgers.
+export const H1C_ASSERTIONS: readonly string[] = Object.freeze([
+  'H1C version 1.17.0 code30',
+  'H1C version 1.99999999999999999999 code30',
+  'H1C version 0.9.0 code20',
+  'H1C version 1.16.x accepted',
+  'H1C apiKey alone code42',
+  'H1C apiKey with u/p code43',
+  'H1C password with token/salt code43',
+  'H1C token without salt code10',
+  'H1C no credentials code10',
+  'H1C empty form p with valid query fallback code10',
+  'H1C JSONP off renders XML',
+  'H1C JSONP setting on through core config',
+  'H1C JSONP callback body',
+  'H1C JSONP content type and nosniff',
+  'H1C JSONP missing callback plain JSON code10',
+  'H1C JSONP invalid callback plain JSON code0 unreflected',
+  'H1C JSONP setting off through core config',
+  'H1C JSONP off again renders XML',
+  'H1C stream auth failure text/xml',
+  'H1C stream not-found text/xml',
+  'H1C getCoverArt auth failure text/xml',
+  'H1C getCoverArt missing id text/xml',
+  'H1C ping XML error stays application/xml',
+]);
+
+export function sameMultiset(
+  actual: readonly string[],
+  expected: readonly string[],
+): boolean {
+  return JSON.stringify([...actual].sort()) ===
+    JSON.stringify([...expected].sort());
+}
+
 export async function runCold(driverArgs = Deno.args) {
   const owner = new OwnedRun({ lease: driverArgs.includes('--lease=stdin') });
   const assertions: string[] = [];
   const parsingAssertions: string[] = [];
+  const h1cAssertions: string[] = [];
   const receipts: {
     ledger: string;
     adaptive: boolean;
@@ -35,8 +73,8 @@ export async function runCold(driverArgs = Deno.args) {
 
     phase = option('phase');
     check(
-      phase === 'H1' || phase === 'H2',
-      'only implemented H1/H2 phases accepted',
+      phase === 'H1' || phase === 'H2' || phase === 'H1C',
+      'only implemented H1/H2/H1C phases accepted',
     );
     const candidate = await owner.operation(
       'candidate root',
@@ -48,11 +86,14 @@ export async function runCold(driverArgs = Deno.args) {
         .test(candidate);
     const correction =
       /^\/home\/tester\/melofon-output-preparation-01\/opensubsonic-prefix-correction-01\/(?:candidate|verification-\d{2,})\/source$/
+        .test(candidate) ||
+      /^\/home\/tester\/melofon-output-preparation-01\/opensubsonic-h1c-01\/(?:candidate|verification-\d{2,})\/source$/
         .test(candidate);
     check(
       historical || correction,
       'candidate outside approved disk root',
     );
+    check(phase !== 'H1C' || correction, 'H1C runs only as a corrected owner');
     check(
       await owner.operation(
         'driver import root',
@@ -187,6 +228,7 @@ export async function runCold(driverArgs = Deno.args) {
         body: string;
         status: number;
         contentType: string | null;
+        headers: Record<string, string>;
       };
       await owner.request(url, init, {
         phaseDeadline,
@@ -929,6 +971,203 @@ export async function runCold(driverArgs = Deno.args) {
       }
     }
 
+    // H1C common protocol over the sole application child's socket. Its own
+    // ledger and receipts; the JSONP setting changes only through the child's
+    // core config route (fixture setup, like library seeding).
+    async function commonProtocolConsumer() {
+      const h1c = (condition: unknown, name: string) => {
+        check(condition, name);
+        h1cAssertions.push(name);
+      };
+      const send = (path: string, init: RequestInit = {}) =>
+        request(path, init, BASE, owner.activeDeadline, 'h1c');
+      const auth = (
+        extra: Record<string, string> = {},
+        drop: string[] = [],
+      ) => {
+        const p = new URLSearchParams(AUTH);
+        for (const key of drop) p.delete(key);
+        for (const [key, value] of Object.entries(extra)) p.set(key, value);
+        return p;
+      };
+      const envelope = async (path: string, init: RequestInit = {}) =>
+        (await send(path, init)).json()['subsonic-response'];
+      const failed = (value: { status?: string; error?: { code?: number } }) =>
+        value.status === 'failed' ? value.error?.code : undefined;
+      const XML = 'application/xml; charset=utf-8';
+      const TEXT_XML = 'text/xml; charset=utf-8';
+      const xmlCode = (body: string) => /<error code="(\d+)"/.exec(body)?.[1];
+      const versions: [string, number][] = [
+        ['1.17.0', 30],
+        ['1.99999999999999999999', 30],
+        ['0.9.0', 20],
+      ];
+      for (const [v, code] of versions) {
+        h1c(
+          failed(await envelope(`/rest/ping?${auth({ v })}`)) === code,
+          `H1C version ${v} code${code}`,
+        );
+      }
+      h1c(
+        (await envelope(`/rest/ping?${auth({ v: '1.16.x' })}`)).status === 'ok',
+        'H1C version 1.16.x accepted',
+      );
+      const keyOnly = new URLSearchParams({
+        apiKey: 'fixture-key',
+        v: '1.16.1',
+        c: 'H1C',
+        f: 'json',
+      });
+      const unsupported = await envelope(`/rest/ping?${keyOnly}`);
+      h1c(
+        failed(unsupported) === 42 &&
+          unsupported.error.message ===
+            'Provided authentication mechanism not supported.',
+        'H1C apiKey alone code42',
+      );
+      const keyMixed = await envelope(
+        `/rest/ping?${auth({ apiKey: 'fixture-key' })}`,
+      );
+      h1c(
+        failed(keyMixed) === 43 &&
+          keyMixed.error.message ===
+            'Multiple conflicting authentication mechanisms provided.',
+        'H1C apiKey with u/p code43',
+      );
+      h1c(
+        failed(
+          await envelope(
+            `/rest/ping?${auth({ t: 'fixture-token', s: 'fixture-salt' })}`,
+          ),
+        ) === 43,
+        'H1C password with token/salt code43',
+      );
+      h1c(
+        failed(
+          await envelope(`/rest/ping?${auth({ t: 'fixture-token' }, ['p'])}`),
+        ) === 10,
+        'H1C token without salt code10',
+      );
+      h1c(
+        failed(await envelope(`/rest/ping?${auth({}, ['p'])}`)) === 10,
+        'H1C no credentials code10',
+      );
+      h1c(
+        failed(
+          await envelope(`/rest/ping?${AUTH}`, {
+            method: 'POST',
+            body: auth({ p: '' }),
+          }),
+        ) === 10,
+        'H1C empty form p with valid query fallback code10',
+      );
+      const callback = 'angular.callbacks._0';
+      const jsonpXml = async (name: string) => {
+        const res = await send(`/rest/ping?${auth({ f: 'jsonp', callback })}`);
+        h1c(
+          res.status === 200 && res.contentType === XML &&
+            res.body.includes('status="ok"') &&
+            res.body.includes('version="1.16.1"') &&
+            !res.body.includes(callback),
+          name,
+        );
+      };
+      await jsonpXml('H1C JSONP off renders XML');
+      const setting = async (value: string) =>
+        await send('/_/config/opensubsonic.jsonp', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ value }),
+        });
+      const on = await setting('on');
+      h1c(
+        on.status === 200 && on.json().ok === true,
+        'H1C JSONP setting on through core config',
+      );
+      const jsonp = await send(`/rest/ping?${auth({ f: 'jsonp', callback })}`);
+      const prefix = `${callback}(`;
+      const wrapped = jsonp.body.startsWith(prefix) &&
+          jsonp.body.endsWith(')')
+        ? JSON.parse(jsonp.body.slice(prefix.length, -1))
+        : undefined;
+      const inner = wrapped?.['subsonic-response'];
+      h1c(
+        jsonp.status === 200 && inner?.status === 'ok' &&
+          inner.version === '1.16.1' && inner.type === 'melofon' &&
+          inner.openSubsonic === true &&
+          jsonp.body === `${prefix}${JSON.stringify(wrapped)})`,
+        'H1C JSONP callback body',
+      );
+      h1c(
+        jsonp.contentType === 'application/javascript' &&
+          jsonp.headers['x-content-type-options'] === 'nosniff',
+        'H1C JSONP content type and nosniff',
+      );
+      const missing = await send(`/rest/ping?${auth({ f: 'jsonp' })}`);
+      h1c(
+        missing.contentType === 'application/json' &&
+          failed(missing.json()['subsonic-response']) === 10 &&
+          missing.json()['subsonic-response'].error.message ===
+            'Required parameter is missing',
+        'H1C JSONP missing callback plain JSON code10',
+      );
+      const rejected = 'alert(document.domain)//';
+      const invalid = await send(
+        `/rest/ping?${auth({ f: 'jsonp', callback: rejected })}`,
+      );
+      h1c(
+        invalid.contentType === 'application/json' &&
+          failed(invalid.json()['subsonic-response']) === 0 &&
+          invalid.json()['subsonic-response'].error.message ===
+            'invalid callback parameter' &&
+          !invalid.body.includes('alert(') &&
+          !invalid.body.includes('document.domain'),
+        'H1C JSONP invalid callback plain JSON code0 unreflected',
+      );
+      const off = await setting('off');
+      h1c(
+        off.status === 200 && off.json().ok === true,
+        'H1C JSONP setting off through core config',
+      );
+      await jsonpXml('H1C JSONP off again renders XML');
+      const xmlError = async (path: string, code: string, name: string) => {
+        const res = await send(path);
+        h1c(
+          res.status === 200 && res.contentType === TEXT_XML &&
+            xmlCode(res.body) === code &&
+            res.body.includes('xmlns="http://subsonic.org/restapi"'),
+          name,
+        );
+      };
+      await xmlError(
+        `/rest/stream?${auth({ p: 'wrong', f: 'xml', id: 'x' })}`,
+        '40',
+        'H1C stream auth failure text/xml',
+      );
+      await xmlError(
+        `/rest/stream.view?${auth({ f: 'xml', id: 'h1c-missing' })}`,
+        '70',
+        'H1C stream not-found text/xml',
+      );
+      await xmlError(
+        `/rest/getCoverArt?${auth({ p: 'wrong', f: 'xml', id: 'x' })}`,
+        '40',
+        'H1C getCoverArt auth failure text/xml',
+      );
+      await xmlError(
+        `/rest/getCoverArt.view?${auth({ f: 'xml' })}`,
+        '10',
+        'H1C getCoverArt missing id text/xml',
+      );
+      const control = await send(
+        `/rest/ping?${auth({ p: 'wrong', f: 'xml' })}`,
+      );
+      h1c(
+        control.contentType === XML && xmlCode(control.body) === '40',
+        'H1C ping XML error stays application/xml',
+      );
+    }
+
     await write('driver-identity', {
       taskRoot: item,
       candidateRoot: candidate,
@@ -1348,7 +1587,7 @@ export async function runCold(driverArgs = Deno.args) {
           BASE,
           owner.activeDeadline,
           'correction',
-        )).json()['subsonic-response'].error.code === 40,
+        )).json()['subsonic-response'].error.code === 10,
         'correction empty credential keeps first form precedence',
       );
       for (
@@ -1448,7 +1687,9 @@ export async function runCold(driverArgs = Deno.args) {
       });
     }
     // H2 retains every H1 assertion before adding its own catalog consumer gate.
-    if (phase === 'H2') await selectionConsumer();
+    // H1C retains the complete H2 phase, then appends its own ledger.
+    if (phase === 'H2' || phase === 'H1C') await selectionConsumer();
+    if (phase === 'H1C') await commonProtocolConsumer();
   }, async (owner, summary) => {
     check(evidence, 'preflight did not establish evidence root');
     const expected = phase === 'H1' ? 144 : 277;
@@ -1459,6 +1700,12 @@ export async function runCold(driverArgs = Deno.args) {
         assertions.length === expected &&
           originalCaseCount === (phase === 'H1' ? 99 : 191),
         'original assertion/request-case ledger changed',
+      );
+      check(
+        phase === 'H1C'
+          ? sameMultiset(h1cAssertions, H1C_ASSERTIONS)
+          : h1cAssertions.length === 0,
+        'H1C ledger differs from its literal multiset',
       );
     }
     const logHashes: Record<string, string> = {};
@@ -1490,12 +1737,14 @@ export async function runCold(driverArgs = Deno.args) {
       elapsedMs: performance.now() - owner.started,
       assertions,
       parsingAssertions,
+      h1cAssertions,
       requests: original.length,
       originalCaseCount,
       adaptivePolls: original.filter((r) => r.adaptive).length,
       correctionResponses: receipts.filter((r) =>
         r.ledger === 'correction'
       ).length,
+      h1cResponses: receipts.filter((r) => r.ledger === 'h1c').length,
       totalResponses: receipts.length,
       childStatus: summary.childStatus,
       cleanupComplete: summary.workJoined && summary.resourcesClosed &&

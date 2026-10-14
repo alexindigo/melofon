@@ -18,6 +18,7 @@ import {
   validateProperties,
 } from '../helpers/transient-watchdog.ts';
 import type { RunSummary } from '../helpers/owned-run.ts';
+import { H1C_ASSERTIONS, sameMultiset } from './cold-http.ts';
 
 const qualificationCases = [
   'qualify-manager',
@@ -47,7 +48,13 @@ const regressionCases = [
   'driver-stopped',
   'cold-h1',
   'cold-h2',
+  'cold-h1c',
 ];
+const coldPhases: Record<string, string> = {
+  'cold-h1': 'H1',
+  'cold-h2': 'H2',
+  'cold-h1c': 'H1C',
+};
 
 function option(name: string) {
   const value = Deno.args.find((a) => a.startsWith(`--${name}=`))?.slice(
@@ -120,12 +127,13 @@ async function regressionOracle(
       }],
     };
   }
-  if (caseName === 'cold-h1' || caseName === 'cold-h2') {
+  if (Object.hasOwn(coldPhases, caseName)) {
     const result = await readReceipt<
       {
         complete: boolean;
         assertions: string[];
         parsingAssertions: string[];
+        h1cAssertions?: string[];
         originalCaseCount: number;
         owner: RunSummary;
       }
@@ -143,6 +151,13 @@ async function regressionOracle(
       'separate correction ledger',
       (result?.parsingAssertions.length ?? 0) > 0,
     );
+    if (caseName === 'cold-h1c') {
+      check(
+        'exact literal H1C ledger multiset',
+        result?.h1cAssertions !== undefined &&
+          sameMultiset(result.h1cAssertions, H1C_ASSERTIONS),
+      );
+    }
     check(
       'cold child/resource/work/pump join',
       result?.owner.childStatus?.code === 0 && result.owner.childReaped &&
@@ -338,7 +353,9 @@ async function run() {
   const root = option('task-root');
   requireFact(
     /^\/home\/tester\/melofon-output-preparation-01\/opensubsonic-prefix-correction-01\/(candidate|verification-\d+)$/
-      .test(root),
+      .test(root) ||
+      /^\/home\/tester\/melofon-output-preparation-01\/opensubsonic-h1c-01\/(candidate|verification-\d{2,})$/
+        .test(root),
     'task root',
   );
   requireFact(await Deno.realPath(root) === root, 'canonical task root');
@@ -378,7 +395,7 @@ async function run() {
       : regressionCases.includes(caseName),
     'literal fixed case',
   );
-  const cold = caseName === 'cold-h1' || caseName === 'cold-h2';
+  const cold = Object.hasOwn(coldPhases, caseName);
   requireFact(
     !cold || implementation === 'corrected',
     'cold cases use corrected driver only',
@@ -457,7 +474,7 @@ async function run() {
       ? [
         `${root}/source/dev/opensubsonic/cold-http.ts`,
         `--candidate-root=${root}/source`,
-        `--phase=${caseName === 'cold-h1' ? 'H1' : 'H2'}`,
+        `--phase=${coldPhases[caseName]}`,
         `--evidence=${evidence}/subject`,
         '--lease=stdin',
         `--supervisor-ticket=${evidence}/containment.json`,

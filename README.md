@@ -52,9 +52,36 @@ ordinary token/quoted parameters. Suffixed lookalikes and unrelated media types
 leave query parameters available and do not invoke the form decoder. The original
 header and body still go through the native form decoder.
 Form values precede query values: scalar getters use the first form value;
-an empty first value stays empty. Repeated getters retain form values followed
+an empty first value stays empty (the login fields below treat it as not sent).
+Repeated getters retain form values followed
 by query values, including duplicates and their order. Both methods reach
 the same injected core services and canonical state.
+
+## OpenSubsonic versions, logins and JSONP
+
+Every response reports `version` 1.16.1, the implemented protocol, with
+`type`, `serverVersion` and `openSubsonic` unchanged. The client's `v` is compared
+with it by major and minor (the patch part is ignored; there is no minimum): an
+older major gets code20, a newer major or a newer minor within major 1 gets code30.
+A `v` that is not `digits.digits[.digits…]` is accepted without comparison.
+
+Logins follow the specification. A password `p` together with a token `t` or salt
+`s` is code43. API keys are not supported: `apiKey` alone is code42, and together
+with any of `u`/`p`/`t`/`s` it is code43. Missing `u`, `v` or `c`, or no `p` and not
+both `t` and `s`, is code10. Then comes the version check, then verification
+(code40). The first value wins as above, but an empty `u`, `v`, `c`, `p`, `t`, `s`
+or `apiKey` counts as not sent and never falls back to a later query value.
+Public capability discovery is unaffected. Errors stay HTTP 200 envelopes.
+XML errors from `stream`, `download`, `getCoverArt`, `getAvatar` and `hls.m3u8`
+use `text/xml; charset=utf-8`; JSON errors there still follow `f`.
+
+JSONP is off by default. With it off, `f=jsonp` is an unrecognized format and
+answers XML. Enable it with
+`PUT /_/config/opensubsonic.jsonp {"value":"on"}`; any other value disables it.
+When it's on, a valid `callback` (`^[a-zA-Z_$][a-zA-Z0-9_$.]*$`) gets
+`callback(json)` as `application/javascript` with `X-Content-Type-Options: nosniff`,
+with U+2028/U+2029 escaped. A missing callback is code10 and an invalid one is
+code0 `invalid callback parameter`. Both are plain JSON and never echo the callback.
 
 ## OpenSubsonic catalog sync and selection
 

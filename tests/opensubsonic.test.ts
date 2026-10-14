@@ -123,7 +123,7 @@ Deno.test('wrong password and unknown user share the generic code-40 body', asyn
   }
 });
 
-Deno.test('missing u/v/c is code 10; no credentials at all is code 40', async () => {
+Deno.test('missing u/v/c is code 10; no credentials at all is code 10', async () => {
   const { app, close } = await setup();
   try {
     const noUser = await app(
@@ -138,7 +138,7 @@ Deno.test('missing u/v/c is code 10; no credentials at all is code 40', async ()
     );
     assertEquals(
       ((await jsonBody(noCreds)).error as { code: number }).code,
-      40,
+      10,
     );
   } finally {
     await close();

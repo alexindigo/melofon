@@ -619,6 +619,8 @@ export class OwnedRun {
         url: string;
         status: number;
         contentType: string | null;
+        /** Every response header, lowercase names (Headers iteration). */
+        headers: Record<string, string>;
         body: string;
       },
       signal: AbortSignal,
@@ -655,9 +657,12 @@ export class OwnedRun {
           body,
         };
         if (options.receipt) {
+          // The receipt also records every response header; the returned
+          // value keeps its existing shape.
+          const headers = Object.fromEntries(response.headers);
           await this.operation(
             'HTTP receipt',
-            () => options.receipt!(value, signal),
+            () => options.receipt!({ ...value, headers }, signal),
           );
         }
         this.assertWork(deadline);

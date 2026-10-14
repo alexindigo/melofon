@@ -1123,12 +1123,14 @@ for (const [index, contentType] of formTypes.entries()) {
         ),
         songIds,
       );
+      // The empty first form u is absent (H1C row 5): code 10, never a
+      // fall-through to the valid query u, which would succeed.
       const emptyCredential = s.auth();
       emptyCredential.set('u', '');
       assertEquals(
         (await post('getMusicFolders', emptyCredential, s.auth().toString()))
           .error?.code,
-        40,
+        10,
       );
     } finally {
       await s.close();
