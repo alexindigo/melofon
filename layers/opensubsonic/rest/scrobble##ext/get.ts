@@ -1,12 +1,19 @@
 // layers/opensubsonic/rest/scrobble/get.ts — GET /rest/scrobble.
-// submission=true (or omitted — Navidrome defaults to true) is append-only:
-// one listens row per id (never a play_count update; never from stream).
-// submission=false is a now-playing notification: one core command —
-// playback.reportPlaying replaces the (user, client) session row; never
-// appends listens; the hat never touches the session table itself.
-// Navidrome takes only the first id on this path; `position` is seconds.
+// `submission` is true when missing or empty, else exactly when it is
+// `true`, `on` or `1` in any case (Navidrome's req.Bool); every other value
+// is a now-playing notification.
+// A submission is append-only: one listens row per known id (never a
+// play_count update; never from stream); ids outside the catalog are skipped
+// and the answer is still ok. When `time` values are sent, there must be one
+// per id (Navidrome: code 0 otherwise).
+// A now-playing notification is one core command — playback.reportPlaying
+// replaces the (user, client) session row; it never appends listens and the
+// hat never touches the session table itself. Navidrome takes only the first
+// id on this path; `position` is seconds.
 import { fail, ok } from '#opensubsonic/envelope.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
+
+const TRUE = new Set(['true', 'on', '1']);
 
 export default async (_request: HatRequest, context: HatContext) => {
   const params = context.state.params!;
@@ -14,7 +21,10 @@ export default async (_request: HatRequest, context: HatContext) => {
   if (ids.length === 0) {
     return fail(context, 10, 'Required parameter is missing');
   }
-  if (params.get('submission') === 'false') {
+  const flag = params.get('submission');
+  const submission = flag === null || flag === '' ||
+    TRUE.has(flag.toLowerCase());
+  if (!submission) {
     const rawPosition = Number(params.get('position') ?? '0');
     await context.app.playback.reportPlaying({
       username: context.state.user!.username,
@@ -27,7 +37,15 @@ export default async (_request: HatRequest, context: HatContext) => {
     });
     return ok(context, {});
   }
-  const times = params.getAll('time').map((t) => Number(t));
+  const rawTimes = params.getAll('time');
+  if (rawTimes.length > 0 && rawTimes.length !== ids.length) {
+    return fail(
+      context,
+      0,
+      `Wrong number of timestamps: ${rawTimes.length}, should be ${ids.length}`,
+    );
+  }
+  const times = rawTimes.map((t) => Number(t));
   for (let i = 0; i < ids.length; i++) {
     const playedAtMs = Number.isFinite(times[i]) && times[i] > 0
       ? times[i]

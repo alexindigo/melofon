@@ -8,12 +8,16 @@
 // extension is not advertised.
 import { ok } from '#opensubsonic/envelope.ts';
 import { childOf } from '#opensubsonic/id3.ts';
+import { loadPersonal } from '#opensubsonic/personal.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
   const rows = await context.app.playback.nowPlayingView();
+  const p = await loadPersonal(context, {
+    songs: rows.map((row) => row.song.id),
+  });
   const entries = rows.map((row) => ({
-    ...childOf(row.song),
+    ...childOf(row.song, p),
     username: row.username,
     minutesAgo: Math.max(
       0,

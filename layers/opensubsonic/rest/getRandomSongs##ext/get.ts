@@ -7,6 +7,7 @@ import {
   folderIdParam,
   yearParam,
 } from '#opensubsonic/params.ts';
+import { loadPersonal } from '#opensubsonic/personal.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
@@ -22,9 +23,12 @@ export default async (_request: HatRequest, context: HatContext) => {
     fromYear,
     toYear,
   });
+  const p = await loadPersonal(context, {
+    songs: songs.map((song) => song.id),
+  });
   return ok(context, {
     randomSongs: {
-      song: songs.map((song) => childOf(song)),
+      song: songs.map((song) => childOf(song, p)),
     },
   });
 };

@@ -10,6 +10,8 @@ import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { createAnnotation } from '../src/annotation.ts';
+import { createListens } from '../src/listens.ts';
 import { createBookmarks } from '../src/bookmarks.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createStream } from '../src/stream.ts';
@@ -43,6 +45,8 @@ async function setup() {
     scan,
     user: createUserService(db, cfg),
     library: createLibrary(db),
+    annotation: createAnnotation(db),
+    listens: createListens(db),
     bookmarks: createBookmarks(db),
     playlists: createPlaylists(db),
     stream: createStream(createMedia()),

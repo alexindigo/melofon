@@ -7,18 +7,22 @@
 // in the tree (no Album dir to hang them under) — they stay reachable via
 // search3/getSong/stream. No shortcuts, no top-level child elements.
 import { ok } from '#opensubsonic/envelope.ts';
-import { IGNORED_ARTICLES, indexName } from '#opensubsonic/id3.ts';
+import { artistOf, IGNORED_ARTICLES, indexName } from '#opensubsonic/id3.ts';
 import { folderIdParam } from '#opensubsonic/params.ts';
+import { loadPersonal } from '#opensubsonic/personal.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
   const folderId = await folderIdParam(context);
   const artists = await context.app.library.listArtists(folderId);
+  const p = await loadPersonal(context, {
+    artists: artists.map((artist) => artist.id),
+  });
   const byIndex = new Map<string, Record<string, unknown>[]>();
   for (const artist of artists) {
     const name = indexName(artist.name);
     const list = byIndex.get(name) ?? [];
-    list.push({ id: artist.id, name: artist.name });
+    list.push(artistOf(artist, p));
     byIndex.set(name, list);
   }
   const names = [...byIndex.keys()].sort((a, b) =>

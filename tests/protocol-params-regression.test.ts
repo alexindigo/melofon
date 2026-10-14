@@ -272,7 +272,7 @@ async function setup() {
       ...annotation,
       star: async (...args: Parameters<typeof annotation.star>) => {
         calls.stars.push(args[1]);
-        await annotation.star(...args);
+        return await annotation.star(...args);
       },
     },
     playlists: {
@@ -558,7 +558,7 @@ Deno.test('numeric rating fractions cannot set or clear persisted rating; id pre
       await s.annotation.setRating(s.cfg.user, id(101), 4);
       assertEquals(
         (await s.get('setRating', { id: id(101), rating: raw })).error?.code,
-        10,
+        0,
       );
       const rows = (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))
         .getRowObjects();
@@ -1103,7 +1103,7 @@ for (const [index, contentType] of formTypes.entries()) {
       rating.set('rating', '1e-400');
       assertEquals(
         (await post('setRating', rating, 'rating=5&f=json')).error?.code,
-        10,
+        0,
       );
       assertEquals(
         (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))

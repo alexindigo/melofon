@@ -167,3 +167,23 @@ ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR;
 -- Connection strategies: legacy speakers retain the chosen Melofon policy.
 ALTER TABLE output_state ADD COLUMN IF NOT EXISTS connection_strategy VARCHAR DEFAULT 'melofon';
 UPDATE output_state SET connection_strategy = 'melofon' WHERE connection_strategy IS NULL;
+-- H3 star history: every star and unstar is one appended event. Rows are
+-- never updated or deleted. seq (from star_event_seq) orders a user's events
+-- for an item. The latest event says whether the item is starred now, and
+-- every star event is one like. The legacy stars table above is read only by
+-- the one-time migration below, which copies existing stars as star events
+-- with their original dates (only while star_events is still empty).
+-- "at" is a DuckDB keyword, so every statement quotes the column name.
+CREATE SEQUENCE IF NOT EXISTS star_event_seq;
+CREATE TABLE IF NOT EXISTS star_events (
+  seq BIGINT PRIMARY KEY DEFAULT nextval('star_event_seq'),
+  user_id VARCHAR NOT NULL,
+  target_id VARCHAR NOT NULL,
+  target_type VARCHAR NOT NULL,
+  action VARCHAR NOT NULL,
+  "at" TIMESTAMPTZ NOT NULL
+);
+INSERT INTO star_events (user_id, target_id, target_type, action, "at")
+  SELECT user_id, target_id, target_type, 'star', starred_at FROM stars
+  WHERE NOT EXISTS (SELECT 1 FROM star_events)
+  ORDER BY starred_at, user_id, target_id;

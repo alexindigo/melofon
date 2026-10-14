@@ -83,6 +83,33 @@ When it's on, a valid `callback` (`^[a-zA-Z_$][a-zA-Z0-9_$.]*$`) gets
 with U+2028/U+2029 escaped. A missing callback is code10 and an invalid one is
 code0 `invalid callback parameter`. Both are plain JSON and never echo the callback.
 
+## OpenSubsonic favourites, ratings and plays
+
+Every star and unstar is kept as an event; nothing is overwritten or deleted, and
+existing stars became events with their original dates. An item is starred while
+its latest event is a star. Each star counts as a like, so starring an item again
+moves it to the top: `starred` is the date of the most recent like (Navidrome's
+rule), and `getStarred`, `getStarred2` and `getAlbumList(2)` `type=starred` list
+newest like first.
+
+Songs, albums and artists carry the requesting user's `starred`, `userRating`,
+`averageRating` (all users, two decimals) and, for songs, albums and directories,
+`playCount` and `played` (the latest scrobble time). Play counts are read through
+the current catalog: an album counts its songs' plays, an artist those of its
+albums. Fields without data are omitted, except the OpenSubsonic additions, which
+are always sent: `played` (`""` when never played) on songs and albums, and
+`userRating` (`0` when unrated) on ID3 albums.
+
+`getStarred` answers the legacy folder-style shape (artists with id and name,
+albums as directory children, songs) next to `getStarred2`; both honour
+`musicFolderId`, and an unmatched folder lists nothing. Old-style IDs are looked
+up, so `star?id=<albumId>` stars the album. `star`, `unstar` and `scrobble` skip
+IDs that are not in the catalog and still answer ok; an item that has left the
+catalog can still be unstarred. `setRating` on an unknown ID is code70, and a
+`rating` that is not an integer 0–5 is code0 (missing is code10). `scrobble`
+treats `submission` as true when missing or empty and otherwise only for
+`true`/`on`/`1`; `time` values, when sent, must match the number of IDs (code0).
+
 ## OpenSubsonic catalog sync and selection
 
 `search3` requires the `query` parameter, but `query=` enumerates the catalog for

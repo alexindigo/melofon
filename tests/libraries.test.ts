@@ -12,6 +12,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { createAnnotation } from '../src/annotation.ts';
+import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
 
@@ -170,6 +172,8 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
       libraries,
       user: createUserService(db, cfg),
       library: createLibrary(db),
+      annotation: createAnnotation(db),
+      listens: createListens(db),
     };
     const app = facade(core, await loadLayers({ app: bag }));
     const get = async (op: string, extra = '') => {

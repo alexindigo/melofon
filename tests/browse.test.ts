@@ -10,6 +10,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { createAnnotation } from '../src/annotation.ts';
+import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
 
@@ -35,6 +37,8 @@ async function setup() {
     libraries,
     user: createUserService(db, cfg),
     library: createLibrary(db),
+    annotation: createAnnotation(db),
+    listens: createListens(db),
   };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));

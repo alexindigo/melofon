@@ -8,6 +8,7 @@ import {
   requiredParam,
   safeIntParam,
 } from '#opensubsonic/params.ts';
+import { loadPersonal } from '#opensubsonic/personal.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
@@ -19,5 +20,10 @@ export default async (_request: HatRequest, context: HatContext) => {
     offset: safeIntParam(params, 'offset', 0),
     folderId: await folderIdParam(context),
   });
-  return ok(context, { songsByGenre: { song: songs.map(childOf) } });
+  const p = await loadPersonal(context, {
+    songs: songs.map((song) => song.id),
+  });
+  return ok(context, {
+    songsByGenre: { song: songs.map((song) => childOf(song, p)) },
+  });
 };

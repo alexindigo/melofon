@@ -85,15 +85,15 @@ export interface Library {
   /** Albums of one album artist, alphabetically. */
   albumsByArtist(artistId: string): Promise<AlbumRow[]>;
   /** Album lists for getAlbumList/getAlbumList2-shaped hats. The user-scoped
-   * sorts (starred / highest / frequent / recent) need `username`; `genre`
-   * sort needs `genre`. */
+   * sorts (highest / frequent / recent) need `username`; `genre` sort needs
+   * `genre`. Favourites are not a sort here: hats derive their order from
+   * app.annotation's star history and resolve rows with albumsById. */
   listAlbums(opts: {
     sort:
       | 'name'
       | 'artist'
       | 'random'
       | 'newest'
-      | 'starred'
       | 'highest'
       | 'frequent'
       | 'recent'
@@ -108,6 +108,10 @@ export interface Library {
     fromYear?: number;
     toYear?: number;
   }): Promise<AlbumRow[]>;
+  /** The given albums (unknown ids skipped), by id. With `folderId`, only
+   * albums with a file in that source, counted and timed within it exactly
+   * as listAlbums scopes them. */
+  albumsById(ids: string[], opts: { folderId?: string }): Promise<AlbumRow[]>;
   getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
   getSong(id: string): Promise<SongRow | null>;
   search3(
@@ -257,30 +261,22 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
 
 // Album query builder. folderId restricts to albums having at least one file
 // in that source (musicFolderId); genre restricts to albums with a file of
-// that genre; starredBy / ratedBy inner-join the user's stars / ratings;
-// listenAgg left-joins per-album play aggregates for frequent / recent. The
-// WHERE goes before the GROUP BY, so it composes with callers' HAVING /
-// ORDER BY / LIMIT. Stars and ratings join at most one row per album (their
-// PKs), and the listen aggregate is one row per album, so song_count and
-// duration stay exact.
+// that genre; ratedBy inner-joins the user's ratings; listenAgg left-joins
+// per-album play aggregates for frequent / recent. The WHERE goes before the
+// GROUP BY, so it composes with callers' HAVING / ORDER BY / LIMIT. Ratings
+// join at most one row per album (their PK), and the listen aggregate is one
+// row per album, so song_count and duration stay exact.
 interface AlbumQuery {
   folderId?: string;
   genre?: string;
   yearFrom?: number;
   yearTo?: number;
-  starredBy?: string; // users.id
   ratedBy?: string; // users.id
   listenAgg?: string; // users.id
 }
 
 function albumSelect(q: AlbumQuery = {}): string {
   const joins: string[] = [];
-  if (q.starredBy !== undefined) {
-    joins.push(
-      `JOIN stars s ON s.target_id = al.id AND s.target_type = 'album'
-         AND s.user_id = ${esc(q.starredBy)}`,
-    );
-  }
   if (q.ratedBy !== undefined) {
     joins.push(
       `JOIN ratings r ON r.target_id = al.id AND r.user_id = ${esc(q.ratedBy)}`,
@@ -318,13 +314,35 @@ function albumSelect(q: AlbumQuery = {}): string {
   GROUP BY al.id, al.name, al.album_artist_id, ar.name`;
 }
 
+// Source membership (musicFolderId) of a catalog id, one owner for every
+// folder-scoped read: a song's file is in the source, an album has a file in
+// it, an artist has an album with a file in it. `idSql` is the SQL
+// expression holding the id. Core services outside this module (favourites)
+// scope through the same predicates.
+export const folderMembership = {
+  song: (idSql: string, folderId: string): string =>
+    `EXISTS (
+       SELECT 1 FROM files ff
+       WHERE ff.id = ${idSql} AND ff.library_id = ${esc(folderId)}
+     )`,
+  album: (idSql: string, folderId: string): string =>
+    `EXISTS (
+       SELECT 1 FROM files ff
+       WHERE ff.album_id = ${idSql} AND ff.library_id = ${esc(folderId)}
+     )`,
+  artist: (idSql: string, folderId: string): string =>
+    `EXISTS (
+       SELECT 1 FROM albums af JOIN files ff ON ff.album_id = af.id
+       WHERE af.album_artist_id = ${idSql}
+         AND ff.library_id = ${esc(folderId)}
+     )`,
+};
+
 // Artists limited to those with an album that has a file in this source.
 function artistFolderFilter(folderId?: string): string {
-  return folderId === undefined ? '' : `
-   AND EXISTS (
-     SELECT 1 FROM albums af JOIN files ff ON ff.album_id = af.id
-     WHERE af.album_artist_id = ar.id AND ff.library_id = ${esc(folderId)}
-   )`;
+  return folderId === undefined
+    ? ''
+    : ` AND ${folderMembership.artist('ar.id', folderId)}`;
 }
 
 // File eligibility has one owner for sync, genre browsing and random sampling.
@@ -406,17 +424,13 @@ export function createLibrary(db: Db): Library {
         case 'artist':
           order = 'ORDER BY ar.name, al.name';
           break;
-        case 'starred':
         case 'highest':
         case 'frequent':
         case 'recent': {
           if (opts.username === undefined) return [];
           const userId = await userIdForName(db, opts.username);
           if (userId === null) return [];
-          if (opts.sort === 'starred') {
-            query.starredBy = userId;
-            order = 'ORDER BY MAX(s.starred_at) DESC';
-          } else if (opts.sort === 'highest') {
+          if (opts.sort === 'highest') {
             query.ratedBy = userId;
             order = 'ORDER BY MAX(r.rating) DESC, al.name';
           } else {
@@ -452,6 +466,16 @@ export function createLibrary(db: Db): Library {
           opts.sort === 'random' ? '' : ', al.id'
         }
          LIMIT ${opts.size} OFFSET ${opts.offset}`,
+      );
+      return (res.getRowObjects() as unknown as AlbumSqlRow[]).map(albumOf);
+    },
+
+    async albumsById(ids, opts) {
+      if (ids.length === 0) return [];
+      const res = await db.conn.runAndReadAll(
+        `${albumSelect({ folderId: opts.folderId })}
+         HAVING al.id IN (${[...new Set(ids)].map(esc).join(', ')})
+         ORDER BY al.id`,
       );
       return (res.getRowObjects() as unknown as AlbumSqlRow[]).map(albumOf);
     },

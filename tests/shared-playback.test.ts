@@ -11,6 +11,7 @@ import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
+import { createAnnotation } from '../src/annotation.ts';
 import { createLibrary } from '../src/library.ts';
 import { createListens } from '../src/listens.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
@@ -54,6 +55,7 @@ async function setup() {
     libraries,
     user: createUserService(db, cfg),
     library,
+    annotation: createAnnotation(db),
     listens: createListens(db),
     nowPlaying,
     player,

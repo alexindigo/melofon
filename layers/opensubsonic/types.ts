@@ -63,7 +63,6 @@ export interface HatContext {
           | 'artist'
           | 'random'
           | 'newest'
-          | 'starred'
           | 'highest'
           | 'frequent'
           | 'recent'
@@ -77,6 +76,11 @@ export interface HatContext {
         fromYear?: number;
         toYear?: number;
       }): Promise<AlbumRow[]>;
+      /** The given albums (unknown skipped), by id; folder-scoped counts. */
+      albumsById(
+        ids: string[],
+        opts: { folderId?: string },
+      ): Promise<AlbumRow[]>;
       getAlbum(
         id: string,
       ): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
@@ -121,25 +125,31 @@ export interface HatContext {
       }): Promise<LyricsRow | null>;
     };
     annotation: {
-      star(
-        username: string,
-        targetId: string,
-        targetType: string,
-      ): Promise<void>;
-      unstar(
-        username: string,
-        targetId: string,
-        targetType: string,
-      ): Promise<void>;
-      /** Subsonic 1..5; 0 clears. */
+      /** Appends a star (a like); core classifies the id. false when the id
+       * is no artist, album or song (nothing written). */
+      star(username: string, targetId: string): Promise<boolean>;
+      /** Appends an unstar (also for ids that left the catalog); false when
+       * there is nothing to unstar. */
+      unstar(username: string, targetId: string): Promise<boolean>;
+      /** Subsonic 1..5; 0 clears. false when the id is unknown. */
       setRating(
         username: string,
         targetId: string,
         rating: number,
-      ): Promise<void>;
-      starred(username: string): Promise<StarredRow[]>;
+      ): Promise<boolean>;
+      /** Starred-now items that still exist, with their raw events. */
+      starred(
+        username: string,
+        opts?: { folderId?: string },
+      ): Promise<StarredItem[]>;
+      /** Batch facts; every requested id is present. */
+      facts(
+        username: string,
+        targetIds: string[],
+      ): Promise<Record<string, PersonalFactsRow>>;
     };
     listens: {
+      /** false when the track is not a catalog file (nothing written). */
       record(
         username: string,
         trackId: string,
@@ -148,7 +158,16 @@ export interface HatContext {
           playedAtMs?: number;
           durationMs?: number;
         },
-      ): Promise<void>;
+      ): Promise<boolean>;
+      /** Batch play facts; every requested id is present. */
+      facts(
+        username: string,
+        ids: { songs?: string[]; albums?: string[]; artists?: string[] },
+      ): Promise<{
+        songs: Record<string, PlayRow>;
+        albums: Record<string, PlayRow>;
+        artists: Record<string, PlayRow>;
+      }>;
     };
     playlists: {
       list(username: string): Promise<PlaylistRow[]>;
@@ -299,10 +318,32 @@ export interface GenreRow {
   albumCount: number;
 }
 
-export interface StarredRow {
+/** One star-history event (core appends, never overwrites). */
+export interface StarEvent {
+  action: 'star' | 'unstar';
+  atMs: number; // epoch milliseconds
+}
+
+export interface StarredItem {
   targetId: string;
-  targetType: string; // 'song' | 'album' | 'artist'
-  starredAtMs: number; // epoch milliseconds
+  targetType: 'song' | 'album' | 'artist';
+  /** This user's events for the item, ascending (oldest first). */
+  events: StarEvent[];
+}
+
+export interface PersonalFactsRow {
+  /** The latest event is a star. */
+  starred: boolean;
+  /** This user's events for the item, ascending (oldest first). */
+  events: StarEvent[];
+  userRating: number | null;
+  /** Unrounded average over all users' ratings. */
+  averageRating: number | null;
+}
+
+export interface PlayRow {
+  playCount: number;
+  lastPlayedMs: number | null;
 }
 
 export interface PlaylistRow {

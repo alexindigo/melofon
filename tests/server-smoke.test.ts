@@ -194,3 +194,46 @@ Deno.test('restart restores an AirPlay output registered by host env', async () 
     await Deno.remove(data, { recursive: true });
   }
 });
+
+Deno.test('personal facts over the socket: star, rating and play read back', async () => {
+  const data = await Deno.makeTempDir({ prefix: 'melofon-smoke-' });
+  const server = await boot(data);
+  try {
+    const { base } = server;
+    const rest = async (op: string, extra: Record<string, string> = {}) => {
+      const query = new URLSearchParams({ ...AUTH, f: 'json', ...extra });
+      const res = await fetch(`${base}/rest/${op}?${query}`);
+      const body = (await res.json())['subsonic-response'];
+      assertEquals(body.status, 'ok', `${op}: ${JSON.stringify(body)}`);
+      return body;
+    };
+    const fixture = new URL('./fixtures/library', import.meta.url).pathname;
+    const added = await fetch(`${base}/_/libraries`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Fixture', path: fixture }),
+    });
+    assertEquals(added.status, 200);
+    await added.body?.cancel();
+    await rest('startScan');
+    const until = Date.now() + 30_000;
+    while ((await rest('getScanStatus')).scanStatus.scanning) {
+      if (Date.now() > until) throw new Error('scan never finished');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const [song] = (await rest('getRandomSongs')).randomSongs.song;
+    assert(song?.id, 'a fixture song');
+    await rest('star', { id: song.id });
+    await rest('setRating', { id: song.id, rating: '3' });
+    await rest('scrobble', { id: song.id });
+    const starred = (await rest('getStarred')).starred.song;
+    assertEquals(starred.map((s: { id: string }) => s.id), [song.id]);
+    const got = (await rest('getSong', { id: song.id })).song;
+    assert(typeof got.starred === 'string' && got.starred !== '', got.starred);
+    assertEquals([got.userRating, got.playCount], [3, 1]);
+    assert(typeof got.played === 'string' && got.played !== '', got.played);
+  } finally {
+    await server.stop();
+    await Deno.remove(data, { recursive: true });
+  }
+});

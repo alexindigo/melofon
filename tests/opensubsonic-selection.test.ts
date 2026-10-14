@@ -6,6 +6,8 @@ import { openDb } from '../src/db.ts';
 import { encryptPassword, seedFirstUser } from '../src/users.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
+import { createAnnotation } from '../src/annotation.ts';
+import { createListens } from '../src/listens.ts';
 import { createUserService } from '../src/user.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
@@ -100,7 +102,7 @@ async function setup(large = false) {
       }, 'Bulk', 2005, 1000, 1000 FROM range(501) r(i)`,
     );
     await db.conn.run(
-      `INSERT INTO stars SELECT u.id, al.id, 'album', now() FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,
+      `INSERT INTO star_events (user_id, target_id, target_type, action, "at") SELECT u.id, al.id, 'album', 'star', now() FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,
     );
     await db.conn.run(
       `INSERT INTO ratings SELECT u.id, al.id, 5 FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,
@@ -110,7 +112,14 @@ async function setup(large = false) {
     );
   }
   const library = createLibrary(db);
-  const bag = { cfg, libraries, library, user: createUserService(db, cfg) };
+  const bag = {
+    cfg,
+    libraries,
+    library,
+    user: createUserService(db, cfg),
+    annotation: createAnnotation(db),
+    listens: createListens(db),
+  };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
   const layers = await loadLayers({ app: bag });
   const app = facade(core, layers);

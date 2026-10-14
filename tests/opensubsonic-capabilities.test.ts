@@ -11,6 +11,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
+import { createListens } from '../src/listens.ts';
 import {
   CAPABILITIES,
   capabilityPayload,
@@ -219,6 +220,7 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
           libraries,
           library,
           annotation,
+          listens: createListens(db),
           user: createUserService(db, cfg),
         },
       }),
@@ -290,7 +292,7 @@ Deno.test('H1 all existing POST operations reexport their corresponding GET cons
     }
   }
   await visit('layers/opensubsonic/rest');
-  assertEquals(count, 57);
+  assertEquals(count, 58);
 });
 
 Deno.test('H1 semantic projection preserves repeated extensions and versions without changing advertised facts', async () => {

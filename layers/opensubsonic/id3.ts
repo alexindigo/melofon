@@ -1,7 +1,9 @@
 // layers/opensubsonic/id3.ts — wire payload builders: ID3 artist/album, the
-// pre-ID3 album shape, song children, playlists, zip entry lists, the scan
-// status, and the getAlbumList/getAlbumList2 type table. Shared module at
-// the layer root, outside the walked mount tree.
+// legacy artist, the pre-ID3 album shape, song children, playlists, zip
+// entry lists, the scan status, the favourites lists, and the
+// getAlbumList/getAlbumList2 type table. Every catalog builder takes the
+// response's Personal facts (personal.ts), so no call site can omit them.
+// Shared module at the layer root, outside the walked mount tree.
 import { fail } from '#opensubsonic/envelope.ts';
 import {
   boundedCountParam,
@@ -10,25 +12,52 @@ import {
   safeIntParam,
   yearParam,
 } from '#opensubsonic/params.ts';
+import {
+  albumId3Fields,
+  artistFields,
+  childFields,
+  lastStarredMs,
+  loadPersonal,
+  type Personal,
+} from '#opensubsonic/personal.ts';
 import type {
   AlbumRow,
   ArtistRow,
   HatContext,
   PlaylistRow,
   SongRow,
+  StarredItem,
 } from '#opensubsonic/types.ts';
 
 export const IGNORED_ARTICLES = 'The El La Los Las Le Les';
 
-export function artistId3Of(artist: ArtistRow): Record<string, unknown> {
+export function artistId3Of(
+  artist: ArtistRow,
+  p: Personal,
+): Record<string, unknown> {
   return {
     id: artist.id,
     name: artist.name,
     albumCount: artist.albumCount,
+    ...artistFields(p.artist(artist.id)),
   };
 }
 
-export function albumId3Of(album: AlbumRow): Record<string, unknown> {
+// Legacy (folder-style) Artist: getIndexes and getStarred.
+export function artistOf(
+  artist: ArtistRow,
+  p: Personal,
+): Record<string, unknown> {
+  return {
+    id: artist.id,
+    name: artist.name,
+    ...artistFields(p.artist(artist.id)),
+  };
+}
+
+// Album fields shared by the ID3 and pre-ID3 shapes, without personal facts:
+// each shape adds its own field rules.
+function albumBaseOf(album: AlbumRow): Record<string, unknown> {
   return {
     id: album.id,
     name: album.name,
@@ -47,14 +76,26 @@ export function albumId3Of(album: AlbumRow): Record<string, unknown> {
   };
 }
 
-// Pre-ID3 album shape (getAlbumList / search2): the ID3 fields plus the
-// legacy duplicates old clients read.
-export function albumV1Of(album: AlbumRow): Record<string, unknown> {
+export function albumId3Of(
+  album: AlbumRow,
+  p: Personal,
+): Record<string, unknown> {
+  return { ...albumBaseOf(album), ...albumId3Fields(p.album(album.id)) };
+}
+
+// Pre-ID3 album shape (getAlbumList / search2 / getStarred): the ID3 fields
+// plus the legacy duplicates old clients read. It is a Child on the wire, so
+// the Child field rules apply (userRating omitted when unset).
+export function albumV1Of(
+  album: AlbumRow,
+  p: Personal,
+): Record<string, unknown> {
   return {
-    ...albumId3Of(album),
+    ...albumBaseOf(album),
     album: album.name,
     title: album.name,
     isDir: true,
+    ...childFields(p.album(album.id)),
   };
 }
 
@@ -67,7 +108,7 @@ export function relativePathOf(song: SongRow): string {
     : song.path;
 }
 
-export function childOf(song: SongRow): Record<string, unknown> {
+export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
   const path = relativePathOf(song);
   return {
     id: song.id,
@@ -93,6 +134,7 @@ export function childOf(song: SongRow): Record<string, unknown> {
     // stream the same id as audio via ExtractAudio.
     type: song.isVideo ? 'video' : 'music',
     isVideo: song.isVideo,
+    ...childFields(p.song(song.id)),
   };
 }
 
@@ -115,18 +157,76 @@ export function playlistOf(
   };
 }
 
+// Song entries of a track list (playlist, play queue): unknown tracks are
+// skipped; the facts are loaded once for the resolved songs.
 export async function entriesFor(
   context: HatContext,
   trackIds: string[],
 ): Promise<Record<string, unknown>[]> {
-  const entries: Record<string, unknown>[] = [];
+  const songs: SongRow[] = [];
   for (const trackId of trackIds) {
     const song = await context.app.library.getSong(trackId);
-    if (song !== null) {
-      entries.push(childOf(song));
-    }
+    if (song !== null) songs.push(song);
   }
-  return entries;
+  const p = await loadPersonal(context, { songs: songs.map((s) => s.id) });
+  return songs.map((song) => childOf(song, p));
+}
+
+// Newest like first (the OpenSubsonic starred date); ties by id ascending.
+function byLatestLike<T extends { id: string }>(
+  rows: T[],
+  items: StarredItem[],
+): T[] {
+  const liked = new Map(
+    items.map((item) => [item.targetId, lastStarredMs(item.events) ?? 0]),
+  );
+  return [...rows].sort((a, b) =>
+    (liked.get(b.id) ?? 0) - (liked.get(a.id) ?? 0) ||
+    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  );
+}
+
+// The current user's favourites (getStarred / getStarred2), honouring
+// musicFolderId: rows that no longer resolve are skipped, each list is
+// newest-like first, and the facts are loaded once for all of them.
+export async function starredLists(context: HatContext): Promise<{
+  artists: ArtistRow[];
+  albums: AlbumRow[];
+  songs: SongRow[];
+  personal: Personal;
+}> {
+  const folderId = await folderIdParam(context);
+  const items = await context.app.annotation.starred(
+    context.state.user!.username,
+    { folderId },
+  );
+  const of = (type: StarredItem['targetType']) =>
+    items.filter((item) => item.targetType === type);
+  const songs: SongRow[] = [];
+  for (const item of of('song')) {
+    const song = await context.app.library.getSong(item.targetId);
+    if (song !== null) songs.push(song);
+  }
+  const albums = await context.app.library.albumsById(
+    of('album').map((item) => item.targetId),
+    { folderId },
+  );
+  const artists: ArtistRow[] = [];
+  for (const item of of('artist')) {
+    const artist = await context.app.library.getArtist(item.targetId);
+    if (artist !== null) artists.push(artist);
+  }
+  const personal = await loadPersonal(context, {
+    songs: songs.map((s) => s.id),
+    albums: albums.map((a) => a.id),
+    artists: artists.map((a) => a.id),
+  });
+  return {
+    artists: byLatestLike(artists, items),
+    albums: byLatestLike(albums, items),
+    songs: byLatestLike(songs, items),
+    personal,
+  };
 }
 
 // Resolve an album / artist / playlist id to a zip entry list plus the
@@ -196,13 +296,14 @@ export async function scanStatusOf(
 
 // getAlbumList/getAlbumList2 share the type table. Every documented type is
 // implemented; unknown types get the same clean "not implemented" envelope.
+// `starred` is not a core sort: the plugin orders the user's favourite
+// albums by their most recent like (see albumListAlbums).
 const ALBUM_LIST_SORTS: Record<
   string,
   | 'name'
   | 'artist'
   | 'random'
   | 'newest'
-  | 'starred'
   | 'highest'
   | 'frequent'
   | 'recent'
@@ -213,7 +314,6 @@ const ALBUM_LIST_SORTS: Record<
   alphabeticalByArtist: 'artist',
   random: 'random',
   newest: 'newest',
-  starred: 'starred',
   highest: 'highest',
   frequent: 'frequent',
   recent: 'recent',
@@ -227,6 +327,23 @@ export async function albumListAlbums(
   const params = context.state.params!;
   const type = requiredParam(context, 'type');
   if (type instanceof Response) return type;
+  if (type === 'starred') {
+    const user = context.state.user;
+    if (user === undefined) return [];
+    const folderId = await folderIdParam(context);
+    const items = (await context.app.annotation.starred(user.username, {
+      folderId,
+    })).filter((item) => item.targetType === 'album');
+    const albums = byLatestLike(
+      await context.app.library.albumsById(
+        items.map((item) => item.targetId),
+        { folderId },
+      ),
+      items,
+    );
+    const offset = safeIntParam(params, 'offset', 0);
+    return albums.slice(offset, offset + boundedCountParam(params, 'size'));
+  }
   const sort = ALBUM_LIST_SORTS[type];
   if (sort === undefined) {
     return fail(context, 0, `album list type not implemented: ${type}`);

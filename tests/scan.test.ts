@@ -147,6 +147,9 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
       "INSERT INTO stars (user_id, target_id, target_type, starred_at) VALUES ('u1', 't1', 'song', now())",
     );
     await db.conn.run(
+      `INSERT INTO star_events (user_id, target_id, target_type, action, "at") VALUES ('u1', 't1', 'song', 'star', now())`,
+    );
+    await db.conn.run(
       "INSERT INTO ratings (user_id, target_id, rating) VALUES ('u1', 't1', 5)",
     );
     await db.conn.run(
@@ -165,6 +168,7 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
       `SELECT
         (SELECT count(*) FROM listens) AS listens,
         (SELECT count(*) FROM stars) AS stars,
+        (SELECT count(*) FROM star_events) AS star_events,
         (SELECT count(*) FROM ratings) AS ratings,
         (SELECT count(*) FROM playlists) AS playlists,
         (SELECT count(*) FROM playlist_tracks) AS playlist_tracks,
@@ -175,6 +179,7 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
       const table of [
         'listens',
         'stars',
+        'star_events',
         'ratings',
         'playlists',
         'playlist_tracks',

@@ -21,6 +21,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { createAnnotation } from '../src/annotation.ts';
+import { createListens } from '../src/listens.ts';
 import { createStream } from '../src/stream.ts';
 import { createMedia } from '../src/media.ts';
 import { loadLayers } from '../src/layers.ts';
@@ -49,6 +51,8 @@ async function setup() {
     libraries,
     user: createUserService(db, cfg),
     library,
+    annotation: createAnnotation(db),
+    listens: createListens(db),
     stream: createStream(createMedia()),
   };
   const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });

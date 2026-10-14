@@ -213,7 +213,7 @@ Deno.test('setRating rejects out-of-range values', async () => {
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'failed');
-    assertEquals((body.error as { code: number }).code, 10);
+    assertEquals((body.error as { code: number }).code, 0);
   } finally {
     await close();
   }

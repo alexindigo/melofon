@@ -35,9 +35,9 @@ Deno.test('openDb creates the M2 user-state tables', async () => {
   const db = await openDb(dir);
   try {
     const res = await db.conn.runAndReadAll(
-      "SELECT table_name FROM information_schema.tables WHERE table_name IN ('listens', 'stars', 'ratings', 'playlists', 'playlist_tracks', 'play_queues')",
+      "SELECT table_name FROM information_schema.tables WHERE table_name IN ('listens', 'stars', 'star_events', 'ratings', 'playlists', 'playlist_tracks', 'play_queues')",
     );
-    assertEquals(res.getRowObjects().length, 6);
+    assertEquals(res.getRowObjects().length, 7);
   } finally {
     db.close();
     await Deno.remove(dir, { recursive: true });
