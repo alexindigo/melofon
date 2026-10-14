@@ -26,8 +26,11 @@ import type {
   AirplayTransport,
   HelperEventFn,
 } from './airplay-profile.ts';
+import { type EventFacts, type Log, scopedLog } from '../logging.ts';
 
 const SYMBOLS = {
+  raop_log_consumer: { parameters: ['i32'], result: 'i32' },
+  raop_log_poll: { parameters: ['buffer', 'usize'], result: 'i32' },
   raop_new: { parameters: [], result: 'pointer' },
   raop_start: {
     parameters: [
@@ -82,14 +85,56 @@ function resolveLibPath(): string {
 }
 
 let loaded: RaopLibrary | undefined;
+let logDrain: ReturnType<typeof setInterval> | undefined;
+let diagnosticLog: Log = scopedLog('raop-native');
+let activeHandles = 0;
+function startLogDrain(): void {
+  if (logDrain !== undefined) return;
+  logDrain = setInterval(drainLogs, 25);
+  Deno.unrefTimer(logDrain);
+}
+function drainLogs(): void {
+  if (!loaded) return;
+  const buffer = new Uint8Array(32768);
+  for (let i = 0; i < 512; i++) {
+    const n = loaded.symbols.raop_log_poll(buffer, BigInt(buffer.length));
+    if (n <= 0) return;
+    diagnosticLog.event(
+      'native_record',
+      JSON.parse(
+        new TextDecoder().decode(buffer.subarray(0, n)),
+      ) as EventFacts['native_record'],
+    );
+  }
+}
+/** Quiesce/free owned transports first. Keep the shared consumer through last free. */
+export function shutdownNativeLogging(): void {
+  if (!loaded) return;
+  drainLogs();
+  if (activeHandles !== 0) return; // A failed free retains ownership and ingress.
+  if (logDrain !== undefined) clearInterval(logDrain);
+  logDrain = undefined;
+  loaded.symbols.raop_log_consumer(0);
+  loaded.close();
+  loaded = undefined;
+}
 
-function loadLibrary(): RaopLibrary {
+function loadLibrary(log: Log = scopedLog('raop-native')): RaopLibrary {
   if (loaded !== undefined) return loaded;
   const path = resolveLibPath();
+  diagnosticLog = log;
   try {
-    loaded = Deno.dlopen(path, SYMBOLS);
+    const library = Deno.dlopen(path, SYMBOLS);
+    if (library.symbols.raop_log_consumer(1) < 0) {
+      library.close();
+      throw new Error('RAOP diagnostic consumer already owned');
+    }
+    loaded = library;
+    startLogDrain();
+    drainLogs();
+    addEventListener('unload', shutdownNativeLogging, { once: true });
   } catch (err) {
-    throw new Error(`RAOP library ${path} failed to load: ${err}`);
+    throw new Error(`RAOP library ${path} failed to load`, { cause: err });
   }
   return loaded;
 }
@@ -139,10 +184,12 @@ class FfiTransport implements AirplayTransport {
     this.lib = lib;
     this.onEvent = onEvent;
     const handle = lib.symbols.raop_new();
+    drainLogs();
     if (handle === null) {
       throw new Error('raop_new failed (out of memory or loop thread)');
     }
     this.handle = handle;
+    activeHandles++;
     // Events arrive at state-change rates; a light interval is plenty (and
     // avoids UnsafeCallback entirely — we poll).
     this.pollTimer = setInterval(() => this.drainEvents(), 25);
@@ -295,6 +342,8 @@ class FfiTransport implements AirplayTransport {
       }
       // The feed token releases only at proven native cleanup.
       if (feed === this.token) feed = null;
+      drainLogs();
+      activeHandles--;
     })();
     return this.closePromise;
   }
@@ -303,14 +352,14 @@ class FfiTransport implements AirplayTransport {
 /** The default transport factory for the AirPlay boot: FFI, in-process.
  * Resolves and loads the RAOP library EAGERLY so a missing build is a loud
  * startup error, not a surprise at play time. */
-export function createFfiSpawn(): (
+export function createFfiSpawn(log: Log = scopedLog('raop-native')): (
   onEvent: HelperEventFn,
 ) => AirplayDriver {
   let lib: RaopLibrary | null = null;
   try {
-    lib = loadLibrary();
+    lib = loadLibrary(log);
   } catch (err) {
-    console.error(`[melofon] airplay: ${(err as Error).message}`);
+    log.event('ffi_load_failed', { error: err });
   }
   return (onEvent) => {
     if (lib === null) {
@@ -327,4 +376,4 @@ export function createFfiSpawn(): (
 }
 
 /** Exported for the gated FFI smoke test only. */
-export const raopFfiInternals = { resolveLibPath, loadLibrary };
+export const raopFfiInternals = { resolveLibPath, loadLibrary, drainLogs };

@@ -34,9 +34,21 @@ import {
   FF_ENCODER_LIBOPUS,
   FF_ENCODER_LIBVORBIS,
   FFmpegError,
+  Log as FFmpegLog,
   Muxer,
   pipeline,
 } from 'node-av';
+import { type Log, scopedLog } from './logging.ts';
+
+const ffmpegLevel = FFmpegLog.getLevel();
+FFmpegLog.setCallback(
+  (sourceLevel, payload) =>
+    scopedLog('media-native').event('dependency_ffmpeg', {
+      sourceLevel,
+      payload,
+    }),
+  { maxLevel: ffmpegLevel },
+);
 
 /** The audio codec as a format token ('mp3', 'aac', 'ogg', …) when known. */
 export type AudioCodecToken = string;
@@ -174,7 +186,7 @@ const PCM_BYTES_PER_SAMPLE = 2 * PCM_CHANNELS; // s16le interleaved
 // HLS segment length in seconds (Airsonic's SEGMENT_DURATION, probed).
 const HLS_SEGMENT_SECONDS = 10;
 
-export function createMedia(): Media {
+export function createMedia(log: Log = scopedLog('media')): Media {
   // One remux per target at a time (two clients asking for the same video
   // share the run, and the loser of the race never sees a half-written dir).
   const inflight = new Map<string, Promise<number | null>>();
@@ -220,7 +232,7 @@ export function createMedia(): Media {
       }
       return count;
     } catch (err) {
-      console.warn(`[melofon] media: hlsRemux failed for ${path}: ${err}`);
+      log.event('media_failed', { operation: 'hlsRemux', path, error: err });
       return null;
     } finally {
       // close() is idempotent; the normal path closed the muxer already.
@@ -288,9 +300,13 @@ export function createMedia(): Media {
           context: { bitRate: `${bitRateKbps}k` } as never,
         });
       } catch (err) {
-        console.warn(
-          `[melofon] media: transcodeAudio(${format}) pre-flight failed for ${path}: ${err}`,
-        );
+        log.event('media_failed', {
+          operation: 'transcodeAudio',
+          phase: 'preflight',
+          format,
+          path,
+          error: err,
+        });
         return null;
       }
 
@@ -340,9 +356,13 @@ export function createMedia(): Media {
           { format: profile.muxer, input },
         );
       } catch (err) {
-        console.warn(
-          `[melofon] media: transcodeAudio(${format}) muxer failed for ${path}: ${err}`,
-        );
+        log.event('media_failed', {
+          operation: 'transcodeAudio',
+          phase: 'muxer',
+          format,
+          path,
+          error: err,
+        });
         encoder[Symbol.dispose]();
         decoder[Symbol.dispose]();
         await input.close().catch(() => {});
@@ -359,9 +379,13 @@ export function createMedia(): Media {
           if (!done) controller.close();
         } catch (err) {
           if (!done) {
-            console.warn(
-              `[melofon] media: transcodeAudio(${format}) failed mid-stream for ${path}: ${err}`,
-            );
+            log.event('media_failed', {
+              operation: 'transcodeAudio',
+              phase: 'stream',
+              format,
+              path,
+              error: err,
+            });
             try {
               controller.error(err);
             } catch { /* stream already closed */ }
@@ -437,7 +461,7 @@ export function createMedia(): Media {
           },
         });
       } catch (err) {
-        console.warn(`[melofon] media: decodePcm failed for ${path}: ${err}`);
+        log.event('media_failed', { operation: 'decodePcm', path, error: err });
         await input.close().catch(() => {});
         return null;
       }

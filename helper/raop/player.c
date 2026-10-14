@@ -137,11 +137,9 @@ player_debug(struct raop_player *p)
   pthread_mutex_unlock(&p->pcm_lock);
 
   /* RAOP packets are 352 samples; fed_samples/352 approximates RTP audio. */
-  DPRINTF(E_DBG, L_RAOP,
-          "tick: streaming=%d pcm_buffered=%zu fed_samples=%llu (~%llu rtp)\n",
-          p->streaming ? 1 : 0, buffered,
-          (unsigned long long)p->fed_samples,
-          (unsigned long long)(p->fed_samples / 352));
+  helper_log_event(E_DBG, L_PLAYER, "player_tick", &(struct helper_log_fields){
+    .value = buffered, .value2 = p->fed_samples, .flags = p->streaming ? 1 : 0
+  });
 }
 
 static void
@@ -285,7 +283,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
   ret = read(p->timer_fd, &overrun, sizeof(overrun));
   if (ret <= 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Error reading playback timer\n");
+      helper_log_event(E_LOG, L_PLAYER, "timer_read_failed", NULL);
       overrun = 0;
     }
   else if (overrun > 0)
@@ -326,8 +324,9 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         }
       if (!p->peak_logged)
         {
-          DPRINTF(E_LOG, L_RAOP, "pcm_peak=%d samples=%d\n",
-                  pcm_peak(scratch, n), (int)(n / 4));
+          helper_log_event(E_LOG, L_RAOP, "pcm_peak", &(struct helper_log_fields){
+            .value = pcm_peak(scratch, n), .value2 = (int64_t)(n / 4)
+          });
           p->peak_logged = true;
         }
 
@@ -367,7 +366,7 @@ raop_player_new(struct event_base *evbase)
   p->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
   if (!p->pcm || p->timer_fd < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not create the player (timerfd/buffer)\n");
+      helper_log_event(E_LOG, L_PLAYER, "player_create_failed", NULL);
       if (p->pcm)
         evbuffer_free(p->pcm);
       if (p->timer_fd >= 0)
@@ -379,7 +378,7 @@ raop_player_new(struct event_base *evbase)
                           playback_cb, p);
   if (!p->timer_ev)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not create the playback timer event\n");
+      helper_log_event(E_LOG, L_PLAYER, "timer_event_failed", NULL);
       close(p->timer_fd);
       evbuffer_free(p->pcm);
       free(p);
@@ -464,7 +463,7 @@ raop_player_session_started(struct raop_player *p)
   tick.it_value.tv_nsec = TICK_MS * 1000000;
   if (event_add(p->timer_ev, NULL) < 0
       || timerfd_settime(p->timer_fd, 0, &tick, NULL) < 0)
-    DPRINTF(E_LOG, L_RAOP, "Could not arm the playback timer\n");
+    helper_log_event(E_LOG, L_PLAYER, "timer_arm_failed", NULL);
 }
 
 /* Loop thread: teardown or failure — disarm. Idempotent. */

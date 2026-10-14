@@ -5,6 +5,7 @@
 // names (database, pairing, …) are valid subscriptions that simply stay
 // quiet until something emits them. Sync emit, no DuckDB, no persistence.
 
+import { type Log, scopedLog } from './logging.ts';
 export type NotifyFn = (types: string[]) => void;
 
 export interface Notify {
@@ -29,7 +30,7 @@ const KNOWN = new Set([
   'lastfm',
 ]);
 
-export function createNotify(): Notify {
+export function createNotify(log: Log = scopedLog('notify')): Notify {
   const subscribers = new Set<NotifyFn>();
   return {
     subscribe(fn) {
@@ -47,7 +48,7 @@ export function createNotify(): Notify {
         } catch (err) {
           // A broken listener (closing socket, …) must not break the emitter
           // or starve the other listeners.
-          console.debug('[melofon] notify listener threw:', err);
+          log.event('notify_listener_failed', { error: err });
         }
       }
     },

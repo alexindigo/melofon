@@ -1,4 +1,6 @@
 import { serve } from './rpc.ts';
+import { appLogger } from '../../src/logging.ts';
+import { installDependencyLogging } from '../../src/logging-dependencies.ts';
 import { startFakeRaop } from '../../tests/helpers/fake-raop.ts';
 import { decodeReceiverAudio } from '../../tests/helpers/raop-audio-consumer.ts';
 import { pcmAt } from './fixture.ts';
@@ -6,6 +8,8 @@ import type { Library, SongRow } from '../../src/library.ts';
 import type { NowPlaying } from '../../src/nowplaying.ts';
 import type { State } from '../../src/state.ts';
 import type { AirplaySpawn } from '../../src/boots/airplay-profile.ts';
+
+installDependencyLogging(appLogger());
 
 export interface ReceiverSession {
   id: string;

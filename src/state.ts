@@ -5,6 +5,7 @@
 // AirPlay mDNS discovery). Env/toml stay first-boot seeds (seedIfUnset) —
 // they never stomp an operator's persisted choice.
 import type { Db } from './db.ts';
+import { type Log, scopedLog } from './logging.ts';
 import {
   CONNECTION_STRATEGY_DEFAULT_KEY,
   requireConnectionStrategy,
@@ -26,7 +27,7 @@ function esc(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-export function createState(db: Db): State {
+export function createState(db: Db, log: Log = scopedLog('state')): State {
   const listeners = new Set<(key: string, value: string) => void>();
   const emit = (key: string, value: string) => {
     for (const fn of [...listeners]) {
@@ -34,7 +35,7 @@ export function createState(db: Db): State {
         fn(key, value);
       } catch (err) {
         // A broken listener must not break the writer or starve the others.
-        console.debug('[melofon] state listener threw:', err);
+        log.event('state_listener_failed', { error: err });
       }
     }
   };

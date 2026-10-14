@@ -268,7 +268,7 @@ resolve_address(const char *host)
 
   if (getaddrinfo(host, NULL, &hints, &res) != 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Cannot resolve '%s'\n", host);
+      helper_log_event(E_LOG, L_RAOP, "resolve_failed", &(struct helper_log_fields){ .host = host });
       return NULL;
     }
 
@@ -400,13 +400,12 @@ device_start(raop_t *h, const cmd *c)
                        c->wanted_metadata);
 
   /* OwnTone raop_device_cb (raop.c:4463). Contract test greps this. */
-  DPRINTF(E_LOG, L_RAOP,
-          "Adding AirPlay device '%s': password: 0, verification: %u, "
-          "encrypt: %u, authsetup: %u, metadata: %u, type %s, address %s:%d\n",
-          c->name, (unsigned)dev->requires_auth, (unsigned)re->encrypt,
-          (unsigned)re->supports_auth_setup, (unsigned)re->wanted_metadata,
-          raop_devtype_name[c->devtype < 0 || c->devtype > 6 ? 3 : c->devtype],
-          address, c->port);
+  helper_log_event(E_LOG, L_RAOP, "device_start", &(struct helper_log_fields){
+    .device = h->id, .name = c->name, .host = address, .value = c->port,
+    .value2 = re->wanted_metadata,
+    .flags = (dev->requires_auth ? 1 : 0) | (re->encrypt ? 2 : 0) |
+             (re->supports_auth_setup ? 4 : 0) | (c->devtype << 3)
+  });
 
   if (output_raop.device_start(dev, 0) < 0)
     {
@@ -446,7 +445,7 @@ native_released(uint64_t id, int sent)
   pthread_mutex_lock(&rt.lock);
   for (h = rt.handles_list; h; h = h->next) if (h->id == id) {
     h->release_completed = 1;
-    if (sent < 0) DPRINTF(E_LOG, L_RAOP, "Local cleanup complete, final TEARDOWN unsent/failed for device %llu\n", (unsigned long long)id);
+    if (sent < 0) helper_log_event(E_LOG, L_RAOP, "teardown_unsent", &(struct helper_log_fields){ .device = id });
     event_active(h->resume_event, EV_TIMEOUT, 1);
     break;
   }
@@ -488,7 +487,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
         h->release_command = c;
         if (raop_release_device(h->id, native_released) == 0) return;
         h->release_command = NULL;
-        DPRINTF(E_LOG, L_RAOP, "Native release could not start; retaining device ownership\n");
+        helper_log_event(E_LOG, L_RAOP, "release_blocked", &(struct helper_log_fields){ .device = h->id });
         if (c->type == CMD_FREE) {
           pthread_mutex_lock(&c->sync->lock);
           c->sync->result = -1; c->sync->done = 1;
@@ -676,13 +675,13 @@ runtime_acquire(void)
           (!gcry_control(GCRYCTL_INITIALIZATION_FINISHED_P) &&
            gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0) != 0))
         {
-          fprintf(stderr, "[raop] libgcrypt initialization failed\n");
+          helper_log_event(E_LOG, L_MAIN, "gcrypt_init_failed", NULL);
           pthread_mutex_unlock(&rt.lock);
           return -1;
         }
       if (evthread_use_pthreads() != 0)
         {
-          fprintf(stderr, "[raop] evthread_use_pthreads failed\n");
+          helper_log_event(E_LOG, L_MAIN, "event_threads_failed", NULL);
           pthread_mutex_unlock(&rt.lock);
           return -1;
         }

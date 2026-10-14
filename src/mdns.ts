@@ -15,6 +15,7 @@
 // deterministically.
 import dgram from 'node:dgram';
 import os from 'node:os';
+import { type Log, scopedLog } from './logging.ts';
 
 const MDNS_GROUP = '224.0.0.251';
 const MDNS_PORT = 5353;
@@ -402,7 +403,10 @@ export interface MdnsBrowser {
   resolve(address: string): void;
 }
 
-export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
+export function createMdnsBrowser(
+  opts: MdnsBrowserOptions & { log?: Log },
+): MdnsBrowser {
+  const log = opts.log ?? scopedLog('mdns');
   const typeName = `${opts.type}.local`;
   const table = createServiceRecords(opts.type);
   const instances = table.instances;
@@ -502,7 +506,7 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
         instance.sawAaaa && !instance.loggedNoV4
       ) {
         instance.loggedNoV4 = true;
-        console.warn(`[melofon] mdns: ${instance.name} no usable v4`);
+        log.event('mdns_no_v4', { instance: instance.name });
       }
       const dest = rinfo !== undefined && unicastTargets.has(rinfo.address)
         ? rinfo.address

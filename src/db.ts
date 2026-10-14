@@ -2,6 +2,7 @@
 // The file lives at <dataDir>/melofon.duckdb; opening is allowed to fail
 // startup (main.ts lets the error propagate).
 import * as duckdb from '@duckdb/node-api';
+import { type Log, scopedLog } from './logging.ts';
 
 export interface Db {
   conn: duckdb.DuckDBConnection;
@@ -18,20 +19,21 @@ export interface Db {
 // along untyped; the span never inspects them — never-log-bind-values).
 type QueryFn = (sql: string, ...rest: unknown[]) => Promise<unknown>;
 
-const verb = (sql: string): string => sql.trim().split(/\s+/, 2).join(' ');
-
-export function instrumentConn(conn: duckdb.DuckDBConnection): void {
+export function instrumentConn(
+  conn: duckdb.DuckDBConnection,
+  log: Log = scopedLog('db'),
+): void {
   let qinflight = 0;
   const wrap = (fn: QueryFn): QueryFn => {
     return (sql, ...rest) => {
       qinflight++;
-      if (qinflight > 1) console.log(`[db] overlap qinflight=${qinflight}`);
-      console.log(`[db] begin sql=${verb(sql)} qinflight=${qinflight}`);
+      if (qinflight > 1) log.event('db_overlap', { qinflight });
+      log.event('db_begin', { sql, qinflight });
       const started = performance.now();
       return fn.apply(conn, [sql, ...rest]).finally(() => {
         qinflight--;
         const waitMs = Math.round(performance.now() - started);
-        console.log(`[db] end sql=${verb(sql)} waitMs=${waitMs}`);
+        log.event('db_end', { sql, waitMs });
       });
     };
   };
@@ -45,14 +47,14 @@ export function instrumentConn(conn: duckdb.DuckDBConnection): void {
 
 export async function openDb(
   dataDir: string,
-  opts: { debugLogQueries?: boolean } = {},
+  opts: { debugLogQueries?: boolean; log?: Log } = {},
 ): Promise<Db> {
   await Deno.mkdir(dataDir, { recursive: true });
   const instance = await duckdb.DuckDBInstance.create(
     `${dataDir}/melofon.duckdb`,
   );
   const conn = await instance.connect();
-  if (opts.debugLogQueries === true) instrumentConn(conn);
+  if (opts.debugLogQueries === true) instrumentConn(conn, opts.log);
   const schema = new URL('./schema.sql', import.meta.url);
   for (const statement of (await Deno.readTextFile(schema)).split(';')) {
     if (statement.trim() !== '') await conn.run(statement);

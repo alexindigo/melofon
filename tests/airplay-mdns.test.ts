@@ -138,7 +138,9 @@ function setup(
     state,
     devices,
     savedOutput: (id) => saved[id],
-    log: (msg) => logs.push(msg),
+    log: {
+      event: (event, facts) => logs.push(JSON.stringify({ event, ...facts })),
+    },
     createBrowser: (onService) => {
       const b = new FakeBrowser();
       b.onService = onService;
@@ -369,8 +371,8 @@ Deno.test('non-AirTunes (no UDP in tp) and odd instance names are skipped', asyn
     browsers[0].onService!('up', svc({ name: '@no id' }));
     browsers[0].onService!('up', svc({ name: 'zz@bad hex' }));
     assertEquals(outputs.list(), []);
-    assert(logs.some((l) => l.includes('no UDP in tp')));
-    assert(logs.some((l) => l.includes('odd instance name')));
+    assert(logs.some((l) => JSON.parse(l).reason === 'no_udp'));
+    assert(logs.some((l) => JSON.parse(l).reason === 'name'));
   } finally {
     discovery.close();
   }
@@ -392,7 +394,7 @@ Deno.test('manual registration wins the host; discovery does not duplicate', asy
     const list = outputs.list();
     assertEquals(list.length, 1);
     assertEquals(list[0].id, 'manual');
-    assert(logs.some((l) => l.includes('host already owned')));
+    assert(logs.some((l) => JSON.parse(l).reason === 'host_owned'));
   } finally {
     discovery.close();
   }
@@ -428,19 +430,19 @@ Deno.test('state preset off: no browser starts until flipped on', async () => {
   }
 });
 
-Deno.test('discovery logs the OwnTone-shaped Adding AirPlay device line', async () => {
+Deno.test('discovery supplies receiver configuration facts to shared logging', async () => {
   const { browsers, logs, discovery } = await setup();
   try {
     await settle();
     browsers[0].onService!('up', svc());
     assert(
       logs.some((l) =>
-        l.includes('Adding AirPlay device') &&
-        l.includes('encrypt: 1') &&
-        l.includes('authsetup: 0') &&
-        l.includes('metadata: 7')
+        JSON.parse(l).event === 'discovery_device' &&
+        JSON.parse(l).encrypt === true &&
+        JSON.parse(l).authsetup === false &&
+        JSON.parse(l).metadata === 7
       ),
-      `missing OwnTone-shaped line: ${logs.join(' | ')}`,
+      `missing discovery configuration: ${logs.join(' | ')}`,
     );
   } finally {
     discovery.close();

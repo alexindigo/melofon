@@ -11,6 +11,7 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 import { openDb } from '../src/db.ts';
+import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 
 async function makeApps() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-facade-' });
@@ -261,18 +262,14 @@ Deno.test('/_/ answers the core tree on an extra bind too', async () => {
 Deno.test('request trace: accept+headers lines, redacted dump only with the extra flag', async () => {
   const { core, layers, close } = await makeApps();
   try {
-    const lines: string[] = [];
-    const orig = console.log;
-    console.log = (line: unknown) => {
-      lines.push(String(line));
-    };
+    const { log, lines } = captureLogs();
     try {
       // Off by default.
-      await facade(core, layers)(new Request('http://x/echo?c=test'));
+      await facade(core, layers, { log })(new Request('http://x/echo?c=test'));
       assertEquals(lines.length, 0);
 
       // With debugLogRequests: compact accept + headers, no header dump.
-      await facade(core, layers, { debugLogRequests: true })(
+      await facade(core, layers, { debugLogRequests: true, log })(
         new Request('http://x/echo?c=test&u=admin&p=hunter2&apiKey=sekrit', {
           headers: {
             'user-agent': 'facade-test',
@@ -282,10 +279,15 @@ Deno.test('request trace: accept+headers lines, redacted dump only with the extr
         }),
       );
       assertEquals(lines.length, 2);
-      assert(lines[0].includes('accept req=1 inflight=1 GET /echo'));
+      assertEquals(parseLogfmt(lines[0]).event, 'http_accept');
+      assertEquals(parseLogfmt(lines[0]).req, '1');
+      assertEquals(parseLogfmt(lines[0]).inflight, '1');
+      assertEquals(parseLogfmt(lines[0]).method, 'GET');
+      assertEquals(parseLogfmt(lines[0]).path, '/echo');
       assert(lines[0].includes('peer='));
-      assert(lines[1].includes('headers req=1'));
-      assert(lines[1].includes('-> 200'));
+      assertEquals(parseLogfmt(lines[1]).event, 'http_headers');
+      assertEquals(parseLogfmt(lines[1]).req, '1');
+      assertEquals(parseLogfmt(lines[1]).status, '200');
       assert(lines[1].includes('waitMs='));
       // No info.completed in this call → done is skipped.
       for (const line of lines) {
@@ -302,6 +304,7 @@ Deno.test('request trace: accept+headers lines, redacted dump only with the extr
       await facade(core, layers, {
         debugLogRequests: true,
         debugLogHeaders: true,
+        log,
       })(
         new Request('http://x/echo?c=test&u=admin&p=hunter2&apiKey=sekrit', {
           headers: {
@@ -312,18 +315,23 @@ Deno.test('request trace: accept+headers lines, redacted dump only with the extr
         }),
       );
       assertEquals(lines.length, 2);
-      assert(lines[0].includes('accept req=1'));
+      assertEquals(parseLogfmt(lines[0]).event, 'http_accept');
+      assertEquals(parseLogfmt(lines[0]).req, '1');
       assert(lines[0].includes('c=test'));
-      assert(lines[0].includes('user-agent: facade-test'));
-      assert(lines[0].includes('u=•••'));
-      assert(lines[0].includes('p=•••'));
-      assert(lines[0].includes('apiKey=•••'));
+      assertEquals(
+        JSON.parse(parseLogfmt(lines[0]).headers)['user-agent'],
+        'facade-test',
+      );
+      const query = new URL(parseLogfmt(lines[0]).url).searchParams;
+      assertEquals(query.get('u'), '[redacted]');
+      assertEquals(query.get('p'), '[redacted]');
+      assertEquals(query.get('apiKey'), '[redacted]');
       assert(!lines[0].includes('hunter2'));
       assert(!lines[0].includes('sekrit'));
       assert(!lines[0].includes('abc123'));
       assert(!lines[0].includes('alsosomething'));
     } finally {
-      console.log = orig;
+      await log.flush();
     }
   } finally {
     await close();
@@ -333,15 +341,11 @@ Deno.test('request trace: accept+headers lines, redacted dump only with the extr
 Deno.test('request trace: done logs when info.completed settles', async () => {
   const { core, layers, close } = await makeApps();
   try {
-    const lines: string[] = [];
-    const orig = console.log;
-    console.log = (line: unknown) => {
-      lines.push(String(line));
-    };
+    const { log, lines } = captureLogs();
     try {
       let complete!: () => void;
       const info = { completed: new Promise<void>((r) => (complete = r)) };
-      const res = await facade(core, layers, { debugLogRequests: true })(
+      const res = await facade(core, layers, { debugLogRequests: true, log })(
         new Request('http://x/echo'),
         info,
       );
@@ -351,11 +355,12 @@ Deno.test('request trace: done logs when info.completed settles', async () => {
       await info.completed;
       await new Promise((resolve) => setTimeout(resolve, 0));
       assertEquals(lines.length, 3);
-      assert(lines[2].includes('done req=1'));
+      assertEquals(parseLogfmt(lines[2]).event, 'http_done');
+      assertEquals(parseLogfmt(lines[2]).req, '1');
       assert(lines[2].includes('bodyMs='));
-      assert(!lines[2].includes('aborted'));
+      assertEquals(parseLogfmt(lines[2]).aborted, 'false');
     } finally {
-      console.log = orig;
+      await log.flush();
     }
   } finally {
     await close();

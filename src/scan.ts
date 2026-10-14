@@ -13,6 +13,7 @@ import { encodeHex } from '@std/encoding/hex';
 import { createMedia, type Media } from './media.ts';
 import type { Db } from './db.ts';
 import type { Notify } from './notify.ts';
+import { type Log, scopedLog } from './logging.ts';
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
@@ -108,7 +109,11 @@ async function probeDurationMs(
   return probe.durationMs;
 }
 
-export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
+export async function scanLibrary(
+  db: Db,
+  media?: Media,
+  log: Log = scopedLog('scan'),
+): Promise<ScanCounts> {
   // node-av (the native addon) is only loaded if some file actually needs the
   // duration fallback — a library whose tags all carry duration never touches
   // it.
@@ -225,10 +230,7 @@ export async function scanLibrary(db: Db, media?: Media): Promise<ScanCounts> {
         err instanceof Deno.errors.NotFound ||
         err instanceof Deno.errors.PermissionDenied
       ) {
-        console.warn(
-          `[melofon] scan: skipping unreadable source ` +
-            `${source.name} (${root}): ${err.message}`,
-        );
+        log.event('scan_skipped', { path: root, error: err });
         continue;
       }
       throw err;
@@ -333,13 +335,14 @@ export interface ScanService {
 export function createScan(
   db: Db,
   media?: Media,
-  opts?: { notify?: Notify },
+  opts?: { notify?: Notify; log?: Log },
 ): ScanService {
+  const log = opts?.log ?? scopedLog('scan');
   let scanning = false;
   let count = 0;
   let lastScanMs: number | null = null;
   const run = async (): Promise<ScanCounts> => {
-    const counts = await scanLibrary(db, media);
+    const counts = await scanLibrary(db, media, log);
     count = counts.files;
     lastScanMs = Date.now();
     // A completed scan changed the library DB — clients re-read (OwnTone
@@ -364,7 +367,7 @@ export function createScan(
       try {
         await run();
       } catch (err) {
-        console.error('[melofon] scan failed:', err);
+        log.event('scan_failed', { error: err });
       } finally {
         scanning = false;
       }

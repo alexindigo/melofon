@@ -10,6 +10,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <json-c/json.h>
+#include <libavutil/log.h>
+#include <event2/event.h>
+#include "../ffi.h"
 
 #include <event2/buffer.h>
 
@@ -27,28 +34,150 @@
 /* ------------------------------- logger ---------------------------------- */
 
 /* 0 = quiet .. 5 = spam; set from argv --verbose in main.c. */
-static int helper_log_severity = E_LOG;
+static _Atomic int helper_log_severity = E_LOG;
+enum { LOG_CAPACITY = 256, LOG_MESSAGE = 2048 };
+struct diagnostic {
+  int severity, domain, truncated, typed, flags;
+  uint64_t sequence, device;
+  int64_t time_ms, value, value2;
+  char event[48], message[LOG_MESSAGE], name[256], host[256];
+};
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct diagnostic diagnostics[LOG_CAPACITY];
+static size_t log_head, log_count;
+static _Atomic uint64_t log_dropped, log_sequence;
+static _Atomic int log_consumer;
+
+static void capture(struct diagnostic *record)
+{
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+  record->time_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+  record->sequence = atomic_fetch_add(&log_sequence, 1) + 1;
+  /* A pacing/foreign producer never waits for JS (or for polling's lock). */
+  if (pthread_mutex_trylock(&log_lock) != 0) {
+    atomic_fetch_add(&log_dropped, 1); return;
+  }
+  if (log_count == LOG_CAPACITY) atomic_fetch_add(&log_dropped, 1);
+  else {
+    diagnostics[(log_head + log_count) % LOG_CAPACITY] = *record;
+    log_count++;
+  }
+  pthread_mutex_unlock(&log_lock);
+}
+
+int raop_log_consumer(int enable)
+{
+  if (enable) {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&log_consumer, &expected, 1)) return -1;
+    av_log_set_callback(logger_ffmpeg);
+    event_set_log_callback(logger_libevent);
+  } else {
+    av_log_set_callback(av_log_default_callback);
+    event_set_log_callback(NULL);
+    atomic_store(&log_consumer, 0);
+  }
+  return 0;
+}
+
+int raop_log_poll(char *buf, size_t cap)
+{
+  struct diagnostic overflow = { .severity = E_WARN, .domain = L_MAIN };
+  struct diagnostic *r;
+  struct json_object *json, *payload;
+  const char *encoded;
+  size_t length;
+  uint64_t lost;
+  if (!buf || !cap || !atomic_load(&log_consumer)) return -1;
+  pthread_mutex_lock(&log_lock);
+  lost = atomic_load(&log_dropped);
+  if (!log_count && !lost) { pthread_mutex_unlock(&log_lock); return 0; }
+  if (log_count) r = &diagnostics[log_head];
+  else {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    overflow.time_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    overflow.sequence = atomic_fetch_add(&log_sequence, 1) + 1;
+    strcpy(overflow.event, "overflow");
+    r = &overflow;
+  }
+  json = json_object_new_object();
+  if (!json) { pthread_mutex_unlock(&log_lock); return -1; }
+  json_object_object_add(json, "severity", json_object_new_int(r->severity));
+  json_object_object_add(json, "domain", json_object_new_int(r->domain));
+  json_object_object_add(json, "timeMs", json_object_new_int64(r->time_ms));
+  json_object_object_add(json, "nativeSequence", json_object_new_uint64(r->sequence));
+  json_object_object_add(json, "nativeEvent", json_object_new_string(r->event));
+  json_object_object_add(json, "truncated", json_object_new_int(r->truncated));
+  json_object_object_add(json, "dropped", json_object_new_uint64(lost));
+  if (r->typed) {
+    payload = json_object_new_object();
+    json_object_object_add(payload, "device", json_object_new_uint64(r->device));
+    json_object_object_add(payload, "value", json_object_new_int64(r->value));
+    json_object_object_add(payload, "value2", json_object_new_int64(r->value2));
+    json_object_object_add(payload, "name", json_object_new_string(r->name));
+    json_object_object_add(payload, "host", json_object_new_string(r->host));
+    json_object_object_add(payload, "flags", json_object_new_int(r->flags));
+    json_object_object_add(json, "payload", payload);
+  } else json_object_object_add(json, "payload", json_object_new_string(r->message));
+  encoded = json_object_to_json_string_ext(json, JSON_C_TO_STRING_PLAIN);
+  length = strlen(encoded);
+  if (length >= cap) { json_object_put(json); pthread_mutex_unlock(&log_lock); return -1; }
+  memcpy(buf, encoded, length);
+  buf[length] = 0;
+  if (log_count) { log_head = (log_head + 1) % LOG_CAPACITY; log_count--; }
+  atomic_fetch_sub(&log_dropped, lost);
+  json_object_put(json);
+  pthread_mutex_unlock(&log_lock);
+  return (int)length;
+}
+
+void helper_log_event(int severity, int domain, const char *event,
+                      const struct helper_log_fields *fields)
+{
+  struct diagnostic r = { .severity = severity, .domain = domain, .typed = 1 };
+  if (severity > atomic_load(&helper_log_severity)) return;
+  if (!atomic_load(&log_consumer)) {
+    /* Central native standalone transport preserves historical probe evidence. */
+    if (strcmp(event, "device_start") == 0 && fields)
+      DPRINTF(severity, domain, "Adding AirPlay device '%s': password: 0, verification: %u, encrypt: %u, authsetup: %u, metadata: %lld, type %lld, address %s:%lld\n", fields->name, (fields->flags & 1) != 0, (fields->flags & 2) != 0, (fields->flags & 4) != 0, (long long)fields->value2, (long long)(fields->flags >> 3), fields->host, (long long)fields->value);
+    else if (strcmp(event, "pcm_peak") == 0 && fields)
+      DPRINTF(severity, domain, "pcm_peak=%lld samples=%lld\n", (long long)fields->value, (long long)fields->value2);
+    else DPRINTF(severity, domain, "%s device=%llu value=%lld\n", event, (unsigned long long)(fields ? fields->device : 0), (long long)(fields ? fields->value : 0));
+    return;
+  }
+  if (snprintf(r.event, sizeof(r.event), "%s", event) >= sizeof(r.event)) r.truncated++;
+  if (fields) {
+    r.device = fields->device; r.value = fields->value; r.value2 = fields->value2; r.flags = fields->flags;
+    if (fields->name && snprintf(r.name, sizeof(r.name), "%s", fields->name) >= sizeof(r.name)) r.truncated++;
+    if (fields->host && snprintf(r.host, sizeof(r.host), "%s", fields->host) >= sizeof(r.host)) r.truncated++;
+  }
+  capture(&r);
+}
 
 void
 DPRINTF(int severity, int domain, const char *fmt, ...)
 {
   va_list ap;
 
-  if (severity > helper_log_severity)
-    return;
-
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  DVPRINTF(severity, domain, fmt, ap);
   va_end(ap);
 }
 
 void
 DVPRINTF(int severity, int domain, const char *fmt, va_list ap)
 {
-  if (severity > helper_log_severity)
+  if (severity > atomic_load(&helper_log_severity))
     return;
-
-  vfprintf(stderr, fmt, ap);
+  if (atomic_load(&log_consumer)) {
+    struct diagnostic r = { .severity = severity, .domain = domain };
+    int length = vsnprintf(r.message, sizeof(r.message), fmt, ap);
+    strcpy(r.event, "printf");
+    r.truncated = length < 0 || length >= sizeof(r.message);
+    capture(&r);
+  } else vfprintf(stderr, fmt, ap);
 }
 
 void
@@ -66,15 +195,29 @@ void
 logger_ffmpeg(void *ptr, int level, const char *fmt, va_list ap)
 {
   (void)ptr;
-  (void)level;
-  (void)fmt;
-  (void)ap;
+  if (level > av_log_get_level()) return;
+  /* Preserve FFmpeg's source filter, independent of OwnTone's E_LOG gate. */
+  if (atomic_load(&log_consumer)) {
+    struct diagnostic r = { .domain = L_FFMPEG, .severity = level <= AV_LOG_FATAL ? E_FATAL : level <= AV_LOG_ERROR ? E_LOG : level <= AV_LOG_WARNING ? E_WARN : level <= AV_LOG_INFO ? E_INFO : E_DBG };
+    int length = vsnprintf(r.message, sizeof(r.message), fmt, ap);
+    strcpy(r.event, "ffmpeg");
+    r.truncated = length < 0 || length >= sizeof(r.message);
+    capture(&r);
+  }
 }
 
 void
 logger_libevent(int severity, const char *msg)
 {
-  DPRINTF(severity, L_EVENT, "%s\n", msg);
+  /* libevent's levels are _EVENT_LOG_DEBUG/MSG/WARN/ERR = 0/1/2/3.
+   * No call back into libevent is permitted from this callback. */
+  int mapped = severity <= 0 ? E_DBG : severity == 1 ? E_INFO : severity == 2 ? E_WARN : E_LOG;
+  if (atomic_load(&log_consumer)) {
+    struct diagnostic r = { .domain = L_EVENT, .severity = mapped };
+    strcpy(r.event, "libevent");
+    r.truncated = snprintf(r.message, sizeof(r.message), "%s", msg) >= sizeof(r.message);
+    capture(&r);
+  } else DPRINTF(mapped, L_EVENT, "%s\n", msg);
 }
 
 void

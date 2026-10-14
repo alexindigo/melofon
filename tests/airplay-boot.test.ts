@@ -13,6 +13,8 @@ import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
+import type { Log } from '../src/logging.ts';
+import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 import {
   createTestAirplayDevices,
   recordingSpawn,
@@ -761,6 +763,7 @@ function longSong(suffix?: string): SongRow {
 
 async function recycleSetup(
   overrides: {
+    log?: Log;
     retryBackoffMs?: number[];
     chunks?: number;
     chunkBytes?: number;
@@ -770,10 +773,11 @@ async function recycleSetup(
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
   const db = await openDb(dir);
   const notify = createNotify();
-  const outputs = createOutputs({ notify });
+  const outputs = createOutputs({ notify, log: overrides.log });
   const player = createPlayer();
   const library = createLibrary(db);
   const playback = createPlayback({
+    log: overrides.log,
     player,
     nowPlaying: createNowPlaying(db),
     library,
@@ -791,6 +795,7 @@ async function recycleSetup(
     }),
   );
   const boot = createAirplayBoot({
+    log: overrides.log,
     outputs,
     playback,
     media: syntheticMedia(decodeCalls, overrides),
@@ -1120,13 +1125,9 @@ Deno.test('ATV3 stale events from the retired session cannot touch the replaceme
 });
 
 Deno.test('ATV3 failure: a failed close blocks the output — visibly, until restart', async () => {
-  const errors: string[] = [];
-  const origError = console.error;
-  console.error = (...args: unknown[]) => {
-    errors.push(args.map(String).join(' '));
-  };
+  const { log, lines: errors } = captureLogs();
   try {
-    const { outputs, playback, spawned, close } = await recycleSetup();
+    const { outputs, playback, spawned, close } = await recycleSetup({ log });
     try {
       registerAtv3(outputs);
       playback.queueAdd([longSong()], { play: true });
@@ -1145,7 +1146,11 @@ Deno.test('ATV3 failure: a failed close blocks the output — visibly, until res
         'a failed retirement authorizes no replacement',
       );
       assert(
-        errors.some((l) => l.includes('retirement') && l.includes('FAILED')),
+        errors.some((l) =>
+          parseLogfmt(l).event === 'retirement_failed' &&
+          parseLogfmt(l).output === ID &&
+          parseLogfmt(l).generation !== undefined
+        ),
         `the failure is logged with output and generation: ${
           errors.join(' | ')
         }`,
@@ -1178,18 +1183,14 @@ Deno.test('ATV3 failure: a failed close blocks the output — visibly, until res
       await close();
     }
   } finally {
-    console.error = origError;
+    await log.flush();
   }
 });
 
 Deno.test('ATV3 provenance: a recycle fabricates no core commands; catalog/volume do not reconnect a down session', async () => {
-  const lines: string[] = [];
-  const origLog = console.log;
-  console.log = (...args: unknown[]) => {
-    lines.push(args.map(String).join(' '));
-  };
+  const { log, lines } = captureLogs();
   try {
-    const { outputs, playback, spawned, close } = await recycleSetup();
+    const { outputs, playback, spawned, close } = await recycleSetup({ log });
     try {
       registerAtv3(outputs);
       playback.queueAdd([longSong()], { play: true });
@@ -1200,12 +1201,15 @@ Deno.test('ATV3 provenance: a recycle fabricates no core commands; catalog/volum
       lines.length = 0; // only the user's own command may follow
       playback.seek({ positionMs: 120_000 });
       await until('replacement', () => spawned.length === 2);
-      const cmds = lines.filter((l) => l.startsWith('[cmd]'));
+      const cmds = lines.map(parseLogfmt).filter((l) => l.event === 'command');
       assertEquals(
-        cmds,
-        ['[cmd] seek position_ms=120000 by internal:core'],
-        `the recycle manufactured no pause/play/selection: ${cmds.join(' | ')}`,
+        cmds.length,
+        1,
+        'the recycle manufactured no pause/play/selection',
       );
+      assertEquals(cmds[0].command, 'seek');
+      assertEquals(JSON.parse(cmds[0].facts), { position_ms: 120000 });
+      assertEquals(cmds[0].kind, 'internal');
 
       // A down session (paused, retired) is not resurrected by a volume
       // update or an unrelated registration.
@@ -1231,7 +1235,7 @@ Deno.test('ATV3 provenance: a recycle fabricates no core commands; catalog/volum
       await close();
     }
   } finally {
-    console.log = origLog;
+    await log.flush();
   }
 });
 

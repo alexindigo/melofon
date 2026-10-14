@@ -1,4 +1,15 @@
 // Owned subprocess IPC; production logging is retained alongside RPC responses.
+// Protocol writer is deliberately distinct from console and diagnostic logging.
+export function writeReply(reply: unknown): void {
+  const bytes = new TextEncoder().encode(
+    'DUALHOME:' + JSON.stringify(reply) + '\n',
+  );
+  for (let offset = 0; offset < bytes.length;) {
+    const n = Deno.stdout.writeSync(bytes.subarray(offset));
+    if (n <= 0) throw new Error('RPC writer made no progress');
+    offset += n;
+  }
+}
 export async function* lines(stream: ReadableStream<Uint8Array>) {
   let pending = '';
   for await (const chunk of stream.pipeThrough(new TextDecoderStream())) {
@@ -101,9 +112,9 @@ export async function serve(
     const { id, command, input } = JSON.parse(line);
     try {
       const value = await handle(command, input);
-      console.log('DUALHOME:' + JSON.stringify({ id, value }));
+      writeReply({ id, value });
     } catch (error) {
-      console.log('DUALHOME:' + JSON.stringify({ id, error: String(error) }));
+      writeReply({ id, error: String(error) });
     }
     if (command === 'close') break;
   }

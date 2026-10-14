@@ -245,7 +245,13 @@ Deno.test('missing tracks drop with a warn and the current index remaps', async 
       nowMs: Date.now(),
       maxAgeMs: 300_000,
       selectedOutputPresent: true,
-      warn: (msg) => warns.push(msg),
+      log: {
+        event: (event, facts) => {
+          if (event === 'restore_missing') {
+            warns.push((facts as { track: string }).track);
+          }
+        },
+      },
     });
 
   // b dropped: c shifts from index 2 to 1, position preserved, still plays.

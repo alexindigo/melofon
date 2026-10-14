@@ -492,11 +492,11 @@ source_consistent(struct raop_session *rs)
   if (result == SOURCE_SELECTED && source_equal(&rs->rtsp_source, &rs->rtp_source) &&
       source_equal(&preferred, &rs->rtsp_source)) return true;
   if (result == SOURCE_UNAVAILABLE)
-    DPRINTF(E_LOG, L_RAOP, "Local source unavailable for device %" PRIu64 " (errno=%d)\n", rs->device_id, error);
+    helper_log_event(E_LOG, L_RAOP, "source_unavailable", &(struct helper_log_fields){ .device = rs->device_id, .value = error });
   else if (result == SOURCE_ERROR)
-    DPRINTF(E_LOG, L_RAOP, "Local source observation error for device %" PRIu64 " (errno=%d)\n", rs->device_id, error);
+    helper_log_event(E_LOG, L_RAOP, "source_observation_error", &(struct helper_log_fields){ .device = rs->device_id, .value = error });
   else
-    DPRINTF(E_LOG, L_RAOP, "Local source changed/inconsistent for device %" PRIu64 "\n", rs->device_id);
+    helper_log_event(E_LOG, L_RAOP, "source_changed", &(struct helper_log_fields){ .device = rs->device_id });
   deferred_session_failure(rs);
   return false;
 }
@@ -511,7 +511,7 @@ source_observer_cb(evutil_socket_t fd, short what, void *arg)
   if (!source_consistent(rs)) return;
   if (evtimer_add(rs->source_observer, &interval) < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not schedule local source observation for device %" PRIu64 "\n", rs->device_id);
+      helper_log_event(E_LOG, L_RAOP, "source_schedule_failed", &(struct helper_log_fields){ .device = rs->device_id });
       deferred_session_failure(rs);
     }
 }
@@ -1703,7 +1703,7 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb, const char *lo
 
   if (source_from_text(&rs->rtsp_source, address, family) < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not snapshot RTSP source for device %" PRIu64 " (errno=%d)\n", rs->device_id, errno);
+      helper_log_event(E_LOG, L_RAOP, "rtsp_source_failed", &(struct helper_log_fields){ .device = rs->device_id, .value = errno });
       free(address);
       deferred_session_failure(rs);
       return 0; /* Only the coordinator may authorize a replacement. */
@@ -3669,7 +3669,7 @@ raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
 
   if (source_from_socket(&rs->rtp_source, rs->server_fd) < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not snapshot RTP source for device %" PRIu64 " (errno=%d)\n", rs->device_id, errno);
+      helper_log_event(E_LOG, L_RAOP, "rtp_source_failed", &(struct helper_log_fields){ .device = rs->device_id, .value = errno });
       deferred_session_failure(rs);
       return;
     }
@@ -3678,7 +3678,7 @@ raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
   struct timeval interval = { RAOP_SOURCE_OBSERVE_INTERVAL, 0 };
   if (!rs->source_observer || evtimer_add(rs->source_observer, &interval) < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not start local source observation for device %" PRIu64 "\n", rs->device_id);
+      helper_log_event(E_LOG, L_RAOP, "source_start_failed", &(struct helper_log_fields){ .device = rs->device_id });
       deferred_session_failure(rs);
       return;
     }

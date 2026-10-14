@@ -16,6 +16,7 @@
 import type { SongRow } from './library.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
+import { type Log, scopedLog } from './logging.ts';
 import {
   CONNECTION_STRATEGY_DEFAULT_KEY,
   type ConnectionStrategy,
@@ -58,24 +59,6 @@ export interface LastCommand {
   atMs: number;
   intent: 'play' | 'pause' | 'stop' | 'none';
   queueCleared: boolean;
-}
-
-/** One greppable line per engine mutation (plan command-provenance) — the
- * 2026-09-24 ghost-writer incident would have been one such line each. */
-export function logCmd(
-  kind: string,
-  detail: string | undefined,
-  source: CommandSource,
-): void {
-  const by = source.kind === 'http'
-    ? `http ${source.peer ?? '?'}` +
-      (source.user ? ` user=${source.user}` : '') +
-      (source.client ? ` client=${source.client}` : '') +
-      (source.userAgent ? ` (${source.userAgent})` : '')
-    : `internal:${source.via ?? 'core'}`;
-  console.log(
-    `[cmd] ${kind}${detail !== undefined ? ` ${detail}` : ''} by ${by}`,
-  );
 }
 
 /** Build a CommandSource from a pathfinder request view (peer +
@@ -172,16 +155,15 @@ export async function planRestore(opts: {
   nowMs: number;
   maxAgeMs: number;
   selectedOutputPresent: boolean;
-  warn?: (msg: string) => void;
+  log?: Log;
 }): Promise<RestoreSnapshot | null> {
-  const warn = opts.warn ??
-    ((msg: string) => console.warn(`[melofon] ${msg}`));
+  const log = opts.log ?? scopedLog('player');
   const queue: SongRow[] = [];
   const keptPositions: number[] = []; // original queue pos per kept song
   for (const [pos, id] of opts.queueIds.entries()) {
     const song = await opts.getSong(id);
     if (song === null) {
-      warn(`restore: track ${id} no longer in the library, dropped`);
+      log.event('restore_missing', { track: id });
       continue;
     }
     keptPositions.push(pos);
@@ -609,10 +591,11 @@ export function createPlayer(): Player {
 }
 
 export function createOutputs(
-  { notify, persistence, state }: {
+  { notify, persistence, state, log = scopedLog('outputs') }: {
     notify?: Notify;
     persistence?: OutputPersistence;
     state?: State;
+    log?: Log;
   } = {},
 ): Outputs {
   const emit = (types: string[]) => notify?.emit(types);
@@ -717,7 +700,11 @@ export function createOutputs(
       }
       saveRow(find(output.id)!);
       record('register', source);
-      logCmd('output.register', output.id, source ?? { kind: 'internal' });
+      log.event('command', {
+        command: 'output.register',
+        facts: { output: output.id },
+        source: source ?? { kind: 'internal' },
+      });
       emit(['outputs']);
     },
     unregister(id, source) {
@@ -726,7 +713,11 @@ export function createOutputs(
       outputs.splice(idx, 1);
       record('unregister', source);
       // The persisted row stays: last-seen state for a re-announcement.
-      logCmd('output.unregister', id, source ?? { kind: 'internal' });
+      log.event('command', {
+        command: 'output.unregister',
+        facts: { output: id },
+        source: source ?? { kind: 'internal' },
+      });
       emit(['outputs']);
       return true;
     },
@@ -739,11 +730,11 @@ export function createOutputs(
         source,
         outputs.map((o) => ({ id: o.id, selected: ids.includes(o.id) })),
       );
-      logCmd(
-        'output.setEnabled',
-        ids.join(','),
-        source ?? { kind: 'internal' },
-      );
+      log.event('command', {
+        command: 'output.setEnabled',
+        facts: { outputs: ids },
+        source: source ?? { kind: 'internal' },
+      });
       emit(['outputs']);
       return true;
     },
@@ -753,7 +744,11 @@ export function createOutputs(
       found.selected = !found.selected;
       saveRow(found);
       record('toggle', source, [{ id, selected: found.selected }]);
-      logCmd('output.toggle', id, source ?? { kind: 'internal' });
+      log.event('command', {
+        command: 'output.toggle',
+        facts: { output: id },
+        source: source ?? { kind: 'internal' },
+      });
       emit(['outputs']);
       return { ...found };
     },
@@ -780,16 +775,16 @@ export function createOutputs(
         opts.connectionStrategy !== undefined
       ) {
         saveRow(found);
-        logCmd(
-          'output.update',
-          id +
-            (opts.selected !== undefined ? ` selected=${opts.selected}` : '') +
-            (opts.volume !== undefined ? ` volume=${opts.volume}` : '') +
-            (opts.connectionStrategy !== undefined
-              ? ` connectionStrategy=${opts.connectionStrategy}`
-              : ''),
-          source ?? { kind: 'internal' },
-        );
+        log.event('command', {
+          command: 'output.update',
+          facts: {
+            output: id,
+            selected: opts.selected,
+            volume: opts.volume,
+            connectionStrategy: opts.connectionStrategy,
+          },
+          source: source ?? { kind: 'internal' },
+        });
       }
       if (opts.needsAuthKey !== undefined) {
         found.needsAuthKey = opts.needsAuthKey;
@@ -803,7 +798,7 @@ export function createOutputs(
           try {
             fn(id, { pin: opts.pin });
           } catch (err) {
-            console.debug('[melofon] outputs command listener threw:', err);
+            log.event('output_listener_failed', { error: err });
           }
         }
       }

@@ -13,6 +13,18 @@ extern "C" {
 
 typedef struct raop_handle raop_t;
 
+/* Exclusive library-wide diagnostic consumer. Install before native init.
+ * This queue is independent of raop_poll's control events and device handles.
+ * enable=1 returns -1 if another consumer owns it; enable=0 requires callers
+ * to quiesce/free their handles and drain first. Standalone consumers retain
+ * their native diagnostic transport when no consumer is installed. */
+int raop_log_consumer(int enable);
+/* Copies one owned JSON transport record (capture UTC milliseconds, sequence,
+ * source severity/domain, typed facts or opaque payload). 0=empty; -1=buffer
+ * too small/invalid. Records are retained on -1. Overflow counts are observable
+ * even without a subsequent producer record. No pointer crosses this API. */
+int raop_log_poll(char *buf, size_t cap);
+
 /* One handle per AirPlay device. The first handle starts the library's
  * background loop thread (libevent; player.c's 10 ms pacing tick arms when
  * the session reports CONNECTED); the last raop_free stops and joins it. */

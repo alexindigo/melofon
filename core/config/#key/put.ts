@@ -3,7 +3,8 @@
 // (e.g. PUT /_/config/airplay.mdns {"value":"off"} stops AirPlay discovery).
 // 400 on a bad body. Provenance-logged like every mutation (plan
 // command-provenance): the key name, never the value (it may be sensitive).
-import { logCmd, sourceFromRequest } from '../../../src/player.ts';
+import { sourceFromRequest } from '../../../src/player.ts';
+import type { Log } from '../../../src/logging.ts';
 import {
   CONNECTION_STRATEGY_DEFAULT_KEY,
   isConnectionStrategy,
@@ -17,7 +18,10 @@ export default async function (
     remoteAddr?: { hostname?: string };
   },
   context: {
-    app: { state: { set(key: string, value: string): Promise<void> } };
+    app: {
+      state: { set(key: string, value: string): Promise<void> };
+      log: Log;
+    };
   },
 ) {
   let body: unknown;
@@ -42,7 +46,10 @@ export default async function (
       status: 400,
     });
   }
-  logCmd('config', request.params.key, sourceFromRequest(request));
+  context.app.log.event('config_changed', {
+    key: request.params.key,
+    source: sourceFromRequest(request),
+  });
   await context.app.state.set(request.params.key, value);
   return { ok: true };
 }

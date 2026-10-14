@@ -23,6 +23,13 @@ import dgram from 'node:dgram';
 import { dnsQuestions } from '../../src/mdns.ts';
 import { airplayAnswer } from '../../tests/mdns-builder.ts';
 import { startFakeRaop } from '../../tests/helpers/fake-raop.ts';
+import { parseLogfmt } from '../../tests/helpers/logging.ts';
+
+function logRecords(text: string): Record<string, string>[] {
+  return text.split('\n').filter((line) => line.startsWith('time=')).map(
+    parseLogfmt,
+  );
+}
 
 const LISTEN = '127.0.0.1:14138';
 const OWNTONE = [14689, 14688];
@@ -163,6 +170,20 @@ const cleanup = async () => {
     try {
       logFile.close();
     } catch { /* already closed */ }
+    const evidence = Deno.env.get('MELOFON_LOGGING_EVIDENCE');
+    if (evidence) {
+      if (
+        !evidence.startsWith(
+          '/home/tester/melofon-output-preparation-01/shared-logging-01/evidence/',
+        )
+      ) fail('evidence outside owned guest workspace');
+      await Deno.mkdir(evidence, { recursive: true, mode: 0o700 });
+      await Deno.writeFile(
+        `${evidence}/child.log`,
+        await Deno.readFile(logPath),
+        { createNew: true },
+      );
+    }
     await Deno.remove(workDir, { recursive: true });
     await Deno.remove(dataDir, { recursive: true });
   }
@@ -191,7 +212,10 @@ try {
   let markerSeen = false;
   for (let i = 0; i < 20 && !markerSeen; i++) {
     const log1 = await Deno.readTextFile(logPath);
-    markerSeen = log1.includes('policy=connection-strategies-v1');
+    markerSeen = logRecords(log1).some((record) =>
+      record.event === 'airplay_policy' &&
+      record.policy === 'connection-strategies-v1'
+    );
     if (!markerSeen) await new Promise((r) => setTimeout(r, 100));
   }
   if (!markerSeen) fail('the boot policy marker is missing from the child log');
@@ -278,7 +302,10 @@ try {
   for (let i = 0; i < 20 && !attributed; i++) {
     await new Promise((resolve) => setTimeout(resolve, 100));
     const log = await Deno.readTextFile(logPath);
-    attributed = /\[cmd\] volume volume=75 .*client=atv3-smoke/.test(log);
+    attributed = logRecords(log).some((record) =>
+      record.event === 'command' && record.command === 'volume' &&
+      record.client === 'atv3-smoke' && JSON.parse(record.facts).volume === 75
+    );
   }
   if (!attributed) fail('the volume command was not attributed in the log');
 

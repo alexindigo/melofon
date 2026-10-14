@@ -4,6 +4,16 @@
 #define __LOGGER_H__
 
 #include <stdarg.h>
+#include <stdint.h>
+
+struct helper_log_fields {
+  uint64_t device;
+  int64_t value, value2;
+  const char *name, *host;
+  int flags;
+};
+void helper_log_event(int severity, int domain, const char *event,
+                      const struct helper_log_fields *fields);
 
 /* Log domains */
 #define L_CONF        0

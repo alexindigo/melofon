@@ -5,6 +5,7 @@ import { assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
 import { createState } from '../src/state.ts';
+import { captureLogs } from './helpers/logging.ts';
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-state-' });
@@ -74,7 +75,11 @@ Deno.test('core /_/config: list and put', async () => {
   const { db, close } = await setup();
   try {
     const state = createState(db);
-    const core = await pathfinder({ roots: ['core/'], app: { db, state } });
+    const { log, records } = captureLogs();
+    const core = await pathfinder({
+      roots: ['core/'],
+      app: { db, state, log },
+    });
 
     const put = (key: string, body: string, json = true) =>
       core(
@@ -97,6 +102,11 @@ Deno.test('core /_/config: list and put', async () => {
     assertEquals(res.status, 200);
     assertEquals(await res.json(), { ok: true });
     assertEquals(seen, [['airplay.mdns', 'off']]);
+
+    assertEquals(
+      records().map((record) => [record.event, record.key, record.kind]),
+      [['config_changed', 'airplay.mdns', 'http']],
+    );
 
     const list = await core(new Request('http://x/config'));
     assertEquals(list.status, 200);

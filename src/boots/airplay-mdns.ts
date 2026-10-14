@@ -13,6 +13,7 @@
 // pw → warn (passwords unsupported). The id is the mDNS instance's 64-bit
 // id in decimal — stable across IP changes, digits for the OwnTone id regex.
 import type { MdnsBrowser, MdnsService } from '../mdns.ts';
+import { type Log, scopedLog } from '../logging.ts';
 import { createMdnsBrowser } from '../mdns.ts';
 import type { Outputs } from '../player.ts';
 import type { State } from '../state.ts';
@@ -61,7 +62,7 @@ export interface AirplayDiscoveryDeps {
     model?: string;
     connectionStrategy?: ConnectionStrategy;
   } | undefined;
-  log?: (msg: string) => void;
+  log?: Log;
 }
 
 export function createAirplayDiscovery(
@@ -70,17 +71,13 @@ export function createAirplayDiscovery(
   close(): void;
 } {
   const { outputs, state } = deps;
-  const log = deps.log ?? ((msg: string) => console.warn(`[melofon] ${msg}`));
+  const log = deps.log ?? scopedLog('airplay-discovery');
   const createBrowser = deps.createBrowser ??
     ((onService: (event: 'up' | 'down', service: MdnsService) => void) =>
       createMdnsBrowser({
         type: '_raop._tcp',
         onService,
-        onError: (err) =>
-          log(
-            `airplay discovery unavailable (no multicast?): ${err} — ` +
-              'manual registration via POST /_/outputs still works',
-          ),
+        onError: (err) => log.event('discovery_failed', { error: err }),
       }));
 
   let browser: MdnsBrowser | null = null;
@@ -102,13 +99,14 @@ export function createAirplayDiscovery(
     // 'up'
     const parsed = parseInstance(svc.name);
     if (parsed === null) {
-      log(`airplay discovery: skipping odd instance name '${svc.name}'`);
+      log.event('discovery_skipped', { instance: svc.name, reason: 'name' });
       return;
     }
     if (!(svc.txt.tp ?? '').includes('UDP')) {
-      log(
-        `airplay discovery: skipping '${parsed.name}': no UDP in tp`,
-      );
+      log.event('discovery_skipped', {
+        instance: parsed.name,
+        reason: 'no_udp',
+      });
       return;
     }
 
@@ -117,9 +115,7 @@ export function createAirplayDiscovery(
       const saved = existing === null
         ? deps.savedOutput?.(parsed.id)
         : undefined;
-      log(
-        `airplay discovery: '${parsed.name}' asks for a password — unsupported`,
-      );
+      log.event('discovery_password', { instance: parsed.name });
       deps.devices.register(
         {
           id: parsed.id,
@@ -141,7 +137,7 @@ export function createAirplayDiscovery(
     try {
       profile = profileFromService(svc);
     } catch (error) {
-      log(`airplay discovery: invalid receiver: ${error}`);
+      log.event('discovery_invalid', { error });
       return;
     }
     const fields = {
@@ -179,30 +175,27 @@ export function createAirplayDiscovery(
     if (
       outputs.list().some((o) => o.id !== parsed.id && o.host === svc.address)
     ) {
-      log(
-        `airplay discovery: skipping '${parsed.name}': host already owned`,
-      );
+      log.event('discovery_skipped', {
+        instance: parsed.name,
+        reason: 'host_owned',
+      });
       return;
     }
     if (svc.txt.pw !== undefined && svc.txt.pw !== 'false') {
-      log(
-        `airplay discovery: '${parsed.name}' asks for a password — ` +
-          'unsupported, registration may fail on play',
-      );
+      log.event('discovery_password', { instance: parsed.name });
     }
     // OwnTone raop_device_cb (raop.c:4463): one grep-able line vs the
     // registration log so a live session can be A/B'd against OwnTone.
-    log(
-      `airplay discovery: Adding AirPlay device '${parsed.name}': ` +
-        `password: ${
-          svc.txt.pw !== undefined && svc.txt.pw !== 'false' ? 1 : 0
-        }, ` +
-        `verification: ${fields.requiresAuth ? 1 : 0}, ` +
-        `encrypt: ${profile.encrypt ? 1 : 0}, ` +
-        `authsetup: ${profile.supportsAuthSetup ? 1 : 0}, ` +
-        `metadata: ${profile.wantedMetadata}, ` +
-        `type ${profile.devtype}, address ${svc.address}:${svc.port}`,
-    );
+    log.event('discovery_device', {
+      instance: parsed.name,
+      host: svc.address,
+      port: svc.port,
+      requiresAuth: fields.requiresAuth,
+      encrypt: profile.encrypt,
+      authsetup: profile.supportsAuthSetup,
+      metadata: profile.wantedMetadata,
+      devtype: profile.devtype,
+    });
     deps.devices.register(
       {
         id: parsed.id,

@@ -9,6 +9,7 @@ import { createState } from '../src/state.ts';
 import { createAirplayDiscovery } from '../src/boots/airplay-mdns.ts';
 import type { MdnsService } from '../src/mdns.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
+import { captureLogs } from './helpers/logging.ts';
 
 const KEY = 'airplay.connectionStrategy.default';
 const source = { kind: 'internal' as const, via: 'strategy-test' };
@@ -40,6 +41,7 @@ async function setup(dir?: string) {
   const core = await pathfinder({
     roots: ['core/'],
     app: {
+      log: captureLogs().log,
       outputs,
       state,
       airplay: devices,
@@ -294,7 +296,7 @@ Deno.test('all three native choices survive real discovery registration gaps, un
       announce = callback;
       return { close() {}, resolve() {} };
     },
-    log: () => {},
+    log: { event() {} },
   });
   const choices = ['melofon', 'owntone', 'audiostation'];
   const service = (id: number, fresh = false): MdnsService => ({

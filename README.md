@@ -116,6 +116,63 @@ and reusable tests, with their own reachability/auth/format checks. HTTP pull
 streams retain their existing decision/preflight boundary. Prepared/connected
 status and synthetic receiver tests do not establish sound on a real speaker.
 
+## Structured logging
+
+Application, RAOP and supported dependency diagnostics use one core-owned
+raw-event → normalization/redaction → logfmt boundary. Each record is one
+physical UTF-8 line with full UTC milliseconds and fixed leading fields:
+
+```text
+time=2026-10-07T21:34:56.789Z level=warn component=airplay event=session_failed message="Output session failed" output=123 generation=12 reason=helper_event
+```
+
+Debug/info/notice/warning records use stdout; errors/fatals use stderr. Journal
+priorities are respectively 7/6/5/4/3/2. Under systemd, use
+`StandardOutput=journal`, `StandardError=inherit`, `SyslogLevelPrefix=yes`.
+The logger validates each destination's device/inode against `JOURNAL_STREAM`
+before emitting a priority prefix; redirected pipes get plain logfmt. Separate
+stderr journal sockets/output overrides require review because that environment
+variable does not identify them. Melofon does not manage diagnostic log files.
+
+Request/header and query tracing retain their existing opt-in controls:
+`MELOFON_DEBUG_LOG_REQUEST=1`, `MELOFON_DEBUG_LOG_HEADERS=1`. HTTP credential
+queries/headers and nested password/PIN/key/token fields are redacted centrally.
+Request bodies and SQL bind values are not logged; SQL tracing emits only safe
+operation/identifier facts. Command attribution remains distinct from login
+credentials. Config events name the key, never the value.
+Public command identities (`kind`, `via`, peer, username and client) keep their
+attribution meaning even when their spelling overlaps an authentication value;
+opaque User-Agent/error/dependency text remains subject to known-value masking.
+
+Bootstrap registers configured password/server-secret values before application
+or dependency evaluation, scrubbing them from opaque messages and Error stacks.
+Normalization snapshots bounded data without custom getters, inspection or
+`toJSON`. Ordinary Error stacks use guarded intrinsic projection; custom unsafe
+stack paths carry explicit `stack_unavailable`. Loss, truncation and normalization
+failures have diagnostic metadata. Quotes/controls use JSON-compatible escaping
+following go-logfmt 0.6.0 conventions, not every informal logfmt dialect.
+
+RAOP diagnostics have capture timestamps and native sequence/drop/truncation
+facts, separate from control events and audio pacing. `nativeDevice` is the
+native identity, not invented core request/output attribution. node-av supplies
+only asynchronously observed `(level,message)` payloads (`time_basis=observed`),
+with a 4096-byte native formatting limit and no flush acknowledgement. Metadata
+`debug` payloads may already be formatted. Arbitrary opaque third-party text is
+not provably secret-free. Sequence fields aid diagnosis; separate destinations
+and asynchronous delivery do not imply a total event ordering.
+
+Unavoidable Deno diagnostics before bootstrap/internal runtime failures, native
+assertion/loader/allocator failures, and unsupported DuckDB/libgcrypt diagnostics
+remain raw. They are preserved, not suppressed or represented as redacted logfmt.
+Standalone native probes also retain their diagnostic transport.
+
+For diagnosis, correlate `event`, `output`, `generation`, `command`, provenance
+and native sequence/loss facts; inspect the original error and preceding events.
+`tests/logging-boundary.test.ts` enforces owned TypeScript output boundaries;
+ordinary integration consumers also check the compiled native writer inventory.
+The contained journal acceptance tool is `dev/logging/verify-service.ts`, for the
+identified development VM only, never the household service.
+
 ## License
 
 AGPL-3.0-or-later. See LICENSE.

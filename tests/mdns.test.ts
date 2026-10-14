@@ -190,7 +190,10 @@ class FakeSocket implements UdpSocketLike {
   }
 }
 
-function setup(socket = new FakeSocket()) {
+function setup(
+  socket = new FakeSocket(),
+  log?: import('../src/logging.ts').Log,
+) {
   const events: ['up' | 'down', string][] = [];
   const errors: unknown[] = [];
   const services = new Map<string, {
@@ -200,6 +203,7 @@ function setup(socket = new FakeSocket()) {
     txt: Record<string, string>;
   }>();
   const browser = createMdnsBrowser({
+    log,
     type: '_raop._tcp',
     socket,
     queryIntervalMs: 60_000,
@@ -419,9 +423,13 @@ Deno.test('browser: SRV without A triggers A+AAAA follow-up, then up', () => {
 
 Deno.test('browser: AAAA-only logs no usable v4 and stays down', () => {
   const warns: string[] = [];
-  const orig = console.warn;
-  console.warn = (...args: unknown[]) => warns.push(args.join(' '));
-  const { browser, socket, events } = setup();
+  const { browser, socket, events } = setup(new FakeSocket(), {
+    event: (event, facts) => {
+      if (event === 'mdns_no_v4') {
+        warns.push((facts as { instance: string }).instance);
+      }
+    },
+  });
   try {
     socket.receive(airplayAnswer({
       instance: INSTANCE,
@@ -432,11 +440,10 @@ Deno.test('browser: AAAA-only logs no usable v4 and stays down', () => {
     }));
     assertEquals(events, []);
     assert(
-      warns.some((w) => w.includes('no usable v4')),
+      warns.some((w) => w === INSTANCE),
       `missing no usable v4 log: ${warns.join(' | ')}`,
     );
   } finally {
-    console.warn = orig;
     browser.close();
   }
 });

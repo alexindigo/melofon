@@ -28,6 +28,7 @@
 import type { PathfinderApp } from '@pathfinder/pathfinder';
 import type { Layer } from './layers.ts';
 import { candidatesForBind } from './binds.ts';
+import { type Log, scopedLog } from './logging.ts';
 
 function headersMatch(request: Request, layer: Layer): boolean {
   return layer.headers.length > 0 &&
@@ -71,39 +72,6 @@ function repath(request: Request, path: string): Request {
   return new Request(url, request);
 }
 
-// Subsonic credentials: u/p, enc:hex p, t+s token, apiKey extension.
-const REDACT_KEYS = ['u', 'p', 't', 's', 'apiKey'];
-
-function redactedQuery(url: URL): string {
-  const q: string[] = [];
-  url.searchParams.forEach((v, k) => {
-    q.push(`${k}=${REDACT_KEYS.includes(k) ? '•••' : v}`);
-  });
-  return q.join('&');
-}
-
-function redactedHeaders(request: Request): string {
-  return [...request.headers.entries()]
-    .map(([k, v]) =>
-      `${k}: ${
-        [
-            'authorization',
-            'proxy-authorization',
-            'cookie',
-            'x-api-key',
-          ].includes(k)
-          ? '•••'
-          : v
-      }`
-    )
-    .join(' | ');
-}
-
-// ISO time-of-day with milliseconds: 12:34:56.789.
-function timeOfDay(): string {
-  return new Date().toISOString().slice(11, 23);
-}
-
 interface TraceInfo {
   remoteAddr?: { hostname?: string };
   completed?: Promise<void>;
@@ -118,6 +86,7 @@ export function facade(
     env?: Record<string, string>;
     debugLogRequests?: boolean;
     debugLogHeaders?: boolean;
+    log?: Log;
   } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
   const candidates = candidatesForBind(
@@ -132,10 +101,10 @@ export function facade(
     opts.listenPort === opts.defaultPort;
   let nextReqId = 0;
   let inflight = 0;
+  const log = opts.log ?? scopedLog('facade');
   return async (request: Request, info?: unknown): Promise<Response> => {
     const debug = opts.debugLogRequests === true;
     const path = new URL(request.url).pathname;
-    const url = new URL(request.url);
     let reqId = 0;
     const started = performance.now();
     if (debug) {
@@ -143,13 +112,13 @@ export function facade(
       inflight++;
       const peer = (info as TraceInfo | undefined)?.remoteAddr?.hostname ??
         '?';
-      const dump = opts.debugLogHeaders === true
-        ? ` ${redactedQuery(url)} {${redactedHeaders(request)}}`
-        : '';
-      console.log(
-        `[http ${timeOfDay()}] accept req=${reqId} inflight=${inflight} ` +
-          `${request.method} ${path} peer=${peer}${dump}`,
-      );
+      log.event('http_accept', {
+        request,
+        req: reqId,
+        inflight,
+        peer,
+        traceHeaders: opts.debugLogHeaders === true,
+      });
     }
 
     // Wraps each dispatch branch: with debug off it is the identity.
@@ -157,10 +126,13 @@ export function facade(
       if (!debug) return res;
       return res.then((response) => {
         const waitMs = Math.round(performance.now() - started);
-        console.log(
-          `[http ${timeOfDay()}] headers req=${reqId} inflight=${inflight} ` +
-            `${request.method} ${path} -> ${response.status} waitMs=${waitMs}`,
-        );
+        log.event('http_headers', {
+          request,
+          req: reqId,
+          inflight,
+          status: response.status,
+          waitMs,
+        });
         const completed = (info as TraceInfo | undefined)?.completed;
         if (completed === undefined) {
           // Tests calling the facade without Deno.serve's info: no `done`.
@@ -171,11 +143,13 @@ export function facade(
             const bodyMs = Math.round(
               performance.now() - started - waitMs,
             );
-            console.log(
-              `[http ${timeOfDay()}] done req=${reqId} inflight=${inflight} ` +
-                `${request.method} ${path} bodyMs=${bodyMs}` +
-                (aborted ? ' aborted' : ''),
-            );
+            log.event('http_done', {
+              request,
+              req: reqId,
+              inflight,
+              bodyMs,
+              aborted,
+            });
           };
           void completed.then(
             () => done(false),

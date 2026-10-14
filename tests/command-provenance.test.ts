@@ -20,6 +20,7 @@ import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createStream } from '../src/stream.ts';
 import { createUserService } from '../src/user.ts';
+import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 
 let songN = 0;
 function song(durationMs: number | null = 180_000): SongRow {
@@ -50,22 +51,18 @@ async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-prov-' });
   const db = await openDb(dir);
   const player = createPlayer();
+  const { log, lines: logs } = captureLogs();
   const playback = createPlayback({
+    log,
     player,
     nowPlaying: createNowPlaying(db),
     library: createLibrary(db),
     cfg: {},
   });
-  const logs: string[] = [];
-  const originalLog = console.log;
-  console.log = (...args: unknown[]) => {
-    logs.push(args.map(String).join(' '));
-  };
   return {
     playback,
     logs,
     close: async () => {
-      console.log = originalLog;
       playback.close();
       db.close();
       await Deno.remove(dir, { recursive: true });
@@ -144,15 +141,18 @@ Deno.test('an unsourced caller reads as internal; [cmd] lines name the source', 
     playback.seek({ positionMs: 4000 }, HA);
     playback.pause({ kind: 'internal', via: 'airplay-boot' });
 
-    const cmdLines = logs.filter((l) => l.startsWith('[cmd]'));
+    const cmdLines = logs.map(parseLogfmt).filter((l) => l.event === 'command');
     assertEquals(cmdLines.length, 3);
-    assertEquals(cmdLines[0], '[cmd] queueAdd songs=1 play by internal:core');
-    assertEquals(
-      cmdLines[1],
-      '[cmd] seek position_ms=4000 by http 10.4.20.172 ' +
-        '(HomeAssistant/2026.9.3 aiohttp/3.14.3 Python/3.14)',
-    );
-    assertEquals(cmdLines[2], '[cmd] pause by internal:airplay-boot');
+    assertEquals(cmdLines[0].command, 'queueAdd');
+    assertEquals(JSON.parse(cmdLines[0].facts), { songs: 1, play: true });
+    assertEquals(cmdLines[0].kind, 'internal');
+    assertEquals(cmdLines[1].command, 'seek');
+    assertEquals(JSON.parse(cmdLines[1].facts), { position_ms: 4000 });
+    assertEquals(cmdLines[1].kind, 'http');
+    assertEquals(cmdLines[1].peer, HA.peer);
+    assertEquals(cmdLines[1].userAgent, HA.userAgent);
+    assertEquals(cmdLines[2].command, 'pause');
+    assertEquals(cmdLines[2].via, 'airplay-boot');
   } finally {
     await close();
   }
@@ -173,10 +173,10 @@ Deno.test('restore is recorded with via restore and keeps engine purity', async 
     const cmd = playback.lastCommand()!;
     assertEquals(cmd.kind, 'restore');
     assertEquals(cmd.source, { kind: 'internal', via: 'restore' });
-    assertEquals(
-      logs.filter((l) => l.startsWith('[cmd]')),
-      ['[cmd] restore by internal:restore'],
-    );
+    const records = logs.map(parseLogfmt).filter((l) => l.event === 'command');
+    assertEquals(records.length, 1);
+    assertEquals(records[0].command, 'restore');
+    assertEquals(records[0].via, 'restore');
     // The restore emits nothing itself (boot-time behavior unchanged).
     const status = playback.playerView();
     assertEquals(status.state, 'pause');
@@ -203,7 +203,15 @@ async function setupWire() {
   const player = createPlayer();
   const nowPlaying = createNowPlaying(db);
   const library = createLibrary(db);
-  const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
+  const { log, lines: logs } = captureLogs();
+  const playback = createPlayback({
+    player,
+    nowPlaying,
+    library,
+    cfg,
+    notify,
+    log,
+  });
   const bag = {
     cfg,
     libraries,
@@ -225,17 +233,11 @@ async function setupWire() {
     defaultPort: 4534,
     env: {},
   });
-  const logs: string[] = [];
-  const originalLog = console.log;
-  console.log = (...args: unknown[]) => {
-    logs.push(args.map(String).join(' '));
-  };
   return {
     playback,
     onHook,
     logs,
     close: async () => {
-      console.log = originalLog;
       playback.close();
       db.close();
       await Deno.remove(dir, { recursive: true });
@@ -305,14 +307,14 @@ Deno.test('X-Melofon-Client is scooped as source.client and logged as client=', 
 
     const cmd = playback.lastCommand()!;
     assertEquals(cmd.source.client, 'book-checkpoint');
-    const cmdLines = logs.filter((l) => l.startsWith('[cmd]'));
-    const seekLine = cmdLines.find((l) => l.startsWith('[cmd] seek '))!;
-    assertEquals(
-      seekLine,
-      '[cmd] seek position_ms=30504000 by http 10.4.20.172 ' +
-        'client=book-checkpoint ' +
-        '(HomeAssistant/2026.9.3 aiohttp/3.14.3 Python/3.14)',
-    );
+    const seekLine = logs.map(parseLogfmt).find((l) =>
+      l.event === 'command' && l.command === 'seek'
+    )!;
+    assertEquals(JSON.parse(seekLine.facts), { position_ms: 30504000 });
+    assertEquals(seekLine.kind, 'http');
+    assertEquals(seekLine.peer, HA.peer);
+    assertEquals(seekLine.client, 'book-checkpoint');
+    assertEquals(seekLine.userAgent, HA.userAgent);
 
     // Header absent → no client field at all.
     await onHook(

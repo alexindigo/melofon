@@ -91,3 +91,35 @@ active state notifications, FLUSH and pre-connection read-ahead. This narrowly
 covers the supported native C API: normal `FfiTransport` retains its sole feed
 token until free and constructs fresh replacement handles. It does not elect
 native feed producers or authorize competing PCM feeds.
+
+## Shared logging ingress
+
+`stub/stubs.c` owns diagnostics: typed `helper_log_event` facts for Melofon-owned
+FFI/player events and a printf-compatible adapter for available vendored text.
+The library-wide `raop_log_consumer`/`raop_log_poll` ABI is additive and separate
+from each handle's `raop_poll` control queue. Install the exclusive consumer
+before initialization; quiesce/free owned handles and drain before disabling it.
+The Deno adapter owns a single library-wide drain, through last-handle release,
+and performs final owned-shutdown draining. Failed free retains native ownership.
+
+Diagnostics capture realtime milliseconds/sequence into a dedicated 256-record
+queue with 2048-byte opaque-message bounds. Producers use a try-lock and never
+wait on the JS consumer or allocate diagnostic JSON on the pacing thread.
+Polling copies records into caller-owned buffers; JSON here is ingress transport,
+not the application's final log format. Overflow/truncation counts remain visible,
+including overflow with no later producer record. No foreign-thread JS callback
+or private native handle mirror is introduced.
+
+The native library installs supported system FFmpeg and libevent callbacks;
+libevent's callback copies data without calling libevent. node-av's embedded
+FFmpeg copy has its separate module-owned callback. Requalify linkage before a
+shared-library/source-build variant; competing global callbacks are not assumed
+safe. Source severities/domains remain available while central schemas assign
+canonical owned-event severity and readable fields.
+
+Standalone consumers without the Deno diagnostic consumer retain native output;
+assertion/loader/allocator and unsupported library failures are not suppressed.
+`DEBUG_PAIR` key-dump paths remain disabled. The compiled object inventory rejects
+enabled raw writers/key-dump symbols outside the logger transport; its negative
+fixture proves a raw writer is detected. `test/probe_logging.c` verifies bounded
+queue/copy/consumer ownership without touching control or pacing structures.

@@ -16,6 +16,7 @@
 // pathfinder root (prefix '').
 import { pathfinder } from '@pathfinder/pathfinder';
 import type { PathfinderApp } from '@pathfinder/pathfinder';
+import { scopedLog } from './logging.ts';
 
 export interface HeaderMatch {
   name: string;
@@ -70,6 +71,7 @@ export async function loadLayers(opts: {
   for (const entry of entries) {
     if (!entry.isDirectory) continue;
     const dir = `${root}/${entry.name}`;
+    const app = { ...opts.app, log: scopedLog(`hat:${entry.name}`) };
     let manifest:
       & { port?: number | number[]; headers?: HeaderMatch[] }
       & Record<
@@ -88,7 +90,7 @@ export async function loadLayers(opts: {
       mounts.push({
         folder: dir,
         prefix: '',
-        app: await pathfinder({ roots: [dir], app: opts.app }),
+        app: await pathfinder({ roots: [dir], app }),
       });
     } else {
       for (const key of mountKeys) {
@@ -102,7 +104,7 @@ export async function loadLayers(opts: {
         mounts.push({
           folder,
           prefix,
-          app: await pathfinder({ roots: [folder], app: opts.app }),
+          app: await pathfinder({ roots: [folder], app }),
         });
       }
     }

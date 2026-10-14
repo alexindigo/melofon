@@ -3,6 +3,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { instrumentConn, openDb } from '../src/db.ts';
 import type * as duckdb from '@duckdb/node-api';
+import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 import {
   decryptPassword,
   encryptPassword,
@@ -96,11 +97,7 @@ Deno.test('seedFirstUser does not overwrite existing users', async () => {
 });
 
 Deno.test('query spans log begin/end and qinflight on overlap', async () => {
-  const lines: string[] = [];
-  const orig = console.log;
-  console.log = (line: unknown) => {
-    lines.push(String(line));
-  };
+  const { log, lines } = captureLogs();
   try {
     let release!: () => void;
     const gate = new Promise<unknown>((
@@ -110,19 +107,27 @@ Deno.test('query spans log begin/end and qinflight on overlap', async () => {
       run: (sql: string) => sql.includes('SLOW') ? gate : Promise.resolve(null),
       runAndReadAll: (_sql: string) => Promise.resolve({ rows: [] }),
     };
-    instrumentConn(fake as unknown as duckdb.DuckDBConnection);
+    instrumentConn(fake as unknown as duckdb.DuckDBConnection, log);
     const slow = fake.run('SELECT SLOW');
     const fast = fake.run('SELECT 1');
     release();
     await Promise.all([slow, fast]);
     assertEquals(lines.length, 5);
-    assertEquals(lines[0], '[db] begin sql=SELECT SLOW qinflight=1');
-    assertEquals(lines[1], '[db] overlap qinflight=2');
-    assertEquals(lines[2], '[db] begin sql=SELECT 1 qinflight=2');
-    assert(lines[3].startsWith('[db] end sql=SELECT 1 waitMs='));
-    assert(lines[4].startsWith('[db] end sql=SELECT SLOW waitMs='));
+    const records = lines.map(parseLogfmt);
+    assertEquals(records.map((r) => r.event), [
+      'db_begin',
+      'db_overlap',
+      'db_begin',
+      'db_end',
+      'db_end',
+    ]);
+    assertEquals(records[0].operation, 'SELECT');
+    assertEquals(records[0].qinflight, '1');
+    assertEquals(records[1].qinflight, '2');
+    assertEquals(records[2].qinflight, '2');
+    assert(records[3].waitMs !== undefined && records[4].waitMs !== undefined);
   } finally {
-    console.log = orig;
+    await log.flush();
   }
 });
 

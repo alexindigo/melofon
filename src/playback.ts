@@ -17,16 +17,16 @@
 import type { Library, SongRow } from './library.ts';
 import type { NowPlaying } from './nowplaying.ts';
 import type { Notify } from './notify.ts';
-import {
-  type CommandSource,
-  type LastCommand,
-  logCmd,
-  type Player,
-  type PlayerPersistence,
-  type PlayerStatus,
-  type QueueEntry,
-  type RepeatMode,
-  type RestoreSnapshot,
+import { type Log, scopedLog } from './logging.ts';
+import type {
+  CommandSource,
+  LastCommand,
+  Player,
+  PlayerPersistence,
+  PlayerStatus,
+  QueueEntry,
+  RepeatMode,
+  RestoreSnapshot,
 } from './player.ts';
 
 export interface ReportPlaying {
@@ -118,8 +118,10 @@ export function createPlayback(deps: {
    * state change flushes the engine snapshot and queue, and a 1 Hz tick
    * keeps position_ms current while playing. */
   persistence?: PlayerPersistence;
+  log?: Log;
 }): Playback {
   const { player, nowPlaying, library, cfg, notify, persistence } = deps;
+  const log = deps.log ?? scopedLog('playback');
   const emit = (types: string[]) => notify?.emit(types);
 
   // Provenance (plan command-provenance): every mutation is recorded and
@@ -131,6 +133,7 @@ export function createPlayback(deps: {
     source?: CommandSource,
     intent: LastCommand['intent'] = 'none',
     queueCleared = false,
+    facts?: Record<string, unknown>,
   ): void => {
     const src = source ?? { kind: 'internal' as const };
     last = {
@@ -141,7 +144,13 @@ export function createPlayback(deps: {
       intent,
       queueCleared,
     };
-    logCmd(kind, detail, src);
+    log.event('command', {
+      command: kind,
+      facts,
+      source: src,
+      intent,
+      queueCleared,
+    });
   };
 
   // Persistence flushes: the same paths that emit. Fire-and-forget — the
@@ -224,19 +233,25 @@ export function createPlayback(deps: {
     },
     setShuffle(on, source) {
       player.setShuffle(on);
-      record('shuffle', `shuffle=${on}`, source);
+      record('shuffle', `shuffle=${on}`, source, 'none', false, {
+        shuffle: on,
+      });
       flushState();
       emit(['options']);
     },
     setConsume(on, source) {
       player.setConsume(on);
-      record('consume', `consume=${on}`, source);
+      record('consume', `consume=${on}`, source, 'none', false, {
+        consume: on,
+      });
       flushState();
       emit(['options']);
     },
     setRepeat(mode, source) {
       player.setRepeat(mode);
-      record('repeat', `repeat=${mode}`, source);
+      record('repeat', `repeat=${mode}`, source, 'none', false, {
+        repeat: mode,
+      });
       flushState();
       emit(['options']);
     },
@@ -249,6 +264,12 @@ export function createPlayback(deps: {
           ? `volume=${opts.volume}`
           : `step=${opts.step}`,
         source,
+        'none',
+        false,
+        {
+          volume: opts.volume,
+          step: opts.volume === undefined ? opts.step : undefined,
+        },
       );
       emit(['volume']);
     },
@@ -262,6 +283,15 @@ export function createPlayback(deps: {
             : `seek_ms=${opts.seekMs ?? 0}`,
           source,
           'play',
+          false,
+          {
+            position_ms: opts.positionMs === undefined
+              ? undefined
+              : Math.trunc(opts.positionMs),
+            seek_ms: opts.positionMs === undefined
+              ? opts.seekMs ?? 0
+              : undefined,
+          },
         );
         flushState();
         emit(['player']);
@@ -282,6 +312,14 @@ export function createPlayback(deps: {
         source,
         opts.play ? 'play' : opts.clear ? 'stop' : 'none',
         opts.clear === true,
+        {
+          songs: songs.length,
+          clear: opts.clear,
+          play: opts.play,
+          position: opts.position,
+          playbackFromPosition: opts.playbackFromPosition,
+          shuffle: opts.shuffle,
+        },
       );
       // An insert can shift the current index, so the state row flushes
       // with the queue even when playback did not start or stop.

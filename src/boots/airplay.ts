@@ -1,6 +1,7 @@
 // AirPlay lifecycle: engine/operator state survives temporary connections.
 // One scheduler, per-output intent epochs, proven local-release barriers.
 import type { Media } from '../media.ts';
+import { type Log, scopedLog } from '../logging.ts';
 import type { Notify } from '../notify.ts';
 import type { CommandSource, Output, Outputs } from '../player.ts';
 import type { Playback } from '../playback.ts';
@@ -20,6 +21,7 @@ export interface AirplayBootDeps {
   notify: Notify;
   devices: AirplayDevices;
   state?: State;
+  log?: Log;
   retryBackoffMs?: number[];
   retryTimer?: {
     set(callback: () => void, delayMs: number): { cancel(): void };
@@ -72,6 +74,7 @@ export function createAirplayBoot(
   deps: AirplayBootDeps,
 ): { close(): Promise<void> } {
   const { outputs, playback, media, notify } = deps;
+  const log = deps.log ?? scopedLog('airplay');
   const devices = deps.devices;
   const retryTimer = deps.retryTimer ??
     {
@@ -81,9 +84,10 @@ export function createAirplayBoot(
       },
     };
   const ownedSource: CommandSource = { kind: 'internal', via: 'airplay-boot' };
-  console.log(
-    '[melofon] airplay: policy=connection-strategies-v1 default=melofon',
-  );
+  log.event('airplay_policy', {
+    policy: 'connection-strategies-v1',
+    default: 'melofon',
+  });
   const runtimes = new Map<string, Runtime>();
   const epochs = new Map<string, Epoch>();
   const generations = new Map<string, number>();
@@ -227,14 +231,17 @@ export function createAirplayBoot(
         for await (const chunk of stream) {
           if (!owns()) return;
           if (DEBUG && bytes === 0) {
-            console.warn(
-              `[melofon] airplay debug: pump first chunk ${chunk.length}B (${path})`,
-            );
+            log.event('pump_first', {
+              output: id,
+              generation: session,
+              path,
+              bytes: chunk.length,
+            });
           }
           try {
             await t.pcm(chunk);
           } catch (error) {
-            if (owns()) sessionFailed(id, r, `PCM: ${error}`);
+            if (owns()) sessionFailed(id, r, 'PCM', error);
             return;
           }
           if (!owns()) return;
@@ -243,16 +250,17 @@ export function createAirplayBoot(
         if (!owns()) return;
         if (!bytes) throw new Error('empty decoder stream');
         if (DEBUG) {
-          console.warn(
-            `[melofon] airplay debug: pump generator end, total ${bytes}B (${path})`,
-          );
+          log.event('pump_end', {
+            output: id,
+            generation: session,
+            path,
+            bytes,
+          });
         }
         // Nonempty EOF is decoder completion, not audible/drained completion.
       } catch (error) {
         if (!owns()) return;
-        console.error(
-          `[melofon] airplay: output ${id} content failed: ${error}`,
-        );
+        log.event('content_failed', { output: id, generation: session, error });
         const e = epoch(id);
         e.contentError = true;
         cancelRetry(id);
@@ -307,25 +315,27 @@ export function createAirplayBoot(
     r.transport = null;
     runtimes.delete(id);
     if (!t) return Promise.resolve(true);
-    console.log(
-      `[melofon] airplay: output ${id} session gen ${
-        r.session - 1
-      } retire (reason=${reason})`,
-    );
+    log.event('session_retire', {
+      output: id,
+      generation: r.session - 1,
+      reason,
+    });
     const close = (async () => {
       try {
         await t.send({ cmd: 'teardown' }).catch(() => {});
         await t.close();
         if (wasFeed) needsHandoff = true;
-        console.log(`[melofon] airplay: output ${id} retired locally`);
+        log.event('session_retired', { output: id, generation: r.session - 1 });
         return true;
       } catch (error) {
         blocked.add(id);
         grants.delete(id);
         cancelRetry(id);
-        console.error(
-          `[melofon] airplay: output ${id} retirement FAILED: ${error}; blocked until user-authorized restart`,
-        );
+        log.event('retirement_failed', {
+          output: id,
+          generation: r.session - 1,
+          error,
+        });
         return false;
       }
     })();
@@ -348,15 +358,17 @@ export function createAirplayBoot(
         (!lease || lease.intent !== intentEpoch))
     ) return;
     if (e.attempts >= backoff.length) {
-      console.warn(
-        `[melofon] airplay: output ${id} exhausted ${e.attempts} retries; new explicit demand required`,
-      );
+      log.event('retry_exhausted', { output: id, attempts: e.attempts });
       return;
     }
     const wait = backoff[e.attempts++], generation = e.generation;
-    console.warn(
-      `[melofon] airplay: output ${id} retry ${e.attempts}/${backoff.length} in ${wait}ms`,
-    );
+    log.event('retry_scheduled', {
+      output: id,
+      generation,
+      attempt: e.attempts,
+      limit: backoff.length,
+      waitMs: wait,
+    });
     e.timer = retryTimer.set(() => {
       e.timer = undefined;
       if (
@@ -367,9 +379,19 @@ export function createAirplayBoot(
       reconcile();
     }, wait);
   };
-  const sessionFailed = (id: string, r: Runtime, why: string) => {
+  const sessionFailed = (
+    id: string,
+    r: Runtime,
+    why: string,
+    error?: unknown,
+  ) => {
     if (runtimes.get(id) !== r) return;
-    console.warn(`[melofon] airplay: output ${id} session failed (${why})`);
+    log.event('session_failed', {
+      output: id,
+      generation: r.session,
+      reason: why,
+      error,
+    });
     const e = epoch(id);
     e.failed = true;
     void retire(id, r, 'failed');
@@ -450,9 +472,7 @@ export function createAirplayBoot(
       grants.delete(id);
       if (!prepared.ok) {
         e.failed = true;
-        console.warn(
-          `[melofon] airplay: output ${id} preparation failed (${prepared.error.code}: ${prepared.error.message})`,
-        );
+        log.event('preparation_failed', { output: id, error: prepared.error });
         if (!usable() && playback.playerView().state === 'play') {
           lease = {
             intent: intentEpoch,
@@ -495,9 +515,12 @@ export function createAirplayBoot(
         !closed && runtimes.get(id) === r && r.session === session &&
         r.transport !== null;
       try {
-        console.log(
-          `[melofon] airplay: output ${id} session gen ${session} start (strategy=${r.strategy} grant=${permission.kind})`,
-        );
+        log.event('session_start', {
+          output: id,
+          generation: session,
+          strategy: r.strategy,
+          grant: permission.kind,
+        });
         const result = await devices.protocol.activate(prepared.value, {
           volume: r.volume,
           positionMs: 0,
@@ -528,13 +551,13 @@ export function createAirplayBoot(
           },
         });
         if (!result.ok && runtimes.get(id) === r) {
-          sessionFailed(id, r, `activation: ${result.error.message}`);
+          sessionFailed(id, r, 'activation', result.error);
         }
       } catch (error) {
-        sessionFailed(id, r, `spawn: ${error}`);
+        sessionFailed(id, r, 'spawn', error);
       }
     })().catch((error) =>
-      console.error(`[melofon] airplay: output ${id} preparation: ${error}`)
+      log.event('preparation_error', { output: id, error })
     );
   };
   const idle = (id: string, r: Runtime, choice: ConnectionStrategy) => {
@@ -548,7 +571,7 @@ export function createAirplayBoot(
     r.held = true;
     r.deadline = performance.now() + HOLD_MS;
     void r.transport!.send({ cmd: 'flush' }).catch((error) => {
-      if (runtimes.get(id) === r) sessionFailed(id, r, `flush: ${error}`);
+      if (runtimes.get(id) === r) sessionFailed(id, r, 'flush', error);
     });
     if (runtimes.get(id) !== r || !r.held) return;
     const session = r.session;
@@ -653,7 +676,7 @@ export function createAirplayBoot(
             cancelPump(id, r);
             void r.transport!.send({ cmd: 'flush' }).catch((error) => {
               if (runtimes.get(id) === r) {
-                sessionFailed(id, r, `flush: ${error}`);
+                sessionFailed(id, r, 'flush', error);
               }
             });
             requestPump(id, r);
@@ -669,7 +692,7 @@ export function createAirplayBoot(
           r.volume = v;
           void r.transport.send({ cmd: 'volume', volume: v }).catch((error) => {
             if (runtimes.get(id) === r) {
-              sessionFailed(id, r, `volume: ${error}`);
+              sessionFailed(id, r, 'volume', error);
             }
           });
         }
@@ -727,9 +750,7 @@ export function createAirplayBoot(
       if (closed || policyRevision !== revision) return;
       policyReady = true;
       backoff = null;
-      console.error(
-        `[melofon] airplay retry settings unavailable; automatic recovery disabled: ${error}`,
-      );
+      log.event('retry_settings_failed', { error });
     });
   }
   outputs.onCommand((id, cmd) => {
@@ -737,7 +758,7 @@ export function createAirplayBoot(
     if (cmd.pin !== undefined && r?.transport) {
       void r.transport.send({ cmd: 'pin', pin: cmd.pin }).catch((error) => {
         if (runtimes.get(id) === r) {
-          sessionFailed(id, r, `PIN: ${error}`);
+          sessionFailed(id, r, 'PIN', error);
         }
       });
     }

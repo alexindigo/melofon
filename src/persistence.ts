@@ -7,6 +7,7 @@
 // once at boot. drain() lets tests await the tail before closing and
 // reopening the db.
 import type { Db } from './db.ts';
+import { type Log, scopedLog } from './logging.ts';
 import {
   DEFAULT_CONNECTION_STRATEGY,
   requireConnectionStrategy,
@@ -44,11 +45,14 @@ function esc(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-export function createPersistence(db: Db): Persistence {
+export function createPersistence(
+  db: Db,
+  log: Log = scopedLog('persistence'),
+): Persistence {
   let tail: Promise<void> = Promise.resolve();
   const enqueue = (write: () => Promise<void>): void => {
     tail = tail.then(write).catch((err) => {
-      console.debug('[melofon] persistence write failed:', err);
+      log.event('persistence_failed', { error: err });
     });
   };
   const outputCache = new Map<string, PersistedOutput>();
