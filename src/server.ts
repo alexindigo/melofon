@@ -87,17 +87,6 @@ const discovery = createAirplayDiscovery({
   devices: airplay,
   savedOutput: (id) => persistence.savedOutput(id),
 });
-const app = {
-  db,
-  cfg,
-  libraries,
-  outputs,
-  state,
-  airplay,
-  outputAdmission,
-  log: scopedLog('core'),
-};
-const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const player = createPlayer();
 const nowPlaying = createNowPlaying(db);
@@ -109,6 +98,18 @@ const playback = createPlayback({
   notify,
   persistence,
 });
+const app = {
+  db,
+  cfg,
+  libraries,
+  outputs,
+  playback,
+  state,
+  airplay,
+  outputAdmission,
+  log: scopedLog('core'),
+};
+const core = await pathfinder({ roots: ['core/'], app });
 
 // Restart transparency (plan restart-transparency): restore the engine —
 // the persisted queue rehydrated via the library (missing tracks drop with

@@ -4,7 +4,8 @@
 // proves: the process boots into the recycle policy marker, /_/health is
 // OK, the OwnTone /api/player wire shape is unchanged (eight keys, no
 // last_command), and a volume PUT is attributed to its X-Melofon-Client.
-// Startup proof only — it proves nothing about ATV audio.
+// Native last-command JSON observes that same command without recording reads.
+// Process/control proof only — it proves nothing about ATV audio.
 //
 //   deno run --allow-run --allow-net --allow-env --allow-read --allow-write \
 //     --allow-ffi --allow-sys --node-modules-dir=auto \
@@ -36,6 +37,7 @@ const OWNTONE = [14689, 14688];
 const BASE = `http://${LISTEN}`;
 const OWNTONE_BASE = `http://127.0.0.1:${OWNTONE[0]}`;
 const HEALTH_DEADLINE_MS = 30_000;
+const nativeReceipts: unknown[] = [];
 
 const repoRoot = decodeURIComponent(
   new URL('../../', import.meta.url).pathname,
@@ -183,6 +185,11 @@ const cleanup = async () => {
         await Deno.readFile(logPath),
         { createNew: true },
       );
+      await Deno.writeTextFile(
+        `${evidence}/native-last-command.json`,
+        JSON.stringify(nativeReceipts, null, 2) + '\n',
+        { createNew: true },
+      );
     }
     await Deno.remove(workDir, { recursive: true });
     await Deno.remove(dataDir, { recursive: true });
@@ -207,6 +214,19 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   if (!healthy) fail('never became healthy (see the child log)');
+
+  const freshCommand = await fetch(`${BASE}/_/last-command`);
+  if (
+    !freshCommand.ok ||
+    freshCommand.headers.get('cache-control') !== 'no-store'
+  ) fail('fresh native last-command response/status/cache policy');
+  const freshBody = await freshCommand.json();
+  if (
+    JSON.stringify(Object.keys(freshBody).sort()) !==
+      JSON.stringify(['outputs', 'playback']) ||
+    freshBody.playback !== null || freshBody.outputs !== null
+  ) fail('fresh native last-command records were not independently null');
+  nativeReceipts.push({ checkpoint: 'fresh', body: freshBody });
 
   // The marker is logged during boot, before listen; give the tee a moment.
   let markerSeen = false;
@@ -291,12 +311,75 @@ try {
     fail(`OwnTone /api/player keys changed: ${keys.join(',')}`);
   }
 
+  const commandStartedAt = Date.now();
   const put = await fetch(`${OWNTONE_BASE}/api/player/volume?volume=75`, {
     method: 'PUT',
-    headers: { 'X-Melofon-Client': 'atv3-smoke' },
+    headers: {
+      'X-Melofon-Client': 'atv3-smoke',
+      'User-Agent': 'melofon-atv3-smoke',
+    },
   });
   if (put.status !== 204) fail(`PUT volume: ${put.status}`);
   await put.body?.cancel();
+  const commandFinishedAt = Date.now();
+  let previousNative: string | undefined;
+  for (let read = 0; read < 2; read++) {
+    const response = await fetch(`${BASE}/_/last-command`, {
+      headers: { 'X-Melofon-Client': 'atv3-observer' },
+    });
+    if (!response.ok || response.headers.get('cache-control') !== 'no-store') {
+      fail('post-volume native last-command status/cache policy');
+    }
+    const body = await response.json();
+    const command = body.playback;
+    if (
+      JSON.stringify(Object.keys(body).sort()) !==
+        JSON.stringify(['outputs', 'playback']) ||
+      !command || command.kind !== 'volume' || command.detail !== 'volume=75' ||
+      command.intent !== 'none' || command.queueCleared !== false ||
+      typeof command.atMs !== 'number' || command.atMs < commandStartedAt ||
+      command.atMs > commandFinishedAt ||
+      JSON.stringify(command.source) !== JSON.stringify({
+          kind: 'http',
+          peer: '127.0.0.1',
+          userAgent: 'melofon-atv3-smoke',
+          client: 'atv3-smoke',
+        }) ||
+      JSON.stringify(Object.keys(command).sort()) !== JSON.stringify([
+          'atMs',
+          'detail',
+          'intent',
+          'kind',
+          'queueCleared',
+          'source',
+        ]) ||
+      body.outputs?.kind !== 'register' ||
+      body.outputs?.source.kind !== 'http' ||
+      body.outputs?.source.peer !== '127.0.0.1' ||
+      JSON.stringify(Object.keys(body.outputs).sort()) !==
+        JSON.stringify(['kind', 'source'])
+    ) {
+      fail(
+        'native JSON did not report the actual volume/current output records',
+      );
+    }
+    const encoded = JSON.stringify(body);
+    if (previousNative !== undefined && encoded !== previousNative) {
+      fail('observer GET overwrote the latest command');
+    }
+    previousNative = encoded;
+    nativeReceipts.push({ checkpoint: `volume-read-${read + 1}`, body });
+  }
+  const volumeState = await (await fetch(`${OWNTONE_BASE}/api/player`)).json();
+  if (
+    JSON.stringify(Object.keys(volumeState).sort()) !==
+      JSON.stringify(expected) ||
+    volumeState.volume !== 75 || volumeState.state !== 'stop'
+  ) fail('native reads changed OwnTone volume/state/wire keys');
+  nativeReceipts.push({ checkpoint: 'owntone-after-reads', body: volumeState });
+  console.log(
+    'cold-start smoke: native last-command fresh nulls and volume/client JSON observed; two reads preserved provenance and OwnTone volume/state',
+  );
   // The [cmd] line attributes the client.
   let attributed = false;
   for (let i = 0; i < 20 && !attributed; i++) {

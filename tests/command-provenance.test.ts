@@ -1,10 +1,15 @@
 // tests/command-provenance.test.ts — command provenance (plan
 // command-provenance): every engine mutation records its source as
-// lastCommand and logs one [cmd] line; unsourced callers read as internal;
-// restore is recorded with via 'restore'; /api/player exposes
-// last_command with the request's peer/user-agent. The 2026-09-24
+// lastCommand and emits a command event; unsourced callers read as internal;
+// restore is recorded with via 'restore'; native /_/last-command reads the
+// records while OwnTone /api/player keeps its eight keys. The 2026-09-24
 // ghost-writer incident is the motivation: attribution on every jump.
-import { assert, assertEquals } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertStrictEquals,
+  assertThrows,
+} from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openDb } from '../src/db.ts';
 import { createBinds } from '../src/binds.ts';
@@ -16,7 +21,14 @@ import { createListens } from '../src/listens.ts';
 import { createMedia } from '../src/media.ts';
 import { createNotify } from '../src/notify.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
-import { createOutputs, createPlayer } from '../src/player.ts';
+import {
+  createOutputs,
+  createPlayer,
+  type LastCommand,
+  type OutputCommand,
+} from '../src/player.ts';
+import { projectCommandProvenance } from '../src/command-provenance.ts';
+import lastCommandGet from '../core/last-command/get.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createStream } from '../src/stream.ts';
 import { createUserService } from '../src/user.ts';
@@ -220,13 +232,16 @@ async function setupWire() {
     listens: createListens(db),
     nowPlaying,
     player,
-    outputs: createOutputs({ notify }),
+    outputs: createOutputs({ notify, log }),
     playback,
     stream: createStream(createMedia(), playback),
     notify,
     binds: createBinds(() => layers, {}),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({
+    roots: ['core/'],
+    app: { db, cfg, playback, outputs: bag.outputs },
+  });
   const layers = await loadLayers({ app: bag });
   const onHook = facade(core, layers, {
     listenPort: 3689,
@@ -235,6 +250,10 @@ async function setupWire() {
   });
   return {
     playback,
+    outputs: bag.outputs,
+    notify,
+    core,
+    onDefault: facade(core, layers, { defaultPort: 4534, env: {} }),
     onHook,
     logs,
     close: async () => {
@@ -356,6 +375,521 @@ Deno.test('sourceFrom edge cases: no peer, no UA; UA truncated at 80', async () 
     const source = playback.lastCommand()!.source;
     assertEquals(source.peer, '10.4.20.172');
     assertEquals(source.userAgent, 'X'.repeat(80));
+  } finally {
+    await close();
+  }
+});
+
+const PLAYER_KEYS = [
+  'state',
+  'repeat',
+  'consume',
+  'shuffle',
+  'volume',
+  'item_id',
+  'item_length_ms',
+  'item_progress_ms',
+].sort();
+
+async function retainNative(name: string, receipt: unknown) {
+  const root = Deno.env.get('MELOFON_LOGGING_EVIDENCE');
+  if (!root) return;
+  assert(root.startsWith(
+    '/home/tester/melofon-output-preparation-01/shared-logging-01/evidence/',
+  ));
+  await Deno.mkdir(root, { recursive: true, mode: 0o700 });
+  await Deno.writeTextFile(
+    `${root}/native-last-command-${name}.json`,
+    JSON.stringify(receipt, null, 2) + '\n',
+    { createNew: true },
+  );
+}
+
+Deno.test('native last-command: detached allowlist, optionals and primitive values', async () => {
+  let hiddenReads = 0;
+  const source = {
+    kind: 'http' as const,
+    via: '',
+    peer: '10.4.20.172',
+    userAgent: 'quotes"\nframing',
+    user: 'public-user',
+    client: 'public-client',
+  };
+  const playback: LastCommand = {
+    kind: 'seek',
+    detail: '',
+    source,
+    atMs: 0,
+    intent: 'none',
+    queueCleared: false,
+  };
+  const selection = [{ id: '0', selected: false }];
+  const outputs: OutputCommand = { kind: 'setEnabled', source, selection };
+  for (const object of [playback, outputs, source, selection[0]]) {
+    for (
+      const key of ['password', 'pin', 'authorization', 'cookie', 'toJSON']
+    ) {
+      Object.defineProperty(object, key, {
+        enumerable: true,
+        get() {
+          hiddenReads++;
+          throw new Error('private accessor must never execute');
+        },
+      });
+    }
+  }
+  const view = projectCommandProvenance(playback, outputs);
+  // Unknown accessors on inputs must not even be inspected by the projection.
+  const sourceExpected = {
+    kind: 'http' as const,
+    via: '',
+    peer: '10.4.20.172',
+    userAgent: 'quotes"\nframing',
+    user: 'public-user',
+    client: 'public-client',
+  };
+  assertEquals(view, {
+    playback: {
+      kind: 'seek',
+      detail: '',
+      source: sourceExpected,
+      atMs: 0,
+      intent: 'none',
+      queueCleared: false,
+    },
+    outputs: {
+      kind: 'setEnabled',
+      source: sourceExpected,
+      selection: [{ id: '0', selected: false }],
+    },
+  });
+  assertEquals(view.playback!.source, sourceExpected);
+  assertEquals(view.outputs!.source, sourceExpected);
+  const json = JSON.stringify(view);
+  assertEquals(JSON.parse(json), view);
+  for (const key of ['password', 'pin', 'authorization', 'cookie', 'toJSON']) {
+    assertEquals(json.includes(`"${key}"`), false);
+  }
+  view.playback!.source.client = 'changed';
+  view.outputs!.source.peer = 'changed';
+  view.playback!.detail = 'changed';
+  view.outputs!.selection![0].selected = true;
+  view.outputs!.selection!.push({ id: 'new', selected: true });
+  assertEquals(source.client, 'public-client');
+  assertEquals(source.peer, '10.4.20.172');
+  assertEquals(playback.detail, '');
+  // Inspect only the fixture's known primitives, never its hostile context.
+  assertEquals(selection.length, 1);
+  assertEquals(selection[0].id, '0');
+  assertEquals(selection[0].selected, false);
+  assertEquals(hiddenReads, 0);
+  const bare = projectCommandProvenance({
+    kind: 'pause',
+    source: { kind: 'internal' },
+    atMs: 0,
+    intent: 'pause',
+    queueCleared: true,
+  }, { kind: 'update', source: { kind: 'internal' } });
+  assertEquals(bare, {
+    playback: {
+      kind: 'pause',
+      source: { kind: 'internal' },
+      atMs: 0,
+      intent: 'pause',
+      queueCleared: true,
+    },
+    outputs: { kind: 'update', source: { kind: 'internal' } },
+  });
+  assertEquals(
+    projectCommandProvenance(null, {
+      kind: 'setEnabled',
+      source: { kind: 'internal' },
+      selection: [],
+    }).outputs!.selection,
+    [],
+  );
+  let coercions = 0;
+  const invalidOptional = {
+    toString() {
+      coercions++;
+      throw new Error('no coercion');
+    },
+    toJSON() {
+      coercions++;
+      throw new Error('no serialization');
+    },
+  };
+  const malformed = projectCommandProvenance({
+    kind: 'seek',
+    atMs: 0,
+    intent: 'none',
+    queueCleared: false,
+    detail: invalidOptional,
+    source: { kind: 'internal', client: invalidOptional },
+  } as unknown as LastCommand, null);
+  assertEquals(Object.hasOwn(malformed.playback!, 'detail'), false);
+  assertEquals(malformed.playback!.source, { kind: 'internal' });
+  assertEquals(coercions, 0);
+  await retainNative('projection', {
+    detached: true,
+    hiddenReads,
+    coercions,
+    bare,
+  });
+});
+
+Deno.test('native last-command: reads each owner once and missing injection fails', async () => {
+  const reads = [0, 0];
+  const context = {
+    app: {
+      playback: {
+        lastCommand() {
+          reads[0]++;
+          return null;
+        },
+      },
+      outputs: {
+        lastCommand() {
+          reads[1]++;
+          return null;
+        },
+      },
+    },
+  };
+  const response = lastCommandGet({}, context);
+  assertEquals(await response.json(), { playback: null, outputs: null });
+  assertEquals(reads, [1, 1]);
+  assertEquals(response.headers.get('cache-control'), 'no-store');
+  for (const missing of ['playback', 'outputs']) {
+    const incomplete = { app: { ...context.app } };
+    Reflect.deleteProperty(incomplete.app, missing);
+    assertThrows(() => lastCommandGet({}, incomplete), TypeError);
+  }
+});
+
+Deno.test('native last-command: independently null owners through actual facade JSON', async () => {
+  const { playback, onDefault, onHook, close } = await setupWire();
+  try {
+    const first = await onDefault(new Request('http://x/_/last-command'));
+    assertEquals(first.status, 200);
+    assertEquals(first.headers.get('cache-control'), 'no-store');
+    assert(first.headers.get('content-type')?.includes('application/json'));
+    const initial = await first.json();
+    assertEquals(initial, { playback: null, outputs: null });
+    playback.pause();
+    const onlyPlayback =
+      await (await onHook(new Request('http://x/_/last-command'))).json();
+    assertEquals(onlyPlayback, {
+      playback: playback.lastCommand(),
+      outputs: null,
+    });
+    await retainNative('null-playback', { initial, onlyPlayback });
+  } finally {
+    await close();
+  }
+  const second = await setupWire();
+  try {
+    second.outputs.setEnabled([]);
+    const onlyOutputs =
+      await (await second.onDefault(new Request('http://x/_/last-command')))
+        .json();
+    assertEquals(onlyOutputs, {
+      playback: null,
+      outputs: second.outputs.lastCommand(),
+    });
+    assertEquals(onlyOutputs.outputs.selection, []);
+    await retainNative('null-outputs', onlyOutputs);
+  } finally {
+    await second.close();
+  }
+});
+
+Deno.test('native last-command: OwnTone seek, volume and selection share the real owners', async () => {
+  const { playback, outputs, onHook, onDefault, close } = await setupWire();
+  try {
+    playback.restore({
+      queue: [song(90_000_000)],
+      state: 'pause',
+      currentIndex: 0,
+      positionMs: 0,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+    });
+    const headers = { ...HA_HEADERS, 'x-melofon-client': 'native-consumer' };
+    const receipts = [];
+    for (
+      const [path, kind, detail] of [
+        ['seek?position_ms=75000', 'seek', 'position_ms=75000'],
+        ['volume?volume=75', 'volume', 'volume=75'],
+      ]
+    ) {
+      const response = await onHook(
+        new Request(`http://x/api/player/${path}`, {
+          method: 'PUT',
+          headers,
+        }),
+        HA_INFO,
+      );
+      assertEquals(response.status, 204);
+      const record = playback.lastCommand()!;
+      assertEquals(record.kind, kind);
+      assertEquals(record.detail, detail);
+      assertEquals(record.source, { ...HA, client: 'native-consumer' });
+      const native =
+        await (await onDefault(new Request('http://x/_/last-command'))).json();
+      assertEquals(native, { playback: record, outputs: null });
+      const own = await (await onHook(new Request('http://x/api/player')))
+        .json();
+      assertEquals(Object.keys(own).sort(), PLAYER_KEYS);
+      assertEquals(
+        own.state,
+        'play',
+        'seek starts playback (OwnTone semantics)',
+      );
+      assert(own.item_progress_ms >= 75000);
+      if (kind === 'volume') assertEquals(own.volume, 75);
+      receipts.push({ native, own });
+    }
+    outputs.register({
+      id: '123',
+      name: 'unconnected fixture',
+      type: 'AirPlay',
+      selected: false,
+      volume: 100,
+    });
+    const selected = await onHook(
+      new Request('http://x/api/outputs/set', {
+        method: 'PUT',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ outputs: ['123'] }),
+      }),
+      HA_INFO,
+    );
+    assertEquals(selected.status, 204);
+    const native = await (await onHook(new Request('http://x/_/last-command')))
+      .json();
+    assertEquals(native, {
+      playback: playback.lastCommand(),
+      outputs: outputs.lastCommand(),
+    });
+    assertEquals(native.outputs, {
+      kind: 'setEnabled',
+      source: { ...HA, client: 'native-consumer' },
+      selection: [{ id: '123', selected: true }],
+    });
+    const ownOutputs = await (await onHook(new Request('http://x/api/outputs')))
+      .json();
+    assertEquals(ownOutputs.outputs[0].selected, true);
+    await retainNative('owntone', { receipts, native, ownOutputs });
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('native last-command: internal pause and restore provenance stays visible', async () => {
+  const { playback, outputs, onDefault, close } = await setupWire();
+  try {
+    playback.restore({
+      queue: [song()],
+      state: 'pause',
+      currentIndex: 0,
+      positionMs: 1234,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+    });
+    outputs.register({
+      id: '123',
+      name: 'restored fixture',
+      type: 'AirPlay',
+      selected: false,
+      volume: 42,
+    }, { kind: 'internal', via: 'restore' });
+    const restored =
+      await (await onDefault(new Request('http://x/_/last-command'))).json();
+    assertEquals(restored, {
+      playback: playback.lastCommand(),
+      outputs: outputs.lastCommand(),
+    });
+    assertEquals(restored.playback.source, {
+      kind: 'internal',
+      via: 'restore',
+    });
+    assertEquals(restored.outputs.source, { kind: 'internal', via: 'restore' });
+    playback.pause({ kind: 'internal', via: 'airplay-boot' });
+    const paused =
+      await (await onDefault(new Request('http://x/_/last-command'))).json();
+    assertEquals(paused.playback.kind, 'pause');
+    assertEquals(paused.playback.source, {
+      kind: 'internal',
+      via: 'airplay-boot',
+    });
+    assertEquals(paused.outputs, restored.outputs);
+    await retainNative('internal', {
+      restored,
+      paused,
+      simulatedInternalSource: true,
+    });
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('native last-command: observer GETs preserve records, state and notifications', async () => {
+  const { playback, outputs, notify, onDefault, onHook, logs, close } =
+    await setupWire();
+  const notifications: string[][] = [];
+  const unsubscribe = notify.subscribe((types) => notifications.push(types));
+  try {
+    playback.restore({
+      queue: [song()],
+      state: 'pause',
+      currentIndex: 0,
+      positionMs: 4321,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+    });
+    outputs.register({
+      id: '123',
+      name: 'frozen fixture',
+      type: 'AirPlay',
+      selected: false,
+      volume: 42,
+    });
+    const playerRecord = playback.lastCommand();
+    const outputRecord = outputs.lastCommand();
+    const before = {
+      playerRecord,
+      outputRecord,
+      player: playback.playerView(),
+      queue: playback.queueView(),
+      outputs: outputs.list(),
+      notifications: notifications.slice(),
+      commands: logs.map(parseLogfmt).filter((l) => l.event === 'command'),
+    };
+    const frozen = JSON.stringify(before);
+    const responses = [];
+    for (const route of [onDefault, onHook, onDefault]) {
+      const response = await route(
+        new Request('http://x/_/last-command', {
+          headers: {
+            ...HA_HEADERS,
+            'x-melofon-client': 'observer',
+            authorization: 'observer-secret',
+            cookie: 'observer-cookie',
+          },
+        }),
+        HA_INFO,
+      );
+      assertEquals(response.headers.get('cache-control'), 'no-store');
+      const body = await response.json();
+      assertEquals(body, { playback: playerRecord, outputs: outputRecord });
+      responses.push(body);
+    }
+    assertStrictEquals(playback.lastCommand(), playerRecord);
+    assertStrictEquals(outputs.lastCommand(), outputRecord);
+    const after = {
+      playerRecord: playback.lastCommand(),
+      outputRecord: outputs.lastCommand(),
+      player: playback.playerView(),
+      queue: playback.queueView(),
+      outputs: outputs.list(),
+      notifications: notifications.slice(),
+      commands: logs.map(parseLogfmt).filter((l) => l.event === 'command'),
+    };
+    assertEquals(JSON.stringify(after), frozen);
+    const own = await (await onHook(new Request('http://x/api/player'))).json();
+    assertEquals(Object.keys(own).sort(), PLAYER_KEYS);
+    await retainNative('readonly', {
+      before,
+      after,
+      responses,
+      recordIdentityPreserved: true,
+      own,
+    });
+  } finally {
+    unsubscribe();
+    await close();
+  }
+});
+
+Deno.test('native last-command: output update and PIN expose no inferred payload', async () => {
+  const { outputs, onHook, close } = await setupWire();
+  try {
+    outputs.register({
+      id: '123',
+      name: 'PIN fixture',
+      type: 'AirPlay',
+      selected: false,
+      volume: 42,
+    });
+    const pins: unknown[] = [];
+    outputs.onCommand((id, command) => pins.push({ id, command }));
+    const response = await onHook(
+      new Request('http://x/api/outputs/123', {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/json',
+          'x-melofon-client': 'pin-control',
+        },
+        body: JSON.stringify({ volume: 0, pin: 'private-pin-canary' }),
+      }),
+    );
+    assertEquals(response.status, 204);
+    assertEquals(pins, [{ id: '123', command: { pin: 'private-pin-canary' } }]);
+    assertEquals(outputs.get('123')!.volume, 0);
+    const native = await (await onHook(new Request('http://x/_/last-command')))
+      .json();
+    assertEquals(native, {
+      playback: null,
+      outputs: {
+        kind: 'update',
+        source: { kind: 'http', client: 'pin-control' },
+      },
+    });
+    assertEquals(JSON.stringify(native).includes('private-pin-canary'), false);
+    await retainNative('pin', {
+      native,
+      pinDelivered: true,
+      volume: outputs.get('123')!.volume,
+    });
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('native last-command: default and extra binds follow GET-only Pathfinder routing', async () => {
+  const { core, onDefault, onHook, playback, outputs, close } =
+    await setupWire();
+  try {
+    for (const route of [onDefault, onHook]) {
+      const response = await route(new Request('http://x/_/last-command'));
+      assertEquals(response.status, 200);
+      assertEquals(await response.json(), { playback: null, outputs: null });
+      const own = await onHook(new Request('http://x/api/player'));
+      assertEquals(Object.keys(await own.json()).sort(), PLAYER_KEYS);
+    }
+    const expected = await core(
+      new Request('http://x/last-command', { method: 'POST' }),
+    );
+    const expectedBody = await expected.text();
+    assert(expected.status >= 400);
+    for (const route of [onDefault, onHook]) {
+      const response = await route(
+        new Request('http://x/_/last-command', { method: 'POST' }),
+      );
+      assertEquals(response.status, expected.status);
+      assertEquals(await response.text(), expectedBody);
+    }
+    assertEquals(playback.lastCommand(), null);
+    assertEquals(outputs.lastCommand(), null);
+    await retainNative('routing', {
+      getStatus: 200,
+      postStatus: expected.status,
+      postBody: expectedBody,
+    });
   } finally {
     await close();
   }

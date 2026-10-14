@@ -32,6 +32,55 @@ view of the same list.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — the secret and the password live in env only.
 
+## Native last-command snapshot
+
+`GET /_/last-command` reads the playback and output owners' current command
+records through the native API, with `Cache-Control: no-store`:
+
+```bash
+curl http://127.0.0.1:8000/_/last-command
+```
+
+Before either owner has recorded a command, the response is
+`{"playback":null,"outputs":null}`. Each missing record is independently null.
+A populated snapshot can look like:
+
+```json
+{
+  "playback": {
+    "kind": "seek",
+    "detail": "position_ms=75000",
+    "source": { "kind": "http", "client": "example-controller" },
+    "atMs": 1791408896789,
+    "intent": "play",
+    "queueCleared": false
+  },
+  "outputs": {
+    "kind": "setEnabled",
+    "source": { "kind": "internal", "via": "example-controller" },
+    "selection": [{ "id": "example-output", "selected": true }]
+  }
+}
+```
+
+`kind` names the existing command; optional playback `detail` keeps its legacy
+detail string. `source.kind` is `http` or `internal`; existing optional `via`,
+`peer`, `userAgent`, `user` and `client` identify the stored attribution.
+Playback `atMs` is the command's Unix timestamp in milliseconds, not the GET
+time. `intent` is `play`, `pause`, `stop` or `none`; `queueCleared` records the
+existing queue-clear flag. Outputs expose only `kind`, `source` and optional
+`selection` entries (`id`, `selected`), with no output timestamp, target,
+volume or PIN payload inferred.
+
+These are independent latest records, not a transaction, total chronology or
+durable history. They last only for the process lifetime; restart begins empty
+or records commands actually performed by boot/restore. Internal discovery,
+preparation or restoration can replace the latest output record. Accepted/no-op
+commands may be recorded without changing state. Reading does not record a
+command. The endpoint follows the existing trusted-network native `/_/` binds
+and unauthenticated exposure. OwnTone `/api/player` retains its eight existing
+keys and has no `last_command` field. This is a Melofon-specific diagnostic view.
+
 ## AirPlay connection strategies
 
 AirPlay runs in-process via `helper/raop/libmelofon_raop.so` and Deno FFI.
