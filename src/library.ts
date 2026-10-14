@@ -69,6 +69,14 @@ export interface Search3Result {
   songs: SongRow[];
 }
 
+export interface RandomSongOptions {
+  size: number;
+  folderId?: string;
+  genre?: string;
+  fromYear?: number;
+  toYear?: number;
+}
+
 export interface Library {
   /** Album artists (artists with at least one album), alphabetically. */
   listArtists(folderId?: string): Promise<ArtistRow[]>;
@@ -119,6 +127,7 @@ export interface Library {
   /** All music videos in the catalog (getVideos). */
   videos(): Promise<SongRow[]>;
   /** Random songs from the catalog (getRandomSongs pull-forward). */
+  randomSongs(opts: RandomSongOptions): Promise<SongRow[]>;
   randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
   /** Paged catalog walk in a STABLE order (path) — for deterministic
    * wire-id resolution (OwnTone find-by-wire-int). */
@@ -318,6 +327,21 @@ function artistFolderFilter(folderId?: string): string {
    )`;
 }
 
+// File eligibility has one owner for sync, genre browsing and random sampling.
+// Optional bounds are inclusive; SQL NULL comparisons do not invent a year.
+function songPredicates(opts: Omit<RandomSongOptions, 'size'>): string[] {
+  const predicates: string[] = [];
+  if (opts.folderId !== undefined) {
+    predicates.push(`f.library_id = ${esc(opts.folderId)}`);
+  }
+  if (opts.genre !== undefined) predicates.push(`f.genre = ${esc(opts.genre)}`);
+  if (opts.fromYear !== undefined) {
+    predicates.push(`f.year >= ${opts.fromYear}`);
+  }
+  if (opts.toYear !== undefined) predicates.push(`f.year <= ${opts.toYear}`);
+  return predicates;
+}
+
 export function createLibrary(db: Db): Library {
   return {
     async listArtists(folderId): Promise<ArtistRow[]> {
@@ -327,7 +351,7 @@ export function createLibrary(db: Db): Library {
          JOIN albums al ON al.album_artist_id = ar.id
          WHERE 1 = 1 ${artistFolderFilter(folderId)}
          GROUP BY ar.id, ar.name
-         ORDER BY ar.name`,
+          ORDER BY ar.name, ar.id`,
       );
       return (res.getRowObjects() as {
         id: string;
@@ -364,7 +388,7 @@ export function createLibrary(db: Db): Library {
     async albumsByArtist(artistId) {
       const res = await db.conn.runAndReadAll(
         `${albumSelect()} HAVING al.album_artist_id = ${esc(artistId)}
-         ORDER BY al.name`,
+         ORDER BY al.name, al.id`,
       );
       return (res.getRowObjects() as unknown as AlbumSqlRow[]).map(albumOf);
     },
@@ -424,7 +448,9 @@ export function createLibrary(db: Db): Library {
           order = 'ORDER BY al.name';
       }
       const res = await db.conn.runAndReadAll(
-        `${albumSelect(query)} ${order}
+        `${albumSelect(query)} ${order}${
+          opts.sort === 'random' ? '' : ', al.id'
+        }
          LIMIT ${opts.size} OFFSET ${opts.offset}`,
       );
       return (res.getRowObjects() as unknown as AlbumSqlRow[]).map(albumOf);
@@ -439,7 +465,7 @@ export function createLibrary(db: Db): Library {
       if (!albumRow) return null;
       const songRes = await db.conn.runAndReadAll(
         `${SONG_SELECT} WHERE f.album_id = ${esc(id)}
-         ORDER BY f.disc, f.track, f.path`,
+         ORDER BY f.disc, f.track, f.path, f.id`,
       );
       return {
         album: albumOf(albumRow),
@@ -464,22 +490,20 @@ export function createLibrary(db: Db): Library {
            JOIN albums al ON al.album_artist_id = ar.id
            WHERE ar.name ILIKE ${like} ${artistFolderFilter(opts.folderId)}
            GROUP BY ar.id, ar.name
-           ORDER BY ar.name
+            ORDER BY ar.name, ar.id
            LIMIT ${opts.artistCount} OFFSET ${opts.artistOffset}`,
         ),
         db.conn.runAndReadAll(
           `${albumSelect({ folderId: opts.folderId })}
            HAVING al.name ILIKE ${like}
-           ORDER BY al.name
+            ORDER BY al.name, al.id
            LIMIT ${opts.albumCount} OFFSET ${opts.albumOffset}`,
         ),
         db.conn.runAndReadAll(
-          `${SONG_SELECT} WHERE f.title ILIKE ${like}${
-            opts.folderId === undefined
-              ? ''
-              : ` AND f.library_id = ${esc(opts.folderId)}`
+          `${SONG_SELECT} WHERE ${
+            [`f.title ILIKE ${like}`, ...songPredicates(opts)].join(' AND ')
           }
-           ORDER BY f.title
+            ORDER BY f.title, f.id
            LIMIT ${opts.songCount} OFFSET ${opts.songOffset}`,
         ),
       ]);
@@ -515,18 +539,22 @@ export function createLibrary(db: Db): Library {
       return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
     },
 
-    async randomSongs(size, folderId) {
+    async randomSongs(input: RandomSongOptions | number, folderId?: string) {
+      const opts = typeof input === 'number'
+        ? { size: input, folderId }
+        : input;
+      const predicates = songPredicates(opts);
       const res = await db.conn.runAndReadAll(
         `${SONG_SELECT}${
-          folderId === undefined ? '' : ` WHERE f.library_id = ${esc(folderId)}`
-        } ORDER BY RANDOM() LIMIT ${Math.trunc(size)}`,
+          predicates.length === 0 ? '' : ` WHERE ${predicates.join(' AND ')}`
+        } ORDER BY RANDOM() LIMIT ${Math.trunc(opts.size)}`,
       );
       return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
     },
 
     async listSongs(opts) {
       const res = await db.conn.runAndReadAll(
-        `${SONG_SELECT} ORDER BY f.path
+        `${SONG_SELECT} ORDER BY f.path, f.id
          LIMIT ${Math.trunc(opts.size)} OFFSET ${Math.trunc(opts.offset)}`,
       );
       return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);
@@ -555,12 +583,8 @@ export function createLibrary(db: Db): Library {
     async songsByGenre(genre, opts) {
       const res = await db.conn.runAndReadAll(
         `${SONG_SELECT}
-         WHERE f.genre = ${esc(genre)}${
-          opts.folderId === undefined
-            ? ''
-            : ` AND f.library_id = ${esc(opts.folderId)}`
-        }
-         ORDER BY f.title
+         WHERE ${songPredicates({ ...opts, genre }).join(' AND ')}
+         ORDER BY f.title, f.id
          LIMIT ${opts.size} OFFSET ${opts.offset}`,
       );
       return (res.getRowObjects() as unknown as SongSqlRow[]).map(songOf);

@@ -51,6 +51,35 @@ Form values precede query values: scalar getters use the first form value;
 repeated getters retain form values followed by query values. Both methods reach
 the same injected core services and canonical state.
 
+## OpenSubsonic catalog sync and selection
+
+`search3` requires the `query` parameter, but `query=` enumerates the catalog for
+offline sync. Artists, albums and songs have independent count/offset pairs
+(defaults20/0); zero suppresses a group. Counts and offsets are nonnegative safe
+integers, with invalid/unsafe values falling back to those defaults. Search has
+no500 ceiling. Deterministic pages sort by label and canonical ID, so duplicate
+labels do not skip or repeat rows over an **unchanged catalog**. There is no
+cross-request snapshot guarantee during rescans. Nonempty search keeps the
+existing case-insensitive substring/ILIKE behavior.
+
+`getRandomSongs` applies indexed genre equality, independently optional inclusive
+`fromYear`/`toYear` and `musicFolderId` together **before** sampling. Unknown years
+do not satisfy a supplied bound; reversed random bounds return an empty pool.
+Music videos and albumless songs remain eligible. Each response has unique song
+IDs; requests do not share an exclusion list or promise a weighted/seeded shuffle.
+Supplied malformed/unsafe years fail with code10 rather than broadening selection.
+
+Random `size`, `getSongsByGenre.count` and both album-list `size` parameters
+default to10 and cap valid positive values at500; zero returns an empty list.
+Invalid/unsafe counts retain the default fallback. Genre/album offsets default
+to0 and require nonnegative safe integers. Album `byYear` keeps its documented
+reverse chronological behavior when `fromYear > toYear`. Core and OwnTone
+whole-catalog consumers are not subject to these OpenSubsonic wire caps.
+
+The existing physical-source integer/hash compatibility remains in place;
+unmatched folders return empty selections. This documents catalog selection,
+not complete source-qualified artist/album aggregate or date/history semantics.
+
 ## Native last-command snapshot
 
 `GET /_/last-command` reads the playback and output owners' current command

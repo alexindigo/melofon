@@ -4,9 +4,11 @@
 // the layer root, outside the walked mount tree.
 import { fail } from '#opensubsonic/envelope.ts';
 import {
+  boundedCountParam,
   folderIdParam,
-  intParam,
   requiredParam,
+  safeIntParam,
+  yearParam,
 } from '#opensubsonic/params.ts';
 import type {
   AlbumRow,
@@ -231,8 +233,8 @@ export async function albumListAlbums(
   }
   const opts: Parameters<HatContext['app']['library']['listAlbums']>[0] = {
     sort,
-    size: intParam(params, 'size', 10),
-    offset: intParam(params, 'offset', 0),
+    size: boundedCountParam(params, 'size'),
+    offset: safeIntParam(params, 'offset', 0),
     folderId: await folderIdParam(context),
     username: context.state.user!.username,
   };
@@ -248,11 +250,10 @@ export async function albumListAlbums(
     if (fromYear instanceof Response) return fromYear;
     const toYear = requiredParam(context, 'toYear');
     if (toYear instanceof Response) return toYear;
-    const from = Number(fromYear);
-    const to = Number(toYear);
-    if (!Number.isInteger(from) || !Number.isInteger(to)) {
-      return fail(context, 10, 'fromYear/toYear must be integers');
-    }
+    const from = yearParam(context, 'fromYear');
+    if (from instanceof Response) return from;
+    const to = yearParam(context, 'toYear');
+    if (to instanceof Response) return to;
     opts.fromYear = from;
     opts.toYear = to;
   }

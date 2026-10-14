@@ -3,9 +3,10 @@
 import { ok } from '#opensubsonic/envelope.ts';
 import { childOf } from '#opensubsonic/id3.ts';
 import {
+  boundedCountParam,
   folderIdParam,
-  intParam,
   requiredParam,
+  safeIntParam,
 } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
@@ -14,8 +15,8 @@ export default async (_request: HatRequest, context: HatContext) => {
   const genre = requiredParam(context, 'genre');
   if (genre instanceof Response) return genre;
   const songs = await context.app.library.songsByGenre(genre, {
-    size: intParam(params, 'count', 10),
-    offset: intParam(params, 'offset', 0),
+    size: boundedCountParam(params, 'count'),
+    offset: safeIntParam(params, 'offset', 0),
     folderId: await folderIdParam(context),
   });
   return ok(context, { songsByGenre: { song: songs.map(childOf) } });

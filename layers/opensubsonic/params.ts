@@ -45,6 +45,49 @@ export function requiredParam(
   return value;
 }
 
+// Presence is distinct from content for search3's required empty sync query.
+// Other required arguments retain requiredParam's nonempty contract.
+export function presentParam(
+  context: HatContext,
+  name: string,
+): string | Response {
+  const params = context.state.params;
+  return params?.has(name)
+    ? params.get(name)!
+    : fail(context, 10, 'Required parameter is missing');
+}
+
+export function safeIntParam(
+  params: URLSearchParams,
+  name: string,
+  fallback: number,
+): number {
+  const raw = params.get(name);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+// These documented limits belong to the wire, never whole-catalog core calls.
+export function boundedCountParam(
+  params: URLSearchParams,
+  name: string,
+): number {
+  return Math.min(500, safeIntParam(params, name, 10));
+}
+
+export function yearParam(
+  context: HatContext,
+  name: string,
+): number | undefined | Response {
+  const raw = context.state.params!.get(name);
+  if (raw === null) return undefined;
+  const value = Number(raw);
+  return raw.trim() !== '' && Number.isSafeInteger(value)
+    ? value
+    : fail(context, 10, `${name} must be a finite safe integer year`);
+}
+
 export function hexDecode(hex: string): string {
   if (!/^([0-9a-fA-F]{2})*$/.test(hex)) throw new Error('bad hex');
   const bytes = new Uint8Array(hex.length / 2);

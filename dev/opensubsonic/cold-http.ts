@@ -1,4 +1,4 @@
-// Bounded socket consumer for the approved H1 protocol boundary. Exactly one
+// Bounded socket consumer for approved H1/H2 protocol boundaries. Exactly one
 // owned main.ts child, private frozen inputs/data, retained evidence on failure.
 // This driver never selects an output or touches a household database.
 import { createHash } from 'node:crypto';
@@ -17,11 +17,14 @@ function option(name: string): string {
 
 const started = performance.now();
 const phase = option('phase');
-check(phase === 'H1', 'only implemented phase H1 is accepted');
+check(
+  phase === 'H1' || phase === 'H2',
+  'only implemented H1/H2 phases accepted',
+);
 const candidate = await Deno.realPath(option('candidate-root'));
 const item = candidate.slice(0, -'/source'.length);
 check(
-  /^\/home\/tester\/melofon-output-preparation-01\/opensubsonic-highest-01\/H01(?:\/verification-\d+)?\/source$/
+  /^\/home\/tester\/melofon-output-preparation-01\/opensubsonic-highest-01\/H0[12](?:\/verification-\d+)?\/source$/
     .test(candidate),
   'candidate outside approved disk root',
 );
@@ -240,6 +243,459 @@ function proved(condition: unknown, name: string) {
   assertions.push(name);
 }
 
+// Independent scan-input oracle. Known tags/paths define the expected IDs;
+// no expected set is derived from a modified Library query or response.
+const fixtureId = (key: string) =>
+  createHash('sha256').update(key).digest('hex').slice(0, 32);
+const same = (actual: string[], expected: string[]) =>
+  JSON.stringify(actual) === JSON.stringify(expected);
+type FixtureSong = {
+  id: string;
+  title: string;
+  genre: string;
+  year: number | null;
+  source: number;
+  albumId: string | null;
+};
+
+async function selectionConsumer() {
+  const root = `${evidence}/selection-fixture`;
+  await Deno.mkdir(root, { mode: 0o700 });
+  const sourcePaths = [`${root}/A`, `${root}/B`];
+  const sourceIds = sourcePaths.map((path) => fixtureId(`library\n${path}`));
+  const mp3 = await Deno.readFile(
+    `${candidate}/tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3`,
+  );
+  check(
+    new TextDecoder().decode(mp3.subarray(0, 3)) === 'ID3' &&
+      (mp3[5] & 0x10) === 0,
+    'fixture has bounded leading ID3 without footer',
+  );
+  const tagSize = (mp3[6] << 21) | (mp3[7] << 14) | (mp3[8] << 7) | mp3[9];
+  const audio = mp3.subarray(10 + tagSize);
+  check(audio.length > 0, 'nonempty existing local MPEG audio');
+  // ID3v2.3 ASCII text frames, big-endian frame sizes and syncsafe tag size.
+  // No new media engine/package; production scan proves the actual tag readback.
+  const tagged = (tags: Record<string, string>) => {
+    const frames = Object.entries(tags).map(([name, value]) => {
+      const text = new TextEncoder().encode(value);
+      const frame = new Uint8Array(11 + text.length);
+      frame.set(new TextEncoder().encode(name));
+      new DataView(frame.buffer).setUint32(4, text.length + 1);
+      frame.set(text, 11);
+      return frame;
+    });
+    const length = frames.reduce((n, frame) => n + frame.length, 0);
+    const out = new Uint8Array(10 + length + audio.length);
+    out.set([
+      73,
+      68,
+      51,
+      3,
+      0,
+      0,
+      (length >> 21) & 127,
+      (length >> 14) & 127,
+      (length >> 7) & 127,
+      length & 127,
+    ]);
+    let offset = 10;
+    for (const frame of frames) {
+      out.set(frame, offset);
+      offset += frame.length;
+    }
+    out.set(audio, offset);
+    return out;
+  };
+  for (const path of sourcePaths) await Deno.mkdir(path, { mode: 0o700 });
+  const small = [
+    [0, 'Jazz', 2000],
+    [0, 'Jazz', 2005],
+    [0, 'Jazz', 2010],
+    [0, 'Jazz', null],
+    [0, 'Rock', 2005],
+    [1, 'Jazz', 2005],
+    [1, 'Jazz', 1999],
+    [1, 'Rock', 2011],
+  ] as const;
+  const oracle: FixtureSong[] = [];
+  for (let n = 0; n < small.length + 501; n++) {
+    const bulk = n >= small.length;
+    const [source, genre, year] = bulk ? [1, 'Bulk', 2005] as const : small[n];
+    const album = bulk
+      ? `Bulk-${String(n - small.length).padStart(3, '0')}`
+      : 'Twin';
+    const artist = source === 0 ? 'Source A' : 'Source B';
+    const filename = `${String(n).padStart(3, '0')}.mp3`;
+    const title = bulk ? 'Bulk' : 'Same';
+    const tags: Record<string, string> = {
+      TIT2: title,
+      TPE1: artist,
+      TPE2: artist,
+      TALB: album,
+      TCON: genre,
+    };
+    if (n === 2) {
+      delete tags.TALB;
+      delete tags.TPE2;
+    }
+    if (year !== null) tags.TYER = String(year);
+    await Deno.writeFile(`${sourcePaths[source]}/${filename}`, tagged(tags), {
+      createNew: true,
+    });
+    oracle.push({
+      id: fixtureId(`file\n${sourceIds[source]}\n${filename}`),
+      title,
+      genre,
+      year,
+      source,
+      albumId: n === 2 ? null : fixtureId(`album\n${artist}\n${album}`),
+    });
+  }
+  await write('selection-oracle', { sourcePaths, sourceIds, songs: oracle });
+  for (let n = 0; n < sourcePaths.length; n++) {
+    const res = await request('/_/libraries', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: `H2 ${n}`, path: sourcePaths[n] }),
+    });
+    proved(
+      res.status === 200 && res.json().library.id === sourceIds[n],
+      `H2 source ${n} canonical ID`,
+    );
+  }
+  const rest = async (
+    op: string,
+    extra: Record<string, string> = {},
+    method = 'GET',
+    format = 'json',
+  ) => {
+    const p = new URLSearchParams(AUTH);
+    p.set('f', format);
+    for (const [key, value] of Object.entries(extra)) p.set(key, value);
+    return await request(
+      `/rest/${op}${method === 'GET' ? '?' + p : ''}`,
+      method === 'POST' ? { method, body: p } : {},
+    );
+  };
+  const body = async (op: string, extra: Record<string, string> = {}) =>
+    (await rest(op, extra)).json()['subsonic-response'];
+  proved((await body('startScan')).status === 'ok', 'H2 sole-child scan start');
+  const deadline = performance.now() + 30_000;
+  let scanned = false;
+  while (performance.now() < deadline && !scanned) {
+    const value = await body('getScanStatus');
+    scanned = value.status === 'ok' && value.scanStatus.scanning === false &&
+      value.scanStatus.count === 513 && value.scanStatus.folderCount === 3;
+    if (!scanned) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  proved(scanned, 'H2 513-song three-source scan consumer');
+  const albumless = await body('getSong', { id: oracle[2].id });
+  proved(
+    albumless.status === 'ok' && albumless.song.albumId === undefined,
+    'H2 actual scan albumless row',
+  );
+  const clip = await body('search3', {
+    query: 'Clip',
+    artistCount: '0',
+    albumCount: '0',
+    songCount: '99',
+  });
+  proved(
+    clip.status === 'ok' && clip.searchResult3.song.length === 1 &&
+      clip.searchResult3.song[0].isVideo === true,
+    'H2 actual video retained in song enumeration',
+  );
+  const songsOf = (value: Record<string, unknown>, key: string) => {
+    check(value.status === 'ok', `${key} status`);
+    return (value[key] as {
+      song: { id: string; genre?: string; year?: number }[];
+    }).song;
+  };
+  const idsOf = (rows: { id: string }[]) => rows.map((row) => row.id);
+  const expectedSmall = oracle.slice(0, 8).map((row) => row.id).sort();
+  const originalSourceId = fixtureId(
+    `library\n${candidate}/tests/fixtures/library`,
+  );
+  const originalSongs = [
+    ['First Song', 'Fixture Artist/Fixture Album/01 - First Song.mp3'],
+    ['Second Song', 'Fixture Artist/Fixture Album/02 - Second Song.mp3'],
+    ['Clip', 'Fixture Artist/Fixture Album/03 - Clip.mp4'],
+    ['Theme', 'Various Artists/Fixture OST/01 - Probe Performer - Theme.mp3'],
+  ].map(([title, path]) => ({
+    title,
+    id: fixtureId(`file\n${originalSourceId}\n${path}`),
+  }));
+  const compare = (
+    a: { label: string; id: string },
+    b: { label: string; id: string },
+  ) =>
+    a.label < b.label
+      ? -1
+      : a.label > b.label
+      ? 1
+      : a.id < b.id
+      ? -1
+      : a.id > b.id
+      ? 1
+      : 0;
+  const albumOracle = [
+    {
+      label: 'Fixture Album',
+      id: fixtureId('album\nFixture Artist\nFixture Album'),
+    },
+    {
+      label: 'Fixture OST',
+      id: fixtureId('album\nVarious Artists\nFixture OST'),
+    },
+    { label: 'Twin', id: fixtureId('album\nSource A\nTwin') },
+    { label: 'Twin', id: fixtureId('album\nSource B\nTwin') },
+    ...oracle.slice(8).map((row, n) => ({
+      label: `Bulk-${String(n).padStart(3, '0')}`,
+      id: row.albumId!,
+    })),
+  ].sort(compare).map((row) => row.id);
+  const pageOracles: Record<string, string[]> = {
+    artist: ['Fixture Artist', 'Source A', 'Source B', 'Various Artists'].map(
+      (name) => fixtureId(`artist\n${name}`),
+    ),
+    album: albumOracle,
+    song: [...originalSongs, ...oracle].map((row) => ({
+      label: row.title,
+      id: row.id,
+    })).sort(compare).map((row) => row.id),
+  };
+  for (const kind of ['artist', 'album', 'song']) {
+    const union: string[] = [];
+    const expected = pageOracles[kind];
+    for (let offset = 0; offset <= expected.length + 100; offset += 100) {
+      const value = await body('search3', {
+        query: '',
+        artistCount: '0',
+        albumCount: '0',
+        songCount: '0',
+        [`${kind}Count`]: '100',
+        [`${kind}Offset`]: String(offset),
+      });
+      const actual = idsOf(value.searchResult3[kind]);
+      proved(
+        value.status === 'ok' &&
+          same(actual, expected.slice(offset, offset + 100)),
+        `H2 full empty-query ${kind} page ${offset}`,
+      );
+      for (const other of ['artist', 'album', 'song']) {
+        if (other !== kind) {
+          proved(
+            value.searchResult3[other].length === 0,
+            `H2 ${kind} independent zero ${other} ${offset}`,
+          );
+        }
+      }
+      union.push(...actual);
+    }
+    proved(
+      same(union, expected) && new Set(union).size === expected.length,
+      `H2 complete empty-query ${kind} union`,
+    );
+  }
+  for (const suffix of ['', '.view']) {
+    for (const method of ['GET', 'POST']) {
+      for (const format of ['json', 'xml']) {
+        const res = await rest(
+          `search3${suffix}`,
+          {
+            query: '',
+            artistCount: '0',
+            albumCount: '0',
+            songCount: '99',
+            musicFolderId: sourceIds[0],
+          },
+          method,
+          format,
+        );
+        const actual = format === 'json'
+          ? idsOf(songsOf(res.json()['subsonic-response'], 'searchResult3'))
+          : [...res.body.matchAll(/<song id="([^"]+)"/g)].map((m) => m[1]);
+        proved(
+          same(actual, oracle.slice(0, 5).map((row) => row.id).sort()),
+          `H2 empty ${method}${suffix} ${format} source enumeration`,
+        );
+        const absent = await rest(`search3${suffix}`, {}, method, format);
+        proved(
+          format === 'json'
+            ? absent.json()['subsonic-response'].error.code === 10
+            : absent.body.includes('<error code="10"'),
+          `H2 absent ${method}${suffix} ${format} code10`,
+        );
+      }
+    }
+  }
+  const union: string[] = [];
+  for (let offset = 0; offset <= 8; offset += 2) {
+    const value = await body('search3', {
+      query: 'Same',
+      artistCount: '0',
+      albumCount: '0',
+      songCount: '2',
+      songOffset: String(offset),
+    });
+    const actual = idsOf(songsOf(value, 'searchResult3'));
+    proved(
+      same(actual, expectedSmall.slice(offset, offset + 2)),
+      `H2 duplicate-title page ${offset}`,
+    );
+    union.push(...actual);
+    proved(
+      value.searchResult3.artist.length === 0 &&
+        value.searchResult3.album.length === 0,
+      `H2 independent zero groups ${offset}`,
+    );
+  }
+  proved(
+    same(union, expectedSmall) && new Set(union).size === 8,
+    'H2 unchanged-catalog exact page union',
+  );
+  const filters: [Record<string, string>, number[]][] = [
+    [{ genre: 'Jazz' }, [0, 1, 2, 3, 5, 6]],
+    [{ genre: 'Jazz', fromYear: '2005' }, [1, 2, 5]],
+    [{ genre: 'Jazz', toYear: '2000' }, [0, 6]],
+    [{
+      genre: 'Jazz',
+      fromYear: '2000',
+      toYear: '2005',
+      musicFolderId: sourceIds[0],
+    }, [0, 1]],
+    [{ genre: 'Jazz', fromYear: '2005', toYear: '2005' }, [1, 5]],
+    [{ fromYear: '2011', toYear: '1999' }, []],
+    [{ genre: 'Jazz', fromYear: '2010', toYear: '2010' }, [2]],
+    [{ genre: 'unknown' }, []],
+    [{ musicFolderId: '2147483647' }, []],
+  ];
+  for (const [params, indexes] of filters) {
+    const songs = songsOf(
+      await body('getRandomSongs', { size: '500', ...params }),
+      'randomSongs',
+    );
+    proved(
+      same(idsOf(songs).sort(), indexes.map((n) => oracle[n].id).sort()) &&
+        new Set(idsOf(songs)).size === songs.length,
+      `H2 whole-pool predicate ${JSON.stringify(params)}`,
+    );
+  }
+  const folders = await body('getMusicFolders');
+  const wireA =
+    folders.musicFolders.musicFolder.find((row: { name: string }) =>
+      row.name === 'H2 0'
+    ).id;
+  const sourceRandom = songsOf(
+    await body('getRandomSongs', {
+      size: '500',
+      genre: 'Jazz',
+      musicFolderId: String(wireA),
+    }),
+    'randomSongs',
+  );
+  proved(
+    same(
+      idsOf(sourceRandom).sort(),
+      oracle.slice(0, 4).map((row) => row.id).sort(),
+    ),
+    'H2 physical source wire int compatibility',
+  );
+  for (
+    const raw of ['', 'NaN', 'Infinity', '2005x', '2005.5', '9007199254740992']
+  ) {
+    for (const bound of ['fromYear', 'toYear']) {
+      proved(
+        (await body('getRandomSongs', { [bound]: raw })).error.code === 10,
+        `H2 malformed ${bound} ${raw}`,
+      );
+    }
+  }
+  const bulkIds = oracle.slice(8).map((row) => row.id).sort();
+  for (
+    const count of [
+      '0',
+      '10',
+      '501',
+      '9007199254740991',
+      '9007199254740992',
+      'Infinity',
+    ]
+  ) {
+    const expectedCount = count === '0'
+      ? 0
+      : ['501', '9007199254740991'].includes(count)
+      ? 500
+      : 10;
+    const random = songsOf(
+      await body('getRandomSongs', { genre: 'Bulk', size: count }),
+      'randomSongs',
+    );
+    proved(
+      random.length === expectedCount &&
+        new Set(idsOf(random)).size === expectedCount &&
+        idsOf(random).every((id) => bulkIds.includes(id)),
+      `H2 random cap ${count}`,
+    );
+    const genre = songsOf(
+      await body('getSongsByGenre', { genre: 'Bulk', count }),
+      'songsByGenre',
+    );
+    proved(
+      same(idsOf(genre), bulkIds.slice(0, expectedCount)),
+      `H2 genre cap ${count}`,
+    );
+    for (const op of ['getAlbumList', 'getAlbumList2']) {
+      const value = await body(op, {
+        type: 'byGenre',
+        genre: 'Bulk',
+        size: count,
+      });
+      const key = op === 'getAlbumList' ? 'albumList' : 'albumList2';
+      const expected = oracle.slice(8, 8 + expectedCount).map((row) =>
+        row.albumId!
+      );
+      proved(
+        value.status === 'ok' && same(idsOf(value[key].album), expected),
+        `H2 ${op} cap ${count}`,
+      );
+    }
+  }
+  const allBulk = songsOf(
+    await body('search3', {
+      query: 'Bulk',
+      artistCount: '0',
+      albumCount: '0',
+      songCount: '501',
+    }),
+    'searchResult3',
+  );
+  proved(same(idsOf(allBulk), bulkIds), 'H2 search has no500 cap');
+  const unsafe = await body('search3', {
+    query: 'Bulk',
+    artistCount: '0',
+    albumCount: '0',
+    songCount: '9007199254740992',
+    songOffset: 'Infinity',
+  });
+  proved(
+    same(idsOf(songsOf(unsafe, 'searchResult3')), bulkIds.slice(0, 20)),
+    'H2 search safe fallback20/0',
+  );
+  const own = await request(
+    '/api/library/albums?offset=500&limit=10',
+    {},
+    'http://127.0.0.1:14689',
+  );
+  // 501 new bulk albums + 2 Twin + 2 original H1 albums: actual OwnTone >500.
+  proved(
+    own.status === 200 && own.json().total === 505 &&
+      own.json().items.length === 5,
+    'H2 OwnTone actual whole-catalog expansion beyond500',
+  );
+}
+
 try {
   await write('driver-identity', {
     taskRoot: item,
@@ -258,6 +714,8 @@ try {
       `${candidate}/layers/opensubsonic/capabilities.ts`,
     ),
     auth: await hash(`${candidate}/layers/opensubsonic/rest/10-auth.ts`),
+    library: await hash(`${candidate}/src/library.ts`),
+    params: await hash(`${candidate}/layers/opensubsonic/params.ts`),
   };
   await write('pins', pins);
   check(
@@ -582,6 +1040,8 @@ try {
       bookmarks[0].entry.id === songs[0].id,
     'scalar/unicode form precedence observed at bookmark consumer',
   );
+  // H2 retains every H1 assertion before adding its own catalog consumer gate.
+  if (phase === 'H2') await selectionConsumer();
 } catch (error) {
   latch(error);
 } finally {

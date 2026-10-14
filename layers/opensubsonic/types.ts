@@ -90,6 +90,15 @@ export interface HatContext {
       /** All music videos in the catalog (getVideos). */
       videos(): Promise<SongRow[]>;
       /** Random songs from the catalog (getRandomSongs pull-forward). */
+      randomSongs(
+        opts: {
+          size: number;
+          folderId?: string;
+          genre?: string;
+          fromYear?: number;
+          toYear?: number;
+        },
+      ): Promise<SongRow[]>;
       randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
       listGenres(): Promise<GenreRow[]>;
       songsByGenre(
