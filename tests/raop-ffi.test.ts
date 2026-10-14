@@ -220,3 +220,58 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    'FFI cancelPcm fences parked writes while preserving connection, feed and no-FLUSH peer state',
+  ignore: !HAVE_LIB,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const fake = await startFakeRaop();
+    let connected = false;
+    const transport = createFfiSpawn()((event, value) => {
+      if (event === 'state' && value === 'connected') connected = true;
+    });
+    try {
+      await transport.send({
+        cmd: 'start',
+        host: '127.0.0.1',
+        port: fake.port,
+        volume: 50,
+      });
+      await until('connected', () => connected);
+      let settled = false;
+      const pending = transport.pcm(new Uint8Array(4 * 176400)).then(() =>
+        settled = true
+      );
+      await until(
+        'actual feed with RTP and parked write',
+        () =>
+          transport.ownsSharedFeed() &&
+          (fake.sessions[0]?.audioPackets ?? 0) > 5 && !settled,
+      );
+      transport.cancelPcm();
+      await until('canceled parked write settles', () => settled, 1000);
+      await pending;
+      assert(
+        transport.ownsSharedFeed(),
+        'cancellation does not optimistically release token',
+      );
+      assertEquals(fake.sessions.length, 1);
+      assertEquals(fake.sessions[0].flushes, 0);
+      assertEquals(fake.sessions[0].teardowns, 0);
+      await transport.send({ cmd: 'volume', volume: 40 });
+      await until(
+        'retained connection observes new command',
+        () =>
+          fake.sessions[0].volumeParams.some((v) =>
+            v.startsWith('volume: -18.')
+          ),
+      );
+    } finally {
+      await transport.close();
+      fake.close();
+    }
+  },
+});

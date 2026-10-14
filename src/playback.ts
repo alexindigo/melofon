@@ -129,6 +129,8 @@ export function createPlayback(deps: {
     kind: string,
     detail: string | undefined,
     source?: CommandSource,
+    intent: LastCommand['intent'] = 'none',
+    queueCleared = false,
   ): void => {
     const src = source ?? { kind: 'internal' as const };
     last = {
@@ -136,6 +138,8 @@ export function createPlayback(deps: {
       ...(detail !== undefined ? { detail } : {}),
       source: src,
       atMs: Date.now(),
+      intent,
+      queueCleared,
     };
     logCmd(kind, detail, src);
   };
@@ -184,37 +188,37 @@ export function createPlayback(deps: {
 
     play(source) {
       player.play();
-      record('play', undefined, source);
+      record('play', undefined, source, 'play');
       flushState();
       emit(['player']);
     },
     pause(source) {
       player.pause();
-      record('pause', undefined, source);
+      record('pause', undefined, source, 'pause');
       flushState();
       emit(['player']);
     },
     stop(source) {
       player.stop();
-      record('stop', undefined, source);
+      record('stop', undefined, source, 'stop');
       flushState();
       emit(['player']);
     },
     toggle(source) {
       player.toggle();
-      record('toggle', undefined, source);
+      record('toggle', undefined, source, player.status().state);
       flushState();
       emit(['player']);
     },
     next(source) {
       player.next();
-      record('next', undefined, source);
+      record('next', undefined, source, player.status().state);
       flushState();
       emit(['player']);
     },
     previous(source) {
       player.previous();
-      record('previous', undefined, source);
+      record('previous', undefined, source, player.status().state);
       flushState();
       emit(['player']);
     },
@@ -257,6 +261,7 @@ export function createPlayback(deps: {
             ? `position_ms=${Math.trunc(opts.positionMs)}`
             : `seek_ms=${opts.seekMs ?? 0}`,
           source,
+          'play',
         );
         flushState();
         emit(['player']);
@@ -275,6 +280,8 @@ export function createPlayback(deps: {
           (opts.play ? ' play' : '') +
           (opts.position !== undefined ? ` position=${opts.position}` : ''),
         source,
+        opts.play ? 'play' : opts.clear ? 'stop' : 'none',
+        opts.clear === true,
       );
       // An insert can shift the current index, so the state row flushes
       // with the queue even when playback did not start or stop.
@@ -288,7 +295,7 @@ export function createPlayback(deps: {
     },
     queueClear(source) {
       player.queueClear();
-      record('queueClear', undefined, source);
+      record('queueClear', undefined, source, 'stop', true);
       flushQueue();
       flushState();
       // The clear also stopped the engine — both reads changed.
@@ -305,7 +312,12 @@ export function createPlayback(deps: {
 
     restore(snapshot) {
       player.restore(snapshot);
-      record('restore', undefined, { kind: 'internal', via: 'restore' });
+      record(
+        'restore',
+        undefined,
+        { kind: 'internal', via: 'restore' },
+        snapshot.state,
+      );
     },
 
     playerView: () => player.status(),

@@ -54,11 +54,13 @@ int raop_pin(raop_t *h, const char *pin);
  * events), -1 on error. */
 int raop_poll(raop_t *h, char *buf, size_t cap);
 
-/* Teardown (if needed), free, and release the shared runtime. Returns 0
- * when the handle was provably released (the loop thread ran the free) and
+/* Teardown (if needed), destroy all device-local native sessions/control
+ * sockets/queued callbacks, free, and release the shared runtime. Returns 0
+ * only after local connection destruction (not remote ACK/peer availability),
  * -1 when the free could not be queued — the handle is then leaked BY
  * DESIGN (never a use-after-free) and the caller must treat cleanup as
- * failed, not report retirement success. */
+ * failed, not report retirement success. May block for the native five-second
+ * final-write budget: Deno declares this function nonblocking and awaits it. */
 int raop_free(raop_t *h);
 
 #ifdef __cplusplus

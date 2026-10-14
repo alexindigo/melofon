@@ -16,6 +16,7 @@ import type { MdnsBrowser, MdnsService } from '../mdns.ts';
 import { createMdnsBrowser } from '../mdns.ts';
 import type { Outputs } from '../player.ts';
 import type { State } from '../state.ts';
+import type { ConnectionStrategy } from '../connection-strategy.ts';
 
 export const MDNS_KEY = 'airplay.mdns';
 
@@ -122,7 +123,12 @@ export interface AirplayDiscoveryDeps {
    * TXT omits `am` recovers it. */
   savedOutput?: (
     id: string,
-  ) => { selected: boolean; volume: number; model?: string } | undefined;
+  ) => {
+    selected: boolean;
+    volume: number;
+    model?: string;
+    connectionStrategy?: ConnectionStrategy;
+  } | undefined;
   log?: (msg: string) => void;
 }
 

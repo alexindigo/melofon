@@ -786,13 +786,18 @@ packet_prepare(AVPacket *pkt, struct stream_ctx *s)
   // This "wonderful" peace of code makes sure that the timestamp always increases,
   // even if the user seeked backwards. The muxer will not accept non-increasing
   // timestamps.
-  pkt->pts += s->offset_pts;
-  if (pkt->pts < s->prev_pts)
+  // Raw PCM frames may intentionally have unknown PTS. AV_NOPTS_VALUE is
+  // a sentinel, not a number to offset/subtract (0 - INT64_MIN overflows).
+  if (pkt->pts != AV_NOPTS_VALUE)
     {
-      s->offset_pts += s->prev_pts - pkt->pts;
-      pkt->pts = s->prev_pts;
+      pkt->pts += s->offset_pts;
+      if (pkt->pts < s->prev_pts)
+        {
+          s->offset_pts += s->prev_pts - pkt->pts;
+          pkt->pts = s->prev_pts;
+        }
+      s->prev_pts = pkt->pts;
     }
-  s->prev_pts = pkt->pts;
   pkt->dts = pkt->pts; //FIXME
 
   av_packet_rescale_ts(pkt, s->codec->time_base, s->stream->time_base);

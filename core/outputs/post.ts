@@ -6,9 +6,11 @@
 import { airplayOutputId } from '../../src/boots/airplay.ts';
 import { sessionFieldsFromTxt } from '../../src/boots/airplay-mdns.ts';
 import type { MdnsService } from '../../src/mdns.ts';
+import { isConnectionStrategy } from '../../src/connection-strategy.ts';
 import {
   type CommandSource,
   type Output,
+  type OutputRegistration,
   sourceFromRequest,
 } from '../../src/player.ts';
 
@@ -17,7 +19,7 @@ interface OutputsApp {
     outputs: {
       list(): Output[];
       get(id: string): Output | null;
-      register(output: Output, source?: CommandSource): void;
+      register(output: OutputRegistration, source?: CommandSource): void;
     };
     airplay?: {
       resolve(address: string): Promise<MdnsService | null>;
@@ -44,12 +46,19 @@ export default async function (
   } catch {
     return badRequest('JSON body with name, type and host is required');
   }
-  const { name, type, host, port } = (body ?? {}) as {
+  const { name, type, host, port, connectionStrategy } = (body ?? {}) as {
     name?: unknown;
     type?: unknown;
     host?: unknown;
     port?: unknown;
+    connectionStrategy?: unknown;
   };
+  if (
+    connectionStrategy !== undefined &&
+    !isConnectionStrategy(connectionStrategy)
+  ) {
+    return badRequest('invalid AirPlay connection strategy');
+  }
   if (typeof name !== 'string' || name.trim() === '') {
     return badRequest('name must be a non-empty string');
   }
@@ -59,7 +68,10 @@ export default async function (
   if (typeof host !== 'string' || host.trim() === '') {
     return badRequest('host must be a non-empty string');
   }
-  if (port !== undefined && (!Number.isInteger(port) || port <= 0)) {
+  if (
+    port !== undefined &&
+    (typeof port !== 'number' || !Number.isInteger(port) || port <= 0)
+  ) {
     return badRequest('port must be a positive integer');
   }
   const address = host.trim();
@@ -74,6 +86,7 @@ export default async function (
     type,
     selected: existing?.selected ?? false,
     volume: existing?.volume ?? 100,
+    ...(connectionStrategy === undefined ? {} : { connectionStrategy }),
   };
   if (svc !== null && (svc.txt.tp ?? '').includes('UDP')) {
     context.app.outputs.register({

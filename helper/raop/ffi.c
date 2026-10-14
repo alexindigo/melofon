@@ -51,6 +51,7 @@
 #include "logger.h"
 #include "misc.h"
 #include "outputs.h"
+#include "raop-bridge.h"
 
 /* The RAOP output backend (raop.c). */
 extern struct output_definition output_raop;
@@ -105,6 +106,7 @@ typedef struct free_sync
   pthread_mutex_t lock;
   pthread_cond_t cond;
   int done;
+  int result;
 } free_sync;
 
 typedef struct cmd
@@ -148,6 +150,10 @@ struct raop_handle
   cmd *cmds_tail;
   pthread_mutex_t cmds_lock;
   int cmds_scheduled;           /* one pending once-callback at a time */
+  struct event *resume_event;
+  cmd *release_command;
+  int release_completed;
+  int free_requested;
 
   struct raop_handle *next;
 };
@@ -162,6 +168,10 @@ static struct
   struct event_base *base;
   int handles;                 /* live handle count (runtime_lock) */
   bool running;
+  bool stopping;
+  bool starting;
+  bool startup_finished;
+  int startup_result;
   pthread_mutex_t lock;
   pthread_cond_t idle;
   uint64_t next_device_id;
@@ -410,15 +420,13 @@ device_start(raop_t *h, const cmd *c)
 }
 
 static void
-device_teardown(raop_t *h)
+device_released(raop_t *h)
 {
   if (!h->device)
     return;
 
   raop_player_session_stopped(h->player);
 
-  if (h->device->session)
-    output_raop.device_stop(h->device, 0);
   device_free(h);
 
   raop_player_flush(h->player);
@@ -427,30 +435,72 @@ device_teardown(raop_t *h)
   event_push(h, "stopped");
 }
 
-/* Loop thread: run every queued command. */
+static void cmds_drain_cb(evutil_socket_t fd, short what, void *arg);
+
+/* Native completion signals device ID, never a raw handle. Resume only on the
+ * preallocated owned event, not inline inside a still-running drain stack. */
+static void
+native_released(uint64_t id, int sent)
+{
+  raop_t *h;
+  pthread_mutex_lock(&rt.lock);
+  for (h = rt.handles_list; h; h = h->next) if (h->id == id) {
+    h->release_completed = 1;
+    if (sent < 0) DPRINTF(E_LOG, L_RAOP, "Local cleanup complete, final TEARDOWN unsent/failed for device %llu\n", (unsigned long long)id);
+    event_active(h->resume_event, EV_TIMEOUT, 1);
+    break;
+  }
+  pthread_mutex_unlock(&rt.lock);
+}
+
+/* Loop thread: serialize commands across native terminal release. */
 static void
 cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
 {
   raop_t *h = arg;
-  cmd *list;
   cmd *c;
-
   (void)fd; (void)what;
-
-  pthread_mutex_lock(&h->cmds_lock);
-  list = h->cmds_head;
-  h->cmds_head = h->cmds_tail = NULL;
-  h->cmds_scheduled = 0;
-  pthread_mutex_unlock(&h->cmds_lock);
-
-  while ((c = list) != NULL)
+  for (;;)
     {
-      list = c->next;
+      int released = 0;
+      if (h->release_command) {
+        if (!h->release_completed) return;
+        c = h->release_command;
+        h->release_command = NULL;
+        h->release_completed = 0;
+        device_released(h);
+        released = 1;
+      } else {
+        pthread_mutex_lock(&h->cmds_lock);
+        c = h->cmds_head;
+        if (!c) {
+          h->cmds_scheduled = 0;
+          pthread_mutex_unlock(&h->cmds_lock);
+          return;
+        }
+        h->cmds_head = c->next;
+        if (!h->cmds_head) h->cmds_tail = NULL;
+        pthread_mutex_unlock(&h->cmds_lock);
+      }
+      if (!released && (c->type == CMD_TEARDOWN || c->type == CMD_FREE ||
+                        (c->type == CMD_START && h->device))) {
+        raop_player_session_stopped(h->player);
+        h->release_command = c;
+        if (raop_release_device(h->id, native_released) == 0) return;
+        h->release_command = NULL;
+        DPRINTF(E_LOG, L_RAOP, "Native release could not start; retaining device ownership\n");
+        if (c->type == CMD_FREE) {
+          pthread_mutex_lock(&c->sync->lock);
+          c->sync->result = -1; c->sync->done = 1;
+          pthread_cond_signal(&c->sync->cond);
+          pthread_mutex_unlock(&c->sync->lock);
+        } else event_push(h, "failed");
+        free(c);
+        continue;
+      }
       switch (c->type)
         {
           case CMD_START:
-            if (h->device)
-              device_teardown(h);
             device_start(h, c);
             break;
 
@@ -469,7 +519,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             break;
 
           case CMD_TEARDOWN:
-            device_teardown(h);
+            /* device_released ran only after native sockets were destroyed. */
             break;
 
           case CMD_PIN:
@@ -478,24 +528,24 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             break;
 
           case CMD_FREE:
-            /* Free on the loop thread: the queue is drained and every
-             * earlier once-callback for this handle has already run (FIFO) —
-             * nothing pending references h any more. The player's tick
-             * cannot see it (unlinked before CMD_FREE was queued). A device
-             * still attached (the caller's teardown enqueue failed) is torn
-             * down here, so a 0 from raop_free always means fully
-             * released. */
-            if (h->device)
-              device_teardown(h);
+            /* Registry and runtime remain owned UNTIL native completion. */
+            pthread_mutex_lock(&rt.lock);
+            raop_t **link;
+            for (link = &rt.handles_list; *link; link = &(*link)->next)
+              if (*link == h) { *link = h->next; break; }
+            pthread_mutex_unlock(&rt.lock);
             raop_player_free(h->player);
+            event_free(h->resume_event);
             pthread_mutex_destroy(&h->events_lock);
             pthread_mutex_destroy(&h->cmds_lock);
+            free(h);
             pthread_mutex_lock(&c->sync->lock);
+            c->sync->result = 0;
             c->sync->done = 1;
             pthread_cond_signal(&c->sync->cond);
             pthread_mutex_unlock(&c->sync->lock);
-            free(h);
-            break;
+            free(c);
+            return;
         }
       free(c);
     }
@@ -518,6 +568,9 @@ cmd_push(raop_t *h, cmd *c)
   int schedule;
 
   pthread_mutex_lock(&h->cmds_lock);
+  if (h->free_requested && c->type != CMD_FREE) {
+    pthread_mutex_unlock(&h->cmds_lock); free(c); return -1;
+  }
   c->next = NULL;
   if (h->cmds_tail)
     h->cmds_tail->next = c;
@@ -526,20 +579,23 @@ cmd_push(raop_t *h, cmd *c)
   h->cmds_tail = c;
   schedule = !h->cmds_scheduled;
   h->cmds_scheduled = 1;
-  pthread_mutex_unlock(&h->cmds_lock);
 
   if (!schedule)
-    return 0; /* the pending drain will see this command */
+    {
+      pthread_mutex_unlock(&h->cmds_lock);
+      return 0; /* the pending drain will see this command */
+    }
 
-  /* Wakes the loop (evthread). Executes the queue ASAP. */
+  /* Keep scheduling and rollback under the queue lock: a concurrent FREE
+   * must not be accepted behind a provisional once-event that then fails.
+   * Otherwise its waiter can be stranded with no drain left to wake it. */
   if (event_base_once(rt.base, -1, EV_TIMEOUT, cmds_drain_cb, h, &zero) < 0)
     {
       cmd **link;
 
-      pthread_mutex_lock(&h->cmds_lock);
       /* c is in the queue (we just linked it) and no drain callback is
        * pending — schedule was true ⇔ cmds_scheduled was 0 — so nothing
-       * can have consumed it. Other threads may have appended behind it.
+       * can have consumed it. Concurrent pushes are held at the queue lock.
        * The failed push owns c: unlink it, free it, restore the flag. */
       link = &h->cmds_head;
       while (*link && *link != c)
@@ -562,6 +618,7 @@ cmd_push(raop_t *h, cmd *c)
       free(c);
       return -1;
     }
+  pthread_mutex_unlock(&h->cmds_lock);
   return 0;
 }
 
@@ -572,25 +629,24 @@ loop_main(void *arg)
 {
   (void)arg;
 
-  rt.base = event_base_new();
-  if (!rt.base)
-    {
-      fprintf(stderr, "[raop] event_base_new failed\n");
-      return NULL;
-    }
-  evbase_player = rt.base;
-
-  if (output_raop.init() < 0)
-    {
-      fprintf(stderr, "[raop] raop init failed\n");
-      return NULL;
-    }
+  struct event_base *base = event_base_new();
+  evbase_player = base;
+  int ready = base && output_raop.init() == 0;
+  pthread_mutex_lock(&rt.lock);
+  rt.base = ready ? base : NULL;
+  rt.startup_result = ready ? 0 : -1;
+  rt.startup_finished = true;
+  pthread_cond_broadcast(&rt.idle);
+  pthread_mutex_unlock(&rt.lock);
+  if (!ready) { if (base) event_base_free(base); evbase_player = NULL; return NULL; }
 
   event_base_dispatch(rt.base);
 
   output_raop.deinit();
   event_base_free(rt.base);
+  pthread_mutex_lock(&rt.lock);
   rt.base = NULL;
+  pthread_mutex_unlock(&rt.lock);
   evbase_player = NULL;
 
   return NULL;
@@ -603,32 +659,56 @@ runtime_acquire(void)
   int ret = 0;
 
   pthread_mutex_lock(&rt.lock);
+  /* Only the initializer owns startup publication/join. Other acquire calls
+   * wait through failure cleanup instead of attempting duplicate joins. */
+  while (rt.stopping || rt.starting) pthread_cond_wait(&rt.idle, &rt.lock);
   if (!rt.running)
     {
       const char *debug = getenv("MELOFON_RAOP_DEBUG");
       if (debug && (strcmp(debug, "1") == 0 || strcmp(debug, "true") == 0))
         helper_logger_set_severity(E_DBG);
 
-      gcry_check_version(NULL);
+      /* Application bootstrap precedes native playback threads. Pairing
+       * rejects an unfinished libgcrypt even when AES playback succeeded.
+       * Preserve an already-initialized in-process consumer and its secure
+       * memory policy; do not reconfigure/deinitialize global crypto. */
+      if (!gcry_check_version(GCRYPT_VERSION) ||
+          (!gcry_control(GCRYCTL_INITIALIZATION_FINISHED_P) &&
+           gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0) != 0))
+        {
+          fprintf(stderr, "[raop] libgcrypt initialization failed\n");
+          pthread_mutex_unlock(&rt.lock);
+          return -1;
+        }
       if (evthread_use_pthreads() != 0)
         {
           fprintf(stderr, "[raop] evthread_use_pthreads failed\n");
           pthread_mutex_unlock(&rt.lock);
           return -1;
         }
+      rt.starting = true;
+      rt.startup_finished = false;
       if (pthread_create(&rt.thread, NULL, loop_main, NULL) != 0)
         {
+          rt.starting = false;
+          pthread_cond_broadcast(&rt.idle);
           pthread_mutex_unlock(&rt.lock);
           return -1;
         }
       rt.running = true;
-      /* Give loop_main a moment to publish rt.base before commands queue. */
-      while (rt.base == NULL)
-        {
-          pthread_mutex_unlock(&rt.lock);
-          usleep(1000);
-          pthread_mutex_lock(&rt.lock);
-        }
+      while (!rt.startup_finished) pthread_cond_wait(&rt.idle, &rt.lock);
+      if (rt.startup_result < 0) {
+        rt.stopping = true;
+        pthread_mutex_unlock(&rt.lock);
+        pthread_join(rt.thread, NULL);
+        pthread_mutex_lock(&rt.lock);
+        rt.running = false; rt.stopping = false; rt.starting = false;
+        pthread_cond_broadcast(&rt.idle);
+        pthread_mutex_unlock(&rt.lock);
+        return -1;
+      }
+      rt.starting = false;
+      pthread_cond_broadcast(&rt.idle);
     }
   rt.handles++;
   pthread_mutex_unlock(&rt.lock);
@@ -645,14 +725,15 @@ runtime_release(void)
       pthread_mutex_unlock(&rt.lock);
       return;
     }
+  rt.stopping = true;
+  if (rt.base) event_base_loopbreak(rt.base);
   pthread_mutex_unlock(&rt.lock);
-
-  if (rt.base)
-    event_base_loopbreak(rt.base);
   pthread_join(rt.thread, NULL);
 
   pthread_mutex_lock(&rt.lock);
   rt.running = false;
+  rt.stopping = false;
+  pthread_cond_broadcast(&rt.idle);
   pthread_mutex_unlock(&rt.lock);
 }
 
@@ -684,6 +765,12 @@ raop_new(void)
       free(h);
       return NULL;
     }
+  h->resume_event = event_new(rt.base, -1, 0, cmds_drain_cb, h);
+  if (!h->resume_event) {
+    raop_player_free(h->player); runtime_release();
+    pthread_mutex_destroy(&h->events_lock); pthread_mutex_destroy(&h->cmds_lock);
+    free(h); return NULL;
+  }
 
   pthread_mutex_lock(&rt.lock);
   h->id = rt.next_device_id++;
@@ -832,35 +919,15 @@ raop_poll(raop_t *h, char *buf, size_t cap)
 int
 raop_free(raop_t *h)
 {
-  raop_t **link;
   free_sync sync;
   cmd *c;
 
   if (!h)
     return -1;
 
-  /* Teardown first if the caller didn't. A failed teardown enqueue is not
-   * fatal: the STOPPED wait would just time out, so skip it — the CMD_FREE
-   * path tears a still-attached device down on the loop thread. */
-  if (h->device)
-    {
-      if (raop_teardown(h) == 0)
-        {
-          /* Wait for the loop to run the teardown (state -> stopped). */
-          for (int i = 0; i < 5000 && h->state != OUTPUT_STATE_STOPPED; i++)
-            usleep(1000);
-        }
-    }
-
-  /* Out of the registry before the free is queued. */
-  pthread_mutex_lock(&rt.lock);
-  for (link = &rt.handles_list; *link; link = &(*link)->next)
-    if (*link == h)
-      {
-        *link = h->next;
-        break;
-      }
-  pthread_mutex_unlock(&rt.lock);
+  pthread_mutex_lock(&h->cmds_lock);
+  h->free_requested = 1;
+  pthread_mutex_unlock(&h->cmds_lock);
 
   /* Free ON the loop thread, after every queued command and every pending
    * drain callback for this handle (CMD_FREE is last-in, FIFO). */
@@ -875,7 +942,6 @@ raop_free(raop_t *h)
        * (the caller cannot tell a leak from a release without the -1). */
       pthread_mutex_destroy(&sync.lock);
       pthread_cond_destroy(&sync.cond);
-      runtime_release();
       return -1;
     }
   c->type = CMD_FREE;
@@ -888,7 +954,6 @@ raop_free(raop_t *h)
       pthread_mutex_unlock(&sync.lock);
       pthread_mutex_destroy(&sync.lock);
       pthread_cond_destroy(&sync.cond);
-      runtime_release();
       return -1;
     }
   while (!sync.done)
@@ -897,6 +962,6 @@ raop_free(raop_t *h)
   pthread_mutex_destroy(&sync.lock);
   pthread_cond_destroy(&sync.cond);
 
-  runtime_release();
-  return 0;
+  if (sync.result == 0) runtime_release();
+  return sync.result;
 }

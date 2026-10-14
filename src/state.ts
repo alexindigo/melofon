@@ -5,6 +5,10 @@
 // AirPlay mDNS discovery). Env/toml stay first-boot seeds (seedIfUnset) —
 // they never stomp an operator's persisted choice.
 import type { Db } from './db.ts';
+import {
+  CONNECTION_STRATEGY_DEFAULT_KEY,
+  requireConnectionStrategy,
+} from './connection-strategy.ts';
 
 export interface State {
   get(key: string): Promise<string | null>;
@@ -47,6 +51,9 @@ export function createState(db: Db): State {
     get,
 
     async set(key, value) {
+      if (key === CONNECTION_STRATEGY_DEFAULT_KEY) {
+        requireConnectionStrategy(value);
+      }
       await db.conn.run(
         `INSERT OR REPLACE INTO state (key, value) VALUES (${esc(key)}, ${
           esc(value)
@@ -56,6 +63,16 @@ export function createState(db: Db): State {
     },
 
     async seedIfUnset(key, value) {
+      if (key === CONNECTION_STRATEGY_DEFAULT_KEY) {
+        requireConnectionStrategy(value);
+        const res = await db.conn.runAndReadAll(
+          `INSERT INTO state (key, value) VALUES (${esc(key)}, ${esc(value)})
+           ON CONFLICT (key) DO NOTHING RETURNING value`,
+        );
+        if (res.getRowObjects().length === 0) return false;
+        emit(key, value);
+        return true;
+      }
       if (await get(key) !== null) return false;
       await db.conn.run(
         `INSERT INTO state (key, value) VALUES (${esc(key)}, ${esc(value)})`,

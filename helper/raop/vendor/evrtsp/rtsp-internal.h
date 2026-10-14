@@ -92,6 +92,11 @@ struct evrtsp_connection {
 	void *ciphercb_arg;
 
 	struct event_base *base;
+
+	int releasing;
+	struct event *release_deadline;
+	void (*release_done)(void *, int);
+	void *release_arg;
 };
 
 /* resets the connection; can be reused for more requests */

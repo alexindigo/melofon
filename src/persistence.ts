@@ -7,6 +7,10 @@
 // once at boot. drain() lets tests await the tail before closing and
 // reopening the db.
 import type { Db } from './db.ts';
+import {
+  DEFAULT_CONNECTION_STRATEGY,
+  requireConnectionStrategy,
+} from './connection-strategy.ts';
 import type {
   OutputPersistence,
   PersistedOutput,
@@ -136,17 +140,23 @@ export function createPersistence(db: Db): Persistence {
     },
 
     saveOutput(row) {
+      const connectionStrategy = requireConnectionStrategy(
+        row.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY,
+      );
+      row = { ...row, connectionStrategy };
       outputCache.set(row.id, row);
       enqueue(async () => {
         await db.conn.run(
           `INSERT INTO output_state (id, host, port, name, type, selected,
-             volume, model)
+             volume, model, connection_strategy)
            VALUES (${esc(row.id)},
              ${row.host === undefined ? 'NULL' : esc(row.host)},
              ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
              ${esc(row.name)}, ${esc(row.type)},
              ${row.selected}, ${Math.trunc(row.volume)},
-             ${row.model === undefined ? 'NULL' : esc(row.model)})
+             ${row.model === undefined ? 'NULL' : esc(row.model)}, ${
+            esc(connectionStrategy)
+          })
            ON CONFLICT (id) DO UPDATE SET
              host = excluded.host,
              port = excluded.port,
@@ -154,14 +164,15 @@ export function createPersistence(db: Db): Persistence {
              type = excluded.type,
              selected = excluded.selected,
              volume = excluded.volume,
-             model = excluded.model`,
+             model = excluded.model,
+             connection_strategy = excluded.connection_strategy`,
         );
       });
     },
 
     async loadOutputs() {
       const res = await db.conn.runAndReadAll(
-        'SELECT id, host, port, name, type, selected, volume, model FROM output_state',
+        'SELECT id, host, port, name, type, selected, volume, model, connection_strategy FROM output_state',
       );
       const rows = (res.getRowObjects() as {
         id: string;
@@ -172,6 +183,7 @@ export function createPersistence(db: Db): Persistence {
         selected: boolean;
         volume: number;
         model: string | null;
+        connection_strategy: string | null;
       }[]).map((row) => ({
         id: row.id,
         ...(row.host === null ? {} : { host: row.host }),
@@ -181,6 +193,9 @@ export function createPersistence(db: Db): Persistence {
         selected: row.selected,
         volume: Number(row.volume),
         ...(row.model === null ? {} : { model: row.model }),
+        connectionStrategy: requireConnectionStrategy(
+          row.connection_strategy ?? DEFAULT_CONNECTION_STRATEGY,
+        ),
       }));
       for (const row of rows) outputCache.set(row.id, row);
       return rows;

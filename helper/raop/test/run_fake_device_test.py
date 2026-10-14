@@ -6,6 +6,9 @@ sequence, RTP pacing, volume, flush, teardown)."""
 import ast
 import os
 import re
+import select
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -345,6 +348,145 @@ def free_contract_scenario():
           'branches)')
 
 
+def local_release_scenario():
+    probe = os.path.join(HERE, 'probe_local_release')
+    build = subprocess.run(['cc', '-O1', '-o', probe,
+        os.path.join(HERE, 'probe_local_release.c'), '-L', LIBDIR,
+        '-lmelofon_raop', '-ldl', '-Wl,-rpath', LIBDIR], capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    fake, port = start_fake({'FAKE_WITHHOLD_TEARDOWN': '1'})
+    try:
+        result = subprocess.run(
+            [probe, port], capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'LD_PRELOAD': FAULTINJECT})
+        assert result.returncode == 0 and 'LOCAL-RELEASE-OK' in result.stdout, \
+            f'local release not proven: {result.returncode} {result.stdout} {result.stderr[-400:]}'
+    finally:
+        fake.kill()
+    print('local-release test: OK (persistent peer, no TEARDOWN reply, local sockets destroyed before free returns)')
+
+
+def lifetime_scenarios():
+    for name in ['probe_runtime', 'probe_rtsp_release']:
+        probe = os.path.join(HERE, name)
+        build = subprocess.run(['cc', '-O1', '-g', '-o', probe,
+            probe + '.c', '-L', LIBDIR, '-lmelofon_raop', '-levent',
+            '-pthread', '-ldl', '-Wl,-rpath', LIBDIR], capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        if name == 'probe_runtime':
+            env = {**os.environ, 'LD_PRELOAD': FAULTINJECT, 'RAOP_FI_BASE_FAIL': '1'}
+            result = subprocess.run([probe, 'fail'], env=env, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0 and 'STARTUP-FAILURE-OK' in result.stdout, result.stderr
+            print(result.stdout.strip())
+            env = {**os.environ, 'LD_PRELOAD': FAULTINJECT, 'RAOP_FI_EBO_BLOCK_FAIL': '1'}
+            result = subprocess.run([probe, 'schedule-race'], env=env, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0 and 'CONCURRENT-SCHEDULE-ROLLBACK-OK' in result.stdout, result.stderr
+            print(result.stdout.strip())
+        result = subprocess.run([probe], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, f'{name}: {result.returncode} {result.stdout} {result.stderr}'
+        print(result.stdout.strip())
+
+
+def session_lifetime_scenarios(phases=None):
+    probe = os.path.join(HERE, 'probe_session_lifetime')
+    subprocess.run(['cc', '-O1', '-g', '-o', probe, probe + '.c',
+                    '-L', LIBDIR, '-lmelofon_raop', '-ldl',
+                    '-Wl,-rpath', LIBDIR], check=True)
+    for phase in phases or ['OPTIONS', 'ANNOUNCE', 'SETUP', 'RECORD', 'FLUSH', 'pair', 'restart']:
+        method = 'POST' if phase == 'pair' else phase
+        fake, port = start_fake({'FAKE_DELAY_METHOD': method, 'FAKE_WITHHOLD_TEARDOWN': '1'})
+        child = subprocess.Popen([probe, port, phase], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, env={**os.environ, 'LD_PRELOAD': FAULTINJECT})
+        try:
+            if phase != 'restart':
+                deadline = time.monotonic() + 10
+                seen = b''
+                flush_sent = False
+                while True:
+                    if time.monotonic() >= deadline:
+                        child.stdin.write('diagnose\n'); child.stdin.flush()
+                        out, err = child.communicate(timeout=10)
+                        raise AssertionError(f'never reached {phase}: seen={seen!r} stdout={out} stderr={err}')
+                    ready, _, _ = select.select([fake.stdout], [], [], 0.1)
+                    if ready:
+                        seen += os.read(fake.stdout.fileno(), 65536)
+                        if phase == 'FLUSH' and not flush_sent and b'AUDIO\n' in seen:
+                            child.stdin.write('flush\n'); child.stdin.flush()
+                            flush_sent = True
+                        if re.search(rb'SEEN \d+ ' + method.encode() + rb' 2\n', seen):
+                            break
+                child.stdin.write('release\n'); child.stdin.flush()
+            out, err = child.communicate(timeout=10)
+            assert child.returncode == 0 and 'SESSION-LIFETIME-OK' in out, f'{phase}: {child.returncode} {out} {err}'
+            report = read_report(fake)
+            assert report and all(c['closed_at'] is not None for c in report['connections']), report
+            print(out.strip())
+        finally:
+            if child.poll() is None: child.kill()
+            child.wait()
+            fake.kill(); fake.wait()
+
+
+def terminal_fault_scenarios(modes=None):
+    probe = os.path.join(HERE, 'probe_session_lifetime')
+    subprocess.run(['cc', '-O1', '-g', '-o', probe, probe + '.c',
+                    '-L', LIBDIR, '-lmelofon_raop', '-ldl', '-Wl,-rpath', LIBDIR], check=True)
+    for mode in modes or ['quiesce', 'release-alloc']:
+        arm = os.path.join(HERE, f'.fi-{mode}-{os.getpid()}')
+        fake, port = start_fake({'FAKE_WITHHOLD_TEARDOWN': '1'})
+        key = 'RAOP_FI_WRITE_BLOCK_ARM_FILE' if mode == 'quiesce' else 'RAOP_FI_RELEASE_ALLOC_ARM_FILE'
+        child = subprocess.Popen([probe, port, mode], stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    env={**os.environ, 'LD_PRELOAD': FAULTINJECT, key: arm})
+        def lines():
+            pending = b''
+            deadline = time.monotonic() + 10
+            while True:
+                if b'\n' in pending:
+                    line, pending = pending.split(b'\n', 1)
+                    yield line.decode()
+                    continue
+                assert time.monotonic() < deadline, 'fake observation timed out'
+                ready, _, _ = select.select([fake.stdout], [], [], 0.05)
+                if ready: pending += os.read(fake.stdout.fileno(), 65536)
+        observations = lines()
+        try:
+            control = seq = None
+            for line in observations:
+                if line.startswith('CONTROL 2 '): control = int(line.split()[2])
+                if line.startswith('RTP_SEQ '): seq = int(line.split()[1])
+                if control is not None and seq is not None: break
+            child.stdin.write('go\n'); child.stdin.flush()
+            if mode == 'quiesce':
+                assert child.stdout.readline().strip() == 'RETIRING'
+                time.sleep(0.03)  # Drain packets already sent before retirement.
+                def snapshot():
+                    fake.stdin.write('SNAPSHOT\n'); fake.stdin.flush()
+                    for line in observations:
+                        if line.startswith('SNAPSHOT '): return ast.literal_eval(line[9:])
+                before = snapshot()
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    for _ in range(12):
+                        sock.sendto(struct.pack('>BBHHH', 0x80, 0xd5, 1, seq, 1), ('127.0.0.1', control))
+                        time.sleep(0.001)
+                time.sleep(0.03)
+                after = snapshot()
+                child.stdin.write('finish\n'); child.stdin.flush()
+                out, err = child.communicate(timeout=10)
+                assert child.returncode == 0 and 'QUIESCENCE-OK' in out, f'{out} {err}'
+                assert before == after, f'retiring session retransmitted old audio: before={before} after={after}'
+                print('QUIESCENCE-OK retired-RTP-retransmit=0 while-final-write-blocked=1')
+            else:
+                out, err = child.communicate(timeout=10)
+                assert child.returncode == 0 and 'RELEASE-ALLOCATION-FAILURE-OK' in out, f'{out} {err}'
+                print(out.strip())
+        finally:
+            if child.poll() is None: child.kill()
+            child.wait(); fake.kill(); fake.wait()
+            if os.path.exists(arm): os.unlink(arm)
+
+
 def main():
     standard_scenario()
     backlog_scenario()
@@ -354,6 +496,10 @@ def main():
     schedfail_scenario()
     teardownfail_scenario()
     free_contract_scenario()
+    local_release_scenario()
+    lifetime_scenarios()
+    session_lifetime_scenarios()
+    terminal_fault_scenarios()
     return 0
 
 

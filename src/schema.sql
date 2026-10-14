@@ -164,3 +164,6 @@ CREATE TABLE IF NOT EXISTS output_state (
 -- (TXT `am`, e.g. AppleTV3,1) is identity, persisted so the recycle policy
 -- survives a restart. NULL on rows saved before this column reads unknown.
 ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR;
+-- Connection strategies: legacy speakers retain the chosen Melofon policy.
+ALTER TABLE output_state ADD COLUMN IF NOT EXISTS connection_strategy VARCHAR DEFAULT 'melofon';
+UPDATE output_state SET connection_strategy = 'melofon' WHERE connection_strategy IS NULL;

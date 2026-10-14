@@ -41,7 +41,13 @@ export interface FakeRaop {
 let sessionSeq = 0;
 
 export function startFakeRaop(
-  opts: { recordDelayMs?: number; teardownDelayMs?: number } = {},
+  opts: {
+    recordDelayMs?: number;
+    teardownDelayMs?: number;
+    withholdTeardownReply?: boolean;
+    setupDelayMs?: number;
+    flushDelayMs?: number;
+  } = {},
 ): Promise<FakeRaop> {
   const sessions: FakeRaopSession[] = [];
   const sockets: { close(): void }[] = [];
@@ -49,7 +55,7 @@ export function startFakeRaop(
   const started = performance.now();
   const now = () => performance.now() - started;
 
-  const tcp = Deno.listen({ port: 0 });
+  const tcp = Deno.listen({ hostname: '127.0.0.1', port: 0 });
   const port = (tcp.addr as Deno.NetAddr).port;
 
   const respond = async (conn: Deno.TcpConn) => {
@@ -73,7 +79,7 @@ export function startFakeRaop(
     sockets.push(udp);
     await new Promise<void>((resolve, reject) => {
       udp.once('error', reject);
-      udp.bind(0, () => resolve());
+      udp.bind(0, '127.0.0.1', () => resolve());
     });
     const audioPort = udp.address().port;
     udp.on('message', (msg) => {
@@ -86,13 +92,39 @@ export function startFakeRaop(
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     let buf = new Uint8Array(0);
+    const inbox: Uint8Array[] = [];
+    let ended = false;
+    let wake: (() => void) | undefined;
+    // Observe connection closure even while request response handling waits.
+    // One socket reader owns all bytes; the RTSP parser consumes its queue.
+    void (async () => {
+      try {
+        for (;;) {
+          const chunk = new Uint8Array(8192);
+          const n = await conn.read(chunk);
+          if (n === null) break;
+          inbox.push(chunk.subarray(0, n));
+          wake?.();
+          wake = undefined;
+        }
+      } catch {
+        /* owned socket closed */
+      } finally {
+        ended = true;
+        session.closedAtMs ??= now();
+        wake?.();
+        wake = undefined;
+      }
+    })();
     const readSome = async () => {
-      const chunk = new Uint8Array(8192);
-      const n = await conn.read(chunk);
-      if (n === null) return false;
-      const next = new Uint8Array(buf.length + n);
+      while (!inbox.length && !ended) {
+        await new Promise<void>((resolve) => wake = resolve);
+      }
+      const chunk = inbox.shift();
+      if (!chunk) return false;
+      const next = new Uint8Array(buf.length + chunk.length);
       next.set(buf);
-      next.set(chunk.subarray(0, n), buf.length);
+      next.set(chunk, buf.length);
       buf = next;
       return true;
     };
@@ -135,6 +167,13 @@ export function startFakeRaop(
         }
         if (method === 'FLUSH') session.flushes++;
         if (method === 'TEARDOWN') session.teardowns++;
+        if (method === 'TEARDOWN' && opts.withholdTeardownReply) continue;
+        const delay = method === 'SETUP'
+          ? opts.setupDelayMs
+          : method === 'FLUSH'
+          ? opts.flushDelayMs
+          : undefined;
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
 
         if (method === 'RECORD' && opts.recordDelayMs !== undefined) {
           await new Promise((resolve) =>
@@ -168,7 +207,7 @@ export function startFakeRaop(
     } catch {
       /* client went away */
     } finally {
-      session.closedAtMs = now();
+      session.closedAtMs ??= now();
       try {
         conn.close();
       } catch { /* already closed */ }

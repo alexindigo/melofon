@@ -76,6 +76,10 @@ class FakeTransport implements AirplayTransport {
     this.frames.push({ type: 'pcm', bytes: chunk.length });
     return Promise.resolve();
   }
+  ownsSharedFeed() {
+    return false;
+  }
+  cancelPcm() {}
   close() {
     this.closeCalls++;
     return (async () => {
@@ -144,9 +148,25 @@ async function setup(overrides: { retryBackoffMs?: number[] } = {}) {
 }
 
 Deno.test('airplay.retry config parse: default, clamp at 60, off', () => {
-  assertEquals(parseRetryBackoff(null), [0, 2, 5, 10, 20, 30, 60]);
-  assertEquals(parseRetryBackoff(''), [0, 2, 5, 10, 20, 30, 60]);
-  assertEquals(parseRetryBackoff('0,2,700,40'), [0, 2, 60, 40]);
+  assertEquals(parseRetryBackoff(null), [
+    0,
+    2000,
+    5000,
+    10000,
+    20000,
+    30000,
+    60000,
+  ]);
+  assertEquals(parseRetryBackoff(''), [
+    0,
+    2000,
+    5000,
+    10000,
+    20000,
+    30000,
+    60000,
+  ]);
+  assertEquals(parseRetryBackoff('0,2,700,40'), [0, 2000, 60000, 40000]);
   assertEquals(parseRetryBackoff('off'), null);
   assertEquals(parseRetryBackoff(' OFF '), null);
 });
@@ -159,6 +179,7 @@ function registerSelected(outputs: ReturnType<typeof createOutputs>) {
     selected: true,
     volume: 100,
     host: HOST,
+    connectionStrategy: 'owntone',
   });
 }
 
@@ -264,7 +285,7 @@ Deno.test('select while playing starts streaming (the HA flow)', async () => {
   }
 });
 
-Deno.test('pause flushes; resume re-decodes; stop tears down', async () => {
+Deno.test('OwnTone pause flushes, resume re-decodes, Stop holds; deselect immediately tears down', async () => {
   const { outputs, playback, spawned, close } = await setup();
   try {
     registerSelected(outputs);
@@ -285,6 +306,9 @@ Deno.test('pause flushes; resume re-decodes; stop tears down', async () => {
     await until('resume re-streams', () => t.pcmBytes() > before);
 
     playback.stop();
+    assertEquals(playback.playerView().current, null);
+    assert(!t.closed, 'OwnTone Stop starts its bounded quick-restart hold');
+    outputs.update(ID, { selected: false });
     await until(
       'teardown',
       () => t.cmds().some((c) => c.cmd === 'teardown') && t.closed,
@@ -346,6 +370,7 @@ Deno.test('deselect and unregister tear the helper down', async () => {
 
     // Again for unregister.
     registerSelected(outputs);
+    outputs.update(ID, { selected: true }); // Catalog registration is not a grant.
     await until('respawned', () => spawned.length === 2);
     const t2 = spawned[1];
     outputs.unregister(ID);
@@ -780,7 +805,7 @@ Deno.test('ATV3 track change: retires; the replacement decodes the new entry fro
   }
 });
 
-Deno.test('unaffected models (AppleTV2,1) keep FLUSH-based transitions', async () => {
+Deno.test('explicit OwnTone choice keeps FLUSH-based transitions regardless of model', async () => {
   const { outputs, playback, spawned, close } = await recycleSetup();
   try {
     outputs.register({
@@ -792,6 +817,7 @@ Deno.test('unaffected models (AppleTV2,1) keep FLUSH-based transitions', async (
       host: HOST,
       devtype: 'appletv',
       model: 'AppleTV2,1',
+      connectionStrategy: 'owntone',
     });
     playback.queueAdd([longSong()], { play: true });
     await until('spawned', () => spawned.length === 1);

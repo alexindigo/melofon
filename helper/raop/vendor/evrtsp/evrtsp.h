@@ -132,6 +132,15 @@ struct evrtsp_connection *evrtsp_connection_new(
 /** Frees an rtsp connection */
 void evrtsp_connection_free(struct evrtsp_connection *evcon);
 
+/* Melofon terminal local release: cancel stale callbacks; preserve a partial
+ * write tail; serialize the final request, write then destroy locally without
+ * reconnecting or waiting for a response. Absolute five-second write budget.
+ * Owns req (NULL closes without a final request). done runs AFTER destruction,
+ * possibly inline: 0 means locally written, -1 skipped/failed/unsent. */
+void evrtsp_connection_release(struct evrtsp_connection *evcon,
+    struct evrtsp_request *req, enum evrtsp_cmd_type type, const char *uri,
+    void (*done)(void *, int), void *arg);
+
 /** Set a callback for connection close. */
 void evrtsp_connection_set_closecb(struct evrtsp_connection *evcon,
     void (*)(struct evrtsp_connection *, void *), void *);

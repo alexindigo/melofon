@@ -45,8 +45,9 @@ await seedFirstUser(db, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();
 const notify = createNotify();
-const outputs = createOutputs({ notify, persistence });
 const state = createState(db);
+const outputs = createOutputs({ notify, persistence, state });
+await outputs.ready();
 const scan = createScan(db, media, { notify });
 const counts = await scan.run();
 console.log(
@@ -94,7 +95,11 @@ for (const row of savedOutputs) {
   const existing = outputs.get(row.id);
   if (existing !== null) {
     // Discovery beat the restore: keep its fresh record, apply user state.
-    outputs.update(row.id, { selected: row.selected, volume: row.volume }, {
+    outputs.update(row.id, {
+      selected: row.selected,
+      volume: row.volume,
+      connectionStrategy: row.connectionStrategy,
+    }, {
       kind: 'internal',
       via: 'restore',
     });
@@ -117,6 +122,7 @@ for (const row of savedOutputs) {
       type: row.type,
       selected: row.selected,
       volume: row.volume,
+      connectionStrategy: row.connectionStrategy,
       host: row.host,
       ...(row.port === undefined ? {} : { port: row.port }),
       ...(row.model === undefined ? {} : { model: row.model }),

@@ -15,6 +15,13 @@
 // it is a lie with boots attached (HA extrapolates past the end).
 import type { SongRow } from './library.ts';
 import type { Notify } from './notify.ts';
+import type { State } from './state.ts';
+import {
+  CONNECTION_STRATEGY_DEFAULT_KEY,
+  type ConnectionStrategy,
+  DEFAULT_CONNECTION_STRATEGY,
+  requireConnectionStrategy,
+} from './connection-strategy.ts';
 
 export interface QueueEntry {
   /** Queue-local int id (monotonic within the process, never reused). */
@@ -41,7 +48,7 @@ export interface CommandSource {
   client?: string;
 }
 
-/** The last engine mutation, for the /api/player last_command surface. */
+/** Internal retained provenance/intent record, never an OwnTone wire field. */
 export interface LastCommand {
   /** 'seek' | 'play' | 'pause' | 'queueAdd' | 'volume' | 'restore' | … */
   kind: string;
@@ -49,6 +56,8 @@ export interface LastCommand {
   detail?: string;
   source: CommandSource;
   atMs: number;
+  intent: 'play' | 'pause' | 'stop' | 'none';
+  queueCleared: boolean;
 }
 
 /** One greppable line per engine mutation (plan command-provenance) — the
@@ -294,6 +303,16 @@ export interface Output {
   /** The device wants a PIN/password (OwnTone needs_auth_key on the wire);
    * set by the boot when its helper reports the auth/verification path. */
   needsAuthKey?: boolean;
+  connectionStrategy: ConnectionStrategy;
+}
+
+export type OutputRegistration = Omit<Output, 'connectionStrategy'> & {
+  connectionStrategy?: ConnectionStrategy;
+};
+export interface OutputCommand {
+  kind: 'register' | 'unregister' | 'setEnabled' | 'toggle' | 'update';
+  source: CommandSource;
+  selection?: { id: string; selected: boolean }[];
 }
 
 export interface Outputs {
@@ -302,7 +321,9 @@ export interface Outputs {
   /** Adds a boot's output; last-wins when the id is already registered.
    * Mutations take a provenance source like the player commands (plan
    * command-provenance): [cmd]-logged, no wire surface this round. */
-  register(output: Output, source?: CommandSource): void;
+  register(output: OutputRegistration, source?: CommandSource): void;
+  ready(): Promise<void>;
+  lastCommand(): OutputCommand | null;
   /** Removes a registered output; false when the id was never registered. */
   unregister(id: string, source?: CommandSource): boolean;
   /** Enables exactly the given ids; false when any id is unknown. */
@@ -318,6 +339,7 @@ export interface Outputs {
       volume?: number;
       pin?: string;
       needsAuthKey?: boolean;
+      connectionStrategy?: ConnectionStrategy;
     },
     source?: CommandSource,
   ): Output | null;
@@ -338,6 +360,7 @@ export interface PersistedOutput {
   selected: boolean;
   volume: number;
   model?: string;
+  connectionStrategy?: ConnectionStrategy;
 }
 
 /** Persistence port for output remotes (plan restart-transparency):
@@ -346,6 +369,7 @@ export interface PersistedOutput {
  * falls back to. Fire-and-forget like the player port. */
 export interface OutputPersistence {
   saveOutput(row: PersistedOutput): void;
+  savedOutput?(id: string): PersistedOutput | undefined;
 }
 
 function clampVolume(n: number): number {
@@ -598,15 +622,58 @@ export function createPlayer(): Player {
 }
 
 export function createOutputs(
-  { notify, persistence }: {
+  { notify, persistence, state }: {
     notify?: Notify;
     persistence?: OutputPersistence;
+    state?: State;
   } = {},
 ): Outputs {
   const emit = (types: string[]) => notify?.emit(types);
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
+  let last: OutputCommand | null = null;
+  const record = (
+    kind: OutputCommand['kind'],
+    source?: CommandSource,
+    selection?: OutputCommand['selection'],
+  ) => {
+    last = {
+      kind,
+      source: source ?? { kind: 'internal' },
+      ...(selection === undefined ? {} : { selection }),
+    };
+  };
+  let defaultStrategy = DEFAULT_CONNECTION_STRATEGY;
+  let initialized = state === undefined;
+  let defaultRevision = 0;
+  state?.onChange((key, value) => {
+    if (key !== CONNECTION_STRATEGY_DEFAULT_KEY) return;
+    defaultStrategy = requireConnectionStrategy(value);
+    defaultRevision++;
+  });
+  const initialization = state === undefined
+    ? Promise.resolve()
+    : (async () => {
+      const before = defaultRevision;
+      let readRevision: number | undefined;
+      try {
+        await state.seedIfUnset(
+          CONNECTION_STRATEGY_DEFAULT_KEY,
+          DEFAULT_CONNECTION_STRATEGY,
+        );
+        readRevision = defaultRevision;
+        const value = await state.get(CONNECTION_STRATEGY_DEFAULT_KEY);
+        if (defaultRevision === readRevision) {defaultStrategy =
+            requireConnectionStrategy(value);}
+        initialized = true;
+      } catch (error) {
+        if (defaultRevision > (readRevision ?? before)) initialized = true;
+        else throw error;
+      }
+    })();
+  // The ready() caller owns the rejection; prevent an unobserved startup task.
+  void initialization.catch(() => {});
   const commandListeners = new Set<
     (id: string, cmd: { pin?: string }) => void
   >();
@@ -620,26 +687,49 @@ export function createOutputs(
       selected: o.selected,
       volume: o.volume,
       model: o.model,
+      connectionStrategy: o.connectionStrategy,
     });
 
   return {
+    ready: () => initialization,
+    lastCommand: () => last,
     list: () => outputs.map((o) => ({ ...o })),
     get: (id) => {
       const found = find(id);
       return found === null ? null : { ...found };
     },
     register(output, source) {
+      if (output.connectionStrategy !== undefined) {
+        requireConnectionStrategy(output.connectionStrategy);
+      }
+      if (!initialized) {
+        throw new Error(
+          'output strategy default not initialized; await outputs.ready()',
+        );
+      }
       const idx = outputs.findIndex((o) => o.id === output.id);
-      if (idx === -1) outputs.push({ ...output });
+      const saved = persistence?.savedOutput?.(output.id);
+      const connectionStrategy = output.connectionStrategy ??
+        find(output.id)?.connectionStrategy ??
+        (saved === undefined
+          ? defaultStrategy
+          : saved.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY);
+      requireConnectionStrategy(connectionStrategy);
+      if (idx === -1) outputs.push({ ...output, connectionStrategy });
       else {
         // Model is identity, not a session knob: a model-less same-id
         // re-registration (resolve timeout, TXT without `am`) keeps the
         // known model — only an explicit different model replaces it. No
         // other old field is merged forward.
         const model = output.model ?? outputs[idx].model;
-        outputs[idx] = { ...output, ...(model === undefined ? {} : { model }) };
+        outputs[idx] = {
+          ...output,
+          connectionStrategy,
+          ...(model === undefined ? {} : { model }),
+        };
       }
       saveRow(find(output.id)!);
+      record('register', source);
       logCmd('output.register', output.id, source ?? { kind: 'internal' });
       emit(['outputs']);
     },
@@ -647,6 +737,7 @@ export function createOutputs(
       const idx = outputs.findIndex((o) => o.id === id);
       if (idx === -1) return false;
       outputs.splice(idx, 1);
+      record('unregister', source);
       // The persisted row stays: last-seen state for a re-announcement.
       logCmd('output.unregister', id, source ?? { kind: 'internal' });
       emit(['outputs']);
@@ -656,6 +747,11 @@ export function createOutputs(
       if (ids.some((id) => find(id) === null)) return false;
       for (const o of outputs) o.selected = ids.includes(o.id);
       for (const o of outputs) saveRow(o);
+      record(
+        'setEnabled',
+        source,
+        outputs.map((o) => ({ id: o.id, selected: ids.includes(o.id) })),
+      );
       logCmd(
         'output.setEnabled',
         ids.join(','),
@@ -669,22 +765,42 @@ export function createOutputs(
       if (found === null) return null;
       found.selected = !found.selected;
       saveRow(found);
+      record('toggle', source, [{ id, selected: found.selected }]);
       logCmd('output.toggle', id, source ?? { kind: 'internal' });
       emit(['outputs']);
       return { ...found };
     },
     update(id, opts, source) {
+      if (opts.connectionStrategy !== undefined) {
+        requireConnectionStrategy(opts.connectionStrategy);
+      }
       const found = find(id);
       if (found === null) return null;
       if (opts.selected !== undefined) found.selected = opts.selected;
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
-      if (opts.selected !== undefined || opts.volume !== undefined) {
+      if (opts.connectionStrategy !== undefined) {
+        found.connectionStrategy = opts.connectionStrategy;
+      }
+      record(
+        'update',
+        source,
+        opts.selected === undefined
+          ? undefined
+          : [{ id, selected: opts.selected }],
+      );
+      if (
+        opts.selected !== undefined || opts.volume !== undefined ||
+        opts.connectionStrategy !== undefined
+      ) {
         saveRow(found);
         logCmd(
           'output.update',
           id +
             (opts.selected !== undefined ? ` selected=${opts.selected}` : '') +
-            (opts.volume !== undefined ? ` volume=${opts.volume}` : ''),
+            (opts.volume !== undefined ? ` volume=${opts.volume}` : '') +
+            (opts.connectionStrategy !== undefined
+              ? ` connectionStrategy=${opts.connectionStrategy}`
+              : ''),
           source ?? { kind: 'internal' },
         );
       }

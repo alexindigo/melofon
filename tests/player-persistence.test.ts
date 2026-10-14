@@ -372,6 +372,7 @@ Deno.test('output selection and volume survive a restart', async () => {
       type: 'AirPlay',
       selected: true,
       volume: 42,
+      connectionStrategy: 'melofon',
     });
     const kitchen = rows.find((r) => r.id === '222')!;
     assertEquals(kitchen.selected, true, 'the toggle persisted');

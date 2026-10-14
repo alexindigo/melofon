@@ -3,6 +3,7 @@
 enough RTSP to get melofon-raop streaming, then counts RTP audio packets on
 the UDP server port. Prints one REPORT line on stdin EOF."""
 import os
+import queue
 import select
 import socket
 import socketserver
@@ -16,6 +17,8 @@ RECORD_DELAY_MS = int(os.environ.get('FAKE_RECORD_DELAY_MS', '0'))
 # The JBL: refuse the ANNOUNCE (403) — the session fails and teardown+free
 # must stay clean (the evbuffer UAF crash).
 ANNOUNCE_403 = os.environ.get('FAKE_ANNOUNCE_403') == '1'
+WITHHOLD_TEARDOWN = os.environ.get('FAKE_WITHHOLD_TEARDOWN') == '1'
+DELAY_METHOD = os.environ.get('FAKE_DELAY_METHOD', '')
 
 state = {
     'requests': [],
@@ -40,6 +43,8 @@ state = {
     'dacp_ids': set(),
     'client_instances': set(),
     'active_remotes': set(),
+    'connections': [],
+    'audio_by_source': {},
 }
 
 NTP_EPOCH_DELTA = 2208988800
@@ -58,15 +63,19 @@ class UDPCollector(threading.Thread):
 
     def run(self):
         while True:
-            data, _ = self.sock.recvfrom(4096)
+            data, source = self.sock.recvfrom(4096)
             if len(data) < 12:
                 continue
             state['audio_packets'] += 1
+            source_port = source[1]
+            state['audio_by_source'][source_port] = state['audio_by_source'].get(source_port, 0) + 1
             state['payload_types'].add(data[1] & 0x7F)
             state['seqs'].append(struct.unpack('>H', data[2:4])[0])
             now = time.monotonic()
             if state['first_rtp_at'] is None:
                 state['first_rtp_at'] = now
+                print('AUDIO', flush=True)
+                print(f'RTP_SEQ {struct.unpack(">H", data[2:4])[0]}', flush=True)
             state['last_rtp_at'] = now
 
 
@@ -108,11 +117,31 @@ ControlCollector(control_sock).start()
 class RTSPHandler(socketserver.BaseRequestHandler):
     timing_port = None
 
+    def setup(self):
+        self.chunks = queue.Queue()
+        self.connection = {'generation': len(state['connections']) + 1,
+                           'closed_at': None, 'requests': []}
+        state['connections'].append(self.connection)
+        # Observe EOF even while the response handler is deliberately delayed.
+        def reader():
+            try:
+                while True:
+                    data = self.request.recv(65536)
+                    if not data:
+                        break
+                    self.chunks.put(data)
+            except OSError:
+                pass
+            finally:
+                self.connection['closed_at'] = time.monotonic()
+                self.chunks.put(b'')
+        threading.Thread(target=reader, daemon=True).start()
+
     def handle(self):
         buf = b''
         while True:
             try:
-                data = self.request.recv(65536)
+                data = self.chunks.get()
             except OSError:
                 return
             if not data:
@@ -131,15 +160,19 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                         headers[k.lower()] = v
                 clen = int(headers.get('content-length', '0'))
                 while len(buf) < clen:
-                    chunk = self.request.recv(65536)
+                    chunk = self.chunks.get()
                     if not chunk:
                         return
                     buf += chunk
                 body, buf = buf[:clen], buf[clen:]
 
+                state['requests'].append(method)
+                self.connection['requests'].append(method)
+                print(f'SEEN {self.connection["generation"]} {method} {headers.get("active-remote", "0")}', flush=True)
+                if method == DELAY_METHOD and headers.get('active-remote') == '2':
+                    time.sleep(0.6)
                 if method == 'RECORD' and RECORD_DELAY_MS > 0:
                     time.sleep(RECORD_DELAY_MS / 1000)
-                state['requests'].append(method)
                 if headers.get('dacp-id'):
                     state['dacp_ids'].add(headers['dacp-id'])
                 if headers.get('client-instance'):
@@ -149,6 +182,7 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                 cseq = headers.get('cseq', '0')
                 if method == 'SETUP':
                     print(f'SETUP headers: {headers!r}', file=sys.stderr, flush=True)
+                    print(f'CONTROL {headers.get("active-remote", "0")} {headers["transport"].split("control_port=")[1].split(";")[0]}', flush=True)
                 if method == 'ANNOUNCE':
                     state['sdp'] = body.decode(errors='replace')
                 if method == 'RECORD':
@@ -171,6 +205,9 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     state['flushes'] += 1
                 if method == 'TEARDOWN':
                     state['teardowns'] += 1
+                    if WITHHOLD_TEARDOWN:
+                        # Keep reading the socket independently, never ack it.
+                        continue
 
                 extra = ''
                 if method == 'OPTIONS':
@@ -209,7 +246,10 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                 else:
                     res = (f'RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n{extra}'
                            f'Server: fake-raop\r\nContent-Length: 0\r\n\r\n')
-                self.request.sendall(res.encode())
+                try:
+                    self.request.sendall(res.encode())
+                except OSError:
+                    return
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -223,8 +263,11 @@ print(f'listening {server.server_address[1]}', flush=True)
 
 while True:
     r, _, _ = select.select([sys.stdin], [], [], 1)
-    if r and sys.stdin.readline() == '':
-        break
+    if r:
+        line = sys.stdin.readline()
+        if line == '': break
+        if line.strip() == 'SNAPSHOT':
+            print('SNAPSHOT ' + repr(state['audio_by_source']), flush=True)
 
 report = dict(state)
 report['seqs'] = state['seqs']

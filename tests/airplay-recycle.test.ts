@@ -32,11 +32,22 @@ import {
   type HelperEventFn,
 } from '../src/boots/airplay.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
+import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
 
 const LIB_PATH = decodeURIComponent(
   new URL('../helper/raop/libmelofon_raop.so', import.meta.url).pathname,
 );
 const HAVE_LIB = await Deno.stat(LIB_PATH).then(() => true).catch(() => false);
+// Optional test-only LD_PRELOAD observer. The explicit verification run loads
+// this same inode before Deno starts, so counters observe native connect/close,
+// independently of helper state and delayed receiver EOF.
+const observerPath = Deno.env.get('MELOFON_RAOP_FAULT_OBSERVER');
+const observer = observerPath
+  ? Deno.dlopen(observerPath, {
+    raop_fi_last_generation: { parameters: [], result: 'u64' },
+    raop_fi_generation_live: { parameters: ['u64'], result: 'i32' },
+  })
+  : null;
 
 const ATV3 = 'AppleTV3,1';
 const HOST_A = '192.0.2.10';
@@ -160,6 +171,10 @@ class FeedFakeTransport implements AirplayTransport {
       }
     })();
   }
+  ownsSharedFeed() {
+    return FeedFakeTransport.feed === this.token;
+  }
+  cancelPcm() {}
   totalBytes() {
     return this.acceptedBytes + this.droppedBytes;
   }
@@ -231,6 +246,7 @@ function register(
     host,
     devtype: 'appletv',
     ...(model === undefined ? {} : { model }),
+    connectionStrategy: model === ATV3 ? 'melofon' : 'owntone',
   });
 }
 
@@ -362,6 +378,7 @@ Deno.test('feed handoff: a peer connecting during a retirement joins the pending
     // A NEW selected output appears mid-retirement (catalog event + hub
     // select edge): its first pump must wait for the batch.
     register(outputs, HOST_C);
+    outputs.update(airplayOutputId(HOST_C), { selected: true });
     await until(
       'C spawned',
       () =>
@@ -518,6 +535,9 @@ interface Integration {
   fakeA: Awaited<ReturnType<typeof startFakeRaop>>;
   fakeB: Awaited<ReturnType<typeof startFakeRaop>>;
   decodeCalls: DecodeCall[];
+  companionFirst: boolean;
+  native: AirplayTransport[];
+  localReleases: bigint[];
   close: () => Promise<void>;
 }
 
@@ -525,6 +545,7 @@ async function integrationSetup(opts: {
   aRecordDelayMs?: number;
   bRecordDelayMs?: number;
   aTeardownDelayMs?: number;
+  companionFirst?: boolean;
 }): Promise<Integration> {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-rec-ffi-' });
   const db = await openDb(dir);
@@ -549,7 +570,46 @@ async function integrationSetup(opts: {
   });
   const fakeB = await startFakeRaop({ recordDelayMs: opts.bRecordDelayMs });
   // The REAL boot: its default spawn is the FFI transport.
-  const boot = createAirplayBoot({ outputs, playback, media, notify });
+  const native: AirplayTransport[] = [];
+  const localReleases: bigint[] = [];
+  const ffiSpawn = createFfiSpawn();
+  const boot = createAirplayBoot({
+    outputs,
+    playback,
+    media,
+    notify,
+    spawn: (event) => {
+      let generation: bigint | undefined;
+      const underlying = ffiSpawn((name, value) => {
+        if (
+          observer && generation === undefined && name === 'state' &&
+          value === 'connected'
+        ) {
+          generation = observer.symbols.raop_fi_last_generation();
+        }
+        event(name, value);
+      });
+      const transport: AirplayTransport = {
+        send: (command) => underlying.send(command),
+        pcm: (data) => underlying.pcm(data),
+        ownsSharedFeed: () => underlying.ownsSharedFeed(),
+        cancelPcm: () => underlying.cancelPcm(),
+        async close() {
+          await underlying.close();
+          if (observer && generation !== undefined) {
+            assertEquals(
+              observer.symbols.raop_fi_generation_live(generation),
+              0,
+              'native TCP generation destroyed before close resolves/replacement',
+            );
+            localReleases.push(generation);
+          }
+        },
+      };
+      native.push(transport);
+      return transport;
+    },
+  });
 
   const registerAt = (
     id: string,
@@ -564,12 +624,15 @@ async function integrationSetup(opts: {
       id,
       name,
       type: 'AirPlay',
-      selected: true,
+      selected: opts.companionFirst === true
+        ? id === '222222222222'
+        : id === '111111111111',
       volume: 100,
       host: '127.0.0.1',
       port,
       devtype: 'appletv',
       ...(model === undefined ? {} : { model }),
+      connectionStrategy: model === ATV3 ? 'melofon' : 'owntone',
     });
   };
   registerAt('111111111111', fakeA.port, 'arbat (affected)', ATV3);
@@ -581,6 +644,9 @@ async function integrationSetup(opts: {
     fakeA,
     fakeB,
     decodeCalls,
+    companionFirst: opts.companionFirst === true,
+    native,
+    localReleases,
     close: async () => {
       await boot.close();
       fakeA.close();
@@ -616,6 +682,19 @@ async function seekBattery(
     (_, i) => longSong(`${label}-${i + 1}`),
   );
   it.playback.queueAdd(songs, { play: true });
+  const owner = it.companionFirst ? it.fakeB : it.fakeA;
+  await until(
+    'intended feed alone actually streaming',
+    () => (owner.sessions[0]?.audioPackets ?? 0) > 2,
+  );
+  assertEquals(it.native.length, 1, 'only intended owner selected initially');
+  assert(
+    it.native[0].ownsSharedFeed(),
+    'observe production feed ownership, not RTP at both receivers',
+  );
+  it.outputs.update(it.companionFirst ? '111111111111' : '222222222222', {
+    selected: true,
+  });
   await until(
     `${label}: both receivers streaming`,
     () =>
@@ -637,6 +716,18 @@ async function seekBattery(
         (it.fakeA.sessions[i]?.audioPackets ?? 0) > 2,
     );
     const nowA = it.fakeA.sessions[i];
+    if (observer) {
+      assertEquals(
+        it.localReleases.length,
+        i,
+        `${label} cycle ${i}: native destruction observed before replacement`,
+      );
+      assertEquals(
+        new Set(it.localReleases).size,
+        i,
+        'distinct connection generations, never FD identity',
+      );
+    }
     assert(
       nowA.requests.some((r) => r.method === 'SETUP') &&
         nowA.requests.some((r) => r.method === 'RECORD'),
@@ -764,13 +855,12 @@ Deno.test({
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
-    // The affected receiver's RECORD is fast, the companion's is slow (so
-    // the companion's PCM is the feed), and the affected's TEARDOWN reply
-    // drags: old-session cleanup overlaps the replacement.
+    // Select companion ALONE, observe actual feed, then explicitly select A.
     const it = await integrationSetup({
       aRecordDelayMs: 0,
       bRecordDelayMs: 400,
       aTeardownDelayMs: 150,
+      companionFirst: true,
     });
     try {
       await seekBattery('b-first', it, 40);

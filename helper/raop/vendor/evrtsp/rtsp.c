@@ -186,6 +186,23 @@ static int evrtsp_add_header_internal(struct evkeyvalq *headers,
 void evrtsp_read(int, short, void *);
 void evrtsp_write(int, short, void *);
 
+static void
+evrtsp_release_finish(struct evrtsp_connection *evcon, int sent)
+{
+  void (*done)(void *, int) = evcon->release_done;
+  void *arg = evcon->release_arg;
+  evcon->release_done = NULL;
+  evcon->closecb = NULL;
+  evrtsp_connection_free(evcon);
+  if (done) done(arg, sent);
+}
+
+static void
+evrtsp_release_deadline(int fd, short what, void *arg)
+{
+  evrtsp_release_finish(arg, -1);
+}
+
 #ifndef EVENT__HAVE_STRSEP
 /* strsep replacement for platforms that lack it.  Only works if
  * del is one character long. */
@@ -457,6 +474,18 @@ evrtsp_write(int fd, short what, void *arg)
 	struct evrtsp_connection *evcon = arg;
 	int n;
 
+	if (evcon->releasing) {
+		n = evbuffer_write(evcon->output_raw, fd);
+		if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+			event_add(&evcon->ev, NULL); return;
+		}
+		if (n <= 0) { evrtsp_release_finish(evcon, -1); return; }
+		if (evbuffer_get_length(evcon->output_raw)) {
+			event_add(&evcon->ev, NULL); return;
+		}
+		evrtsp_release_finish(evcon, 0); return;
+	}
+
 	if (what == EV_TIMEOUT) {
 		event_warn("%s: write timeout", __func__);
 		evrtsp_connection_fail(evcon, EVCON_RTSP_TIMEOUT);
@@ -680,6 +709,8 @@ evrtsp_connection_free(struct evrtsp_connection *evcon)
 {
 	struct evrtsp_request *req;
 
+	if (evcon->release_deadline != NULL) event_free(evcon->release_deadline);
+
 	/* notify interested parties that this connection is going down */
 	if (evcon->fd != -1) {
 		if (evrtsp_connected(evcon) && evcon->closecb != NULL)
@@ -720,6 +751,65 @@ evrtsp_connection_free(struct evrtsp_connection *evcon)
 		evbuffer_free(evcon->output_raw);
 
 	free(evcon);
+}
+
+void
+evrtsp_connection_release(struct evrtsp_connection *evcon,
+    struct evrtsp_request *req, enum evrtsp_cmd_type type, const char *uri,
+    void (*done)(void *, int), void *arg)
+{
+  struct evrtsp_request *old;
+  struct evkeyval *header;
+  size_t expected, before;
+  struct timeval budget = { 5, 0 };
+  evcon->releasing = 1;
+  evcon->release_done = done;
+  evcon->release_arg = arg;
+  evcon->closecb = NULL;
+  evcon->cb = NULL;
+  if (event_initialized(&evcon->ev)) event_del(&evcon->ev);
+  if (event_initialized(&evcon->close_ev)) event_del(&evcon->close_ev);
+  while ((old = TAILQ_FIRST(&evcon->requests)) != NULL) {
+    TAILQ_REMOVE(&evcon->requests, old, next);
+    old->evcon = NULL;
+    evrtsp_request_free(old);
+  }
+  if (!req || !evrtsp_connected(evcon) || evcon->fd < 0) {
+    if (req) evrtsp_request_free(req);
+    evrtsp_release_finish(evcon, -1); return;
+  }
+  req->kind = EVRTSP_REQUEST;
+  req->type = type;
+  req->major = 1; req->minor = 0;
+  free(req->uri);
+  req->uri = strdup(uri);
+  if (!req->uri) {
+    evrtsp_request_free(req); evrtsp_release_finish(evcon, -1); return;
+  }
+  /* Empty-body TEARDOWN, built by raop_add_headers; detect partial header
+   * serialization instead of claiming a successful write after OOM. */
+  expected = strlen(evrtsp_method(type)) + strlen(uri) + strlen("  RTSP/1.0\r\n\r\n");
+  TAILQ_FOREACH(header, req->output_headers, next)
+    expected += strlen(header->key) + strlen(header->value) + 4;
+  before = evbuffer_get_length(evcon->output_buffer);
+  evrtsp_make_header(evcon, req);
+  evrtsp_request_free(req);
+  if (evbuffer_get_length(evcon->output_buffer) != before + expected) {
+    evrtsp_release_finish(evcon, -1); return;
+  }
+  /* Keep output_raw's old request tail. Cipher the new ordinary request
+   * after it using the original cipher callback, never splice/discard it. */
+  if (!evcon->ciphercb) evbuffer_add_buffer(evcon->output_raw, evcon->output_buffer);
+  else if (evcon->ciphercb(evcon->output_raw, evcon->output_buffer, evcon->ciphercb_arg, 1) < 0 ||
+           evbuffer_get_length(evcon->output_buffer)) {
+    evrtsp_release_finish(evcon, -1); return;
+  }
+  evcon->release_deadline = evtimer_new(evcon->base, evrtsp_release_deadline, evcon);
+  if (!evcon->release_deadline || evtimer_add(evcon->release_deadline, &budget) < 0) {
+    evrtsp_release_finish(evcon, -1); return;
+  }
+  event_assign(&evcon->ev, evcon->base, evcon->fd, EV_WRITE, evrtsp_write, evcon);
+  if (event_add(&evcon->ev, NULL) < 0) evrtsp_release_finish(evcon, -1);
 }
 
 static void

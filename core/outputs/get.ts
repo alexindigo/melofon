@@ -12,6 +12,7 @@ export default function (
           type: string;
           selected: boolean;
           volume: number;
+          connectionStrategy: string;
           host?: string;
           port?: number;
         }[];

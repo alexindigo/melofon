@@ -194,6 +194,8 @@ struct raop_session
   struct evrtsp_connection *ctrl;
 
   enum raop_state state;
+  bool retiring;
+  struct melofon_release *release;
 
   uint16_t wanted_metadata;
   bool req_has_auth;
@@ -1780,6 +1782,7 @@ static void
 raop_status(struct raop_session *rs)
 {
   enum output_device_state state;
+  if (rs->retiring) return;
 
   switch (rs->state)
     {
@@ -1959,6 +1962,11 @@ session_free(struct raop_session *rs)
   if (rs->server_fd >= 0)
     close(rs->server_fd);
 
+  pair_verify_free(rs->pair_verify_ctx);
+  rs->pair_verify_ctx = NULL;
+  pair_setup_free(rs->pair_setup_ctx);
+  rs->pair_setup_ctx = NULL;
+
   free(rs->realm);
   free(rs->nonce);
   free(rs->session);
@@ -1989,6 +1997,72 @@ session_cleanup(struct raop_session *rs)
   outputs_device_session_remove(rs->device_id);
 
   session_free(rs);
+}
+
+/* Melofon device-ID-owned release. No helper handle/layout in session state. */
+struct melofon_release {
+  uint64_t id;
+  int pending;
+  int unsent;
+  void (*done)(uint64_t, int);
+};
+
+static void
+melofon_session_released(void *arg, int sent)
+{
+  struct raop_session *rs = arg;
+  struct melofon_release *release = rs->release;
+  rs->ctrl = NULL; /* evrtsp already destroyed the local control socket. */
+  if (sent < 0) release->unsent = -1;
+  session_cleanup(rs);
+  if (--release->pending == 0) {
+    uint64_t id = release->id;
+    int unsent = release->unsent;
+    void (*done)(uint64_t, int) = release->done;
+    free(release);
+    done(id, unsent);
+  }
+}
+
+int
+raop_release_device(uint64_t id, void (*done)(uint64_t, int))
+{
+  struct raop_session *rs, *next;
+  struct melofon_release *release;
+  int count = 0;
+  for (rs = raop_sessions; rs; rs = rs->next) if (rs->device_id == id) count++;
+  if (!count) { done(id, 0); return 0; }
+  release = calloc(1, sizeof(*release));
+  if (!release) return -1;
+  release->id = id; release->pending = count; release->done = done;
+  /* Quiesce the entire batch before any inline terminal callback. */
+  for (rs = raop_sessions; rs; rs = rs->next) if (rs->device_id == id) {
+    rs->retiring = true;
+    rs->release = release;
+    rs->state = RAOP_STATE_STOPPED; /* No connected-bit work can be queued. */
+    rs->callback_id = -1;
+    rs->reqs_in_flight = 0;
+    event_del(rs->deferredev);
+  }
+  for (rs = raop_sessions; rs; rs = next) {
+    struct evrtsp_request *req = NULL;
+    next = rs->next;
+    if (rs->device_id != id) continue;
+    if (rs->session) {
+      req = evrtsp_request_new(NULL, NULL);
+      if (req && raop_add_headers(rs, req, EVRTSP_REQ_TEARDOWN) < 0) {
+        evrtsp_request_free(req); req = NULL;
+      }
+    }
+    if (rs->ctrl)
+      evrtsp_connection_release(rs->ctrl, req, EVRTSP_REQ_TEARDOWN, rs->session_url,
+                               melofon_session_released, rs);
+    else {
+      if (req) evrtsp_request_free(req);
+      melofon_session_released(rs, -1);
+    }
+  }
+  return 0;
 }
 
 static void
@@ -2933,6 +3007,11 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
   uint16_t s;
   int i;
   bool pkt_missing = false;
+
+  /* The shared control service remains alive for peers during terminal
+   * write/close. A retiring session must not send cached old audio or queue
+   * a deferred failure while its native release owns destruction. */
+  if (rs->retiring) return;
 
   rtp_session = rs->master_session->rtp_session;
 
@@ -3935,6 +4014,7 @@ raop_cb_pair_verify_step2(struct evrtsp_request *req, void *arg)
   int ret;
 
   pair_verify_free(rs->pair_verify_ctx);
+  rs->pair_verify_ctx = NULL;
 
   ret = raop_pair_response_process(5, req, rs);
   if (ret < 0)

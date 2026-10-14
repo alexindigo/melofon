@@ -49,7 +49,7 @@ const SYMBOLS = {
   raop_poll: { parameters: ['pointer', 'buffer', 'usize'], result: 'i32' },
   // -1 = the native free could not be queued; the handle is leaked by design
   // and close() must report failure, not retirement success (ffi.h).
-  raop_free: { parameters: ['pointer'], result: 'i32' },
+  raop_free: { parameters: ['pointer'], result: 'i32', nonblocking: true },
 } as const;
 
 type RaopLibrary = Deno.DynamicLibrary<typeof SYMBOLS>;
@@ -221,12 +221,12 @@ class FfiTransport implements AirplayTransport {
   }
 
   async pcm(chunk: Uint8Array): Promise<void> {
-    if (this.closed) return;
+    const gen = this.writeGen;
+    if (this.closed || this.writeGen !== gen) return;
     // Feed election: the first writer owns the shared stream; every other
     // selected output's PCM is accepted and dropped (see the header).
     if (feed === null) feed = this.token;
     if (feed !== this.token) return;
-    const gen = this.writeGen;
     let offset = 0;
     while (offset < chunk.length) {
       // Abandon the remaining bytes when a FLUSH/TEARDOWN/close landed
@@ -248,6 +248,14 @@ class FfiTransport implements AirplayTransport {
     }
   }
 
+  ownsSharedFeed(): boolean {
+    return feed === this.token;
+  }
+
+  cancelPcm(): void {
+    this.writeGen++;
+  }
+
   close(): Promise<void> {
     // Memoized, including rejection: a repeated close must not turn a
     // failed retirement into a success.
@@ -255,13 +263,13 @@ class FfiTransport implements AirplayTransport {
     this.closed = true;
     this.writeGen++; // cancel in-flight stale PCM writes before native free
     clearInterval(this.pollTimer);
-    this.closePromise = (() => {
+    this.closePromise = (async () => {
       try {
         this.lib.symbols.raop_teardown(this.handle);
       } catch { /* the library is already gone */ }
       let rc: number;
       try {
-        rc = this.lib.symbols.raop_free(this.handle);
+        rc = await this.lib.symbols.raop_free(this.handle);
       } catch {
         rc = -1;
       }
@@ -269,13 +277,10 @@ class FfiTransport implements AirplayTransport {
         // The handle is leaked by design (never a UAF). The feed token is
         // NOT released: no optimistic rerouting through broken native
         // state — the boot's blocked lifecycle record keeps this loud.
-        return Promise.reject(
-          new Error('raop_free failed: native cleanup not proven'),
-        );
+        throw new Error('raop_free failed: native cleanup not proven');
       }
       // The feed token releases only at proven native cleanup.
       if (feed === this.token) feed = null;
-      return Promise.resolve();
     })();
     return this.closePromise;
   }

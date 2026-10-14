@@ -4,6 +4,10 @@
 // 400 on a bad body. Provenance-logged like every mutation (plan
 // command-provenance): the key name, never the value (it may be sensitive).
 import { logCmd, sourceFromRequest } from '../../../src/player.ts';
+import {
+  CONNECTION_STRATEGY_DEFAULT_KEY,
+  isConnectionStrategy,
+} from '../../../src/connection-strategy.ts';
 
 export default async function (
   request: {
@@ -27,6 +31,14 @@ export default async function (
   const { value } = (body ?? {}) as { value?: unknown };
   if (typeof value !== 'string') {
     return Response.json({ error: 'value must be a string' }, {
+      status: 400,
+    });
+  }
+  if (
+    request.params.key === CONNECTION_STRATEGY_DEFAULT_KEY &&
+    !isConnectionStrategy(value)
+  ) {
+    return Response.json({ error: 'invalid AirPlay connection strategy' }, {
       status: 400,
     });
   }

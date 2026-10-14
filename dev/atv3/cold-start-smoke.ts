@@ -16,6 +16,10 @@
 // child gets clearEnv (only PATH/HOME survive) and NO --env flag, so no
 // household configuration can leak in.
 
+import { openDb } from '../../src/db.ts';
+import { createPersistence } from '../../src/persistence.ts';
+import { createState } from '../../src/state.ts';
+
 const LISTEN = '127.0.0.1:14138';
 const OWNTONE = [14689, 14688];
 const BASE = `http://${LISTEN}`;
@@ -27,8 +31,7 @@ const repoRoot = decodeURIComponent(
 );
 
 function fail(msg: string): never {
-  console.error(`cold-start smoke: FAIL — ${msg}`);
-  Deno.exit(1);
+  throw new Error(`cold-start smoke: FAIL — ${msg}`);
 }
 
 function assertPortFree(port: number): void {
@@ -115,10 +118,10 @@ console.log(
 console.log(`cold-start smoke: raopLib=${raopLib} sha256=${libHash}`);
 console.log(`cold-start smoke: deno.lock sha256=${lockHash}`);
 
-let done = false;
-const cleanup = async () => {
-  if (done) return;
-  done = true;
+let done = false, stopped = false;
+const stopChild = async () => {
+  if (stopped) return;
+  stopped = true;
   try {
     child.kill('SIGTERM');
   } catch { /* already gone */ }
@@ -142,12 +145,20 @@ const cleanup = async () => {
   if (status.success === false && status.signal === undefined) {
     fail(`child exited abnormally: code=${status.code}`);
   }
-  await Promise.allSettled(tees);
+};
+const cleanup = async () => {
+  if (done) return;
+  done = true;
   try {
-    logFile.close();
-  } catch { /* already closed */ }
-  await Deno.remove(workDir, { recursive: true });
-  await Deno.remove(dataDir, { recursive: true });
+    await stopChild();
+  } finally {
+    await Promise.allSettled(tees);
+    try {
+      logFile.close();
+    } catch { /* already closed */ }
+    await Deno.remove(workDir, { recursive: true });
+    await Deno.remove(dataDir, { recursive: true });
+  }
 };
 
 try {
@@ -173,10 +184,61 @@ try {
   let markerSeen = false;
   for (let i = 0; i < 20 && !markerSeen; i++) {
     const log1 = await Deno.readTextFile(logPath);
-    markerSeen = log1.includes('policy=atv3-recycle-v1');
+    markerSeen = log1.includes('policy=connection-strategies-v1');
     if (!markerSeen) await new Promise((r) => setTimeout(r, 100));
   }
   if (!markerSeen) fail('the boot policy marker is missing from the child log');
+
+  const DEFAULT_KEY = 'airplay.connectionStrategy.default';
+  const config = await fetch(`${BASE}/_/config`);
+  const configBody = await config.json();
+  const values = configBody.config;
+  if (values[DEFAULT_KEY] !== 'melofon') {
+    fail('new-speaker strategy default not seeded');
+  }
+  const create = async (host: string) => {
+    const response = await fetch(`${BASE}/_/outputs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'unselected smoke fake',
+        type: 'AirPlay',
+        host,
+      }),
+    });
+    if (!response.ok) fail(`native output POST: ${response.status}`);
+    return (await response.json()).output;
+  };
+  const first = await create('192.0.2.240');
+  if (first.connectionStrategy !== 'melofon' || first.selected) {
+    fail('first output default/selection wrong');
+  }
+  const choice = await fetch(`${BASE}/_/outputs/${first.id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ connectionStrategy: 'audiostation' }),
+  });
+  if (
+    !choice.ok ||
+    (await choice.json()).output.connectionStrategy !== 'audiostation'
+  ) fail('native per-output choice failed');
+  const global = await fetch(`${BASE}/_/config/${DEFAULT_KEY}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ value: 'owntone' }),
+  });
+  if (!global.ok) fail('global strategy PUT failed');
+  await global.body?.cancel();
+  const second = await create('192.0.2.241');
+  if (second.connectionStrategy !== 'owntone' || second.selected) {
+    fail('new-output-only default failed');
+  }
+  const list = await fetch(`${BASE}/_/outputs`);
+  const rows = (await list.json()).outputs;
+  if (
+    rows.find((row: { id: string }) => row.id === first.id)
+      ?.connectionStrategy !== 'audiostation'
+  ) fail('global change rewrote existing choice');
 
   const player = await fetch(`${OWNTONE_BASE}/api/player`);
   if (!player.ok) fail(`GET /api/player: ${player.status}`);
@@ -209,6 +271,55 @@ try {
     attributed = /\[cmd\] volume volume=75 .*client=atv3-smoke/.test(log);
   }
   if (!attributed) fail('the volume command was not attributed in the log');
+
+  const wireOutputs = await fetch(`${OWNTONE_BASE}/api/outputs`);
+  if (!wireOutputs.ok) fail(`OwnTone outputs: ${wireOutputs.status}`);
+  const projected = (await wireOutputs.json()).outputs;
+  const outputKeys = [
+    'format',
+    'has_password',
+    'id',
+    'name',
+    'needs_auth_key',
+    'offset_ms',
+    'requires_auth',
+    'selected',
+    'supported_formats',
+    'type',
+    'volume',
+  ].sort();
+  if (
+    projected.length !== 2 ||
+    projected.some((row: Record<string, unknown>) =>
+      JSON.stringify(Object.keys(row).sort()) !== JSON.stringify(outputKeys)
+    )
+  ) {
+    fail('OwnTone output wire keys changed');
+  }
+  // Stop the only writer before reopening its real on-disk database. These
+  // are public persistence consumers, not a second connection to a live DB.
+  await stopChild();
+  const reopened = await openDb(dataDir);
+  try {
+    const stored = createPersistence(reopened);
+    const saved = await stored.loadOutputs();
+    if (
+      saved.find((row) => row.id === first.id)?.connectionStrategy !==
+        'audiostation' ||
+      saved.find((row) => row.id === second.id)?.connectionStrategy !==
+        'owntone'
+    ) {
+      fail('native settings did not survive disk reopen');
+    }
+    if (await createState(reopened).get(DEFAULT_KEY) !== 'owntone') {
+      fail('global default did not survive disk reopen');
+    }
+  } finally {
+    reopened.close();
+  }
+  console.log(
+    'cold-start smoke: native strategies survived disk reopen; OwnTone player/output keys unchanged',
+  );
 
   console.log('cold-start smoke: OK');
 } finally {
