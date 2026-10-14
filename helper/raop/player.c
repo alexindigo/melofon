@@ -45,6 +45,7 @@
 
 #include "logger.h"
 #include "outputs.h"
+#include "raop-bridge.h"
 
 /* The RAOP output backend (raop.c). */
 extern struct output_definition output_raop;
@@ -472,6 +473,13 @@ raop_player_session_stopped(struct raop_player *p)
   if (!p->streaming)
     return;
   p->streaming = false;
+
+  /* A player that actually fed the shared backend owns its incomplete PCM
+   * block too. Do not splice it into a later current-position feed while a
+   * surviving peer keeps the native master alive. Non-feeding handles must
+   * not disturb the effective peer's partial input. This runs on the loop. */
+  if (p->fed_samples > 0)
+    raop_discard_pending_input();
 
   memset(&zero, 0, sizeof(zero));
   timerfd_settime(p->timer_fd, 0, &zero, NULL);

@@ -5,12 +5,25 @@ import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { createOutputs } from '../src/player.ts';
 import type { MdnsService } from '../src/mdns.ts';
+import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { PreparationError } from '../src/output-admission.ts';
 
 async function setup() {
   const outputs = createOutputs();
+  const airplay = createAirplayDevices({
+    outputs,
+    resolver: {
+      resolve: () =>
+        Promise.reject(new PreparationError('timeout', 'fixture timeout')),
+      close() {},
+    },
+    spawn: () => {
+      throw new Error('CRUD cannot start a transport');
+    },
+  });
   const core = await pathfinder({
     roots: ['core/'],
-    app: { cfg: {}, outputs },
+    app: { cfg: {}, outputs, airplay, outputAdmission: airplay.admission },
   });
   return { core, outputs };
 }
@@ -144,17 +157,26 @@ Deno.test('core /_/outputs copies TXT when unicast resolve answers', async () =>
     txt: { tp: 'UDP', am: 'AppleTV3,1', md: '0,1,2', ek: '1' },
     ttlMs: 120_000,
   };
+  const airplay = createAirplayDevices({
+    outputs,
+    resolver: {
+      resolve: (address) => {
+        assertEquals(address, '10.4.10.106');
+        return Promise.resolve(svc);
+      },
+      close() {},
+    },
+    spawn: () => {
+      throw new Error('CRUD cannot start');
+    },
+  });
   const core = await pathfinder({
     roots: ['core/'],
     app: {
       cfg: {},
       outputs,
-      airplay: {
-        resolve: (address: string) => {
-          assertEquals(address, '10.4.10.106');
-          return Promise.resolve(svc);
-        },
-      },
+      airplay,
+      outputAdmission: airplay.admission,
     },
   });
   const res = await post(
@@ -167,11 +189,11 @@ Deno.test('core /_/outputs copies TXT when unicast resolve answers', async () =>
   );
   assertEquals(res.status, 200);
   const { output } = (await res.json()) as {
-    output: { host: string; port: number; wantedMetadata: number };
+    output: { id: string; host: string; preparation: { state: string } };
   };
   assertEquals(output.host, '10.4.10.106');
-  assertEquals(output.port, 7000);
-  assertEquals(output.wantedMetadata, 7);
+  assertEquals(output.preparation.state, 'ready');
+  assertEquals(airplay.admission.describe(output.id).source, 'dns-sd');
 });
 
 Deno.test('core /_/outputs re-registration: model preserved on timeout, replaced by a fresh am', async () => {
@@ -185,12 +207,26 @@ Deno.test('core /_/outputs re-registration: model preserved on timeout, replaced
     ttlMs: 120_000,
   };
   let answer: MdnsService | null = atv3;
+  const airplay = createAirplayDevices({
+    outputs,
+    resolver: {
+      resolve: () =>
+        answer
+          ? Promise.resolve(answer)
+          : Promise.reject(new PreparationError('timeout', 'fixture timeout')),
+      close() {},
+    },
+    spawn: () => {
+      throw new Error('CRUD cannot start');
+    },
+  });
   const core = await pathfinder({
     roots: ['core/'],
     app: {
       cfg: {},
       outputs,
-      airplay: { resolve: () => Promise.resolve(answer) },
+      airplay,
+      outputAdmission: airplay.admission,
     },
   });
   const body = JSON.stringify({
@@ -202,7 +238,7 @@ Deno.test('core /_/outputs re-registration: model preserved on timeout, replaced
   const first = await post(core, body);
   assertEquals(first.status, 200);
   const firstOut = (await first.json()) as {
-    output: { id: string; model?: string; devtype?: string };
+    output: { id: string; model?: string };
   };
   // Melofon's own CRUD surface may carry the model (never the OwnTone wire).
   assertEquals(firstOut.output.model, 'AppleTV3,1', 'TXT am is identity');
@@ -223,7 +259,7 @@ Deno.test('core /_/outputs re-registration: model preserved on timeout, replaced
     'AppleTV2,1',
     'an explicit different model wins',
   );
-  assertEquals(outputs.get(id)!.devtype, 'appletv');
+  assertEquals(airplay.admission.describe(id).state, 'ready');
 });
 
 Deno.test('core /_/outputs/<id>/pin delivers the pin to the boot', async () => {

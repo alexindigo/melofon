@@ -8,6 +8,10 @@ import type { NowPlaying } from '../src/nowplaying.ts';
 import type { Media } from '../src/media.ts';
 import type { State } from '../src/state.ts';
 import {
+  createTestAirplayDevices,
+  recordingSpawn,
+} from './helpers/airplay-devices.ts';
+import {
   type AirplayTransport,
   createAirplayBoot,
   type HelperEventFn,
@@ -119,18 +123,22 @@ function setup(backoff = [0, 20], finite = false, opts: {
     }),
   } as unknown as Media;
   const transports: Transport[] = [];
+  const devices = createTestAirplayDevices(
+    outputs,
+    recordingSpawn((event) => {
+      const t = new Transport(event);
+      transports.push(t);
+      if (opts.spawnFailure) throw new Error('injected spawn failure');
+      return t;
+    }),
+  );
   const boot = createAirplayBoot({
     outputs,
     playback,
     notify,
     media,
     ...(opts.state ? { state: opts.state } : { retryBackoffMs: backoff }),
-    spawn: (event) => {
-      const t = new Transport(event);
-      transports.push(t);
-      if (opts.spawnFailure) throw new Error('injected spawn failure');
-      return t;
-    },
+    devices,
   });
   const register = (
     id: string,
@@ -154,6 +162,7 @@ function setup(backoff = [0, 20], finite = false, opts: {
     register,
     close: async () => {
       await boot.close();
+      devices.close();
       playback.close();
     },
   };
@@ -202,6 +211,7 @@ Deno.test('failure → explicit no-op Pause revokes the retry resume lease', asy
   try {
     s.register('1');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     const t = s.transports[0];
     t.event('state', 'failed');
     assertEquals(s.playback.playerView().state, 'pause');
@@ -219,6 +229,7 @@ Deno.test('connected/failed flaps exhaust one epoch and preserve selection; expl
   try {
     s.register('1');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     s.transports[0].event('state', 'connected');
     s.transports[0].event('state', 'failed');
     await until(() => s.transports.length === 2);
@@ -239,6 +250,7 @@ Deno.test('retry-owned Play authorizes only its target, not an exhausted/down se
     s.register('1');
     s.register('2');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 2);
     const [a, b] = s.transports;
     a.event('state', 'connected');
     b.event('state', 'connected');
@@ -269,6 +281,7 @@ Deno.test('compound clear+play retires OwnTone held/active session before one re
   try {
     s.register('1', 'owntone');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     const old = s.transports[0];
     old.event('state', 'connected');
     await until(() => old.writes.length > 0);
@@ -292,6 +305,7 @@ Deno.test('OwnTone Stop retains current-null transport, quick Play reuses withou
   try {
     s.register('1', 'owntone');
     s.playback.queueAdd([song(), song('b')], { play: true });
+    await until(() => s.transports.length === 1);
     const t = s.transports[0];
     t.event('state', 'connected');
     await until(() => t.writes.length > 0);
@@ -312,6 +326,7 @@ Deno.test('OwnTone idle hold expires at ten seconds without repeated events exte
   try {
     s.register('1', 'owntone');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     const t = s.transports[0];
     t.event('state', 'connected');
     const send = t.send.bind(t);
@@ -346,6 +361,7 @@ Deno.test('finite dropping peer is repumped from current position after actual f
         s.register(id, id === '2' ? 'owntone' : 'melofon');
       }
       s.playback.queueAdd([song()], { play: true });
+      await until(() => s.transports.length === 2);
       const a = s.transports.find((t) =>
         t.commands.some((c) => c.host === '192.0.2.1')
       )!;
@@ -375,6 +391,7 @@ Deno.test('ordinary nonempty decoder EOF remains live for buffered audio', async
   try {
     s.register('1');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     s.transports[0].event('state', 'connected');
     await until(() => s.transports[0].writes.length === 2);
     await sleep(30);
@@ -401,6 +418,7 @@ Deno.test('current decoder null/empty/creation/iterator errors release without c
     try {
       s.register('1');
       s.playback.queueAdd([song()], { play: true });
+      await until(() => s.transports.length === 1);
       s.transports[0].event('state', 'connected');
       await until(() => s.transports[0].closed);
       await sleep(30);
@@ -429,6 +447,7 @@ Deno.test('stale decoder rejection cannot pause or retire its replacement', asyn
   try {
     s.register('1');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     s.transports[0].event('state', 'connected');
     await until(() => calls === 1);
     s.playback.seek({ positionMs: 60000 });
@@ -446,9 +465,9 @@ Deno.test('stale decoder rejection cannot pause or retire its replacement', asyn
 });
 
 Deno.test('user Pause synchronously during retry-owned Play wins, including same-millisecond records', async () => {
-  const s = setup([0]);
   const realNow = Date.now;
   Date.now = () => 123;
+  const s = setup([0]);
   const off = s.notify.subscribe(() => {
     const command = s.playback.lastCommand();
     if (command?.kind === 'play' && command.source.via === 'airplay-boot') {
@@ -458,6 +477,7 @@ Deno.test('user Pause synchronously during retry-owned Play wins, including same
   try {
     s.register('1');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     s.transports[0].event('state', 'failed');
     await sleep(50);
     assertEquals(s.transports.length, 1);
@@ -475,6 +495,7 @@ Deno.test('switch during Play waits for transition; switch during OwnTone hold r
   try {
     s.register('1', 'owntone');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     const t = s.transports[0];
     t.event('state', 'connected');
     await until(() => t.writes.length > 0);
@@ -505,6 +526,7 @@ Deno.test('old entered peer PCM released exactly after feed close cannot claim t
     s.register('1');
     s.register('2', 'owntone');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 2);
     const [a, b] = s.transports;
     a.event('state', 'connected');
     await until(() => a.ownsSharedFeed());
@@ -539,6 +561,7 @@ Deno.test('reverse snapshot order: all retirement barriers precede sibling trans
       // negative control, so this exposes ordering, not just the new policy.
       s.outputs.register({ ...s.outputs.get('1')!, model: 'AppleTV3,1' });
       s.playback.queueAdd([song()], { play: true });
+      await until(() => s.transports.length === 2);
       const a = s.transports.find((t) =>
         t.commands.some((c) => c.host === '192.0.2.1')
       )!;
@@ -595,6 +618,7 @@ Deno.test('retry initial read is a barrier, late reads cannot override live off,
     try {
       s.register('1');
       s.playback.queueAdd([song()], { play: true });
+      await until(() => s.transports.length === 1);
       s.transports[0].event('state', 'failed');
       await sleep(20);
       assertEquals(s.transports.length, 1);
@@ -620,6 +644,7 @@ Deno.test('retry-off cancels a pending retry close grant but preserves planned s
   try {
     s.register('1');
     s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
     const t = s.transports[0];
     t.event('state', 'connected');
     t.closeGate = new Promise((resolve) => release = resolve);

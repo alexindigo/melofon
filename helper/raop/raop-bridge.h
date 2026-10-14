@@ -6,4 +6,7 @@
  * all device-local sessions/sockets are destroyed, possibly inline. sent=0
  * all final requests wrote locally, -1 some unsent; neither means remote ACK. */
 int raop_release_device(uint64_t id, void (*done)(uint64_t, int));
+/* Loop-thread effective-feed discontinuity: discard partial raw ALAC input,
+ * retaining peer sessions, RTP clocks and already encoded retransmit packets. */
+void raop_discard_pending_input(void);
 #endif

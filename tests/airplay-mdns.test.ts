@@ -13,6 +13,8 @@ import type { MdnsService } from '../src/mdns.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs } from '../src/player.ts';
 import type { State } from '../src/state.ts';
+import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { recordingSpawn } from './helpers/airplay-devices.ts';
 
 const INSTANCE = 'A4B2C1D2E3F4@Kitchen ATV._raop._tcp.local';
 const ID = BigInt('0xA4B2C1D2E3F4').toString(10);
@@ -90,9 +92,51 @@ function setup(
   const state = fakeState(initial);
   const browsers: FakeBrowser[] = [];
   const logs: string[] = [];
+  const resolved: string[] = [];
+  const commands: Record<string, unknown>[] = [];
+  const devices = createAirplayDevices({
+    outputs,
+    resolver: {
+      resolve(address) {
+        resolved.push(address);
+        return Promise.resolve(svc({ address }));
+      },
+      close() {},
+    },
+    spawn: recordingSpawn(() => ({
+      send(command) {
+        commands.push(command);
+        return Promise.resolve();
+      },
+      pcm: () => Promise.resolve(),
+      close: () => Promise.resolve(),
+      ownsSharedFeed: () => false,
+      cancelPcm() {},
+    })),
+  });
+  const session = async (id: string) => {
+    const permit = await devices.protocol.prepare({
+      id,
+      targetRevision: devices.admission.describe(id).targetRevision,
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+    });
+    assert(permit.ok);
+    const active = await devices.protocol.activate(permit.value, {
+      volume: 1,
+      positionMs: 0,
+      lengthMs: 1,
+      title: '',
+      artist: '',
+    }, { publish() {}, onEvent() {} });
+    assert(active.ok);
+    await active.value.close();
+    return commands.at(-1)!;
+  };
   const discovery = createAirplayDiscovery({
     outputs,
     state,
+    devices,
     savedOutput: (id) => saved[id],
     log: (msg) => logs.push(msg),
     createBrowser: (onService) => {
@@ -102,7 +146,17 @@ function setup(
       return b;
     },
   });
-  return { outputs, state, browsers, logs, discovery, notify };
+  return {
+    outputs,
+    state,
+    browsers,
+    logs,
+    discovery,
+    notify,
+    devices,
+    resolved,
+    session,
+  };
 }
 
 /** The initial state.get resolves asynchronously. */
@@ -129,7 +183,7 @@ Deno.test('TXT md/et parse like raop_device_cb', () => {
 });
 
 Deno.test('up registers with TXT-derived fields; down unregisters', async () => {
-  const { outputs, browsers, discovery } = await setup();
+  const { outputs, browsers, discovery, session } = await setup();
   try {
     await settle();
     assertEquals(browsers.length, 1, 'browser starts (unset = on)');
@@ -145,10 +199,11 @@ Deno.test('up registers with TXT-derived fields; down unregisters', async () => 
     assertEquals(out.volume, 100);
     assertEquals(out.host, '192.168.1.50');
     assertEquals(out.port, 7000);
-    assertEquals(out.devtype, 'appletv');
-    assertEquals(out.encrypt, true);
-    assertEquals(out.wantedMetadata, 7);
-    assertEquals(out.supportsAuthSetup, false);
+    const prepared = await session(out.id);
+    assertEquals(prepared.devtype, 'appletv');
+    assertEquals(prepared.encrypt, true);
+    assertEquals(prepared.wanted_metadata, 7);
+    assertEquals(prepared.authsetup, 0);
     assertEquals(out.requiresAuth, true);
     assertEquals(out.needsAuthKey, true);
     assertEquals(out.model, 'AppleTV3,1', 'TXT am is the output identity');
@@ -161,7 +216,7 @@ Deno.test('up registers with TXT-derived fields; down unregisters', async () => 
 });
 
 Deno.test('re-announcement updates host without wiping user state', async () => {
-  const { outputs, browsers, discovery } = await setup();
+  const { outputs, browsers, discovery, session } = await setup();
   try {
     await settle();
     browsers[0].onService!('up', svc());
@@ -177,7 +232,7 @@ Deno.test('re-announcement updates host without wiping user state', async () => 
     assertEquals(out.selected, true, 'selection preserved');
     assertEquals(out.volume, 42, 'volume preserved');
     assertEquals(out.needsAuthKey, false, 'PIN completion preserved');
-    assertEquals(out.devtype, 'appletv');
+    assertEquals((await session(out.id)).devtype, 'appletv');
   } finally {
     discovery.close();
   }
@@ -186,7 +241,7 @@ Deno.test('re-announcement updates host without wiping user state', async () => 
 Deno.test('a device coming back unregistered registers with the saved selection', async () => {
   // No in-memory record (mDNS down→up, or a restart before the row
   // re-registers): the persisted user state wins over discovery defaults.
-  const { outputs, browsers, discovery } = await setup({}, {
+  const { outputs, browsers, discovery, session } = await setup({}, {
     [ID]: { selected: true, volume: 42 },
   });
   try {
@@ -197,7 +252,11 @@ Deno.test('a device coming back unregistered registers with the saved selection'
     assertEquals(out.volume, 42, 'saved volume applied');
     assertEquals(out.host, '192.168.1.50', 'announcement refreshes the host');
     assertEquals(out.port, 7000);
-    assertEquals(out.devtype, 'appletv', 'TXT knobs still derived');
+    assertEquals(
+      (await session(out.id)).devtype,
+      'appletv',
+      'TXT knobs still derived',
+    );
 
     // Without a saved row the discovery defaults stand.
     browsers[0].onService!('down', svc());
@@ -214,7 +273,7 @@ Deno.test('a device coming back unregistered registers with the saved selection'
 });
 
 Deno.test('an identical re-announcement is a catalog no-op', async () => {
-  const { outputs, browsers, logs, discovery, notify } = await setup();
+  const { outputs, browsers, logs, discovery, notify, session } = await setup();
   try {
     await settle();
     let outputsEvents = 0;
@@ -236,14 +295,14 @@ Deno.test('an identical re-announcement is a catalog no-op', async () => {
     // A changed TXT (metadata knobs) is a real catalog update.
     browsers[0].onService!('up', svc({ txt: { ...svc().txt, md: '0,1' } }));
     assertEquals(outputsEvents, 2, 'changed TXT registers');
-    assertEquals(outputs.get(ID)!.wantedMetadata, 3);
+    assertEquals((await session(ID)).wanted_metadata, 3);
   } finally {
     discovery.close();
   }
 });
 
 Deno.test('a changed model is a real catalog update even within one devtype', async () => {
-  const { outputs, browsers, discovery, notify } = await setup();
+  const { outputs, browsers, discovery, notify, session } = await setup();
   try {
     await settle();
     let outputsEvents = 0;
@@ -257,13 +316,13 @@ Deno.test('a changed model is a real catalog update even within one devtype', as
       svc({ txt: { ...svc().txt, am: 'AppleTV2,1' } }),
     );
     assertEquals(outputs.get(ID)!.model, 'AppleTV2,1');
-    assertEquals(outputs.get(ID)!.devtype, 'appletv');
+    assertEquals((await session(ID)).devtype, 'appletv');
     assertEquals(outputsEvents, 1);
 
     browsers[0].onService!('up', svc()); // am AppleTV3,1
     assertEquals(outputsEvents, 2, 'the model replacement registers');
     assertEquals(outputs.get(ID)!.model, 'AppleTV3,1');
-    assertEquals(outputs.get(ID)!.devtype, 'appletv', 'devtype unchanged');
+    assertEquals((await session(ID)).devtype, 'appletv', 'devtype unchanged');
 
     // Same model, same everything: a no-op again.
     browsers[0].onService!('up', svc());
@@ -276,7 +335,7 @@ Deno.test('a changed model is a real catalog update even within one devtype', as
 Deno.test('a re-announcement without am recovers the saved model identity', async () => {
   // No in-memory record; the persisted row knows the model. A TXT without
   // `am` neither erases nor hides it (plan atv3-session-recycle).
-  const { outputs, browsers, discovery } = await setup({}, {
+  const { outputs, browsers, discovery, session } = await setup({}, {
     [ID]: { selected: true, volume: 42, model: 'AppleTV3,1' },
   });
   try {
@@ -292,7 +351,7 @@ Deno.test('a re-announcement without am recovers the saved model identity', asyn
     assertEquals(out.selected, true, 'saved selection applied');
     assertEquals(out.volume, 42, 'saved volume applied');
     assertEquals(
-      out.devtype,
+      (await session(out.id)).devtype,
       'apex1',
       'session knobs re-derive from the actual TXT',
     );
@@ -388,20 +447,23 @@ Deno.test('discovery logs the OwnTone-shaped Adding AirPlay device line', async 
   }
 });
 
-Deno.test('known-host resolve registers wantedMetadata from TXT', async () => {
-  const { outputs, browsers, discovery } = await setup();
+Deno.test('known-host preparation derives metadata while automatic browsing is off', async () => {
+  const { browsers, discovery, devices, resolved, session } = await setup({
+    'airplay.mdns': 'off',
+  });
   try {
     await settle();
-    const pending = discovery.resolve('192.168.1.50');
-    await settle();
-    assertEquals(browsers[0].resolved, ['192.168.1.50']);
-    browsers[0].onService!('up', svc());
-    const got = await pending;
-    assertEquals(got?.txt.md, '0,1,2');
-    const out = outputs.list().find((o) => o.host === '192.168.1.50');
-    assertEquals(out?.wantedMetadata, 7);
+    const out = await devices.registerAddress({
+      name: 'Kitchen ATV',
+      host: '192.168.1.50',
+    });
+    assert(out);
+    assertEquals(browsers.length, 0);
+    assertEquals(resolved, ['192.168.1.50']);
+    assertEquals((await session(out.id)).wanted_metadata, 7);
   } finally {
     discovery.close();
+    devices.close();
   }
 });
 

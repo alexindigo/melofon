@@ -42,3 +42,36 @@ These are targeted lifetime/release changes, not an upstream refresh, codec
 rewrite or general network redesign. Verify the old eight native scenarios,
 local TCP close with a persistent peer and withheld TEARDOWN reply, lifetime
 faults and the Deno/native shared-feed integration before changing them.
+
+## Intentional local patch: sender-source recovery
+
+`outputs/raop.c` snapshots the actual RTSP source used by ANNOUNCE and the
+connected RTP source. Before CONNECTED it compares both with the kernel's
+fresh preferred source, normalized by family/address/link-local scope (ports
+are ignored). Split-source startup fails through deferred terminal failure;
+it never takes the native IPv6-to-IPv4 startup-redial path.
+
+Each established session owns one two-second libevent observer. A fresh
+nonblocking, close-on-exec UDP socket connects to the numeric receiver,
+reads getsockname and closes without sending. Source mismatch, unavailable
+route/source, and observation/system errors have distinct bounded diagnostics
+and use the ordinary failed event once. The observer cannot reconnect or
+change retry authority. This is source selection, not a receiver-liveness test.
+
+Deferred failure fences PCM, retransmits and late FLUSH/CONNECTED publication.
+The timer is disarmed before teardown, failure or device-ID release and freed
+with its native session, including startup failure and shutdown. Existing
+device-ID completion and failed-free ownership remain intact.
+
+`dev/dual-home/run.ts` proves metric-only, loss, startup and cancellation cases
+in isolated rootless namespaces on the identified Melofon VM. It observes
+actual sender socket inodes, independent RTSP/SDP/RTP/control/timing sources,
+and receiver-decoded position-identifiable PCM. Shared control/timing sockets
+are not assumed to share RTSP/RTP source pinning.
+
+The kernel peer regression also exposed an old partial-ALAC-input boundary:
+when the effective player stops, `player.c` calls the loop-thread
+`raop_discard_pending_input()` backend method through `raop-bridge.h`.
+Pending raw master input/sample counts are cleared before a fresh feed can
+append; surviving peer sockets, RTP clocks and encoded retransmit buffers
+remain owned. A handle that never fed the backend does not clear peer input.

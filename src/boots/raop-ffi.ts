@@ -18,7 +18,14 @@
 // close PROVES native cleanup: a failed free keeps the token, so no bytes
 // are optimistically routed through a broken native state (plan
 // atv3-session-recycle).
-import type { AirplayTransport, HelperEventFn } from './airplay.ts';
+import type {
+  AirplayControl,
+  AirplayDriver,
+  AirplayInput,
+  AirplayProfile,
+  AirplayTransport,
+  HelperEventFn,
+} from './airplay-profile.ts';
 
 const SYMBOLS = {
   raop_new: { parameters: [], result: 'pointer' },
@@ -164,7 +171,32 @@ class FfiTransport implements AirplayTransport {
     }
   }
 
-  send(cmd: Record<string, unknown>): Promise<void> {
+  start(profile: Readonly<AirplayProfile>, input: AirplayInput): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new Error('raop start on a closed transport'));
+    }
+    const rc = this.lib.symbols.raop_start(
+      this.handle,
+      cstr(profile.host),
+      profile.port,
+      cstr(profile.name),
+      input.volume,
+      DEVTYPE[profile.devtype],
+      profile.encrypt ? 1 : 0,
+      input.positionMs,
+      input.lengthMs,
+      profile.wantedMetadata,
+      profile.supportsAuthSetup ? 1 : 0,
+      profile.requiresAuth ? 1 : 0,
+      cstr(input.title),
+      cstr(input.artist),
+    );
+    return rc < 0
+      ? Promise.reject(new Error('raop start enqueue failed'))
+      : Promise.resolve();
+  }
+
+  send(cmd: AirplayControl): Promise<void> {
     // A send on a closed transport must not silently report a successful
     // start — the caller learns the enqueue never happened.
     if (this.closed) {
@@ -175,26 +207,8 @@ class FfiTransport implements AirplayTransport {
     const s = this.lib.symbols;
     let rc = 0;
     switch (cmd.cmd) {
-      case 'start':
-        rc = s.raop_start(
-          this.handle,
-          cstr(String(cmd.host)),
-          Number(cmd.port) || 7000,
-          cstr(String(cmd.name ?? cmd.host)),
-          Number(cmd.volume) || 0,
-          DEVTYPE[String(cmd.devtype)] ?? DEVTYPE.appletv,
-          cmd.encrypt === true ? 1 : 0,
-          Number(cmd.pos_ms) || 0,
-          Number(cmd.len_ms) || 0,
-          Number(cmd.wanted_metadata) || 0,
-          Number(cmd.authsetup) || 0,
-          Number(cmd.requires_auth) || 0,
-          cstr(String(cmd.title ?? '')),
-          cstr(String(cmd.artist ?? '')),
-        );
-        break;
       case 'volume':
-        rc = s.raop_volume(this.handle, Number(cmd.volume) || 0);
+        rc = s.raop_volume(this.handle, cmd.volume);
         break;
       case 'flush':
         this.writeGen++; // before the native call — stale writers stop now
@@ -205,7 +219,7 @@ class FfiTransport implements AirplayTransport {
         rc = s.raop_teardown(this.handle);
         break;
       case 'pin':
-        rc = s.raop_pin(this.handle, cstr(String(cmd.pin)));
+        rc = s.raop_pin(this.handle, cstr(cmd.pin));
         break;
       default:
         return Promise.resolve();
@@ -291,7 +305,7 @@ class FfiTransport implements AirplayTransport {
  * startup error, not a surprise at play time. */
 export function createFfiSpawn(): (
   onEvent: HelperEventFn,
-) => AirplayTransport {
+) => AirplayDriver {
   let lib: RaopLibrary | null = null;
   try {
     lib = loadLibrary();
@@ -304,7 +318,11 @@ export function createFfiSpawn(): (
         'RAOP library not available (see startup log; build helper/raop)',
       );
     }
-    return new FfiTransport(lib, onEvent);
+    const transport = new FfiTransport(lib, onEvent);
+    return {
+      transport,
+      start: (profile, input) => transport.start(profile, input),
+    };
   };
 }
 

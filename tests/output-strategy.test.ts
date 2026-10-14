@@ -8,6 +8,7 @@ import { createPersistence } from '../src/persistence.ts';
 import { createState } from '../src/state.ts';
 import { createAirplayDiscovery } from '../src/boots/airplay-mdns.ts';
 import type { MdnsService } from '../src/mdns.ts';
+import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
 
 const KEY = 'airplay.connectionStrategy.default';
 const source = { kind: 'internal' as const, via: 'strategy-test' };
@@ -35,7 +36,16 @@ async function setup(dir?: string) {
   const outputs = createOutputs(deps);
   await ready(outputs);
   await persistence.loadOutputs();
-  const core = await pathfinder({ roots: ['core/'], app: { outputs, state } });
+  const devices = createTestAirplayDevices(outputs);
+  const core = await pathfinder({
+    roots: ['core/'],
+    app: {
+      outputs,
+      state,
+      airplay: devices,
+      outputAdmission: devices.admission,
+    },
+  });
   return { data, db, persistence, outputs, state, core };
 }
 
@@ -276,6 +286,7 @@ Deno.test('all three native choices survive real discovery registration gaps, un
     | ((event: 'up' | 'down', service: MdnsService) => void)
     | undefined;
   const discovery = createAirplayDiscovery({
+    devices: createTestAirplayDevices(s.outputs),
     outputs: s.outputs,
     state: s.state,
     savedOutput: (id) => s.persistence.savedOutput(id),

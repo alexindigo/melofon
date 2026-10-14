@@ -17,8 +17,18 @@ export default function (
           port?: number;
         }[];
       };
+      outputAdmission: {
+        describe(
+          id: string,
+        ): import('../../src/output-admission.ts').PreparationView;
+      };
     };
   },
 ) {
-  return { outputs: context.app.outputs.list() };
+  return {
+    outputs: context.app.outputs.list().map((output) => ({
+      ...output,
+      preparation: context.app.outputAdmission.describe(output.id),
+    })),
+  };
 }

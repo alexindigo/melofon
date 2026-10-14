@@ -27,11 +27,10 @@ import { createPersistence } from './src/persistence.ts';
 import { createPlayback } from './src/playback.ts';
 import { createNotify } from './src/notify.ts';
 import { createState } from './src/state.ts';
-import { airplayOutputId, createAirplayBoot } from './src/boots/airplay.ts';
-import {
-  createAirplayDiscovery,
-  sessionFieldsFromTxt,
-} from './src/boots/airplay-mdns.ts';
+import { createAirplayBoot } from './src/boots/airplay.ts';
+import { createAirplayDiscovery } from './src/boots/airplay-mdns.ts';
+import { createAirplayDevices } from './src/boots/airplay-device.ts';
+import { createOutputAdmission } from './src/output-admission.ts';
 import { loadLayers } from './src/layers.ts';
 import { actualPorts, createBinds } from './src/binds.ts';
 import { facade } from './src/facade.ts';
@@ -65,12 +64,28 @@ if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
 // this populates the savedOutput cache discovery consults synchronously, and
 // the rows are the restore snapshot below — model identity included.
 const savedOutputs = await persistence.loadOutputs();
-const airplay = createAirplayDiscovery({
+const outputAdmission = createOutputAdmission({
+  endpoint(id) {
+    const row = outputs.get(id);
+    return row?.host
+      ? {
+        id,
+        protocol: row.type,
+        address: row.host,
+        ...(row.port === undefined ? {} : { port: row.port }),
+      }
+      : null;
+  },
+  changed: () => notify.emit(['outputs']),
+});
+const airplay = createAirplayDevices({ outputs, admission: outputAdmission });
+const discovery = createAirplayDiscovery({
   outputs,
   state,
+  devices: airplay,
   savedOutput: (id) => persistence.savedOutput(id),
 });
-const app = { db, cfg, libraries, outputs, state, airplay };
+const app = { db, cfg, libraries, outputs, state, airplay, outputAdmission };
 const core = await pathfinder({ roots: ['core/'], app });
 const library = createLibrary(db);
 const player = createPlayer();
@@ -109,14 +124,14 @@ for (const row of savedOutputs) {
     if (existing.model === undefined && row.model !== undefined) {
       const fresh = outputs.get(row.id);
       if (fresh !== null) {
-        outputs.register({ ...fresh, model: row.model }, {
+        airplay.register({ ...fresh, model: row.model }, {
           kind: 'internal',
           via: 'restore',
         });
       }
     }
   } else if (row.host !== undefined) {
-    outputs.register({
+    airplay.register({
       id: row.id,
       name: row.name,
       type: row.type,
@@ -176,7 +191,18 @@ const bag = {
 const layers = await loadLayers({ app: bag });
 
 // Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
-createAirplayBoot({ outputs, playback, media, notify, state });
+createAirplayBoot({
+  outputs,
+  playback,
+  media,
+  notify,
+  state,
+  devices: airplay,
+});
+addEventListener('unload', () => {
+  discovery.close();
+  airplay.close();
+});
 
 // The engine's clock: wall-clock progress reaching an item's length ends it
 // (advance/replay/drop/stop per repeat/consume). Without this the engine sat
@@ -191,40 +217,16 @@ if (airplayHost) {
   const match = airplayHost.match(/^(.+?)(?::(\d+))?$/);
   const host = match?.[1] ?? airplayHost;
   const port = match?.[2] === undefined ? undefined : Number(match[2]);
-  const svc = await airplay.resolve(host);
-  const existing = outputs.list().find((o) => o.host === host);
-  const id = existing?.id ?? airplayOutputId(host);
-  if (svc !== null && (svc.txt.tp ?? '').includes('UDP')) {
-    outputs.register({
-      id,
-      name: existing?.name ?? host,
-      type: 'AirPlay',
-      selected: existing?.selected ?? false,
-      volume: existing?.volume ?? 100,
-      host: svc.address,
-      port: svc.port,
-      ...sessionFieldsFromTxt(svc.txt),
-    }, { kind: 'internal', via: 'airplay-host-env' });
-    console.log(
-      `[melofon] airplay: registered ${svc.address}:${svc.port} with TXT`,
-    );
-  } else {
-    // No TXT (resolve timeout): register the bare host, but never clobber
-    // restored user state or a known model (plan atv3-session-recycle —
-    // register() preserves the model; selection/volume are kept here).
-    outputs.register({
-      id,
-      name: host,
-      type: 'AirPlay',
-      selected: existing?.selected ?? false,
-      volume: existing?.volume ?? 100,
-      host,
-      ...(port === undefined ? {} : { port }),
-    }, { kind: 'internal', via: 'airplay-host-env' });
-    console.log(
-      `[melofon] airplay: registered ${host}${port ? `:${port}` : ''} (no TXT)`,
-    );
-  }
+  const row = await airplay.registerAddress({
+    name: outputs.list().find((o) => o.host === host)?.name ?? host,
+    host,
+    ...(port === undefined ? {} : { port }),
+  }, { kind: 'internal', via: 'airplay-host-env' });
+  console.log(
+    `[melofon] airplay: registered ${host} preparation=${
+      row ? outputAdmission.describe(row.id).state : 'failed'
+    }`,
+  );
 }
 
 // A restored engine announces itself once the boots exist: the AirPlay boot

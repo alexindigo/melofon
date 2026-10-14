@@ -18,9 +18,13 @@ import {
   AV_CODEC_ID_MP3,
   AV_CODEC_ID_OPUS,
   AV_CODEC_ID_VORBIS,
+  AV_NOPTS_VALUE,
   AV_SAMPLE_FMT_S16,
+  AV_TIME_BASE,
+  AV_TIME_BASE_Q,
   AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
+  avRescaleQ,
   AVSEEK_FLAG_BACKWARD,
   Decoder,
   Demuxer,
@@ -29,6 +33,7 @@ import {
   FF_ENCODER_LIBMP3LAME,
   FF_ENCODER_LIBOPUS,
   FF_ENCODER_LIBVORBIS,
+  FFmpegError,
   Muxer,
   pipeline,
 } from 'node-av';
@@ -81,8 +86,8 @@ export interface Media {
    * 16-bit, stereo, the RAOP default quality (raop.c). Boots stream the
    * chunks to their sink; each chunk is one decoded frame's bytes (a copy,
    * safe after the frame is freed). `startMs` seeks (keyframe granularity)
-   * for a pause → resume. Null when the file has no audio or the decoder
-   * cannot be created; mid-stream errors propagate to the consumer. Breaking
+   * for a pause → resume. Null when the file has no audio, seeking fails, or
+   * the decoder cannot be created; mid-stream errors propagate. Breaking
    * out of the iteration cancels the decode and frees everything. */
   decodePcm(
     path: string,
@@ -398,6 +403,32 @@ export function createMedia(): Media {
           await input.close();
           return null; // no audio track to decode
         }
+        if (opts.startMs !== undefined && opts.startMs > 0) {
+          // OwnTone-style audio seek: the native API expects this stream's
+          // time base, not the convenience seek's global microseconds.
+          // Preserve fractional engine milliseconds at microsecond precision.
+          const microseconds = BigInt(
+            Math.round(opts.startMs * AV_TIME_BASE / 1000),
+          );
+          let targetPts = avRescaleQ(
+            microseconds,
+            AV_TIME_BASE_Q,
+            audio.timeBase,
+          );
+          const startTime = audio.startTime;
+          if (startTime !== AV_NOPTS_VALUE && startTime > 0n) {
+            targetPts += startTime;
+          }
+          // Backward/keyframe seeking can overlap the requested position.
+          const ret = await input.getFormatContext().seekFrame(
+            audio.index,
+            targetPts,
+            AVSEEK_FLAG_BACKWARD,
+          );
+          FFmpegError.throwIfError(ret, 'PCM seek');
+        }
+        // Allocate only after successful seeking; a failed preflight owns
+        // just the input, which the existing failure handler closes.
         decoder = await Decoder.create(audio, {
           resample: {
             sampleRate: PCM_RATE,
@@ -405,16 +436,6 @@ export function createMedia(): Media {
             channelLayout: AV_CHANNEL_LAYOUT_STEREO,
           },
         });
-        if (opts.startMs !== undefined && opts.startMs > 0) {
-          // Keyframe granularity (AVSEEK_FLAG_BACKWARD): resume is allowed a
-          // small overlap. Failure still decodes — from the start.
-          await input.seek(
-            opts.startMs / 1000,
-            audio.index,
-            AVSEEK_FLAG_BACKWARD,
-          )
-            .catch(() => -1);
-        }
       } catch (err) {
         console.warn(`[melofon] media: decodePcm failed for ${path}: ${err}`);
         await input.close().catch(() => {});

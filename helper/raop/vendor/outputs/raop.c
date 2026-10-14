@@ -103,6 +103,8 @@
 // https://github.com/owntone/owntone-server/issues/734#issuecomment-622959334
 #define RAOP_KEEP_ALIVE_INTERVAL   25
 
+#define RAOP_SOURCE_OBSERVE_INTERVAL 2
+
 // This is an arbitrary value which just needs to be kept in sync with the config
 #define RAOP_CONFIG_MAX_VOLUME     11
 
@@ -184,6 +186,14 @@ struct raop_master_session
   struct raop_master_session *next;
 };
 
+/* Address-only normalized source identity; never compare ephemeral ports. */
+struct raop_source
+{
+  int family;
+  uint8_t address[16];
+  uint32_t scope;
+};
+
 struct raop_session
 {
   uint64_t device_id;
@@ -207,6 +217,10 @@ struct raop_session
   bool only_probe;
 
   struct event *deferredev;
+  struct event *source_observer;
+  struct raop_source rtsp_source;
+  struct raop_source rtp_source;
+  bool failure_pending;
 
   int reqs_in_flight;
   int cseq;
@@ -355,6 +369,152 @@ static bool raop_uncompressed_alac;
 // Forwards
 static int
 raop_device_start(struct output_device *rd, int callback_id);
+
+static void
+deferred_session_failure(struct raop_session *rs);
+
+/* Numeric-only socket/address operations. No DNS, sends, interface mutation or
+ * net_connect() in observation. This observes preferred source, not liveness. */
+static int
+source_normalize(struct raop_source *source, const union net_sockaddr *address, socklen_t length)
+{
+  memset(source, 0, sizeof(*source));
+  if (address->sa.sa_family == AF_INET && length >= sizeof(address->sin))
+    {
+      if (address->sin.sin_addr.s_addr == INADDR_ANY) { errno = EADDRNOTAVAIL; return -1; }
+      source->family = AF_INET;
+      memcpy(source->address, &address->sin.sin_addr, 4);
+      return 0;
+    }
+  if (address->sa.sa_family == AF_INET6 && length >= sizeof(address->sin6))
+    {
+      if (IN6_IS_ADDR_UNSPECIFIED(&address->sin6.sin6_addr)) { errno = EADDRNOTAVAIL; return -1; }
+      if (IN6_IS_ADDR_V4MAPPED(&address->sin6.sin6_addr))
+        {
+          source->family = AF_INET;
+          memcpy(source->address, address->sin6.sin6_addr.s6_addr + 12, 4);
+        }
+      else
+        {
+          source->family = AF_INET6;
+          memcpy(source->address, &address->sin6.sin6_addr, 16);
+          if (IN6_IS_ADDR_LINKLOCAL(&address->sin6.sin6_addr))
+            source->scope = address->sin6.sin6_scope_id;
+        }
+      return 0;
+    }
+  errno = EAFNOSUPPORT;
+  return -1;
+}
+
+static int
+source_from_text(struct raop_source *source, char *text, int family)
+{
+  union net_sockaddr address = { 0 };
+  char *zone = strchr(text, '%');
+  int ret;
+  address.sa.sa_family = family;
+  if (zone) *zone = '\0';
+  if (family == AF_INET)
+    ret = inet_pton(family, text, &address.sin.sin_addr);
+  else if (family == AF_INET6)
+    ret = inet_pton(family, text, &address.sin6.sin6_addr);
+  else ret = 0;
+  if (zone)
+    {
+      *zone = '%';
+      if (safe_atou32(zone + 1, &address.sin6.sin6_scope_id) < 0)
+        address.sin6.sin6_scope_id = if_nametoindex(zone + 1);
+      if (!address.sin6.sin6_scope_id) ret = 0;
+    }
+  if (ret != 1) { errno = EINVAL; return -1; }
+  return source_normalize(source, &address, family == AF_INET ? sizeof(address.sin) : sizeof(address.sin6));
+}
+
+static int
+source_from_socket(struct raop_source *source, int fd)
+{
+  union net_sockaddr address = { 0 };
+  socklen_t length = sizeof(address);
+  if (getsockname(fd, &address.sa, &length) < 0) return -1;
+  return source_normalize(source, &address, length);
+}
+
+static bool
+source_equal(const struct raop_source *a, const struct raop_source *b)
+{
+  return a->family == b->family && a->scope == b->scope &&
+    memcmp(a->address, b->address, sizeof(a->address)) == 0;
+}
+
+enum source_result { SOURCE_SELECTED, SOURCE_UNAVAILABLE, SOURCE_ERROR };
+
+static enum source_result
+source_probe(struct raop_session *rs, struct raop_source *source, int *error)
+{
+  union net_sockaddr receiver = rs->naddr;
+  socklen_t length;
+  int fd, ret, saved;
+  if (rs->family == AF_INET)
+    { receiver.sin.sin_port = htons(rs->server_port); length = sizeof(receiver.sin); }
+  else if (rs->family == AF_INET6)
+    { receiver.sin6.sin6_port = htons(rs->server_port); length = sizeof(receiver.sin6); }
+  else { *error = EAFNOSUPPORT; return SOURCE_ERROR; }
+  fd = socket(rs->family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) { *error = errno; return SOURCE_ERROR; }
+  ret = connect(fd, &receiver.sa, length);
+  saved = errno;
+  if (ret == 0) { ret = source_from_socket(source, fd); saved = errno; }
+  close(fd);
+  *error = ret < 0 ? saved : 0;
+  if (ret == 0) return SOURCE_SELECTED;
+  switch (saved)
+    {
+      case ENETUNREACH: case EHOSTUNREACH: case ENETDOWN: case EADDRNOTAVAIL:
+        return SOURCE_UNAVAILABLE;
+      default:
+        return SOURCE_ERROR;
+    }
+}
+
+static void
+source_observer_cancel(struct raop_session *rs)
+{
+  if (rs->source_observer) event_del(rs->source_observer);
+}
+
+static bool
+source_consistent(struct raop_session *rs)
+{
+  struct raop_source preferred;
+  int error;
+  enum source_result result = source_probe(rs, &preferred, &error);
+  if (result == SOURCE_SELECTED && source_equal(&rs->rtsp_source, &rs->rtp_source) &&
+      source_equal(&preferred, &rs->rtsp_source)) return true;
+  if (result == SOURCE_UNAVAILABLE)
+    DPRINTF(E_LOG, L_RAOP, "Local source unavailable for device %" PRIu64 " (errno=%d)\n", rs->device_id, error);
+  else if (result == SOURCE_ERROR)
+    DPRINTF(E_LOG, L_RAOP, "Local source observation error for device %" PRIu64 " (errno=%d)\n", rs->device_id, error);
+  else
+    DPRINTF(E_LOG, L_RAOP, "Local source changed/inconsistent for device %" PRIu64 "\n", rs->device_id);
+  deferred_session_failure(rs);
+  return false;
+}
+
+static void
+source_observer_cb(evutil_socket_t fd, short what, void *arg)
+{
+  struct raop_session *rs = arg;
+  struct timeval interval = { RAOP_SOURCE_OBSERVE_INTERVAL, 0 };
+  if (rs->retiring || rs->failure_pending || rs->state == RAOP_STATE_TEARDOWN ||
+      !(rs->state & RAOP_STATE_F_CONNECTED)) return;
+  if (!source_consistent(rs)) return;
+  if (evtimer_add(rs->source_observer, &interval) < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not schedule local source observation for device %" PRIu64 "\n", rs->device_id);
+      deferred_session_failure(rs);
+    }
+}
 
 
 /* ------------------------------- MISC HELPERS ----------------------------- */
@@ -1541,6 +1701,14 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb, const char *lo
       return -1;
     }
 
+  if (source_from_text(&rs->rtsp_source, address, family) < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not snapshot RTSP source for device %" PRIu64 " (errno=%d)\n", rs->device_id, errno);
+      free(address);
+      deferred_session_failure(rs);
+      return 0; /* Only the coordinator may authorize a replacement. */
+    }
+
   intf = strchr(address, '%');
   if (intf)
     {
@@ -1783,6 +1951,7 @@ raop_status(struct raop_session *rs)
 {
   enum output_device_state state;
   if (rs->retiring) return;
+  if (rs->failure_pending && rs->state != RAOP_STATE_FAILED) return;
 
   switch (rs->state)
     {
@@ -1866,6 +2035,17 @@ master_session_cleanup(struct raop_master_session *rms)
   master_session_free(rms);
 }
 
+void
+raop_discard_pending_input(void)
+{
+  struct raop_master_session *rms;
+  for (rms = raop_master_sessions; rms; rms = rms->next)
+    {
+      evbuffer_drain(rms->input_buffer, evbuffer_get_length(rms->input_buffer));
+      rms->input_buffer_samples = 0;
+    }
+}
+
 static struct raop_master_session *
 master_session_make(struct media_quality *quality, bool encrypt)
 {
@@ -1946,6 +2126,9 @@ session_free(struct raop_session *rs)
 {
   if (!rs)
     return;
+
+  source_observer_cancel(rs);
+  if (rs->source_observer) event_free(rs->source_observer);
 
   if (rs->master_session)
     master_session_cleanup(rs->master_session);
@@ -2043,6 +2226,7 @@ raop_release_device(uint64_t id, void (*done)(uint64_t, int))
     rs->callback_id = -1;
     rs->reqs_in_flight = 0;
     event_del(rs->deferredev);
+    source_observer_cancel(rs);
   }
   for (rs = raop_sessions; rs; rs = next) {
     struct evrtsp_request *req = NULL;
@@ -2082,6 +2266,9 @@ deferred_session_failure(struct raop_session *rs)
 {
   struct timeval tv;
 
+  if (rs->retiring || rs->failure_pending) return;
+  rs->failure_pending = true;
+  source_observer_cancel(rs);
   rs->state = RAOP_STATE_FAILED;
 
   evutil_timerclear(&tv);
@@ -2122,6 +2309,8 @@ session_teardown(struct raop_session *rs, const char *log_caller)
 {
   int ret;
 
+  source_observer_cancel(rs);
+  if (rs->failure_pending) return 0;
   ret = raop_send_req_teardown(rs, session_teardown_cb, log_caller);
   if (ret < 0)
     {
@@ -2140,7 +2329,7 @@ deferredev_cb(int fd, short what, void *arg)
 {
   struct raop_session *rs = arg;
 
-  if (rs->state == RAOP_STATE_FAILED)
+  if (rs->failure_pending || rs->state == RAOP_STATE_FAILED)
     {
       DPRINTF(E_DBG, L_RAOP, "Cleaning up failed session (deferred) on device '%s'\n", rs->devname);
       session_failure(rs);
@@ -2844,6 +3033,7 @@ raop_cb_flush(struct evrtsp_request *req, void *arg)
   int ret;
 
   rs->reqs_in_flight--;
+  if (rs->failure_pending || rs->retiring) return;
 
   if (!req)
     goto error;
@@ -2939,7 +3129,7 @@ packet_send(struct raop_session *rs, struct rtp_packet *pkt)
 {
   int ret;
 
-  if (!rs)
+  if (!rs || rs->retiring || rs->failure_pending)
     return -1;
 
   ret = send(rs->server_fd, pkt->data, pkt->data_len, 0);
@@ -2975,6 +3165,7 @@ control_packet_send(struct raop_session *rs, struct rtp_packet *pkt)
   int fd;
   int ret;
 
+  if (rs->retiring || rs->failure_pending) return;
   switch (rs->family)
     {
       case AF_INET:
@@ -3011,7 +3202,7 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
   /* The shared control service remains alive for peers during terminal
    * write/close. A retiring session must not send cached old audio or queue
    * a deferred failure while its native release owns destruction. */
-  if (rs->retiring) return;
+  if (rs->retiring || rs->failure_pending) return;
 
   rtp_session = rs->master_session->rtp_session;
 
@@ -3452,6 +3643,7 @@ raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
   int ret;
 
   rs->reqs_in_flight--;
+  if (rs->failure_pending || rs->retiring) return;
 
   if (!req)
     goto cleanup;
@@ -3474,6 +3666,22 @@ raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
   rs->server_fd = net_connect(rs->address, rs->server_port, SOCK_DGRAM, "RAOP data");
   if (rs->server_fd < 0)
     goto cleanup;
+
+  if (source_from_socket(&rs->rtp_source, rs->server_fd) < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not snapshot RTP source for device %" PRIu64 " (errno=%d)\n", rs->device_id, errno);
+      deferred_session_failure(rs);
+      return;
+    }
+  if (!source_consistent(rs)) return;
+  rs->source_observer = evtimer_new(evbase_player, source_observer_cb, rs);
+  struct timeval interval = { RAOP_SOURCE_OBSERVE_INTERVAL, 0 };
+  if (!rs->source_observer || evtimer_add(rs->source_observer, &interval) < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not start local source observation for device %" PRIu64 "\n", rs->device_id);
+      deferred_session_failure(rs);
+      return;
+    }
 
   rs->state = RAOP_STATE_CONNECTED;
 

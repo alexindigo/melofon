@@ -9,31 +9,21 @@ import {
   CONNECTION_STRATEGIES,
   type ConnectionStrategy,
 } from '../connection-strategy.ts';
-import { createFfiSpawn } from './raop-ffi.ts';
-
-export function airplayOutputId(host: string): string {
-  let hash = 0xcbf29ce484222325n;
-  for (const byte of new TextEncoder().encode(host)) {
-    hash = BigInt.asUintN(64, (hash ^ BigInt(byte)) * 0x100000001b3n);
-  }
-  return hash.toString(10);
-}
-export interface AirplayTransport {
-  send(cmd: Record<string, unknown>): Promise<void>;
-  pcm(chunk: Uint8Array): Promise<void>;
-  close(): Promise<void>;
-  ownsSharedFeed(): boolean;
-  cancelPcm(): void;
-}
-export type HelperEventFn = (event: string, value?: string) => void;
+import type { AirplayDevices } from './airplay-device.ts';
+import type { AirplayTransport } from './airplay-profile.ts';
+export { airplayOutputId } from './airplay-profile.ts';
+export type { AirplayTransport, HelperEventFn } from './airplay-profile.ts';
 export interface AirplayBootDeps {
   outputs: Outputs;
   playback: Playback;
   media: Media;
   notify: Notify;
-  spawn?: (onEvent: HelperEventFn) => AirplayTransport;
+  devices: AirplayDevices;
   state?: State;
   retryBackoffMs?: number[];
+  retryTimer?: {
+    set(callback: () => void, delayMs: number): { cancel(): void };
+  };
 }
 export const AIRPLAY_RETRY_KEY = 'airplay.retry';
 const DEFAULT_SECONDS = [0, 2, 5, 10, 20, 30, 60];
@@ -52,7 +42,7 @@ type View = ReturnType<Playback['playerView']>;
 interface Epoch {
   generation: number;
   attempts: number;
-  timer?: ReturnType<typeof setTimeout>;
+  timer?: { cancel(): void };
   failed: boolean;
   contentError: boolean;
 }
@@ -82,7 +72,14 @@ export function createAirplayBoot(
   deps: AirplayBootDeps,
 ): { close(): Promise<void> } {
   const { outputs, playback, media, notify } = deps;
-  const spawn = deps.spawn ?? createFfiSpawn();
+  const devices = deps.devices;
+  const retryTimer = deps.retryTimer ??
+    {
+      set(callback: () => void, delay: number) {
+        const timer = setTimeout(callback, delay);
+        return { cancel: () => clearTimeout(timer) };
+      },
+    };
   const ownedSource: CommandSource = { kind: 'internal', via: 'airplay-boot' };
   console.log(
     '[melofon] airplay: policy=connection-strategies-v1 default=melofon',
@@ -91,6 +88,10 @@ export function createAirplayBoot(
   const epochs = new Map<string, Epoch>();
   const generations = new Map<string, number>();
   const grants = new Map<string, Grant>();
+  const preparing = new Map<
+    string,
+    { controller: AbortController; grant: Grant; host: string; port?: number }
+  >();
   const retiring = new Map<string, Promise<boolean>>();
   const blocked = new Set<string>();
   const pendingPumps = new Map<string, Runtime>();
@@ -121,11 +122,16 @@ export function createAirplayBoot(
   };
   const cancelRetry = (id: string) => {
     const e = epoch(id);
-    if (e.timer !== undefined) clearTimeout(e.timer);
+    e.timer?.cancel();
     e.timer = undefined;
     if (grants.get(id)?.kind === 'retry') grants.delete(id);
+    if (preparing.get(id)?.grant.kind === 'retry') {
+      preparing.get(id)!.controller.abort();
+    }
   };
   const revoke = (id: string) => {
+    preparing.get(id)?.controller.abort();
+    preparing.delete(id);
     cancelRetry(id);
     grants.delete(id);
     pendingPumps.delete(id);
@@ -351,7 +357,7 @@ export function createAirplayBoot(
     console.warn(
       `[melofon] airplay: output ${id} retry ${e.attempts}/${backoff.length} in ${wait}ms`,
     );
-    e.timer = setTimeout(() => {
+    e.timer = retryTimer.set(() => {
       e.timer = undefined;
       if (
         closed || e.generation !== generation || backoff === null ||
@@ -410,77 +416,126 @@ export function createAirplayBoot(
       ) return;
     }
     if (!view.current) return;
-    grants.delete(id);
-    e.failed = false;
-    const session = (generations.get(id) ?? 0) + 1;
-    generations.set(id, session);
-    const r: Runtime = {
-      transport: null,
-      session,
-      pump: 0,
-      authorizedPump: null,
-      connected: false,
-      entry: null,
-      strategy: out.connectionStrategy,
+    if (preparing.has(id)) return;
+    const controller = new AbortController();
+    const work = {
+      controller,
+      grant: permission,
       host: out.host,
-      port: out.port ?? 7000,
-      progress: view.itemProgressMs,
-      at: performance.now(),
-      volume: volume(out, view),
-      held: false,
+      port: out.port,
     };
-    runtimes.set(id, r);
-    const own = () =>
-      !closed && runtimes.get(id) === r && r.session === session &&
-      r.transport !== null;
-    try {
-      r.transport = spawn((event, value) => {
-        if (!own()) return;
-        if (event === 'state' && value === 'failed') {
-          sessionFailed(id, r, 'helper event');
-        } else if (event === 'state' && value === 'password') {
-          outputs.update(id, { needsAuthKey: true }, ownedSource);
-        } else if (event === 'state' && value === 'connected') {
-          const wasConnected = r.connected;
-          r.connected = true;
-          const latest = playback.playerView();
-          r.progress = latest.itemProgressMs;
-          r.at = performance.now();
-          if (!wasConnected && !r.held && latest.state === 'play') {
-            requestPump(id, r);
-          }
-          // Connected/FLUSH notifications never reset a demand's retry budget.
+    preparing.set(id, work);
+    let activated: Runtime | undefined;
+    const current = () => {
+      const row = outputs.get(id);
+      return !closed && !controller.signal.aborted &&
+        permission.epoch === epoch(id).generation &&
+        row?.selected === true && intent === 'play' &&
+        playback.playerView().state === 'play' &&
+        (activated
+          ? runtimes.get(id) === activated && activated.session === session
+          : grants.get(id) === permission) &&
+        !blocked.has(id) && !retiring.has(id);
+    };
+    let session = 0;
+    void (async () => {
+      const prepared = await devices.protocol.prepare({
+        id,
+        targetRevision: devices.admission.describe(id).targetRevision,
+        signal: controller.signal,
+        isCurrent: current,
+      });
+      if (preparing.get(id) !== work || !current()) return;
+      preparing.delete(id);
+      grants.delete(id);
+      if (!prepared.ok) {
+        e.failed = true;
+        console.warn(
+          `[melofon] airplay: output ${id} preparation failed (${prepared.error.code}: ${prepared.error.message})`,
+        );
+        if (!usable() && playback.playerView().state === 'play') {
+          lease = {
+            intent: intentEpoch,
+            outputs: new Map(
+              [...epochs].map(([key, value]) => [key, value.generation]),
+            ),
+          };
+          playback.pause(ownedSource);
         }
-      });
-      console.log(
-        `[melofon] airplay: output ${id} session gen ${session} start (strategy=${r.strategy} grant=${permission.kind})`,
-      );
-      r.transport.send({
-        cmd: 'start',
-        host: out.host,
-        port: out.port ?? 7000,
-        name: out.name,
-        volume: r.volume,
-        ...(out.devtype === undefined ? {} : { devtype: out.devtype }),
-        ...(out.encrypt === undefined ? {} : { encrypt: out.encrypt }),
-        wanted_metadata: out.wantedMetadata ?? 0,
-        authsetup: out.supportsAuthSetup ? 1 : 0,
-        requires_auth: out.requiresAuth ? 1 : 0,
-        ...(out.sampleRate === undefined
-          ? {}
-          : { sample_rate: out.sampleRate }),
-        ...(out.bitsPerSample === undefined ? {} : { bits: out.bitsPerSample }),
-        ...(out.channels === undefined ? {} : { channels: out.channels }),
-        pos_ms: 0,
-        len_ms: view.current.song.durationMs ?? 0,
-        title: view.current.song.title ?? '',
-        artist: view.current.song.artistName ?? '',
-      }).catch((error) => {
-        if (own()) sessionFailed(id, r, `start enqueue: ${error}`);
-      });
-    } catch (error) {
-      sessionFailed(id, r, `spawn: ${error}`);
-    }
+        scheduleRetry(id);
+        return;
+      }
+      const latestOut = outputs.get(id)!;
+      view = playback.playerView();
+      if (!view.current) return;
+      e.failed = false;
+      session = (generations.get(id) ?? 0) + 1;
+      generations.set(id, session);
+      const r: Runtime = {
+        transport: null,
+        session,
+        pump: 0,
+        authorizedPump: null,
+        connected: false,
+        // Retain queue identity for same-entry seeks before CONNECTED is
+        // polled. Entry changes during the handshake still absorb the latest
+        // item when the connecting generation starts its first pump.
+        entry: view.current.id,
+        strategy: latestOut.connectionStrategy,
+        host: latestOut.host!,
+        port: latestOut.port ?? 7000,
+        progress: view.itemProgressMs,
+        at: performance.now(),
+        volume: volume(latestOut, view),
+        held: false,
+      };
+      runtimes.set(id, r);
+      activated = r;
+      const own = () =>
+        !closed && runtimes.get(id) === r && r.session === session &&
+        r.transport !== null;
+      try {
+        console.log(
+          `[melofon] airplay: output ${id} session gen ${session} start (strategy=${r.strategy} grant=${permission.kind})`,
+        );
+        const result = await devices.protocol.activate(prepared.value, {
+          volume: r.volume,
+          positionMs: 0,
+          lengthMs: view.current.song.durationMs ?? 0,
+          title: view.current.song.title ?? '',
+          artist: view.current.song.artistName ?? '',
+        }, {
+          publish(transport) {
+            r.transport = transport;
+          },
+          onEvent({ event, value }) {
+            if (!own()) return;
+            if (event === 'state' && value === 'failed') {
+              sessionFailed(id, r, 'helper event');
+            } else if (event === 'state' && value === 'password') {
+              outputs.update(id, { needsAuthKey: true }, ownedSource);
+            } else if (event === 'state' && value === 'connected') {
+              const wasConnected = r.connected;
+              r.connected = true;
+              const latest = playback.playerView();
+              r.progress = latest.itemProgressMs;
+              r.at = performance.now();
+              if (!wasConnected && !r.held && latest.state === 'play') {
+                requestPump(id, r);
+              }
+              // Connected/FLUSH notifications never reset a demand's retry budget.
+            }
+          },
+        });
+        if (!result.ok && runtimes.get(id) === r) {
+          sessionFailed(id, r, `activation: ${result.error.message}`);
+        }
+      } catch (error) {
+        sessionFailed(id, r, `spawn: ${error}`);
+      }
+    })().catch((error) =>
+      console.error(`[melofon] airplay: output ${id} preparation: ${error}`)
+    );
   };
   const idle = (id: string, r: Runtime, choice: ConnectionStrategy) => {
     r.strategy = choice;
@@ -512,6 +567,14 @@ export function createAirplayBoot(
     );
     const retirements: [string, Runtime, string][] = [];
     const actions: (() => void)[] = [];
+    for (const [id, work] of preparing) {
+      const row = outputs.get(id);
+      if (!row || row.host !== work.host || row.port !== work.port) {
+        work.controller.abort();
+        preparing.delete(id);
+        devices.admission.describe(id);
+      }
+    }
     if (startup) {
       startup = false;
       if (view.state === 'play' && intent === 'play') {
@@ -572,7 +635,8 @@ export function createAirplayBoot(
           if (r.connected) requestPump(id, r);
         });
       } else if (
-        r.connected && r.entry !== null && (r.entry !== view.current.id ||
+        r.entry !== null && (r.connected || r.entry === view.current.id) &&
+        (r.entry !== view.current.id ||
           Math.abs(view.itemProgressMs - (r.progress + (now - r.at))) >
             SEEK_JUMP_MS)
       ) {
@@ -584,7 +648,8 @@ export function createAirplayBoot(
             r,
             r.entry !== view.current.id ? 'track' : 'seek',
           ]);
-        } else {actions.push(() => {
+        } else if (r.connected) {
+          actions.push(() => {
             cancelPump(id, r);
             void r.transport!.send({ cmd: 'flush' }).catch((error) => {
               if (runtimes.get(id) === r) {
@@ -592,7 +657,8 @@ export function createAirplayBoot(
               }
             });
             requestPump(id, r);
-          });}
+          });
+        }
       }
       actions.push(() => {
         if (runtimes.get(id) !== r || !r.transport) return;
@@ -688,6 +754,8 @@ export function createAirplayBoot(
       unsubscribePolicy?.();
       lease = null;
       grants.clear();
+      for (const work of preparing.values()) work.controller.abort();
+      preparing.clear();
       pendingPumps.clear();
       for (const id of epochs.keys()) cancelRetry(id);
       const closes: Promise<unknown>[] = [...retiring.values()];

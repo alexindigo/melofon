@@ -6,14 +6,18 @@ export class MsgBuilder {
   bytes: number[] = [];
   private offsets = new Map<string, number>();
 
-  header(ancount: number) {
+  header(
+    ancount: number,
+    id = 0,
+    questions: { name: string; type: number }[] = [],
+  ) {
     this.bytes.push(
-      0,
-      0, // id
+      (id >> 8) & 0xff,
+      id & 0xff,
       0x84,
       0x00, // flags: response, authoritative
-      0,
-      0, // qd
+      (questions.length >> 8) & 0xff,
+      questions.length & 0xff,
       (ancount >> 8) & 0xff,
       ancount & 0xff,
       0,
@@ -21,6 +25,11 @@ export class MsgBuilder {
       0,
       0, // ns, ar
     );
+    for (const question of questions) {
+      this.name(question.name);
+      this.u16(question.type);
+      this.u16(1);
+    }
   }
 
   name(fqdn: string) {
@@ -79,9 +88,14 @@ export class MsgBuilder {
 }
 
 /** PTR-only: the instance name, no SRV/TXT/A. */
-export function ptrOnlyAnswer(instance: string, ttl = 120): Uint8Array {
+export function ptrOnlyAnswer(
+  instance: string,
+  ttl = 120,
+  id = 0,
+  questions: { name: string; type: number }[] = [],
+): Uint8Array {
   const b = new MsgBuilder();
-  b.header(1);
+  b.header(1, id, questions);
   b.record('_raop._tcp.local', 12, ttl, (bb) => bb.name(instance));
   return b.build();
 }
@@ -96,21 +110,27 @@ export function airplayAnswer(opts: {
   txt?: string[];
   omitA?: boolean;
   aaaa?: number[];
+  omitTxt?: boolean;
+  id?: number;
+  questions?: { name: string; type: number }[];
 }): Uint8Array {
   const ttl = opts.ttl ?? 120;
   const port = opts.port ?? 7000;
   const txt = opts.txt ?? ['tp=UDP', 'am=AppleTV3,1', 'ek=1', 'sf=0x200'];
   const b = new MsgBuilder();
   let ancount = 3;
+  if (opts.omitTxt) ancount--;
   if (!opts.omitA) ancount++;
   if (opts.aaaa !== undefined) ancount++;
-  b.header(ancount);
+  b.header(ancount, opts.id, opts.questions);
   b.record('_raop._tcp.local', 12, ttl, (bb) => bb.name(opts.instance));
-  b.record(opts.instance, 16, ttl, (bb) => {
-    for (const kv of txt) {
-      bb.bytes.push(kv.length, ...[...kv].map((c) => c.charCodeAt(0)));
-    }
-  });
+  if (!opts.omitTxt) {
+    b.record(opts.instance, 16, ttl, (bb) => {
+      for (const kv of txt) {
+        bb.bytes.push(kv.length, ...[...kv].map((c) => c.charCodeAt(0)));
+      }
+    });
+  }
   b.record(opts.instance, 33, ttl, (bb) => {
     bb.u16(0);
     bb.u16(0);

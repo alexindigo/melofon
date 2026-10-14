@@ -17,41 +17,16 @@ import { createMdnsBrowser } from '../mdns.ts';
 import type { Outputs } from '../player.ts';
 import type { State } from '../state.ts';
 import type { ConnectionStrategy } from '../connection-strategy.ts';
+import type { AirplayDevices } from './airplay-device.ts';
+import { profileFromService } from './airplay-profile.ts';
+export {
+  devtypeFromAm,
+  sessionFieldsFromTxt,
+  supportsAuthSetupFromEt,
+  wantedMetadataFromMd,
+} from './airplay-profile.ts';
 
 export const MDNS_KEY = 'airplay.mdns';
-
-/** OwnTone's raop_device_cb model-string → the helper's devtype token. */
-export function devtypeFromAm(am: string | undefined): string {
-  if (am === undefined) return 'apex1'; // first-gen AirPort Express (no am)
-  if (am.startsWith('AirPort4')) return 'apex2';
-  if (am.startsWith('AirPort')) return 'apex3';
-  if (am.startsWith('AppleTV5,3')) return 'appletv4';
-  if (am.startsWith('AppleTV')) return 'appletv';
-  if (am.startsWith('AudioAccessory')) return 'homepod';
-  return 'other';
-}
-
-/** OwnTone raop.c:96-98 / raop_device_cb md tokens: 0=text 1=artwork 2=progress. */
-export const RAOP_MD_TEXT = 1 << 0;
-export const RAOP_MD_ARTWORK = 1 << 1;
-export const RAOP_MD_PROGRESS = 1 << 2;
-
-export function wantedMetadataFromMd(md: string | undefined): number {
-  if (md === undefined || md === '') return 0;
-  let bits = 0;
-  for (const token of md.split(',')) {
-    if (token === '0') bits |= RAOP_MD_TEXT;
-    else if (token === '1') bits |= RAOP_MD_ARTWORK;
-    else if (token === '2') bits |= RAOP_MD_PROGRESS;
-  }
-  return bits;
-}
-
-/** TXT `et` token 4: the device supports (does not require) auth-setup. */
-export function supportsAuthSetupFromEt(et: string | undefined): boolean {
-  if (et === undefined) return false;
-  return et.split(',').includes('4');
-}
 
 /** Parse the mDNS instance name: <64-bit hex id>@<pretty name>, with the
  * `._raop._tcp.local` domain suffix stripped (the label is `id@name`). */
@@ -64,53 +39,10 @@ function parseInstance(name: string): { id: string; name: string } | null {
   return { id: BigInt(`0x${hex}`).toString(10), name: label.slice(at + 1) };
 }
 
-/** sf flags: bit 9 means the device wants verification (OwnTone). */
-function wantsAuth(sf: string | undefined): boolean {
-  if (sf === undefined) return false;
-  const hex = sf.startsWith('0x') ? sf.slice(2) : sf;
-  if (!/^[0-9a-fA-F]+$/.test(hex)) return false;
-  return ((BigInt(`0x${hex}`) >> 9n) & 1n) === 1n;
-}
-
-/** OwnTone raop_device_cb session knobs from a device TXT. `model` is NOT
- * a knob: the nonempty trimmed `am` is the device's identity (plan
- * atv3-session-recycle), persisted and preserved across model-less
- * re-registration. */
-export function sessionFieldsFromTxt(txt: Record<string, string>): {
-  devtype: string;
-  model?: string;
-  encrypt: boolean;
-  wantedMetadata: number;
-  supportsAuthSetup: boolean;
-  requiresAuth: boolean;
-  needsAuthKey: boolean;
-  sampleRate?: number;
-  bitsPerSample?: number;
-  channels?: number;
-} {
-  const requiresAuth = wantsAuth(txt.sf);
-  const sampleRate = Number.parseInt(txt.sr ?? '', 10);
-  const bitsPerSample = Number.parseInt(txt.ss ?? '', 10);
-  const channels = Number.parseInt(txt.ch ?? '', 10);
-  const model = txt.am?.trim();
-  return {
-    devtype: devtypeFromAm(txt.am),
-    ...(model ? { model } : {}),
-    encrypt: txt.ek === '1',
-    wantedMetadata: wantedMetadataFromMd(txt.md),
-    supportsAuthSetup: supportsAuthSetupFromEt(txt.et),
-    requiresAuth,
-    needsAuthKey: requiresAuth,
-    ...(Number.isFinite(sampleRate) && sampleRate > 0 && { sampleRate }),
-    ...(Number.isFinite(bitsPerSample) && bitsPerSample > 0 &&
-      { bitsPerSample }),
-    ...(Number.isFinite(channels) && channels > 0 && { channels }),
-  };
-}
-
 export interface AirplayDiscoveryDeps {
   outputs: Outputs;
   state: State;
+  devices: AirplayDevices;
   /** Injectable browser factory for tests; default browses _raop._tcp. */
   createBrowser?: (
     onService: (event: 'up' | 'down', service: MdnsService) => void,
@@ -136,7 +68,6 @@ export function createAirplayDiscovery(
   deps: AirplayDiscoveryDeps,
 ): {
   close(): void;
-  resolve(address: string): Promise<MdnsService | null>;
 } {
   const { outputs, state } = deps;
   const log = deps.log ?? ((msg: string) => console.warn(`[melofon] ${msg}`));
@@ -154,14 +85,10 @@ export function createAirplayDiscovery(
 
   let browser: MdnsBrowser | null = null;
   const discovered = new Set<string>();
-  const waiters = new Map<string, (svc: MdnsService) => void>();
+  const signatures = new Map<string, string>();
   let closed = false;
 
   const onService = (event: 'up' | 'down', svc: MdnsService) => {
-    if (event === 'up') {
-      const waiter = waiters.get(svc.address);
-      if (waiter !== undefined) waiter(svc);
-    }
     if (event === 'down') {
       const parsed = parseInstance(svc.name);
       if (parsed !== null && discovered.delete(parsed.id)) {
@@ -185,7 +112,44 @@ export function createAirplayDiscovery(
       return;
     }
 
-    const fields = sessionFieldsFromTxt(svc.txt);
+    if (svc.txt.pw !== undefined && svc.txt.pw !== 'false') {
+      const existing = outputs.get(parsed.id);
+      const saved = existing === null
+        ? deps.savedOutput?.(parsed.id)
+        : undefined;
+      log(
+        `airplay discovery: '${parsed.name}' asks for a password — unsupported`,
+      );
+      deps.devices.register(
+        {
+          id: parsed.id,
+          name: parsed.name,
+          type: 'AirPlay',
+          host: svc.address,
+          port: svc.port,
+          selected: existing?.selected ?? saved?.selected ?? false,
+          volume: existing?.volume ?? saved?.volume ?? 100,
+          ...(svc.txt.am?.trim() ? { model: svc.txt.am.trim() } : {}),
+        },
+        { kind: 'internal', via: 'airplay-discovery' },
+        svc,
+      );
+      discovered.add(parsed.id);
+      return;
+    }
+    let profile: ReturnType<typeof profileFromService>;
+    try {
+      profile = profileFromService(svc);
+    } catch (error) {
+      log(`airplay discovery: invalid receiver: ${error}`);
+      return;
+    }
+    const fields = {
+      ...(profile.model === undefined ? {} : { model: profile.model }),
+      requiresAuth: profile.requiresAuth,
+      needsAuthKey: profile.requiresAuth,
+    };
+    const signature = JSON.stringify(profile);
     const existing = outputs.get(parsed.id);
     // A device re-announcing while not registered (mDNS down→up, or a
     // restart before its row re-registers) gets its persisted user state
@@ -202,16 +166,10 @@ export function createAirplayDiscovery(
       existing !== null &&
       existing.host === svc.address &&
       existing.port === svc.port &&
-      existing.devtype === fields.devtype &&
-      (existing.encrypt ?? false) === fields.encrypt &&
-      (existing.wantedMetadata ?? 0) === fields.wantedMetadata &&
-      (existing.supportsAuthSetup ?? false) === fields.supportsAuthSetup &&
-      (existing.requiresAuth ?? false) === fields.requiresAuth &&
-      existing.sampleRate === fields.sampleRate &&
-      existing.bitsPerSample === fields.bitsPerSample &&
-      existing.channels === fields.channels &&
+      signatures.get(parsed.id) === signature &&
       (fields.model === undefined || fields.model === existing.model)
     ) {
+      deps.devices.observe(parsed.id, svc);
       return;
     }
 
@@ -240,32 +198,37 @@ export function createAirplayDiscovery(
           svc.txt.pw !== undefined && svc.txt.pw !== 'false' ? 1 : 0
         }, ` +
         `verification: ${fields.requiresAuth ? 1 : 0}, ` +
-        `encrypt: ${fields.encrypt ? 1 : 0}, ` +
-        `authsetup: ${fields.supportsAuthSetup ? 1 : 0}, ` +
-        `metadata: ${fields.wantedMetadata}, ` +
-        `type ${fields.devtype}, address ${svc.address}:${svc.port}`,
+        `encrypt: ${profile.encrypt ? 1 : 0}, ` +
+        `authsetup: ${profile.supportsAuthSetup ? 1 : 0}, ` +
+        `metadata: ${profile.wantedMetadata}, ` +
+        `type ${profile.devtype}, address ${svc.address}:${svc.port}`,
     );
-    outputs.register({
-      id: parsed.id,
-      name: parsed.name,
-      type: 'AirPlay',
-      // Re-announcement must never wipe user state: an ethernet→wifi move
-      // replaces the record (identity, address, TXT fields) but keeps
-      // selection, volume, and PIN completion. A device that was gone gets
-      // the persisted state back instead of the discovery defaults.
-      selected: existing?.selected ?? saved?.selected ?? false,
-      volume: existing?.volume ?? saved?.volume ?? 100,
-      host: svc.address,
-      port: svc.port,
-      ...fields,
-      // Model identity: fresh `am` rides the ...fields spread; when the TXT
-      // omits it, a live record's model survives inside register() and a
-      // returning device's saved model is recovered here.
-      ...(existing === null && fields.model === undefined &&
-        saved?.model !== undefined && { model: saved.model }),
-      ...(existing?.needsAuthKey !== undefined &&
-        { needsAuthKey: existing.needsAuthKey }),
-    }, { kind: 'internal', via: 'airplay-discovery' });
+    deps.devices.register(
+      {
+        id: parsed.id,
+        name: parsed.name,
+        type: 'AirPlay',
+        // Re-announcement must never wipe user state: an ethernet→wifi move
+        // replaces the record (identity, address, TXT fields) but keeps
+        // selection, volume, and PIN completion. A device that was gone gets
+        // the persisted state back instead of the discovery defaults.
+        selected: existing?.selected ?? saved?.selected ?? false,
+        volume: existing?.volume ?? saved?.volume ?? 100,
+        host: svc.address,
+        port: svc.port,
+        ...fields,
+        // Model identity: fresh `am` rides the ...fields spread; when the TXT
+        // omits it, a live record's model survives inside register() and a
+        // returning device's saved model is recovered here.
+        ...(existing === null && fields.model === undefined &&
+          saved?.model !== undefined && { model: saved.model }),
+        ...(existing?.needsAuthKey !== undefined &&
+          { needsAuthKey: existing.needsAuthKey }),
+      },
+      { kind: 'internal', via: 'airplay-discovery' },
+      svc,
+    );
+    signatures.set(parsed.id, signature);
     discovered.add(parsed.id);
   };
 
@@ -283,7 +246,7 @@ export function createAirplayDiscovery(
     discovered.clear();
   };
 
-  const started = state.get(MDNS_KEY).then((value) => {
+  void state.get(MDNS_KEY).then((value) => {
     if (value !== 'off') start();
   });
   const unsubscribe = state.onChange((key, value) => {
@@ -297,31 +260,6 @@ export function createAirplayDiscovery(
       closed = true;
       unsubscribe();
       stop();
-    },
-    async resolve(address: string) {
-      await started;
-      if (closed || browser === null) {
-        log(
-          `airplay discovery: resolve ${address} skipped (browser not running)`,
-        );
-        return null;
-      }
-      return await new Promise<MdnsService | null>((resolvePromise) => {
-        const timer = setTimeout(() => {
-          waiters.delete(address);
-          log(
-            `airplay discovery: resolve ${address} timed out ` +
-              '(no TXT from the device)',
-          );
-          resolvePromise(null);
-        }, 2000);
-        waiters.set(address, (svc) => {
-          clearTimeout(timer);
-          waiters.delete(address);
-          resolvePromise(svc);
-        });
-        browser!.resolve(address);
-      });
     },
   };
 }

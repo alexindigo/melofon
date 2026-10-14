@@ -279,27 +279,13 @@ export interface Output {
   host?: string;
   /** Boot port (RAOP defaults to 7000). */
   port?: number;
-  /** RAOP device type token (appletv/apex1/...; from mDNS `am`) — passed to
-   * the helper's start. */
-  devtype?: string;
   /** The raw device model string (TXT `am`, e.g. 'AppleTV3,1') — identity,
    * not a session knob: persisted, preserved across model-less
    * re-registration, and what the boot's affected-model predicate matches
    * (plan atv3-session-recycle). */
   model?: string;
-  /** Encrypt the RTP stream (mDNS `ek=1`). */
-  encrypt?: boolean;
-  /** OwnTone raop_device_cb wanted_metadata bitmask from TXT `md`
-   * (1=text 2=artwork 4=progress). Absent `md` ⇒ 0. */
-  wantedMetadata?: number;
-  /** TXT `et` contains token 4: the device supports (not requires) auth-setup. */
-  supportsAuthSetup?: boolean;
   /** TXT `sf` bit 9: device verification. OwnTone `requires_auth`. */
   requiresAuth?: boolean;
-  /** TXT `sr`/`ss`/`ch` when present; the helper defaults 44100/16/2. */
-  sampleRate?: number;
-  bitsPerSample?: number;
-  channels?: number;
   /** The device wants a PIN/password (OwnTone needs_auth_key on the wire);
    * set by the boot when its helper reports the auth/verification path. */
   needsAuthKey?: boolean;
@@ -339,6 +325,7 @@ export interface Outputs {
       volume?: number;
       pin?: string;
       needsAuthKey?: boolean;
+      requiresAuth?: boolean;
       connectionStrategy?: ConnectionStrategy;
     },
     source?: CommandSource,
@@ -806,6 +793,9 @@ export function createOutputs(
       }
       if (opts.needsAuthKey !== undefined) {
         found.needsAuthKey = opts.needsAuthKey;
+      }
+      if (opts.requiresAuth !== undefined) {
+        found.requiresAuth = opts.requiresAuth;
       }
       if (opts.pin !== undefined) {
         // A command, not state: straight to the boot, never stored.

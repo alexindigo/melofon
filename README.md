@@ -56,7 +56,8 @@ Playing strategy changes apply at the next discontinuity/idle transition;
 switching an OwnTone idle hold to immediate release retires it now. Deselect,
 unregister and queue clear release immediately for every choice. OwnTone's
 FLUSH compatibility path can be problematic on ATV3; it is an operator choice,
-not a guessed model policy. Unknown model identity does not prevent playback.
+not a guessed model policy. A recognized Apple model is not required for
+playback; a complete supported receiver profile is required.
 
 Recovery is finite per explicit demand: initial attempt plus at most seven
 automatic slots, default seconds `0,2,5,10,20,30,60`. Pause/Stop/no-op commands
@@ -67,6 +68,53 @@ Local release has a five-second final-write budget; failure blocks replacement
 until a separately authorized process restart. Local close proves neither
 remote acknowledgment nor sound/other-controller availability. Normal decoder
 EOF does not truncate buffered audio or change engine track-end semantics.
+
+## Output preparation
+
+Registered speakers, prepared targets, connected sessions and audible playback
+are distinct. The shared `src/output-admission.ts` boundary owns preparation,
+endpoint revisions, cancellation and single-use activation permits. Protocol
+adapters validate acquired facts; the AirPlay coordinator cannot start from a
+bare registered address or restore a prepared permit from disk.
+
+Native POST/GET outputs include `preparation`: `unresolved`, `preparing`,
+`ready` or `failed`, with target revision and evidence/failure information.
+Selection and volume remain operator preferences even when preparation fails.
+The OwnTone output/player wire shape is unchanged.
+
+AirPlay manual registration and `MELOFON_AIRPLAY_HOST` perform bounded,
+target-specific unicast DNS-SD lookup independently of automatic browsing.
+`airplay.mdns=off` disables browsing, not explicit preparation. TXT/SRV/address
+completion and supported UDP/44100-Hz/16-bit/stereo configuration are required.
+Missing receiver facts never become guessed metadata/auth/encryption settings;
+a received optional key's absence can use its documented protocol default.
+Password-required receivers remain unsupported and cannot receive an admitted
+session. Preparation failures follow the existing finite recovery policy.
+
+### Wi-Fi / Ethernet source changes
+
+Established AirPlay sessions check the kernel's preferred sender source every
+two seconds. If a receiver's preferred source changes (including a metric-only
+switch with both interfaces still up), the obsolete session is released and
+the existing finite `airplay.retry` policy may reconnect at the retained/current
+playback position. Startup spanning incompatible RTSP/RTP sources is rejected.
+Other receivers whose preferred source is unchanged continue playing.
+
+`airplay.retry=off` still permits detection and local release, but prevents
+automatic reconnection. Pause, Stop and deselection cancel recovery authority;
+successful reconnects do not refill the demand's retry budget. If no usable
+output remains, the existing paused bookmark is retained. OwnTone idle hold
+can release obsolete sockets without resuming a user-paused/stopped player.
+
+This detects a preferred-source change, not every network or receiver failure.
+Same-source route changes and arbitrary policy routing are outside this check;
+recovery may have an audible gap. VM timing bounds are not hardware audibility
+or gapless-playback guarantees.
+
+Future server-controlled protocol adapters use this same admission contract
+and reusable tests, with their own reachability/auth/format checks. HTTP pull
+streams retain their existing decision/preflight boundary. Prepared/connected
+status and synthetic receiver tests do not establish sound on a real speaker.
 
 ## License
 

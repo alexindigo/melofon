@@ -3,9 +3,7 @@
 // resolves `_raop._tcp` at the host and copies device TXT when it answers;
 // a timeout still registers the row but without pretending md=7. The id is
 // stable from the host (or the discovered instance if that row exists).
-import { airplayOutputId } from '../../src/boots/airplay.ts';
-import { sessionFieldsFromTxt } from '../../src/boots/airplay-mdns.ts';
-import type { MdnsService } from '../../src/mdns.ts';
+import type { AirplayDevices } from '../../src/boots/airplay-device.ts';
 import { isConnectionStrategy } from '../../src/connection-strategy.ts';
 import {
   type CommandSource,
@@ -21,9 +19,7 @@ interface OutputsApp {
       get(id: string): Output | null;
       register(output: OutputRegistration, source?: CommandSource): void;
     };
-    airplay?: {
-      resolve(address: string): Promise<MdnsService | null>;
-    };
+    airplay: AirplayDevices;
   };
 }
 
@@ -70,37 +66,22 @@ export default async function (
   }
   if (
     port !== undefined &&
-    (typeof port !== 'number' || !Number.isInteger(port) || port <= 0)
+    (typeof port !== 'number' || !Number.isInteger(port) || port <= 0 ||
+      port > 65535)
   ) {
     return badRequest('port must be a positive integer');
   }
   const address = host.trim();
-  const svc = context.app.airplay !== undefined
-    ? await context.app.airplay.resolve(address)
-    : null;
-  const existing = context.app.outputs.list().find((o) => o.host === address);
-  const id = existing?.id ?? airplayOutputId(address);
-  const base = {
-    id,
+  const output = await context.app.airplay.registerAddress({
     name: name.trim(),
-    type,
-    selected: existing?.selected ?? false,
-    volume: existing?.volume ?? 100,
+    host: address,
+    ...(port === undefined ? {} : { port: port as number }),
     ...(connectionStrategy === undefined ? {} : { connectionStrategy }),
+  }, source);
+  return {
+    output: output === null ? null : {
+      ...output,
+      preparation: context.app.airplay.admission.describe(output.id),
+    },
   };
-  if (svc !== null && (svc.txt.tp ?? '').includes('UDP')) {
-    context.app.outputs.register({
-      ...base,
-      host: svc.address,
-      port: svc.port,
-      ...sessionFieldsFromTxt(svc.txt),
-    }, source);
-  } else {
-    context.app.outputs.register({
-      ...base,
-      host: address,
-      ...(port === undefined ? {} : { port }),
-    }, source);
-  }
-  return { output: context.app.outputs.get(id) };
 }

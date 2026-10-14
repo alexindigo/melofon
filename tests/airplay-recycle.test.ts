@@ -33,6 +33,10 @@ import {
 } from '../src/boots/airplay.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
+import {
+  createTestAirplayDevices,
+  recordingSpawn,
+} from './helpers/airplay-devices.ts';
 
 const LIB_PATH = decodeURIComponent(
   new URL('../helper/raop/libmelofon_raop.so', import.meta.url).pathname,
@@ -207,16 +211,20 @@ async function feedSetup() {
   const decodeCalls: DecodeCall[] = [];
   const spawned: FeedFakeTransport[] = [];
   const byHost = new Map<string, FeedFakeTransport>();
+  const devices = createTestAirplayDevices(
+    outputs,
+    recordingSpawn((onEvent) => {
+      const t = new FeedFakeTransport(onEvent);
+      spawned.push(t);
+      return t;
+    }),
+  );
   const boot = createAirplayBoot({
     outputs,
     playback,
     media: syntheticMedia(decodeCalls),
     notify,
-    spawn: (onEvent) => {
-      const t = new FeedFakeTransport(onEvent);
-      spawned.push(t);
-      return t;
-    },
+    devices,
   });
   return {
     outputs,
@@ -244,7 +252,6 @@ function register(
     selected: true,
     volume: 100,
     host,
-    devtype: 'appletv',
     ...(model === undefined ? {} : { model }),
     connectionStrategy: model === ATV3 ? 'melofon' : 'owntone',
   });
@@ -573,42 +580,44 @@ async function integrationSetup(opts: {
   const native: AirplayTransport[] = [];
   const localReleases: bigint[] = [];
   const ffiSpawn = createFfiSpawn();
+  const devices = createTestAirplayDevices(outputs, (event) => {
+    let generation: bigint | undefined;
+    const driver = ffiSpawn((name, value) => {
+      if (
+        observer && generation === undefined && name === 'state' &&
+        value === 'connected'
+      ) {
+        generation = observer.symbols.raop_fi_last_generation();
+      }
+      event(name, value);
+    });
+    const underlying = driver.transport;
+    const transport: AirplayTransport = {
+      send: (command) => underlying.send(command),
+      pcm: (data) => underlying.pcm(data),
+      ownsSharedFeed: () => underlying.ownsSharedFeed(),
+      cancelPcm: () => underlying.cancelPcm(),
+      async close() {
+        await underlying.close();
+        if (observer && generation !== undefined) {
+          assertEquals(
+            observer.symbols.raop_fi_generation_live(generation),
+            0,
+            'native TCP generation destroyed before close resolves/replacement',
+          );
+          localReleases.push(generation);
+        }
+      },
+    };
+    native.push(transport);
+    return { transport, start: driver.start };
+  });
   const boot = createAirplayBoot({
     outputs,
     playback,
     media,
     notify,
-    spawn: (event) => {
-      let generation: bigint | undefined;
-      const underlying = ffiSpawn((name, value) => {
-        if (
-          observer && generation === undefined && name === 'state' &&
-          value === 'connected'
-        ) {
-          generation = observer.symbols.raop_fi_last_generation();
-        }
-        event(name, value);
-      });
-      const transport: AirplayTransport = {
-        send: (command) => underlying.send(command),
-        pcm: (data) => underlying.pcm(data),
-        ownsSharedFeed: () => underlying.ownsSharedFeed(),
-        cancelPcm: () => underlying.cancelPcm(),
-        async close() {
-          await underlying.close();
-          if (observer && generation !== undefined) {
-            assertEquals(
-              observer.symbols.raop_fi_generation_live(generation),
-              0,
-              'native TCP generation destroyed before close resolves/replacement',
-            );
-            localReleases.push(generation);
-          }
-        },
-      };
-      native.push(transport);
-      return transport;
-    },
+    devices,
   });
 
   const registerAt = (
@@ -630,7 +639,6 @@ async function integrationSetup(opts: {
       volume: 100,
       host: '127.0.0.1',
       port,
-      devtype: 'appletv',
       ...(model === undefined ? {} : { model }),
       connectionStrategy: model === ATV3 ? 'melofon' : 'owntone',
     });

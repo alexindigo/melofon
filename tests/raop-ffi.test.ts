@@ -6,13 +6,50 @@
 // without `make -C helper/raop` still run the suite green. Sanitizers off:
 // the dlopen'd library is process-lifetime by design.
 import { assert, assertEquals, assertRejects } from '@std/assert';
-import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
+import { createOutputs } from '../src/player.ts';
+import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
+import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 
 const LIB_PATH = decodeURIComponent(
   new URL('../helper/raop/libmelofon_raop.so', import.meta.url).pathname,
 );
 const HAVE_LIB = await Deno.stat(LIB_PATH).then(() => true).catch(() => false);
+
+async function admittedTransport(
+  fake: Awaited<ReturnType<typeof startFakeRaop>>,
+  name: string,
+  volume: number,
+  event: HelperEventFn,
+) {
+  const outputs = createOutputs();
+  outputs.register({
+    id: '1',
+    host: '127.0.0.1',
+    port: fake.port,
+    name,
+    type: 'AirPlay',
+    selected: true,
+    volume: 100,
+  });
+  const devices = createTestAirplayDevices(outputs);
+  const permit = await devices.protocol.prepare({
+    id: '1',
+    targetRevision: devices.admission.describe('1').targetRevision,
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+  });
+  assert(permit.ok);
+  const result = await devices.protocol.activate(permit.value, {
+    volume,
+    positionMs: 0,
+    lengthMs: 1000,
+    title: '',
+    artist: '',
+  }, { publish() {}, onEvent: ({ event: kind, value }) => event(kind, value) });
+  assert(result.ok);
+  return { transport: result.value, devices };
+}
 
 async function until(what: string, fn: () => boolean, timeoutMs = 15000) {
   const deadline = performance.now() + timeoutMs;
@@ -30,17 +67,13 @@ Deno.test({
   fn: async () => {
     const fake = await startFakeRaop();
     const events: [string, string | undefined][] = [];
-    const transport = createFfiSpawn()((event, value) =>
-      events.push([event, value])
+    const { transport, devices } = await admittedTransport(
+      fake,
+      'FFI smoke',
+      80,
+      (event, value) => events.push([event, value]),
     );
     try {
-      await transport.send({
-        cmd: 'start',
-        host: '127.0.0.1',
-        port: fake.port,
-        name: 'FFI smoke',
-        volume: 80,
-      });
       await until(
         'connected',
         () => events.some(([e, v]) => e === 'state' && v === 'connected'),
@@ -87,6 +120,7 @@ Deno.test({
       );
     } finally {
       await transport.close().catch(() => {});
+      devices.close();
       fake.close();
     }
   },
@@ -99,15 +133,13 @@ Deno.test({
   sanitizeResources: false,
   fn: async () => {
     const fake = await startFakeRaop();
-    const transport = createFfiSpawn()(() => {});
+    const { transport, devices } = await admittedTransport(
+      fake,
+      'closed-contract',
+      50,
+      () => {},
+    );
     try {
-      await transport.send({
-        cmd: 'start',
-        host: '127.0.0.1',
-        port: fake.port,
-        name: 'closed-contract',
-        volume: 50,
-      });
       const first = transport.close();
       const second = transport.close();
       assert(first === second, 'close memoizes its promise');
@@ -119,6 +151,7 @@ Deno.test({
         'closed transport',
       );
     } finally {
+      devices.close();
       fake.close();
     }
   },
@@ -132,17 +165,13 @@ Deno.test({
   fn: async () => {
     const fake = await startFakeRaop();
     const events: [string, string | undefined][] = [];
-    const transport = createFfiSpawn()((event, value) =>
-      events.push([event, value])
+    const { transport, devices } = await admittedTransport(
+      fake,
+      'writegen',
+      80,
+      (event, value) => events.push([event, value]),
     );
     try {
-      await transport.send({
-        cmd: 'start',
-        host: '127.0.0.1',
-        port: fake.port,
-        name: 'writegen',
-        volume: 80,
-      });
       await until(
         'connected',
         () => events.some(([e, v]) => e === 'state' && v === 'connected'),
@@ -171,6 +200,7 @@ Deno.test({
       );
     } finally {
       await transport.close().catch(() => {});
+      devices.close();
       fake.close();
     }
   },
@@ -184,17 +214,13 @@ Deno.test({
   fn: async () => {
     const fake = await startFakeRaop();
     const events: [string, string | undefined][] = [];
-    const transport = createFfiSpawn()((event, value) =>
-      events.push([event, value])
+    const { transport, devices } = await admittedTransport(
+      fake,
+      'writegen-close',
+      80,
+      (event, value) => events.push([event, value]),
     );
     try {
-      await transport.send({
-        cmd: 'start',
-        host: '127.0.0.1',
-        port: fake.port,
-        name: 'writegen-close',
-        volume: 80,
-      });
       await until(
         'connected',
         () => events.some(([e, v]) => e === 'state' && v === 'connected'),
@@ -216,6 +242,7 @@ Deno.test({
         'close tore the session down',
       );
     } finally {
+      devices.close();
       fake.close();
     }
   },
@@ -230,16 +257,15 @@ Deno.test({
   fn: async () => {
     const fake = await startFakeRaop();
     let connected = false;
-    const transport = createFfiSpawn()((event, value) => {
-      if (event === 'state' && value === 'connected') connected = true;
-    });
+    const { transport, devices } = await admittedTransport(
+      fake,
+      'fenced',
+      50,
+      (event, value) => {
+        if (event === 'state' && value === 'connected') connected = true;
+      },
+    );
     try {
-      await transport.send({
-        cmd: 'start',
-        host: '127.0.0.1',
-        port: fake.port,
-        volume: 50,
-      });
       await until('connected', () => connected);
       let settled = false;
       const pending = transport.pcm(new Uint8Array(4 * 176400)).then(() =>
@@ -271,6 +297,7 @@ Deno.test({
       );
     } finally {
       await transport.close();
+      devices.close();
       fake.close();
     }
   },

@@ -19,6 +19,10 @@
 import { openDb } from '../../src/db.ts';
 import { createPersistence } from '../../src/persistence.ts';
 import { createState } from '../../src/state.ts';
+import dgram from 'node:dgram';
+import { dnsQuestions } from '../../src/mdns.ts';
+import { airplayAnswer } from '../../tests/mdns-builder.ts';
+import { startFakeRaop } from '../../tests/helpers/fake-raop.ts';
 
 const LISTEN = '127.0.0.1:14138';
 const OWNTONE = [14689, 14688];
@@ -76,6 +80,8 @@ const spawnedAt = Date.now();
 const child = new Deno.Command(Deno.execPath(), {
   args: [
     'run',
+    '--frozen',
+    '--cached-only',
     '--allow-net',
     '--allow-env',
     '--allow-read',
@@ -90,6 +96,7 @@ const child = new Deno.Command(Deno.execPath(), {
   env: {
     PATH: Deno.env.get('PATH') ?? '/usr/bin:/bin',
     HOME: Deno.env.get('HOME') ?? '/tmp',
+    TMPDIR: Deno.env.get('TMPDIR') ?? '/tmp',
     MELOFON_LISTEN: LISTEN,
     MELOFON_LISTEN_owntone: OWNTONE.join(','),
     MELOFON_DATA: dataDir,
@@ -209,9 +216,12 @@ try {
     if (!response.ok) fail(`native output POST: ${response.status}`);
     return (await response.json()).output;
   };
-  const first = await create('192.0.2.240');
+  const first = await create('127.0.0.240');
   if (first.connectionStrategy !== 'melofon' || first.selected) {
     fail('first output default/selection wrong');
+  }
+  if (first.preparation.state === 'ready') {
+    fail('bare registration manufactured receiver readiness');
   }
   const choice = await fetch(`${BASE}/_/outputs/${first.id}`, {
     method: 'PUT',
@@ -229,7 +239,7 @@ try {
   });
   if (!global.ok) fail('global strategy PUT failed');
   await global.body?.cancel();
-  const second = await create('192.0.2.241');
+  const second = await create('127.0.0.241');
   if (second.connectionStrategy !== 'owntone' || second.selected) {
     fail('new-output-only default failed');
   }
@@ -324,4 +334,158 @@ try {
   console.log('cold-start smoke: OK');
 } finally {
   await cleanup();
+}
+
+// Real composition-root proof: env registration prepares with browsing off;
+// a later process restores preferences without treating disk identity as facts.
+const prepData = await Deno.makeTempDir({ prefix: 'melofon-prep-smoke-data-' });
+const prepWork = await Deno.makeTempDir({ prefix: 'melofon-prep-smoke-' });
+const receiver = await startFakeRaop();
+const dns = dgram.createSocket('udp4');
+let prepChild: Deno.ChildProcess | undefined;
+let pumps: Promise<void>[] = [];
+let prepLog: Deno.FsFile | undefined;
+let queries = 0;
+const stopPreparationChild = async () => {
+  if (!prepChild) return;
+  const owned = prepChild;
+  prepChild = undefined;
+  try {
+    owned.kill('SIGTERM');
+  } catch { /* already exited */ }
+  const status = await Promise.race([
+    owned.status,
+    new Promise<undefined>((r) => setTimeout(() => r(undefined), 5000)),
+  ]);
+  if (status === undefined) {
+    try {
+      owned.kill('SIGKILL');
+    } catch { /* already exited */ }
+    await owned.status;
+  }
+  await Promise.allSettled(pumps);
+  prepLog?.close();
+  prepLog = undefined;
+};
+const launchPreparationChild = async (envRegistration: boolean) => {
+  assertPortFree(14138);
+  for (const port of OWNTONE) assertPortFree(port);
+  prepLog = await Deno.open(
+    `${prepWork}/${envRegistration ? 'env' : 'restore'}.log`,
+    { createNew: true, write: true },
+  );
+  const log = prepLog;
+  prepChild = new Deno.Command(Deno.execPath(), {
+    args: [
+      'run',
+      '--frozen',
+      '--cached-only',
+      '--allow-net',
+      '--allow-env',
+      '--allow-read',
+      '--allow-write',
+      '--allow-ffi',
+      '--allow-sys',
+      '--node-modules-dir=auto',
+      'main.ts',
+    ],
+    cwd: repoRoot,
+    clearEnv: true,
+    env: {
+      PATH: Deno.env.get('PATH') ?? '/usr/bin:/bin',
+      HOME: Deno.env.get('HOME') ?? '/tmp',
+      TMPDIR: Deno.env.get('TMPDIR') ?? '/tmp',
+      MELOFON_LISTEN: LISTEN,
+      MELOFON_LISTEN_owntone: OWNTONE.join(','),
+      MELOFON_DATA: prepData,
+      MELOFON_AIRPLAY_MDNS: 'off',
+      MELOFON_RAOP_LIB: raopLib,
+      MELOFON_USER: 'smoke',
+      MELOFON_PASSWORD: 'smoke',
+      MELOFON_SECRET: 'smoke-secret',
+      ...(envRegistration
+        ? { MELOFON_AIRPLAY_HOST: `127.0.0.1:${receiver.port}` }
+        : {}),
+    },
+    stdout: 'piped',
+    stderr: 'piped',
+  }).spawn();
+  pumps = [prepChild.stdout, prepChild.stderr].map((stream) =>
+    (async () => {
+      for await (const chunk of stream) await log.write(chunk);
+    })()
+  );
+  const deadline = performance.now() + HEALTH_DEADLINE_MS;
+  while (performance.now() < deadline) {
+    try {
+      const response = await fetch(`${BASE}/_/health`);
+      if (response.ok && (await response.json()).ok === true) return;
+    } catch { /* startup in flight */ }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  fail('preparation child failed to boot');
+};
+try {
+  // Do not substitute another port or kill a service if this fixture bind fails.
+  await new Promise<void>((resolve, reject) => {
+    dns.once('error', reject);
+    dns.bind(5353, '127.0.0.1', resolve);
+  });
+  dns.on('message', (message, peer) => {
+    const questions = dnsQuestions(message);
+    if (!questions || (message[2] & 0x80) !== 0) return;
+    queries++;
+    const id = new DataView(message.buffer, message.byteOffset).getUint16(0);
+    dns.send(
+      airplayAnswer({
+        instance: '001122334455@Env Fixture._raop._tcp.local',
+        host: 'env-fixture.local',
+        address: [127, 0, 0, 1],
+        port: receiver.port,
+        ttl: 10,
+        txt: ['tp=UDP', 'am=AppleTV3,1', 'md=0,1,2'],
+        id,
+        questions,
+      }),
+      peer.port,
+      peer.address,
+    );
+  });
+  await launchPreparationChild(true);
+  const envRows = (await (await fetch(`${BASE}/_/outputs`)).json()).outputs;
+  if (
+    envRows.length !== 1 || envRows[0].preparation.state !== 'ready' ||
+    envRows[0].model !== 'AppleTV3,1' || queries < 1 ||
+    receiver.sessions.length !== 0
+  ) fail('env path did not prepare without creating a session');
+  const selected = await fetch(`${OWNTONE_BASE}/api/outputs/${envRows[0].id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ selected: true, volume: 42 }),
+  });
+  if (selected.status !== 204) fail('saved selection command failed');
+  await selected.body?.cancel();
+  await new Promise((r) => setTimeout(r, 100));
+  await stopPreparationChild();
+  const queriesBefore = queries;
+  await launchPreparationChild(false);
+  const restored = (await (await fetch(`${BASE}/_/outputs`)).json()).outputs;
+  if (
+    restored.length !== 1 || !restored[0].selected ||
+    restored[0].volume !== 42 || restored[0].model !== 'AppleTV3,1' ||
+    restored[0].preparation.state !== 'unresolved' ||
+    receiver.sessions.length !== 0 || queries !== queriesBefore
+  ) fail('restore manufactured capabilities or discarded saved preferences');
+  console.log(
+    'cold-start smoke: env path ready via unicast with browse off; restore retained preferences but not a prepared permit; zero RTSP sessions',
+  );
+  console.log('cold-start smoke: preparation OK');
+} finally {
+  await stopPreparationChild();
+  try {
+    dns.close();
+  } catch { /* fixture bind failed */ }
+  receiver.close();
+  await Deno.remove(prepWork, { recursive: true });
+  await Deno.remove(prepData, { recursive: true });
 }

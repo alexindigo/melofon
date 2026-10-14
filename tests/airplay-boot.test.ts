@@ -14,6 +14,10 @@ import { createNotify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import {
+  createTestAirplayDevices,
+  recordingSpawn,
+} from './helpers/airplay-devices.ts';
+import {
   airplayOutputId,
   type AirplayTransport,
   createAirplayBoot,
@@ -107,7 +111,14 @@ function closeGate(): { gate: Promise<void>; release: () => void } {
   return { gate, release };
 }
 
-async function setup(overrides: { retryBackoffMs?: number[] } = {}) {
+async function setup(
+  overrides: {
+    retryBackoffMs?: number[];
+    media?: Media;
+    retryTimer?:
+      import('../src/boots/airplay.ts').AirplayBootDeps['retryTimer'];
+  } = {},
+) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
   const db = await openDb(dir);
   const notify = createNotify();
@@ -122,25 +133,56 @@ async function setup(overrides: { retryBackoffMs?: number[] } = {}) {
     notify,
   });
   const spawned: FakeTransport[] = [];
-  const boot = createAirplayBoot({
+  const decodeRequests: { path: string; startMs?: number }[] = [];
+  const sourceMedia = overrides.media ?? createMedia();
+  const media: Media = {
+    ...sourceMedia,
+    decodePcm(path, opts) {
+      decodeRequests.push({ path, startMs: opts?.startMs });
+      return sourceMedia.decodePcm(path, opts);
+    },
+  };
+  const devices = createTestAirplayDevices(
     outputs,
-    playback,
-    media: createMedia(),
-    notify,
-    spawn: (onEvent) => {
+    recordingSpawn((onEvent) => {
       const t = new FakeTransport(onEvent);
       spawned.push(t);
       return t;
-    },
+    }),
+  );
+  const boot = createAirplayBoot({
+    outputs,
+    playback,
+    media,
+    notify,
+    devices,
     ...(overrides.retryBackoffMs !== undefined &&
       { retryBackoffMs: overrides.retryBackoffMs }),
+    ...(overrides.retryTimer === undefined
+      ? {}
+      : { retryTimer: overrides.retryTimer }),
   });
   return {
     outputs,
     playback,
     spawned,
+    devices,
+    async referenceBytes() {
+      const request = decodeRequests.at(-1)!;
+      const reference = await createMedia().decodePcm(
+        request.path,
+        request.startMs === undefined
+          ? undefined
+          : { startMs: request.startMs },
+      );
+      assert(reference);
+      let bytes = 0;
+      for await (const chunk of reference) bytes += chunk.length;
+      return bytes;
+    },
     close: async () => {
       await boot.close();
+      devices.close();
       db.close();
       await Deno.remove(dir, { recursive: true });
     },
@@ -215,7 +257,7 @@ Deno.test('unselected play does not spawn the helper', async () => {
 });
 
 Deno.test('selected + play: start command, then the track as PCM', async () => {
-  const { outputs, playback, spawned, close } = await setup();
+  const { outputs, playback, spawned, close, referenceBytes } = await setup();
   try {
     registerSelected(outputs);
     playback.queueAdd([fixtureSong()], { play: true });
@@ -237,15 +279,39 @@ Deno.test('selected + play: start command, then the track as PCM', async () => {
     const startIdx = t.frames.findIndex((f) => f.cmd?.cmd === 'start');
     const firstPcmIdx = t.frames.findIndex((f) => f.type === 'pcm');
     assert(firstPcmIdx === -1 || startIdx < firstPcmIdx);
-    // The whole 1 s fixture decodes through.
-    await until('PCM streamed', () => t.pcmBytes() === FIXTURE_PCM_BYTES);
+    // Admission may advance the engine clock. Independently decode its
+    // actual position, and require the entire resulting tail at the sink.
+    const expected = await referenceBytes();
+    assert(expected > 0 && expected <= FIXTURE_PCM_BYTES);
+    await until('PCM streamed', () => t.pcmBytes() === expected);
   } finally {
     await close();
   }
 });
 
 Deno.test('no PCM before the helper reports connected', async () => {
-  const { outputs, playback, spawned, close } = await setup();
+  const realMedia = createMedia();
+  let decodeCalls = 0;
+  let startMs: number | undefined;
+  let decodedBytes = 0;
+  let decoded = false;
+  const media: Media = {
+    ...realMedia,
+    async decodePcm(path, opts) {
+      decodeCalls++;
+      startMs = opts?.startMs;
+      const stream = await realMedia.decodePcm(path, opts);
+      if (stream === null) return null;
+      return (async function* () {
+        for await (const chunk of stream) {
+          decodedBytes += chunk.length;
+          yield chunk;
+        }
+        decoded = true;
+      })();
+    },
+  };
+  const { outputs, playback, spawned, close } = await setup({ media });
   try {
     registerSelected(outputs);
     playback.queueAdd([fixtureSong()], { play: true });
@@ -256,8 +322,19 @@ Deno.test('no PCM before the helper reports connected', async () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
     assertEquals(t.pcmBytes(), 0);
     // The session connects: the track flows from the engine position.
+    const beforeConnectedMs = playback.playerView().itemProgressMs;
     t.onEvent('state', 'connected');
-    await until('PCM streamed', () => t.pcmBytes() === FIXTURE_PCM_BYTES);
+    const afterConnectedMs = playback.playerView().itemProgressMs;
+    await until('remaining PCM decoded', () => decoded);
+    assertEquals(decodeCalls, 1);
+    assert(startMs !== undefined);
+    assert(startMs >= beforeConnectedMs && startMs <= afterConnectedMs);
+    assert(decodedBytes > 0 && decodedBytes < FIXTURE_PCM_BYTES);
+    assertEquals(
+      t.pcmBytes(),
+      decodedBytes,
+      'the complete decoded tail reaches the transport',
+    );
   } finally {
     await close();
   }
@@ -286,15 +363,17 @@ Deno.test('select while playing starts streaming (the HA flow)', async () => {
 });
 
 Deno.test('OwnTone pause flushes, resume re-decodes, Stop holds; deselect immediately tears down', async () => {
-  const { outputs, playback, spawned, close } = await setup();
+  const { outputs, playback, spawned, close, referenceBytes } = await setup();
   try {
     registerSelected(outputs);
     playback.queueAdd([fixtureSong()], { play: true });
     await until('helper spawned', () => spawned.length === 1);
     spawned[0].onEvent('state', 'connected');
+    const expected = await referenceBytes();
+    assert(expected > 0 && expected <= FIXTURE_PCM_BYTES);
     await until(
       'PCM streamed',
-      () => spawned[0]?.pcmBytes() === FIXTURE_PCM_BYTES,
+      () => spawned[0]?.pcmBytes() === expected,
     );
     const t = spawned[0];
 
@@ -381,8 +460,8 @@ Deno.test('deselect and unregister tear the helper down', async () => {
   }
 });
 
-Deno.test('mDNS-derived devtype/encrypt ride the start command', async () => {
-  const { outputs, playback, spawned, close } = await setup();
+Deno.test('mDNS-derived devtype/encrypt ride the admitted start command', async () => {
+  const { outputs, playback, spawned, devices, close } = await setup();
   try {
     outputs.register({
       id: ID,
@@ -391,8 +470,14 @@ Deno.test('mDNS-derived devtype/encrypt ride the start command', async () => {
       selected: true,
       volume: 100,
       host: HOST,
-      devtype: 'apex3',
-      encrypt: true,
+    });
+    devices.observe(ID, {
+      name: '001122334455@Kitchen ATV._raop._tcp.local',
+      host: 'fixture.local',
+      address: HOST,
+      port: 7000,
+      ttlMs: 120000,
+      txt: { tp: 'UDP', am: 'AirPort10,1', ek: '1' },
     });
     playback.queueAdd([fixtureSong()], { play: true });
     await until('helper spawned', () => spawned.length === 1);
@@ -464,9 +549,36 @@ Deno.test('persistent failure: the player pauses and stays put (no storm)', asyn
   }
 });
 
+function controlledRetry() {
+  let next = 0;
+  const pending = new Map<number, () => void>();
+  return {
+    timer: {
+      set(callback: () => void, delay: number) {
+        assertEquals(delay, 150);
+        const id = ++next;
+        pending.set(id, callback);
+        return {
+          cancel: () => {
+            pending.delete(id);
+          },
+        };
+      },
+    },
+    fire() {
+      const item = pending.entries().next().value;
+      assert(item);
+      pending.delete(item[0]);
+      item[1]();
+    },
+  };
+}
+
 Deno.test('catalog events do not move sessions: another device registering leaves a failed session down', async () => {
+  const retry = controlledRetry();
   const { outputs, playback, spawned, close } = await setup({
     retryBackoffMs: [150],
+    retryTimer: retry.timer,
   });
   try {
     registerSelected(outputs);
@@ -517,6 +629,7 @@ Deno.test('catalog events do not move sessions: another device registering leave
     );
 
     // The hub's retry for that output does.
+    retry.fire();
     await until('retry respawned', () => spawned.length === 3);
   } finally {
     await close();
@@ -524,8 +637,10 @@ Deno.test('catalog events do not move sessions: another device registering leave
 });
 
 Deno.test('a re-announcement of the same device does not restart its failed session', async () => {
+  const retry = controlledRetry();
   const { outputs, playback, spawned, close } = await setup({
     retryBackoffMs: [150],
+    retryTimer: retry.timer,
   });
   try {
     registerSelected(outputs);
@@ -561,6 +676,7 @@ Deno.test('a re-announcement of the same device does not restart its failed sess
 
     // The retry is the hub decision — and it dials the re-announced address
     // (discovery owns the address; the session binds to the device).
+    retry.fire();
     await until('retry respawned', () => spawned.length === 3);
     const start = spawned[2].cmds().find((c) => c.cmd === 'start')!;
     assertEquals(
@@ -666,16 +782,20 @@ async function recycleSetup(
   });
   const decodeCalls: DecodeCall[] = [];
   const spawned: FakeTransport[] = [];
+  const devices = createTestAirplayDevices(
+    outputs,
+    recordingSpawn((onEvent) => {
+      const t = new FakeTransport(onEvent);
+      spawned.push(t);
+      return t;
+    }),
+  );
   const boot = createAirplayBoot({
     outputs,
     playback,
     media: syntheticMedia(decodeCalls, overrides),
     notify,
-    spawn: (onEvent) => {
-      const t = new FakeTransport(onEvent);
-      spawned.push(t);
-      return t;
-    },
+    devices,
     ...(overrides.retryBackoffMs !== undefined &&
       { retryBackoffMs: overrides.retryBackoffMs }),
   });
@@ -701,7 +821,6 @@ function registerAtv3(outputs: ReturnType<typeof createOutputs>): string {
     selected: true,
     volume: 100,
     host: HOST,
-    devtype: 'appletv',
     model: ATV3,
   });
   return ID;
@@ -815,7 +934,6 @@ Deno.test('explicit OwnTone choice keeps FLUSH-based transitions regardless of m
       selected: true,
       volume: 100,
       host: HOST,
-      devtype: 'appletv',
       model: 'AppleTV2,1',
       connectionStrategy: 'owntone',
     });

@@ -16,6 +16,7 @@ import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
 
 const HOOK = 3689;
 const DEFAULT_PORT = 4534;
@@ -36,6 +37,7 @@ async function setup(env: Record<string, string> = {}) {
   await scanLibrary(db);
   const notify = createNotify();
   const outputs = createOutputs({ notify });
+  const devices = createTestAirplayDevices(outputs);
   const player = createPlayer();
   const library = createLibrary(db);
   const bag = {
@@ -55,7 +57,13 @@ async function setup(env: Record<string, string> = {}) {
   };
   const core = await pathfinder({
     roots: ['core/'],
-    app: { db, cfg, outputs },
+    app: {
+      db,
+      cfg,
+      outputs,
+      airplay: devices,
+      outputAdmission: devices.admission,
+    },
   });
   const layers = await loadLayers({ app: bag });
   const forBind = (listenPort: number | undefined, env = {}) =>
@@ -77,6 +85,7 @@ async function setup(env: Record<string, string> = {}) {
     forBind,
     outputs,
     close: async () => {
+      devices.close();
       db.close();
       await Deno.remove(dir, { recursive: true });
     },
@@ -161,10 +170,7 @@ Deno.test('the OwnTone wire never carries model/recycle fields (plan atv3-sessio
       volume: 100,
       host: '10.4.10.106',
       port: 7000,
-      devtype: 'appletv',
       model: 'AppleTV3,1',
-      encrypt: false,
-      wantedMetadata: 7,
       requiresAuth: true,
     });
     const listed = await get(onHook, '/api/outputs');

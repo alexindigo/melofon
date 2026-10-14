@@ -100,6 +100,7 @@ function readName(
 export interface DnsRecord {
   name: string;
   type: number;
+  rclass: number;
   ttl: number;
   rdata: Uint8Array;
 }
@@ -127,6 +128,7 @@ export function parseDnsMessage(msg: Uint8Array): DnsRecord[] | null {
     offset = r.next;
     if (offset + 10 > msg.length) return null;
     const type = view.getUint16(offset);
+    const rclass = view.getUint16(offset + 2) & 0x7fff;
     const ttl = view.getUint32(offset + 4);
     const rdlen = view.getUint16(offset + 8);
     offset += 10;
@@ -134,6 +136,7 @@ export function parseDnsMessage(msg: Uint8Array): DnsRecord[] | null {
     records.push({
       name: r.name,
       type,
+      rclass,
       ttl,
       rdata: msg.subarray(offset, offset + rdlen),
     });
@@ -166,12 +169,12 @@ export function parseSrv(
 }
 
 /** TXT rdata: <len:1><bytes> chunks of "key=value" (bare "key" has no =). */
-export function parseTxt(record: DnsRecord): Record<string, string> {
+export function parseTxt(record: DnsRecord): Record<string, string> | null {
   const txt: Record<string, string> = {};
   let offset = 0;
   while (offset < record.rdata.length) {
     const len = record.rdata[offset++];
-    if (offset + len > record.rdata.length) break;
+    if (offset + len > record.rdata.length) return null;
     const entry = decoder.decode(record.rdata.subarray(offset, offset + len));
     offset += len;
     const eq = entry.indexOf('=');
@@ -188,12 +191,13 @@ export function parseA(record: DnsRecord): string | null {
 
 // --------------------------------------------------------------------------
 
-function encodeQuery(name: string, types: number[]): Uint8Array {
+export function encodeQuery(name: string, types: number[], id = 0): Uint8Array {
   const parts = name.replace(/\.+$/, '').split('.').filter((p) => p.length > 0);
   const qnameLen = parts.reduce((n, p) => n + 1 + p.length, 1);
   const rest = types.length === 0 ? 0 : 4 + (types.length - 1) * 6;
   const out = new Uint8Array(12 + (types.length === 0 ? 0 : qnameLen + rest));
   const view = new DataView(out.buffer);
+  view.setUint16(0, id);
   view.setUint16(4, types.length);
   if (types.length === 0) return out;
   let offset = 12;
@@ -247,6 +251,149 @@ interface Instance {
   expiresAt: number;
   /** Signature of the last 'up' we announced (dedupe: refresh ≠ re-up). */
   upKey: string | null;
+  validity: Map<number, number>;
+}
+
+export function dnsQuestions(
+  msg: Uint8Array,
+): { name: string; type: number }[] | null {
+  if (msg.length < 12) return null;
+  const view = new DataView(msg.buffer, msg.byteOffset, msg.length);
+  const questions: { name: string; type: number }[] = [];
+  let offset = 12;
+  for (let i = 0; i < view.getUint16(4); i++) {
+    const item = readName(msg, offset);
+    if (!item || item.next + 4 > msg.length) return null;
+    if ((view.getUint16(item.next + 2) & 0x7fff) !== 1) return null;
+    questions.push({ name: item.name, type: view.getUint16(item.next) });
+    offset = item.next + 4;
+  }
+  return questions;
+}
+
+/** Shared record completion for browsing and explicit requests. */
+export function createServiceRecords(type: string, clock = Date.now) {
+  const typeName = `${type}.local`.toLowerCase();
+  const instances = new Map<string, Instance>();
+  const validity = (instance: Instance, kind: number, ttl: number) => {
+    instance.validity.set(kind, clock() + ttl * 1000);
+    instance.expiresAt = Math.min(...instance.validity.values());
+  };
+  return {
+    instances,
+    ingest(msg: Uint8Array): boolean {
+      if (msg.length < 12 || (msg[2] & 0x80) === 0) return false;
+      const records = parseDnsMessage(msg);
+      if (!records) return false;
+      // Validate before mutating the table; malformed TXT must not become {}.
+      if (records.some((r) => r.type === TYPE_TXT && parseTxt(r) === null)) {
+        return false;
+      }
+      for (const record of records) {
+        if (
+          record.rclass !== 1 || record.type !== TYPE_PTR ||
+          record.name.toLowerCase() !== typeName
+        ) continue;
+        const name = parsePtrName(msg, record);
+        if (!name || !name.toLowerCase().endsWith(`.${typeName}`)) continue;
+        const key = name.toLowerCase();
+        let instance = instances.get(key);
+        if (record.ttl === 0) {
+          if (instance) validity(instance, TYPE_PTR, 0);
+          continue;
+        }
+        if (!instance) {
+          instance = {
+            name,
+            host: null,
+            port: null,
+            address: null,
+            txt: {},
+            gotTxt: false,
+            sawAaaa: false,
+            loggedNoV4: false,
+            lastFollowUpAt: 0,
+            expiresAt: 0,
+            upKey: null,
+            validity: new Map(),
+          };
+          instances.set(key, instance);
+        }
+        validity(instance, TYPE_PTR, record.ttl);
+      }
+      for (const record of records) {
+        if (record.rclass !== 1) continue;
+        const instance = instances.get(record.name.toLowerCase());
+        if (record.ttl === 0) {
+          if (
+            instance && (record.type === TYPE_SRV || record.type === TYPE_TXT)
+          ) {
+            validity(instance, record.type, 0);
+            if (record.type === TYPE_TXT) instance.gotTxt = false;
+            else {
+              instance.host = null;
+              instance.port = null;
+              instance.address = null;
+            }
+          }
+          if (record.type === TYPE_A) {
+            for (const item of instances.values()) {
+              if (
+                item.host?.toLowerCase() ===
+                  record.name.replace(/\.+$/, '').toLowerCase()
+              ) {
+                validity(item, TYPE_A, 0);
+                item.address = null;
+              }
+            }
+          }
+          continue;
+        }
+        if (record.type === TYPE_SRV && instance) {
+          const srv = parseSrv(msg, record);
+          if (!srv) continue;
+          if (instance.host !== srv.target.replace(/\.+$/, '')) {
+            instance.address = null;
+            instance.validity.delete(TYPE_A);
+          }
+          instance.host = srv.target.replace(/\.+$/, '');
+          instance.port = srv.port;
+          validity(instance, TYPE_SRV, record.ttl);
+        } else if (record.type === TYPE_TXT && instance) {
+          instance.txt = parseTxt(record)!;
+          instance.gotTxt = true;
+          validity(instance, TYPE_TXT, record.ttl);
+        } else if (record.type === TYPE_A || record.type === TYPE_AAAA) {
+          for (const item of instances.values()) {
+            if (
+              item.host?.toLowerCase() !==
+                record.name.replace(/\.+$/, '').toLowerCase()
+            ) continue;
+            if (record.type === TYPE_AAAA) item.sawAaaa = true;
+            else {
+              const address = parseA(record);
+              if (!address || isLinkLocal(address)) continue;
+              item.address = address;
+              validity(item, TYPE_A, record.ttl);
+            }
+          }
+        }
+      }
+      return true;
+    },
+    services(): MdnsService[] {
+      return [...instances.values()].filter((i) =>
+        i.host && i.port && i.address && i.gotTxt && i.expiresAt > clock()
+      ).map((i) => ({
+        name: i.name,
+        host: i.host!,
+        port: i.port!,
+        address: i.address!,
+        txt: { ...i.txt },
+        ttlMs: i.expiresAt - clock(),
+      }));
+    },
+  };
 }
 
 export interface MdnsBrowser {
@@ -257,7 +404,8 @@ export interface MdnsBrowser {
 
 export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
   const typeName = `${opts.type}.local`;
-  const instances = new Map<string, Instance>();
+  const table = createServiceRecords(opts.type);
+  const instances = table.instances;
   const unicastTargets = new Set<string>();
   let dead = false;
 
@@ -281,7 +429,8 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
   const emit = (instance: Instance) => {
     if (
       instance.host === null || instance.port === null ||
-      instance.address === null
+      instance.address === null || !instance.gotTxt ||
+      instance.expiresAt <= Date.now()
     ) return; // not complete yet
     const key = `${instance.host}|${instance.port}|${instance.address}|` +
       JSON.stringify(instance.txt);
@@ -341,79 +490,9 @@ export function createMdnsBrowser(opts: MdnsBrowserOptions): MdnsBrowser {
     msg: Uint8Array,
     rinfo?: { address: string; port: number },
   ) => {
-    // Only responses/announcements (qr bit set, flags byte 2 bit 7).
-    if (msg.length < 12 || (msg[2] & 0x80) === 0) return;
-    const records = parseDnsMessage(msg);
-    if (records === null) return;
-    const now = Date.now();
-
-    // First pass: PTR — discover instances of our type.
-    for (const record of records) {
-      if (record.type !== TYPE_PTR) continue;
-      const ptrName = parsePtrName(msg, record);
-      if (ptrName === null || !ptrName.endsWith(`.${typeName}`)) continue;
-      const key = ptrName.toLowerCase();
-      let instance = instances.get(key);
-      if (record.ttl === 0) {
-        if (instance !== undefined) drop(key, instance);
-        continue;
-      }
-      if (instance === undefined) {
-        instance = {
-          name: ptrName,
-          host: null,
-          port: null,
-          address: null,
-          txt: {},
-          gotTxt: false,
-          sawAaaa: false,
-          loggedNoV4: false,
-          lastFollowUpAt: 0,
-          expiresAt: 0,
-          upKey: null,
-        };
-        instances.set(key, instance);
-      }
-      instance.expiresAt = now + record.ttl * 1000;
-    }
-
-    // Second pass: SRV/TXT/A flesh the instances out.
-    for (const record of records) {
-      if (record.ttl === 0) continue; // goodbye handled above
-      const key = record.name.toLowerCase();
-      const instance = instances.get(key);
-      if (record.type === TYPE_SRV && instance !== undefined) {
-        const srv = parseSrv(msg, record);
-        if (srv === null) continue;
-        instance.host = srv.target.replace(/\.+$/, '');
-        instance.port = srv.port;
-        instance.expiresAt = now + record.ttl * 1000;
-      } else if (record.type === TYPE_TXT && instance !== undefined) {
-        instance.txt = parseTxt(record);
-        instance.gotTxt = true;
-        instance.expiresAt = now + record.ttl * 1000;
-      } else if (record.type === TYPE_A) {
-        // The A record's name is the SRV target's hostname, not the instance.
-        const address = parseA(record);
-        if (address === null || isLinkLocal(address)) continue;
-        for (const inst of instances.values()) {
-          if (
-            inst.host !== null &&
-            inst.host.toLowerCase() ===
-              record.name.replace(/\.+$/, '').toLowerCase()
-          ) {
-            inst.address = address;
-            inst.expiresAt = now + record.ttl * 1000;
-          }
-        }
-      } else if (record.type === TYPE_AAAA) {
-        const hostName = record.name.replace(/\.+$/, '').toLowerCase();
-        for (const inst of instances.values()) {
-          if (inst.host !== null && inst.host.toLowerCase() === hostName) {
-            inst.sawAaaa = true;
-          }
-        }
-      }
+    if (!table.ingest(msg)) return;
+    for (const [key, instance] of instances) {
+      if (instance.expiresAt <= Date.now()) drop(key, instance);
     }
 
     for (const instance of instances.values()) {
