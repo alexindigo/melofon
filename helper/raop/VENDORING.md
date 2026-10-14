@@ -74,4 +74,20 @@ when the effective player stops, `player.c` calls the loop-thread
 `raop_discard_pending_input()` backend method through `raop-bridge.h`.
 Pending raw master input/sample counts are cleared before a fresh feed can
 append; surviving peer sockets, RTP clocks and encoded retransmit buffers
-remain owned. A handle that never fed the backend does not clear peer input.
+remain owned. Feeding is scoped to the current streaming epoch: the loop-owned
+`fed_in_epoch` marker is set only after an actual backend write, initialized
+after the idempotent start guard and cleared after a genuine stop. Cumulative
+`fed_samples` remains a lifetime diagnostic. Read-ahead acceptance is not
+backend feeding; FLUSH and repeated CONNECTED/STREAMING notifications do not
+clear the active marker. A non-feeding epoch leaves peer input intact even if
+the same native handle fed in an earlier epoch.
+
+`test/probe_player_epoch.c` and `tests/raop-player-epoch.test.ts` compile the
+actual helper graph independently, observe shared-master bytes/sample counts
+only on the native loop and compare the surviving receiver's complete decoded
+352-frame ALAC block byte-for-byte. They cover same-handle non-feeding restart,
+fresh never-fed release, successive feeding epochs, repeated stop, repeated
+active state notifications, FLUSH and pre-connection read-ahead. This narrowly
+covers the supported native C API: normal `FfiTransport` retains its sole feed
+token until free and constructs fresh replacement handles. It does not elect
+native feed producers or authorize competing PCM feeds.

@@ -84,6 +84,7 @@ struct raop_player
   int timer_fd;                  /* timerfd, CLOCK_MONOTONIC */
   struct event *timer_ev;        /* EV_READ|EV_PERSIST on timer_fd */
   bool streaming;                /* between CONNECTED and teardown/failed */
+  bool fed_in_epoch;             /* loop-owned actual backend write this epoch */
 
   /* PCM read-ahead the 10 ms tick paces out; mutex-guarded (write is
    * called from the caller's thread, the tick from the loop thread). */
@@ -341,6 +342,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
       obuf.pts = pts_now(p);
 
       output_raop.write(&obuf);
+      p->fed_in_epoch = true;
 
       p->fed_samples += (uint64_t)(n / 4);
       p->pts_samples += (uint64_t)(n / 4);
@@ -451,6 +453,7 @@ raop_player_session_started(struct raop_player *p)
 
   if (p->streaming)
     return;
+  p->fed_in_epoch = false;
   p->streaming = true;
   p->clock_started = false;
   p->metadata_sent = false;
@@ -474,12 +477,13 @@ raop_player_session_stopped(struct raop_player *p)
     return;
   p->streaming = false;
 
-  /* A player that actually fed the shared backend owns its incomplete PCM
-   * block too. Do not splice it into a later current-position feed while a
-   * surviving peer keeps the native master alive. Non-feeding handles must
-   * not disturb the effective peer's partial input. This runs on the loop. */
-  if (p->fed_samples > 0)
+  /* A player that actually fed the shared backend in this epoch owns its
+   * incomplete PCM block too. Do not splice it into a later current-position
+   * feed while a surviving peer keeps the native master alive. Non-feeding
+   * handles must not disturb the effective peer's partial input. Loop-only. */
+  if (p->fed_in_epoch)
     raop_discard_pending_input();
+  p->fed_in_epoch = false;
 
   memset(&zero, 0, sizeof(zero));
   timerfd_settime(p->timer_fd, 0, &zero, NULL);
