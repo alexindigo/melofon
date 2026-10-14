@@ -3,9 +3,9 @@
  * Run in a fresh rootless network namespace without an uplink. */
 #include <assert.h>
 #include <sys/resource.h>
-#include "../../helper/raop/ffi.h"
+#include "../ffi.h"
 #define raop_write raop_vendor_write
-#include "../../helper/raop/vendor/outputs/raop.c"
+#include "../vendor/outputs/raop.c"
 #undef raop_write
 
 static void observation_error_session(int port)

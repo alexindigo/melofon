@@ -315,8 +315,8 @@ For diagnosis, correlate `event`, `output`, `generation`, `command`, provenance
 and native sequence/loss facts; inspect the original error and preceding events.
 `tests/logging-boundary.test.ts` enforces owned TypeScript output boundaries;
 ordinary integration consumers also check the compiled native writer inventory.
-The contained journal acceptance tool is `dev/logging/verify-service.ts`, for the
-identified development VM only, never the household service.
+Journald priority prefixes are covered by `tests/logging.test.ts` and
+`tests/logging-integration.test.ts`.
 
 ## License
 

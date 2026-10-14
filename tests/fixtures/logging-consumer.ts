@@ -13,15 +13,6 @@ for (const key of Object.keys(Deno.env.toObject())) {
 log.registerSecrets(['credential/CANARY']);
 installDependencyLogging(log);
 const mode = Deno.args[0];
-const retained = Deno.env.get('MELOFON_LOGGING_CHILD_EVIDENCE');
-if (retained) {
-  if (
-    !retained.startsWith(
-      '/home/tester/melofon-output-preparation-01/shared-logging-01/evidence/',
-    )
-  ) throw new Error('Invalid owned child evidence');
-  await Deno.mkdir(retained, { recursive: true, mode: 0o700 });
-}
 if (mode === 'streams') {
   log.event('fixture_info', { payload: 'credential/CANARY\nline\u001b[31m' });
   log.event('fixture_warn', { payload: { PIN: 'pin-canary' } });
@@ -61,15 +52,6 @@ if (mode === 'streams') {
     }).output();
     if (!result.success) {
       throw new Error(new TextDecoder().decode(result.stderr));
-    }
-    if (retained) {
-      await Deno.copyFile(binary, `${retained}/probe_logging`);
-      await Deno.writeFile(`${retained}/native.stdout`, result.stdout, {
-        createNew: true,
-      });
-      await Deno.writeFile(`${retained}/native.stderr`, result.stderr, {
-        createNew: true,
-      });
     }
     for (
       const line of new TextDecoder().decode(result.stdout).trim().split('\n')
@@ -119,11 +101,6 @@ if (mode === 'streams') {
     !compiled.success ||
     violations(new TextDecoder().decode(compiled.stdout)).length
   ) throw new Error('Compiled native writer boundary violation');
-  if (retained) {
-    await Deno.writeFile(`${retained}/native-inventory.txt`, compiled.stdout, {
-      createNew: true,
-    });
-  }
   const dir = await Deno.makeTempDir({ prefix: 'logging-inventory-' });
   try {
     await Deno.writeTextFile(
@@ -148,15 +125,6 @@ if (mode === 'streams') {
       !negative.success ||
       !violations(new TextDecoder().decode(negative.stdout)).length
     ) throw new Error('Native checker did not reject raw output');
-    if (retained) {
-      await Deno.copyFile(`${dir}/negative.c`, `${retained}/negative.c`);
-      await Deno.copyFile(`${dir}/negative.o`, `${retained}/negative.o`);
-      await Deno.writeFile(
-        `${retained}/negative-inventory.txt`,
-        negative.stdout,
-        { createNew: true },
-      );
-    }
     log.event('fixture_info', {
       payload: {
         compiledNativeObjects: objects.length,
@@ -238,18 +206,16 @@ if (mode === 'streams') {
     db.close();
     await Deno.remove(data, { recursive: true });
   }
-} else if (mode === 'audio' || mode === 'idle-lifecycle') {
+} else if (mode === 'idle-lifecycle') {
   const { createFfiSpawn, raopFfiInternals, shutdownNativeLogging } =
     await import('../../src/boots/raop-ffi.ts');
   await import('../../src/media.ts');
   const { startFakeRaop } = await import('../helpers/fake-raop.ts');
-  const { decodeReceiverAudio } = await import(
+  const { decodeReceiverAudio, pcmAt } = await import(
     '../helpers/raop-audio-consumer.ts'
   );
-  const { pcmAt } = await import('../../dev/dual-home/fixture.ts');
   const fake = await startFakeRaop({ captureAudio: true });
   const state: string[] = [];
-  const idle = mode === 'idle-lifecycle';
   const delivered: { marker: string; phase: string; observedMs: number }[] = [];
   const phases: { phase: string; marker: string; automatic: boolean }[] = [];
   let phase = 'before-first-handle';
@@ -300,7 +266,7 @@ if (mode === 'streams') {
     });
   };
   // A bounded delivery observation finishes before constructing any handle.
-  if (idle) await automatic('correction_before_first');
+  await automatic('correction_before_first');
   phase = 'audio-handle';
   const driver = spawn((_event, value) => {
     if (value) state.push(value);
@@ -385,47 +351,13 @@ if (mode === 'streams') {
     }
     // The synchronous producer burst queues diagnostics before the async free barrier.
     await driver.transport.close();
-    if (!idle) raopFfiInternals.drainLogs();
+    raopFfiInternals.drainLogs();
     await until('owned release', () => session.closedAtMs !== null);
     if (session.teardowns !== 1) {
       throw new Error('Owned release did not reach receiver');
     }
     phase = 'after-last-free';
-    if (idle) await automatic('correction_after_last_free');
-    if (retained) {
-      await Deno.writeFile(`${retained}/decoded.pcm`, decoded, {
-        createNew: true,
-      });
-      await Deno.writeFile(
-        `${retained}/expected-prefix.pcm`,
-        pcm.subarray(0, decoded.length),
-        { createNew: true },
-      );
-      await Deno.writeFile(`${retained}/metadata.dmap`, metadata.body, {
-        createNew: true,
-      });
-      await Deno.writeTextFile(
-        `${retained}/session.json`,
-        JSON.stringify(
-          {
-            sdp: session.sdp,
-            requests: session.requests,
-            audioPackets: session.audioPackets,
-            closedAtMs: session.closedAtMs,
-            teardowns: session.teardowns,
-            frames: decoded.length / 4,
-            exactPrefix: true,
-            parameters: session.parameters.map((parameter) => ({
-              contentType: parameter.contentType,
-              body: Array.from(parameter.body),
-            })),
-          },
-          null,
-          2,
-        ),
-        { createNew: true },
-      );
-    }
+    await automatic('correction_after_last_free');
     log.event('fixture_info', {
       payload: {
         outcome: 'audio_metadata_release',
@@ -462,65 +394,48 @@ if (mode === 'streams') {
         'failed native session',
         () => failureStates.includes('failed'),
       );
-      if (idle) await automatic('correction_new_handle');
-      if (idle) emit('correction_queued_at_shutdown');
+      await automatic('correction_new_handle');
+      emit('correction_queued_at_shutdown');
       await failed.transport.close();
-      if (!idle) raopFfiInternals.drainLogs();
       log.event('fixture_info', {
         payload: { outcome: 'failure_release', failed: true, released: true },
       });
-      if (retained) {
-        await Deno.writeTextFile(
-          `${retained}/failure.json`,
-          JSON.stringify({ failureStates, released: true }),
-          { createNew: true },
-        );
-      }
     } finally {
       await failed.transport.close();
     }
-    if (idle) {
-      phase = 'valid-shutdown';
-      shutdownNativeLogging();
-      shutdownNativeLogging();
-      const consumerReleased = library.symbols.raop_log_consumer(1) === 0;
-      if (consumerReleased) library.symbols.raop_log_consumer(0);
-      // Re-acquire through the normal factory, without constructing a handle.
-      phase = 'reload-idle';
-      createFfiSpawn({
-        event(id, facts) {
-          log.event(id, facts);
-          if (
-            id === 'native_record' && 'nativeEvent' in facts &&
-            facts.nativeEvent.startsWith('correction_')
-          ) {
-            delivered.push({
-              marker: facts.nativeEvent,
-              phase,
-              observedMs: performance.now(),
-            });
-          }
-        },
-      });
-      await automatic('correction_reloaded_idle');
-      shutdownNativeLogging();
-      const outcome = {
-        outcome: 'idle_lifecycle',
-        phases,
-        delivered,
-        consumerReleased,
-        releaseCompleted: session.closedAtMs !== null,
-        queuedBeforeRelease: 100,
-      };
-      if (retained) {
-        await Deno.writeTextFile(
-          `${retained}/phases.json`,
-          JSON.stringify(outcome, null, 2),
-          { createNew: true },
-        );
-      }
-      log.event('fixture_info', { payload: outcome });
-    }
+    phase = 'valid-shutdown';
+    shutdownNativeLogging();
+    shutdownNativeLogging();
+    const consumerReleased = library.symbols.raop_log_consumer(1) === 0;
+    if (consumerReleased) library.symbols.raop_log_consumer(0);
+    // Re-acquire through the normal factory, without constructing a handle.
+    phase = 'reload-idle';
+    createFfiSpawn({
+      event(id, facts) {
+        log.event(id, facts);
+        if (
+          id === 'native_record' && 'nativeEvent' in facts &&
+          facts.nativeEvent.startsWith('correction_')
+        ) {
+          delivered.push({
+            marker: facts.nativeEvent,
+            phase,
+            observedMs: performance.now(),
+          });
+        }
+      },
+    });
+    await automatic('correction_reloaded_idle');
+    shutdownNativeLogging();
+    const outcome = {
+      outcome: 'idle_lifecycle',
+      phases,
+      delivered,
+      consumerReleased,
+      releaseCompleted: session.closedAtMs !== null,
+      queuedBeforeRelease: 100,
+    };
+    log.event('fixture_info', { payload: outcome });
   } finally {
     await driver.transport.close();
     fake.close();
@@ -531,9 +446,6 @@ if (mode === 'streams') {
   const { createFfiSpawn } = await import('../../src/boots/raop-ffi.ts');
   createFfiSpawn();
   log.event('fixture_info', { payload: 'idle-owner-exit' });
-} else if (mode === 'ipc') {
-  const { serve } = await import('../../dev/dual-home/rpc.ts');
-  await serve((command, input) => command === 'close' ? true : input);
 } else throw new Error(`Unknown fixture mode ${mode}`);
 await log.flush();
 // Make parser qualification part of the consumer module graph, without parsing via the serializer.

@@ -54,19 +54,15 @@ export function startFakeRaop(
     recordDelayMs?: number;
     teardownDelayMs?: number;
     withholdTeardownReply?: boolean;
-    setupDelayMs?: number;
     flushDelayMs?: number;
     captureAudio?: boolean;
-    bindAddress?: string;
-    probeChannels?: boolean;
   } = {},
 ): Promise<FakeRaop> {
   const sessions: FakeRaopSession[] = [];
   const sockets: { close(): void }[] = [];
   const conns: Deno.TcpConn[] = [];
-  const timers: ReturnType<typeof setInterval>[] = [];
   const retransmits = new Map<string, () => void>();
-  const bindAddress = opts.bindAddress ?? '127.0.0.1';
+  const bindAddress = '127.0.0.1';
   const started = performance.now();
   const now = () => performance.now() - started;
 
@@ -236,11 +232,7 @@ export function startFakeRaop(
         if (method === 'FLUSH') session.flushes++;
         if (method === 'TEARDOWN') session.teardowns++;
         if (method === 'TEARDOWN' && opts.withholdTeardownReply) continue;
-        const delay = method === 'SETUP'
-          ? opts.setupDelayMs
-          : method === 'FLUSH'
-          ? opts.flushDelayMs
-          : undefined;
+        const delay = method === 'FLUSH' ? opts.flushDelayMs : undefined;
         if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
 
         if (method === 'RECORD' && opts.recordDelayMs !== undefined) {
@@ -263,7 +255,6 @@ export function startFakeRaop(
           const controlPort = Number(
             transport.match(/control_port=(\d+)/)?.[1],
           );
-          const timingPort = Number(transport.match(/timing_port=(\d+)/)?.[1]);
           retransmits.set(session.id, () => {
             const sequence = session.rtpSequences.at(-1);
             if (!controlPort || sequence === undefined) return;
@@ -271,15 +262,6 @@ export function startFakeRaop(
             new DataView(request.buffer).setUint16(4, sequence);
             control.send(request, controlPort, session.rtspPeer.address);
           });
-          if (opts.probeChannels && timingPort) {
-            const sample = () => {
-              const request = new Uint8Array(32);
-              request.set([0x80, 0xd2, 0, 1]);
-              timing.send(request, timingPort, session.rtspPeer.address);
-            };
-            sample();
-            timers.push(setInterval(sample, 500));
-          }
           extra =
             `Session: ${session.id}\r\nTransport: RTP/AVP/UDP;unicast;mode=record;server_port=${audioPort};control_port=${control.address().port};timing_port=${timing.address().port}\r\n`;
         } else if (method === 'RECORD') {
@@ -315,7 +297,6 @@ export function startFakeRaop(
       retransmits.get(id)?.();
     },
     close() {
-      for (const timer of timers.splice(0)) clearInterval(timer);
       retransmits.clear();
       try {
         tcp.close();

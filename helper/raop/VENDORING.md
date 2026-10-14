@@ -63,11 +63,9 @@ The timer is disarmed before teardown, failure or device-ID release and freed
 with its native session, including startup failure and shutdown. Existing
 device-ID completion and failed-free ownership remain intact.
 
-`dev/dual-home/run.ts` proves metric-only, loss, startup and cancellation cases
-in isolated rootless namespaces on the identified Melofon VM. It observes
-actual sender socket inodes, independent RTSP/SDP/RTP/control/timing sources,
-and receiver-decoded position-identifiable PCM. Shared control/timing sockets
-are not assumed to share RTSP/RTP source pinning.
+`tests/raop-source-probe.test.ts` covers the native source-address contracts;
+the kernel route-change result is recorded in
+`~/Documents/melofon/plans/airplay-dual-home-recovery/report.md`.
 
 The kernel peer regression also exposed an old partial-ALAC-input boundary:
 when the effective player stops, `player.c` calls the loop-thread

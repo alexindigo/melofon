@@ -1,5 +1,5 @@
-// Ordinary failed-event authority contracts. Actual source detection and decoded
-// delivery are independently exercised by dev/dual-home/run.ts in the owned VM.
+// Ordinary failed-event authority contracts. Native source detection is
+// covered by tests/raop-source-probe.test.ts.
 import { assert, assertEquals } from '@std/assert';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';

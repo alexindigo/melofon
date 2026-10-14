@@ -13,6 +13,9 @@ import {
   Packet,
 } from 'node-av';
 
+export function pcmAt(frame: number): [number, number] {
+  return [1000 + (frame % 20000), -1000 - (Math.floor(frame / 20000) % 20000)];
+}
 export function alacConfiguration(sdp: string): Buffer {
   if (/a=(?:rsaaeskey|aesiv):/.test(sdp)) {
     throw new Error('test consumer requires unencrypted ALAC');

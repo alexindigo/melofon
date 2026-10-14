@@ -7,6 +7,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { openDb } from '../src/db.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
+import { createLogger, type Log } from '../src/logging.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPersistence } from '../src/persistence.ts';
 import {
@@ -499,5 +500,36 @@ Deno.test('unregister keeps the persisted row (last-seen state)', async () => {
     assertEquals(rows[0].volume, 42);
   } finally {
     await close();
+  }
+});
+
+Deno.test('a failed save is drained and counted once; a broken logger is harmless', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-persist-' });
+  const db = await openDb(dir);
+  const logger = createLogger({
+    sinks: {
+      stdout: () => {
+        throw new Error('sink unavailable');
+      },
+      stderr: () => {
+        throw new Error('sink unavailable');
+      },
+    },
+  });
+  const events: string[] = [];
+  const log: Log = {
+    event(id, facts) {
+      events.push(id);
+      logger.event(id, facts);
+    },
+  };
+  try {
+    const persistence = createPersistence(db, log);
+    db.close();
+    persistence.saveQueue(['a', 'b']);
+    await persistence.drain();
+    assertEquals(events.filter((id) => id === 'persistence_failed').length, 1);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
   }
 });

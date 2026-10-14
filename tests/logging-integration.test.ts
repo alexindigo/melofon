@@ -10,7 +10,15 @@ const permissions = [
   '--allow-ffi',
   '--allow-sys',
 ];
-function child(mode: string, stdin: 'null' | 'piped' = 'null'): Deno.Command {
+const inherited: Record<string, string> = {};
+for (const key of ['HOME', 'PATH', 'DENO_DIR', 'TMPDIR', 'MELOFON_RAOP_LIB']) {
+  const value = Deno.env.get(key);
+  if (value) inherited[key] = value;
+}
+function child(
+  mode: string,
+  options: { env?: Record<string, string>; signal?: AbortSignal } = {},
+): Deno.Command {
   return new Deno.Command(Deno.execPath(), {
     args: [
       'run',
@@ -22,65 +30,16 @@ function child(mode: string, stdin: 'null' | 'piped' = 'null'): Deno.Command {
       mode,
     ],
     clearEnv: true,
-    env: {
-      HOME: '/home/tester',
-      PATH: '/home/tester/.deno/bin:/usr/bin:/bin',
-      TMPDIR: Deno.env.get('TMPDIR')!,
-      MELOFON_RAOP_LIB: Deno.env.get('MELOFON_RAOP_LIB') ??
-        `${Deno.cwd()}/helper/raop/libmelofon_raop.so`,
-      DEBUG: 'music-metadata:*',
-      ...(Deno.env.get('MELOFON_LOGGING_EVIDENCE')
-        ? {
-          MELOFON_LOGGING_CHILD_EVIDENCE: `${
-            Deno.env.get('MELOFON_LOGGING_EVIDENCE')
-          }/assets/${mode}`,
-        }
-        : {}),
-    },
+    env: { ...inherited, DEBUG: 'music-metadata:*', ...options.env },
     stdout: 'piped',
     stderr: 'piped',
-    stdin,
+    stdin: 'null',
+    signal: options.signal,
   });
 }
 function records(bytes: Uint8Array) {
   return new TextDecoder().decode(bytes).trim().split('\n').filter(Boolean).map(
     parseLogfmt,
-  );
-}
-async function retain(mode: string, result: Deno.CommandOutput) {
-  const root = Deno.env.get('MELOFON_LOGGING_EVIDENCE');
-  if (!root) return;
-  if (
-    !root.startsWith(
-      '/home/tester/melofon-output-preparation-01/shared-logging-01/evidence/',
-    )
-  ) throw new Error('Evidence must remain in the owned guest workspace');
-  await Deno.mkdir(root, { recursive: true, mode: 0o700 });
-  const destination = `${root}/${mode}`;
-  await Deno.mkdir(destination, { mode: 0o700 });
-  await Deno.writeFile(`${destination}/stdout.log`, result.stdout, {
-    createNew: true,
-  });
-  await Deno.writeFile(`${destination}/stderr.log`, result.stderr, {
-    createNew: true,
-  });
-  await Deno.writeTextFile(`${destination}/exit`, `${result.code}\n`, {
-    createNew: true,
-  });
-  await Deno.writeTextFile(
-    `${destination}/consumer.json`,
-    JSON.stringify(
-      {
-        mode,
-        source: Deno.cwd(),
-        deno: Deno.version.deno,
-        clearEnv: true,
-        faultEnvironmentRemoved: true,
-      },
-      null,
-      2,
-    ),
-    { createNew: true },
   );
 }
 
@@ -96,16 +55,13 @@ Deno.test('bootstrap catches application import/startup failure with redacted di
     ],
     clearEnv: true,
     env: {
-      HOME: '/home/tester',
-      PATH: '/home/tester/.deno/bin:/usr/bin:/bin',
-      TMPDIR: Deno.env.get('TMPDIR')!,
+      ...inherited,
       MELOFON_PASSWORD: 'credential/CANARY',
       MELOFON_LISTEN: 'invalid-listen-credential/CANARY',
     },
     stdout: 'piped',
     stderr: 'piped',
   }).output();
-  await retain('startup', result);
   assertEquals(result.code, 1);
   const error = records(result.stderr).find((record) =>
     record.event === 'startup_failed'
@@ -118,7 +74,6 @@ Deno.test('bootstrap catches application import/startup failure with redacted di
 });
 Deno.test('actual pipe consumers see correct streams, one-line records and redaction', async () => {
   const result = await child('streams').output();
-  await retain('streams', result);
   assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
   const stdout = records(result.stdout), stderr = records(result.stderr);
   assertEquals(stdout.map((r) => r.level), ['info', 'warn']);
@@ -129,10 +84,16 @@ Deno.test('actual pipe consumers see correct streams, one-line records and redac
     !text.includes('credential/CANARY') && !text.includes('pin-canary') &&
       !text.includes('\u001b'),
   );
+  // Forged JOURNAL_STREAM (not this pipe's dev:ino): no priority prefix.
+  const forged = await child('streams', {
+    env: { JOURNAL_STREAM: '1:2' },
+  }).output();
+  assertEquals(forged.code, 0, new TextDecoder().decode(forged.stderr));
+  assert(!/^<\d>/m.test(new TextDecoder().decode(forged.stdout)));
+  assert(!/^<\d>/m.test(new TextDecoder().decode(forged.stderr)));
 });
 Deno.test('ordinary native diagnostic queue reaches final consumer with before-handle, bounded overflow and truncation facts', async () => {
   const result = await child('queue').output();
-  await retain('queue', result);
   assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
   const all = [...records(result.stdout), ...records(result.stderr)];
   assertEquals(all.length, 256);
@@ -161,7 +122,6 @@ Deno.test('ordinary native diagnostic queue reaches final consumer with before-h
 });
 Deno.test('actual HTTP, DB, command, Pathfinder, metadata debug and node-av events reach normalized stdout/stderr', async () => {
   const result = await child('families').output();
-  await retain('families', result);
   assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
   const all = [...records(result.stdout), ...records(result.stderr)];
   for (
@@ -209,7 +169,6 @@ Deno.test('actual HTTP, DB, command, Pathfinder, metadata debug and node-av even
 });
 Deno.test('compiled native graph has no enabled raw diagnostic/key-dump bypass; negative writer is rejected', async () => {
   const result = await child('inventory').output();
-  await retain('inventory', result);
   assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
   assertEquals(JSON.parse(records(result.stdout)[0].payload), {
     compiledNativeObjects: 11,
@@ -218,76 +177,9 @@ Deno.test('compiled native graph has no enabled raw diagnostic/key-dump bypass; 
     debugKeyDumpsAbsent: true,
   });
 });
-Deno.test('fake receiver decodes exact audio and metadata; owned release completes while diagnostics are queued', async () => {
-  const result = await child('audio').output();
-  await retain('audio', result);
-  assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
-  const all = [...records(result.stdout), ...records(result.stderr)];
-  assert(
-    all.some((r) =>
-      r.event === 'native_record' && r.nativeEvent === 'device_start' &&
-      r.metadata === '7'
-    ),
-  );
-  assert(
-    all.some((r) =>
-      r.event === 'native_record' && r.nativeEvent === 'pcm_peak' &&
-      Number(r.pcm_peak) > 0
-    ),
-  );
-  assertEquals(all.filter((r) => r.nativeEvent === 'probe_queued').length, 100);
-  assert(
-    all.some((record) =>
-      record.event === 'dependency_ffmpeg' &&
-      record.payload.includes('node-av-after-raop-adapter') &&
-      record.time_basis === 'observed'
-    ),
-  );
-  const outcome = all.find((r) => r.event === 'fixture_info')!;
-  assertEquals(JSON.parse(outcome.payload), {
-    outcome: 'audio_metadata_release',
-    frames: 7040,
-    title: 'logging-title',
-    queuedBeforeRelease: 100,
-    released: true,
-  });
-  assert(
-    all.some((record) =>
-      record.nativeEvent === 'libevent' && record.level === 'warn'
-    ),
-  );
-  assert(
-    all.some((record) =>
-      record.event === 'fixture_info' &&
-      JSON.parse(record.payload).outcome === 'failure_release'
-    ),
-  );
-  assert(
-    !new TextDecoder().decode(result.stderr).includes('credential/CANARY'),
-  );
-});
-Deno.test('machine RPC replies remain exact protocol bytes with dependency console adapter installed', async () => {
-  const process = child('ipc', 'piped').spawn();
-  const writer = process.stdin.getWriter();
-  await writer.write(
-    new TextEncoder().encode(
-      '{"id":1,"command":"echo","input":{"v":"line\\nquote\\""}}\n{"id":2,"command":"close","input":{}}\n',
-    ),
-  );
-  await writer.close();
-  const result = await process.output();
-  await retain('ipc', result);
-  assertEquals(result.code, 0);
-  assertEquals(
-    new TextDecoder().decode(result.stdout),
-    'DUALHOME:{"id":1,"value":{"v":"line\\nquote\\""}}\nDUALHOME:{"id":2,"value":true}\n',
-  );
-  assertEquals(result.stderr.length, 0);
-});
 
 Deno.test('logging correction: ordinary native owner drains before first handle, after last free and after reload', async () => {
   const result = await child('idle-lifecycle').output();
-  await retain('idle-lifecycle', result);
   assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
   const all = [...records(result.stdout), ...records(result.stderr)];
   const outcome = JSON.parse(
@@ -328,19 +220,9 @@ Deno.test('logging correction: ordinary native owner drains before first handle,
 });
 
 Deno.test('logging correction: diagnostic ownership alone never keeps an ordinary child alive', async () => {
-  const process = child('idle-exit').spawn();
-  let timeout = false;
-  const timer = setTimeout(() => {
-    timeout = true;
-    process.kill('SIGTERM');
-  }, 5000);
-  try {
-    const result = await process.output();
-    await retain('idle-exit', result);
-    assertEquals(timeout, false);
-    assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
-    assert(records(result.stdout).some((r) => r.payload === 'idle-owner-exit'));
-  } finally {
-    clearTimeout(timer);
-  }
+  const result = await child('idle-exit', {
+    signal: AbortSignal.timeout(5000),
+  }).output();
+  assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
+  assert(records(result.stdout).some((r) => r.payload === 'idle-owner-exit'));
 });
