@@ -1,5 +1,5 @@
 // layers/opensubsonic/rest/10-auth.ts — Subsonic auth for every /rest/…
-// route. The hat extracts credentials (query or form body; `p` clear or
+// route except exact public capability discovery. The hat extracts credentials (query or form body; `p` clear or
 // `enc:`+hex, or `t`+`s` md5 token); core verifies via app.user. Failure is
 // Navidrome-shaped: HTTP 200, status="failed", code 40 with a generic
 // message (unknown user and bad password are indistinguishable); missing
@@ -14,6 +14,16 @@ export const disableStreaming = true;
 export default async function (request: HatRequest, context: HatContext) {
   const p = await params(request);
   context.state.params = p;
+  // The facade has already stripped force/mount prefixes. Match the complete
+  // repathed operation, not a name prefix or the caller's external /rest URL.
+  // Params still precede this exception so format/form precedence is identical.
+  const path = new URL(request._raw.url).pathname;
+  if (
+    (request.method === 'GET' || request.method === 'POST') &&
+    (path === '/getOpenSubsonicExtensions' ||
+      path === '/getOpenSubsonicExtensions.view') &&
+    (request.params.ext === undefined || request.params.ext === '.view')
+  ) return;
   const username = p.get('u');
   if (username === null || p.get('v') === null || p.get('c') === null) {
     return fail(context, 10, 'Required parameter is missing');

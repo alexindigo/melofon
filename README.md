@@ -32,6 +32,25 @@ view of the same list.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — the secret and the password live in env only.
 
+## OpenSubsonic capabilities and form POST
+
+`GET` or form `POST /rest/getOpenSubsonicExtensions` (also `.view`) is public:
+no credentials, `v` or `c` are required, and invalid supplied credentials do not
+change its server-wide response. The existing `/_opensubsonic/` force prefix
+works too. Other OpenSubsonic operations retain their authentication checks;
+discovery is unavailable on OwnTone-exclusive listens.
+
+JSON returns `subsonic-response.openSubsonicExtensions` as
+`[{"name":"formPost","versions":[1]}]`. XML repeats `openSubsonicExtensions`
+elements with a `name` attribute and `versions` children. Only `formPost` version1
+is advertised. This does not advertise missing operations or other extensions.
+
+Existing GET/POST operations accept `application/x-www-form-urlencoded` arguments,
+including percent-encoded credentials/text and repeated fields such as star `id`.
+Form values precede query values: scalar getters use the first form value;
+repeated getters retain form values followed by query values. Both methods reach
+the same injected core services and canonical state.
+
 ## Native last-command snapshot
 
 `GET /_/last-command` reads the playback and output owners' current command

@@ -253,11 +253,8 @@ Deno.test('getMusicFolders and getOpenSubsonicExtensions answer Feishin probes',
     assertEquals(typeof musicFolder[0].id, 'number');
     const extensions = await get(app, 'getOpenSubsonicExtensions');
     assertEquals(
-      (extensions.openSubsonicExtensions as {
-        openSubsonicExtension: unknown[];
-      })
-        .openSubsonicExtension,
-      [],
+      extensions.openSubsonicExtensions,
+      [{ name: 'formPost', versions: [1] }],
     );
   } finally {
     await close();
