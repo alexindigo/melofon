@@ -43,6 +43,7 @@ function song(id = 'song'): SongRow {
     size: 1,
     genre: null,
     year: null,
+    firstSeenMs: null,
     isVideo: false,
     suffix: 'mp3',
     contentType: 'audio/mpeg',

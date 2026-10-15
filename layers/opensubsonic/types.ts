@@ -54,8 +54,12 @@ export interface HatContext {
       start(): Promise<void>;
     };
     library: {
-      listArtists(folderId?: string): Promise<ArtistRow[]>;
+      listArtists(
+        folderId?: string,
+        opts?: { ignoredArticles?: string[] },
+      ): Promise<ArtistRow[]>;
       getArtist(id: string): Promise<ArtistRow | null>;
+      artistById(id: string): Promise<ArtistRow | null>;
       albumsByArtist(artistId: string): Promise<AlbumRow[]>;
       listAlbums(opts: {
         sort:
@@ -73,6 +77,7 @@ export interface HatContext {
         folderId?: string;
         genre?: string;
         username?: string;
+        ignoredArticles?: string[];
         fromYear?: number;
         toYear?: number;
       }): Promise<AlbumRow[]>;
@@ -277,6 +282,7 @@ export interface ArtistRow {
   id: string;
   name: string;
   albumCount: number;
+  sortKey?: string;
 }
 
 export interface AlbumRow {
@@ -287,7 +293,7 @@ export interface AlbumRow {
   songCount: number;
   durationMs: number;
   year: number | null;
-  /** Newest file mtime on the album (null only when it has no files). */
+  /** Earliest first observation among the album's listed files. */
   createdAtMs: number | null;
 }
 
@@ -307,6 +313,7 @@ export interface SongRow {
   size: number | null;
   genre: string | null;
   year: number | null;
+  firstSeenMs: number | null;
   isVideo: boolean;
   suffix: string;
   contentType: string;
@@ -374,6 +381,7 @@ export interface ScanStatusRow {
   count: number;
   folderCount: number;
   lastScanMs: number | null;
+  lastScanStartedMs: number | null;
 }
 
 export interface BookmarkRow {

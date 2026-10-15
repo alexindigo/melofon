@@ -149,7 +149,7 @@ Deno.test('getAlbum returns the album with ordered child songs', async () => {
     assertEquals(album.songCount, 3);
     assert(album.duration >= 2);
     // Required by the OpenSubsonic schema: ISO 8601 "date the album was
-    // added" (derived from the newest file mtime).
+    // added" (the earliest retained first-seen among its files).
     assertEquals(typeof album.created, 'string');
     assert(album.created.endsWith('Z'));
     assertEquals(album.song.map((s) => [s.track, s.title]), [

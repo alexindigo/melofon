@@ -72,6 +72,7 @@ async function fixture(dir: string) {
     size: wav.length,
     genre: null,
     year: null,
+    firstSeenMs: null,
     isVideo: false,
     suffix: 'wav',
     contentType: 'audio/wav',

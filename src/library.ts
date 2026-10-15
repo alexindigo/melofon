@@ -10,6 +10,8 @@ export interface ArtistRow {
   id: string;
   name: string;
   albumCount: number;
+  /** Present on article-aware lists; the exact key used for ordering/grouping. */
+  sortKey?: string;
 }
 
 export interface AlbumRow {
@@ -21,9 +23,7 @@ export interface AlbumRow {
   durationMs: number;
   /** Newest song year on the album (null when no song carries a year). */
   year: number | null;
-  /** Newest file mtime on the album — the wire's AlbumID3.created ("date the
-   * album was added"; the catalog rebuild makes a row-creation time
-   * meaningless). Null only when the album has no files. */
+  /** Earliest first-seen time among the album's listed files. */
   createdAtMs: number | null;
 }
 
@@ -45,6 +45,8 @@ export interface SongRow {
   size: number | null;
   genre: string | null;
   year: number | null;
+  /** Retained first observation, independent of file mtime and retagging. */
+  firstSeenMs: number | null;
   /** M4: row is a music video (probe-decided at scan), else an audio file. */
   isVideo: boolean;
   suffix: string;
@@ -79,9 +81,14 @@ export interface RandomSongOptions {
 
 export interface Library {
   /** Album artists (artists with at least one album), alphabetically. */
-  listArtists(folderId?: string): Promise<ArtistRow[]>;
+  listArtists(
+    folderId?: string,
+    opts?: { ignoredArticles?: string[] },
+  ): Promise<ArtistRow[]>;
   /** One album artist by ID (null when unknown or has no albums). */
   getArtist(id: string): Promise<ArtistRow | null>;
+  /** Any catalog artist, including track-only performers with zero albums. */
+  artistById(id: string): Promise<ArtistRow | null>;
   /** Albums of one album artist, alphabetically. */
   albumsByArtist(artistId: string): Promise<AlbumRow[]>;
   /** Album lists for getAlbumList/getAlbumList2-shaped hats. The user-scoped
@@ -104,6 +111,7 @@ export interface Library {
     folderId?: string;
     genre?: string;
     username?: string;
+    ignoredArticles?: string[];
     /** `year` sort: range bounds (either order; from > to is newest-first). */
     fromYear?: number;
     toYear?: number;
@@ -182,6 +190,23 @@ function esc(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
+// Generic sorting policy: the hat supplies articles, core owns the computed
+// key. Strip a single case-sensitive leading article after accent folding,
+// before lowercasing (Navidrome); unoptioned callers retain their old order.
+function sortKeySql(column: string, articles?: string[]): string {
+  if (articles === undefined) return column;
+  const folded = `trim(strip_accents(${column}))`;
+  const branches = articles.map((article) =>
+    `WHEN starts_with(${folded}, ${
+      esc(article + ' ')
+    }) THEN substring(${folded}, length(${esc(article)}) + 2)`
+  );
+  const stripped = branches.length === 0
+    ? folded
+    : `CASE ${branches.join(' ')} ELSE ${folded} END`;
+  return `lower(trim(${stripped}))`;
+}
+
 interface SongSqlRow {
   id: string;
   path: string;
@@ -198,6 +223,7 @@ interface SongSqlRow {
   size: number | bigint | null;
   genre: string | null;
   year: number | null;
+  first_seen_ms: number | bigint | null;
   is_video: boolean | null;
 }
 
@@ -219,6 +245,7 @@ function songOf(row: SongSqlRow): SongRow {
     size: num(row.size),
     genre: row.genre,
     year: num(row.year),
+    firstSeenMs: num(row.first_seen_ms),
     isVideo: row.is_video ?? false,
     suffix,
     contentType: CONTENT_TYPES[suffix] ?? 'application/octet-stream',
@@ -229,11 +256,12 @@ const SONG_SELECT = `
   SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title,
          f.album_id, al.name AS album_name, f.artist_id,
          ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
-         f.genre, f.year, f.is_video
+         f.genre, f.year, f.is_video, epoch_ms(fi.first_seen_at) AS first_seen_ms
   FROM files f
   LEFT JOIN albums al ON al.id = f.album_id
   LEFT JOIN artists ar ON ar.id = f.artist_id
-  LEFT JOIN libraries l ON l.id = f.library_id`;
+  LEFT JOIN libraries l ON l.id = f.library_id
+  LEFT JOIN file_identity fi ON fi.id = f.id`;
 
 interface AlbumSqlRow {
   id: string;
@@ -261,7 +289,7 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
 
 // Album query builder. folderId restricts to albums having at least one file
 // in that source (musicFolderId); genre restricts to albums with a file of
-// that genre; ratedBy inner-joins the user's ratings; listenAgg left-joins
+// that genre; ratedBy inner-joins the user's ratings; listenAgg inner-joins
 // per-album play aggregates for frequent / recent. The WHERE goes before the
 // GROUP BY, so it composes with callers' HAVING / ORDER BY / LIMIT. Ratings
 // join at most one row per album (their PK), and the listen aggregate is one
@@ -284,7 +312,7 @@ function albumSelect(q: AlbumQuery = {}): string {
   }
   if (q.listenAgg !== undefined) {
     joins.push(
-      `LEFT JOIN (
+      `JOIN (
          SELECT f2.album_id AS album_id, COUNT(li.track_id) AS play_count,
                 MAX(li.played_at) AS last_played
          FROM files f2
@@ -298,17 +326,26 @@ function albumSelect(q: AlbumQuery = {}): string {
   if (q.folderId !== undefined) {
     wheres.push(`f.library_id = ${esc(q.folderId)}`);
   }
-  if (q.genre !== undefined) wheres.push(`f.genre = ${esc(q.genre)}`);
+  if (q.genre !== undefined) {
+    wheres.push(
+      `EXISTS (SELECT 1 FROM files fg WHERE fg.album_id = al.id AND fg.genre = ${
+        esc(q.genre)
+      })`,
+    );
+  }
   if (q.yearFrom !== undefined && q.yearTo !== undefined) {
-    wheres.push(`f.year BETWEEN ${q.yearFrom} AND ${q.yearTo}`);
+    wheres.push(
+      `EXISTS (SELECT 1 FROM files fy WHERE fy.album_id = al.id AND fy.year BETWEEN ${q.yearFrom} AND ${q.yearTo})`,
+    );
   }
   return `
   SELECT al.id, al.name, al.album_artist_id, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
-         MAX(f.year) AS year, MAX(f.mtime) AS created_ms
+         MAX(f.year) AS year, epoch_ms(MIN(fi.first_seen_at)) AS created_ms
   FROM albums al
   JOIN artists ar ON ar.id = al.album_artist_id
   LEFT JOIN files f ON f.album_id = al.id
+  LEFT JOIN file_identity fi ON fi.id = f.id
   ${joins.join('\n')}
   ${wheres.length === 0 ? '' : `WHERE ${wheres.join(' AND ')}`}
   GROUP BY al.id, al.name, al.album_artist_id, ar.name`;
@@ -361,46 +398,58 @@ function songPredicates(opts: Omit<RandomSongOptions, 'size'>): string[] {
 }
 
 export function createLibrary(db: Db): Library {
+  async function resolveArtist(
+    id: string,
+    all: boolean,
+  ): Promise<ArtistRow | null> {
+    const res = await db.conn.runAndReadAll(
+      `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
+       FROM artists ar
+       ${all ? 'LEFT JOIN' : 'JOIN'} albums al ON al.album_artist_id = ar.id
+       WHERE ar.id = ${esc(id)}
+       GROUP BY ar.id, ar.name`,
+    );
+    const row = (res.getRowObjects() as {
+      id: string;
+      name: string;
+      album_count: number | bigint;
+    }[])[0];
+    return row
+      ? { id: row.id, name: row.name, albumCount: Number(row.album_count) }
+      : null;
+  }
   return {
-    async listArtists(folderId): Promise<ArtistRow[]> {
+    async listArtists(folderId, opts = {}): Promise<ArtistRow[]> {
+      const key = sortKeySql('ar.name', opts.ignoredArticles);
       const res = await db.conn.runAndReadAll(
-        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
+        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count, ${key} AS sort_key
          FROM artists ar
          JOIN albums al ON al.album_artist_id = ar.id
          WHERE 1 = 1 ${artistFolderFilter(folderId)}
          GROUP BY ar.id, ar.name
-          ORDER BY ar.name, ar.id`,
+          ORDER BY sort_key, ar.id`,
       );
       return (res.getRowObjects() as {
         id: string;
         name: string;
         album_count: number | bigint;
+        sort_key: string;
       }[]).map((row) => ({
         id: row.id,
         name: row.name,
         albumCount: Number(row.album_count),
+        ...(opts.ignoredArticles === undefined
+          ? {}
+          : { sortKey: row.sort_key }),
       }));
     },
 
     async getArtist(id) {
-      const res = await db.conn.runAndReadAll(
-        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
-         FROM artists ar
-         JOIN albums al ON al.album_artist_id = ar.id
-         WHERE ar.id = ${esc(id)}
-         GROUP BY ar.id, ar.name`,
-      );
-      const row = (res.getRowObjects() as {
-        id: string;
-        name: string;
-        album_count: number | bigint;
-      }[])[0];
-      if (!row) return null;
-      return {
-        id: row.id,
-        name: row.name,
-        albumCount: Number(row.album_count),
-      };
+      return await resolveArtist(id, false);
+    },
+
+    async artistById(id) {
+      return await resolveArtist(id, true);
     },
 
     async albumsByArtist(artistId) {
@@ -419,10 +468,12 @@ export function createLibrary(db: Db): Library {
           order = 'ORDER BY RANDOM()';
           break;
         case 'newest':
-          order = 'ORDER BY MAX(f.mtime) DESC NULLS LAST';
+          order = 'ORDER BY created_ms DESC NULLS LAST';
           break;
         case 'artist':
-          order = 'ORDER BY ar.name, al.name';
+          order = `ORDER BY ${sortKeySql('ar.name', opts.ignoredArticles)}, ${
+            sortKeySql('al.name', opts.ignoredArticles)
+          }`;
           break;
         case 'highest':
         case 'frequent':
@@ -459,7 +510,7 @@ export function createLibrary(db: Db): Library {
           break;
         }
         default:
-          order = 'ORDER BY al.name';
+          order = `ORDER BY ${sortKeySql('al.name', opts.ignoredArticles)}`;
       }
       const res = await db.conn.runAndReadAll(
         `${albumSelect(query)} ${order}${

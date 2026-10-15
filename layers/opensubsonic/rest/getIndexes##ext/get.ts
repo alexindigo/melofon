@@ -7,35 +7,21 @@
 // in the tree (no Album dir to hang them under) — they stay reachable via
 // search3/getSong/stream. No shortcuts, no top-level child elements.
 import { ok } from '#opensubsonic/envelope.ts';
-import { artistOf, IGNORED_ARTICLES, indexName } from '#opensubsonic/id3.ts';
-import { folderIdParam } from '#opensubsonic/params.ts';
-import { loadPersonal } from '#opensubsonic/personal.ts';
+import { artistIndex, artistOf, IGNORED_ARTICLES } from '#opensubsonic/id3.ts';
+import { safeIntParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
-  const folderId = await folderIdParam(context);
-  const artists = await context.app.library.listArtists(folderId);
-  const p = await loadPersonal(context, {
-    artists: artists.map((artist) => artist.id),
-  });
-  const byIndex = new Map<string, Record<string, unknown>[]>();
-  for (const artist of artists) {
-    const name = indexName(artist.name);
-    const list = byIndex.get(name) ?? [];
-    list.push(artistOf(artist, p));
-    byIndex.set(name, list);
-  }
-  const names = [...byIndex.keys()].sort((a, b) =>
-    a === '#' ? -1 : b === '#' ? 1 : a.localeCompare(b)
-  );
-  // Required by the OpenSubsonic schema: last time the index was modified,
-  // epoch milliseconds (Navidrome answers the last scan time too).
   const scan = await context.app.scan.status();
+  const lastModified = scan.lastScanStartedMs ?? 0;
+  const since = safeIntParam(context.state.params!, 'ifModifiedSince', 0);
   return ok(context, {
     indexes: {
       ignoredArticles: IGNORED_ARTICLES,
-      lastModified: scan.lastScanMs ?? 0,
-      index: names.map((name) => ({ name, artist: byIndex.get(name)! })),
+      lastModified,
+      index: since >= lastModified
+        ? undefined
+        : await artistIndex(context, artistOf),
     },
   });
 };

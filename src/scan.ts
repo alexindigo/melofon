@@ -473,6 +473,8 @@ export interface ScanStatus {
   folderCount: number;
   /** Completion time of the last scan (Navidrome's lastScan extra). */
   lastScanMs: number | null;
+  /** Start time of the latest scan, for conditional catalog reads. */
+  lastScanStartedMs: number | null;
 }
 export interface ScanService {
   /** Foreground scan. Concurrent callers await the same result. */
@@ -491,8 +493,10 @@ export function createScan(
   let pending: Promise<ScanCounts> | null = null;
   let count = 0;
   let lastScanMs: number | null = null;
+  let lastScanStartedMs: number | null = null;
   const run = (): Promise<ScanCounts> => {
     if (pending !== null) return pending;
+    lastScanStartedMs = Date.now();
     pending = (async () => {
       const counts = await scanLibrary(db, media, log);
       count = counts.files;
@@ -512,7 +516,13 @@ export function createScan(
         'SELECT COUNT(*) AS n FROM libraries',
       );
       const folderCount = Number((res.getRowObjects() as { n: bigint }[])[0].n);
-      return { scanning: pending !== null, count, folderCount, lastScanMs };
+      return {
+        scanning: pending !== null,
+        count,
+        folderCount,
+        lastScanMs,
+        lastScanStartedMs,
+      };
     },
     async start() {
       try {

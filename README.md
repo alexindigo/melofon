@@ -106,8 +106,8 @@ newest like first.
 Songs, albums and artists carry the requesting user's `starred`, `userRating`,
 `averageRating` (all users, two decimals) and, for songs, albums and directories,
 `playCount` and `played` (the latest scrobble time). Play counts are read through
-the current catalog: an album counts its songs' plays, an artist those of its
-albums. Fields without data are omitted, except the OpenSubsonic additions, which
+the current catalog: an album counts its songs' plays, an artist the songs
+crediting it as track artist. Fields without data are omitted, except the OpenSubsonic additions, which
 are always sent: `played` (`""` when never played) on songs and albums, and
 `userRating` (`0` when unrated) on ID3 albums.
 
@@ -165,6 +165,30 @@ rounded Number representation. This is not lossless representation or a new
 safe-only limit. OwnTone signed values, paging `-1` sentinel and first-valid
 absolute/relative command precedence remain in place. Fractional bookmark/client
 queue positions and scrobble seconds retain their separate number contracts.
+
+## OpenSubsonic browsing
+
+Every advertised artist ID resolves in `getArtist` and `getMusicDirectory`,
+including track-only performers: they have zero albums and empty album/child
+lists, and can appear in both favourites endpoints. Artist indexes still list
+album artists. `getArtist` albums sort by year ascending, then name and ID.
+
+Artist indexes and alphabetical album lists ignore the leading articles
+`The El La Los Las Le Les Os As O A`, fold accents and lowercase their sort key.
+Article matching is case-sensitive and requires a following space, as in
+Navidrome. Index groups are A–W, X-Z (X/Y/Z), [Unknown] (names starting with `[`) and
+`#` for unmatched names; group labels sort ascending. `getIndexes.lastModified`
+is the last scan's start time in epoch milliseconds. `ifModifiedSince` at or
+after it omits `index`, while retaining `lastModified` and `ignoredArticles`.
+
+Album and song `created` dates are first-seen dates, retained across retags and
+moves. An album uses the earliest first-seen among its listed files; `newest`
+orders that date descending, with ID ties. `recent` and `frequent` include only
+albums the requesting user has played. `byGenre` and `byYear` select album
+membership and count/time the whole album, rather than only matching songs.
+Existing music-folder aggregate scope and empty unmatched-folder behavior stay
+in place. Song Child `parent` points to its album, and album Child `parent` to
+its album artist across browsing, lists and legacy search.
 
 ## Native last-command snapshot
 

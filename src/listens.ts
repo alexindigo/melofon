@@ -26,7 +26,7 @@ export interface Listens {
   ): Promise<boolean>;
   /** Batch play facts for this user through current catalog membership: a
    * song counts its own listens, an album the listens of its files, an
-   * artist the listens of files on the albums it is album artist of. Every
+   * artist the listens of files crediting it as track artist. Every
    * requested id is present (no listens → 0 plays, null date). */
   facts(
     username: string,
@@ -123,12 +123,11 @@ export function createListens(db: Db): Listens {
         artists: await plays(
           ids.artists,
           (list) =>
-            `SELECT al.album_artist_id AS id, ${aggregate}
-             FROM albums al
-             JOIN files f ON f.album_id = al.id
+            `SELECT f.artist_id AS id, ${aggregate}
+             FROM files f
              JOIN listens li ON li.track_id = f.id AND li.user_id = ${user}
-             WHERE al.album_artist_id IN (${list})
-             GROUP BY al.album_artist_id`,
+             WHERE f.artist_id IN (${list})
+             GROUP BY f.artist_id`,
         ),
       };
     },

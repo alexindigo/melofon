@@ -29,7 +29,8 @@ import type {
   StarredItem,
 } from '#opensubsonic/types.ts';
 
-export const IGNORED_ARTICLES = 'The El La Los Las Le Les';
+export const IGNORED_ARTICLES = 'The El La Los Las Le Les Os As O A';
+const ARTICLES = IGNORED_ARTICLES.split(' ');
 
 export function artistId3Of(
   artist: ArtistRow,
@@ -66,9 +67,7 @@ function albumBaseOf(album: AlbumRow): Record<string, unknown> {
     coverArt: album.id, // getCoverArt resolves album IDs
     songCount: album.songCount,
     duration: Math.round(album.durationMs / 1000),
-    // Required by the OpenSubsonic schema: "date the album was added" — the
-    // newest file mtime stands in for it (the catalog rebuild makes a
-    // row-creation time meaningless).
+    // Retained first observation, independent of retags/catalog rebuilds.
     created: album.createdAtMs === null
       ? undefined
       : new Date(album.createdAtMs).toISOString(),
@@ -92,6 +91,7 @@ export function albumV1Of(
 ): Record<string, unknown> {
   return {
     ...albumBaseOf(album),
+    parent: album.artistId,
     album: album.name,
     title: album.name,
     isDir: true,
@@ -112,6 +112,10 @@ export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
   const path = relativePathOf(song);
   return {
     id: song.id,
+    parent: song.albumId ?? undefined,
+    created: song.firstSeenMs === null
+      ? undefined
+      : new Date(song.firstSeenMs).toISOString(),
     isDir: false,
     title: song.title,
     album: song.albumName ?? undefined,
@@ -213,7 +217,7 @@ export async function starredLists(context: HatContext): Promise<{
   );
   const artists: ArtistRow[] = [];
   for (const item of of('artist')) {
-    const artist = await context.app.library.getArtist(item.targetId);
+    const artist = await context.app.library.artistById(item.targetId);
     if (artist !== null) artists.push(artist);
   }
   const personal = await loadPersonal(context, {
@@ -275,9 +279,44 @@ export async function zipEntriesFor(
   return null;
 }
 
-export function indexName(name: string): string {
-  const ch = name.charAt(0).toUpperCase();
-  return ch >= 'A' && ch <= 'Z' ? ch : '#';
+// Navidrome default IndexGroups; grouping reads the same core-computed key
+// that ordered the artists, avoiding divergent SQL/JavaScript accent folding.
+function indexName(key: string): string {
+  const ch = key.charAt(0).toUpperCase();
+  if (ch >= 'X' && ch <= 'Z') return 'X-Z';
+  if (ch >= 'A' && ch <= 'W') return ch;
+  return ch === '[' ? '[Unknown]' : '#';
+}
+
+export async function artistIndex(
+  context: HatContext,
+  build: typeof artistOf,
+): Promise<Record<string, unknown>[]> {
+  const artists = await context.app.library.listArtists(
+    await folderIdParam(context),
+    { ignoredArticles: ARTICLES },
+  );
+  const p = await loadPersonal(context, { artists: artists.map((a) => a.id) });
+  const groups = new Map<string, Record<string, unknown>[]>();
+  for (const artist of artists) {
+    const name = indexName(artist.sortKey!);
+    const list = groups.get(name) ?? [];
+    list.push(build(artist, p));
+    groups.set(name, list);
+  }
+  return [...groups.keys()].sort().map((name) => ({
+    name,
+    artist: groups.get(name)!,
+  }));
+}
+
+/** Navidrome's ascending indexed year, then album name and canonical id. */
+export function artistAlbumsOrder(albums: AlbumRow[]): AlbumRow[] {
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  return [...albums].sort((a, b) =>
+    (a.year ?? 0) - (b.year ?? 0) || compare(a.name, b.name) ||
+    compare(a.id, b.id)
+  );
 }
 
 export async function scanStatusOf(
@@ -354,6 +393,7 @@ export async function albumListAlbums(
     offset: safeIntParam(params, 'offset', 0),
     folderId: await folderIdParam(context),
     username: context.state.user!.username,
+    ignoredArticles: ARTICLES,
   };
   if (sort === 'genre') {
     const genre = requiredParam(context, 'genre');
