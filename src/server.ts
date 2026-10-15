@@ -14,6 +14,7 @@ import { createLibraries } from './libraries.ts';
 import { createLibrary } from './library.ts';
 import { createAnnotation } from './annotation.ts';
 import { createListens } from './listens.ts';
+import { createIdentity } from './identity.ts';
 import { createPlaylists } from './playlists.ts';
 import { createClientQueue } from './clientqueue.ts';
 import { createBookmarks } from './bookmarks.ts';
@@ -107,6 +108,7 @@ const app = {
   state,
   airplay,
   outputAdmission,
+  identity: createIdentity(db),
   log: scopedLog('core'),
 };
 const core = await pathfinder({ roots: ['core/'], app });

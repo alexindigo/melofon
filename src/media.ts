@@ -15,6 +15,8 @@ import {
   AV_CODEC_ID_ALAC,
   AV_CODEC_ID_FLAC,
   AV_CODEC_ID_H264,
+  AV_CODEC_ID_MP1,
+  AV_CODEC_ID_MP2,
   AV_CODEC_ID_MP3,
   AV_CODEC_ID_OPUS,
   AV_CODEC_ID_VORBIS,
@@ -22,6 +24,8 @@ import {
   AV_SAMPLE_FMT_S16,
   AV_TIME_BASE,
   AV_TIME_BASE_Q,
+  AVDISCARD_ALL,
+  avGetCodecName,
   AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
   avRescaleQ,
@@ -38,6 +42,7 @@ import {
   Muxer,
   pipeline,
 } from 'node-av';
+import { createHash } from 'node:crypto';
 import { type Log, scopedLog } from './logging.ts';
 
 const ffmpegLevel = FFmpegLog.getLevel();
@@ -74,6 +79,10 @@ export interface ExtractedAudio {
 }
 
 export interface Media {
+  /** afp/1: compressed audio packets only, excluding tags and container data.
+   * Throws on I/O/demux failure. No audio or packets yields a null fingerprint.
+   * pcmMd5 is FLAC's nonzero STREAMINFO checksum, never a decoded-audio hash. */
+  fingerprint(path: string): Promise<AudioFingerprint>;
   /** Never throws: unreadable/unsupported media probes as all-null/false. */
   probe(path: string): Promise<Probe>;
   /** Audio track of `path` re-encoded to `format`, STREAMED: the muxer write
@@ -105,6 +114,64 @@ export interface Media {
     path: string,
     opts?: { startMs?: number },
   ): Promise<AsyncIterable<Uint8Array> | null>;
+}
+
+export interface AudioFingerprint {
+  fingerprint: string | null;
+  pcmMd5: string | null;
+}
+
+// MPEG packets can include trailing tags or leading padding. Only the first
+// complete MPEG frame belongs to afp/1, never the whole packet's tail.
+function mpegFrame(data: Uint8Array, first: boolean): Uint8Array | null {
+  const rates = [44100, 48000, 32000];
+  const v1 = [
+    [32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+    [32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+    [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+  ];
+  const v2 = [
+    [32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+    [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+  ];
+  for (let at = 0; at + 4 <= data.length; at++) {
+    if (data[at] !== 0xff || (data[at + 1] & 0xe0) !== 0xe0) continue;
+    const version = (data[at + 1] >> 3) & 3;
+    const layerBits = (data[at + 1] >> 1) & 3;
+    const bitrateIndex = data[at + 2] >> 4;
+    const rateIndex = (data[at + 2] >> 2) & 3;
+    if (
+      version === 1 || layerBits === 0 || bitrateIndex === 0 ||
+      bitrateIndex === 15 || rateIndex === 3
+    ) continue;
+    const layer = 4 - layerBits;
+    const bitrate = (version === 3 ? v1[layer - 1] : v2[layer === 1 ? 0 : 1])[
+      bitrateIndex - 1
+    ] * 1000;
+    const sampleRate = rates[rateIndex] /
+      (version === 3 ? 1 : version === 2 ? 2 : 4);
+    const padding = (data[at + 2] >> 1) & 1;
+    const length = layer === 1
+      ? (Math.floor(12 * bitrate / sampleRate) + padding) * 4
+      : Math.floor(
+        (layer === 3 && version !== 3 ? 72 : 144) * bitrate / sampleRate,
+      ) + padding;
+    if (at + length > data.length) continue;
+    const frame = data.subarray(at, at + length);
+    if (first) {
+      const mono = (frame[3] >> 6) === 3;
+      const crc = (frame[1] & 1) === 0 ? 2 : 0;
+      const sideInfo = version === 3 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+      const marker = (offset: number) =>
+        String.fromCharCode(...frame.subarray(offset, offset + 4));
+      const xing = marker(4 + crc + sideInfo);
+      if (xing === 'Xing' || xing === 'Info' || marker(36) === 'VBRI') {
+        return null;
+      }
+    }
+    return frame;
+  }
+  return null;
 }
 
 // Transcode profiles: format → encoder + muxer + wire content type + default
@@ -242,6 +309,57 @@ export function createMedia(log: Log = scopedLog('media')): Media {
   }
 
   return {
+    async fingerprint(path) {
+      const input = await Demuxer.open(path);
+      try {
+        const audio = input.audio(0);
+        if (audio === undefined) return { fingerprint: null, pcmMd5: null };
+        for (const stream of input.streams) {
+          if (stream.index !== audio.index) stream.discard = AVDISCARD_ALL;
+        }
+        const params = audio.codecpar;
+        const hash = createHash('sha256');
+        hash.update(`melofon-afp/1\0${avGetCodecName(params.codecId)}\0`);
+        const format = new Uint8Array(8);
+        const view = new DataView(format.buffer);
+        view.setUint32(0, params.sampleRate, true);
+        view.setUint32(4, params.channelLayout.nbChannels, true);
+        hash.update(format);
+        let pcmMd5: string | null = null;
+        if (params.codecId === AV_CODEC_ID_FLAC) {
+          const md5 = params.extradata?.subarray(18, 34);
+          if (md5?.length === 16 && md5.some((b) => b !== 0)) {
+            pcmMd5 = md5.toString('hex');
+          }
+        }
+        const mpeg = [AV_CODEC_ID_MP1, AV_CODEC_ID_MP2, AV_CODEC_ID_MP3]
+          .includes(params.codecId);
+        let first = true;
+        let bytes = 0;
+        for await (const packet of input.packets(audio.index)) {
+          if (packet === null) continue;
+          try {
+            const data = packet.data;
+            if (data === null || data.length === 0) continue;
+            const payload = mpeg ? mpegFrame(data, first) : data;
+            first = false;
+            if (payload !== null) {
+              hash.update(payload);
+              bytes += payload.length;
+            }
+          } finally {
+            packet.free();
+          }
+        }
+        return {
+          fingerprint: bytes === 0 ? null : hash.digest('hex').slice(0, 32),
+          pcmMd5,
+        };
+      } finally {
+        await input.close();
+      }
+    },
+
     async probe(path) {
       let input;
       try {

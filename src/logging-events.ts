@@ -51,6 +51,7 @@ export interface EventFacts {
     albums: number;
   };
   scan_skipped: { path: string } & ErrorFacts;
+  scan_fingerprint_failed: { path: string } & ErrorFacts;
   scan_failed: ErrorFacts;
   restore_complete: {
     queued: number;
@@ -197,6 +198,12 @@ export const events: Record<EventId, EventDefinition> = {
     'path error',
   ),
   scan_failed: definition('scan', 'error', 'Library scan failed', 'error'),
+  scan_fingerprint_failed: definition(
+    'scan',
+    'warn',
+    'Audio fingerprint failed',
+    'path error',
+  ),
   restore_complete: definition(
     'player',
     'info',

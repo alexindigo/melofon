@@ -186,3 +186,35 @@ INSERT INTO star_events (user_id, target_id, target_type, action, occurred_at)
   SELECT user_id, target_id, target_type, 'star', starred_at FROM stars
   WHERE NOT EXISTS (SELECT 1 FROM star_events)
   ORDER BY starred_at, user_id, target_id;
+
+-- Keep-on-rescan song identity: id is the files/song id first assigned on scan.
+-- The scan is the sole writer and enforces one row per (library_id, rel_path).
+-- No unique path index: DuckDB index updates on changed keys are fragile.
+CREATE TABLE IF NOT EXISTS file_identity (
+  id VARCHAR PRIMARY KEY,
+  library_id VARCHAR NOT NULL,
+  rel_path VARCHAR NOT NULL,
+  present BOOLEAN NOT NULL,
+  first_seen_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ NOT NULL,
+  size BIGINT,
+  mtime_ms BIGINT,
+  dev BIGINT,
+  ino BIGINT,
+  fingerprint VARCHAR,
+  pcm_md5 VARCHAR
+);
+-- Append-only history. kind is linked, ambiguous or audio_changed.
+CREATE SEQUENCE IF NOT EXISTS file_event_seq;
+CREATE TABLE IF NOT EXISTS file_events (
+  seq BIGINT PRIMARY KEY DEFAULT nextval('file_event_seq'),
+  occurred_at TIMESTAMPTZ NOT NULL,
+  kind VARCHAR NOT NULL,
+  file_id VARCHAR NOT NULL,
+  fingerprint VARCHAR,
+  from_library_id VARCHAR,
+  from_path VARCHAR,
+  to_library_id VARCHAR,
+  to_path VARCHAR,
+  candidates VARCHAR[]
+);

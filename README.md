@@ -32,6 +32,17 @@ view of the same list.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — the secret and the password live in env only.
 
+## Catalog identity
+
+Scanning records an `afp/1` audio fingerprint from compressed audio packets,
+excluding tags. Unchanged stat tuples reuse the cached fingerprint, including
+same-filesystem moves. Song ids stay stable across tag edits and automatically
+linked moves/renames, keeping stars, ratings and listens attached. External moves
+link only when exactly one missing identity and one new path share a fingerprint;
+links and ambiguous candidates are kept as history. First-seen is recorded once
+when a scan first sees a file and carried across moves. Core indexes exact-audio
+duplicate groups and retains missing identities; API/UI access comes later.
+
 ## OpenSubsonic capabilities and form POST
 
 `GET` or form `POST /rest/getOpenSubsonicExtensions` (also `.view`) is public:
