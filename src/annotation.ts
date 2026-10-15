@@ -115,7 +115,7 @@ export function createAnnotation(db: Db): Annotation {
     action: 'star' | 'unstar',
   ): Promise<void> {
     await db.conn.run(
-      `INSERT INTO star_events (user_id, target_id, target_type, action, "at")
+      `INSERT INTO star_events (user_id, target_id, target_type, action, occurred_at)
        VALUES (${esc(userId_)}, ${esc(targetId)}, ${esc(targetType)}, ${
         esc(action)
       }, now())`,
@@ -196,7 +196,7 @@ export function createAnnotation(db: Db): Annotation {
            WHERE l.action = 'star' AND (${liveSql})
          )
          SELECT e.target_id, live.target_type, e.action,
-                epoch_ms(e."at")::BIGINT AS at_ms
+                epoch_ms(e.occurred_at)::BIGINT AS at_ms
          FROM star_events e JOIN live ON live.target_id = e.target_id
          WHERE e.user_id = ${esc(userId_)}
          ORDER BY e.target_id, e.seq`,
@@ -232,7 +232,7 @@ export function createAnnotation(db: Db): Annotation {
       const ids = inList(targetIds);
       const events = await db.conn.runAndReadAll(
         `SELECT target_id, target_type, action,
-                epoch_ms("at")::BIGINT AS at_ms
+                epoch_ms(occurred_at)::BIGINT AS at_ms
          FROM star_events
          WHERE user_id = ${esc(userId_)} AND target_id IN (${ids})
          ORDER BY target_id, seq`,

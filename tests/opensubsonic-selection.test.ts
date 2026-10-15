@@ -102,7 +102,7 @@ async function setup(large = false) {
       }, 'Bulk', 2005, 1000, 1000 FROM range(501) r(i)`,
     );
     await db.conn.run(
-      `INSERT INTO star_events (user_id, target_id, target_type, action, "at") SELECT u.id, al.id, 'album', 'star', now() FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,
+      `INSERT INTO star_events (user_id, target_id, target_type, action, occurred_at) SELECT u.id, al.id, 'album', 'star', now() FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,
     );
     await db.conn.run(
       `INSERT INTO ratings SELECT u.id, al.id, 5 FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,

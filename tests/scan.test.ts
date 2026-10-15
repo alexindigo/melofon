@@ -147,7 +147,7 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
       "INSERT INTO stars (user_id, target_id, target_type, starred_at) VALUES ('u1', 't1', 'song', now())",
     );
     await db.conn.run(
-      `INSERT INTO star_events (user_id, target_id, target_type, action, "at") VALUES ('u1', 't1', 'song', 'star', now())`,
+      `INSERT INTO star_events (user_id, target_id, target_type, action, occurred_at) VALUES ('u1', 't1', 'song', 'star', now())`,
     );
     await db.conn.run(
       "INSERT INTO ratings (user_id, target_id, rating) VALUES ('u1', 't1', 5)",

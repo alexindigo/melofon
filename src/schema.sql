@@ -173,7 +173,6 @@ UPDATE output_state SET connection_strategy = 'melofon' WHERE connection_strateg
 -- every star event is one like. The legacy stars table above is read only by
 -- the one-time migration below, which copies existing stars as star events
 -- with their original dates (only while star_events is still empty).
--- "at" is a DuckDB keyword, so every statement quotes the column name.
 CREATE SEQUENCE IF NOT EXISTS star_event_seq;
 CREATE TABLE IF NOT EXISTS star_events (
   seq BIGINT PRIMARY KEY DEFAULT nextval('star_event_seq'),
@@ -181,9 +180,9 @@ CREATE TABLE IF NOT EXISTS star_events (
   target_id VARCHAR NOT NULL,
   target_type VARCHAR NOT NULL,
   action VARCHAR NOT NULL,
-  "at" TIMESTAMPTZ NOT NULL
+  occurred_at TIMESTAMPTZ NOT NULL
 );
-INSERT INTO star_events (user_id, target_id, target_type, action, "at")
+INSERT INTO star_events (user_id, target_id, target_type, action, occurred_at)
   SELECT user_id, target_id, target_type, 'star', starred_at FROM stars
   WHERE NOT EXISTS (SELECT 1 FROM star_events)
   ORDER BY starred_at, user_id, target_id;

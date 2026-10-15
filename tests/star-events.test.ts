@@ -55,7 +55,7 @@ interface EventRow {
 async function events(db: Db): Promise<EventRow[]> {
   const rows = (await db.conn.runAndReadAll(
     `SELECT user_id, target_id, target_type, action,
-            epoch_ms("at")::BIGINT AS at_ms
+            epoch_ms(occurred_at)::BIGINT AS at_ms
      FROM star_events ORDER BY seq`,
   )).getRowObjects() as unknown as (Omit<EventRow, 'at_ms'> & {
     at_ms: bigint;
