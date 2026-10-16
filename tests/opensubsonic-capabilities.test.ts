@@ -211,7 +211,7 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
     await libraries.add('Fixture', 'tests/fixtures/library');
     await scanLibrary(db);
     const library = createLibrary(db);
-    const annotation = createAnnotation(db);
+    const annotation = createAnnotation(store);
     const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
     const app = facade(
       core,

@@ -48,9 +48,9 @@ async function setup() {
     libraries,
     user: createUserService(store, cfg),
     library: createLibrary(db),
-    annotation: createAnnotation(db),
+    annotation: createAnnotation(store),
     listens: createListens(store),
-    playlists: createPlaylists(db),
+    playlists: createPlaylists(store),
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));

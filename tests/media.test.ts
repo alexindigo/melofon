@@ -46,10 +46,10 @@ async function setup() {
     scan,
     user: createUserService(store, cfg),
     library: createLibrary(db),
-    annotation: createAnnotation(db),
+    annotation: createAnnotation(store),
     listens: createListens(store),
     bookmarks: createBookmarks(store),
-    playlists: createPlaylists(db),
+    playlists: createPlaylists(store),
     stream: createStream(createMedia()),
     zip: createZip(),
   };

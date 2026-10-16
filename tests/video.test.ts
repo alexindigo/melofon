@@ -52,7 +52,7 @@ async function setup() {
     libraries,
     user: createUserService(store, cfg),
     library,
-    annotation: createAnnotation(db),
+    annotation: createAnnotation(store),
     listens: createListens(store),
     stream: createStream(createMedia()),
   };

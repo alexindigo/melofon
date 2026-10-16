@@ -174,7 +174,7 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
       libraries,
       user: createUserService(store, cfg),
       library: createLibrary(db),
-      annotation: createAnnotation(db),
+      annotation: createAnnotation(store),
       listens: createListens(store),
     };
     const app = facade(core, await loadLayers({ app: bag }));

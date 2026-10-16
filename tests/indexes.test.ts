@@ -40,7 +40,7 @@ async function setup() {
     scan,
     user: createUserService(store, cfg),
     library: createLibrary(db),
-    annotation: createAnnotation(db),
+    annotation: createAnnotation(store),
     listens: createListens(store),
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });

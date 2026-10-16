@@ -229,8 +229,8 @@ async function setup() {
     );
   }
   const library = createLibrary(db);
-  const annotation = createAnnotation(db);
-  const playlists = createPlaylists(db);
+  const annotation = createAnnotation(store);
+  const playlists = createPlaylists(store);
   const playlist = await playlists.create(cfg.user, 'Mix', songIds);
   const bookmarks = createBookmarks(store);
   const clientQueue = createClientQueue(store);

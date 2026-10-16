@@ -119,7 +119,7 @@ Deno.test('star history: legacy stars migrate once, in time order, never again',
     store = await openStore(dir);
     db = store.legacy;
     assertEquals(await events(db), migrated, 'a third open does not repeat');
-    assert(await createAnnotation(db).star(CFG.user, 's1'));
+    assert(await createAnnotation(store).star(CFG.user, 's1'));
     db.close();
 
     store = await openStore(dir);
@@ -135,8 +135,8 @@ Deno.test('star history: legacy stars migrate once, in time order, never again',
 });
 
 Deno.test('star history: starred now follows the latest event; every star is a like', async () => {
-  await withDb(async (db) => {
-    const annotation = createAnnotation(db);
+  await withDb(async (db, store) => {
+    const annotation = createAnnotation(store);
     for (const step of ['star', 'star', 'unstar', 'star'] as const) {
       assert(await annotation[step](CFG.user, 's1'), step);
     }
@@ -169,8 +169,8 @@ Deno.test('star history: starred now follows the latest event; every star is a l
 });
 
 Deno.test('star history: classification by lookup and the unstar fallback', async () => {
-  await withDb(async (db) => {
-    const annotation = createAnnotation(db);
+  await withDb(async (db, store) => {
+    const annotation = createAnnotation(store);
     for (const id of ['ar1', 'al1', 's1']) {
       assert(await annotation.star(CFG.user, id), id);
     }
@@ -206,14 +206,14 @@ Deno.test('star history: classification by lookup and the unstar fallback', asyn
 });
 
 Deno.test('star history: starred honours the music folder', async () => {
-  await withDb(async (db) => {
+  await withDb(async (db, store) => {
     await db.conn.run(
       "INSERT INTO libraries VALUES ('lib-a', 'A', '/a'), ('lib-b', 'B', '/b')",
     );
     await db.conn.run(
       "UPDATE files SET library_id = CASE WHEN id = 's3' THEN 'lib-b' ELSE 'lib-a' END",
     );
-    const annotation = createAnnotation(db);
+    const annotation = createAnnotation(store);
     for (const id of ['ar1', 'ar2', 'al1', 'al2', 's1', 's3']) {
       assert(await annotation.star(CFG.user, id));
     }
@@ -227,8 +227,8 @@ Deno.test('star history: starred honours the music folder', async () => {
 });
 
 Deno.test('star history: batch facts cover every id; the average is unrounded', async () => {
-  await withDb(async (db) => {
-    const annotation = createAnnotation(db);
+  await withDb(async (db, store) => {
+    const annotation = createAnnotation(store);
     await addUser(db, 'bob-id', 'bob');
     await addUser(db, 'carol-id', 'carol');
     assert(await annotation.setRating(CFG.user, 's1', 1));

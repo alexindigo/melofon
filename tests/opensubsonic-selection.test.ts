@@ -118,7 +118,7 @@ async function setup(large = false) {
     libraries,
     library,
     user: createUserService(store, cfg),
-    annotation: createAnnotation(db),
+    annotation: createAnnotation(store),
     listens: createListens(store),
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });

@@ -45,7 +45,7 @@ async function setup(
   const scan = createScan(db);
   await scan.run();
   const library = createLibrary(db);
-  const playlists = createPlaylists(db);
+  const playlists = createPlaylists(store);
   if (withPlaylist && seedUser) {
     const albums = await library.listAlbums({
       sort: 'name',

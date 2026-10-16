@@ -37,7 +37,7 @@ async function setup() {
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
   const library = createLibrary(db);
-  const playlists = createPlaylists(db);
+  const playlists = createPlaylists(store);
   const albums = await library.listAlbums({
     sort: 'name',
     size: 10,

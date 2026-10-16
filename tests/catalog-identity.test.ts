@@ -158,7 +158,7 @@ Deno.test('identity: within-library move and rename preserve user-state joins an
       password: 'test',
       secret: 'test-secret',
     });
-    const annotation = createAnnotation(t.db);
+    const annotation = createAnnotation(t.store);
     const listens = createListens(t.store);
     assert(await annotation.star('admin', id));
     assert(await annotation.setRating('admin', id, 5));
