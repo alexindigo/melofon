@@ -1,0 +1,1042 @@
+// Catalog data access. Every public operation owns one exclusive engine slot.
+import { atomic, type Engine, esc, type Queries } from './engine.ts';
+import { userIdForName } from './users.ts';
+import { artistFolderFilter } from './catalog-sql.ts';
+
+export interface ArtistRow {
+  id: string;
+  name: string;
+  albumCount: number;
+  /** Present on article-aware lists; the exact key used for ordering/grouping. */
+  sortKey?: string;
+}
+
+export interface AlbumRow {
+  id: string;
+  name: string;
+  artistId: string;
+  artistName: string;
+  songCount: number;
+  durationMs: number;
+  /** Newest song year on the album (null when no song carries a year). */
+  year: number | null;
+  /** Earliest first-seen time among the album's listed files. */
+  createdAtMs: number | null;
+}
+
+export interface SongRow {
+  id: string;
+  path: string;
+  /** Source this file was scanned from (null only for pre-M3 rows). */
+  libraryId: string | null;
+  /** Absolute path of that source's root — hats relativize `path` against it. */
+  libraryPath: string | null;
+  title: string;
+  albumId: string | null;
+  albumName: string | null;
+  artistId: string | null;
+  artistName: string | null;
+  track: number | null;
+  disc: number | null;
+  durationMs: number | null;
+  size: number | null;
+  genre: string | null;
+  year: number | null;
+  /** Retained first observation, independent of file mtime and retagging. */
+  firstSeenMs: number | null;
+  /** M4: row is a music video (probe-decided at scan), else an audio file. */
+  isVideo: boolean;
+  suffix: string;
+  contentType: string;
+}
+
+export interface GenreRow {
+  name: string;
+  songCount: number;
+  albumCount: number;
+}
+
+export interface LyricsRow {
+  artist: string | null;
+  title: string | null;
+  text: string;
+}
+
+export interface Search3Result {
+  artists: ArtistRow[];
+  albums: AlbumRow[];
+  songs: SongRow[];
+}
+
+export interface RandomSongOptions {
+  size: number;
+  folderId?: string;
+  genre?: string;
+  fromYear?: number;
+  toYear?: number;
+}
+
+export interface CatalogReads {
+  /** Album artists (artists with at least one album), alphabetically. */
+  listArtists(
+    folderId?: string,
+    opts?: { ignoredArticles?: string[] },
+  ): Promise<ArtistRow[]>;
+  /** One album artist by ID (null when unknown or has no albums). */
+  getArtist(id: string): Promise<ArtistRow | null>;
+  /** Any catalog artist, including track-only performers with zero albums. */
+  artistById(id: string): Promise<ArtistRow | null>;
+  /** Albums of one album artist, alphabetically. */
+  albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+  /** Album lists for getAlbumList/getAlbumList2-shaped hats. The user-scoped
+   * sorts (highest / frequent / recent) need `username`; `genre` sort needs
+   * `genre`. Favourites are not a sort here: hats derive their order from
+   * app.annotation's star history and resolve rows with albumsById. */
+  listAlbums(opts: {
+    sort:
+      | 'name'
+      | 'artist'
+      | 'random'
+      | 'newest'
+      | 'highest'
+      | 'frequent'
+      | 'recent'
+      | 'genre'
+      | 'year';
+    size: number;
+    offset: number;
+    folderId?: string;
+    genre?: string;
+    username?: string;
+    ignoredArticles?: string[];
+    /** `year` sort: range bounds (either order; from > to is newest-first). */
+    fromYear?: number;
+    toYear?: number;
+  }): Promise<AlbumRow[]>;
+  /** The given albums (unknown ids skipped), by id. With `folderId`, only
+   * albums with a file in that source, counted and timed within it exactly
+   * as listAlbums scopes them. */
+  albumsById(ids: string[], opts: { folderId?: string }): Promise<AlbumRow[]>;
+  getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
+  getSong(id: string): Promise<SongRow | null>;
+  search3(
+    query: string,
+    opts: {
+      artistCount: number;
+      artistOffset: number;
+      albumCount: number;
+      albumOffset: number;
+      songCount: number;
+      songOffset: number;
+      folderId?: string;
+    },
+  ): Promise<Search3Result>;
+  /** Absolute path of a song's audio file, for app.stream. */
+  songPath(id: string): Promise<string | null>;
+  /** All music videos in the catalog (getVideos). */
+  videos(): Promise<SongRow[]>;
+  /** Random songs from the catalog (getRandomSongs pull-forward). */
+  randomSongs(opts: RandomSongOptions): Promise<SongRow[]>;
+  randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
+  /** Paged catalog walk in a STABLE order (path) — for deterministic
+   * wire-id resolution (OwnTone find-by-wire-int). */
+  listSongs(opts: { offset: number; size: number }): Promise<SongRow[]>;
+  /** All genres with song/album counts (getGenres). */
+  listGenres(): Promise<GenreRow[]>;
+  /** Songs of one genre (getSongsByGenre). */
+  songsByGenre(
+    genre: string,
+    opts: { size: number; offset: number; folderId?: string },
+  ): Promise<SongRow[]>;
+  songForLyrics(
+    query: { artist?: string; title?: string },
+  ): Promise<SongRow | null>;
+  coverSongPath(id: string): Promise<string | null>;
+  albumSongPath(id: string): Promise<string | null>;
+}
+
+const CONTENT_TYPES: Record<string, string> = {
+  mp3: 'audio/mpeg',
+  flac: 'audio/flac',
+  m4a: 'audio/mp4',
+  ogg: 'audio/ogg',
+  opus: 'audio/ogg',
+  wav: 'audio/wav',
+  mp4: 'video/mp4',
+  m4v: 'video/mp4',
+  mkv: 'video/x-matroska',
+  webm: 'video/webm',
+};
+
+function suffixOf(path: string): string {
+  const idx = path.lastIndexOf('.');
+  return idx === -1 ? '' : path.slice(idx + 1).toLowerCase();
+}
+
+function num(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  return Number(value);
+}
+
+// Generic sorting policy: the hat supplies articles, core owns the computed
+// key. Strip a single case-sensitive leading article after accent folding,
+// before lowercasing (Navidrome); unoptioned callers retain their old order.
+function sortKeySql(column: string, articles?: string[]): string {
+  if (articles === undefined) return column;
+  const folded = `trim(strip_accents(${column}))`;
+  const branches = articles.map((article) =>
+    `WHEN starts_with(${folded}, ${
+      esc(article + ' ')
+    }) THEN substring(${folded}, length(${esc(article)}) + 2)`
+  );
+  const stripped = branches.length === 0
+    ? folded
+    : `CASE ${branches.join(' ')} ELSE ${folded} END`;
+  return `lower(trim(${stripped}))`;
+}
+
+interface SongSqlRow {
+  id: string;
+  path: string;
+  library_id: string | null;
+  library_path: string | null;
+  title: string;
+  album_id: string | null;
+  album_name: string | null;
+  artist_id: string | null;
+  artist_name: string | null;
+  track: number | null;
+  disc: number | null;
+  duration_ms: number | bigint | null;
+  size: number | bigint | null;
+  genre: string | null;
+  year: number | null;
+  first_seen_ms: number | bigint | null;
+  is_video: boolean | null;
+}
+
+function songOf(row: SongSqlRow): SongRow {
+  const suffix = suffixOf(row.path);
+  return {
+    id: row.id,
+    path: row.path,
+    libraryId: row.library_id,
+    libraryPath: row.library_path,
+    title: row.title,
+    albumId: row.album_id,
+    albumName: row.album_name,
+    artistId: row.artist_id,
+    artistName: row.artist_name,
+    track: num(row.track),
+    disc: num(row.disc),
+    durationMs: num(row.duration_ms),
+    size: num(row.size),
+    genre: row.genre,
+    year: num(row.year),
+    firstSeenMs: num(row.first_seen_ms),
+    isVideo: row.is_video ?? false,
+    suffix,
+    contentType: CONTENT_TYPES[suffix] ?? 'application/octet-stream',
+  };
+}
+
+const SONG_SELECT = `
+  SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title,
+         f.album_id, al.name AS album_name, f.artist_id,
+         ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
+         f.genre, f.year, f.is_video, epoch_ms(fi.first_seen_at) AS first_seen_ms
+  FROM files f
+  LEFT JOIN albums al ON al.id = f.album_id
+  LEFT JOIN artists ar ON ar.id = f.artist_id
+  LEFT JOIN libraries l ON l.id = f.library_id
+  LEFT JOIN file_identity fi ON fi.id = f.id`;
+
+interface AlbumSqlRow {
+  id: string;
+  name: string;
+  album_artist_id: string;
+  artist_name: string;
+  song_count: number | bigint;
+  duration_ms: number | bigint | null;
+  year: number | bigint | null;
+  created_ms: number | bigint | null;
+}
+
+function albumOf(row: AlbumSqlRow): AlbumRow {
+  return {
+    id: row.id,
+    name: row.name,
+    artistId: row.album_artist_id,
+    artistName: row.artist_name,
+    songCount: Number(row.song_count),
+    durationMs: Number(row.duration_ms ?? 0),
+    year: num(row.year),
+    createdAtMs: num(row.created_ms),
+  };
+}
+
+// Album query builder. folderId restricts to albums having at least one file
+// in that source (musicFolderId); genre restricts to albums with a file of
+// that genre; ratedBy inner-joins the user's ratings; listenAgg inner-joins
+// per-album play aggregates for frequent / recent. The WHERE goes before the
+// GROUP BY, so it composes with callers' HAVING / ORDER BY / LIMIT. Ratings
+// join at most one row per album (their PK), and the listen aggregate is one
+// row per album, so song_count and duration stay exact.
+interface AlbumQuery {
+  folderId?: string;
+  genre?: string;
+  yearFrom?: number;
+  yearTo?: number;
+  ratedBy?: string; // users.id
+  listenAgg?: string; // users.id
+}
+
+function albumSelect(q: AlbumQuery = {}): string {
+  const joins: string[] = [];
+  if (q.ratedBy !== undefined) {
+    joins.push(
+      `JOIN ratings r ON r.target_id = al.id AND r.user_id = ${esc(q.ratedBy)}`,
+    );
+  }
+  if (q.listenAgg !== undefined) {
+    joins.push(
+      `JOIN (
+         SELECT f2.album_id AS album_id, COUNT(li.track_id) AS play_count,
+                MAX(li.played_at) AS last_played
+         FROM files f2
+         JOIN listens li ON li.track_id = f2.id
+           AND li.user_id = ${esc(q.listenAgg)}
+         GROUP BY f2.album_id
+       ) agg ON agg.album_id = al.id`,
+    );
+  }
+  const wheres: string[] = [];
+  if (q.folderId !== undefined) {
+    wheres.push(`f.library_id = ${esc(q.folderId)}`);
+  }
+  if (q.genre !== undefined) {
+    wheres.push(
+      `EXISTS (SELECT 1 FROM files fg WHERE fg.album_id = al.id AND fg.genre = ${
+        esc(q.genre)
+      })`,
+    );
+  }
+  if (q.yearFrom !== undefined && q.yearTo !== undefined) {
+    wheres.push(
+      `EXISTS (SELECT 1 FROM files fy WHERE fy.album_id = al.id AND fy.year BETWEEN ${q.yearFrom} AND ${q.yearTo})`,
+    );
+  }
+  return `
+  SELECT al.id, al.name, al.album_artist_id, ar.name AS artist_name,
+         COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
+         MAX(f.year) AS year, epoch_ms(MIN(fi.first_seen_at)) AS created_ms
+  FROM albums al
+  JOIN artists ar ON ar.id = al.album_artist_id
+  LEFT JOIN files f ON f.album_id = al.id
+  LEFT JOIN file_identity fi ON fi.id = f.id
+  ${joins.join('\n')}
+  ${wheres.length === 0 ? '' : `WHERE ${wheres.join(' AND ')}`}
+  GROUP BY al.id, al.name, al.album_artist_id, ar.name`;
+}
+
+// File eligibility has one owner for sync, genre browsing and random sampling.
+// Optional bounds are inclusive; SQL NULL comparisons do not invent a year.
+function songPredicates(opts: Omit<RandomSongOptions, 'size'>): string[] {
+  const predicates: string[] = [];
+  if (opts.folderId !== undefined) {
+    predicates.push(`f.library_id = ${esc(opts.folderId)}`);
+  }
+  if (opts.genre !== undefined) predicates.push(`f.genre = ${esc(opts.genre)}`);
+  if (opts.fromYear !== undefined) {
+    predicates.push(`f.year >= ${opts.fromYear}`);
+  }
+  if (opts.toYear !== undefined) predicates.push(`f.year <= ${opts.toYear}`);
+  return predicates;
+}
+
+// Internal helpers share the current slot, never another public operation.
+function catalogReads(q: Queries): CatalogReads {
+  async function resolveArtist(
+    id: string,
+    all: boolean,
+  ): Promise<ArtistRow | null> {
+    const res = await q.all(
+      `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
+       FROM artists ar
+       ${all ? 'LEFT JOIN' : 'JOIN'} albums al ON al.album_artist_id = ar.id
+       WHERE ar.id = ${esc(id)}
+       GROUP BY ar.id, ar.name`,
+    );
+    const row = (res as {
+      id: string;
+      name: string;
+      album_count: number | bigint;
+    }[])[0];
+    return row
+      ? { id: row.id, name: row.name, albumCount: Number(row.album_count) }
+      : null;
+  }
+  return {
+    async listArtists(folderId, opts = {}): Promise<ArtistRow[]> {
+      const key = sortKeySql('ar.name', opts.ignoredArticles);
+      const res = await q.all(
+        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count, ${key} AS sort_key
+         FROM artists ar
+         JOIN albums al ON al.album_artist_id = ar.id
+         WHERE 1 = 1 ${artistFolderFilter(folderId)}
+         GROUP BY ar.id, ar.name
+          ORDER BY sort_key, ar.id`,
+      );
+      return (res as {
+        id: string;
+        name: string;
+        album_count: number | bigint;
+        sort_key: string;
+      }[]).map((row) => ({
+        id: row.id,
+        name: row.name,
+        albumCount: Number(row.album_count),
+        ...(opts.ignoredArticles === undefined
+          ? {}
+          : { sortKey: row.sort_key }),
+      }));
+    },
+
+    async getArtist(id) {
+      return await resolveArtist(id, false);
+    },
+
+    async artistById(id) {
+      return await resolveArtist(id, true);
+    },
+
+    async albumsByArtist(artistId) {
+      const res = await q.all(
+        `${albumSelect()} HAVING al.album_artist_id = ${esc(artistId)}
+         ORDER BY al.name, al.id`,
+      );
+      return (res as unknown as AlbumSqlRow[]).map(albumOf);
+    },
+
+    async listAlbums(opts) {
+      const query: AlbumQuery = { folderId: opts.folderId };
+      let order: string;
+      switch (opts.sort) {
+        case 'random':
+          order = 'ORDER BY RANDOM()';
+          break;
+        case 'newest':
+          order = 'ORDER BY created_ms DESC NULLS LAST';
+          break;
+        case 'artist':
+          order = `ORDER BY ${sortKeySql('ar.name', opts.ignoredArticles)}, ${
+            sortKeySql('al.name', opts.ignoredArticles)
+          }`;
+          break;
+        case 'highest':
+        case 'frequent':
+        case 'recent': {
+          if (opts.username === undefined) return [];
+          const userId = await userIdForName(q, opts.username);
+          if (userId === null) return [];
+          if (opts.sort === 'highest') {
+            query.ratedBy = userId;
+            order = 'ORDER BY MAX(r.rating) DESC, al.name';
+          } else {
+            query.listenAgg = userId;
+            order = opts.sort === 'frequent'
+              ? 'ORDER BY MAX(agg.play_count) DESC NULLS LAST, al.name'
+              : 'ORDER BY MAX(agg.last_played) DESC NULLS LAST, al.name';
+          }
+          break;
+        }
+        case 'genre':
+          if (opts.genre === undefined) return [];
+          query.genre = opts.genre;
+          order = 'ORDER BY al.name';
+          break;
+        case 'year': {
+          if (opts.fromYear === undefined || opts.toYear === undefined) {
+            return [];
+          }
+          query.yearFrom = Math.min(opts.fromYear, opts.toYear);
+          query.yearTo = Math.max(opts.fromYear, opts.toYear);
+          // Subsonic: fromYear > toYear is a reverse chronological list.
+          order = opts.fromYear > opts.toYear
+            ? 'ORDER BY MAX(f.year) DESC, al.name'
+            : 'ORDER BY MAX(f.year), al.name';
+          break;
+        }
+        default:
+          order = `ORDER BY ${sortKeySql('al.name', opts.ignoredArticles)}`;
+      }
+      const res = await q.all(
+        `${albumSelect(query)} ${order}${
+          opts.sort === 'random' ? '' : ', al.id'
+        }
+         LIMIT ${opts.size} OFFSET ${opts.offset}`,
+      );
+      return (res as unknown as AlbumSqlRow[]).map(albumOf);
+    },
+
+    async albumsById(ids, opts) {
+      if (ids.length === 0) return [];
+      const res = await q.all(
+        `${albumSelect({ folderId: opts.folderId })}
+         HAVING al.id IN (${[...new Set(ids)].map(esc).join(', ')})
+         ORDER BY al.id`,
+      );
+      return (res as unknown as AlbumSqlRow[]).map(albumOf);
+    },
+
+    async getAlbum(id) {
+      const albumRes = await q.all(
+        `${albumSelect()} HAVING al.id = ${esc(id)}`,
+      );
+      const albumRow = (albumRes as unknown as AlbumSqlRow[])[0];
+      if (!albumRow) return null;
+      const songRes = await q.all(
+        `${SONG_SELECT} WHERE f.album_id = ${esc(id)}
+         ORDER BY f.disc, f.track, f.path, f.id`,
+      );
+      return {
+        album: albumOf(albumRow),
+        songs: (songRes as unknown as SongSqlRow[]).map(songOf),
+      };
+    },
+
+    async getSong(id) {
+      const res = await q.all(
+        `${SONG_SELECT} WHERE f.id = ${esc(id)}`,
+      );
+      const row = (res as unknown as SongSqlRow[])[0];
+      return row ? songOf(row) : null;
+    },
+
+    async search3(query, opts) {
+      const like = `'%' || ${esc(query)} || '%'`;
+      const artistRes = await q.all(
+        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
+           FROM artists ar
+           JOIN albums al ON al.album_artist_id = ar.id
+           WHERE ar.name ILIKE ${like} ${artistFolderFilter(opts.folderId)}
+           GROUP BY ar.id, ar.name
+            ORDER BY ar.name, ar.id
+           LIMIT ${opts.artistCount} OFFSET ${opts.artistOffset}`,
+      );
+      const albumRes = await q.all(
+        `${albumSelect({ folderId: opts.folderId })}
+           HAVING al.name ILIKE ${like}
+            ORDER BY al.name, al.id
+           LIMIT ${opts.albumCount} OFFSET ${opts.albumOffset}`,
+      );
+      const songRes = await q.all(
+        `${SONG_SELECT} WHERE ${
+          [`f.title ILIKE ${like}`, ...songPredicates(opts)].join(' AND ')
+        }
+            ORDER BY f.title, f.id
+           LIMIT ${opts.songCount} OFFSET ${opts.songOffset}`,
+      );
+      return {
+        artists: (artistRes as {
+          id: string;
+          name: string;
+          album_count: number | bigint;
+        }[]).map((row) => ({
+          id: row.id,
+          name: row.name,
+          albumCount: Number(row.album_count),
+        })),
+        albums: (albumRes as unknown as AlbumSqlRow[]).map(
+          albumOf,
+        ),
+        songs: (songRes as unknown as SongSqlRow[]).map(songOf),
+      };
+    },
+
+    async songPath(id) {
+      const res = await q.all(
+        `SELECT path FROM files WHERE id = ${esc(id)}`,
+      );
+      const row = (res as { path: string }[])[0];
+      return row?.path ?? null;
+    },
+
+    async videos() {
+      const res = await q.all(
+        `${SONG_SELECT} WHERE f.is_video ORDER BY f.path`,
+      );
+      return (res as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async randomSongs(input: RandomSongOptions | number, folderId?: string) {
+      const opts = typeof input === 'number'
+        ? { size: input, folderId }
+        : input;
+      const predicates = songPredicates(opts);
+      const res = await q.all(
+        `${SONG_SELECT}${
+          predicates.length === 0 ? '' : ` WHERE ${predicates.join(' AND ')}`
+        } ORDER BY RANDOM() LIMIT ${Math.trunc(opts.size)}`,
+      );
+      return (res as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async listSongs(opts) {
+      const res = await q.all(
+        `${SONG_SELECT} ORDER BY f.path, f.id
+         LIMIT ${Math.trunc(opts.size)} OFFSET ${Math.trunc(opts.offset)}`,
+      );
+      return (res as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async listGenres(): Promise<GenreRow[]> {
+      const res = await q.all(
+        `SELECT genre, COUNT(*) AS song_count,
+                COUNT(DISTINCT album_id) AS album_count
+         FROM files
+         WHERE genre IS NOT NULL
+         GROUP BY genre
+         ORDER BY genre`,
+      );
+      return (res as {
+        genre: string;
+        song_count: number | bigint;
+        album_count: number | bigint;
+      }[]).map((row) => ({
+        name: row.genre,
+        songCount: Number(row.song_count),
+        albumCount: Number(row.album_count),
+      }));
+    },
+
+    async songsByGenre(genre, opts) {
+      const res = await q.all(
+        `${SONG_SELECT}
+         WHERE ${songPredicates({ ...opts, genre }).join(' AND ')}
+         ORDER BY f.title, f.id
+         LIMIT ${opts.size} OFFSET ${opts.offset}`,
+      );
+      return (res as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async songForLyrics(query) {
+      const wheres: string[] = [];
+      if (query.artist !== undefined) {
+        wheres.push(`ar.name ILIKE ${esc(query.artist)}`);
+      }
+      if (query.title !== undefined) {
+        wheres.push(`f.title ILIKE ${esc(query.title)}`);
+      }
+      if (wheres.length === 0) return null;
+      const res = await q.all(
+        `${SONG_SELECT} WHERE ${wheres.join(' AND ')}
+         ORDER BY f.title LIMIT 1`,
+      );
+      const row = (res as unknown as SongSqlRow[])[0];
+      return row ? songOf(row) : null;
+    },
+
+    async coverSongPath(id) {
+      let res = await q.all(
+        `SELECT path FROM files WHERE album_id = ${esc(id)}
+         ORDER BY path LIMIT 1`,
+      );
+      let row = (res as { path: string }[])[0];
+      if (!row) {
+        res = await q.all(
+          `SELECT path FROM files WHERE id = ${esc(id)}`,
+        );
+        row = (res as { path: string }[])[0];
+      }
+      return row?.path ?? null;
+    },
+
+    async albumSongPath(id) {
+      const res = await q.all(
+        `SELECT path FROM files WHERE album_id = ${
+          esc(id)
+        } ORDER BY path LIMIT 1`,
+      );
+      const row = (res as { path: string }[])[0];
+      return row?.path ?? null;
+    },
+  };
+}
+
+function createCatalogReadStore(engine: Engine): CatalogReads {
+  return {
+    listArtists: (...args) =>
+      engine.exclusive((q) => catalogReads(q).listArtists(...args)),
+    getArtist: (id) => engine.exclusive((q) => catalogReads(q).getArtist(id)),
+    artistById: (id) => engine.exclusive((q) => catalogReads(q).artistById(id)),
+    albumsByArtist: (id) =>
+      engine.exclusive((q) => catalogReads(q).albumsByArtist(id)),
+    listAlbums: (opts) =>
+      engine.exclusive((q) => catalogReads(q).listAlbums(opts)),
+    albumsById: (...args) =>
+      engine.exclusive((q) => catalogReads(q).albumsById(...args)),
+    getAlbum: (id) => engine.exclusive((q) => catalogReads(q).getAlbum(id)),
+    getSong: (id) => engine.exclusive((q) => catalogReads(q).getSong(id)),
+    search3: (...args) =>
+      engine.exclusive((q) => catalogReads(q).search3(...args)),
+    songPath: (id) => engine.exclusive((q) => catalogReads(q).songPath(id)),
+    videos: () => engine.exclusive((q) => catalogReads(q).videos()),
+    randomSongs: (input: RandomSongOptions | number, folderId?: string) =>
+      engine.exclusive((q) =>
+        catalogReads(q).randomSongs(
+          typeof input === 'number' ? { size: input, folderId } : input,
+        )
+      ),
+    listSongs: (opts) =>
+      engine.exclusive((q) => catalogReads(q).listSongs(opts)),
+    listGenres: () => engine.exclusive((q) => catalogReads(q).listGenres()),
+    songsByGenre: (...args) =>
+      engine.exclusive((q) => catalogReads(q).songsByGenre(...args)),
+    songForLyrics: (query) =>
+      engine.exclusive((q) => catalogReads(q).songForLyrics(query)),
+    coverSongPath: (id) =>
+      engine.exclusive((q) => catalogReads(q).coverSongPath(id)),
+    albumSongPath: (id) =>
+      engine.exclusive((q) => catalogReads(q).albumSongPath(id)),
+  };
+}
+
+export interface LibraryRow {
+  id: string;
+  name: string;
+  path: string;
+}
+
+export interface DuplicateGroup {
+  fingerprint: string;
+  files: { id: string; libraryId: string; relPath: string }[];
+}
+
+export interface FileEvent {
+  seq: number;
+  occurredAtMs: number;
+  kind: 'linked' | 'ambiguous' | 'audio_changed';
+  fileId: string;
+  fingerprint: string | null;
+  fromLibraryId: string | null;
+  fromPath: string | null;
+  toLibraryId: string | null;
+  toPath: string | null;
+  candidates: string[];
+}
+
+export interface CatalogFileStat {
+  size: number | null;
+  mtime_ms: number | null;
+  dev: number | null;
+  ino: number | null;
+}
+
+export interface CatalogIdentity extends CatalogFileStat {
+  id: string;
+  library_id: string;
+  rel_path: string;
+  fingerprint: string | null;
+  pcm_md5: string | null;
+}
+
+export interface CatalogFile {
+  id: string;
+  path: string;
+  rel: string;
+  libraryId: string;
+  stat: CatalogFileStat;
+  fingerprint: string | null;
+  pcmMd5: string | null;
+  title: string;
+  albumId: string | null;
+  artistId: string | null;
+  track: number | null;
+  disc: number | null;
+  durationMs: number | null;
+  genre: string | null;
+  year: number | null;
+  isVideo: boolean;
+}
+
+export interface CatalogEvent {
+  kind: FileEvent['kind'];
+  file: CatalogFile;
+  from?: CatalogIdentity;
+  candidates?: string[];
+}
+
+export interface CatalogSnapshot {
+  artists: { id: string; name: string }[];
+  albums: { id: string; name: string; albumArtistId: string }[];
+  files: CatalogFile[];
+  events: CatalogEvent[];
+  retainedIds: string[];
+}
+
+// The scan's nullable literals use the same escaping owner as every domain.
+const nullable = (value: string | null | undefined) =>
+  value == null ? 'NULL' : esc(value);
+
+async function replaceCatalog(
+  q: Queries,
+  snapshot: CatalogSnapshot,
+): Promise<void> {
+  const { artists, albums, files, events } = snapshot;
+  const byId = new Set(snapshot.retainedIds);
+  await q.run('UPDATE file_identity SET present = false');
+  for (const file of files) {
+    const values = `${esc(file.libraryId)}, ${esc(file.rel)}, true, now(), ${
+      file.stat.size ?? 'NULL'
+    }, ${file.stat.mtime_ms ?? 'NULL'}, ${file.stat.dev ?? 'NULL'}, ${
+      file.stat.ino ?? 'NULL'
+    }, ${nullable(file.fingerprint)}, ${nullable(file.pcmMd5)}`;
+    if (byId.has(file.id)) {
+      await q.run(`UPDATE file_identity SET
+          library_id = ${esc(file.libraryId)}, rel_path = ${esc(file.rel)},
+          present = true, last_seen_at = now(), size = ${
+        file.stat.size ?? 'NULL'
+      },
+          mtime_ms = ${file.stat.mtime_ms ?? 'NULL'}, dev = ${
+        file.stat.dev ?? 'NULL'
+      },
+          ino = ${file.stat.ino ?? 'NULL'}, fingerprint = ${
+        nullable(file.fingerprint)
+      },
+          pcm_md5 = ${nullable(file.pcmMd5)} WHERE id = ${esc(file.id)}`);
+    } else {
+      await q.run(`INSERT INTO file_identity
+          (id, first_seen_at, library_id, rel_path, present, last_seen_at, size, mtime_ms, dev, ino, fingerprint, pcm_md5)
+          VALUES (${esc(file.id)}, now(), ${values})`);
+    }
+  }
+  for (const event of events) {
+    await q.run(`INSERT INTO file_events
+        (occurred_at, kind, file_id, fingerprint, from_library_id, from_path, to_library_id, to_path, candidates)
+        VALUES (now(), ${esc(event.kind)}, ${esc(event.file.id)}, ${
+      nullable(event.file.fingerprint)
+    },
+          ${nullable(event.from?.library_id)}, ${
+      nullable(event.from?.rel_path)
+    },
+          ${esc(event.file.libraryId)}, ${esc(event.file.rel)},
+          [${(event.candidates ?? []).map(esc).join(', ')}]::VARCHAR[])`);
+  }
+
+  // Rebuild catalog tables as before, using the resolved song ids.
+  await q.run('DELETE FROM files');
+  await q.run('DELETE FROM albums');
+  await q.run('DELETE FROM artists');
+
+  const artistStmt = await q.prepare(
+    'INSERT INTO artists (id, name) VALUES (?, ?)',
+  );
+  try {
+    for (const artist of artists) {
+      artistStmt.bindVarchar(1, artist.id);
+      artistStmt.bindVarchar(2, artist.name);
+      await artistStmt.run();
+    }
+  } finally {
+    artistStmt.destroySync();
+  }
+
+  const albumStmt = await q.prepare(
+    'INSERT INTO albums (id, name, album_artist_id) VALUES (?, ?, ?)',
+  );
+  try {
+    for (const album of albums) {
+      albumStmt.bindVarchar(1, album.id);
+      albumStmt.bindVarchar(2, album.name);
+      albumStmt.bindVarchar(3, album.albumArtistId);
+      await albumStmt.run();
+    }
+  } finally {
+    albumStmt.destroySync();
+  }
+
+  const fileStmt = await q.prepare(
+    `INSERT INTO files (id, path, library_id, mtime, size, title, album_id,
+        artist_id, track, disc, duration_ms, genre, year, is_video)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  try {
+    for (const file of files) {
+      fileStmt.bindVarchar(1, file.id);
+      fileStmt.bindVarchar(2, file.path);
+      fileStmt.bindVarchar(3, file.libraryId);
+      if (file.stat.mtime_ms === null) fileStmt.bindNull(4);
+      else fileStmt.bindBigInt(4, BigInt(file.stat.mtime_ms));
+      if (file.stat.size === null) fileStmt.bindNull(5);
+      else fileStmt.bindBigInt(5, BigInt(file.stat.size));
+      fileStmt.bindVarchar(6, file.title);
+      if (file.albumId === null) fileStmt.bindNull(7);
+      else fileStmt.bindVarchar(7, file.albumId);
+      if (file.artistId === null) fileStmt.bindNull(8);
+      else fileStmt.bindVarchar(8, file.artistId);
+      if (file.track === null) fileStmt.bindNull(9);
+      else fileStmt.bindInteger(9, file.track);
+      if (file.disc === null) fileStmt.bindNull(10);
+      else fileStmt.bindInteger(10, file.disc);
+      if (file.durationMs === null) fileStmt.bindNull(11);
+      else fileStmt.bindInteger(11, file.durationMs);
+      if (file.genre === null) fileStmt.bindNull(12);
+      else fileStmt.bindVarchar(12, file.genre);
+      if (file.year === null) fileStmt.bindNull(13);
+      else fileStmt.bindInteger(13, file.year);
+      fileStmt.bindBoolean(14, file.isVideo);
+      await fileStmt.run();
+    }
+  } finally {
+    fileStmt.destroySync();
+  }
+}
+
+export function createCatalogStore(engine: Engine) {
+  return {
+    ...createCatalogReadStore(engine),
+    identitySnapshot(): Promise<CatalogIdentity[]> {
+      return engine.exclusive((q) =>
+        q.all<CatalogIdentity>(`
+    SELECT id, library_id, rel_path, size, mtime_ms, dev, ino, fingerprint, pcm_md5
+    FROM file_identity ORDER BY id`)
+      );
+    },
+    replaceCatalog(snapshot: CatalogSnapshot): Promise<void> {
+      return atomic(engine, (q) => replaceCatalog(q, snapshot));
+    },
+    libraryCount(): Promise<number> {
+      return engine.exclusive(async (q) =>
+        (await q.all<{ n: number }>(
+          'SELECT COUNT(*) AS n FROM libraries',
+        ))[0].n
+      );
+    },
+    duplicates(): Promise<DuplicateGroup[]> {
+      return engine.exclusive(async (q) => {
+        const rows = await q.all<{
+          id: string;
+          library_id: string;
+          rel_path: string;
+          fingerprint: string;
+        }>(`
+        SELECT id, library_id, rel_path, fingerprint FROM file_identity
+        WHERE present AND fingerprint IN (
+          SELECT fingerprint FROM file_identity
+          WHERE present AND fingerprint IS NOT NULL
+          GROUP BY fingerprint HAVING COUNT(*) > 1
+        ) ORDER BY fingerprint, rel_path, library_id, id`);
+        const groups: DuplicateGroup[] = [];
+        for (const row of rows) {
+          let group = groups[groups.length - 1];
+          if (group?.fingerprint !== row.fingerprint) {
+            group = { fingerprint: row.fingerprint, files: [] };
+            groups.push(group);
+          }
+          group.files.push({
+            id: row.id,
+            libraryId: row.library_id,
+            relPath: row.rel_path,
+          });
+        }
+        return groups;
+      });
+    },
+    events({ limit }: { limit: number }): Promise<FileEvent[]> {
+      if (!Number.isSafeInteger(limit) || limit < 0) {
+        return Promise.reject(new RangeError('invalid event limit'));
+      }
+      return engine.exclusive(async (q) => {
+        const rows = await q.all<{
+          seq: number;
+          at_ms: number;
+          kind: FileEvent['kind'];
+          file_id: string;
+          fingerprint: string | null;
+          from_library_id: string | null;
+          from_path: string | null;
+          to_library_id: string | null;
+          to_path: string | null;
+          candidates: string[] | null;
+        }>(`
+        SELECT seq, epoch_ms(occurred_at)::BIGINT AS at_ms, kind, file_id,
+               fingerprint, from_library_id, from_path, to_library_id, to_path,
+               candidates FROM file_events ORDER BY seq DESC LIMIT ${limit}`);
+        return rows.map((row) => ({
+          seq: Number(row.seq),
+          occurredAtMs: Number(row.at_ms),
+          kind: row.kind,
+          fileId: row.file_id,
+          fingerprint: row.fingerprint,
+          fromLibraryId: row.from_library_id,
+          fromPath: row.from_path,
+          toLibraryId: row.to_library_id,
+          toPath: row.to_path,
+          candidates: row.candidates ?? [],
+        }));
+      });
+    },
+    firstSeen(ids: string[]): Promise<Record<string, number>> {
+      return engine.exclusive(async (q) => {
+        if (ids.length === 0) return {};
+        const rows = await q.all<{ id: string; at_ms: number }>(`
+        SELECT id, epoch_ms(first_seen_at)::BIGINT AS at_ms FROM file_identity
+        WHERE id IN (${[...new Set(ids)].map(esc).join(', ')})`);
+        const out: Record<string, number> = {};
+        for (const row of rows) out[row.id] = Number(row.at_ms);
+        return out;
+      });
+    },
+    listLibraries(): Promise<LibraryRow[]> {
+      return engine.exclusive((q) =>
+        q.all<LibraryRow>(
+          'SELECT id, name, path FROM libraries ORDER BY name',
+        )
+      );
+    },
+    addLibrary(row: LibraryRow): Promise<LibraryRow> {
+      return atomic(engine, async (q) => {
+        const existing = await q.all<LibraryRow>(
+          `SELECT id, name, path FROM libraries WHERE path = ${esc(row.path)}`,
+        );
+        if (existing[0]) return existing[0];
+        const stmt = await q.prepare(
+          'INSERT INTO libraries (id, name, path) VALUES (?, ?, ?)',
+        );
+        try {
+          stmt.bindVarchar(1, row.id);
+          stmt.bindVarchar(2, row.name);
+          stmt.bindVarchar(3, row.path);
+          await stmt.run();
+        } finally {
+          stmt.destroySync();
+        }
+        return row;
+      });
+    },
+    removeLibrary(id: string): Promise<boolean> {
+      return atomic(engine, async (q) => {
+        const existing = await q.all(
+          `SELECT id FROM libraries WHERE id = ${esc(id)}`,
+        );
+        if (existing.length === 0) return false;
+        await q.run(`DELETE FROM libraries WHERE id = ${esc(id)}`);
+        await q.run(`DELETE FROM files WHERE library_id = ${esc(id)}`);
+        await q.run(
+          `DELETE FROM albums WHERE id NOT IN
+             (SELECT DISTINCT album_id FROM files WHERE album_id IS NOT NULL)`,
+        );
+        await q.run(
+          `DELETE FROM artists WHERE id NOT IN
+             (SELECT album_artist_id FROM albums
+               WHERE album_artist_id IS NOT NULL)
+           AND id NOT IN
+             (SELECT DISTINCT artist_id FROM files
+               WHERE artist_id IS NOT NULL)`,
+        );
+        return true;
+      });
+    },
+  };
+}

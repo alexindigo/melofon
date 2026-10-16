@@ -46,7 +46,7 @@ async function setup(large = false) {
       sql(await encryptPassword(cfg.secret, 'test'))
     }, now())`,
   );
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   const sources = [];
   for (const name of ['A', 'B']) {
     const path = `${dir}/${name}`;
@@ -112,7 +112,7 @@ async function setup(large = false) {
       `INSERT INTO listens SELECT u.id, f.id, now(), 1000, 'fixture' FROM users u CROSS JOIN files f WHERE f.genre='Bulk'`,
     );
   }
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const bag = {
     cfg,
     libraries,

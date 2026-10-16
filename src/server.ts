@@ -45,16 +45,15 @@ const cfg = loadConfig();
 const store = await openStore(cfg.dataDir, {
   debugLogQueries: cfg.debugLogRequests,
 });
-const db = store.legacy;
 const persistence = createPersistence(store);
 await seedFirstUser(store, cfg);
-const libraries = createLibraries(db);
+const libraries = createLibraries(store);
 const media = createMedia();
 const notify = createNotify();
 const state = createState(store);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
-const scan = createScan(db, media, { notify });
+const scan = createScan(store, media, { notify });
 const counts = await scan.run();
 log.event('scan_complete', counts);
 const env = Deno.env.toObject();
@@ -89,7 +88,7 @@ const discovery = createAirplayDiscovery({
   devices: airplay,
   savedOutput: (id) => persistence.savedOutput(id),
 });
-const library = createLibrary(db);
+const library = createLibrary(store);
 const player = createPlayer();
 const nowPlaying = createNowPlaying(store);
 const playback = createPlayback({
@@ -109,7 +108,7 @@ const app = {
   state,
   airplay,
   outputAdmission,
-  identity: createIdentity(db),
+  identity: createIdentity(store),
   log: scopedLog('core'),
 };
 const core = await pathfinder({ roots: ['core/'], app });

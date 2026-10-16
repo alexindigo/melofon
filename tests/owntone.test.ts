@@ -33,14 +33,14 @@ async function setup(env: Record<string, string> = {}) {
     secret: 's3cret',
     version: '0.0.0-test',
   };
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   await libraries.add('Music', 'tests/fixtures/library');
-  await scanLibrary(db);
+  await scanLibrary(store);
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const devices = createTestAirplayDevices(outputs);
   const player = createPlayer();
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const bag = {
     cfg,
     libraries,

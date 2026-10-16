@@ -53,7 +53,7 @@ async function setup() {
   const playback = createPlayback({
     player,
     nowPlaying: createNowPlaying(store),
-    library: createLibrary(db),
+    library: createLibrary(store),
     cfg: {},
     persistence,
   });

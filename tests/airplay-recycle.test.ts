@@ -199,7 +199,7 @@ async function feedSetup() {
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const playback = createPlayback({
     player,
     nowPlaying: createNowPlaying(store),
@@ -559,7 +559,7 @@ async function integrationSetup(opts: {
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const playback = createPlayback({
     player,
     nowPlaying: createNowPlaying(store),

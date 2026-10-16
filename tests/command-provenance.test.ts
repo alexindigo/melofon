@@ -70,7 +70,7 @@ async function setup() {
     log,
     player,
     nowPlaying: createNowPlaying(store),
-    library: createLibrary(db),
+    library: createLibrary(store),
     cfg: {},
   });
   return {
@@ -213,11 +213,11 @@ async function setupWire() {
     secret: undefined,
     version: '0.0.0-test',
   };
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   const notify = createNotify();
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const { log, lines: logs } = captureLogs();
   const playback = createPlayback({
     player,

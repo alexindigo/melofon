@@ -30,16 +30,16 @@ async function setup() {
     version: '0.0.0-test',
   };
   await seedFirstUser(store, cfg);
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   await libraries.add('Music', 'tests/fixtures/library');
-  const scan = createScan(db);
+  const scan = createScan(store);
   await scan.run();
   const bag = {
     cfg,
     libraries,
     scan,
     user: createUserService(store, cfg),
-    library: createLibrary(db),
+    library: createLibrary(store),
     annotation: createAnnotation(store),
     listens: createListens(store),
   };

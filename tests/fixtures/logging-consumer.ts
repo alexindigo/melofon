@@ -153,7 +153,7 @@ if (mode === 'streams') {
   const playback = createPlayback({
     player: createPlayer(),
     nowPlaying: createNowPlaying(store),
-    library: createLibrary(db),
+    library: createLibrary(store),
     cfg: {},
   });
   const app = await pathfinder({

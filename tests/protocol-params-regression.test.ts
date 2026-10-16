@@ -199,7 +199,7 @@ async function setup() {
     listen: undefined,
   };
   await seedFirstUser(store, cfg);
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   await Deno.mkdir(`${dir}/music`);
   const source = await libraries.add('Music', `${dir}/music`);
   for (let n = 1; n <= 3; n++) {
@@ -228,7 +228,7 @@ async function setup() {
       },${n === 6},1000,600000)`,
     );
   }
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const annotation = createAnnotation(store);
   const playlists = createPlaylists(store);
   const playlist = await playlists.create(cfg.user, 'Mix', songIds);

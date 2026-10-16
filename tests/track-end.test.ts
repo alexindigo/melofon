@@ -45,7 +45,7 @@ async function setup() {
   const notify = createNotify();
   notify.subscribe((types) => events.push(types));
   const player = createPlayer();
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const playback = createPlayback({
     player,
     nowPlaying: createNowPlaying(store),

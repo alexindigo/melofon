@@ -41,15 +41,15 @@ async function setup() {
     version: '0.0.0-test',
   };
   await seedFirstUser(store, cfg);
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   await libraries.add('Music', 'tests/fixtures/library');
-  await scanLibrary(db);
+  await scanLibrary(store);
   const events: string[][] = [];
   const notify = createNotify();
   notify.subscribe((types) => events.push(types));
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
   const bag = {
     cfg,

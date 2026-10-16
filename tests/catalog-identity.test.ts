@@ -53,7 +53,7 @@ async function setup() {
   await Deno.mkdir(root);
   const store = await openStore(`${dir}/db`);
   const db = store.legacy;
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   const source = await libraries.add('Music', root);
   const media = createMedia() as ReturnType<typeof createMedia> & {
     fingerprint?: (
@@ -71,7 +71,7 @@ async function setup() {
     },
   };
   await Deno.copyFile(MP3, `${root}/a.mp3`);
-  const identity: Identity = mod.createIdentity(db);
+  const identity: Identity = mod.createIdentity(store);
   return {
     dir,
     root,
@@ -82,7 +82,7 @@ async function setup() {
     identity,
     media: wrapped,
     calls: () => calls,
-    scan: () => scanLibrary(db, wrapped),
+    scan: () => scanLibrary(store, wrapped),
     async close() {
       db.close();
       await Deno.remove(dir, { recursive: true });
@@ -173,7 +173,7 @@ Deno.test('identity: within-library move and rename preserve user-state joins an
     await t.scan();
     assertEquals(t.calls(), 1);
     assertEquals(
-      (await createLibrary(t.db).getSong(id))?.path,
+      (await createLibrary(t.store).getSong(id))?.path,
       `${t.root}/sub/renamed.mp3`,
     );
     assertEquals((await annotation.facts('admin', [id]))[id].starred, true);
@@ -382,7 +382,7 @@ Deno.test('identity: concurrent run and start share one scan and its completion'
       },
     };
     let completions = 0;
-    const scan = createScan(t.db, media, {
+    const scan = createScan(t.store, media, {
       notify: {
         emit() {
           completions++;
@@ -425,11 +425,11 @@ Deno.test('identity: failed fingerprints warn but still catalog and null never l
         events.push(id);
       },
     };
-    await scanLibrary(t.db, media, log);
+    await scanLibrary(t.store, media, log);
     const [{ id }] = await catalog(t.db);
     assertEquals(events, ['scan_fingerprint_failed']);
     await Deno.rename(`${t.root}/a.mp3`, `${t.root}/moved.mp3`);
-    await scanLibrary(t.db, media, log);
+    await scanLibrary(t.store, media, log);
     assertNotEquals((await catalog(t.db))[0].id, id);
     assertEquals(await t.identity.events({ limit: 10 }), []);
     assertEquals(await t.identity.duplicates(), []);

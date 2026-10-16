@@ -35,10 +35,10 @@ async function setup() {
     version: '0.0.0-test',
   };
   await seedFirstUser(store, cfg);
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   await libraries.add('Music', 'tests/fixtures/library');
-  await scanLibrary(db);
-  const library = createLibrary(db);
+  await scanLibrary(store);
+  const library = createLibrary(store);
   const notify = createNotify();
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
@@ -198,7 +198,7 @@ Deno.test('playback.reportPlaying emits player; a failed report emits nothing', 
     const playback = createPlayback({
       player: createPlayer(),
       nowPlaying: createNowPlaying(store),
-      library: createLibrary(db),
+      library: createLibrary(store),
       cfg,
       notify,
     });

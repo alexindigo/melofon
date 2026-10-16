@@ -5,13 +5,9 @@
 // (M5) is a form, not a second store. This table is the only source list —
 // no env var names one.
 import { encodeHex } from '@std/encoding/hex';
-import type { Db } from './db.ts';
-
-export interface LibraryRow {
-  id: string;
-  name: string;
-  path: string;
-}
+import type { Store } from './store/index.ts';
+import type { LibraryRow } from './store/catalog.ts';
+export type { LibraryRow } from './store/catalog.ts';
 
 export interface Libraries {
   /** All configured sources, by name. */
@@ -35,69 +31,20 @@ async function stableId(key: string): Promise<string> {
   return encodeHex(new Uint8Array(digest)).slice(0, 32);
 }
 
-function esc(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-export function createLibraries(db: Db): Libraries {
+export function createLibraries(store: Store): Libraries {
   return {
-    async list(): Promise<LibraryRow[]> {
-      const res = await db.conn.runAndReadAll(
-        'SELECT id, name, path FROM libraries ORDER BY name',
-      );
-      return res.getRowObjects() as unknown as LibraryRow[];
-    },
+    list: store.catalog.listLibraries,
 
     async add(name, path) {
       const normalized = path.replace(/\/+$/, '');
-      const existing = await db.conn.runAndReadAll(
-        `SELECT id, name, path FROM libraries WHERE path = ${esc(normalized)}`,
-      );
-      const found = (existing.getRowObjects() as unknown as LibraryRow[])[0];
-      if (found) return found;
       const row: LibraryRow = {
         id: await stableId(normalized),
         name,
         path: normalized,
       };
-      const stmt = await db.conn.prepare(
-        'INSERT INTO libraries (id, name, path) VALUES (?, ?, ?)',
-      );
-      stmt.bindVarchar(1, row.id);
-      stmt.bindVarchar(2, row.name);
-      stmt.bindVarchar(3, row.path);
-      await stmt.run();
-      stmt.destroySync();
-      return row;
+      return await store.catalog.addLibrary(row);
     },
 
-    async remove(id) {
-      const existing = await db.conn.runAndReadAll(
-        `SELECT id FROM libraries WHERE id = ${esc(id)}`,
-      );
-      if (existing.getRowObjects().length === 0) return false;
-      await db.conn.run('BEGIN TRANSACTION');
-      try {
-        await db.conn.run(`DELETE FROM libraries WHERE id = ${esc(id)}`);
-        await db.conn.run(`DELETE FROM files WHERE library_id = ${esc(id)}`);
-        await db.conn.run(
-          `DELETE FROM albums WHERE id NOT IN
-             (SELECT DISTINCT album_id FROM files WHERE album_id IS NOT NULL)`,
-        );
-        await db.conn.run(
-          `DELETE FROM artists WHERE id NOT IN
-             (SELECT album_artist_id FROM albums
-               WHERE album_artist_id IS NOT NULL)
-           AND id NOT IN
-             (SELECT DISTINCT artist_id FROM files
-               WHERE artist_id IS NOT NULL)`,
-        );
-        await db.conn.run('COMMIT');
-      } catch (err) {
-        await db.conn.run('ROLLBACK');
-        throw err;
-      }
-      return true;
-    },
+    remove: store.catalog.removeLibrary,
   };
 }

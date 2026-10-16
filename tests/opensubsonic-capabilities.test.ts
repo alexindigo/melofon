@@ -207,10 +207,10 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
       secret: 'H1-test-secret',
     };
     await seedFirstUser(store, cfg);
-    const libraries = createLibraries(db);
+    const libraries = createLibraries(store);
     await libraries.add('Fixture', 'tests/fixtures/library');
-    await scanLibrary(db);
-    const library = createLibrary(db);
+    await scanLibrary(store);
+    const library = createLibrary(store);
     const annotation = createAnnotation(store);
     const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
     const app = facade(

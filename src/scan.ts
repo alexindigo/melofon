@@ -4,7 +4,13 @@
 import { parseFile } from 'music-metadata';
 import { encodeHex } from '@std/encoding/hex';
 import { type AudioFingerprint, createMedia, type Media } from './media.ts';
-import type { Db } from './db.ts';
+import type { Store } from './store/index.ts';
+import type {
+  CatalogEvent as EventIn,
+  CatalogFile as FileIn,
+  CatalogFileStat as FileStat,
+  CatalogIdentity as IdentityRow,
+} from './store/catalog.ts';
 import type { Notify } from './notify.ts';
 import { type Log, scopedLog } from './logging.ts';
 
@@ -42,41 +48,6 @@ interface AlbumIn {
   name: string;
   albumArtistId: string;
 }
-interface FileStat {
-  size: bigint | null;
-  mtime_ms: bigint | null;
-  dev: bigint | null;
-  ino: bigint | null;
-}
-interface IdentityRow extends FileStat {
-  id: string;
-  library_id: string;
-  rel_path: string;
-  fingerprint: string | null;
-  pcm_md5: string | null;
-}
-interface FileIn extends AudioFingerprint {
-  id: string;
-  path: string;
-  rel: string;
-  libraryId: string;
-  stat: FileStat;
-  title: string;
-  albumId: string | null;
-  artistId: string | null;
-  track: number | null;
-  disc: number | null;
-  durationMs: number | null;
-  genre: string | null;
-  year: number | null;
-  isVideo: boolean;
-}
-interface EventIn {
-  kind: 'linked' | 'ambiguous' | 'audio_changed';
-  file: FileIn;
-  from?: IdentityRow;
-  candidates?: string[];
-}
 
 async function stableId(kind: string, key: string): Promise<string> {
   const digest = await crypto.subtle.digest(
@@ -93,10 +64,6 @@ function pathKey(libraryId: string, rel: string): string {
 function statKey(stat: FileStat): string | null {
   const fields = [stat.dev, stat.ino, stat.size, stat.mtime_ms];
   return fields.some((n) => n === null) ? null : fields.join('/');
-}
-
-function esc(value: string | null | undefined): string {
-  return value == null ? 'NULL' : `'${value.replaceAll("'", "''")}'`;
 }
 
 function extOf(name: string): string {
@@ -125,20 +92,15 @@ async function* walkMedia(
 }
 
 export async function scanLibrary(
-  db: Db,
+  store: Store,
   media?: Media,
   log: Log = scopedLog('scan'),
 ): Promise<ScanCounts> {
   let media_: Media | undefined = media;
   const fallbackMedia = () => (media_ ??= createMedia());
-  const sources = await db.conn.runAndReadAll(
-    'SELECT id, name, path FROM libraries ORDER BY name',
-  );
+  const sources = await store.catalog.listLibraries();
   // Read-only preparation: previous rows remain unchanged until the transaction.
-  const retained = (await db.conn.runAndReadAll(`
-    SELECT id, library_id, rel_path, size, mtime_ms, dev, ino, fingerprint, pcm_md5
-    FROM file_identity ORDER BY id`))
-    .getRowObjects() as unknown as IdentityRow[];
+  const retained = await store.catalog.identitySnapshot();
   const byId = new Map(retained.map((row) => [row.id, row]));
   const byPath = new Map<string, IdentityRow>();
   const byStat = new Map<string, IdentityRow>();
@@ -160,24 +122,16 @@ export async function scanLibrary(
   const files: FileIn[] = [];
   let skipped = 0;
 
-  for (
-    const source of sources.getRowObjects() as {
-      id: string;
-      name: string;
-      path: string;
-    }[]
-  ) {
+  for (const source of sources) {
     const root = source.path.replace(/\/+$/, '');
     try {
       for await (const { abs, rel } of walkMedia(root)) {
         const info = await Deno.stat(abs).catch(() => null);
-        const asBigInt = (n: number | null | undefined) =>
-          n == null ? null : BigInt(n);
         const stat: FileStat = {
-          size: asBigInt(info?.size),
-          mtime_ms: asBigInt(info?.mtime?.getTime()),
-          dev: asBigInt(info?.dev),
-          ino: asBigInt(info?.ino),
+          size: info?.size ?? null,
+          mtime_ms: info?.mtime?.getTime() ?? null,
+          dev: info?.dev ?? null,
+          ino: info?.ino ?? null,
         };
         const cacheKey = statKey(stat);
         const previous = byPath.get(pathKey(source.id, rel));
@@ -354,109 +308,13 @@ export async function scanLibrary(
     seen.add(file.id);
   }
 
-  await db.conn.run('BEGIN TRANSACTION');
-  try {
-    await db.conn.run('UPDATE file_identity SET present = false');
-    for (const file of files) {
-      const values = `${esc(file.libraryId)}, ${esc(file.rel)}, true, now(), ${
-        file.stat.size ?? 'NULL'
-      }, ${file.stat.mtime_ms ?? 'NULL'}, ${file.stat.dev ?? 'NULL'}, ${
-        file.stat.ino ?? 'NULL'
-      }, ${esc(file.fingerprint)}, ${esc(file.pcmMd5)}`;
-      if (byId.has(file.id)) {
-        await db.conn.run(`UPDATE file_identity SET
-          library_id = ${esc(file.libraryId)}, rel_path = ${esc(file.rel)},
-          present = true, last_seen_at = now(), size = ${
-          file.stat.size ?? 'NULL'
-        },
-          mtime_ms = ${file.stat.mtime_ms ?? 'NULL'}, dev = ${
-          file.stat.dev ?? 'NULL'
-        },
-          ino = ${file.stat.ino ?? 'NULL'}, fingerprint = ${
-          esc(file.fingerprint)
-        },
-          pcm_md5 = ${esc(file.pcmMd5)} WHERE id = ${esc(file.id)}`);
-      } else {
-        await db.conn.run(`INSERT INTO file_identity
-          (id, first_seen_at, library_id, rel_path, present, last_seen_at, size, mtime_ms, dev, ino, fingerprint, pcm_md5)
-          VALUES (${esc(file.id)}, now(), ${values})`);
-      }
-    }
-    for (const event of events) {
-      await db.conn.run(`INSERT INTO file_events
-        (occurred_at, kind, file_id, fingerprint, from_library_id, from_path, to_library_id, to_path, candidates)
-        VALUES (now(), ${esc(event.kind)}, ${esc(event.file.id)}, ${
-        esc(event.file.fingerprint)
-      },
-          ${esc(event.from?.library_id)}, ${esc(event.from?.rel_path)},
-          ${esc(event.file.libraryId)}, ${esc(event.file.rel)},
-          [${(event.candidates ?? []).map(esc).join(', ')}]::VARCHAR[])`);
-    }
-
-    // Rebuild catalog tables as before, using the resolved song ids.
-    await db.conn.run('DELETE FROM files');
-    await db.conn.run('DELETE FROM albums');
-    await db.conn.run('DELETE FROM artists');
-
-    const artistStmt = await db.conn.prepare(
-      'INSERT INTO artists (id, name) VALUES (?, ?)',
-    );
-    for (const artist of artists.values()) {
-      artistStmt.bindVarchar(1, artist.id);
-      artistStmt.bindVarchar(2, artist.name);
-      await artistStmt.run();
-    }
-    artistStmt.destroySync();
-
-    const albumStmt = await db.conn.prepare(
-      'INSERT INTO albums (id, name, album_artist_id) VALUES (?, ?, ?)',
-    );
-    for (const album of albums.values()) {
-      albumStmt.bindVarchar(1, album.id);
-      albumStmt.bindVarchar(2, album.name);
-      albumStmt.bindVarchar(3, album.albumArtistId);
-      await albumStmt.run();
-    }
-    albumStmt.destroySync();
-
-    const fileStmt = await db.conn.prepare(
-      `INSERT INTO files (id, path, library_id, mtime, size, title, album_id,
-        artist_id, track, disc, duration_ms, genre, year, is_video)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (const file of files) {
-      fileStmt.bindVarchar(1, file.id);
-      fileStmt.bindVarchar(2, file.path);
-      fileStmt.bindVarchar(3, file.libraryId);
-      if (file.stat.mtime_ms === null) fileStmt.bindNull(4);
-      else fileStmt.bindBigInt(4, file.stat.mtime_ms);
-      if (file.stat.size === null) fileStmt.bindNull(5);
-      else fileStmt.bindBigInt(5, file.stat.size);
-      fileStmt.bindVarchar(6, file.title);
-      if (file.albumId === null) fileStmt.bindNull(7);
-      else fileStmt.bindVarchar(7, file.albumId);
-      if (file.artistId === null) fileStmt.bindNull(8);
-      else fileStmt.bindVarchar(8, file.artistId);
-      if (file.track === null) fileStmt.bindNull(9);
-      else fileStmt.bindInteger(9, file.track);
-      if (file.disc === null) fileStmt.bindNull(10);
-      else fileStmt.bindInteger(10, file.disc);
-      if (file.durationMs === null) fileStmt.bindNull(11);
-      else fileStmt.bindInteger(11, file.durationMs);
-      if (file.genre === null) fileStmt.bindNull(12);
-      else fileStmt.bindVarchar(12, file.genre);
-      if (file.year === null) fileStmt.bindNull(13);
-      else fileStmt.bindInteger(13, file.year);
-      fileStmt.bindBoolean(14, file.isVideo);
-      await fileStmt.run();
-    }
-    fileStmt.destroySync();
-
-    await db.conn.run('COMMIT');
-  } catch (err) {
-    await db.conn.run('ROLLBACK');
-    throw err;
-  }
+  await store.catalog.replaceCatalog({
+    artists: [...artists.values()],
+    albums: [...albums.values()],
+    files,
+    events,
+    retainedIds: [...byId.keys()],
+  });
   return {
     files: files.length,
     skipped,
@@ -485,7 +343,7 @@ export interface ScanService {
 }
 
 export function createScan(
-  db: Db,
+  store: Store,
   media?: Media,
   opts?: { notify?: Notify; log?: Log },
 ): ScanService {
@@ -498,7 +356,7 @@ export function createScan(
     if (pending !== null) return pending;
     lastScanStartedMs = Date.now();
     pending = (async () => {
-      const counts = await scanLibrary(db, media, log);
+      const counts = await scanLibrary(store, media, log);
       count = counts.files;
       lastScanMs = Date.now();
       // Core emits after successful completion; hats just consume the event.
@@ -512,10 +370,7 @@ export function createScan(
   return {
     run,
     async status() {
-      const res = await db.conn.runAndReadAll(
-        'SELECT COUNT(*) AS n FROM libraries',
-      );
-      const folderCount = Number((res.getRowObjects() as { n: bigint }[])[0].n);
+      const folderCount = await store.catalog.libraryCount();
       return {
         scanning: pending !== null,
         count,

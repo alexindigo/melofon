@@ -54,16 +54,16 @@ async function setup(split = false) {
       sql(await encryptPassword(cfg.secret, 'test'))
     }, now())`,
   );
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   if (split) {
     await libraries.add('A', `${FIXTURE}/Fixture Artist`);
     await libraries.add('B', `${FIXTURE}/Various Artists`);
   } else {
     await libraries.add('Music', FIXTURE);
   }
-  const scan = createScan(db);
+  const scan = createScan(store);
   await scan.run();
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
   const bag = {

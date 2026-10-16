@@ -37,9 +37,9 @@ async function setup(fixture = true) {
     version: 'test',
   };
   await seedFirstUser(store, cfg);
-  const libraries = createLibraries(db);
-  const scan = createScan(db);
-  const library = createLibrary(db);
+  const libraries = createLibraries(store);
+  const scan = createScan(store);
+  const library = createLibrary(store);
   if (fixture) {
     await libraries.add('Music', 'tests/fixtures/library');
     await scan.run();

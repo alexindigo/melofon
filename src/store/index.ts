@@ -9,6 +9,7 @@ import { createListensStore } from './listens.ts';
 import { createAnnotationsStore } from './annotations.ts';
 import { createPlaylistsStore } from './playlists.ts';
 import { createPlaybackStore } from './playback.ts';
+import { createCatalogStore } from './catalog.ts';
 
 export interface Store {
   users: ReturnType<typeof createUsersStore>;
@@ -20,6 +21,7 @@ export interface Store {
   annotations: ReturnType<typeof createAnnotationsStore>;
   playlists: ReturnType<typeof createPlaylistsStore>;
   playback: ReturnType<typeof createPlaybackStore>;
+  catalog: ReturnType<typeof createCatalogStore>;
   ping(): Promise<void>;
   close(): Promise<void>;
   /** Transitional raw access for domains not yet moved (removed in S5). */
@@ -41,6 +43,7 @@ export async function openStore(
     annotations: createAnnotationsStore(engine),
     playlists: createPlaylistsStore(engine),
     playback: createPlaybackStore(engine),
+    catalog: createCatalogStore(engine),
     ping: engine.ping,
     close: engine.close,
     legacy: engine.legacy,

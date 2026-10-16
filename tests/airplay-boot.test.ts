@@ -128,7 +128,7 @@ async function setup(
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const playback = createPlayback({
     player,
     nowPlaying: createNowPlaying(store),
@@ -779,7 +779,7 @@ async function recycleSetup(
   const notify = createNotify();
   const outputs = createOutputs({ notify, log: overrides.log });
   const player = createPlayer();
-  const library = createLibrary(db);
+  const library = createLibrary(store);
   const playback = createPlayback({
     log: overrides.log,
     player,

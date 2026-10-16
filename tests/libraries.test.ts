@@ -34,7 +34,7 @@ async function setup() {
     version: '0.0.0-test',
   };
   await seedFirstUser(store, cfg);
-  const libraries = createLibraries(db);
+  const libraries = createLibraries(store);
   const core = await pathfinder({
     roots: ['core/'],
     app: { store, cfg, libraries },
@@ -87,11 +87,11 @@ Deno.test('app.libraries add is idempotent by path and lists by name', async () 
 });
 
 Deno.test('app.libraries remove drops the source and its catalog rows', async () => {
-  const { db, libraries, close } = await setup();
+  const { db, store, libraries, close } = await setup();
   try {
     const a = await libraries.add('A root', ROOT_A);
     await libraries.add('B root', ROOT_B);
-    await scanLibrary(db);
+    await scanLibrary(store);
     const count = async (sql: string) => {
       const res = await db.conn.runAndReadAll(sql);
       return Number((res.getRowObjects() as { n: bigint }[])[0].n);
@@ -164,16 +164,16 @@ Deno.test('core /_/libraries CRUD validates input and round-trips rows', async (
 });
 
 Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolderId filters', async () => {
-  const { db, store, cfg, core, libraries, close } = await setup();
+  const { store, cfg, core, libraries, close } = await setup();
   try {
     const a = await addViaApi(core, 'A root', ROOT_A);
     await addViaApi(core, 'B root', ROOT_B);
-    await scanLibrary(db);
+    await scanLibrary(store);
     const bag = {
       cfg,
       libraries,
       user: createUserService(store, cfg),
-      library: createLibrary(db),
+      library: createLibrary(store),
       annotation: createAnnotation(store),
       listens: createListens(store),
     };
