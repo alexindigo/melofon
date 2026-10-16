@@ -1,14 +1,11 @@
-import { atomic, type Db, type Engine, esc, type Queries } from './engine.ts';
+import { atomic, type Engine, esc, type Queries } from './engine.ts';
 
-// The legacy branch keeps unmigrated domains on the same lookup until S2/S4.
 export async function userIdForName(
-  q: Queries | Db,
+  q: Queries,
   username: string,
 ): Promise<string | null> {
   const sql = `SELECT id FROM users WHERE name = ${esc(username)}`;
-  const rows = 'conn' in q
-    ? (await q.conn.runAndReadAll(sql)).getRowObjects() as { id: string }[]
-    : await q.all<{ id: string }>(sql);
+  const rows = await q.all<{ id: string }>(sql);
   return rows[0]?.id ?? null;
 }
 

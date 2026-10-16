@@ -18,7 +18,7 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-os-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -44,7 +44,7 @@ async function setup() {
     dir,
     app,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -164,10 +164,7 @@ Deno.test('enc: hex password authenticates', async () => {
 Deno.test('md5 token+salt authenticates; a bad token fails', async () => {
   const { app, db, close } = await setup();
   try {
-    const res = await db.conn.runAndReadAll(
-      `SELECT md5('test' || 'c19b2d') AS h`,
-    );
-    const token = (res.getRowObjects() as { h: string }[])[0].h;
+    const token = await db.users.passwordToken('test' + 'c19b2d');
     const ok = await app(
       new Request(
         `http://x/rest/ping?u=admin&t=${token}&s=c19b2d&v=1.16.1&c=t&f=json`,

@@ -2,6 +2,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -27,7 +28,7 @@ function items(container: unknown, key: string): Item[] {
 async function setup(fixture = true) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-h4-' });
   const store = await openStore(`${dir}/db`);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -86,7 +87,7 @@ async function setup(fixture = true) {
     get,
     request,
     async close() {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -471,9 +472,9 @@ Deno.test('H4 created and newest use first-seen across later imports and retags'
     const got = (await s.get('getAlbum', { id: first.id })).album as Item;
     const child = items(got, 'song')[0];
     assertEquals(child.created, first.created);
-    const identity = (await s.db.conn.runAndReadAll(
+    const identity = (await rawSql(s.db).all(
       `SELECT epoch_ms(first_seen_at) AS ms FROM file_identity WHERE id = '${child.id}'`,
-    )).getRowObjects()[0];
+    ))[0];
     assertEquals(child.created, new Date(Number(identity.ms)).toISOString());
     await tagged(`${a}/a.mp3`, {
       TIT2: 'A retagged',

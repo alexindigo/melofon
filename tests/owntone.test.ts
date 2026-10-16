@@ -24,7 +24,7 @@ const DEFAULT_PORT = 4534;
 async function setup(env: Record<string, string> = {}) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ot-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -87,7 +87,7 @@ async function setup(env: Record<string, string> = {}) {
     outputs,
     close: async () => {
       devices.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

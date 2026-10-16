@@ -33,7 +33,7 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-video-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -64,7 +64,7 @@ async function setup() {
     app,
     library,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

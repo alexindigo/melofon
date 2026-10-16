@@ -5,7 +5,8 @@
 // (username, minutesAgo, playerId, playerName).
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openStore } from '../src/store/index.ts';
+import { openStore, type Store } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -25,7 +26,7 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-np-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -56,15 +57,15 @@ async function setup() {
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
-  const songIds = (await db.conn.runAndReadAll(
+  const songIds = (await rawSql(db).all(
     'SELECT id, title FROM files ORDER BY album_id, track',
-  )).getRowObjects() as { id: string; title: string }[];
+  )) as { id: string; title: string }[];
   return {
     db,
     app,
     songIds,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -86,13 +87,11 @@ async function get(
   return (body as Record<string, Envelope>)['subsonic-response'];
 }
 
-async function listensCount(db: {
-  conn: { runAndReadAll(sql: string): Promise<unknown> };
-}): Promise<number> {
-  const rows = (await db.conn.runAndReadAll(
+async function listensCount(db: Store): Promise<number> {
+  const rows = (await rawSql(db).all(
     'SELECT count(*) AS n FROM listens',
-  )) as { getRowObjects(): { n: bigint }[] };
-  return Number(rows.getRowObjects()[0].n);
+  )) as { n: bigint }[];
+  return Number(rows[0].n);
 }
 
 Deno.test('scrobble submission=false lists the song in getNowPlaying', async () => {
@@ -181,7 +180,7 @@ Deno.test('getNowPlaying renders entries as XML', async () => {
 Deno.test('playback.reportPlaying emits player; a failed report emits nothing', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-np-emit-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     const cfg = {
       listen: undefined,
@@ -220,7 +219,7 @@ Deno.test('playback.reportPlaying emits player; a failed report emits nothing', 
     }).catch(() => {});
     assertEquals(events, [['player']]);
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 });

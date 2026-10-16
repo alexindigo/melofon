@@ -63,7 +63,7 @@ function song(durationMs: number | null = 180_000): SongRow {
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-prov-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const player = createPlayer();
   const { log, lines: logs } = captureLogs();
   const playback = createPlayback({
@@ -78,7 +78,7 @@ async function setup() {
     logs,
     close: async () => {
       playback.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -204,7 +204,7 @@ Deno.test('restore is recorded with via restore and keeps engine purity', async 
 async function setupWire() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-prov-wire-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -261,7 +261,7 @@ async function setupWire() {
     logs,
     close: async () => {
       playback.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

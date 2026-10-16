@@ -7,6 +7,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -24,7 +25,7 @@ const ROOT_B = 'tests/fixtures/library/Various Artists';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-libs-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -47,7 +48,7 @@ async function setup() {
     libraries,
     core,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -93,18 +94,16 @@ Deno.test('app.libraries remove drops the source and its catalog rows', async ()
     await libraries.add('B root', ROOT_B);
     await scanLibrary(store);
     const count = async (sql: string) => {
-      const res = await db.conn.runAndReadAll(sql);
-      return Number((res.getRowObjects() as { n: bigint }[])[0].n);
+      const res = await rawSql(db).all(sql);
+      return Number((res as { n: bigint }[])[0].n);
     };
     assertEquals(await count('SELECT COUNT(*) AS n FROM files'), 4);
     assertEquals(await libraries.remove(a.id), true);
     assertEquals(await count('SELECT COUNT(*) AS n FROM files'), 1);
     // Orphan albums/artists of the removed source are gone; B's remain.
     assertEquals(await count('SELECT COUNT(*) AS n FROM albums'), 1);
-    const artists = await db.conn.runAndReadAll('SELECT name FROM artists');
-    const names = artists.getRowObjects().map((r) =>
-      (r as { name: string }).name
-    );
+    const artists = await rawSql(db).all('SELECT name FROM artists');
+    const names = artists.map((r) => (r as { name: string }).name);
     assert(!names.includes('Fixture Artist'));
     assertEquals(await libraries.remove(a.id), false);
   } finally {

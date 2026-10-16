@@ -10,13 +10,13 @@ import { captureLogs } from './helpers/logging.ts';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-state-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   return {
     dir,
     db,
     store,
     close: async (keep = false) => {
-      db.close();
+      await db.close();
       if (!keep) await Deno.remove(dir, { recursive: true });
     },
   };
@@ -62,12 +62,12 @@ Deno.test('state: persists across reopen; seedIfUnset never stomps', async () =>
     assertEquals(await state.get('airplay.mdns'), 'on');
 
     // Reopen the same database file: values persist.
-    db.close();
+    await db.close();
     const store2 = await openStore(dir);
-    const db2 = store2.legacy;
+    const db2 = store2;
     const state2 = createState(store2);
     assertEquals(await state2.get('airplay.mdns'), 'on');
-    db2.close();
+    await db2.close();
   } finally {
     await close(true);
     await Deno.remove(dir, { recursive: true });

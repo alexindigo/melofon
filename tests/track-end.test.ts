@@ -40,7 +40,7 @@ function song(durationMs: number | null = 1): SongRow {
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-te-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const events: string[][] = [];
   const notify = createNotify();
   notify.subscribe((types) => events.push(types));
@@ -58,7 +58,7 @@ async function setup() {
     playback,
     events,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

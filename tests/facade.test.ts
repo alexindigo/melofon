@@ -16,12 +16,12 @@ import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 async function makeApps() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-facade-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const app = { store, cfg: {} };
   const core = await pathfinder({ roots: ['core/'], app });
   const layers = await loadLayers({ app, layersRoot: 'tests/fixtures/layers' });
   const close = async () => {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   };
   return { core, layers, close };

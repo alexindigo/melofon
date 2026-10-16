@@ -5,6 +5,7 @@
 import { assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -30,7 +31,7 @@ interface PlaylistPayload {
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-pl-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -54,15 +55,15 @@ async function setup() {
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
-  const songs = await db.conn.runAndReadAll(
+  const songs = await rawSql(db).all(
     "SELECT id FROM files WHERE title != '' ORDER BY path",
   );
-  const songIds = (songs.getRowObjects() as { id: string }[]).map((r) => r.id);
+  const songIds = (songs as { id: string }[]).map((r) => r.id);
   return {
     app,
     songIds,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

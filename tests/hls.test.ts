@@ -6,6 +6,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -20,7 +21,7 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-hls-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -42,17 +43,17 @@ async function setup() {
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
-  const clips = await db.conn.runAndReadAll(
+  const clips = await rawSql(db).all(
     "SELECT id FROM files WHERE title = 'Clip'",
   );
-  const videoId = (clips.getRowObjects() as { id: string }[])[0].id;
+  const videoId = (clips as { id: string }[])[0].id;
   return {
     db,
     dir,
     app,
     videoId,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

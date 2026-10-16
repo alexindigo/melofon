@@ -5,6 +5,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -26,7 +27,7 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-media-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -55,16 +56,16 @@ async function setup() {
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
-  const songIds = (await db.conn.runAndReadAll(
+  const songIds = (await rawSql(db).all(
     "SELECT id, title FROM files WHERE title = 'First Song'",
-  )).getRowObjects() as { id: string; title: string }[];
+  )) as { id: string; title: string }[];
   return {
     db,
     app,
     scan,
     songIds,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -152,9 +153,9 @@ Deno.test('download zips albums, artists, and playlists', async () => {
       return out;
     };
 
-    const albumId = (await db.conn.runAndReadAll(
+    const albumId = (await rawSql(db).all(
       "SELECT id FROM albums WHERE name = 'Fixture Album'",
-    )).getRowObjects() as { id: string }[];
+    )) as { id: string }[];
     const albumRes = await app(
       new Request(`http://x/rest/download?${AUTH}&id=${albumId[0].id}`),
     );
@@ -178,9 +179,9 @@ Deno.test('download zips albums, artists, and playlists', async () => {
     );
     assertEquals(albumEntries[0].bytes, original);
 
-    const artistId = (await db.conn.runAndReadAll(
+    const artistId = (await rawSql(db).all(
       "SELECT id FROM artists WHERE name = 'Various Artists'",
-    )).getRowObjects() as { id: string }[];
+    )) as { id: string }[];
     const artistRes = await app(
       new Request(`http://x/rest/download?${AUTH}&id=${artistId[0].id}`),
     );

@@ -7,6 +7,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -31,7 +32,7 @@ const NARJO = 'u=admin&p=test&v=1.16.1&c=narjo';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-sp-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -74,9 +75,9 @@ async function setup() {
     defaultPort: DEFAULT_PORT,
     env: {},
   });
-  const songs = (await db.conn.runAndReadAll(
+  const songs = (await rawSql(db).all(
     'SELECT id, title, duration_ms FROM files ORDER BY album_id, track',
-  )).getRowObjects() as { id: string; title: string; duration_ms: number }[];
+  )) as { id: string; title: string; duration_ms: number }[];
   return {
     db,
     onDefault,
@@ -85,7 +86,7 @@ async function setup() {
     events,
     songs,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -155,9 +156,9 @@ Deno.test('a stream open reports the play (no listens; player stays engine)', as
     assertEquals(entries[0].title, songs[0].title);
 
     // …but stream is not a scrobble: no listens row.
-    const listens = (await db.conn.runAndReadAll(
+    const listens = (await rawSql(db).all(
       'SELECT count(*) AS n FROM listens',
-    )).getRowObjects() as { n: bigint }[];
+    )) as { n: bigint }[];
     assertEquals(Number(listens[0].n), 0);
 
     // …and the OwnTone player is still the idle engine.

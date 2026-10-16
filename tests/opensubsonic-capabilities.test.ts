@@ -5,6 +5,7 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -197,7 +198,7 @@ Deno.test('H1 public exception never leaks to forged routes, methods or exclusiv
 Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach canonical consumers', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-capabilities-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     const cfg = {
       listen: undefined,
@@ -262,8 +263,8 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
       )).status,
       'ok',
     );
-    const rows = await db.conn.runAndReadAll('SELECT rating FROM ratings');
-    assertEquals(Number(rows.getRowObjects()[0].rating), 4);
+    const rows = await rawSql(db).all('SELECT rating FROM ratings');
+    assertEquals(Number(rows[0].rating), 4);
     const user = await body(
       await app(
         new Request('http://x/rest/getUser', { method: 'POST', body: AUTH }),
@@ -271,7 +272,7 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
     );
     assertEquals(user.user.username, cfg.user);
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 });

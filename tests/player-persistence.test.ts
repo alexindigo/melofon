@@ -6,6 +6,7 @@
 // tick keeps position_ms current while playing and stops when paused.
 import { assert, assertEquals } from '@std/assert';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createLogger, type Log } from '../src/logging.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
@@ -47,7 +48,7 @@ function song(durationMs: number | null = 180_000): SongRow {
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-persist-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const persistence = createPersistence(store);
   const player = createPlayer();
   const playback = createPlayback({
@@ -65,7 +66,7 @@ async function setup() {
     playback,
     close: async (keep = false) => {
       playback.close();
-      db.close();
+      await db.close();
       if (!keep) await Deno.remove(dir, { recursive: true });
     },
   };
@@ -74,13 +75,13 @@ async function setup() {
 /** Reopen the same data dir: a fresh db handle + store, like a restart. */
 async function reopen(dir: string) {
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const persistence = createPersistence(store);
   return {
     db,
     persistence,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -421,12 +422,12 @@ Deno.test('output model identity survives a restart; legacy rows read unknown', 
   // Simulate a pre-change database: output_state without the model column,
   // one legacy row written under it. The migration (run at every openDb)
   // re-adds the column idempotently.
-  await db.conn.run('ALTER TABLE output_state DROP COLUMN model');
-  await db.conn.run(
+  await rawSql(db).run('ALTER TABLE output_state DROP COLUMN model');
+  await rawSql(db).run(
     'INSERT INTO output_state (id, host, port, name, type, selected, volume) ' +
       "VALUES ('legacy', '10.4.10.200', 7000, 'old-atv', 'AirPlay', false, 100)",
   );
-  await db.conn.run(
+  await rawSql(db).run(
     'ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR',
   );
 
@@ -509,7 +510,7 @@ Deno.test('unregister keeps the persisted row (last-seen state)', async () => {
 Deno.test('a failed save is drained and counted once; a broken logger is harmless', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-persist-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const logger = createLogger({
     sinks: {
       stdout: () => {
@@ -529,7 +530,7 @@ Deno.test('a failed save is drained and counted once; a broken logger is harmles
   };
   try {
     const persistence = createPersistence(store, log);
-    db.close();
+    await db.close();
     persistence.saveQueue(['a', 'b']);
     await persistence.drain();
     assertEquals(events.filter((id) => id === 'persistence_failed').length, 1);

@@ -2,6 +2,7 @@
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs } from '../src/player.ts';
 import { createPersistence } from '../src/persistence.ts';
@@ -30,7 +31,7 @@ async function ready(outputs: ReturnType<typeof createOutputs>) {
 async function setup(dir?: string) {
   const data = dir ?? await Deno.makeTempDir({ prefix: 'melofon-strategy-' });
   const store = await openStore(data);
-  const db = store.legacy;
+  const db = store;
   const persistence = createPersistence(store);
   const state = createState(store);
   const notify = createNotify();
@@ -105,7 +106,7 @@ Deno.test('strategies: invalid known state value is rejected before SQL or onCha
     assertEquals(await s.state.get(KEY), before);
     assertEquals(changes, 0);
   } finally {
-    s.db.close();
+    await s.db.close();
     await Deno.remove(s.data, { recursive: true });
   }
 });
@@ -152,7 +153,7 @@ Deno.test('strategies: native API, new-ID default, saved-cache gap and reopen pr
       404,
     );
     await s.persistence.drain();
-    s.db.close();
+    await s.db.close();
     next = await setup(s.data);
     const rows = await next.persistence.loadOutputs();
     for (const row of rows) next.outputs.register(row, source);
@@ -168,7 +169,7 @@ Deno.test('strategies: native API, new-ID default, saved-cache gap and reopen pr
     ]);
   } finally {
     await (next?.persistence ?? s.persistence).drain();
-    (next?.db ?? s.db).close();
+    await (next?.db ?? s.db).close();
     await Deno.remove(s.data, { recursive: true });
   }
 });
@@ -206,25 +207,25 @@ Deno.test('strategies: invalid POST rejected before host resolution', async () =
 Deno.test('strategies: migration backfills legacy Melofon, does not overwrite saved choice; corrupt values fail visibly', async () => {
   const s = await setup();
   try {
-    await s.db.conn.run(
+    await rawSql(s.db).run(
       'ALTER TABLE output_state DROP COLUMN IF EXISTS connection_strategy',
     );
-    await s.db.conn.run(
+    await rawSql(s.db).run(
       "INSERT INTO output_state (id,name,type,selected,volume) VALUES ('legacy','old','AirPlay',false,100)",
     );
     await s.state.set(KEY, 'owntone');
-    s.db.close();
+    await s.db.close();
     const store = await openStore(s.data);
-    const db = store.legacy;
+    const db = store;
     try {
       const p = createPersistence(store);
       assertEquals(strategy((await p.loadOutputs())[0]), 'melofon');
-      await db.conn.run(
+      await rawSql(db).run(
         "UPDATE output_state SET connection_strategy='corrupt' WHERE id='legacy'",
       );
       await assertRejects(() => p.loadOutputs());
     } finally {
-      db.close();
+      await db.close();
     }
   } finally {
     await Deno.remove(s.data, { recursive: true });
@@ -343,7 +344,7 @@ Deno.test('all three native choices survive real discovery registration gaps, un
     }
     discovery.close();
     await s.persistence.drain();
-    s.db.close();
+    await s.db.close();
     next = await setup(s.data);
     for (const row of await next.persistence.loadOutputs()) {
       next.outputs.register(row);
@@ -359,7 +360,7 @@ Deno.test('all three native choices survive real discovery registration gaps, un
   } finally {
     discovery.close();
     await (next?.persistence ?? s.persistence).drain();
-    (next?.db ?? s.db).close();
+    await (next?.db ?? s.db).close();
     await Deno.remove(s.data, { recursive: true });
   }
 });

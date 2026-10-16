@@ -5,6 +5,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -20,7 +21,7 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-lists-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -43,19 +44,19 @@ async function setup() {
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
-  const albumIds = (await db.conn.runAndReadAll(
+  const albumIds = (await rawSql(db).all(
     'SELECT id, name FROM albums ORDER BY name',
-  )).getRowObjects() as { id: string; name: string }[];
-  const songIds = (await db.conn.runAndReadAll(
+  )) as { id: string; name: string }[];
+  const songIds = (await rawSql(db).all(
     'SELECT id, title, album_id FROM files ORDER BY album_id, track',
-  )).getRowObjects() as { id: string; title: string; album_id: string }[];
+  )) as { id: string; title: string; album_id: string }[];
   return {
     db,
     app,
     albumIds,
     songIds,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

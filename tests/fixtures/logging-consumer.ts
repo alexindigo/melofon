@@ -139,6 +139,7 @@ if (mode === 'streams') {
 } else if (mode === 'families') {
   const { pathfinder } = await import('@pathfinder/pathfinder');
   const { openStore } = await import('../../src/store/index.ts');
+  const { rawSql } = await import('../../src/store/testing.ts');
   const { facade } = await import('../../src/facade.ts');
   const { createPlayer, createOutputs } = await import('../../src/player.ts');
   const { createPlayback } = await import('../../src/playback.ts');
@@ -149,7 +150,7 @@ if (mode === 'streams') {
   const { Log, AV_LOG_ERROR } = await import('node-av');
   const data = await Deno.makeTempDir({ prefix: 'logging-families-' });
   const store = await openStore(data, { debugLogQueries: true });
-  const db = store.legacy;
+  const db = store;
   const playback = createPlayback({
     player: createPlayer(),
     nowPlaying: createNowPlaying(store),
@@ -192,7 +193,7 @@ if (mode === 'streams') {
       volume: 100,
       host: '127.0.0.1',
     });
-    await db.conn.runAndReadAll("SELECT 'sql-canary' AS value");
+    await rawSql(db).all("SELECT 'sql-canary' AS value");
     await createMedia().probe('tests/fixtures/library/corrupt.mp3');
     const require = createRequire(import.meta.url);
     const debug = createRequire(require.resolve('music-metadata'))('debug');
@@ -207,7 +208,7 @@ if (mode === 'streams') {
     await server.shutdown();
     await server.finished;
     playback.close();
-    db.close();
+    await db.close();
     await Deno.remove(data, { recursive: true });
   }
 } else if (mode === 'idle-lifecycle') {

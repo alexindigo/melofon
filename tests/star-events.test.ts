@@ -3,8 +3,8 @@
 // the unstar fallback for ids that left the catalog, batch facts, and listen
 // facts through current catalog membership.
 import { assert, assertEquals } from '@std/assert';
-import type { Db } from '../src/db.ts';
 import { openStore, type Store } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
@@ -22,22 +22,22 @@ async function freshDir(): Promise<string> {
   return await Deno.makeTempDir({ prefix: 'melofon-star-events-' });
 }
 
-async function addUser(db: Db, id: string, name: string): Promise<void> {
-  await db.conn.run(
+async function addUser(db: Store, id: string, name: string): Promise<void> {
+  await rawSql(db).run(
     `INSERT INTO users VALUES ('${id}', '${name}', 'unused', now())`,
   );
 }
 
 // Catalog: artist ar1 → album al1 → songs s1, s2; artist ar2 → album al2 →
 // song s3. Ids are plain literals (kind-distinct, like the scan's hashes).
-async function seedCatalog(db: Db): Promise<void> {
-  await db.conn.run(
+async function seedCatalog(db: Store): Promise<void> {
+  await rawSql(db).run(
     "INSERT INTO artists VALUES ('ar1', 'One'), ('ar2', 'Two')",
   );
-  await db.conn.run(
+  await rawSql(db).run(
     "INSERT INTO albums VALUES ('al1', 'First', 'ar1'), ('al2', 'Second', 'ar2')",
   );
-  await db.conn.run(
+  await rawSql(db).run(
     `INSERT INTO files (id, path, title, album_id, artist_id) VALUES
        ('s1', '/m/1.mp3', 'S1', 'al1', 'ar1'),
        ('s2', '/m/2.mp3', 'S2', 'al1', 'ar1'),
@@ -53,29 +53,29 @@ interface EventRow {
   at_ms: number;
 }
 
-async function events(db: Db): Promise<EventRow[]> {
-  const rows = (await db.conn.runAndReadAll(
+async function events(db: Store): Promise<EventRow[]> {
+  const rows = (await rawSql(db).all(
     `SELECT user_id, target_id, target_type, action,
             epoch_ms(occurred_at)::BIGINT AS at_ms
      FROM star_events ORDER BY seq`,
-  )).getRowObjects() as unknown as (Omit<EventRow, 'at_ms'> & {
+  )) as unknown as (Omit<EventRow, 'at_ms'> & {
     at_ms: bigint;
   })[];
   return rows.map((row) => ({ ...row, at_ms: Number(row.at_ms) }));
 }
 
 async function withDb(
-  fn: (db: Db, store: Store) => Promise<void>,
+  fn: (db: Store, store: Store) => Promise<void>,
 ): Promise<void> {
   const dir = await freshDir();
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     await seedFirstUser(store, { ...CFG, dataDir: dir });
     await seedCatalog(db);
     await fn(db, store);
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 }
@@ -84,19 +84,19 @@ Deno.test('star history: legacy stars migrate once, in time order, never again',
   const dir = await freshDir();
   try {
     let store = await openStore(dir);
-    let db = store.legacy;
+    let db = store;
     await seedFirstUser(store, { ...CFG, dataDir: dir });
     await seedCatalog(db);
     // Later star inserted first: the migration orders by time, not by row.
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO stars (user_id, target_id, target_type, starred_at) VALUES
          ('u-legacy', 's2', 'song', '2024-01-02 00:00:00+00'),
          ('u-legacy', 'al1', 'album', '2024-01-01 00:00:00+00')`,
     );
-    db.close();
+    await db.close();
 
     store = await openStore(dir);
-    db = store.legacy;
+    db = store;
     const migrated = [
       {
         user_id: 'u-legacy',
@@ -114,21 +114,21 @@ Deno.test('star history: legacy stars migrate once, in time order, never again',
       },
     ];
     assertEquals(await events(db), migrated);
-    db.close();
+    await db.close();
 
     store = await openStore(dir);
-    db = store.legacy;
+    db = store;
     assertEquals(await events(db), migrated, 'a third open does not repeat');
     assert(await createAnnotation(store).star(CFG.user, 's1'));
-    db.close();
+    await db.close();
 
     store = await openStore(dir);
-    db = store.legacy;
+    db = store;
     const after = await events(db);
     assertEquals(after.length, 3, 'no re-migration after a new event');
     assertEquals(after.slice(0, 2), migrated);
     assertEquals(after[2].target_id, 's1');
-    db.close();
+    await db.close();
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -181,7 +181,7 @@ Deno.test('star history: classification by lookup and the unstar fallback', asyn
       [['al1', 'album'], ['ar1', 'artist'], ['s1', 'song']],
     );
     // A starred song leaves the catalog: no longer listed, still unstarrable.
-    await db.conn.run("DELETE FROM files WHERE id = 's1'");
+    await rawSql(db).run("DELETE FROM files WHERE id = 's1'");
     assertEquals(
       (await annotation.starred(CFG.user)).map((i) => i.targetId),
       ['al1', 'ar1'],
@@ -199,7 +199,7 @@ Deno.test('star history: classification by lookup and the unstar fallback', asyn
     assertEquals(await annotation.setRating(CFG.user, 'nope', 3), false);
     assertEquals((await events(db)).length, before);
     assertEquals(
-      (await db.conn.runAndReadAll('SELECT * FROM ratings')).getRowObjects(),
+      await rawSql(db).all('SELECT * FROM ratings'),
       [],
     );
   });
@@ -207,10 +207,10 @@ Deno.test('star history: classification by lookup and the unstar fallback', asyn
 
 Deno.test('star history: starred honours the music folder', async () => {
   await withDb(async (db, store) => {
-    await db.conn.run(
+    await rawSql(db).run(
       "INSERT INTO libraries VALUES ('lib-a', 'A', '/a'), ('lib-b', 'B', '/b')",
     );
-    await db.conn.run(
+    await rawSql(db).run(
       "UPDATE files SET library_id = CASE WHEN id = 's3' THEN 'lib-b' ELSE 'lib-a' END",
     );
     const annotation = createAnnotation(store);
@@ -265,9 +265,9 @@ Deno.test('listen facts: song/album/artist plays through current membership', as
     assert(await listens.record('bob', 's1', at(9000)));
     assertEquals(await listens.record(CFG.user, 'nope', at(4000)), false);
     assertEquals(
-      (await db.conn.runAndReadAll(
+      await rawSql(db).all(
         "SELECT count(*) AS n FROM listens WHERE track_id = 'nope'",
-      )).getRowObjects(),
+      ),
       [{ n: 0n }],
     );
     const facts = await listens.facts(CFG.user, {
@@ -291,7 +291,7 @@ Deno.test('listen facts: song/album/artist plays through current membership', as
     });
     // Membership is read at query time: a song moved to the other album
     // counts there from now on.
-    await db.conn.run("UPDATE files SET album_id = 'al2' WHERE id = 's2'");
+    await rawSql(db).run("UPDATE files SET album_id = 'al2' WHERE id = 's2'");
     const moved = await listens.facts(CFG.user, { albums: ['al1', 'al2'] });
     assertEquals(moved.albums.al1.playCount, 2);
     assertEquals(moved.albums.al2, { playCount: 2, lastPlayedMs: 5000 });

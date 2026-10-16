@@ -3,6 +3,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { encryptPassword, seedFirstUser } from '../src/users.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
@@ -31,7 +32,7 @@ type Item = { id: string; year?: number; genre?: string; isVideo?: boolean };
 async function setup(large = false) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-selection-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -41,7 +42,7 @@ async function setup(large = false) {
     version: 'test',
   };
   await seedFirstUser(store, cfg);
-  await db.conn.run(
+  await rawSql(db).run(
     `INSERT INTO users VALUES ('bob-id', 'bob', ${
       sql(await encryptPassword(cfg.secret, 'test'))
     }, now())`,
@@ -55,13 +56,13 @@ async function setup(large = false) {
   }
   // Insert deliberately reverse-ID order with equal labels: ordering must not
   // accidentally rely on insertion/physical row order.
-  await db.conn.run(
+  await rawSql(db).run(
     `INSERT INTO artists VALUES (${sql(id(12))}, 'Same'), (${
       sql(id(11))
     }, 'Same')`,
   );
   for (let n = 3; n >= 0; n--) {
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO albums VALUES (${sql(id(20 + n))}, 'Same', ${
         sql(id(11 + n % 2))
       })`,
@@ -74,7 +75,7 @@ async function setup(large = false) {
       'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3',
       path,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO files (id,path,library_id,title,album_id,artist_id,genre,year,is_video,mtime,duration_ms)
       VALUES (${sql(id(100 + n))},${sql(path)},${
         sql(sources[source].id)
@@ -86,13 +87,13 @@ async function setup(large = false) {
   if (large) {
     // Separate 501-album/501-song eligible pool. Fixed IDs and identical label,
     // source/year/genre/mTime; tests can independently enumerate its exact set.
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO artists SELECT lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24), 'Bulk' FROM range(501) r(i)`,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO albums SELECT lpad(lower(to_hex(1000+i)),8,'0') || repeat('0',24), 'Bulk', lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24) FROM range(501) r(i)`,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO files (id,path,library_id,title,album_id,artist_id,genre,year,mtime,duration_ms)
       SELECT lpad(lower(to_hex(2000+i)),8,'0') || repeat('0',24), ${
         sql(sources[1].path + '/bulk-')
@@ -102,13 +103,13 @@ async function setup(large = false) {
         sql(id(11))
       }, 'Bulk', 2005, 1000, 1000 FROM range(501) r(i)`,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO star_events (user_id, target_id, target_type, action, occurred_at) SELECT u.id, al.id, 'album', 'star', now() FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO ratings SELECT u.id, al.id, 5 FROM users u CROSS JOIN albums al WHERE al.name='Bulk'`,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO listens SELECT u.id, f.id, now(), 1000, 'fixture' FROM users u CROSS JOIN files f WHERE f.genre='Bulk'`,
     );
   }
@@ -168,7 +169,7 @@ async function setup(large = false) {
     get,
     own,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

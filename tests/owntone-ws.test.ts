@@ -23,7 +23,7 @@ const DEFAULT_PORT = 4534;
 async function setup(env: Record<string, string> = {}) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-otws-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -66,7 +66,7 @@ async function setup(env: Record<string, string> = {}) {
     wsBase: `ws://127.0.0.1:${port}`,
     close: async () => {
       await server.shutdown();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

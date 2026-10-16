@@ -124,7 +124,7 @@ async function setup(
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
@@ -187,7 +187,7 @@ async function setup(
     close: async () => {
       await boot.close();
       devices.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -775,7 +775,7 @@ async function recycleSetup(
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const notify = createNotify();
   const outputs = createOutputs({ notify, log: overrides.log });
   const player = createPlayer();
@@ -815,7 +815,7 @@ async function recycleSetup(
     decodeCalls,
     close: async () => {
       await boot.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { atomic, openEngine, type Queries } from '../src/store/engine.ts';
 import { openStore } from '../src/store/index.ts';
 import { createStateStore } from '../src/store/state.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { captureLogs } from './helpers/logging.ts';
 
 function deferred() {
@@ -128,7 +129,7 @@ Deno.test('store engine runs schema on both first open and reopen', async () => 
   }
 });
 
-Deno.test('store engine logging stays below the queue for concurrent domain and legacy operations', async () => {
+Deno.test('store engine logging stays below the queue for concurrent domain and test-only operations', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'store-engine-' });
   const { log, records } = captureLogs();
   const store = await openStore(dir, { debugLogQueries: true, log });
@@ -138,13 +139,11 @@ Deno.test('store engine logging stays below the queue for concurrent domain and 
       Array.from({ length: 10 }, (_, i) => [
         store.state.set(`key${i}`, 'value'),
         store.state.get(`key${i}`),
-        store.legacy.conn.run('SELECT 1'),
-        store.legacy.conn.runAndReadAll('SELECT 1'),
+        rawSql(store).run('SELECT 1'),
+        rawSql(store).all('SELECT 1'),
       ]).flat(),
     );
-    await assertRejects(() =>
-      store.legacy.conn.run('SELECT * FROM absent_table')
-    );
+    await assertRejects(() => rawSql(store).run('SELECT * FROM absent_table'));
     await store.ping();
     await log.flush();
     const spans = records().slice(offset);
@@ -239,7 +238,7 @@ Deno.test('store engine rejects escaped queries after their slot ends', async ()
   }
 });
 
-Deno.test('store engine returns plain numbers and arrays while legacy keeps driver results and bindings', async () => {
+Deno.test('store engine converts plain rows and keeps prepared driver results inside its slot', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'store-engine-' });
   const engine = await openEngine(dir);
   try {
@@ -249,17 +248,22 @@ Deno.test('store engine returns plain numbers and arrays while legacy keeps driv
       ),
       [{ n: 12, items: [1, 2] }],
     );
-    const result = await engine.legacy.conn.runAndReadAll(
-      'SELECT $1::BIGINT AS n',
-      [13],
-    );
-    assertEquals(result.getRowObjects()[0].n, 13n);
-    const stmt = await engine.legacy.conn.prepare('SELECT 14 AS n');
-    try {
-      assertEquals((await stmt.runAndReadAll()).getRowObjects(), [{ n: 14 }]);
-    } finally {
-      stmt.destroySync();
-    }
+    await engine.exclusive(async (q) => {
+      const bound = await q.prepare('SELECT $1::BIGINT AS n');
+      try {
+        bound.bind([13]);
+        const result = await bound.runAndReadAll();
+        assertEquals(result.getRowObjects()[0].n, 13n);
+      } finally {
+        bound.destroySync();
+      }
+      const stmt = await q.prepare('SELECT 14 AS n');
+      try {
+        assertEquals((await stmt.runAndReadAll()).getRowObjects(), [{ n: 14 }]);
+      } finally {
+        stmt.destroySync();
+      }
+    });
   } finally {
     await engine.close();
     await Deno.remove(dir, { recursive: true });

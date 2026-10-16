@@ -1,4 +1,4 @@
-import { type Engine, openEngine } from './engine.ts';
+import { openEngine, registerStore } from './engine.ts';
 import type { Log } from '../logging.ts';
 import { createUsersStore } from './users.ts';
 import { createStateStore } from './state.ts';
@@ -24,8 +24,6 @@ export interface Store {
   catalog: ReturnType<typeof createCatalogStore>;
   ping(): Promise<void>;
   close(): Promise<void>;
-  /** Transitional raw access for domains not yet moved (removed in S5). */
-  legacy: Engine['legacy'];
 }
 
 export async function openStore(
@@ -33,7 +31,7 @@ export async function openStore(
   opts: { debugLogQueries?: boolean; log?: Log } = {},
 ): Promise<Store> {
   const engine = await openEngine(dataDir, opts);
-  return {
+  const store: Store = {
     users: createUsersStore(engine),
     state: createStateStore(engine),
     bookmarks: createBookmarksStore(engine),
@@ -46,6 +44,7 @@ export async function openStore(
     catalog: createCatalogStore(engine),
     ping: engine.ping,
     close: engine.close,
-    legacy: engine.legacy,
   };
+  registerStore(store, engine);
+  return store;
 }

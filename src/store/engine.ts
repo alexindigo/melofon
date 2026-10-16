@@ -3,11 +3,6 @@ import * as duckdb from '@duckdb/node-api';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { type Log, scopedLog } from '../logging.ts';
 
-export interface Db {
-  conn: Pick<duckdb.DuckDBConnection, 'run' | 'runAndReadAll' | 'prepare'>;
-  close(): void;
-}
-
 // Debug spans behind MELOFON_DEBUG_LOG_REQUEST (plans/diag-request-trace):
 // [db] begin/end for run + runAndReadAll — sql truncated to the verb plus
 // the first identifier, never bind values, `qinflight` shows concurrent
@@ -51,14 +46,27 @@ export function esc(value: string): string {
 export interface Queries {
   run(sql: string): Promise<void>;
   all<T = Record<string, unknown>>(sql: string): Promise<T[]>;
+  rawAll<T = Record<string, unknown>>(sql: string): Promise<T[]>;
   prepare(sql: string): ReturnType<duckdb.DuckDBConnection['prepare']>;
 }
 
 export interface Engine {
   exclusive<T>(fn: (q: Queries) => Promise<T>): Promise<T>;
-  legacy: Db;
   ping(): Promise<void>;
   close(): Promise<void>;
+}
+
+// The test seam resolves an engine without putting raw access on Store.
+const engines = new WeakMap<object, Engine>();
+
+export function registerStore(store: object, engine: Engine): void {
+  engines.set(store, engine);
+}
+
+export function engineForTesting(store: object): Engine {
+  const engine = engines.get(store);
+  if (!engine) throw new Error('Unknown store');
+  return engine;
 }
 
 function plain(value: unknown): unknown {
@@ -139,6 +147,11 @@ export async function openEngine(
           const result = await queries.runAndReadAll(sql);
           return plain(result.getRowObjectsJS()) as T[];
         },
+        async rawAll<T>(sql: string): Promise<T[]> {
+          check();
+          const result = await queries.runAndReadAll(sql);
+          return result.getRowObjects() as T[];
+        },
         prepare(sql) {
           check();
           return conn.prepare(sql);
@@ -164,7 +177,6 @@ export async function openEngine(
     }
     if (!closed) {
       closing = true;
-      // The transitional synchronous close remains synchronous when idle.
       if (pending === 0) {
         conn.closeSync();
         closed = Promise.resolve();
@@ -179,18 +191,6 @@ export async function openEngine(
     exclusive,
     ping: () => exclusive((q) => q.run('SELECT 1')),
     close,
-    legacy: {
-      conn: {
-        run: (...args) => exclusive(() => queries.run(...args)),
-        runAndReadAll: (...args) =>
-          exclusive(() => queries.runAndReadAll(...args)),
-        // Prepared-statement executions remain transitional until S4.
-        prepare: (sql) => exclusive(() => conn.prepare(sql)),
-      },
-      close: () => {
-        void close();
-      },
-    },
   };
   try {
     // Read the file before acquiring the slot: no filesystem work in the queue.

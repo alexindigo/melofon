@@ -1,7 +1,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { encodeHex } from '@std/encoding/hex';
-import type { Db } from '../src/db.ts';
-import { openStore } from '../src/store/index.ts';
+import { openStore, type Store } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { createMedia } from '../src/media.ts';
 import { createScan, scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -52,7 +52,7 @@ async function setup() {
   const root = `${dir}/music`;
   await Deno.mkdir(root);
   const store = await openStore(`${dir}/db`);
-  const db = store.legacy;
+  const db = store;
   const libraries = createLibraries(store);
   const source = await libraries.add('Music', root);
   const media = createMedia() as ReturnType<typeof createMedia> & {
@@ -84,7 +84,7 @@ async function setup() {
     calls: () => calls,
     scan: () => scanLibrary(store, wrapped),
     async close() {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -101,10 +101,10 @@ async function pathId(libraryId: string, rel: string): Promise<string> {
   ).slice(0, 32);
 }
 
-async function catalog(db: Db) {
-  return (await db.conn.runAndReadAll(
+async function catalog(db: Store) {
+  return (await rawSql(db).all(
     'SELECT id, path FROM files ORDER BY path',
-  )).getRowObjects() as { id: string; path: string }[];
+  )) as { id: string; path: string }[];
 }
 
 Deno.test('identity: fresh-install ids match path hashes and first-seen is recorded once', async () => {
@@ -118,9 +118,9 @@ Deno.test('identity: fresh-install ids match path hashes and first-seen is recor
     assert(first[id] >= before && first[id] <= Date.now());
     assertEquals(Object.keys(first), [id]);
     assertEquals(await t.identity.firstSeen([]), {});
-    const rows = (await t.db.conn.runAndReadAll(
+    const rows = await rawSql(t.db).all(
       'SELECT present, fingerprint FROM file_identity',
-    )).getRowObjects();
+    );
     assertEquals(rows.length, 1);
     assertEquals(rows[0].present, true);
     assert(typeof rows[0].fingerprint === 'string');
@@ -239,8 +239,7 @@ Deno.test('identity: disappear then reappear at the same path retains id and fir
     await t.scan();
     assertEquals(await catalog(t.db), []);
     assertEquals(
-      (await t.db.conn.runAndReadAll('SELECT present FROM file_identity'))
-        .getRowObjects()[0].present,
+      (await rawSql(t.db).all('SELECT present FROM file_identity'))[0].present,
       false,
     );
     assertEquals(await t.identity.firstSeen([id]), first);

@@ -3,6 +3,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { instrumentConn } from '../src/store/engine.ts';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import type * as duckdb from '@duckdb/node-api';
 import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 import {
@@ -18,16 +19,16 @@ async function tmpdir(): Promise<string> {
 Deno.test('openDb creates melofon.duckdb with the M0 tables', async () => {
   const dir = await tmpdir();
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     const stat = await Deno.stat(`${dir}/melofon.duckdb`);
     assert(stat.isFile);
-    const res = await db.conn.runAndReadAll(
+    const res = await rawSql(db).all(
       "SELECT table_name FROM information_schema.tables WHERE table_name IN ('users', 'artists', 'albums', 'files')",
     );
-    assertEquals(res.getRowObjects().length, 4);
+    assertEquals(res.length, 4);
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 });
@@ -35,14 +36,14 @@ Deno.test('openDb creates melofon.duckdb with the M0 tables', async () => {
 Deno.test('openDb creates the M2 user-state tables', async () => {
   const dir = await tmpdir();
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
-    const res = await db.conn.runAndReadAll(
+    const res = await rawSql(db).all(
       "SELECT table_name FROM information_schema.tables WHERE table_name IN ('listens', 'stars', 'star_events', 'ratings', 'playlists', 'playlist_tracks', 'play_queues')",
     );
-    assertEquals(res.getRowObjects().length, 7);
+    assertEquals(res.length, 7);
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 });
@@ -50,7 +51,7 @@ Deno.test('openDb creates the M2 user-state tables', async () => {
 Deno.test('seedFirstUser inserts one row with an encrypted password', async () => {
   const dir = await tmpdir();
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     await seedFirstUser(store, {
       listen: undefined,
@@ -59,10 +60,10 @@ Deno.test('seedFirstUser inserts one row with an encrypted password', async () =
       password: 'test',
       secret: 's3cret',
     });
-    const res = await db.conn.runAndReadAll(
+    const res = await rawSql(db).all(
       'SELECT name, password_enc FROM users',
     );
-    const rows = res.getRowObjects() as {
+    const rows = res as {
       name: string;
       password_enc: string;
     }[];
@@ -71,7 +72,7 @@ Deno.test('seedFirstUser inserts one row with an encrypted password', async () =
     assertNotEquals(rows[0].password_enc, 'test');
     assertEquals(await decryptPassword('s3cret', rows[0].password_enc), 'test');
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 });
@@ -79,7 +80,7 @@ Deno.test('seedFirstUser inserts one row with an encrypted password', async () =
 Deno.test('seedFirstUser does not overwrite existing users', async () => {
   const dir = await tmpdir();
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     const cfg = {
       listen: undefined,
@@ -90,13 +91,13 @@ Deno.test('seedFirstUser does not overwrite existing users', async () => {
     };
     await seedFirstUser(store, cfg);
     await seedFirstUser(store, { ...cfg, password: 'second' });
-    const res = await db.conn.runAndReadAll(
+    const res = await rawSql(db).all(
       'SELECT count(*) AS n FROM users',
     );
-    const rows = res.getRowObjects() as { n: bigint | number }[];
+    const rows = res as { n: bigint | number }[];
     assertEquals(Number(rows[0].n), 1);
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 });

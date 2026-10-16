@@ -7,14 +7,14 @@ import { openStore } from '../src/store/index.ts';
 Deno.test('GET /health on the core tree returns {"ok":true} with a live DuckDB', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-health-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     const app = await pathfinder({ roots: ['core/'], app: { store, cfg: {} } });
     const res = await app(new Request('http://x/health'));
     assertEquals(res.status, 200);
     assertEquals(await res.json(), { ok: true });
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
   }
 });

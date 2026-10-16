@@ -5,6 +5,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -23,7 +24,7 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ann-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -52,10 +53,10 @@ async function setup() {
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
-  const songs = await db.conn.runAndReadAll(
+  const songs = await rawSql(db).all(
     "SELECT id, album_id, artist_id FROM files WHERE title != '' ORDER BY path",
   );
-  const songIds = songs.getRowObjects() as {
+  const songIds = songs as {
     id: string;
     album_id: string;
     artist_id: string;
@@ -65,7 +66,7 @@ async function setup() {
     app,
     songIds,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -170,11 +171,11 @@ Deno.test('setRating upserts and 0 clears', async () => {
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
-    let rows = await db.conn.runAndReadAll(
+    let rows = await rawSql(db).all(
       'SELECT rating FROM ratings',
     );
     assertEquals(
-      Number((rows.getRowObjects()[0] as { rating: number }).rating),
+      Number((rows[0] as { rating: number }).rating),
       4,
     );
 
@@ -184,10 +185,10 @@ Deno.test('setRating upserts and 0 clears', async () => {
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
-    rows = await db.conn.runAndReadAll('SELECT rating FROM ratings');
-    assertEquals(rows.getRowObjects().length, 1);
+    rows = await rawSql(db).all('SELECT rating FROM ratings');
+    assertEquals(rows.length, 1);
     assertEquals(
-      Number((rows.getRowObjects()[0] as { rating: number }).rating),
+      Number((rows[0] as { rating: number }).rating),
       2,
     );
 
@@ -197,8 +198,8 @@ Deno.test('setRating upserts and 0 clears', async () => {
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
-    rows = await db.conn.runAndReadAll('SELECT rating FROM ratings');
-    assertEquals(rows.getRowObjects().length, 0);
+    rows = await rawSql(db).all('SELECT rating FROM ratings');
+    assertEquals(rows.length, 0);
   } finally {
     await close();
   }
@@ -232,10 +233,10 @@ Deno.test('scrobble submission=true appends listens rows, never updates', async 
       );
       assertEquals((await jsonBody(res)).status, 'ok');
     }
-    const rows = await db.conn.runAndReadAll(
+    const rows = await rawSql(db).all(
       'SELECT track_id, source FROM listens',
     );
-    const listens = rows.getRowObjects() as {
+    const listens = rows as {
       track_id: string;
       source: string;
     }[];
@@ -258,11 +259,11 @@ Deno.test('scrobble honors the time parameter for offline scrobbles', async () =
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
-    const rows = await db.conn.runAndReadAll(
+    const rows = await rawSql(db).all(
       'SELECT epoch_ms(played_at)::BIGINT AS ms FROM listens',
     );
     assertEquals(
-      Number((rows.getRowObjects()[0] as { ms: bigint }).ms),
+      Number((rows[0] as { ms: bigint }).ms),
       1700000000000,
     );
   } finally {
@@ -281,10 +282,10 @@ Deno.test('scrobble submission=false does not append listens', async () => {
       ),
     );
     assertEquals((await jsonBody(res)).status, 'ok');
-    const rows = await db.conn.runAndReadAll(
+    const rows = await rawSql(db).all(
       'SELECT count(*) AS n FROM listens',
     );
-    assertEquals(Number((rows.getRowObjects()[0] as { n: bigint }).n), 0);
+    assertEquals(Number((rows[0] as { n: bigint }).n), 0);
   } finally {
     await close();
   }

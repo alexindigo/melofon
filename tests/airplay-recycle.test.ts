@@ -195,7 +195,7 @@ async function feedSetup() {
   FeedFakeTransport.feed = null;
   const dir = await Deno.makeTempDir({ prefix: 'melofon-rec-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
@@ -233,7 +233,7 @@ async function feedSetup() {
     decodeCalls,
     close: async () => {
       await boot.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -555,7 +555,7 @@ async function integrationSetup(opts: {
 }): Promise<Integration> {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-rec-ffi-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
@@ -659,7 +659,7 @@ async function integrationSetup(opts: {
       await boot.close();
       fakeA.close();
       fakeB.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

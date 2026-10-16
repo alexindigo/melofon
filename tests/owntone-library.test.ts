@@ -30,7 +30,7 @@ async function setup(
   const { seedUser = true, withPlaylist = true } = opts;
   const dir = await Deno.makeTempDir({ prefix: 'melofon-otlib-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -84,7 +84,7 @@ async function setup(
     app,
     onDefault,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };

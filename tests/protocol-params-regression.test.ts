@@ -15,6 +15,7 @@ import {
   wireInt,
 } from '../layers/owntone/payloads.ts';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -189,7 +190,7 @@ type Page = {
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-protocol-params-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     dataDir: dir,
     user: 'U + 雪',
@@ -203,10 +204,10 @@ async function setup() {
   await Deno.mkdir(`${dir}/music`);
   const source = await libraries.add('Music', `${dir}/music`);
   for (let n = 1; n <= 3; n++) {
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO artists VALUES (${quote(id(10 + n))}, 'Artist ${n}')`,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO albums VALUES (${quote(id(20 + n))}, 'Album ${n}', ${
         quote(id(10 + n))
       })`,
@@ -219,7 +220,7 @@ async function setup() {
       'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3',
       path,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO files (id,path,library_id,title,album_id,artist_id,genre,year,is_video,mtime,duration_ms)
       VALUES (${quote(id(100 + n))},${quote(path)},${
         quote(source.id)
@@ -380,7 +381,7 @@ async function setup() {
     recordSearchOnly: () => recordSearchOnly = true,
     close: async () => {
       playback.close();
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -561,8 +562,7 @@ Deno.test('numeric rating fractions cannot set or clear persisted rating; id pre
         (await s.get('setRating', { id: id(101), rating: raw })).error?.code,
         0,
       );
-      const rows = (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))
-        .getRowObjects();
+      const rows = await rawSql(s.db).all('SELECT rating FROM ratings');
       assertEquals(rows, [{ rating: 4 }]);
     }
     for (const rating of ['', '-0', '0e999999999999999999']) {
@@ -571,8 +571,7 @@ Deno.test('numeric rating fractions cannot set or clear persisted rating; id pre
         'ok',
       );
       assertEquals(
-        (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))
-          .getRowObjects(),
+        await rawSql(s.db).all('SELECT rating FROM ratings'),
         [],
       );
     }
@@ -586,8 +585,7 @@ Deno.test('numeric rating fractions cannot set or clear persisted rating; id pre
       'ok',
     );
     assertEquals(
-      (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))
-        .getRowObjects(),
+      await rawSql(s.db).all('SELECT rating FROM ratings'),
       [{ rating: 5 }],
     );
   } finally {
@@ -1086,8 +1084,7 @@ for (const [index, contentType] of formTypes.entries()) {
         'ok',
       );
       assertEquals(
-        (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))
-          .getRowObjects(),
+        await rawSql(s.db).all('SELECT rating FROM ratings'),
         [{ rating: 2 }],
       );
       rating.set('rating', '');
@@ -1096,8 +1093,7 @@ for (const [index, contentType] of formTypes.entries()) {
         'ok',
       );
       assertEquals(
-        (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))
-          .getRowObjects(),
+        await rawSql(s.db).all('SELECT rating FROM ratings'),
         [],
       );
       await s.annotation.setRating(s.cfg.user, id(101), 4);
@@ -1107,8 +1103,7 @@ for (const [index, contentType] of formTypes.entries()) {
         0,
       );
       assertEquals(
-        (await s.db.conn.runAndReadAll('SELECT rating FROM ratings'))
-          .getRowObjects(),
+        await rawSql(s.db).all('SELECT rating FROM ratings'),
         [{ rating: 4 }],
       );
       const catalog = s.auth();

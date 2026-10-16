@@ -7,6 +7,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { encryptPassword, seedFirstUser } from '../src/users.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -39,7 +40,7 @@ const sql = (s: string) => `'${s.replaceAll("'", "''")}'`;
 async function setup(split = false) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-personal-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -49,7 +50,7 @@ async function setup(split = false) {
     version: '0.0.0-test',
   };
   await seedFirstUser(store, cfg);
-  await db.conn.run(
+  await rawSql(db).run(
     `INSERT INTO users VALUES ('bob-id', 'bob', ${
       sql(await encryptPassword(cfg.secret, 'test'))
     }, now())`,
@@ -82,10 +83,10 @@ async function setup(split = false) {
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
 
-  const rows = (await db.conn.runAndReadAll(
+  const rows = (await rawSql(db).all(
     `SELECT f.id, f.title, f.album_id, al.album_artist_id
      FROM files f JOIN albums al ON al.id = f.album_id ORDER BY f.path`,
-  )).getRowObjects() as {
+  )) as {
     id: string;
     title: string;
     album_id: string;
@@ -155,7 +156,7 @@ async function setup(split = false) {
     okGet,
     xml,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -544,9 +545,9 @@ Deno.test('H3 unknown IDs: star/unstar/scrobble skip, setRating is 70', async ()
     await s.okGet('scrobble', { id: [nope, ids.first] });
     const song = (await s.okGet('getSong', { id: ids.first })).song as Item;
     assertEquals(song.playCount, 1);
-    const listens = (await s.db.conn.runAndReadAll(
+    const listens = await rawSql(s.db).all(
       'SELECT track_id FROM listens',
-    )).getRowObjects();
+    );
     assertEquals(listens, [{ track_id: ids.first }]);
   });
 });

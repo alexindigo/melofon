@@ -5,6 +5,7 @@
 // walks every configured source.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createScan, scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -16,14 +17,14 @@ const FIXTURE_LIBRARY = 'tests/fixtures/library';
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-scan-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   await createLibraries(store).add('Music', FIXTURE_LIBRARY);
   return {
     dir,
     store,
     db,
     close: async () => {
-      db.close();
+      await db.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
@@ -49,10 +50,10 @@ Deno.test('scanLibrary reads tags, honors TPE2, skips corrupt files', async () =
     const counts = await scanLibrary(store);
     assertEquals(counts, { files: 4, skipped: 1, artists: 3, albums: 2 });
 
-    const songs = await db.conn.runAndReadAll(
+    const songs = await rawSql(db).all(
       'SELECT title, track, duration_ms, is_video FROM files ORDER BY album_id, track',
     );
-    const rows = songs.getRowObjects() as {
+    const rows = songs as {
       title: string;
       track: number;
       duration_ms: number;
@@ -83,7 +84,7 @@ Deno.test('same-named files in different dirs get distinct ids', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-dupes-db-' });
   const root = await Deno.makeTempDir({ prefix: 'melofon-dupes-' });
   const store = await openStore(dir);
-  const db = store.legacy;
+  const db = store;
   try {
     const fixture =
       'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3';
@@ -94,13 +95,13 @@ Deno.test('same-named files in different dirs get distinct ids', async () => {
     await createLibraries(store).add('Dupes', root);
     const counts = await scanLibrary(store);
     assertEquals(counts.files, 2);
-    const rows = (await db.conn.runAndReadAll(
+    const rows = (await rawSql(db).all(
       'SELECT id, path FROM files ORDER BY path',
-    )).getRowObjects() as { id: string; path: string }[];
+    )) as { id: string; path: string }[];
     assertEquals(rows.length, 2);
     assertNotEquals(rows[0].id, rows[1].id);
   } finally {
-    db.close();
+    await db.close();
     await Deno.remove(dir, { recursive: true });
     await Deno.remove(root, { recursive: true });
   }
@@ -117,23 +118,23 @@ Deno.test('rescan keeps users and stable IDs', async () => {
       secret: 's3cret',
     });
     await scanLibrary(store);
-    const first = await db.conn.runAndReadAll(
+    const first = await rawSql(db).all(
       'SELECT id FROM files ORDER BY id',
     );
-    const firstIds = first.getRowObjects().map((r) => (r as { id: string }).id);
+    const firstIds = first.map((r) => (r as { id: string }).id);
 
     await scanLibrary(store);
-    const second = await db.conn.runAndReadAll(
+    const second = await rawSql(db).all(
       'SELECT id FROM files ORDER BY id',
     );
     assertEquals(
-      second.getRowObjects().map((r) => (r as { id: string }).id),
+      second.map((r) => (r as { id: string }).id),
       firstIds,
     );
-    const users = await db.conn.runAndReadAll(
+    const users = await rawSql(db).all(
       'SELECT count(*) AS n FROM users',
     );
-    assertEquals(Number((users.getRowObjects()[0] as { n: bigint }).n), 1);
+    assertEquals(Number((users[0] as { n: bigint }).n), 1);
   } finally {
     await close();
   }
@@ -143,31 +144,31 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
   const { db, store, close } = await setup();
   try {
     await scanLibrary(store);
-    await db.conn.run(
+    await rawSql(db).run(
       "INSERT INTO listens (user_id, track_id, played_at, duration_ms, source) VALUES ('u1', 't1', now(), 1000, 'opensubsonic')",
     );
-    await db.conn.run(
+    await rawSql(db).run(
       "INSERT INTO stars (user_id, target_id, target_type, starred_at) VALUES ('u1', 't1', 'song', now())",
     );
-    await db.conn.run(
+    await rawSql(db).run(
       `INSERT INTO star_events (user_id, target_id, target_type, action, occurred_at) VALUES ('u1', 't1', 'song', 'star', now())`,
     );
-    await db.conn.run(
+    await rawSql(db).run(
       "INSERT INTO ratings (user_id, target_id, rating) VALUES ('u1', 't1', 5)",
     );
-    await db.conn.run(
+    await rawSql(db).run(
       "INSERT INTO playlists (id, user_id, name, created_at, changed_at) VALUES ('p1', 'u1', 'Mix', now(), now())",
     );
-    await db.conn.run(
+    await rawSql(db).run(
       "INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES ('p1', 0, 't1')",
     );
-    await db.conn.run(
+    await rawSql(db).run(
       "INSERT INTO play_queues (user_id, current_id, position_ms, changed_at, track_ids) VALUES ('u1', 't1', 0, now(), ['t1'])",
     );
 
     await scanLibrary(store);
 
-    const res = await db.conn.runAndReadAll(
+    const res = await rawSql(db).all(
       `SELECT
         (SELECT count(*) FROM listens) AS listens,
         (SELECT count(*) FROM stars) AS stars,
@@ -177,7 +178,7 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
         (SELECT count(*) FROM playlist_tracks) AS playlist_tracks,
         (SELECT count(*) FROM play_queues) AS play_queues`,
     );
-    const row = res.getRowObjects()[0] as Record<string, bigint | number>;
+    const row = res[0] as Record<string, bigint | number>;
     for (
       const table of [
         'listens',
