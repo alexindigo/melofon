@@ -14,7 +14,7 @@ import {
   pagingParams,
   wireInt,
 } from '../layers/owntone/payloads.ts';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -188,7 +188,8 @@ type Page = {
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-protocol-params-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     dataDir: dir,
     user: 'U + 雪',
@@ -197,7 +198,7 @@ async function setup() {
     version: 'test',
     listen: undefined,
   };
-  await seedFirstUser(db, cfg);
+  await seedFirstUser(store, cfg);
   const libraries = createLibraries(db);
   await Deno.mkdir(`${dir}/music`);
   const source = await libraries.add('Music', `${dir}/music`);
@@ -231,9 +232,9 @@ async function setup() {
   const annotation = createAnnotation(db);
   const playlists = createPlaylists(db);
   const playlist = await playlists.create(cfg.user, 'Mix', songIds);
-  const bookmarks = createBookmarks(db);
-  const clientQueue = createClientQueue(db);
-  const nowPlaying = createNowPlaying(db);
+  const bookmarks = createBookmarks(store);
+  const clientQueue = createClientQueue(store);
+  const nowPlaying = createNowPlaying(store);
   const notify = createNotify();
   const player = createPlayer();
   const playback = createPlayback({ player, library, nowPlaying, cfg, notify });
@@ -258,7 +259,7 @@ async function setup() {
   const bag = {
     cfg,
     libraries,
-    user: createUserService(db, cfg),
+    user: createUserService(store, cfg),
     library: {
       ...library,
       search3: async (...args: Parameters<typeof library.search3>) => {
@@ -284,7 +285,7 @@ async function setup() {
     },
     bookmarks,
     clientQueue,
-    listens: createListens(db),
+    listens: createListens(store),
     nowPlaying,
     player,
     outputs,
@@ -314,7 +315,7 @@ async function setup() {
       },
     },
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, ...bag } });
+  const core = await pathfinder({ roots: ['core/'], app: { store, ...bag } });
   const layers = await loadLayers({ app: bag });
   const app = facade(core, layers);
   const own = facade(core, layers, {

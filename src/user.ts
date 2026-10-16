@@ -5,7 +5,7 @@
 // Success → { username, displayName }; failure → null. Unknown user and bad
 // password are indistinguishable to the caller (no user enumeration).
 import type { Config } from './config.ts';
-import type { Db } from './db.ts';
+import type { Store } from './store/index.ts';
 import { decryptPassword } from './users.ts';
 
 export interface StateUser {
@@ -24,31 +24,12 @@ export interface UserService {
   ): Promise<StateUser | null>;
 }
 
-function esc(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-/** Internal user id for a state username — user-state tables key on id. */
-export async function userIdForName(
-  db: Db,
-  username: string,
-): Promise<string | null> {
-  const res = await db.conn.runAndReadAll(
-    `SELECT id FROM users WHERE name = ${esc(username)}`,
-  );
-  const row = (res.getRowObjects() as { id: string }[])[0];
-  return row?.id ?? null;
-}
-
-export function createUserService(db: Db, cfg: Config): UserService {
+export function createUserService(store: Store, cfg: Config): UserService {
   async function passwordOf(username: string): Promise<string | null> {
     if (cfg.secret === undefined) return null;
-    const res = await db.conn.runAndReadAll(
-      `SELECT password_enc FROM users WHERE name = ${esc(username)}`,
-    );
-    const row = (res.getRowObjects() as { password_enc: string }[])[0];
-    if (!row) return null;
-    return await decryptPassword(cfg.secret, row.password_enc);
+    const encrypted = await store.users.passwordForName(username);
+    if (encrypted === null) return null;
+    return await decryptPassword(cfg.secret, encrypted);
   }
 
   return {
@@ -61,10 +42,7 @@ export function createUserService(db: Db, cfg: Config): UserService {
     async authMd5(username, token, salt) {
       const stored = await passwordOf(username);
       if (stored === null) return null;
-      const res = await db.conn.runAndReadAll(
-        `SELECT md5(${esc(stored + salt)}) AS h`,
-      );
-      const hash = (res.getRowObjects() as { h: string }[])[0].h;
+      const hash = await store.users.passwordToken(stored + salt);
       if (hash !== token.toLowerCase()) return null;
       return { username, displayName: username };
     },

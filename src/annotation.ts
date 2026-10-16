@@ -10,7 +10,7 @@
 // (e.g. OpenSubsonic's "most recent like") are derived by the hats.
 import type { Db } from './db.ts';
 import { folderMembership } from './library.ts';
-import { userIdForName } from './user.ts';
+import { userIdForName } from './store/users.ts';
 
 export type TargetType = 'song' | 'album' | 'artist';
 

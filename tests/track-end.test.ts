@@ -6,7 +6,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
@@ -39,7 +39,8 @@ function song(durationMs: number | null = 1): SongRow {
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-te-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const events: string[][] = [];
   const notify = createNotify();
   notify.subscribe((types) => events.push(types));
@@ -47,7 +48,7 @@ async function setup() {
   const library = createLibrary(db);
   const playback = createPlayback({
     player,
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library,
     cfg: {},
     notify,

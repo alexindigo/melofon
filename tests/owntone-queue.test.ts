@@ -3,7 +3,7 @@
 // playback commands. Fixture library + a seeded playlist ("Mix", one track).
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -22,7 +22,8 @@ const DEFAULT_PORT = 4534;
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-otq-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -31,7 +32,7 @@ async function setup() {
     secret: 's3cret',
     version: '0.0.0-test',
   };
-  await seedFirstUser(db, cfg);
+  await seedFirstUser(store, cfg);
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
@@ -55,7 +56,7 @@ async function setup() {
     outputs: createOutputs({ notify }),
     playback: createPlayback({
       player,
-      nowPlaying: createNowPlaying(db),
+      nowPlaying: createNowPlaying(store),
       library,
       cfg,
       notify,
@@ -63,7 +64,7 @@ async function setup() {
     notify,
     binds: createBinds(() => layers, {}),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const layers = await loadLayers({ app: bag });
   const app = facade(core, layers, {
     listenPort: HOOK,

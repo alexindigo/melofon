@@ -1,7 +1,7 @@
 // H4 browsing outcomes over the real scan, DuckDB services and HTTP facade.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -26,7 +26,8 @@ function items(container: unknown, key: string): Item[] {
 
 async function setup(fixture = true) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-h4-' });
-  const db = await openDb(`${dir}/db`);
+  const store = await openStore(`${dir}/db`);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -35,7 +36,7 @@ async function setup(fixture = true) {
     secret: 's3cret',
     version: 'test',
   };
-  await seedFirstUser(db, cfg);
+  await seedFirstUser(store, cfg);
   const libraries = createLibraries(db);
   const scan = createScan(db);
   const library = createLibrary(db);
@@ -48,11 +49,11 @@ async function setup(fixture = true) {
     libraries,
     scan,
     library,
-    user: createUserService(db, cfg),
+    user: createUserService(store, cfg),
     annotation: createAnnotation(db),
-    listens: createListens(db),
+    listens: createListens(store),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
   const request = async (
     op: string,

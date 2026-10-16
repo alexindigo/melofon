@@ -4,7 +4,7 @@ import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -196,7 +196,8 @@ Deno.test('H1 public exception never leaks to forged routes, methods or exclusiv
 
 Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach canonical consumers', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-capabilities-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
     const cfg = {
       listen: undefined,
@@ -205,13 +206,13 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
       password: AUTH.get('p')!,
       secret: 'H1-test-secret',
     };
-    await seedFirstUser(db, cfg);
+    await seedFirstUser(store, cfg);
     const libraries = createLibraries(db);
     await libraries.add('Fixture', 'tests/fixtures/library');
     await scanLibrary(db);
     const library = createLibrary(db);
     const annotation = createAnnotation(db);
-    const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+    const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
     const app = facade(
       core,
       await loadLayers({
@@ -220,8 +221,8 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
           libraries,
           library,
           annotation,
-          listens: createListens(db),
-          user: createUserService(db, cfg),
+          listens: createListens(store),
+          user: createUserService(store, cfg),
         },
       }),
     );

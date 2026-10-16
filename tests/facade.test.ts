@@ -10,13 +10,14 @@ import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 
 async function makeApps() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-facade-' });
-  const db = await openDb(dir);
-  const app = { db, cfg: {} };
+  const store = await openStore(dir);
+  const db = store.legacy;
+  const app = { store, cfg: {} };
   const core = await pathfinder({ roots: ['core/'], app });
   const layers = await loadLayers({ app, layersRoot: 'tests/fixtures/layers' });
   const close = async () => {

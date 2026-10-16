@@ -2,13 +2,14 @@
 // only when context.app.db is open.
 import { assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 
 Deno.test('GET /health on the core tree returns {"ok":true} with a live DuckDB', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-health-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
-    const app = await pathfinder({ roots: ['core/'], app: { db, cfg: {} } });
+    const app = await pathfinder({ roots: ['core/'], app: { store, cfg: {} } });
     const res = await app(new Request('http://x/health'));
     assertEquals(res.status, 200);
     assertEquals(await res.json(), { ok: true });
@@ -21,7 +22,7 @@ Deno.test('GET /health on the core tree returns {"ok":true} with a live DuckDB',
 Deno.test('GET /health on the core tree is 500 without a db on context.app', async () => {
   const app = await pathfinder({
     roots: ['core/'],
-    app: { db: null, cfg: {} },
+    app: { store: null, cfg: {} },
   });
   const res = await app(new Request('http://x/health'));
   assertEquals(res.status, 500);

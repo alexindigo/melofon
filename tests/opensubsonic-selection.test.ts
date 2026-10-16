@@ -2,7 +2,7 @@
 // Fixed catalog rows are independent oracles, never computed by Library queries.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { encryptPassword, seedFirstUser } from '../src/users.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
@@ -30,7 +30,8 @@ type Item = { id: string; year?: number; genre?: string; isVideo?: boolean };
 
 async function setup(large = false) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-selection-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -39,7 +40,7 @@ async function setup(large = false) {
     secret: 'fixture',
     version: 'test',
   };
-  await seedFirstUser(db, cfg);
+  await seedFirstUser(store, cfg);
   await db.conn.run(
     `INSERT INTO users VALUES ('bob-id', 'bob', ${
       sql(await encryptPassword(cfg.secret, 'test'))
@@ -116,11 +117,11 @@ async function setup(large = false) {
     cfg,
     libraries,
     library,
-    user: createUserService(db, cfg),
+    user: createUserService(store, cfg),
     annotation: createAnnotation(db),
-    listens: createListens(db),
+    listens: createListens(store),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const layers = await loadLayers({ app: bag });
   const app = facade(core, layers);
   const own = facade(core, layers, {

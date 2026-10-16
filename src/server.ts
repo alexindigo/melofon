@@ -6,7 +6,7 @@
 // handle.
 import { pathfinder } from '@pathfinder/pathfinder';
 import { loadConfig } from './config.ts';
-import { openDb } from './db.ts';
+import { openStore } from './store/index.ts';
 import { seedFirstUser } from './users.ts';
 import { createScan } from './scan.ts';
 import { createUserService } from './user.ts';
@@ -42,15 +42,16 @@ import { shutdownNativeLogging } from './boots/raop-ffi.ts';
 const log = scopedLog('server');
 
 const cfg = loadConfig();
-const db = await openDb(cfg.dataDir, {
+const store = await openStore(cfg.dataDir, {
   debugLogQueries: cfg.debugLogRequests,
 });
+const db = store.legacy;
 const persistence = createPersistence(db);
-await seedFirstUser(db, cfg);
+await seedFirstUser(store, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();
 const notify = createNotify();
-const state = createState(db);
+const state = createState(store);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
 const scan = createScan(db, media, { notify });
@@ -90,7 +91,7 @@ const discovery = createAirplayDiscovery({
 });
 const library = createLibrary(db);
 const player = createPlayer();
-const nowPlaying = createNowPlaying(db);
+const nowPlaying = createNowPlaying(store);
 const playback = createPlayback({
   player,
   nowPlaying,
@@ -100,7 +101,7 @@ const playback = createPlayback({
   persistence,
 });
 const app = {
-  db,
+  store,
   cfg,
   libraries,
   outputs,
@@ -183,13 +184,13 @@ const bag = {
   libraries,
   scan,
   media,
-  user: createUserService(db, cfg),
+  user: createUserService(store, cfg),
   library,
   annotation: createAnnotation(db),
-  listens: createListens(db),
+  listens: createListens(store),
   playlists: createPlaylists(db),
-  clientQueue: createClientQueue(db),
-  bookmarks: createBookmarks(db),
+  clientQueue: createClientQueue(store),
+  bookmarks: createBookmarks(store),
   nowPlaying,
   playback,
   stream: createStream(media, playback, cfg),
@@ -311,7 +312,7 @@ async function shutdown(): Promise<void> {
   shutdownNativeLogging();
   playback.close();
   await persistence.drain();
-  db.close();
+  await store.close();
   await appLogger().flush();
   Deno.exit(0);
 }

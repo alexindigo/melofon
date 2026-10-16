@@ -3,7 +3,8 @@
 // the unstar fallback for ids that left the catalog, batch facts, and listen
 // facts through current catalog membership.
 import { assert, assertEquals } from '@std/assert';
-import { type Db, openDb } from '../src/db.ts';
+import type { Db } from '../src/db.ts';
+import { openStore, type Store } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
@@ -63,13 +64,16 @@ async function events(db: Db): Promise<EventRow[]> {
   return rows.map((row) => ({ ...row, at_ms: Number(row.at_ms) }));
 }
 
-async function withDb(fn: (db: Db) => Promise<void>): Promise<void> {
+async function withDb(
+  fn: (db: Db, store: Store) => Promise<void>,
+): Promise<void> {
   const dir = await freshDir();
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
-    await seedFirstUser(db, { ...CFG, dataDir: dir });
+    await seedFirstUser(store, { ...CFG, dataDir: dir });
     await seedCatalog(db);
-    await fn(db);
+    await fn(db, store);
   } finally {
     db.close();
     await Deno.remove(dir, { recursive: true });
@@ -79,8 +83,9 @@ async function withDb(fn: (db: Db) => Promise<void>): Promise<void> {
 Deno.test('star history: legacy stars migrate once, in time order, never again', async () => {
   const dir = await freshDir();
   try {
-    let db = await openDb(dir);
-    await seedFirstUser(db, { ...CFG, dataDir: dir });
+    let store = await openStore(dir);
+    let db = store.legacy;
+    await seedFirstUser(store, { ...CFG, dataDir: dir });
     await seedCatalog(db);
     // Later star inserted first: the migration orders by time, not by row.
     await db.conn.run(
@@ -90,7 +95,8 @@ Deno.test('star history: legacy stars migrate once, in time order, never again',
     );
     db.close();
 
-    db = await openDb(dir);
+    store = await openStore(dir);
+    db = store.legacy;
     const migrated = [
       {
         user_id: 'u-legacy',
@@ -110,12 +116,14 @@ Deno.test('star history: legacy stars migrate once, in time order, never again',
     assertEquals(await events(db), migrated);
     db.close();
 
-    db = await openDb(dir);
+    store = await openStore(dir);
+    db = store.legacy;
     assertEquals(await events(db), migrated, 'a third open does not repeat');
     assert(await createAnnotation(db).star(CFG.user, 's1'));
     db.close();
 
-    db = await openDb(dir);
+    store = await openStore(dir);
+    db = store.legacy;
     const after = await events(db);
     assertEquals(after.length, 3, 'no re-migration after a new event');
     assertEquals(after.slice(0, 2), migrated);
@@ -246,8 +254,8 @@ Deno.test('star history: batch facts cover every id; the average is unrounded', 
 });
 
 Deno.test('listen facts: song/album/artist plays through current membership', async () => {
-  await withDb(async (db) => {
-    const listens = createListens(db);
+  await withDb(async (db, store) => {
+    const listens = createListens(store);
     await addUser(db, 'bob-id', 'bob');
     const at = (ms: number) => ({ source: 'test', playedAtMs: ms });
     assert(await listens.record(CFG.user, 's1', at(3000)));

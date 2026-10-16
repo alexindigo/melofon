@@ -18,7 +18,7 @@
 // and with delayed old-session cleanup. Packet counts establish wire
 // delivery — not decoded sample identity, and not an Apple TV DAC rendering.
 import { assert, assertEquals } from '@std/assert';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import type { Media } from '../src/media.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
@@ -194,14 +194,15 @@ function closeGate(): { gate: Promise<void>; release: () => void } {
 async function feedSetup() {
   FeedFakeTransport.feed = null;
   const dir = await Deno.makeTempDir({ prefix: 'melofon-rec-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
   const library = createLibrary(db);
   const playback = createPlayback({
     player,
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library,
     cfg: {},
     notify,
@@ -553,14 +554,15 @@ async function integrationSetup(opts: {
   companionFirst?: boolean;
 }): Promise<Integration> {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-rec-ffi-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
   const library = createLibrary(db);
   const playback = createPlayback({
     player,
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library,
     cfg: {},
     notify,

@@ -5,7 +5,7 @@
 // per test; no auth on this hat (LAN).
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
@@ -23,7 +23,8 @@ const DEFAULT_PORT = 4534;
 
 async function setup(env: Record<string, string> = {}) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ot-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -50,7 +51,7 @@ async function setup(env: Record<string, string> = {}) {
     binds: createBinds(() => layers, env),
     playback: createPlayback({
       player,
-      nowPlaying: createNowPlaying(db),
+      nowPlaying: createNowPlaying(store),
       library,
       cfg,
     }),
@@ -58,7 +59,7 @@ async function setup(env: Record<string, string> = {}) {
   const core = await pathfinder({
     roots: ['core/'],
     app: {
-      db,
+      store,
       cfg,
       outputs,
       airplay: devices,

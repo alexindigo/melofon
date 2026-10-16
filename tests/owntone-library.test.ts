@@ -5,7 +5,7 @@
 // substring-matched like OwnTone's C (track ≡ tracks).
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -29,7 +29,8 @@ async function setup(
 ) {
   const { seedUser = true, withPlaylist = true } = opts;
   const dir = await Deno.makeTempDir({ prefix: 'melofon-otlib-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -38,7 +39,7 @@ async function setup(
     secret: 's3cret',
     version: '0.0.0-test',
   };
-  if (seedUser) await seedFirstUser(db, cfg);
+  if (seedUser) await seedFirstUser(store, cfg);
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
   const scan = createScan(db);
@@ -56,7 +57,7 @@ async function setup(
   }
   const notify = createNotify();
   const player = createPlayer();
-  const nowPlaying = createNowPlaying(db);
+  const nowPlaying = createNowPlaying(store);
   const bag = {
     cfg,
     startedAt: STARTED_AT,
@@ -71,7 +72,7 @@ async function setup(
     notify,
     binds: createBinds(() => layers, {}),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const layers = await loadLayers({ app: bag });
   const app = facade(core, layers, {
     listenPort: HOOK,

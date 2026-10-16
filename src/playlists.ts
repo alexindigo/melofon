@@ -3,7 +3,7 @@
 // (another user's playlist is indistinguishable from a missing one).
 // Positions are rewritten 0..n-1 on every mutation — no fractional ordering.
 import type { Db } from './db.ts';
-import { userIdForName } from './user.ts';
+import { userIdForName } from './store/users.ts';
 
 export interface PlaylistRow {
   id: string;

@@ -11,7 +11,7 @@ import {
   assertThrows,
 } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
@@ -62,13 +62,14 @@ function song(durationMs: number | null = 180_000): SongRow {
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-prov-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const player = createPlayer();
   const { log, lines: logs } = captureLogs();
   const playback = createPlayback({
     log,
     player,
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library: createLibrary(db),
     cfg: {},
   });
@@ -202,7 +203,8 @@ Deno.test('restore is recorded with via restore and keeps engine purity', async 
 /** Full facade harness: real hats, real core, in-memory requests. */
 async function setupWire() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-prov-wire-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -214,7 +216,7 @@ async function setupWire() {
   const libraries = createLibraries(db);
   const notify = createNotify();
   const player = createPlayer();
-  const nowPlaying = createNowPlaying(db);
+  const nowPlaying = createNowPlaying(store);
   const library = createLibrary(db);
   const { log, lines: logs } = captureLogs();
   const playback = createPlayback({
@@ -228,9 +230,9 @@ async function setupWire() {
   const bag = {
     cfg,
     libraries,
-    user: createUserService(db, cfg),
+    user: createUserService(store, cfg),
     library,
-    listens: createListens(db),
+    listens: createListens(store),
     nowPlaying,
     player,
     outputs: createOutputs({ notify, log }),
@@ -241,7 +243,7 @@ async function setupWire() {
   };
   const core = await pathfinder({
     roots: ['core/'],
-    app: { db, cfg, playback, outputs: bag.outputs },
+    app: { store, cfg, playback, outputs: bag.outputs },
   });
   const layers = await loadLayers({ app: bag });
   const onHook = facade(core, layers, {

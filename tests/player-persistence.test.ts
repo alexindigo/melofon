@@ -5,7 +5,7 @@
 // saved place; missing tracks drop and the current index remaps; the 1 Hz
 // tick keeps position_ms current while playing and stops when paused.
 import { assert, assertEquals } from '@std/assert';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createLogger, type Log } from '../src/logging.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
@@ -46,12 +46,13 @@ function song(durationMs: number | null = 180_000): SongRow {
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-persist-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const persistence = createPersistence(db);
   const player = createPlayer();
   const playback = createPlayback({
     player,
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library: createLibrary(db),
     cfg: {},
     persistence,
@@ -72,7 +73,8 @@ async function setup() {
 
 /** Reopen the same data dir: a fresh db handle + store, like a restart. */
 async function reopen(dir: string) {
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const persistence = createPersistence(db);
   return {
     db,
@@ -506,7 +508,8 @@ Deno.test('unregister keeps the persisted row (last-seen state)', async () => {
 
 Deno.test('a failed save is drained and counted once; a broken logger is harmless', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-persist-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const logger = createLogger({
     sinks: {
       stdout: () => {

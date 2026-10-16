@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { encodeHex } from '@std/encoding/hex';
-import { type Db, openDb } from '../src/db.ts';
+import type { Db } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createMedia } from '../src/media.ts';
 import { createScan, scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -50,7 +51,8 @@ async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-identity-' });
   const root = `${dir}/music`;
   await Deno.mkdir(root);
-  const db = await openDb(`${dir}/db`);
+  const store = await openStore(`${dir}/db`);
+  const db = store.legacy;
   const libraries = createLibraries(db);
   const source = await libraries.add('Music', root);
   const media = createMedia() as ReturnType<typeof createMedia> & {
@@ -74,6 +76,7 @@ async function setup() {
     dir,
     root,
     db,
+    store,
     source,
     libraries,
     identity,
@@ -148,7 +151,7 @@ Deno.test('identity: within-library move and rename preserve user-state joins an
     await t.scan();
     const [{ id }] = await catalog(t.db);
     const first = await t.identity.firstSeen([id]);
-    await seedFirstUser(t.db, {
+    await seedFirstUser(t.store, {
       dataDir: '',
       listen: undefined,
       user: 'admin',
@@ -156,7 +159,7 @@ Deno.test('identity: within-library move and rename preserve user-state joins an
       secret: 'test-secret',
     });
     const annotation = createAnnotation(t.db);
-    const listens = createListens(t.db);
+    const listens = createListens(t.store);
     assert(await annotation.star('admin', id));
     assert(await annotation.setRating('admin', id, 5));
     assert(

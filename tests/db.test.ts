@@ -1,7 +1,8 @@
 // tests/db.test.ts — openDb creates the file + schema; seedFirstUser inserts
 // once, encrypts the password, never overwrites existing users.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
-import { instrumentConn, openDb } from '../src/db.ts';
+import { instrumentConn } from '../src/store/engine.ts';
+import { openStore } from '../src/store/index.ts';
 import type * as duckdb from '@duckdb/node-api';
 import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 import {
@@ -16,7 +17,8 @@ async function tmpdir(): Promise<string> {
 
 Deno.test('openDb creates melofon.duckdb with the M0 tables', async () => {
   const dir = await tmpdir();
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
     const stat = await Deno.stat(`${dir}/melofon.duckdb`);
     assert(stat.isFile);
@@ -32,7 +34,8 @@ Deno.test('openDb creates melofon.duckdb with the M0 tables', async () => {
 
 Deno.test('openDb creates the M2 user-state tables', async () => {
   const dir = await tmpdir();
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
     const res = await db.conn.runAndReadAll(
       "SELECT table_name FROM information_schema.tables WHERE table_name IN ('listens', 'stars', 'star_events', 'ratings', 'playlists', 'playlist_tracks', 'play_queues')",
@@ -46,9 +49,10 @@ Deno.test('openDb creates the M2 user-state tables', async () => {
 
 Deno.test('seedFirstUser inserts one row with an encrypted password', async () => {
   const dir = await tmpdir();
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
-    await seedFirstUser(db, {
+    await seedFirstUser(store, {
       listen: undefined,
       dataDir: dir,
       user: 'admin',
@@ -74,7 +78,8 @@ Deno.test('seedFirstUser inserts one row with an encrypted password', async () =
 
 Deno.test('seedFirstUser does not overwrite existing users', async () => {
   const dir = await tmpdir();
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
     const cfg = {
       listen: undefined,
@@ -83,8 +88,8 @@ Deno.test('seedFirstUser does not overwrite existing users', async () => {
       password: 'first',
       secret: 's3cret',
     };
-    await seedFirstUser(db, cfg);
-    await seedFirstUser(db, { ...cfg, password: 'second' });
+    await seedFirstUser(store, cfg);
+    await seedFirstUser(store, { ...cfg, password: 'second' });
     const res = await db.conn.runAndReadAll(
       'SELECT count(*) AS n FROM users',
     );

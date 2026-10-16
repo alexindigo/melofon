@@ -4,7 +4,7 @@
 // second store. Components subscribe with onChange for live toggles (e.g.
 // AirPlay mDNS discovery). Env/toml stay first-boot seeds (seedIfUnset) —
 // they never stomp an operator's persisted choice.
-import type { Db } from './db.ts';
+import type { Store } from './store/index.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   CONNECTION_STRATEGY_DEFAULT_KEY,
@@ -23,11 +23,10 @@ export interface State {
   onChange(fn: (key: string, value: string) => void): () => void;
 }
 
-function esc(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-export function createState(db: Db, log: Log = scopedLog('state')): State {
+export function createState(
+  store: Store,
+  log: Log = scopedLog('state'),
+): State {
   const listeners = new Set<(key: string, value: string) => void>();
   const emit = (key: string, value: string) => {
     for (const fn of [...listeners]) {
@@ -40,59 +39,27 @@ export function createState(db: Db, log: Log = scopedLog('state')): State {
     }
   };
 
-  const get = async (key: string): Promise<string | null> => {
-    const res = await db.conn.runAndReadAll(
-      `SELECT value FROM state WHERE key = ${esc(key)}`,
-    );
-    const row = (res.getRowObjects() as { value: string }[])[0];
-    return row === undefined ? null : row.value;
-  };
-
   return {
-    get,
+    get: store.state.get,
 
     async set(key, value) {
       if (key === CONNECTION_STRATEGY_DEFAULT_KEY) {
         requireConnectionStrategy(value);
       }
-      await db.conn.run(
-        `INSERT OR REPLACE INTO state (key, value) VALUES (${esc(key)}, ${
-          esc(value)
-        })`,
-      );
+      await store.state.set(key, value);
       emit(key, value);
     },
 
     async seedIfUnset(key, value) {
       if (key === CONNECTION_STRATEGY_DEFAULT_KEY) {
         requireConnectionStrategy(value);
-        const res = await db.conn.runAndReadAll(
-          `INSERT INTO state (key, value) VALUES (${esc(key)}, ${esc(value)})
-           ON CONFLICT (key) DO NOTHING RETURNING value`,
-        );
-        if (res.getRowObjects().length === 0) return false;
-        emit(key, value);
-        return true;
       }
-      if (await get(key) !== null) return false;
-      await db.conn.run(
-        `INSERT INTO state (key, value) VALUES (${esc(key)}, ${esc(value)})`,
-      );
+      if (!await store.state.seedIfUnset(key, value)) return false;
       emit(key, value);
       return true;
     },
 
-    async list() {
-      const res = await db.conn.runAndReadAll(
-        'SELECT key, value FROM state ORDER BY key',
-      );
-      return Object.fromEntries(
-        (res.getRowObjects() as { key: string; value: string }[]).map((r) => [
-          r.key,
-          r.value,
-        ]),
-      );
-    },
+    list: store.state.list,
 
     onChange(fn) {
       listeners.add(fn);

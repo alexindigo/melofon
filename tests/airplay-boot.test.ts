@@ -6,7 +6,7 @@
 // down, volume and pin reach the helper, and a helper "password" event
 // flips needsAuthKey on the output row.
 import { assert, assertEquals } from '@std/assert';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createMedia, type Media } from '../src/media.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
@@ -123,14 +123,15 @@ async function setup(
   } = {},
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const notify = createNotify();
   const outputs = createOutputs({ notify });
   const player = createPlayer();
   const library = createLibrary(db);
   const playback = createPlayback({
     player,
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library,
     cfg: {},
     notify,
@@ -773,7 +774,8 @@ async function recycleSetup(
   } = {},
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-ap-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const notify = createNotify();
   const outputs = createOutputs({ notify, log: overrides.log });
   const player = createPlayer();
@@ -781,7 +783,7 @@ async function recycleSetup(
   const playback = createPlayback({
     log: overrides.log,
     player,
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library,
     cfg: {},
     notify,

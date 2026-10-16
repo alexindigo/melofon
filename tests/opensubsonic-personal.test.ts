@@ -6,7 +6,7 @@
 // HTTP routes; the catalog comes from the fixture library.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { encryptPassword, seedFirstUser } from '../src/users.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -38,7 +38,8 @@ const sql = (s: string) => `'${s.replaceAll("'", "''")}'`;
 
 async function setup(split = false) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-personal-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -47,7 +48,7 @@ async function setup(split = false) {
     secret: 's3cret',
     version: '0.0.0-test',
   };
-  await seedFirstUser(db, cfg);
+  await seedFirstUser(store, cfg);
   await db.conn.run(
     `INSERT INTO users VALUES ('bob-id', 'bob', ${
       sql(await encryptPassword(cfg.secret, 'test'))
@@ -64,21 +65,21 @@ async function setup(split = false) {
   await scan.run();
   const library = createLibrary(db);
   const player = createPlayer();
-  const nowPlaying = createNowPlaying(db);
+  const nowPlaying = createNowPlaying(store);
   const bag = {
     cfg,
     libraries,
     scan,
-    user: createUserService(db, cfg),
+    user: createUserService(store, cfg),
     library,
     annotation: createAnnotation(db),
-    listens: createListens(db),
+    listens: createListens(store),
     playlists: createPlaylists(db),
     nowPlaying,
     player,
     playback: createPlayback({ player, nowPlaying, library, cfg }),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
 
   const rows = (await db.conn.runAndReadAll(

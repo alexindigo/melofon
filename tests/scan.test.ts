@@ -4,7 +4,7 @@
 // The fixture root is registered as a libraries row (M3 sources); the scan
 // walks every configured source.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { createScan, scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -15,10 +15,12 @@ const FIXTURE_LIBRARY = 'tests/fixtures/library';
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-scan-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   await createLibraries(db).add('Music', FIXTURE_LIBRARY);
   return {
     dir,
+    store,
     db,
     close: async () => {
       db.close();
@@ -80,7 +82,8 @@ Deno.test('same-named files in different dirs get distinct ids', async () => {
   // the files PRIMARY KEY and rolls back the whole scan.
   const dir = await Deno.makeTempDir({ prefix: 'melofon-dupes-db-' });
   const root = await Deno.makeTempDir({ prefix: 'melofon-dupes-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   try {
     const fixture =
       'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3';
@@ -104,9 +107,9 @@ Deno.test('same-named files in different dirs get distinct ids', async () => {
 });
 
 Deno.test('rescan keeps users and stable IDs', async () => {
-  const { db, close } = await setup();
+  const { db, store, close } = await setup();
   try {
-    await seedFirstUser(db, {
+    await seedFirstUser(store, {
       listen: undefined,
       dataDir: '',
       user: 'admin',

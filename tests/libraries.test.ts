@@ -6,7 +6,7 @@
 // filters the browse ops.
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -23,7 +23,8 @@ const ROOT_B = 'tests/fixtures/library/Various Artists';
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-libs-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -32,14 +33,15 @@ async function setup() {
     secret: 's3cret',
     version: '0.0.0-test',
   };
-  await seedFirstUser(db, cfg);
+  await seedFirstUser(store, cfg);
   const libraries = createLibraries(db);
   const core = await pathfinder({
     roots: ['core/'],
-    app: { db, cfg, libraries },
+    app: { store, cfg, libraries },
   });
   return {
     db,
+    store,
     dir,
     cfg,
     libraries,
@@ -162,7 +164,7 @@ Deno.test('core /_/libraries CRUD validates input and round-trips rows', async (
 });
 
 Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolderId filters', async () => {
-  const { db, cfg, core, libraries, close } = await setup();
+  const { db, store, cfg, core, libraries, close } = await setup();
   try {
     const a = await addViaApi(core, 'A root', ROOT_A);
     await addViaApi(core, 'B root', ROOT_B);
@@ -170,10 +172,10 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
     const bag = {
       cfg,
       libraries,
-      user: createUserService(db, cfg),
+      user: createUserService(store, cfg),
       library: createLibrary(db),
       annotation: createAnnotation(db),
-      listens: createListens(db),
+      listens: createListens(store),
     };
     const app = facade(core, await loadLayers({ app: bag }));
     const get = async (op: string, extra = '') => {

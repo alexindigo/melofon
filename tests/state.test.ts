@@ -3,16 +3,18 @@
 // /_/config endpoints (list + put) the Settings UI will form over.
 import { assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createState } from '../src/state.ts';
 import { captureLogs } from './helpers/logging.ts';
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-state-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   return {
     dir,
     db,
+    store,
     close: async (keep = false) => {
       db.close();
       if (!keep) await Deno.remove(dir, { recursive: true });
@@ -21,9 +23,9 @@ async function setup() {
 }
 
 Deno.test('state: get/set/list round-trip, onChange fires live', async () => {
-  const { db, close } = await setup();
+  const { store, close } = await setup();
   try {
-    const state = createState(db);
+    const state = createState(store);
     assertEquals(await state.get('airplay.mdns'), null);
 
     const seen: [string, string][] = [];
@@ -48,9 +50,9 @@ Deno.test('state: get/set/list round-trip, onChange fires live', async () => {
 });
 
 Deno.test('state: persists across reopen; seedIfUnset never stomps', async () => {
-  const { dir, db, close } = await setup();
+  const { dir, db, store, close } = await setup();
   try {
-    const state = createState(db);
+    const state = createState(store);
     assertEquals(await state.seedIfUnset('airplay.mdns', 'off'), true);
     assertEquals(await state.get('airplay.mdns'), 'off');
 
@@ -61,8 +63,9 @@ Deno.test('state: persists across reopen; seedIfUnset never stomps', async () =>
 
     // Reopen the same database file: values persist.
     db.close();
-    const db2 = await openDb(dir);
-    const state2 = createState(db2);
+    const store2 = await openStore(dir);
+    const db2 = store2.legacy;
+    const state2 = createState(store2);
     assertEquals(await state2.get('airplay.mdns'), 'on');
     db2.close();
   } finally {
@@ -72,13 +75,13 @@ Deno.test('state: persists across reopen; seedIfUnset never stomps', async () =>
 });
 
 Deno.test('core /_/config: list and put', async () => {
-  const { db, close } = await setup();
+  const { store, close } = await setup();
   try {
-    const state = createState(db);
+    const state = createState(store);
     const { log, records } = captureLogs();
     const core = await pathfinder({
       roots: ['core/'],
-      app: { db, state, log },
+      app: { store, state, log },
     });
 
     const put = (key: string, body: string, json = true) =>

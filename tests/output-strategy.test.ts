@@ -1,7 +1,7 @@
 // Native settings → output/cache/DB → reopen → native settings consumer.
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs } from '../src/player.ts';
 import { createPersistence } from '../src/persistence.ts';
@@ -29,9 +29,10 @@ async function ready(outputs: ReturnType<typeof createOutputs>) {
 
 async function setup(dir?: string) {
   const data = dir ?? await Deno.makeTempDir({ prefix: 'melofon-strategy-' });
-  const db = await openDb(data);
+  const store = await openStore(data);
+  const db = store.legacy;
   const persistence = createPersistence(db);
-  const state = createState(db);
+  const state = createState(store);
   const notify = createNotify();
   const deps = { persistence, state, notify };
   const outputs = createOutputs(deps);
@@ -213,7 +214,8 @@ Deno.test('strategies: migration backfills legacy Melofon, does not overwrite sa
     );
     await s.state.set(KEY, 'owntone');
     s.db.close();
-    const db = await openDb(s.data);
+    const store = await openStore(s.data);
+    const db = store.legacy;
     try {
       const p = createPersistence(db);
       assertEquals(strategy((await p.loadOutputs())[0]), 'melofon');

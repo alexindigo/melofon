@@ -4,7 +4,7 @@
 // namespace on context.app.library.
 import { parseFile } from 'music-metadata';
 import type { Db } from './db.ts';
-import { userIdForName } from './user.ts';
+import { userIdForName } from './store/users.ts';
 
 export interface ArtistRow {
   id: string;

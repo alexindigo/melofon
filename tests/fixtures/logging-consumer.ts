@@ -138,7 +138,7 @@ if (mode === 'streams') {
   }
 } else if (mode === 'families') {
   const { pathfinder } = await import('@pathfinder/pathfinder');
-  const { openDb } = await import('../../src/db.ts');
+  const { openStore } = await import('../../src/store/index.ts');
   const { facade } = await import('../../src/facade.ts');
   const { createPlayer, createOutputs } = await import('../../src/player.ts');
   const { createPlayback } = await import('../../src/playback.ts');
@@ -148,14 +148,18 @@ if (mode === 'streams') {
   const { createRequire } = await import('node:module');
   const { Log, AV_LOG_ERROR } = await import('node-av');
   const data = await Deno.makeTempDir({ prefix: 'logging-families-' });
-  const db = await openDb(data, { debugLogQueries: true });
+  const store = await openStore(data, { debugLogQueries: true });
+  const db = store.legacy;
   const playback = createPlayback({
     player: createPlayer(),
-    nowPlaying: createNowPlaying(db),
+    nowPlaying: createNowPlaying(store),
     library: createLibrary(db),
     cfg: {},
   });
-  const app = await pathfinder({ roots: ['core/'], app: { db, cfg: {}, log } });
+  const app = await pathfinder({
+    roots: ['core/'],
+    app: { store, cfg: {}, log },
+  });
   const server = Deno.serve({
     hostname: '127.0.0.1',
     port: 0,

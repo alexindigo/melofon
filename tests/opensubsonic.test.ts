@@ -4,7 +4,7 @@
 // layer. Fixture library + seeded admin/test user per test.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { openDb } from '../src/db.ts';
+import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -17,7 +17,8 @@ const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-os-' });
-  const db = await openDb(dir);
+  const store = await openStore(dir);
+  const db = store.legacy;
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -26,17 +27,17 @@ async function setup() {
     secret: 's3cret',
     version: '0.0.0-test',
   };
-  await seedFirstUser(db, cfg);
+  await seedFirstUser(store, cfg);
   const libraries = createLibraries(db);
   await libraries.add('Music', 'tests/fixtures/library');
   await scanLibrary(db);
   const bag = {
     cfg,
     libraries,
-    user: createUserService(db, cfg),
+    user: createUserService(store, cfg),
     library: createLibrary(db),
   };
-  const core = await pathfinder({ roots: ['core/'], app: { db, cfg } });
+  const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));
   return {
     db,

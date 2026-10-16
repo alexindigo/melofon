@@ -5,7 +5,7 @@
 // Never log the secret or the password.
 import { encodeHex } from '@std/encoding/hex';
 import type { Config } from './config.ts';
-import type { Db } from './db.ts';
+import type { Store } from './store/index.ts';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -51,14 +51,8 @@ export async function decryptPassword(
   return decoder.decode(pt);
 }
 
-function esc(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-export async function seedFirstUser(db: Db, cfg: Config): Promise<void> {
-  const res = await db.conn.runAndReadAll('SELECT count(*) AS n FROM users');
-  const rows = res.getRowObjects() as { n: bigint | number }[];
-  const count = Number(rows[0]?.n ?? 0);
+export async function seedFirstUser(store: Store, cfg: Config): Promise<void> {
+  const count = await store.users.count();
   if (count > 0) return; // existing users are never overwritten from env
   if (!cfg.user || !cfg.password) return;
   if (!cfg.secret) {
@@ -67,9 +61,5 @@ export async function seedFirstUser(db: Db, cfg: Config): Promise<void> {
     );
   }
   const enc = await encryptPassword(cfg.secret, cfg.password);
-  await db.conn.run(
-    `INSERT INTO users (id, name, password_enc, created_at) VALUES (${
-      esc(crypto.randomUUID())
-    }, ${esc(cfg.user)}, ${esc(enc)}, now())`,
-  );
+  await store.users.seedFirst(crypto.randomUUID(), cfg.user, enc);
 }
