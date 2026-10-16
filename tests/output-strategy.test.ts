@@ -31,7 +31,7 @@ async function setup(dir?: string) {
   const data = dir ?? await Deno.makeTempDir({ prefix: 'melofon-strategy-' });
   const store = await openStore(data);
   const db = store.legacy;
-  const persistence = createPersistence(db);
+  const persistence = createPersistence(store);
   const state = createState(store);
   const notify = createNotify();
   const deps = { persistence, state, notify };
@@ -217,7 +217,7 @@ Deno.test('strategies: migration backfills legacy Melofon, does not overwrite sa
     const store = await openStore(s.data);
     const db = store.legacy;
     try {
-      const p = createPersistence(db);
+      const p = createPersistence(store);
       assertEquals(strategy((await p.loadOutputs())[0]), 'melofon');
       await db.conn.run(
         "UPDATE output_state SET connection_strategy='corrupt' WHERE id='legacy'",

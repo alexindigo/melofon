@@ -48,7 +48,7 @@ async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-persist-' });
   const store = await openStore(dir);
   const db = store.legacy;
-  const persistence = createPersistence(db);
+  const persistence = createPersistence(store);
   const player = createPlayer();
   const playback = createPlayback({
     player,
@@ -75,7 +75,7 @@ async function setup() {
 async function reopen(dir: string) {
   const store = await openStore(dir);
   const db = store.legacy;
-  const persistence = createPersistence(db);
+  const persistence = createPersistence(store);
   return {
     db,
     persistence,
@@ -528,7 +528,7 @@ Deno.test('a failed save is drained and counted once; a broken logger is harmles
     },
   };
   try {
-    const persistence = createPersistence(db, log);
+    const persistence = createPersistence(store, log);
     db.close();
     persistence.saveQueue(['a', 'b']);
     await persistence.drain();

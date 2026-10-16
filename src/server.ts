@@ -46,7 +46,7 @@ const store = await openStore(cfg.dataDir, {
   debugLogQueries: cfg.debugLogRequests,
 });
 const db = store.legacy;
-const persistence = createPersistence(db);
+const persistence = createPersistence(store);
 await seedFirstUser(store, cfg);
 const libraries = createLibraries(db);
 const media = createMedia();

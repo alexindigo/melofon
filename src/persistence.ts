@@ -1,12 +1,8 @@
-// src/persistence.ts — the DuckDB adapter for the player and outputs
-// persistence ports (server_queue / player_state / output_state — plan
-// restart-transparency). The engine is synchronous, so saves are
-// fire-and-forget, serialized on one tail so a fast run of commands can't
-// interleave a DELETE/INSERT pair with the next mutation's (the spike
-// measured p99 ~12 ms on the one connection — cheap). Loads are awaited
-// once at boot. drain() lets tests await the tail before closing and
-// reopening the db.
-import type { Db } from './db.ts';
+// src/persistence.ts — the store adapter for the player and outputs
+// persistence ports. The engine is synchronous, so saves are fire-and-forget,
+// serialized on one tail. Loads are awaited once at boot. drain() lets tests
+// await the tail before closing and reopening the store.
+import type { Store } from './store/index.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   DEFAULT_CONNECTION_STRATEGY,
@@ -16,16 +12,10 @@ import type {
   OutputPersistence,
   PersistedOutput,
   PlayerPersistence,
-  PlayerState,
-  PlayerStateSnapshot,
-  RepeatMode,
 } from './player.ts';
+import type { PersistedPlayerState } from './store/playback.ts';
 
-/** The persisted engine snapshot plus the resume-freshness reference. */
-export interface PersistedPlayerState extends PlayerStateSnapshot {
-  /** Wall-clock ms of the last write (player_state.updated_at). */
-  updatedAtMs: number;
-}
+export type { PersistedPlayerState } from './store/playback.ts';
 
 export interface Persistence extends PlayerPersistence, OutputPersistence {
   /** The persisted queue, pos-ordered library song ids. */
@@ -41,12 +31,8 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   drain(): Promise<void>;
 }
 
-function esc(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
 export function createPersistence(
-  db: Db,
+  store: Store,
   log: Log = scopedLog('persistence'),
 ): Persistence {
   let tail: Promise<void> = Promise.resolve();
@@ -59,89 +45,16 @@ export function createPersistence(
 
   return {
     saveQueue(songIds) {
-      enqueue(async () => {
-        // DELETE+INSERT in one transaction: a SIGKILL between them must not
-        // persist an empty queue over a full one.
-        await db.conn.run('BEGIN TRANSACTION');
-        try {
-          await db.conn.run('DELETE FROM server_queue');
-          if (songIds.length > 0) {
-            const values = songIds
-              .map((id, pos) => `(${pos}, ${esc(id)})`)
-              .join(', ');
-            await db.conn.run(
-              `INSERT INTO server_queue (pos, song_id) VALUES ${values}`,
-            );
-          }
-          await db.conn.run('COMMIT');
-        } catch (err) {
-          await db.conn.run('ROLLBACK').catch(() => {});
-          throw err;
-        }
-      });
+      enqueue(() => store.playback.saveQueue(songIds));
     },
 
     saveState(snapshot) {
-      enqueue(async () => {
-        await db.conn.run(
-          `INSERT INTO player_state (id, state, current_index, position_ms,
-             repeat, shuffle, consume, updated_at)
-           VALUES (1, ${esc(snapshot.state)},
-             ${
-            snapshot.currentIndex === null
-              ? 'NULL'
-              : Math.trunc(snapshot.currentIndex)
-          },
-             ${Math.trunc(snapshot.positionMs)},
-             ${esc(snapshot.repeat)}, ${snapshot.shuffle}, ${snapshot.consume},
-             now())
-           ON CONFLICT (id) DO UPDATE SET
-             state = excluded.state,
-             current_index = excluded.current_index,
-             position_ms = excluded.position_ms,
-             repeat = excluded.repeat,
-             shuffle = excluded.shuffle,
-             consume = excluded.consume,
-             updated_at = excluded.updated_at`,
-        );
-      });
+      enqueue(() => store.playback.saveState(snapshot));
     },
 
-    async loadQueue() {
-      const res = await db.conn.runAndReadAll(
-        'SELECT song_id FROM server_queue ORDER BY pos',
-      );
-      return (res.getRowObjects() as { song_id: string }[]).map((r) =>
-        r.song_id
-      );
-    },
+    loadQueue: () => store.playback.loadQueue(),
 
-    async loadPlayerState() {
-      const res = await db.conn.runAndReadAll(
-        `SELECT state, current_index, position_ms, repeat, shuffle, consume,
-                epoch_ms(updated_at)::BIGINT AS updated_ms
-         FROM player_state WHERE id = 1`,
-      );
-      const row = (res.getRowObjects() as {
-        state: string;
-        current_index: number | null;
-        position_ms: number | bigint | null;
-        repeat: string | null;
-        shuffle: boolean | null;
-        consume: boolean | null;
-        updated_ms: number | bigint | null;
-      }[])[0];
-      if (row === undefined) return null;
-      return {
-        state: row.state as PlayerState,
-        currentIndex: row.current_index,
-        positionMs: row.position_ms === null ? 0 : Number(row.position_ms),
-        repeat: (row.repeat ?? 'off') as RepeatMode,
-        shuffle: row.shuffle ?? false,
-        consume: row.consume ?? false,
-        updatedAtMs: Number(row.updated_ms ?? 0),
-      };
-    },
+    loadPlayerState: () => store.playback.loadPlayerState(),
 
     saveOutput(row) {
       const connectionStrategy = requireConnectionStrategy(
@@ -149,56 +62,14 @@ export function createPersistence(
       );
       row = { ...row, connectionStrategy };
       outputCache.set(row.id, row);
-      enqueue(async () => {
-        await db.conn.run(
-          `INSERT INTO output_state (id, host, port, name, type, selected,
-             volume, model, connection_strategy)
-           VALUES (${esc(row.id)},
-             ${row.host === undefined ? 'NULL' : esc(row.host)},
-             ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
-             ${esc(row.name)}, ${esc(row.type)},
-             ${row.selected}, ${Math.trunc(row.volume)},
-             ${row.model === undefined ? 'NULL' : esc(row.model)}, ${
-            esc(connectionStrategy)
-          })
-           ON CONFLICT (id) DO UPDATE SET
-             host = excluded.host,
-             port = excluded.port,
-             name = excluded.name,
-             type = excluded.type,
-             selected = excluded.selected,
-             volume = excluded.volume,
-             model = excluded.model,
-             connection_strategy = excluded.connection_strategy`,
-        );
-      });
+      enqueue(() => store.playback.saveOutput({ ...row, connectionStrategy }));
     },
 
     async loadOutputs() {
-      const res = await db.conn.runAndReadAll(
-        'SELECT id, host, port, name, type, selected, volume, model, connection_strategy FROM output_state',
-      );
-      const rows = (res.getRowObjects() as {
-        id: string;
-        host: string | null;
-        port: number | null;
-        name: string | null;
-        type: string | null;
-        selected: boolean;
-        volume: number;
-        model: string | null;
-        connection_strategy: string | null;
-      }[]).map((row) => ({
-        id: row.id,
-        ...(row.host === null ? {} : { host: row.host }),
-        ...(row.port === null ? {} : { port: Number(row.port) }),
-        name: row.name ?? '',
-        type: row.type ?? '',
-        selected: row.selected,
-        volume: Number(row.volume),
-        ...(row.model === null ? {} : { model: row.model }),
+      const rows = (await store.playback.loadOutputs()).map((row) => ({
+        ...row,
         connectionStrategy: requireConnectionStrategy(
-          row.connection_strategy ?? DEFAULT_CONNECTION_STRATEGY,
+          row.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY,
         ),
       }));
       for (const row of rows) outputCache.set(row.id, row);
