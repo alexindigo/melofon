@@ -24,9 +24,11 @@ export const folderMembership = {
      )`,
 };
 
-// Artists limited to those with an album that has a file in this source.
-export function artistFolderFilter(folderId?: string): string {
+// Artist rows joined to their albums (`al`), limited to albums with a file in
+// this source: the artist appears when it has one, and its album count covers
+// only that source's albums (Navidrome's per-library artist stats).
+export function artistAlbumFolderFilter(folderId?: string): string {
   return folderId === undefined
     ? ''
-    : ` AND ${folderMembership.artist('ar.id', folderId)}`;
+    : ` AND ${folderMembership.album('al.id', folderId)}`;
 }

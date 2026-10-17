@@ -1,7 +1,7 @@
 // Catalog data access. Every public operation owns one exclusive engine slot.
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { userIdForName } from './users.ts';
-import { artistFolderFilter } from './catalog-sql.ts';
+import { artistAlbumFolderFilter } from './catalog-sql.ts';
 import type {
   Album,
   AlbumEvent,
@@ -402,7 +402,7 @@ function catalogReads(q: Queries): CatalogReads {
         `SELECT ar.id, ar.name, COUNT(al.id) AS album_count, ${key} AS sort_key
          FROM artists ar
          JOIN albums al ON al.album_artist_id = ar.id
-         WHERE 1 = 1 ${artistFolderFilter(folderId)}
+         WHERE 1 = 1 ${artistAlbumFolderFilter(folderId)}
          GROUP BY ar.id, ar.name
           ORDER BY sort_key, ar.id`,
       );
@@ -554,7 +554,7 @@ function catalogReads(q: Queries): CatalogReads {
         `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
            FROM artists ar
            JOIN albums al ON al.album_artist_id = ar.id
-           WHERE ar.name ILIKE ${like} ${artistFolderFilter(opts.folderId)}
+           WHERE ar.name ILIKE ${like} ${artistAlbumFolderFilter(opts.folderId)}
            GROUP BY ar.id, ar.name
             ORDER BY ar.name, ar.id
            LIMIT ${opts.artistCount} OFFSET ${opts.artistOffset}`,

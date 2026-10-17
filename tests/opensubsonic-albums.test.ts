@@ -301,8 +301,9 @@ Deno.test('A2 placeholder roots are folder-aware with accurate counts and stable
       }
       const second = await s.index(legacy, s.folders[1].id);
       assertEquals(second.map((a) => a.name), ['Various Artists']);
-      // Existing real artists span folders and retain their global count.
-      assertEquals(second[0].albumCount, legacy ? undefined : 2);
+      // A real artist spans folders; inside one folder its album count covers
+      // only that folder's albums (Navidrome), unfiltered it covers all.
+      assertEquals(second[0].albumCount, legacy ? undefined : 1);
       assertEquals(
         (await s.index(legacy)).find((a) => a.name === 'Various Artists')
           ?.albumCount,
@@ -447,5 +448,23 @@ Deno.test('A2 placeholders remain absent from search and cannot be starred or ra
         assert(!found.some((a) => a.id === artist.id));
       }
     }
+  });
+});
+
+Deno.test('folder-scoped artist album counts in search3 follow the folder', async () => {
+  await setup(async (s) => {
+    const count = async (musicFolderId?: string) => {
+      const body = await s.get('search3', {
+        query: 'Various',
+        ...(musicFolderId === undefined ? {} : { musicFolderId }),
+      });
+      const artist = rows(body.searchResult3, 'artist').find((a) =>
+        a.name === 'Various Artists'
+      );
+      return artist?.albumCount;
+    };
+    assertEquals(await count(), 2);
+    assertEquals(await count(s.folders[0].id), 1);
+    assertEquals(await count(s.folders[1].id), 1);
   });
 });
