@@ -7,6 +7,7 @@
 // or genre → 404; malformed uri → 400; http/DLNA stays 400.
 import {
   albumArtistResolver,
+  artistAlbums,
   badRequest,
   boolParam,
   findAlbumByWire,
@@ -41,7 +42,7 @@ async function songsForUri(
     const artist = await findArtistByWire(app, id);
     if (artist === null) return null;
     const songs: SongRow[] = [];
-    for (const album of await app.library.albumsByArtist(artist.id)) {
+    for (const album of await artistAlbums(app, artist.id)) {
       const got = await app.library.getAlbum(album.id);
       if (got !== null) songs.push(...got.songs);
     }

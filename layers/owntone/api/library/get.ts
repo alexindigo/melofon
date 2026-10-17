@@ -2,6 +2,7 @@
 // is SECONDS (probed httpd_jsonapi.c: fci.length / 1000 at both call sites —
 // the doc table's "milliseconds" is wrong). updated_at omitted before the
 // first scan completes.
+import { browseArtists } from '#owntone/payloads.ts';
 import type { HatContext } from '#owntone/types.ts';
 
 export default async (_request: unknown, context: HatContext) => {
@@ -11,7 +12,7 @@ export default async (_request: unknown, context: HatContext) => {
     size: Number.MAX_SAFE_INTEGER,
     offset: 0,
   });
-  const artists = await context.app.library.listArtists();
+  const artists = await browseArtists(context.app);
   const playtimeMs = albums.reduce((n, a) => n + a.durationMs, 0);
   return {
     songs: status.count,

@@ -156,6 +156,7 @@ export interface HatContext {
       listArtists(): Promise<ArtistRow[]>;
       getArtist(id: string): Promise<ArtistRow | null>;
       albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+      albumsWithoutArtist(kind: 'various' | 'unknown'): Promise<AlbumRow[]>;
       getSong(id: string): Promise<SongRow | null>;
       listGenres(): Promise<GenreRow[]>;
       search3(

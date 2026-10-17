@@ -6,10 +6,12 @@
 // `data_kind is pipe` (→ empty results, we have no pipes); anything else →
 // 400. media_kind is accepted and ignored in this slice.
 import {
+  albumArtistLabel,
   albumArtistResolver,
   albumPayload,
   artistPayload,
   badRequest,
+  browseArtists,
   paged,
   pagingParams,
   playlistPayload,
@@ -87,8 +89,8 @@ export default async (request: HatRequest, context: HatContext) => {
         size: ALL,
         offset: 0,
       });
-      const artistIds = new Set(albums.map((a) => a.artistId));
-      const artists = (await context.app.library.listArtists()).filter((a) =>
+      const artistIds = new Set(albums.map((a) => albumArtistLabel(a).id));
+      const artists = (await browseArtists(context.app)).filter((a) =>
         artistIds.has(a.id)
       );
       reply.artists = paged(

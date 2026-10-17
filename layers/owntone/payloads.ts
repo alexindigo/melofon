@@ -52,10 +52,46 @@ const PLACEHOLDER_IDS = {
   various: await placeholderId('various'),
   unknown: await placeholderId('unknown'),
 };
+const PLACEHOLDER_KINDS = ['various', 'unknown'] as const;
+type PlaceholderKind = typeof PLACEHOLDER_KINDS[number];
+const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+
+function placeholderArtist(
+  kind: PlaceholderKind,
+  albumCount: number,
+): ArtistRow {
+  return {
+    id: PLACEHOLDER_IDS[kind],
+    name: kind === 'various' ? '[Various Artists]' : '[Unknown Artist]',
+    albumCount,
+  };
+}
+
+/** Protocol-only artist membership. All artist browse/queue/payload paths
+ * use this boundary, so placeholder ids never reach real-artist queries. */
+export function artistAlbums(app: HatContext['app'], id: string) {
+  const kind = PLACEHOLDER_KINDS.find((kind) => PLACEHOLDER_IDS[kind] === id);
+  return kind === undefined
+    ? app.library.albumsByArtist(id)
+    : app.library.albumsWithoutArtist(kind);
+}
+
+/** Artist roots and statistics share the same derived set. A placeholder
+ * exists only while at least one album has that artist kind. */
+export async function browseArtists(
+  app: HatContext['app'],
+): Promise<ArtistRow[]> {
+  const artists = [...await app.library.listArtists()];
+  for (const kind of PLACEHOLDER_KINDS) {
+    const albums = await artistAlbums(app, PLACEHOLDER_IDS[kind]);
+    if (albums.length > 0) artists.push(placeholderArtist(kind, albums.length));
+  }
+  return artists.sort((a, b) => compare(a.name, b.name) || compare(a.id, b.id));
+}
+
 export const albumLabel = (album: AlbumRow) =>
   album.name ?? `[${album.folderName}]`;
 export function albumsByLabel(albums: AlbumRow[]): AlbumRow[] {
-  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
   return [...albums].sort((a, b) =>
     compare(albumLabel(a), albumLabel(b)) || compare(a.id, b.id)
   );
@@ -64,12 +100,8 @@ export function albumArtistLabel(
   album: AlbumRow,
 ): { id: string; name: string } {
   if (album.artistKind === 'various' || album.artistKind === 'unknown') {
-    return {
-      id: PLACEHOLDER_IDS[album.artistKind],
-      name: album.artistKind === 'various'
-        ? '[Various Artists]'
-        : '[Unknown Artist]',
-    };
+    const { id, name } = placeholderArtist(album.artistKind, 0);
+    return { id, name };
   }
   return { id: album.artistId!, name: album.artistName! };
 }
@@ -110,7 +142,7 @@ export async function findArtistByWire(
 ): Promise<ArtistRow | null> {
   if (!/^\d+$/.test(wire)) return null;
   const n = Number(wire);
-  const artists = await app.library.listArtists();
+  const artists = await browseArtists(app);
   return artists.find((a) => wireInt(a.id) === n) ?? null;
 }
 
@@ -162,18 +194,20 @@ export function trackPayload(
   song: SongRow,
   albumArtist: { id: string; name: string } | null,
 ) {
+  const artist = song.artistName ??
+    (song.albumId === null ? '' : placeholderArtist('unknown', 0).name);
   return {
     id: wireInt(song.id),
     title: song.title,
-    artist: song.artistName ?? '',
-    artist_sort: song.artistName ?? '',
+    artist,
+    artist_sort: artist,
     ...(song.albumId !== null && {
       album: song.albumName ?? `[${song.albumFolderName}]`,
       album_sort: song.albumName ?? `[${song.albumFolderName}]`,
     }),
     ...(song.albumId !== null && { album_id: String(wireInt(song.albumId)) }),
-    album_artist: albumArtist?.name ?? song.artistName ?? '',
-    album_artist_sort: albumArtist?.name ?? song.artistName ?? '',
+    album_artist: albumArtist?.name ?? artist,
+    album_artist_sort: albumArtist?.name ?? artist,
     ...(albumArtist !== null && {
       album_artist_id: String(wireInt(albumArtist.id)),
     }),
@@ -228,7 +262,7 @@ export async function artistPayload(
   app: HatContext['app'],
   artist: ArtistRow,
 ) {
-  const albums = await app.library.albumsByArtist(artist.id);
+  const albums = await artistAlbums(app, artist.id);
   return {
     id: String(wireInt(artist.id)),
     name: artist.name,

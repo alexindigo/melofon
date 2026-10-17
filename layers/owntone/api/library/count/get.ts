@@ -1,7 +1,7 @@
 // layers/owntone/api/library/count/get.ts — GET /api/library/count.
 // db_playtime in SECONDS (same probe as /api/library). expression: only
 // `data_kind is pipe` (→ zeros — we have no pipes); anything else → 400.
-import { badRequest } from '#owntone/payloads.ts';
+import { badRequest, browseArtists } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
 
 export default async (request: HatRequest, context: HatContext) => {
@@ -18,7 +18,7 @@ export default async (request: HatRequest, context: HatContext) => {
     size: Number.MAX_SAFE_INTEGER,
     offset: 0,
   });
-  const artists = await context.app.library.listArtists();
+  const artists = await browseArtists(context.app);
   const playtimeMs = albums.reduce((n, a) => n + a.durationMs, 0);
   return {
     tracks: status.count,
