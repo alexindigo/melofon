@@ -57,6 +57,7 @@ async function router(
       songPath: none,
       getAlbum: none,
       getArtist: none,
+      artistById: none,
       albumsByArtist: () => Promise.resolve([]),
     },
     playlists: { get: none },

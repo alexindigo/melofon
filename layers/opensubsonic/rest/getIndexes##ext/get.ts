@@ -3,9 +3,9 @@
 // browse-by-folder… returns a simulated directory tree, using the format
 // /Artist/Album/01 - Song.mp3"). There is no folders table: top-level
 // directories are the album artists (same set as getArtists), directory
-// ids borrow the real artist/album ids. Songs with no album tag are not
-// in the tree (no Album dir to hang them under) — they stay reachable via
-// search3/getSong/stream. No shortcuts, no top-level child elements.
+// ids use the real artist/album ids or the plugin's placeholder artist ids.
+// Every scanned song has an album, including untagged directory albums, so
+// every song is in the tree. No shortcuts, no top-level child elements.
 import { ok } from '#opensubsonic/envelope.ts';
 import { artistIndex, artistOf, IGNORED_ARTICLES } from '#opensubsonic/id3.ts';
 import { safeIntParam } from '#opensubsonic/params.ts';

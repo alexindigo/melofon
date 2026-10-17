@@ -9,6 +9,7 @@ import {
   albumsByLabel,
   albumV1Of,
   childOf,
+  resolveArtist,
 } from '#opensubsonic/id3.ts';
 import { requiredParam } from '#opensubsonic/params.ts';
 import { directoryFields, loadPersonal } from '#opensubsonic/personal.ts';
@@ -17,9 +18,9 @@ import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 export default async (_request: HatRequest, context: HatContext) => {
   const id = requiredParam(context, 'id');
   if (id instanceof Response) return id;
-  const artist = await context.app.library.artistById(id);
-  if (artist !== null) {
-    const albums = await context.app.library.albumsByArtist(id);
+  const resolved = await resolveArtist(context, id);
+  if (resolved !== null) {
+    const { artist, albums } = resolved;
     const p = await loadPersonal(context, {
       artists: [artist.id],
       albums: albums.map((album) => album.id),

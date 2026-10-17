@@ -61,6 +61,10 @@ export interface HatContext {
       getArtist(id: string): Promise<ArtistRow | null>;
       artistById(id: string): Promise<ArtistRow | null>;
       albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+      albumsWithoutArtist(
+        kind: 'various' | 'unknown',
+        opts?: { folderId?: string },
+      ): Promise<AlbumRow[]>;
       listAlbums(opts: {
         sort:
           | 'name'

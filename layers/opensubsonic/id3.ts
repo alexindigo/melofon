@@ -44,6 +44,35 @@ const PLACEHOLDER_IDS = {
   various: await placeholderId('various'),
   unknown: await placeholderId('unknown'),
 };
+const PLACEHOLDER_KINDS = ['various', 'unknown'] as const;
+type PlaceholderKind = typeof PLACEHOLDER_KINDS[number];
+
+function placeholderArtist(
+  kind: PlaceholderKind,
+  albumCount: number,
+): ArtistRow {
+  const name = kind === 'various' ? '[Various Artists]' : '[Unknown Artist]';
+  return { id: PLACEHOLDER_IDS[kind], name, albumCount, sortKey: name };
+}
+
+// Protocol-only artists are derived from album facts, never persisted in core.
+// Every artist browse/download path resolves the same artist and membership.
+export async function resolveArtist(
+  context: HatContext,
+  id: string,
+): Promise<{ artist: ArtistRow; albums: AlbumRow[] } | null> {
+  const kind = PLACEHOLDER_KINDS.find((kind) => PLACEHOLDER_IDS[kind] === id);
+  if (kind !== undefined) {
+    const albums = await context.app.library.albumsWithoutArtist(kind);
+    return albums.length === 0
+      ? null
+      : { artist: placeholderArtist(kind, albums.length), albums };
+  }
+  const artist = await context.app.library.artistById(id);
+  if (artist === null) return null;
+  return { artist, albums: await context.app.library.albumsByArtist(id) };
+}
+
 export const albumLabel = (album: AlbumRow) =>
   album.name ?? `[${album.folderName}]`;
 export function albumsByLabel(albums: AlbumRow[]): AlbumRow[] {
@@ -56,12 +85,8 @@ export function albumArtistLabel(
   album: AlbumRow,
 ): { id: string; name: string } {
   if (album.artistKind === 'various' || album.artistKind === 'unknown') {
-    return {
-      id: PLACEHOLDER_IDS[album.artistKind],
-      name: album.artistKind === 'various'
-        ? '[Various Artists]'
-        : '[Unknown Artist]',
-    };
+    const { id, name } = placeholderArtist(album.artistKind, 0);
+    return { id, name };
   }
   return { id: album.artistId!, name: album.artistName! };
 }
@@ -292,14 +317,17 @@ export async function zipEntriesFor(
       filename: sanitize(albumLabel(album.album)),
     };
   }
-  const artist = await context.app.library.getArtist(id);
-  if (artist !== null) {
+  const resolved = await resolveArtist(context, id);
+  if (resolved !== null && resolved.albums.length > 0) {
     const songs: SongRow[] = [];
-    for (const a of await context.app.library.albumsByArtist(id)) {
+    for (const a of resolved.albums) {
       const got = await context.app.library.getAlbum(a.id);
       if (got !== null) songs.push(...got.songs);
     }
-    return { entries: entriesOf(songs), filename: sanitize(artist.name) };
+    return {
+      entries: entriesOf(songs),
+      filename: sanitize(resolved.artist.name),
+    };
   }
   const playlist = await context.app.playlists.get(
     context.state.user!.username,
@@ -329,9 +357,20 @@ export async function artistIndex(
   context: HatContext,
   build: typeof artistOf,
 ): Promise<Record<string, unknown>[]> {
+  const folderId = await folderIdParam(context);
   const artists = await context.app.library.listArtists(
-    await folderIdParam(context),
+    folderId,
     { ignoredArticles: ARTICLES },
+  );
+  for (const kind of PLACEHOLDER_KINDS) {
+    const albums = await context.app.library.albumsWithoutArtist(kind, {
+      folderId,
+    });
+    if (albums.length > 0) artists.push(placeholderArtist(kind, albums.length));
+  }
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  artists.sort((a, b) =>
+    compare(a.sortKey!, b.sortKey!) || compare(a.id, b.id)
   );
   const p = await loadPersonal(context, { artists: artists.map((a) => a.id) });
   const groups = new Map<string, Record<string, unknown>[]>();
