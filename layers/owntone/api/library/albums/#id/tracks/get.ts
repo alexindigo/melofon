@@ -1,6 +1,7 @@
 // layers/owntone/api/library/albums/#id/tracks/get.ts — GET
 // /api/library/albums/<id>/tracks: { items, total, offset, limit }.
 import {
+  albumArtistLabel,
   badRequest,
   findAlbumByWire,
   notFound,
@@ -18,7 +19,7 @@ export default async (request: HatRequest, context: HatContext) => {
   if (got === null) return notFound();
   const paging = pagingParams(request.query);
   if (paging instanceof Response) return paging;
-  const albumArtist = { id: got.album.artistId, name: got.album.artistName };
+  const albumArtist = albumArtistLabel(got.album);
   return paged(
     got.songs.map((song) => trackPayload(song, albumArtist)),
     paging.offset,

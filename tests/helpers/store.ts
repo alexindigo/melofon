@@ -28,7 +28,9 @@ export async function domainFixture<T>(factory: (engine: Engine) => T) {
     "INSERT INTO users VALUES ('u', 'alice', 'encrypted', now()), ('v', 'bob', 'other', now())",
   );
   await run("INSERT INTO artists VALUES ('artist', 'Artist')");
-  await run("INSERT INTO albums VALUES ('album', 'Album', 'artist')");
+  await run(
+    "INSERT INTO albums (id, name, album_artist_id, artist_kind, folder_name) VALUES ('album', 'Album', 'artist', 'tagged', 'Music')",
+  );
   await run(
     "INSERT INTO files (id, path, album_id, artist_id) VALUES ('song', '/song', 'album', 'artist')",
   );

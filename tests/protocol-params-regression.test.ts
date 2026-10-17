@@ -208,9 +208,9 @@ async function setup() {
       `INSERT INTO artists VALUES (${quote(id(10 + n))}, 'Artist ${n}')`,
     );
     await rawSql(db).run(
-      `INSERT INTO albums VALUES (${quote(id(20 + n))}, 'Album ${n}', ${
-        quote(id(10 + n))
-      })`,
+      `INSERT INTO albums (id, name, album_artist_id) VALUES (${
+        quote(id(20 + n))
+      }, 'Album ${n}', ${quote(id(10 + n))})`,
     );
   }
   for (let n = 1; n <= 6; n++) {

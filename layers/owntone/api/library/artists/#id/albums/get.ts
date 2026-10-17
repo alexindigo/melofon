@@ -2,6 +2,7 @@
 // /api/library/artists/<id>/albums (paged album objects).
 import {
   albumPayload,
+  albumsByLabel,
   badRequest,
   findArtistByWire,
   notFound,
@@ -17,5 +18,9 @@ export default async (request: HatRequest, context: HatContext) => {
   const paging = pagingParams(request.query);
   if (paging instanceof Response) return paging;
   const albums = await context.app.library.albumsByArtist(artist.id);
-  return paged(albums.map(albumPayload), paging.offset, paging.limit);
+  return paged(
+    albumsByLabel(albums).map(albumPayload),
+    paging.offset,
+    paging.limit,
+  );
 };

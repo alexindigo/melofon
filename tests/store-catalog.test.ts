@@ -32,7 +32,18 @@ function snapshot(): CatalogSnapshot {
   };
   return {
     artists: [{ id: 'artist', name: "Artist'" }],
-    albums: [{ id: 'album', name: "Album'", albumArtistId: 'artist' }],
+    albums: [{
+      id: 'album',
+      name: "Album'",
+      albumArtistId: 'artist',
+      artistName: "Artist'",
+      artistKind: 'tagged',
+      folderName: 'Music',
+      libraryId: 'lib',
+      rootDir: '',
+    }],
+    albumIdentities: [{ id: 'album', libraryId: 'lib', rootDir: '' }],
+    albumEvents: [],
     files: [file],
     events: [],
     retainedIds: [],
@@ -55,6 +66,7 @@ Deno.test('store.catalog replaceCatalog round-trips plain identity snapshots and
       ino: 2,
       fingerprint: 'afp/1:one',
       pcm_md5: 'pcm',
+      album_id: 'album',
     }]);
     assertEquals(JSON.parse(JSON.stringify(retained)), retained);
     const firstSeen = await t.domain.firstSeen(['song']);
@@ -99,6 +111,8 @@ Deno.test('store.catalog replaceCatalog round-trips plain identity snapshots and
     await t.domain.replaceCatalog({
       artists: [],
       albums: [],
+      albumIdentities: [],
+      albumEvents: [],
       files: [],
       events: [],
       retainedIds: ['song'],
@@ -125,6 +139,8 @@ Deno.test('store.catalog replaceCatalog duplicate file id rolls back every table
       'files',
       'file_identity',
       'file_events',
+      'album_identity',
+      'album_events',
     ];
     const before = await Promise.all(
       tables.map((table) => t.all(`SELECT * FROM ${table}`)),
@@ -142,6 +158,11 @@ Deno.test('store.catalog replaceCatalog duplicate file id rolls back every table
       kind: 'ambiguous',
       file: next.files[0],
       candidates: ['song'],
+    });
+    next.albumEvents.push({
+      kind: 'unlinked',
+      albumId: 'prior',
+      candidates: ['album'],
     });
     const failure = assertRejects(
       () => t.domain.replaceCatalog(next),
@@ -345,6 +366,8 @@ Deno.test('store.catalog artist and album reads return plain rows, scoped counts
       name: 'Album',
       artistId: 'artist',
       artistName: 'Artist',
+      artistKind: 'tagged' as const,
+      folderName: 'Music',
       songCount: 1,
       durationMs: 1200,
       year: 2001,
@@ -425,6 +448,182 @@ Deno.test('store.catalog song, search, genre and path families preserve nulls an
     assertEquals(await t.domain.albumSongPath('album'), '/song.mp4');
     assertEquals(await t.domain.albumSongPath('song'), null);
     assert(JSON.stringify(found).length > 0);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('store.catalog artistless albums survive every album read with plain folder facts and scoped totals', async () => {
+  const t = await domainFixture(createCatalogStore);
+  try {
+    const next = snapshot();
+    next.artists = [];
+    next.albums = [
+      {
+        ...next.albums[0],
+        id: 'various',
+        name: null,
+        albumArtistId: null,
+        artistName: null,
+        artistKind: 'various',
+        folderName: 'The Singles',
+      },
+      {
+        ...next.albums[0],
+        id: 'unknown',
+        name: null,
+        albumArtistId: null,
+        artistName: null,
+        artistKind: 'unknown',
+        folderName: 'Mystery',
+        libraryId: 'other',
+      },
+    ];
+    next.files = next.albums.map((a, i) => ({
+      ...next.files[0],
+      id: `s${i}`,
+      albumId: a.id,
+      artistId: null,
+      libraryId: a.libraryId,
+      path: `/music/${i}.mp3`,
+      rel: `${i}.mp3`,
+    }));
+    next.albumIdentities = next.albums.map(({ id, libraryId, rootDir }) => ({
+      id,
+      libraryId,
+      rootDir,
+    }));
+    await t.domain.replaceCatalog(next);
+    const all = await t.domain.listAlbums({
+      sort: 'name',
+      size: 10,
+      offset: 0,
+    });
+    assertEquals(
+      all.map((
+        a,
+      ) => [
+        a.id,
+        a.name,
+        a.artistId,
+        a.artistName,
+        a.artistKind,
+        a.folderName,
+      ]),
+      [['unknown', null, null, null, 'unknown', 'Mystery'], [
+        'various',
+        null,
+        null,
+        null,
+        'various',
+        'The Singles',
+      ]],
+    );
+    assertEquals(await t.domain.albumsWithoutArtist('various'), [all[1]]);
+    assertEquals(await t.domain.albumsWithoutArtist('unknown'), [all[0]]);
+    assertEquals(
+      await t.domain.albumsWithoutArtist('various', { folderId: 'other' }),
+      [],
+    );
+    assertEquals(
+      await t.domain.albumsWithoutArtist('various', { folderId: 'lib' }),
+      [all[1]],
+    );
+    assertEquals(await t.domain.albumsById(['various'], { folderId: 'lib' }), [
+      all[1],
+    ]);
+    const got = (await t.domain.getAlbum('various'))!;
+    assertEquals(got.album, all[1]);
+    assertEquals(got.songs.map((s) => [s.albumName, s.albumFolderName]), [[
+      null,
+      'The Singles',
+    ]]);
+    assertEquals(got.album.songCount, got.songs.length);
+    assertEquals(
+      got.album.durationMs,
+      got.songs.reduce((n, s) => n + (s.durationMs ?? 0), 0),
+    );
+    const search = await t.domain.search3('Singles', {
+      artistCount: 10,
+      artistOffset: 0,
+      albumCount: 10,
+      albumOffset: 0,
+      songCount: 10,
+      songOffset: 0,
+    });
+    assertEquals(search.albums, [all[1]]);
+    assertEquals(
+      (await t.domain.listAlbums({
+        sort: 'name',
+        size: 10,
+        offset: 0,
+        ignoredArticles: ['The'],
+      })).map((a) => a.id),
+      ['unknown', 'various'],
+    );
+    assertEquals(await t.domain.listArtists(), []);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('store.catalog retained album snapshots and append-only events survive absence and library removal', async () => {
+  const t = await domainFixture(createCatalogStore);
+  try {
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    const next = snapshot();
+    next.albumEvents = [
+      {
+        kind: 'moved',
+        albumId: 'album',
+        from: { id: 'album', libraryId: 'lib', rootDir: 'Before' },
+        to: next.albumIdentities[0],
+      },
+      { kind: 'unlinked', albumId: 'prior', candidates: ['album'] },
+    ];
+    await t.domain.replaceCatalog(next);
+    assertEquals(await t.domain.albumIdentitySnapshot(), next.albumIdentities);
+    assertEquals((await t.domain.identitySnapshot())[0].album_id, 'album');
+    const events = await t.all(
+      'SELECT kind, album_id, from_root, to_root, candidates FROM album_events ORDER BY seq',
+    );
+    assertEquals(events, [
+      {
+        kind: 'moved',
+        album_id: 'album',
+        from_root: 'Before',
+        to_root: '',
+        candidates: [],
+      },
+      {
+        kind: 'unlinked',
+        album_id: 'prior',
+        from_root: null,
+        to_root: null,
+        candidates: ['album'],
+      },
+    ]);
+    await t.domain.replaceCatalog({
+      artists: [],
+      albums: [],
+      files: [],
+      retainedIds: ['song'],
+      events: [],
+      albumIdentities: [],
+      albumEvents: [],
+    });
+    assertEquals(await t.all('SELECT present FROM album_identity'), [{
+      present: false,
+    }]);
+    assertEquals((await t.domain.identitySnapshot())[0].album_id, 'album');
+    assertEquals(await t.domain.removeLibrary('lib'), true);
+    assertEquals(await t.domain.albumIdentitySnapshot(), next.albumIdentities);
+    assertEquals(
+      await t.all(
+        'SELECT kind, album_id, from_root, to_root, candidates FROM album_events ORDER BY seq',
+      ),
+      events,
+    );
   } finally {
     await t.close();
   }

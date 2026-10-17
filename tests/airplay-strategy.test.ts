@@ -36,6 +36,7 @@ function song(id = 'song'): SongRow {
     libraryPath: null,
     albumId: null,
     albumName: null,
+    albumFolderName: null,
     artistId: null,
     artistName: null,
     track: 1,

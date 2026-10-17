@@ -35,7 +35,7 @@ async function seedCatalog(db: Store): Promise<void> {
     "INSERT INTO artists VALUES ('ar1', 'One'), ('ar2', 'Two')",
   );
   await rawSql(db).run(
-    "INSERT INTO albums VALUES ('al1', 'First', 'ar1'), ('al2', 'Second', 'ar2')",
+    "INSERT INTO albums (id, name, album_artist_id) VALUES ('al1', 'First', 'ar1'), ('al2', 'Second', 'ar2')",
   );
   await rawSql(db).run(
     `INSERT INTO files (id, path, title, album_id, artist_id) VALUES

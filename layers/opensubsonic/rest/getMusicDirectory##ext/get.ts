@@ -3,7 +3,13 @@
 // The directory carries its own artist/album facts (Directory rules); album
 // children are Children (Child rules).
 import { notFound, ok } from '#opensubsonic/envelope.ts';
-import { albumV1Of, childOf } from '#opensubsonic/id3.ts';
+import {
+  albumArtistLabel,
+  albumLabel,
+  albumsByLabel,
+  albumV1Of,
+  childOf,
+} from '#opensubsonic/id3.ts';
 import { requiredParam } from '#opensubsonic/params.ts';
 import { directoryFields, loadPersonal } from '#opensubsonic/personal.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
@@ -23,7 +29,7 @@ export default async (_request: HatRequest, context: HatContext) => {
         id: artist.id,
         name: artist.name,
         ...directoryFields(p.artist(artist.id)),
-        child: albums.map((album) => albumV1Of(album, p)),
+        child: albumsByLabel(albums).map((album) => albumV1Of(album, p)),
       },
     });
   }
@@ -36,8 +42,8 @@ export default async (_request: HatRequest, context: HatContext) => {
     return ok(context, {
       directory: {
         id: got.album.id,
-        name: got.album.name,
-        parent: got.album.artistId,
+        name: albumLabel(got.album),
+        parent: albumArtistLabel(got.album).id,
         ...directoryFields(p.album(got.album.id)),
         child: got.songs.map((song) => childOf(song, p)),
       },

@@ -2,7 +2,7 @@
 // assigned once, then resolved before rebuilding files so user state follows
 // unambiguous external moves. All identity/catalog writes share one transaction.
 import { parseFile } from 'music-metadata';
-import { encodeHex } from '@std/encoding/hex';
+import { type AlbumInput, groupAlbums, stableId } from './albums.ts';
 import { type AudioFingerprint, createMedia, type Media } from './media.ts';
 import type { Store } from './store/index.ts';
 import type {
@@ -41,20 +41,6 @@ export interface ScanCounts {
 interface ArtistIn {
   id: string;
   name: string;
-}
-
-interface AlbumIn {
-  id: string;
-  name: string;
-  albumArtistId: string;
-}
-
-async function stableId(kind: string, key: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(`${kind}\n${key}`),
-  );
-  return encodeHex(new Uint8Array(digest)).slice(0, 32);
 }
 
 function pathKey(libraryId: string, rel: string): string {
@@ -101,6 +87,7 @@ export async function scanLibrary(
   const sources = await store.catalog.listLibraries();
   // Read-only preparation: previous rows remain unchanged until the transaction.
   const retained = await store.catalog.identitySnapshot();
+  const retainedAlbums = await store.catalog.albumIdentitySnapshot();
   const byId = new Map(retained.map((row) => [row.id, row]));
   const byPath = new Map<string, IdentityRow>();
   const byStat = new Map<string, IdentityRow>();
@@ -118,7 +105,7 @@ export async function scanLibrary(
     }
   }
   const artists = new Map<string, ArtistIn>(); // name → row
-  const albums = new Map<string, AlbumIn>(); // id → row
+  const albumInputs = new Map<FileIn, Omit<AlbumInput, 'songId'>>();
   const files: FileIn[] = [];
   let skipped = 0;
 
@@ -174,9 +161,8 @@ export async function scanLibrary(
           title = meta.common.title?.trim() || undefined;
           trackArtist = meta.common.artist?.trim() || undefined;
           albumName = meta.common.album?.trim() || undefined;
-          // TPE2 (album artist) wins — household VA/OST rule; TPE1 is the track
-          // artist. Fallback: album-level artist = track artist.
-          albumArtist = meta.common.albumartist?.trim() || trackArtist;
+          // Preserve the tagged fact. Album-level inference owns the fallback.
+          albumArtist = meta.common.albumartist?.trim() || undefined;
           trackNo = meta.common.track.no;
           discNo = meta.common.disk.no;
           if (meta.format.duration && meta.format.duration > 0) {
@@ -209,14 +195,7 @@ export async function scanLibrary(
           artistId = await stableId('artist', trackArtist);
           artists.set(trackArtist, { id: artistId, name: trackArtist });
         }
-        let albumId: string | null = null;
-        if (albumName !== undefined && albumArtist !== undefined) {
-          albumId = await stableId('album', `${albumArtist}\n${albumName}`);
-          const albumArtistId = await stableId('artist', albumArtist);
-          artists.set(albumArtist, { id: albumArtistId, name: albumArtist });
-          albums.set(albumId, { id: albumId, name: albumName, albumArtistId });
-        }
-        files.push({
+        const file: FileIn = {
           id: '',
           path: abs,
           rel,
@@ -224,7 +203,7 @@ export async function scanLibrary(
           stat,
           ...audio,
           title: title ?? name,
-          albumId,
+          albumId: null,
           artistId,
           track: trackNo,
           disc: discNo,
@@ -232,6 +211,15 @@ export async function scanLibrary(
           genre,
           year,
           isVideo,
+        };
+        files.push(file);
+        albumInputs.set(file, {
+          libraryId: source.id,
+          rel,
+          albumName: albumName ?? null,
+          albumArtistTag: albumArtist ?? null,
+          trackArtist: trackArtist ?? null,
+          disc: discNo,
         });
       }
     } catch (err) {
@@ -308,9 +296,26 @@ export async function scanLibrary(
     seen.add(file.id);
   }
 
+  const grouped = await groupAlbums(
+    files.map((f) => ({ ...albumInputs.get(f)!, songId: f.id })),
+    sources,
+    new Map(retained.map((r) => [r.id, r.album_id])),
+    retainedAlbums,
+  );
+  for (const file of files) file.albumId = grouped.fileAlbums.get(file.id)!;
+  for (const album of grouped.albums) {
+    if (album.artistName !== null) {
+      artists.set(album.artistName, {
+        id: album.albumArtistId!,
+        name: album.artistName,
+      });
+    }
+  }
   await store.catalog.replaceCatalog({
     artists: [...artists.values()],
-    albums: [...albums.values()],
+    albums: grouped.albums,
+    albumIdentities: grouped.identities,
+    albumEvents: grouped.events,
     files,
     events,
     retainedIds: [...byId.keys()],
@@ -319,7 +324,7 @@ export async function scanLibrary(
     files: files.length,
     skipped,
     artists: artists.size,
-    albums: albums.size,
+    albums: grouped.albums.length,
   };
 }
 

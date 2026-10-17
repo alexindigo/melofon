@@ -25,6 +25,7 @@ function song(): SongRow {
     title: `Song ${songN}`,
     albumId: null,
     albumName: null,
+    albumFolderName: null,
     artistId: null,
     artistName: 'Artist',
     track: songN,

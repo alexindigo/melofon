@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS albums (
   name VARCHAR NOT NULL,
   album_artist_id VARCHAR
 );
+ALTER TABLE albums ALTER COLUMN name DROP NOT NULL;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS artist_kind VARCHAR;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS library_id VARCHAR;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS root_dir VARCHAR;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS folder_name VARCHAR;
 CREATE TABLE IF NOT EXISTS files (
   id VARCHAR PRIMARY KEY,
   path VARCHAR UNIQUE NOT NULL,
@@ -216,5 +221,25 @@ CREATE TABLE IF NOT EXISTS file_events (
   from_path VARCHAR,
   to_library_id VARCHAR,
   to_path VARCHAR,
+  candidates VARCHAR[]
+);
+ALTER TABLE file_identity ADD COLUMN IF NOT EXISTS album_id VARCHAR;
+-- Retained album identity and append-only scan decisions.
+CREATE TABLE IF NOT EXISTS album_identity (
+  id VARCHAR PRIMARY KEY,
+  library_id VARCHAR NOT NULL,
+  root_dir VARCHAR NOT NULL,
+  present BOOLEAN NOT NULL
+);
+CREATE SEQUENCE IF NOT EXISTS album_event_seq;
+CREATE TABLE IF NOT EXISTS album_events (
+  seq BIGINT PRIMARY KEY DEFAULT nextval('album_event_seq'),
+  "at" TIMESTAMP NOT NULL,
+  kind VARCHAR NOT NULL,
+  album_id VARCHAR NOT NULL,
+  from_library_id VARCHAR,
+  from_root VARCHAR,
+  to_library_id VARCHAR,
+  to_root VARCHAR,
   candidates VARCHAR[]
 );

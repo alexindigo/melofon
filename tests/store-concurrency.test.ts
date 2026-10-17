@@ -10,7 +10,18 @@ import { createState } from '../src/state.ts';
 function snapshot(): CatalogSnapshot {
   return {
     artists: [{ id: 'artist', name: 'Artist' }],
-    albums: [{ id: 'album', name: 'Album', albumArtistId: 'artist' }],
+    albums: [{
+      id: 'album',
+      name: 'Album',
+      albumArtistId: 'artist',
+      artistName: 'Artist',
+      artistKind: 'tagged',
+      folderName: 'Music',
+      libraryId: 'lib',
+      rootDir: '',
+    }],
+    albumIdentities: [{ id: 'album', libraryId: 'lib', rootDir: '' }],
+    albumEvents: [],
     files: [{
       id: 'song',
       path: '/song',

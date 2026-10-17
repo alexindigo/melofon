@@ -40,6 +40,40 @@ export function sourceFrom(request: HatRequest): CommandSourceRow {
 
 const ALL = Number.MAX_SAFE_INTEGER;
 
+const placeholderId = async (kind: string) => {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`melofon-placeholder-artist\n${kind}`),
+  );
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0'))
+    .join('').slice(0, 32);
+};
+const PLACEHOLDER_IDS = {
+  various: await placeholderId('various'),
+  unknown: await placeholderId('unknown'),
+};
+export const albumLabel = (album: AlbumRow) =>
+  album.name ?? `[${album.folderName}]`;
+export function albumsByLabel(albums: AlbumRow[]): AlbumRow[] {
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  return [...albums].sort((a, b) =>
+    compare(albumLabel(a), albumLabel(b)) || compare(a.id, b.id)
+  );
+}
+export function albumArtistLabel(
+  album: AlbumRow,
+): { id: string; name: string } {
+  if (album.artistKind === 'various' || album.artistKind === 'unknown') {
+    return {
+      id: PLACEHOLDER_IDS[album.artistKind],
+      name: album.artistKind === 'various'
+        ? '[Various Artists]'
+        : '[Unknown Artist]',
+    };
+  }
+  return { id: album.artistId!, name: album.artistName! };
+}
+
 /** Wire int → album row (null when unknown or not digits). The catalog has
  * no by-wire-int index: list and match, like OpenSubsonic's folderIdParam. */
 export async function findAlbumByWire(
@@ -102,9 +136,7 @@ export function albumArtistResolver(app: HatContext['app']) {
       const got = await app.library.getAlbum(albumId);
       cache.set(
         albumId,
-        got === null
-          ? null
-          : { id: got.album.artistId, name: got.album.artistName },
+        got === null ? null : albumArtistLabel(got.album),
       );
     }
     return cache.get(albumId) ?? null;
@@ -112,12 +144,13 @@ export function albumArtistResolver(app: HatContext['app']) {
 }
 
 export function albumPayload(album: AlbumRow) {
+  const artist = albumArtistLabel(album);
   return {
     id: String(wireInt(album.id)),
-    name: album.name,
-    name_sort: album.name, // the catalog keeps no sort names
-    artist: album.artistName,
-    artist_id: String(wireInt(album.artistId)),
+    name: albumLabel(album),
+    name_sort: albumLabel(album), // the catalog keeps no sort names
+    artist: artist.name,
+    artist_id: String(wireInt(artist.id)),
     track_count: album.songCount,
     length_ms: album.durationMs,
     uri: `library:album:${wireInt(album.id)}`,
@@ -134,9 +167,9 @@ export function trackPayload(
     title: song.title,
     artist: song.artistName ?? '',
     artist_sort: song.artistName ?? '',
-    ...(song.albumName !== null && {
-      album: song.albumName,
-      album_sort: song.albumName,
+    ...(song.albumId !== null && {
+      album: song.albumName ?? `[${song.albumFolderName}]`,
+      album_sort: song.albumName ?? `[${song.albumFolderName}]`,
     }),
     ...(song.albumId !== null && { album_id: String(wireInt(song.albumId)) }),
     album_artist: albumArtist?.name ?? song.artistName ?? '',

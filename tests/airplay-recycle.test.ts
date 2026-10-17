@@ -69,6 +69,7 @@ function longSong(suffix?: string): SongRow {
     title: `Rec ${id}`,
     albumId: null,
     albumName: 'Rec Album',
+    albumFolderName: 'Rec Album',
     artistId: null,
     artistName: 'Rec Artist',
     track: 1,

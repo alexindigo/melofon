@@ -182,6 +182,7 @@ export interface SongRow {
   title: string;
   albumId: string | null;
   albumName: string | null;
+  albumFolderName: string | null;
   artistId: string | null;
   artistName: string | null;
   track: number | null;
@@ -194,9 +195,11 @@ export interface SongRow {
 
 export interface AlbumRow {
   id: string;
-  name: string;
-  artistId: string;
-  artistName: string;
+  name: string | null;
+  artistId: string | null;
+  artistName: string | null;
+  artistKind: 'tagged' | 'shared' | 'various' | 'unknown';
+  folderName: string;
   songCount: number;
   durationMs: number;
 }

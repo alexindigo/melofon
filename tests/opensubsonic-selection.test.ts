@@ -63,9 +63,9 @@ async function setup(large = false) {
   );
   for (let n = 3; n >= 0; n--) {
     await rawSql(db).run(
-      `INSERT INTO albums VALUES (${sql(id(20 + n))}, 'Same', ${
-        sql(id(11 + n % 2))
-      })`,
+      `INSERT INTO albums (id, name, album_artist_id) VALUES (${
+        sql(id(20 + n))
+      }, 'Same', ${sql(id(11 + n % 2))})`,
     );
   }
   for (let n = ROWS.length - 1; n >= 0; n--) {
@@ -91,7 +91,7 @@ async function setup(large = false) {
       `INSERT INTO artists SELECT lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24), 'Bulk' FROM range(501) r(i)`,
     );
     await rawSql(db).run(
-      `INSERT INTO albums SELECT lpad(lower(to_hex(1000+i)),8,'0') || repeat('0',24), 'Bulk', lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24) FROM range(501) r(i)`,
+      `INSERT INTO albums (id, name, album_artist_id) SELECT lpad(lower(to_hex(1000+i)),8,'0') || repeat('0',24), 'Bulk', lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24) FROM range(501) r(i)`,
     );
     await rawSql(db).run(
       `INSERT INTO files (id,path,library_id,title,album_id,artist_id,genre,year,mtime,duration_ms)

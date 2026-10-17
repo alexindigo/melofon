@@ -2,6 +2,12 @@
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { userIdForName } from './users.ts';
 import { artistFolderFilter } from './catalog-sql.ts';
+import type {
+  Album,
+  AlbumEvent,
+  AlbumIdentity,
+  ArtistKind,
+} from '../albums.ts';
 
 export interface ArtistRow {
   id: string;
@@ -13,9 +19,11 @@ export interface ArtistRow {
 
 export interface AlbumRow {
   id: string;
-  name: string;
-  artistId: string;
-  artistName: string;
+  name: string | null;
+  artistId: string | null;
+  artistName: string | null;
+  artistKind: ArtistKind;
+  folderName: string;
   songCount: number;
   durationMs: number;
   /** Newest song year on the album (null when no song carries a year). */
@@ -34,6 +42,7 @@ export interface SongRow {
   title: string;
   albumId: string | null;
   albumName: string | null;
+  albumFolderName: string | null;
   artistId: string | null;
   artistName: string | null;
   track: number | null;
@@ -88,6 +97,10 @@ export interface CatalogReads {
   artistById(id: string): Promise<ArtistRow | null>;
   /** Albums of one album artist, alphabetically. */
   albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+  albumsWithoutArtist(
+    kind: 'various' | 'unknown',
+    opts?: { folderId?: string },
+  ): Promise<AlbumRow[]>;
   /** Album lists for getAlbumList/getAlbumList2-shaped hats. The user-scoped
    * sorts (highest / frequent / recent) need `username`; `genre` sort needs
    * `genre`. Favourites are not a sort here: hats derive their order from
@@ -203,6 +216,7 @@ interface SongSqlRow {
   title: string;
   album_id: string | null;
   album_name: string | null;
+  album_folder_name: string | null;
   artist_id: string | null;
   artist_name: string | null;
   track: number | null;
@@ -225,6 +239,7 @@ function songOf(row: SongSqlRow): SongRow {
     title: row.title,
     albumId: row.album_id,
     albumName: row.album_name,
+    albumFolderName: row.album_folder_name,
     artistId: row.artist_id,
     artistName: row.artist_name,
     track: num(row.track),
@@ -242,7 +257,7 @@ function songOf(row: SongSqlRow): SongRow {
 
 const SONG_SELECT = `
   SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title,
-         f.album_id, al.name AS album_name, f.artist_id,
+         f.album_id, al.name AS album_name, al.folder_name AS album_folder_name, f.artist_id,
          ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
          f.genre, f.year, f.is_video, epoch_ms(fi.first_seen_at) AS first_seen_ms
   FROM files f
@@ -253,9 +268,11 @@ const SONG_SELECT = `
 
 interface AlbumSqlRow {
   id: string;
-  name: string;
-  album_artist_id: string;
-  artist_name: string;
+  name: string | null;
+  album_artist_id: string | null;
+  artist_name: string | null;
+  artist_kind: ArtistKind;
+  folder_name: string;
   song_count: number | bigint;
   duration_ms: number | bigint | null;
   year: number | bigint | null;
@@ -268,6 +285,8 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
     name: row.name,
     artistId: row.album_artist_id,
     artistName: row.artist_name,
+    artistKind: row.artist_kind,
+    folderName: row.folder_name,
     songCount: Number(row.song_count),
     durationMs: Number(row.duration_ms ?? 0),
     year: num(row.year),
@@ -327,16 +346,16 @@ function albumSelect(q: AlbumQuery = {}): string {
     );
   }
   return `
-  SELECT al.id, al.name, al.album_artist_id, ar.name AS artist_name,
+  SELECT al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
          MAX(f.year) AS year, epoch_ms(MIN(fi.first_seen_at)) AS created_ms
   FROM albums al
-  JOIN artists ar ON ar.id = al.album_artist_id
+  LEFT JOIN artists ar ON ar.id = al.album_artist_id
   LEFT JOIN files f ON f.album_id = al.id
   LEFT JOIN file_identity fi ON fi.id = f.id
   ${joins.join('\n')}
   ${wheres.length === 0 ? '' : `WHERE ${wheres.join(' AND ')}`}
-  GROUP BY al.id, al.name, al.album_artist_id, ar.name`;
+  GROUP BY al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name`;
 }
 
 // File eligibility has one owner for sync, genre browsing and random sampling.
@@ -413,8 +432,15 @@ function catalogReads(q: Queries): CatalogReads {
     async albumsByArtist(artistId) {
       const res = await q.all(
         `${albumSelect()} HAVING al.album_artist_id = ${esc(artistId)}
-         ORDER BY al.name, al.id`,
+         ORDER BY COALESCE(al.name, al.folder_name), al.id`,
       );
+      return (res as unknown as AlbumSqlRow[]).map(albumOf);
+    },
+
+    async albumsWithoutArtist(kind, opts = {}) {
+      const res = await q.all(`${albumSelect({ folderId: opts.folderId })}
+        HAVING al.album_artist_id IS NULL AND al.artist_kind = ${esc(kind)}
+        ORDER BY COALESCE(al.name, al.folder_name), al.id`);
       return (res as unknown as AlbumSqlRow[]).map(albumOf);
     },
 
@@ -430,7 +456,10 @@ function catalogReads(q: Queries): CatalogReads {
           break;
         case 'artist':
           order = `ORDER BY ${sortKeySql('ar.name', opts.ignoredArticles)}, ${
-            sortKeySql('al.name', opts.ignoredArticles)
+            sortKeySql(
+              'COALESCE(al.name, al.folder_name)',
+              opts.ignoredArticles,
+            )
           }`;
           break;
         case 'highest':
@@ -441,19 +470,20 @@ function catalogReads(q: Queries): CatalogReads {
           if (userId === null) return [];
           if (opts.sort === 'highest') {
             query.ratedBy = userId;
-            order = 'ORDER BY MAX(r.rating) DESC, al.name';
+            order =
+              'ORDER BY MAX(r.rating) DESC, COALESCE(al.name, al.folder_name)';
           } else {
             query.listenAgg = userId;
             order = opts.sort === 'frequent'
-              ? 'ORDER BY MAX(agg.play_count) DESC NULLS LAST, al.name'
-              : 'ORDER BY MAX(agg.last_played) DESC NULLS LAST, al.name';
+              ? 'ORDER BY MAX(agg.play_count) DESC NULLS LAST, COALESCE(al.name, al.folder_name)'
+              : 'ORDER BY MAX(agg.last_played) DESC NULLS LAST, COALESCE(al.name, al.folder_name)';
           }
           break;
         }
         case 'genre':
           if (opts.genre === undefined) return [];
           query.genre = opts.genre;
-          order = 'ORDER BY al.name';
+          order = 'ORDER BY COALESCE(al.name, al.folder_name)';
           break;
         case 'year': {
           if (opts.fromYear === undefined || opts.toYear === undefined) {
@@ -463,12 +493,17 @@ function catalogReads(q: Queries): CatalogReads {
           query.yearTo = Math.max(opts.fromYear, opts.toYear);
           // Subsonic: fromYear > toYear is a reverse chronological list.
           order = opts.fromYear > opts.toYear
-            ? 'ORDER BY MAX(f.year) DESC, al.name'
-            : 'ORDER BY MAX(f.year), al.name';
+            ? 'ORDER BY MAX(f.year) DESC, COALESCE(al.name, al.folder_name)'
+            : 'ORDER BY MAX(f.year), COALESCE(al.name, al.folder_name)';
           break;
         }
         default:
-          order = `ORDER BY ${sortKeySql('al.name', opts.ignoredArticles)}`;
+          order = `ORDER BY ${
+            sortKeySql(
+              'COALESCE(al.name, al.folder_name)',
+              opts.ignoredArticles,
+            )
+          }`;
       }
       const res = await q.all(
         `${albumSelect(query)} ${order}${
@@ -526,8 +561,8 @@ function catalogReads(q: Queries): CatalogReads {
       );
       const albumRes = await q.all(
         `${albumSelect({ folderId: opts.folderId })}
-           HAVING al.name ILIKE ${like}
-            ORDER BY al.name, al.id
+            HAVING COALESCE(al.name, al.folder_name) ILIKE ${like}
+             ORDER BY COALESCE(al.name, al.folder_name), al.id
            LIMIT ${opts.albumCount} OFFSET ${opts.albumOffset}`,
       );
       const songRes = await q.all(
@@ -672,6 +707,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
     artistById: (id) => engine.exclusive((q) => catalogReads(q).artistById(id)),
     albumsByArtist: (id) =>
       engine.exclusive((q) => catalogReads(q).albumsByArtist(id)),
+    albumsWithoutArtist: (...args) =>
+      engine.exclusive((q) => catalogReads(q).albumsWithoutArtist(...args)),
     listAlbums: (opts) =>
       engine.exclusive((q) => catalogReads(q).listAlbums(opts)),
     albumsById: (...args) =>
@@ -739,6 +776,7 @@ export interface CatalogIdentity extends CatalogFileStat {
   rel_path: string;
   fingerprint: string | null;
   pcm_md5: string | null;
+  album_id: string | null;
 }
 
 export interface CatalogFile {
@@ -769,7 +807,9 @@ export interface CatalogEvent {
 
 export interface CatalogSnapshot {
   artists: { id: string; name: string }[];
-  albums: { id: string; name: string; albumArtistId: string }[];
+  albums: Album[];
+  albumIdentities: AlbumIdentity[];
+  albumEvents: AlbumEvent[];
   files: CatalogFile[];
   events: CatalogEvent[];
   retainedIds: string[];
@@ -791,7 +831,9 @@ async function replaceCatalog(
       file.stat.size ?? 'NULL'
     }, ${file.stat.mtime_ms ?? 'NULL'}, ${file.stat.dev ?? 'NULL'}, ${
       file.stat.ino ?? 'NULL'
-    }, ${nullable(file.fingerprint)}, ${nullable(file.pcmMd5)}`;
+    }, ${nullable(file.fingerprint)}, ${nullable(file.pcmMd5)}, ${
+      nullable(file.albumId)
+    }`;
     if (byId.has(file.id)) {
       await q.run(`UPDATE file_identity SET
           library_id = ${esc(file.libraryId)}, rel_path = ${esc(file.rel)},
@@ -804,10 +846,12 @@ async function replaceCatalog(
           ino = ${file.stat.ino ?? 'NULL'}, fingerprint = ${
         nullable(file.fingerprint)
       },
-          pcm_md5 = ${nullable(file.pcmMd5)} WHERE id = ${esc(file.id)}`);
+          pcm_md5 = ${nullable(file.pcmMd5)}, album_id = ${
+        nullable(file.albumId)
+      } WHERE id = ${esc(file.id)}`);
     } else {
       await q.run(`INSERT INTO file_identity
-          (id, first_seen_at, library_id, rel_path, present, last_seen_at, size, mtime_ms, dev, ino, fingerprint, pcm_md5)
+          (id, first_seen_at, library_id, rel_path, present, last_seen_at, size, mtime_ms, dev, ino, fingerprint, pcm_md5, album_id)
           VALUES (${esc(file.id)}, now(), ${values})`);
     }
   }
@@ -825,6 +869,23 @@ async function replaceCatalog(
   }
 
   // Rebuild catalog tables as before, using the resolved song ids.
+  await q.run('UPDATE album_identity SET present = false');
+  for (const identity of snapshot.albumIdentities) {
+    await q.run(`INSERT INTO album_identity (id, library_id, root_dir, present)
+      VALUES (${esc(identity.id)}, ${esc(identity.libraryId)}, ${
+      esc(identity.rootDir)
+    }, true)
+      ON CONFLICT (id) DO UPDATE SET library_id = excluded.library_id,
+        root_dir = excluded.root_dir, present = true`);
+  }
+  for (const event of snapshot.albumEvents) {
+    await q.run(`INSERT INTO album_events
+      ("at", kind, album_id, from_library_id, from_root, to_library_id, to_root, candidates)
+      VALUES (now(), ${esc(event.kind)}, ${esc(event.albumId)},
+        ${nullable(event.from?.libraryId)}, ${nullable(event.from?.rootDir)},
+        ${nullable(event.to?.libraryId)}, ${nullable(event.to?.rootDir)},
+        [${(event.candidates ?? []).map(esc).join(', ')}]::VARCHAR[])`);
+  }
   await q.run('DELETE FROM files');
   await q.run('DELETE FROM albums');
   await q.run('DELETE FROM artists');
@@ -843,13 +904,19 @@ async function replaceCatalog(
   }
 
   const albumStmt = await q.prepare(
-    'INSERT INTO albums (id, name, album_artist_id) VALUES (?, ?, ?)',
+    'INSERT INTO albums (id, name, album_artist_id, artist_kind, library_id, root_dir, folder_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
   );
   try {
     for (const album of albums) {
       albumStmt.bindVarchar(1, album.id);
-      albumStmt.bindVarchar(2, album.name);
-      albumStmt.bindVarchar(3, album.albumArtistId);
+      if (album.name === null) albumStmt.bindNull(2);
+      else albumStmt.bindVarchar(2, album.name);
+      if (album.albumArtistId === null) albumStmt.bindNull(3);
+      else albumStmt.bindVarchar(3, album.albumArtistId);
+      albumStmt.bindVarchar(4, album.artistKind);
+      albumStmt.bindVarchar(5, album.libraryId);
+      albumStmt.bindVarchar(6, album.rootDir);
+      albumStmt.bindVarchar(7, album.folderName);
       await albumStmt.run();
     }
   } finally {
@@ -899,8 +966,16 @@ export function createCatalogStore(engine: Engine) {
     identitySnapshot(): Promise<CatalogIdentity[]> {
       return engine.exclusive((q) =>
         q.all<CatalogIdentity>(`
-    SELECT id, library_id, rel_path, size, mtime_ms, dev, ino, fingerprint, pcm_md5
-    FROM file_identity ORDER BY id`)
+    SELECT fi.id, fi.library_id, fi.rel_path, fi.size, fi.mtime_ms, fi.dev, fi.ino,
+      fi.fingerprint, fi.pcm_md5, COALESCE(fi.album_id, f.album_id) AS album_id
+    FROM file_identity fi LEFT JOIN files f ON f.id = fi.id ORDER BY fi.id`)
+      );
+    },
+    albumIdentitySnapshot(): Promise<AlbumIdentity[]> {
+      return engine.exclusive((q) =>
+        q.all<AlbumIdentity>(`
+        SELECT id, library_id AS "libraryId", root_dir AS "rootDir"
+        FROM album_identity ORDER BY id`)
       );
     },
     replaceCatalog(snapshot: CatalogSnapshot): Promise<void> {

@@ -66,6 +66,7 @@ async function fixture(dir: string) {
     libraryPath: null,
     albumId: null,
     albumName: null,
+    albumFolderName: null,
     artistId: null,
     track: 1,
     disc: 1,

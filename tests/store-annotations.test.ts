@@ -10,7 +10,9 @@ Deno.test('store.annotations.classify looks up artist then album then song and r
     assertEquals(await t.domain.classify('alice', 'song'), 'song');
     assertEquals(await t.domain.classify('alice', "unknown'"), null);
     await t.run("INSERT INTO artists VALUES ('song', 'Collision')");
-    await t.run("INSERT INTO albums VALUES ('song', 'Collision', 'artist')");
+    await t.run(
+      "INSERT INTO albums (id, name, album_artist_id) VALUES ('song', 'Collision', 'artist')",
+    );
     assertEquals(await t.domain.classify('alice', 'song'), 'artist');
     await t.run("DELETE FROM artists WHERE id = 'song'");
     assertEquals(await t.domain.classify('alice', 'song'), 'album');

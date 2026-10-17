@@ -22,6 +22,7 @@ function song(durationMs: number | null = 1): SongRow {
     title: `Song ${songN}`,
     albumId: null,
     albumName: null,
+    albumFolderName: null,
     artistId: null,
     artistName: 'Artist',
     track: songN,

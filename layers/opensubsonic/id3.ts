@@ -32,6 +32,40 @@ import type {
 export const IGNORED_ARTICLES = 'The El La Los Las Le Les Os As O A';
 const ARTICLES = IGNORED_ARTICLES.split(' ');
 
+const placeholderId = async (kind: string) => {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`melofon-placeholder-artist\n${kind}`),
+  );
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0'))
+    .join('').slice(0, 32);
+};
+const PLACEHOLDER_IDS = {
+  various: await placeholderId('various'),
+  unknown: await placeholderId('unknown'),
+};
+export const albumLabel = (album: AlbumRow) =>
+  album.name ?? `[${album.folderName}]`;
+export function albumsByLabel(albums: AlbumRow[]): AlbumRow[] {
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  return [...albums].sort((a, b) =>
+    compare(albumLabel(a), albumLabel(b)) || compare(a.id, b.id)
+  );
+}
+export function albumArtistLabel(
+  album: AlbumRow,
+): { id: string; name: string } {
+  if (album.artistKind === 'various' || album.artistKind === 'unknown') {
+    return {
+      id: PLACEHOLDER_IDS[album.artistKind],
+      name: album.artistKind === 'various'
+        ? '[Various Artists]'
+        : '[Unknown Artist]',
+    };
+  }
+  return { id: album.artistId!, name: album.artistName! };
+}
+
 export function artistId3Of(
   artist: ArtistRow,
   p: Personal,
@@ -59,11 +93,12 @@ export function artistOf(
 // Album fields shared by the ID3 and pre-ID3 shapes, without personal facts:
 // each shape adds its own field rules.
 function albumBaseOf(album: AlbumRow): Record<string, unknown> {
+  const artist = albumArtistLabel(album);
   return {
     id: album.id,
-    name: album.name,
-    artist: album.artistName,
-    artistId: album.artistId,
+    name: albumLabel(album),
+    artist: artist.name,
+    artistId: artist.id,
     coverArt: album.id, // getCoverArt resolves album IDs
     songCount: album.songCount,
     duration: Math.round(album.durationMs / 1000),
@@ -91,9 +126,9 @@ export function albumV1Of(
 ): Record<string, unknown> {
   return {
     ...albumBaseOf(album),
-    parent: album.artistId,
-    album: album.name,
-    title: album.name,
+    parent: albumArtistLabel(album).id,
+    album: albumLabel(album),
+    title: albumLabel(album),
     isDir: true,
     ...childFields(p.album(album.id)),
   };
@@ -118,7 +153,9 @@ export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
       : new Date(song.firstSeenMs).toISOString(),
     isDir: false,
     title: song.title,
-    album: song.albumName ?? undefined,
+    album: song.albumId === null
+      ? undefined
+      : song.albumName ?? `[${song.albumFolderName}]`,
     artist: song.artistName ?? undefined,
     track: song.track ?? undefined,
     coverArt: song.albumId ?? undefined,
@@ -252,7 +289,7 @@ export async function zipEntriesFor(
   if (album !== null) {
     return {
       entries: entriesOf(album.songs),
-      filename: sanitize(album.album.name),
+      filename: sanitize(albumLabel(album.album)),
     };
   }
   const artist = await context.app.library.getArtist(id);
@@ -314,7 +351,7 @@ export async function artistIndex(
 export function artistAlbumsOrder(albums: AlbumRow[]): AlbumRow[] {
   const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
   return [...albums].sort((a, b) =>
-    (a.year ?? 0) - (b.year ?? 0) || compare(a.name, b.name) ||
+    (a.year ?? 0) - (b.year ?? 0) || compare(albumLabel(a), albumLabel(b)) ||
     compare(a.id, b.id)
   );
 }

@@ -32,6 +32,7 @@ export function createLibrary(store: Store): Library {
     getArtist: catalog.getArtist,
     artistById: catalog.artistById,
     albumsByArtist: catalog.albumsByArtist,
+    albumsWithoutArtist: catalog.albumsWithoutArtist,
     listAlbums: catalog.listAlbums,
     albumsById: catalog.albumsById,
     getAlbum: catalog.getAlbum,
