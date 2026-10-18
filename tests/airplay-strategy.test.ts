@@ -30,6 +30,7 @@ function song(id = 'song'): SongRow {
   return {
     id,
     path: `/fixture/${id}`,
+    fileName: id,
     title: id,
     durationMs: 3_600_000,
     libraryId: null,

@@ -198,7 +198,7 @@ export function trackPayload(
     (song.albumId === null ? '' : placeholderArtist('unknown', 0).name);
   return {
     id: wireInt(song.id),
-    title: song.title,
+    title: song.title ?? `[${song.fileName.replaceAll('_', ' ')}]`,
     artist,
     artist_sort: artist,
     ...(song.albumId !== null && {

@@ -1,9 +1,8 @@
 // src/artwork.ts — app.artwork: cover art as a Response, always an image,
-// never an error page. Resolution order (household rule: local cover.jpg
-// wins): the album's cover.jpg, then the embedded (APIC) picture of the
-// album's first song / of the song id itself, then the same chain for the
-// artist's first album (clients ask getCoverArt with artist ids for artist
-// tiles), then the placeholder. No rescaling in M1 (the `size` param is
+// never an error page. A song's own picture precedes its album's cover;
+// an album uses cover.<ext>, then its first track's picture. Artist tiles
+// use the same chain for the artist's first album, then the placeholder.
+// No rescaling in M1 (the `size` param is
 // ignored by the hat). Resolution of ids → data is app.library's job;
 // artwork composes (both are core).
 import { decodeBase64 } from '@std/encoding/base64';
@@ -28,23 +27,37 @@ function placeholder(): Response {
 }
 
 export function createArtwork(library: Library): ArtworkService {
+  const embeddedResponse = (picture: { bytes: Uint8Array; format: string }) =>
+    new Response(picture.bytes as unknown as BodyInit, {
+      headers: { 'content-type': picture.format },
+    });
   async function cover(id: string): Promise<Response> {
+    const song = await library.getSong(id);
+    if (song !== null) {
+      const own = await library.embeddedCover(id);
+      if (own !== null) return embeddedResponse(own);
+      return song.albumId === null ? placeholder() : await cover(song.albumId);
+    }
     const coverPath = await library.albumCoverPath(id);
     if (coverPath !== null) {
       try {
         const bytes = await Deno.readFile(coverPath);
         return new Response(bytes as unknown as BodyInit, {
-          headers: { 'content-type': 'image/jpeg' },
+          headers: {
+            'content-type': coverPath.toLowerCase().endsWith('.png')
+              ? 'image/png'
+              : coverPath.toLowerCase().endsWith('.webp')
+              ? 'image/webp'
+              : 'image/jpeg',
+          },
         });
       } catch {
-        // cover.jpg vanished between scan and read — fall through
+        // Cover vanished between resolution and read — fall through.
       }
     }
     const embedded = await library.embeddedCover(id);
     if (embedded !== null) {
-      return new Response(embedded.bytes as unknown as BodyInit, {
-        headers: { 'content-type': embedded.format },
-      });
+      return embeddedResponse(embedded);
     }
     // Artist id for an artist tile: the first album's cover stands in.
     const albums = await library.albumsByArtist(id);

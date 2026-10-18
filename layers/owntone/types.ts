@@ -180,7 +180,8 @@ export interface HatContext {
 export interface SongRow {
   id: string;
   path: string;
-  title: string;
+  title: string | null;
+  fileName: string;
   albumId: string | null;
   albumName: string | null;
   albumFolderName: string | null;

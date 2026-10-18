@@ -64,6 +64,7 @@ function longSong(suffix?: string): SongRow {
   return {
     id,
     path: `/music/${id}.mp3`,
+    fileName: id,
     libraryId: null,
     libraryPath: null,
     title: `Rec ${id}`,

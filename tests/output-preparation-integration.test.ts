@@ -59,6 +59,7 @@ async function fixture(dir: string) {
   const song: SongRow = {
     id: 'receiver-proof',
     path,
+    fileName: 'admission',
     title: 'Admission Fixture',
     artistName: 'Receiver Proof',
     durationMs: 60000,

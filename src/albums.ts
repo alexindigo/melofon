@@ -58,7 +58,7 @@ const formatWords = new Set([
   ...codecs,
   ...'lossless lossy hi res hires cbr vbr v0 v1 v2 bit khz kbps'.split(' '),
 ]);
-function isHint(name: string): boolean {
+export function isAlbumFolderHint(name: string): boolean {
   if (
     /^(dis[ck]|cd|cassette|digital[\s_-]*media|vinyl|vol(ume)?|part|act|side)[\W_]*\d+(\b.*)?$/i
       .test(name)
@@ -211,7 +211,7 @@ export async function groupAlbums(
       : 'unknown';
     const artistName = sample.albumArtistTag ??
       (performers.size === 1 ? [...performers][0] : null);
-    const displayDir = !group.merged && isHint(base(group.root))
+    const displayDir = !group.merged && isAlbumFolderHint(base(group.root))
       ? parent(group.root)
       : group.root;
     const folderName = displayDir === ''

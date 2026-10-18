@@ -2,6 +2,7 @@
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { userIdForName } from './users.ts';
 import { artistAlbumFolderFilter } from './catalog-sql.ts';
+import { isAlbumFolderHint } from '../albums.ts';
 import type {
   Album,
   AlbumEvent,
@@ -39,7 +40,9 @@ export interface SongRow {
   libraryId: string | null;
   /** Absolute path of that source's root — hats relativize `path` against it. */
   libraryPath: string | null;
-  title: string;
+  title: string | null;
+  /** Basename without extension; a filesystem fact, never a display label. */
+  fileName: string;
   albumId: string | null;
   albumName: string | null;
   albumFolderName: string | null;
@@ -166,6 +169,8 @@ export interface CatalogReads {
   ): Promise<SongRow | null>;
   coverSongPath(id: string): Promise<string | null>;
   albumSongPath(id: string): Promise<string | null>;
+  /** Track directories first, then an eligible album-only root directory. */
+  albumCoverDirectories(id: string): Promise<string[]>;
 }
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -213,7 +218,8 @@ interface SongSqlRow {
   path: string;
   library_id: string | null;
   library_path: string | null;
-  title: string;
+  title: string | null;
+  file_name: string;
   album_id: string | null;
   album_name: string | null;
   album_folder_name: string | null;
@@ -237,6 +243,7 @@ function songOf(row: SongSqlRow): SongRow {
     libraryId: row.library_id,
     libraryPath: row.library_path,
     title: row.title,
+    fileName: row.file_name,
     albumId: row.album_id,
     albumName: row.album_name,
     albumFolderName: row.album_folder_name,
@@ -255,8 +262,11 @@ function songOf(row: SongSqlRow): SongRow {
   };
 }
 
+const SONG_FILE_NAME =
+  `regexp_replace(regexp_extract(f.path, '[^/]+$'), '\\.[^.]*$', '')`;
+const SONG_TITLE = `COALESCE(f.title, ${SONG_FILE_NAME})`;
 const SONG_SELECT = `
-  SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title,
+  SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title, ${SONG_FILE_NAME} AS file_name,
          f.album_id, al.name AS album_name, al.folder_name AS album_folder_name, f.artist_id,
          ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
          f.genre, f.year, f.is_video, epoch_ms(fi.first_seen_at) AS first_seen_ms
@@ -567,9 +577,9 @@ function catalogReads(q: Queries): CatalogReads {
       );
       const songRes = await q.all(
         `${SONG_SELECT} WHERE ${
-          [`f.title ILIKE ${like}`, ...songPredicates(opts)].join(' AND ')
+          [`${SONG_TITLE} ILIKE ${like}`, ...songPredicates(opts)].join(' AND ')
         }
-            ORDER BY f.title, f.id
+            ORDER BY ${SONG_TITLE}, f.id
            LIMIT ${opts.songCount} OFFSET ${opts.songOffset}`,
       );
       return {
@@ -649,7 +659,7 @@ function catalogReads(q: Queries): CatalogReads {
       const res = await q.all(
         `${SONG_SELECT}
          WHERE ${songPredicates({ ...opts, genre }).join(' AND ')}
-         ORDER BY f.title, f.id
+         ORDER BY ${SONG_TITLE}, f.id
          LIMIT ${opts.size} OFFSET ${opts.offset}`,
       );
       return (res as unknown as SongSqlRow[]).map(songOf);
@@ -661,12 +671,12 @@ function catalogReads(q: Queries): CatalogReads {
         wheres.push(`ar.name ILIKE ${esc(query.artist)}`);
       }
       if (query.title !== undefined) {
-        wheres.push(`f.title ILIKE ${esc(query.title)}`);
+        wheres.push(`${SONG_TITLE} ILIKE ${esc(query.title)}`);
       }
       if (wheres.length === 0) return null;
       const res = await q.all(
         `${SONG_SELECT} WHERE ${wheres.join(' AND ')}
-         ORDER BY f.title LIMIT 1`,
+         ORDER BY ${SONG_TITLE}, f.id LIMIT 1`,
       );
       const row = (res as unknown as SongSqlRow[])[0];
       return row ? songOf(row) : null;
@@ -675,7 +685,7 @@ function catalogReads(q: Queries): CatalogReads {
     async coverSongPath(id) {
       let res = await q.all(
         `SELECT path FROM files WHERE album_id = ${esc(id)}
-         ORDER BY path LIMIT 1`,
+         ORDER BY disc, track, path, id LIMIT 1`,
       );
       let row = (res as { path: string }[])[0];
       if (!row) {
@@ -695,6 +705,45 @@ function catalogReads(q: Queries): CatalogReads {
       );
       const row = (res as { path: string }[])[0];
       return row?.path ?? null;
+    },
+
+    async albumCoverDirectories(id) {
+      const rows = await q.all<{
+        dir: string;
+        library_path: string;
+        root_dir: string;
+      }>(`SELECT DISTINCT regexp_replace(f.path, '/[^/]+$', '') AS dir,
+                 l.path AS library_path, al.root_dir
+          FROM albums al JOIN files f ON f.album_id = al.id
+          JOIN libraries l ON l.id = al.library_id
+          WHERE al.id = ${esc(id)} ORDER BY dir`);
+      if (rows.length === 0) return [];
+      const dirs = rows.map((r) => r.dir);
+      const libraryPath = rows[0].library_path.replace(/\/+$/, '');
+      const root = rows[0].root_dir;
+      const albumDir = root === '' ? libraryPath : `${libraryPath}/${root}`;
+      const merged = dirs.length > 1;
+      if (
+        !merged &&
+        !isAlbumFolderHint(albumDir.slice(albumDir.lastIndexOf('/') + 1))
+      ) {
+        return dirs;
+      }
+      const candidate = merged
+        ? albumDir
+        : albumDir.slice(0, albumDir.lastIndexOf('/'));
+      // A root fallback must belong solely to this album, never the library
+      // root or an artist folder containing any other album's media.
+      if (
+        candidate === libraryPath || !candidate.startsWith(`${libraryPath}/`) ||
+        dirs.includes(candidate)
+      ) {
+        return dirs;
+      }
+      const other = await q.all(`SELECT 1 FROM files
+        WHERE starts_with(path, ${esc(candidate + '/')})
+          AND album_id IS DISTINCT FROM ${esc(id)} LIMIT 1`);
+      return other.length === 0 ? [...dirs, candidate] : dirs;
     },
   };
 }
@@ -736,6 +785,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).coverSongPath(id)),
     albumSongPath: (id) =>
       engine.exclusive((q) => catalogReads(q).albumSongPath(id)),
+    albumCoverDirectories: (id) =>
+      engine.exclusive((q) => catalogReads(q).albumCoverDirectories(id)),
   };
 }
 
@@ -787,7 +838,7 @@ export interface CatalogFile {
   stat: CatalogFileStat;
   fingerprint: string | null;
   pcmMd5: string | null;
-  title: string;
+  title: string | null;
   albumId: string | null;
   artistId: string | null;
   track: number | null;
@@ -937,7 +988,8 @@ async function replaceCatalog(
       else fileStmt.bindBigInt(4, BigInt(file.stat.mtime_ms));
       if (file.stat.size === null) fileStmt.bindNull(5);
       else fileStmt.bindBigInt(5, BigInt(file.stat.size));
-      fileStmt.bindVarchar(6, file.title);
+      if (file.title === null) fileStmt.bindNull(6);
+      else fileStmt.bindVarchar(6, file.title);
       if (file.albumId === null) fileStmt.bindNull(7);
       else fileStmt.bindVarchar(7, file.albumId);
       if (file.artistId === null) fileStmt.bindNull(8);

@@ -64,7 +64,7 @@ async function* walkMedia(
   for await (const entry of Deno.readDir(dir)) {
     const abs = `${dir}/${entry.name}`;
     if (entry.isDirectory) {
-      yield* walkMedia(root, abs);
+      if (!entry.name.startsWith('.')) yield* walkMedia(root, abs);
     } else if (
       entry.isFile &&
       (AUDIO_EXTENSIONS.has(extOf(entry.name)) ||
@@ -189,7 +189,6 @@ export async function scanLibrary(
           durationMs = (await fallbackMedia().probe(abs)).durationMs;
         }
 
-        const name = rel.split('/').pop()!.replace(/\.[^.]*$/, '');
         let artistId: string | null = null;
         if (trackArtist !== undefined) {
           artistId = await stableId('artist', trackArtist);
@@ -202,7 +201,7 @@ export async function scanLibrary(
           libraryId: source.id,
           stat,
           ...audio,
-          title: title ?? name,
+          title: title ?? null,
           albumId: null,
           artistId,
           track: trackNo,

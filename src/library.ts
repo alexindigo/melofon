@@ -12,16 +12,21 @@ export type {
   SongRow,
 } from './store/catalog.ts';
 
-export interface Library
-  extends
-    Omit<CatalogReads, 'songForLyrics' | 'coverSongPath' | 'albumSongPath'> {
+export interface Library extends
+  Omit<
+    CatalogReads,
+    | 'songForLyrics'
+    | 'coverSongPath'
+    | 'albumSongPath'
+    | 'albumCoverDirectories'
+  > {
   /** Embedded (USLT) lyrics of the best artist/title match. */
   lyrics(query: { artist?: string; title?: string }): Promise<LyricsRow | null>;
   /** Embedded (APIC) cover of an album's first song, or of a song id itself. */
   embeddedCover(
     id: string,
   ): Promise<{ bytes: Uint8Array; format: string } | null>;
-  /** Absolute path of an album's cover.jpg, for app.artwork (null if none). */
+  /** Absolute path of cover.{jpg,jpeg,png,webp} in album folder/root. */
   albumCoverPath(id: string): Promise<string | null>;
 }
 
@@ -70,16 +75,25 @@ export function createLibrary(store: Store): Library {
       }
     },
     async albumCoverPath(id) {
-      const path = await catalog.albumSongPath(id);
-      if (path === null) return null;
-      const dir = path.slice(0, path.lastIndexOf('/'));
-      const cover = `${dir}/cover.jpg`;
-      try {
-        const stat = await Deno.stat(cover);
-        return stat.isFile ? cover : null;
-      } catch {
-        return null;
+      const dirs = await catalog.albumCoverDirectories(id);
+      for (const dir of dirs) {
+        try {
+          const names: string[] = [];
+          for await (const entry of Deno.readDir(dir)) {
+            if (
+              entry.isFile && /^cover\.(jpg|jpeg|png|webp)$/i.test(entry.name)
+            ) {
+              names.push(entry.name);
+            }
+          }
+          // Stable selection until local conflicts become candidates (L3).
+          names.sort();
+          if (names.length > 0) return `${dir}/${names[0]}`;
+        } catch {
+          // Missing/unreadable folder: try the remaining eligible directories.
+        }
       }
+      return null;
     },
   };
 }

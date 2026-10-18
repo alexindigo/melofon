@@ -20,6 +20,7 @@ function song(): SongRow {
   return {
     id: `hash-${songN}`,
     path: `/music/song-${songN}.mp3`,
+    fileName: `song-${songN}`,
     libraryId: null,
     libraryPath: null,
     title: `Song ${songN}`,

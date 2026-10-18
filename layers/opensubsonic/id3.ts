@@ -177,7 +177,7 @@ export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
       ? undefined
       : new Date(song.firstSeenMs).toISOString(),
     isDir: false,
-    title: song.title,
+    title: song.title ?? `[${song.fileName.replaceAll('_', ' ')}]`,
     album: song.albumId === null
       ? undefined
       : song.albumName ?? `[${song.albumFolderName}]`,

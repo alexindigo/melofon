@@ -308,7 +308,8 @@ export interface SongRow {
   path: string;
   libraryId: string | null;
   libraryPath: string | null;
-  title: string;
+  title: string | null;
+  fileName: string;
   albumId: string | null;
   albumName: string | null;
   albumFolderName: string | null;

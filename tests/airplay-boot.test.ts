@@ -38,6 +38,7 @@ function fixtureSong(): SongRow {
   return {
     id: 'fixture-song-1',
     path: FIXTURE_MP3,
+    fileName: '01 - First Song',
     libraryId: null,
     libraryPath: null,
     title: 'First Song',
@@ -745,6 +746,7 @@ function longSong(suffix?: string): SongRow {
   return {
     id,
     path: `/music/${id}.mp3`,
+    fileName: id,
     libraryId: null,
     libraryPath: null,
     title: `Long ${id}`,
