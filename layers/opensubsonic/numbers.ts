@@ -77,3 +77,8 @@ export function safeInteger(raw: string): number | null {
   const value = Number(raw);
   return Number.isSafeInteger(value) ? value : null;
 }
+
+/** JSON has already classified the token as a number; strings are never coerced. */
+export function jsonInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value);
+}

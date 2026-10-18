@@ -163,7 +163,7 @@ async function videoId(
   return (videos.videos as { video: { id: string }[] }).video[0].id;
 }
 
-Deno.test('stream on a video id DirectPlays the original container', async () => {
+Deno.test('stream on a video id defaults to audio; raw supports container Range', async () => {
   const { app, close } = await setup();
   try {
     const id = await videoId(app);
@@ -171,18 +171,14 @@ Deno.test('stream on a video id DirectPlays the original container', async () =>
       new Request(`http://x/rest/stream?${AUTH}&id=${id}`),
     );
     assertEquals(res.status, 200);
-    assertEquals(res.headers.get('content-type'), 'video/mp4');
+    assertEquals(res.headers.get('content-type'), 'audio/mpeg');
     const bytes = new Uint8Array(await res.arrayBuffer());
-    const onDisk = await Deno.readFile(
-      'tests/fixtures/library/Fixture Artist/Fixture Album/03 - Clip.mp4',
-    );
-    assertEquals(bytes.length, onDisk.length);
-    // ISO BMFF magic: bytes 4..8 are 'ftyp'.
-    assertEquals(new TextDecoder().decode(bytes.slice(4, 8)), 'ftyp');
+    const meta = await parseBuffer(bytes, 'audio/mpeg');
+    assert(meta.format.duration !== undefined && meta.format.duration > 0);
 
     // Range still applies (DirectPlay keeps serveFile semantics).
     const partial = await app(
-      new Request(`http://x/rest/stream?${AUTH}&id=${id}`, {
+      new Request(`http://x/rest/stream?${AUTH}&id=${id}&format=raw`, {
         headers: { range: 'bytes=0-99' },
       }),
     );
@@ -227,11 +223,11 @@ Deno.test('stream decision boundaries: raw/unknown formats and audio files', asy
     assertEquals(raw.headers.get('content-type'), 'video/mp4');
     await raw.body?.cancel();
 
-    // An unknown format is not an audio codec — DirectPlay, not an error.
+    // An unavailable video format falls back to the default audio profile.
     const unknown = await app(
       new Request(`http://x/rest/stream?${AUTH}&id=${id}&format=mkv`),
     );
-    assertEquals(unknown.headers.get('content-type'), 'video/mp4');
+    assertEquals(unknown.headers.get('content-type'), 'audio/mpeg');
     await unknown.body?.cancel();
 
     // format=mp3 on an AUDIO file is not ExtractAudio (that branch needs a

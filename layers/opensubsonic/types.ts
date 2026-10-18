@@ -22,6 +22,7 @@ export interface HatRequest {
   headers: Headers;
   body: {
     form(): Promise<FormData>;
+    json(): Promise<unknown>;
   };
   _raw: Request;
 }
@@ -251,7 +252,20 @@ export interface HatContext {
         format?: string,
         identity?: StreamIdentity,
         maxBitRateKbps?: number,
+        options?: { timeOffset?: number; estimateContentLength?: boolean },
       ): Promise<Response | null>;
+      decision(
+        file: { path: string; isVideo: boolean },
+        capabilities: import('./transcoding.ts').ClientInfo,
+        username: string,
+      ): Promise<import('./transcoding.ts').TranscodeDecision | null>;
+      negotiated(
+        request: Request,
+        file: { path: string; isVideo: boolean },
+        token: string,
+        identity: StreamIdentity,
+        offset?: number,
+      ): Promise<Response>;
     };
     media: {
       /** Remux to 10s MPEG-TS HLS segments in outDir (stream copy);

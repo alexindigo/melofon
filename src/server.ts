@@ -49,9 +49,9 @@ const store = await openStore(cfg.dataDir, {
 const persistence = createPersistence(store);
 await seedFirstUser(store, cfg);
 const libraries = createLibraries(store);
-const media = createMedia();
 const notify = createNotify();
 const state = createState(store);
+const media = createMedia(undefined, state);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
 const scan = createScan(store, media, { notify });

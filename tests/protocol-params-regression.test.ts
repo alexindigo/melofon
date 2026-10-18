@@ -1013,6 +1013,7 @@ for (const [index, contentType] of [...formTypes, ...nonFormTypes].entries()) {
         query: new URLSearchParams('n=query-first&n=query-second'),
         _raw: new Request('http://x'),
         body: {
+          json: () => Promise.reject(new Error('Params must not decode JSON')),
           form: () => {
             decoded++;
             return Promise.resolve(form);
@@ -1244,10 +1245,14 @@ Deno.test('MIME facade non-form types retain query auth and exact public discove
       assertEquals(response.status, 200);
       if (format === 'json') {
         const body = (await response.json())['subsonic-response'];
-        assertEquals(body.openSubsonicExtensions, [{
-          name: 'formPost',
-          versions: [1],
-        }]);
+        assertEquals(body.openSubsonicExtensions, [
+          {
+            name: 'formPost',
+            versions: [1],
+          },
+          { name: 'transcodeOffset', versions: [1] },
+          { name: 'transcoding', versions: [1] },
+        ]);
         assertEquals(Object.keys(body).sort(), [
           'openSubsonic',
           'openSubsonicExtensions',

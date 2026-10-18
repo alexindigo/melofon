@@ -7,6 +7,8 @@ export interface Capability {
 
 export const CAPABILITIES: readonly Capability[] = Object.freeze([
   Object.freeze({ name: 'formPost', versions: Object.freeze([1]) }),
+  Object.freeze({ name: 'transcodeOffset', versions: Object.freeze([1]) }),
+  Object.freeze({ name: 'transcoding', versions: Object.freeze([1]) }),
 ]);
 
 // One semantic projection for JSON and the envelope's repeated-array XML.

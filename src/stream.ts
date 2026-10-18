@@ -1,79 +1,92 @@
-// src/stream.ts — app.stream: a decision, then bytes. The decision is
-// DirectPlay | TranscodeAudio (audio and video alike — one path):
-//   format=raw                DirectPlay (protocol's explicit no-transcode)
-//   format absent             DirectPlay, unless MELOFON_STREAM_ABSENT_TO_MP3
-//                             (dumb clients) or the maxBitRate ceiling kicks in
-//   format == source codec    DirectPlay (probed codec, not the suffix)
-//   format set, differs       TranscodeAudio, streaming (chunked, no
-//                             content-length, no Range)
-//   maxBitRate < source bitrate  transcode even when format is absent or
-//                             matching (Navidrome's rule); value clamps the
-//                             encoder. Keep the source codec when it has a
-//                             profile, else mp3.
-// No flac target (lossless clients DirectPlay). TranscodeVideo stays a named
-// path only — not implemented. No listens here — stream is not a scrobble.
+// Core owns stream decisions and their execution. Hats parse wire arguments;
+// one prepared decision governs GET/HEAD, legacy streaming and negotiation.
 import { serveFile } from '@std/http/file-server';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { Buffer } from 'node:buffer';
+import { extname } from 'node:path';
 import type { Media } from './media.ts';
 import type { Playback } from './playback.ts';
+import { type Log, scopedLog } from './logging.ts';
+import {
+  type ClientCapabilities,
+  negotiate,
+  type Negotiation,
+} from './stream-negotiation.ts';
 
 export interface StreamFile {
   path: string;
   isVideo: boolean;
 }
-
-/** Who is listening, from the hat: one id per stream OPEN (each Range hit
- * mints its own). Start → playback.reportPlaying; request completion or
- * disconnect → playback.reportStopped (stale ids no-op there). */
 export interface StreamIdentity {
   username: string;
   client: string;
   trackId: string;
   streamId: string;
 }
-
-type Decision =
+export interface StreamOptions {
+  timeOffset?: number;
+  estimateContentLength?: boolean;
+}
+export type StreamDecision =
   | { kind: 'direct' }
-  | { kind: 'transcode'; format: string; bitRateKbps: number };
-
+  | {
+    kind: 'transcode';
+    format: string;
+    bitRateKbps: number;
+    sampleRate?: number;
+    channels?: number;
+  };
 export interface StreamService {
-  /** Stream one file path to the client (200 full / 206 partial). */
   file(
     request: Request,
     path: string,
     identity?: StreamIdentity,
   ): Promise<Response>;
-  /** Decide DirectPlay vs TranscodeAudio for a catalog file, then serve it.
-   * Null when the decision needed a transcode that failed pre-flight (no
-   * audio / no such target / encoder missing) — the hat renders its error
-   * envelope. `maxBitRateKbps` is the Subsonic maxBitRate (kbps). */
   play(
     request: Request,
     file: StreamFile,
     format?: string,
     identity?: StreamIdentity,
     maxBitRateKbps?: number,
+    options?: StreamOptions,
   ): Promise<Response | null>;
+  decision(
+    file: StreamFile,
+    capabilities: ClientCapabilities,
+    username: string,
+  ): Promise<(Negotiation & { transcodeParams: string }) | null>;
+  negotiated(
+    request: Request,
+    file: StreamFile,
+    token: string,
+    identity: StreamIdentity,
+    offset?: number,
+  ): Promise<Response>;
 }
 
-// Transcode targets (the plan's no-flac-target rule lives in app.media).
-const TRANSCODE_TARGETS = new Set(['mp3', 'aac', 'opus', 'ogg']);
-const PROFILE_DEFAULT_KBPS: Record<string, number> = {
-  mp3: 192,
-  aac: 160,
-  opus: 128,
-  ogg: 192,
-};
+// Normalize unlimited once, before any target or bitrate selection.
+const limit = (value?: number) =>
+  value !== undefined && Number.isFinite(value) && value > 0 ? value : Infinity;
+const offsetSeconds = (value?: number) =>
+  value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 
 export function createStream(
   media: Media,
   playback?: Playback,
-  cfg?: { absentToMp3?: boolean },
+  cfg?: { absentToMp3?: boolean; secret?: string },
+  log: Log = scopedLog('stream'),
 ): StreamService {
-  // reportPlaying at open; reportStopped when the response is done (either
-  // way — delivered or disconnected; request.signal aborts on both under
-  // Deno's current legacy behavior). Stale streamIds no-op downstream.
+  const secret = cfg?.secret ?? crypto.randomUUID();
+  const signature = (payload: string) =>
+    createHmac('sha256', secret).update(payload).digest();
+  const fileKey = (path: string) =>
+    createHash('sha256').update(path).digest('hex');
+  const stamp = async (path: string) => {
+    const stat = await Deno.stat(path);
+    return `${stat.size}:${stat.mtime?.getTime()}:${stat.ino}`;
+  };
   const hook = (request: Request, identity?: StreamIdentity) => {
-    if (playback === undefined || identity === undefined) return;
+    if (!playback || !identity || request.method === 'HEAD') return;
     void playback.reportPlaying(identity);
     request.signal.addEventListener(
       'abort',
@@ -81,84 +94,166 @@ export function createStream(
       { once: true },
     );
   };
-
-  const decide = async (
-    file: StreamFile,
-    format: string | undefined,
-    maxBitRateKbps: number | undefined,
-  ): Promise<Decision> => {
-    if (format === 'raw') return { kind: 'direct' };
-
-    // The probe is needed only when a format or a ceiling is in play.
-    const probed = (format !== undefined || maxBitRateKbps !== undefined)
-      ? await media.probe(file.path)
-      : null;
-    const sourceCodec = probed?.audioCodec ?? null;
-    const sourceBitrateKbps = probed?.bitrateKbps ?? null;
-
-    // Navidrome's ceiling rule: transcode when the source is over maxBitRate,
-    // even when the format is absent or already matches. 0 = "no limit".
-    const ceiling = maxBitRateKbps !== undefined && maxBitRateKbps > 0 &&
-      sourceBitrateKbps !== null && sourceBitrateKbps > maxBitRateKbps;
-    const clamp = (profileDefault: number) =>
-      maxBitRateKbps === undefined
-        ? profileDefault
-        : Math.min(profileDefault, maxBitRateKbps);
-
-    if (format === undefined) {
-      if (cfg?.absentToMp3 === true) {
-        return {
-          kind: 'transcode',
-          format: 'mp3',
-          bitRateKbps: clamp(PROFILE_DEFAULT_KBPS.mp3),
-        };
-      }
-      if (ceiling) {
-        const target =
-          sourceCodec !== null && TRANSCODE_TARGETS.has(sourceCodec)
-            ? sourceCodec
-            : 'mp3';
-        return {
-          kind: 'transcode',
-          format: target,
-          bitRateKbps: clamp(PROFILE_DEFAULT_KBPS[target]),
-        };
-      }
-      return { kind: 'direct' };
+  const fixed = async (
+    request: Request,
+    path: string,
+    identity?: StreamIdentity,
+  ) => {
+    const response = await serveFile(request, path);
+    const probe = await media.probe(path);
+    if (probe.durationMs !== null) {
+      response.headers.set(
+        'X-Content-Duration',
+        String(probe.durationMs / 1000),
+      );
     }
-
-    // No such target (flac, mkv, wav): DirectPlay — the no-flac-target rule
-    // is "lossless clients get DirectPlay", not an error envelope.
-    if (!TRANSCODE_TARGETS.has(format)) return { kind: 'direct' };
-    if (format === sourceCodec && !ceiling) return { kind: 'direct' };
-    return {
-      kind: 'transcode',
-      format,
-      bitRateKbps: clamp(PROFILE_DEFAULT_KBPS[format]),
-    };
+    hook(request, identity);
+    return response;
   };
-
+  const serve = async (
+    request: Request,
+    file: StreamFile,
+    decision: StreamDecision,
+    identity?: StreamIdentity,
+    options: StreamOptions = {},
+  ): Promise<Response | null> => {
+    if (decision.kind === 'direct') return fixed(request, file.path, identity);
+    const profile = (await media.audioProfiles()).find((p) =>
+      p.format === decision.format
+    );
+    if (!profile) return null;
+    const probe = await media.probe(file.path);
+    if (!probe.hasAudio) return null;
+    const offset = offsetSeconds(options.timeOffset);
+    const headers = new Headers({
+      'content-type': profile.contentType,
+      'accept-ranges': 'none',
+    });
+    if (probe.durationMs !== null) {
+      headers.set('X-Content-Duration', String(probe.durationMs / 1000));
+    }
+    const empty = probe.durationMs !== null &&
+      offset * 1000 >= probe.durationMs;
+    // Navidrome media_streamer.go:149-151,165-172: full source duration,
+    // selected kbps and 1024 (not 1000), even for an offset request.
+    if (options.estimateContentLength && probe.durationMs !== null) {
+      headers.set(
+        'content-length',
+        String(
+          Math.trunc(probe.durationMs / 1000 * decision.bitRateKbps / 8 * 1024),
+        ),
+      );
+    }
+    if (empty) {
+      log.event('stream_empty', {
+        path: file.path,
+        format: decision.format,
+        offset,
+      });
+      headers.set('content-length', '0');
+    }
+    if (request.method === 'HEAD' || empty) {
+      return new Response(null, { headers });
+    }
+    const audio = await media.transcodeAudio(file.path, decision.format, {
+      bitRateKbps: decision.bitRateKbps,
+      startSeconds: offset,
+      sampleRate: decision.sampleRate,
+      channels: decision.channels,
+      signal: request.signal,
+    });
+    if (!audio) return null;
+    hook(request, identity);
+    return new Response(audio.stream, { headers });
+  };
   return {
-    file(request, path, identity) {
-      hook(request, identity);
-      return serveFile(request, path);
+    file: fixed,
+    async play(request, file, format, identity, maxBitRateKbps, options) {
+      if (format === 'raw') return fixed(request, file.path, identity);
+      const ceiling = limit(maxBitRateKbps);
+      const probe = await media.probe(file.path);
+      const profiles = await media.audioProfiles();
+      const over = probe.bitrateKbps !== null && probe.bitrateKbps > ceiling;
+      const container = extname(file.path).slice(1).toLowerCase();
+      if (file.isVideo && format === container && !over) {
+        return fixed(request, file.path, identity);
+      }
+      let target = format;
+      if (!file.isVideo && format === undefined && !cfg?.absentToMp3 && !over) {
+        return fixed(request, file.path, identity);
+      }
+      if (!file.isVideo && format === probe.audioCodec && !over) {
+        return fixed(request, file.path, identity);
+      }
+      if (target === undefined && over && !file.isVideo) {
+        target = probe.audioCodec ?? undefined;
+      }
+      const profile = profiles.find((p) => p.format === target) ??
+        profiles.find((p) => p.format === 'mp3');
+      if (!profile) return null;
+      if (
+        !file.isVideo && format !== undefined &&
+        profile.format === probe.audioCodec && !over
+      ) return fixed(request, file.path, identity);
+      return serve(
+        request,
+        file,
+        {
+          kind: 'transcode',
+          format: profile.format,
+          bitRateKbps: Math.min(profile.bitRateKbps, ceiling),
+        },
+        identity,
+        options,
+      );
     },
-    async play(request, file, format, identity, maxBitRateKbps) {
-      const decision = await decide(file, format, maxBitRateKbps);
-      if (decision.kind === 'transcode') {
-        const audio = await media.transcodeAudio(file.path, decision.format, {
-          bitRateKbps: decision.bitRateKbps,
-        });
-        if (audio === null) return null;
-        hook(request, identity);
-        // Chunked: no content-length, no accept-ranges. Subsonic `size`
-        // fields stay the SOURCE size — never an estimate.
-        return new Response(audio.stream, {
-          headers: { 'content-type': audio.contentType },
+    async decision(file, capabilities, username) {
+      const source = await media.describeAudio(file.path);
+      if (!source) return null;
+      const result = negotiate(
+        source,
+        capabilities,
+        await media.audioProfiles(),
+      );
+      let token = '';
+      if (result.selection) {
+        const payload = Buffer.from(
+          JSON.stringify({
+            file: fileKey(file.path),
+            stamp: await stamp(file.path),
+            username,
+            decision: result.selection,
+          }),
+        ).toString('base64url');
+        token = `${payload}.${signature(payload).toString('base64url')}`;
+      }
+      return { ...result, transcodeParams: token };
+    },
+    async negotiated(request, file, token, identity, offset) {
+      let decision: StreamDecision;
+      try {
+        const [payload, mac, extra] = token.split('.');
+        const expected = signature(payload);
+        const actual = Buffer.from(mac, 'base64url');
+        if (
+          extra !== undefined || actual.length !== expected.length ||
+          !timingSafeEqual(actual, expected)
+        ) throw new Error('Invalid token');
+        const claims = JSON.parse(Buffer.from(payload, 'base64url').toString());
+        if (
+          claims.file !== fileKey(file.path) ||
+          claims.username !== identity.username ||
+          claims.stamp !== await stamp(file.path)
+        ) throw new Error('Stale token');
+        decision = claims.decision;
+      } catch {
+        return new Response('Invalid or stale transcodeParams', {
+          status: 410,
         });
       }
-      hook(request, identity);
-      return serveFile(request, file.path);
+      return await serve(request, file, decision, identity, {
+        timeOffset: offset,
+      }) ?? new Response('Cannot create media stream', { status: 500 });
     },
   };
 }

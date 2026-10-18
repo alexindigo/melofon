@@ -370,6 +370,8 @@ Deno.test('H1C discovery stays public with conflicting credentials and f=jsonp',
   claims(value);
   assertEquals(value.openSubsonicExtensions, [
     { name: 'formPost', versions: [1] },
+    { name: 'transcodeOffset', versions: [1] },
+    { name: 'transcoding', versions: [1] },
   ]);
   assertEquals(on.calls.auth, []);
 });

@@ -1,12 +1,12 @@
 // layers/opensubsonic/rest/stream/get.ts — GET /rest/stream.
-// app.stream decides (M4): DirectPlay = original bytes, Range-aware;
-// ExtractAudio = a video id + an audio `format` → in-process audio track.
+// app.stream prepares DirectPlay or a live audio transcode; unrequested
+// music-video containers become audio-only. HEAD shares headers, never encoding.
 // Every open reports the play to core (playback.reportPlaying, one id per
 // open; completion/disconnect reports the stop — an older Range completing
 // never clears a newer stream). Never a listens row — stream is not a
 // scrobble. The hat only parses, calls, encodes.
 import { fail, notFound } from '#opensubsonic/envelope.ts';
-import { requiredParam } from '#opensubsonic/params.ts';
+import { intParam, requiredParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (request: HatRequest, context: HatContext) => {
@@ -29,6 +29,11 @@ export default async (request: HatRequest, context: HatContext) => {
       streamId: crypto.randomUUID(),
     },
     maxBitRateKbps,
+    {
+      timeOffset: intParam(context.state.params!, 'timeOffset', 0),
+      estimateContentLength:
+        context.state.params!.get('estimateContentLength') === 'true',
+    },
   );
   if (res === null) {
     return fail(context, 0, 'audio extraction failed');

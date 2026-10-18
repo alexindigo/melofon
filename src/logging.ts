@@ -33,7 +33,7 @@ export interface LoggerOptions {
   maxQueued?: number;
 }
 const SENSITIVE =
-  /^(?:u|p|t|s|user|username|password|passwd|pwd|pin|secret|token|accesstoken|refreshtoken|apikey|key|privatekey|authorization|proxyauthorization|cookie|setcookie|xapikey|xpin)$/;
+  /^(?:u|p|t|s|user|username|password|passwd|pwd|pin|secret|token|transcodeparams|accesstoken|refreshtoken|apikey|key|privatekey|authorization|proxyauthorization|cookie|setcookie|xapikey|xpin)$/;
 function sensitive(key: string): boolean {
   let name = key;
   for (let i = 0; i < 3; i++) {

@@ -2,7 +2,11 @@
 // getters, the required-param failure, and the musicFolderId wire-int
 // mapping. Shared module at the layer root, outside the walked mount tree.
 import { fail } from '#opensubsonic/envelope.ts';
-import { legacyInteger, safeInteger } from '#opensubsonic/numbers.ts';
+import {
+  jsonInteger,
+  legacyInteger,
+  safeInteger,
+} from '#opensubsonic/numbers.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 // Merged request params, Navidrome's postFormToQueryParams model: form body
@@ -28,6 +32,11 @@ export async function params(request: HatRequest): Promise<URLSearchParams> {
 // Whole-number entry point for route-specific required/range/filter contracts.
 export function integerParam(raw: string | null): number | null {
   return raw === null ? null : legacyInteger(raw);
+}
+
+/** Body-number policy: optional callers handle absence, never coerce strings. */
+export function jsonIntegerParam(value: unknown): value is number {
+  return jsonInteger(value);
 }
 
 export function intParam(

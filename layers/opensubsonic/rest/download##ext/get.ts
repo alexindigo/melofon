@@ -21,9 +21,10 @@ export default async (request: HatRequest, context: HatContext) => {
   const named = await zipEntriesFor(context, id);
   if (named === null) return notFound(context);
   const blob = await context.app.zip.archive(named.entries);
-  return new Response(blob, {
+  return new Response(request.method === 'HEAD' ? null : blob, {
     headers: {
       'content-type': 'application/zip',
+      'content-length': String(blob.size),
       'content-disposition': `attachment; filename="${named.filename}.zip"`,
     },
   });

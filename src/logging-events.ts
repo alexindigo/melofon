@@ -85,6 +85,7 @@ export interface EventFacts {
     path: string;
     format?: string;
   } & ErrorFacts;
+  stream_empty: { path: string; format: string; offset: number };
   mdns_no_v4: { instance: string };
   discovery_failed: ErrorFacts;
   discovery_skipped: {
@@ -161,6 +162,12 @@ const definition = (
   fields: fields ? fields.split(' ') : [],
 });
 export const events: Record<EventId, EventDefinition> = {
+  stream_empty: definition(
+    'stream',
+    'warn',
+    'Transcode offset is beyond the end of the media',
+    'path format offset',
+  ),
   http_accept: definition(
     'http',
     'info',

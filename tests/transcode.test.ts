@@ -60,7 +60,7 @@ Deno.test('flac + format=mp3: chunked transcode, body decodes as mp3', async () 
   assertEquals(res.status, 200);
   assertEquals(res.headers.get('content-type'), 'audio/mpeg');
   assertEquals(res.headers.get('content-length'), null);
-  assertEquals(res.headers.get('accept-ranges'), null);
+  assertEquals(res.headers.get('accept-ranges'), 'none');
   const bytes = await body(res);
   assert(isMp3Magic(bytes), 'mp3 magic missing');
   assert(await decodesAsAudio(bytes), 'body does not decode as audio');
@@ -146,7 +146,7 @@ Deno.test('video + format=mp3 still answers audio (the old ExtractAudio path)', 
   assert(isMp3Magic(await body(res)));
 });
 
-Deno.test('no profile for the target (flac) is DirectPlay, never an error', async () => {
+Deno.test('unsupported flac target falls back to mp3 (source is already mp3)', async () => {
   const res = await play(undefined, { path: MP3, format: 'flac' });
   assert(res !== null);
   assertEquals(await body(res), await Deno.readFile(MP3));

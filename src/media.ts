@@ -31,6 +31,7 @@ import {
   AVMEDIA_TYPE_VIDEO,
   avRescaleQ,
   AVSEEK_FLAG_BACKWARD,
+  Codec,
   Decoder,
   Demuxer,
   Dictionary,
@@ -40,6 +41,7 @@ import {
   FF_ENCODER_LIBOPUS,
   FF_ENCODER_LIBVORBIS,
   FFmpegError,
+  FilterAPI,
   Log as FFmpegLog,
   Muxer,
   pipeline,
@@ -48,6 +50,7 @@ import { Buffer } from 'node:buffer';
 import { extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { type Log, scopedLog } from './logging.ts';
+import type { State } from './state.ts';
 
 const ffmpegLevel = FFmpegLog.getLevel();
 FFmpegLog.setCallback(
@@ -75,6 +78,29 @@ export interface Probe {
 export interface TranscodedAudio {
   stream: ReadableStream<Uint8Array>;
   contentType: string;
+  /** Settles only after all native resources have been released. */
+  completion: Promise<void>;
+}
+
+export interface AudioDetails {
+  protocol: string;
+  container: string;
+  codec: string;
+  audioChannels?: number;
+  audioBitrate?: number;
+  audioProfile?: string;
+  audioSamplerate?: number;
+  audioBitdepth?: number;
+}
+
+export interface AudioProfile {
+  format: string;
+  container: string;
+  codec: string;
+  contentType: string;
+  bitRateKbps: number;
+  sampleRates: number[] | null;
+  channelCounts: number[] | null;
 }
 
 export interface ExtractedAudio {
@@ -89,6 +115,10 @@ export interface Media {
   fingerprint(path: string): Promise<AudioFingerprint>;
   /** Never throws: unreadable/unsupported media probes as all-null/false. */
   probe(path: string): Promise<Probe>;
+  /** Actual selected audio stream facts, separate from the legacy probe shape. */
+  describeAudio(path: string): Promise<AudioDetails | null>;
+  /** Only installed, usable encoders; shared by negotiation and execution. */
+  audioProfiles(): Promise<AudioProfile[]>;
   /** Audio track of `path` re-encoded to `format`, STREAMED: the muxer write
    * callback feeds a ReadableStream (client-paced via desiredSize
    * backpressure; client disconnect aborts the pipeline). Null when the
@@ -99,7 +129,13 @@ export interface Media {
   transcodeAudio(
     path: string,
     format: string,
-    opts?: { bitRateKbps?: number },
+    opts?: {
+      bitRateKbps?: number;
+      startSeconds?: number;
+      sampleRate?: number;
+      channels?: number;
+      signal?: AbortSignal;
+    },
   ): Promise<TranscodedAudio | null>;
   /** Remux a video into HLS: 10s MPEG-TS segments (`seg<N>.ts`) plus FFmpeg's
    * own `index.m3u8` in `outDir`. Stream copy — H.264 video + AAC audio only
@@ -180,8 +216,7 @@ function mpegFrame(data: Uint8Array, first: boolean): Uint8Array | null {
 
 // Transcode profiles: format → encoder + muxer + wire content type + default
 // bitrate. The muxer names are FFmpeg's own ('adts' = raw AAC frames).
-// No flac target: streaming flac needs the STREAMINFO patch Navidrome
-// carries; lossless clients DirectPlay.
+// Unsupported requested targets are resolved by the stream service to mp3.
 const TRANSCODE_PROFILES: Record<
   string,
   {
@@ -193,6 +228,7 @@ const TRANSCODE_PROFILES: Record<
     muxer: string;
     contentType: string;
     bitRateKbps: number;
+    frameSamples?: number;
   }
 > = {
   mp3: {
@@ -218,6 +254,11 @@ const TRANSCODE_PROFILES: Record<
     muxer: 'ogg',
     contentType: 'audio/ogg',
     bitRateKbps: 192,
+    // libvorbis' native frame_size is 64. node-av's FIFO drains only one
+    // frame per receive() until a packet exists; feeding decoder-sized
+    // chunks overfills that FIFO and its EOF send loop drops EAGAIN frames.
+    // Enforce the codec's input framing before the encoder owns the frames.
+    frameSamples: 64,
   },
 };
 
@@ -397,7 +438,22 @@ export async function remuxPicture(
   await output.close();
 }
 
-export function createMedia(log: Log = scopedLog('media')): Media {
+export function createMedia(
+  log: Log = scopedLog('media'),
+  state?: Pick<State, 'declare' | 'getTyped'>,
+): Media {
+  for (const [format, profile] of Object.entries(TRANSCODE_PROFILES)) {
+    state?.declare(`media.transcode.${format}.bitRateKbps`, {
+      type: 'integer',
+      minimum: 1,
+      default: profile.bitRateKbps,
+    });
+  }
+  const bitrate = async (format: string) =>
+    Number(
+      await state?.getTyped(`media.transcode.${format}.bitRateKbps`) ??
+        TRANSCODE_PROFILES[format].bitRateKbps,
+    );
   // One remux per target at a time (two clients asking for the same video
   // share the run, and the loser of the race never sees a half-written dir).
   const inflight = new Map<string, Promise<number | null>>();
@@ -453,6 +509,63 @@ export function createMedia(log: Log = scopedLog('media')): Media {
   }
 
   return {
+    async describeAudio(path) {
+      try {
+        await using input = await Demuxer.open(path);
+        const audio = input.audio();
+        if (!audio) return null;
+        const p = audio.codecpar;
+        const codecName = avGetCodecName(p.codecId);
+        if (!codecName) return null;
+        const codec = Codec.findDecoder(p.codecId);
+        const profile = codec?.profiles?.find((entry) =>
+          entry.profile === p.profile
+        )?.name;
+        const container = input.formatName.split(',');
+        const suffix = extname(path).slice(1).toLowerCase();
+        return {
+          protocol: 'http',
+          container: container.includes('mov')
+            ? (suffix === 'm4a' ? 'm4a' : 'mp4')
+            : container.includes(suffix)
+            ? suffix
+            : container[0],
+          codec: codecName,
+          ...(p.channelLayout.nbChannels > 0
+            ? { audioChannels: p.channelLayout.nbChannels }
+            : {}),
+          ...(p.bitRate > 0n ? { audioBitrate: Number(p.bitRate) } : {}),
+          ...(profile ? { audioProfile: profile } : {}),
+          ...(p.sampleRate > 0 ? { audioSamplerate: p.sampleRate } : {}),
+          ...((p.bitsPerRawSample || p.bitsPerCodedSample) > 0
+            ? { audioBitdepth: p.bitsPerRawSample || p.bitsPerCodedSample }
+            : {}),
+        };
+      } catch {
+        return null;
+      }
+    },
+
+    async audioProfiles() {
+      const profiles: AudioProfile[] = [];
+      for (const [format, profile] of Object.entries(TRANSCODE_PROFILES)) {
+        const codec = Codec.findEncoderByName(profile.encoder);
+        if (!codec) continue;
+        profiles.push({
+          format,
+          container: profile.muxer === 'adts' ? 'aac' : profile.muxer,
+          codec: format === 'ogg' ? 'vorbis' : format,
+          contentType: profile.contentType,
+          bitRateKbps: await bitrate(format),
+          sampleRates: codec.supportedSamplerates,
+          channelCounts: codec.channelLayouts?.map((layout) =>
+            layout.nbChannels
+          ) ?? null,
+        });
+      }
+      return profiles;
+    },
+
     async fingerprint(path) {
       const input = await Demuxer.open(path);
       try {
@@ -536,22 +649,45 @@ export function createMedia(log: Log = scopedLog('media')): Media {
       const profile = TRANSCODE_PROFILES[format];
       if (profile === undefined) return null; // no such target (e.g. flac)
       const bitRateKbps = Math.min(
-        profile.bitRateKbps,
-        opts.bitRateKbps ?? Infinity,
+        await bitrate(format),
+        opts.bitRateKbps !== undefined && opts.bitRateKbps > 0
+          ? opts.bitRateKbps
+          : Infinity,
       );
 
       // Pre-flight: open, require an audio stream, create the encoder. A
       // failure here is a clean null for the hat's envelope — no byte has
       // been sent. Mid-stream failures truncate the body (Navidrome's rule).
-      let input: Demuxer;
-      let decoder: Decoder;
+      let input: Demuxer | undefined;
+      let decoder: Decoder | undefined;
       let encoder: Encoder;
+      let trimStart = 0;
       try {
-        input = await Demuxer.open(path);
+        input = await Demuxer.open(path, { signal: opts.signal });
         const audio = input.audio();
         if (audio === undefined) {
           await input.close();
           return null;
+        }
+        const start = opts.startSeconds ?? 0;
+        if (Number.isSafeInteger(start) && start > 0) {
+          const origin = audio.startTime === AV_NOPTS_VALUE
+            ? 0n
+            : audio.startTime;
+          const target = avRescaleQ(
+            BigInt(start) * BigInt(AV_TIME_BASE),
+            AV_TIME_BASE_Q,
+            audio.timeBase,
+          ) + origin;
+          FFmpegError.throwIfError(
+            await input.getFormatContext().seekFrame(
+              audio.index,
+              target,
+              AVSEEK_FLAG_BACKWARD,
+            ),
+            'Transcode seek',
+          );
+          trimStart = Number(target) * audio.timeBase.num / audio.timeBase.den;
         }
         decoder = await Decoder.create(audio);
         // autoResample: decoded frames arrive in whatever rate/format/layout
@@ -559,9 +695,11 @@ export function createMedia(log: Log = scopedLog('media')): Media {
         // (ffmpeg's implicit aresample). context.bitRate = the clamped value.
         encoder = await Encoder.create(profile.encoder, {
           autoResample: true,
-          context: { bitRate: `${bitRateKbps}k` } as never,
+          context: { bitRate: `${bitRateKbps}k` },
         });
       } catch (err) {
+        decoder?.[Symbol.dispose]();
+        await input?.close().catch(() => {});
         log.event('media_failed', {
           operation: 'transcodeAudio',
           phase: 'preflight',
@@ -576,6 +714,15 @@ export function createMedia(log: Log = scopedLog('media')): Media {
       let done = false;
       let controller!: ReadableStreamDefaultController<Uint8Array>;
       let waiting: (() => void) | null = null;
+      const cancel = () => {
+        done = true;
+        const wake = waiting;
+        waiting = null;
+        wake?.();
+        abort.abort();
+      };
+      opts.signal?.addEventListener('abort', cancel, { once: true });
+      if (opts.signal?.aborted) cancel();
       const stream = new ReadableStream<Uint8Array>({
         start(c) {
           controller = c;
@@ -588,11 +735,8 @@ export function createMedia(log: Log = scopedLog('media')): Media {
           wake?.();
         },
         cancel() {
-          done = true;
-          const wake = waiting;
-          waiting = null;
-          wake?.();
-          abort.abort();
+          cancel();
+          return completion;
         },
       });
 
@@ -628,16 +772,36 @@ export function createMedia(log: Log = scopedLog('media')): Media {
         encoder[Symbol.dispose]();
         decoder[Symbol.dispose]();
         await input.close().catch(() => {});
+        opts.signal?.removeEventListener('abort', cancel);
         return null;
       }
 
       const run = async () => {
+        const filters = [
+          ...(trimStart > 0
+            ? [`atrim=start=${trimStart}`, 'asetpts=PTS-STARTPTS']
+            : []),
+          ...(opts.sampleRate ? [`aresample=${opts.sampleRate}`] : []),
+          ...(opts.channels
+            ? [`aformat=channel_layouts=${opts.channels}c`]
+            : []),
+          ...(profile.frameSamples
+            ? [`asetnsamples=n=${profile.frameSamples}`]
+            : []),
+        ];
+        const filter = filters.length
+          ? FilterAPI.create(filters.join(','))
+          : undefined;
         try {
           // NB: pipeline owns addStream on the muxer — adding one ourselves
           // makes two streams and the muxer rejects the header.
-          await pipeline(input, decoder, encoder, output, {
-            signal: abort.signal,
-          }).completion;
+          await (filter
+            ? pipeline(input!, decoder!, filter, encoder, output, {
+              signal: abort.signal,
+            })
+            : pipeline(input!, decoder!, encoder, output, {
+              signal: abort.signal,
+            })).completion;
           if (!done) controller.close();
         } catch (err) {
           if (!done) {
@@ -655,14 +819,16 @@ export function createMedia(log: Log = scopedLog('media')): Media {
         } finally {
           // pipeline closes the muxer on completion; close() is idempotent.
           await output.close().catch(() => {});
+          filter?.[Symbol.dispose]();
           encoder[Symbol.dispose]();
-          decoder[Symbol.dispose]();
-          await input.close().catch(() => {});
+          decoder![Symbol.dispose]();
+          await input!.close().catch(() => {});
+          opts.signal?.removeEventListener('abort', cancel);
         }
       };
-      void run();
+      const completion = run();
 
-      return { stream, contentType: profile.contentType };
+      return { stream, contentType: profile.contentType, completion };
     },
 
     hlsRemux(path, outDir) {

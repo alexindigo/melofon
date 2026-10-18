@@ -21,7 +21,10 @@ import {
 import { ok } from '../layers/opensubsonic/envelope.ts';
 import type { HatContext } from '../layers/opensubsonic/types.ts';
 
-const EXPECTED = [{ name: 'formPost', versions: [1] }];
+const EXPECTED = [{ name: 'formPost', versions: [1] }, {
+  name: 'transcodeOffset',
+  versions: [1],
+}, { name: 'transcoding', versions: [1] }];
 const OP = 'getOpenSubsonicExtensions';
 const AUTH = new URLSearchParams({
   u: 'fixture + 雪',
@@ -298,7 +301,7 @@ Deno.test('H1 all existing POST operations reexport their corresponding GET cons
     }
   }
   await visit('layers/opensubsonic/rest');
-  assertEquals(count, 58);
+  assertEquals(count, 60);
 });
 
 Deno.test('H1 semantic projection preserves repeated extensions and versions without changing advertised facts', async () => {
