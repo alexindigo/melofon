@@ -1,6 +1,6 @@
 // src/artwork.ts — app.artwork: cover art as a Response, always an image,
 // never an error page. A song's own picture precedes its album's cover;
-// an album uses cover.<ext>, then its first track's picture. Artist tiles
+// an album uses cover.<ext>, its first track's picture, then a strong candidate. Artist tiles
 // use the same chain for the artist's first album, then the placeholder.
 // No rescaling in M1 (the `size` param is
 // ignored by the hat). Resolution of ids → data is app.library's job;
@@ -59,6 +59,8 @@ export function createArtwork(library: Library): ArtworkService {
     if (embedded !== null) {
       return embeddedResponse(embedded);
     }
+    const candidate = await library.candidateCover(id);
+    if (candidate !== null) return embeddedResponse(candidate);
     // Artist id for an artist tile: the first album's cover stands in.
     const albums = await library.albumsByArtist(id);
     if (albums.length > 0) return await cover(albums[0].id);

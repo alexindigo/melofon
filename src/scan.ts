@@ -13,6 +13,13 @@ import type {
 } from './store/catalog.ts';
 import type { Notify } from './notify.ts';
 import { type Log, scopedLog } from './logging.ts';
+import {
+  imageExtension,
+  imageHash,
+  isCoverFile,
+  libraryImagesWritable,
+} from './images.ts';
+import type { LocalVersion } from './store/candidates.ts';
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
@@ -68,7 +75,7 @@ async function* walkMedia(
     } else if (
       entry.isFile &&
       (AUDIO_EXTENSIONS.has(extOf(entry.name)) ||
-        VIDEO_EXTENSIONS.has(extOf(entry.name)))
+        VIDEO_EXTENSIONS.has(extOf(entry.name)) || isCoverFile(entry.name))
     ) {
       // Anchor at the source root, not the recursion dir: same-named files
       // in different subdirectories must not share an identity path.
@@ -107,12 +114,30 @@ export async function scanLibrary(
   const artists = new Map<string, ArtistIn>(); // name → row
   const albumInputs = new Map<FileIn, Omit<AlbumInput, 'songId'>>();
   const files: FileIn[] = [];
+  const embeddedPictures = new Map<FileIn, Omit<LocalVersion, 'origin'>[]>();
+  const coverPictures = new Map<string, LocalVersion>();
   let skipped = 0;
 
   for (const source of sources) {
     const root = source.path.replace(/\/+$/, '');
     try {
       for await (const { abs, rel } of walkMedia(root)) {
+        if (isCoverFile(rel.slice(rel.lastIndexOf('/') + 1))) {
+          try {
+            coverPictures.set(abs, {
+              imageHash: await imageHash(await Deno.readFile(abs)),
+              imageExt: imageExtension(extOf(abs).slice(1)),
+              libraryId: source.id,
+              origin: rel,
+            });
+          } catch (error) {
+            if (
+              !(error instanceof Deno.errors.NotFound ||
+                error instanceof Deno.errors.PermissionDenied)
+            ) throw error;
+          }
+          continue;
+        }
         const info = await Deno.stat(abs).catch(() => null);
         const stat: FileStat = {
           size: info?.size ?? null,
@@ -149,6 +174,7 @@ export async function scanLibrary(
         let genre: string | null = null;
         let year: number | null = null;
         let isVideo = false;
+        let pictures: Omit<LocalVersion, 'origin'>[] = [];
         try {
           const meta = await parseFile(abs);
           // Garbage bytes can resolve with an empty format rather than throw.
@@ -171,6 +197,13 @@ export async function scanLibrary(
           // TCON is multi-valued; keep its first value, as before.
           genre = meta.common.genre?.[0]?.trim() || null;
           year = meta.common.year ?? null;
+          pictures = await Promise.all(
+            (meta.common.picture ?? []).map(async (picture) => ({
+              imageHash: await imageHash(picture.data),
+              imageExt: imageExtension(picture.format),
+              libraryId: source.id,
+            })),
+          );
         } catch {
           skipped++;
           continue; // unreadable tags — skip the file, keep scanning
@@ -212,6 +245,7 @@ export async function scanLibrary(
           isVideo,
         };
         files.push(file);
+        embeddedPictures.set(file, pictures);
         albumInputs.set(file, {
           libraryId: source.id,
           rel,
@@ -319,6 +353,46 @@ export async function scanLibrary(
     events,
     retainedIds: [...byId.keys()],
   });
+  // Catalog owns album/root eligibility. Hashes are already prepared outside its
+  // exclusive slot; candidates own the separate atomic reconciliation.
+  const picturesByAlbum = new Map<string, Map<string, LocalVersion>>();
+  for (const file of files) {
+    const versions = picturesByAlbum.get(file.albumId!) ??
+      new Map<string, LocalVersion>();
+    for (const picture of embeddedPictures.get(file) ?? []) {
+      if (!versions.has(picture.imageHash)) {
+        versions.set(picture.imageHash, { ...picture, origin: file.id });
+      }
+    }
+    picturesByAlbum.set(file.albumId!, versions);
+  }
+  const writable = new Map<string, boolean>();
+  for (const album of grouped.albums) {
+    const versions = picturesByAlbum.get(album.id)!;
+    const dirs = new Set(await store.catalog.albumCoverDirectories(album.id));
+    for (const [path, picture] of coverPictures) {
+      if (
+        dirs.has(path.slice(0, path.lastIndexOf('/'))) &&
+        !versions.has(picture.imageHash)
+      ) {
+        versions.set(picture.imageHash, picture);
+      }
+    }
+    if (versions.size > 1 && !writable.has(album.libraryId)) {
+      writable.set(
+        album.libraryId,
+        await libraryImagesWritable(
+          sources.find((s) => s.id === album.libraryId)!,
+        ),
+      );
+    }
+    await store.candidates.replaceLocal(
+      album.id,
+      versions.size > 1 && writable.get(album.libraryId)
+        ? [...versions.values()]
+        : [],
+    );
+  }
   return {
     files: files.length,
     skipped,

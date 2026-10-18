@@ -245,3 +245,40 @@ CREATE TABLE IF NOT EXISTS album_events (
   to_root VARCHAR,
   candidates VARCHAR[]
 );
+
+-- Kept satellite proposals and persistent lookup work, never rebuilt by scans.
+CREATE SEQUENCE IF NOT EXISTS candidate_seq;
+CREATE TABLE IF NOT EXISTS candidates (
+  id VARCHAR PRIMARY KEY,
+  seq BIGINT DEFAULT nextval('candidate_seq'),
+  entity_type VARCHAR NOT NULL CHECK (entity_type IN ('album', 'song', 'artist')),
+  entity_id VARCHAR NOT NULL,
+  kind VARCHAR NOT NULL CHECK (kind IN ('cover', 'fields')),
+  source VARCHAR NOT NULL,
+  confidence VARCHAR CHECK (confidence IN ('strong', 'medium', 'low')),
+  state VARCHAR NOT NULL CHECK (state IN ('open', 'accepted', 'rejected', 'edited')),
+  image_hash VARCHAR NOT NULL,
+  image_ext VARCHAR NOT NULL,
+  library_id VARCHAR NOT NULL,
+  origin VARCHAR NOT NULL,
+  found_at TIMESTAMPTZ NOT NULL,
+  decided_at TIMESTAMPTZ,
+  details JSON NOT NULL
+);
+CREATE SEQUENCE IF NOT EXISTS lookup_job_seq;
+CREATE TABLE IF NOT EXISTS lookup_jobs (
+  id VARCHAR PRIMARY KEY,
+  seq BIGINT DEFAULT nextval('lookup_job_seq'),
+  plugin VARCHAR NOT NULL,
+  entity_type VARCHAR NOT NULL CHECK (entity_type IN ('album', 'song', 'artist')),
+  entity_id VARCHAR NOT NULL,
+  facts_hash VARCHAR NOT NULL,
+  mode VARCHAR NOT NULL CHECK (mode IN ('missing', 'all')),
+  state VARCHAR NOT NULL CHECK (state IN ('waiting', 'active', 'done', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error VARCHAR,
+  queued_at TIMESTAMPTZ NOT NULL,
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ,
+  not_before TIMESTAMPTZ NOT NULL
+);

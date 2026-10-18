@@ -10,6 +10,8 @@ import { createAnnotationsStore } from './annotations.ts';
 import { createPlaylistsStore } from './playlists.ts';
 import { createPlaybackStore } from './playback.ts';
 import { createCatalogStore } from './catalog.ts';
+import { createCandidatesStore } from './candidates.ts';
+import { createLookupsStore } from './lookups.ts';
 
 export interface Store {
   users: ReturnType<typeof createUsersStore>;
@@ -22,6 +24,8 @@ export interface Store {
   playlists: ReturnType<typeof createPlaylistsStore>;
   playback: ReturnType<typeof createPlaybackStore>;
   catalog: ReturnType<typeof createCatalogStore>;
+  candidates: ReturnType<typeof createCandidatesStore>;
+  lookups: ReturnType<typeof createLookupsStore>;
   ping(): Promise<void>;
   close(): Promise<void>;
 }
@@ -42,9 +46,12 @@ export async function openStore(
     playlists: createPlaylistsStore(engine),
     playback: createPlaybackStore(engine),
     catalog: createCatalogStore(engine),
+    candidates: createCandidatesStore(engine),
+    lookups: createLookupsStore(engine),
     ping: engine.ping,
     close: engine.close,
   };
   registerStore(store, engine);
+  await store.lookups.resetActive();
   return store;
 }

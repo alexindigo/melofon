@@ -2,6 +2,7 @@
 import { parseFile } from 'music-metadata';
 import type { Store } from './store/index.ts';
 import type { CatalogReads, LyricsRow } from './store/catalog.ts';
+import { imageContentType, isCoverFile, readCandidateImage } from './images.ts';
 export type {
   AlbumRow,
   ArtistRow,
@@ -28,6 +29,10 @@ export interface Library extends
   ): Promise<{ bytes: Uint8Array; format: string } | null>;
   /** Absolute path of cover.{jpg,jpeg,png,webp} in album folder/root. */
   albumCoverPath(id: string): Promise<string | null>;
+  /** Strong open album proposal, resolved outside the store slot. */
+  candidateCover(
+    id: string,
+  ): Promise<{ bytes: Uint8Array; format: string } | null>;
 }
 
 export function createLibrary(store: Store): Library {
@@ -81,12 +86,12 @@ export function createLibrary(store: Store): Library {
           const names: string[] = [];
           for await (const entry of Deno.readDir(dir)) {
             if (
-              entry.isFile && /^cover\.(jpg|jpeg|png|webp)$/i.test(entry.name)
+              entry.isFile && isCoverFile(entry.name)
             ) {
               names.push(entry.name);
             }
           }
-          // Stable selection until local conflicts become candidates (L3).
+          // Conflicts are proposals only, so the displayed local choice stays stable.
           names.sort();
           if (names.length > 0) return `${dir}/${names[0]}`;
         } catch {
@@ -94,6 +99,26 @@ export function createLibrary(store: Store): Library {
         }
       }
       return null;
+    },
+    async candidateCover(id) {
+      const candidate = await store.candidates.strongestOpen(
+        'album',
+        id,
+        'cover',
+      );
+      if (candidate === null) return null;
+      const library = (await catalog.listLibraries()).find((l) =>
+        l.id === candidate.libraryId
+      );
+      if (!library) return null;
+      const bytes = await readCandidateImage(
+        library,
+        candidate.imageHash,
+        candidate.imageExt,
+      );
+      return bytes === null
+        ? null
+        : { bytes, format: imageContentType(candidate.imageExt) };
     },
   };
 }
