@@ -1,0 +1,31 @@
+{
+  "contract": 1,
+  "name": "iTunes covers",
+  "version": "1.0.0",
+  "description": "Album covers from the iTunes Store search",
+  "website": "https://performance-partners.apple.com/search-api",
+  "capabilities": [
+    {
+      "id": "album-cover",
+      "accepts": "album",
+      "provides": ["album.image.front"],
+      "requires": []
+    }
+  ],
+  "network": {
+    "hosts": ["itunes.apple.com", "*.mzstatic.com"],
+    "reason": "Search the iTunes Store and download cover images",
+    "ratePerMinute": 20
+  },
+  "settings": {
+    "type": "object",
+    "properties": {
+      "countries": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["us", "ru"],
+        "title": "Stores to search"
+      }
+    }
+  }
+}

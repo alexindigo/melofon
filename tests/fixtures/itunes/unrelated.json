@@ -1,0 +1,15 @@
+{
+  "resultCount": 1,
+  "results": [
+    {
+      "wrapperType": "collection",
+      "collectionType": "Album",
+      "artistId": 156013,
+      "collectionId": 1440833098,
+      "artistName": "Miles Davis",
+      "collectionName": "Kind of Blue",
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music/unrelated.jpg/100x100bb.jpg",
+      "country": "USA"
+    }
+  ]
+}

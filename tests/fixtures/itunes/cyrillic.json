@@ -1,0 +1,15 @@
+{
+  "resultCount": 1,
+  "results": [
+    {
+      "wrapperType": "collection",
+      "collectionType": "Album",
+      "artistId": 12345,
+      "collectionId": 23456,
+      "artistName": "Кино",
+      "collectionName": "Группа крови",
+      "artworkUrl100": "https://is2-ssl.mzstatic.com/image/thumb/Music/gruppa-krovi.jpg/100x100bb.jpg",
+      "country": "RUS"
+    }
+  ]
+}

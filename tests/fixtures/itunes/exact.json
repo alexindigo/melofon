@@ -1,0 +1,15 @@
+{
+  "resultCount": 1,
+  "results": [
+    {
+      "wrapperType": "collection",
+      "collectionType": "Album",
+      "artistId": 136975,
+      "collectionId": 1441164426,
+      "artistName": "The Beatles",
+      "collectionName": "Abbey Road",
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music/abbey-road.jpg/100x100bb.jpg",
+      "country": "USA"
+    }
+  ]
+}
