@@ -13,6 +13,7 @@ import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createArtwork } from '../src/artwork.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -36,6 +37,7 @@ async function setup() {
   await scan.run();
   const library = createLibrary(store);
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     scan,

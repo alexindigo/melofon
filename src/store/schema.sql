@@ -131,6 +131,8 @@ CREATE TABLE IF NOT EXISTS state (
   key VARCHAR PRIMARY KEY,
   value VARCHAR NOT NULL
 );
+ALTER TABLE state ADD COLUMN IF NOT EXISTS revision BIGINT DEFAULT 0;
+ALTER TABLE state ADD COLUMN IF NOT EXISTS declared BOOLEAN DEFAULT false;
 -- Restart transparency (plan restart-transparency): the server engine's queue
 -- and player state, keep-on-rescan user state. The queue stores library song
 -- ids in order and rehydrates via the library at boot (missing tracks drop).

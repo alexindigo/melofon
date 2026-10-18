@@ -13,6 +13,7 @@ import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -35,6 +36,7 @@ async function setup() {
   const scan = createScan(store);
   await scan.run();
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     scan,

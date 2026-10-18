@@ -7,7 +7,7 @@ import type { ResponseFormat } from '#opensubsonic/types.ts';
 /** The implemented protocol: reported in every envelope, checked against `v`. */
 export const API_VERSION = '1.16.1';
 
-/** Operator setting enabling JSONP (`on`); anything else or unset is off. */
+/** Declared in manifest.json; only `on` enables JSONP, including with raw injected reads. */
 export const JSONP_SETTING = 'opensubsonic.jsonp';
 
 // Navidrome's callback rule: a JS identifier, optionally dotted.

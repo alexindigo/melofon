@@ -30,6 +30,7 @@ import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback, type Playback } from '../src/playback.ts';
 import { createNotify } from '../src/notify.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const fractions = [
@@ -258,6 +259,7 @@ async function setup() {
   };
   let recordSearchOnly = false;
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     user: createUserService(store, cfg),

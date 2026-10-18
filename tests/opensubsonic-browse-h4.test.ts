@@ -11,6 +11,7 @@ import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 import { tagged } from './helpers/tagged.ts';
 
@@ -45,6 +46,7 @@ async function setup(fixture = true) {
     await scan.run();
   }
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     scan,

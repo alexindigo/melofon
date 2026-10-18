@@ -16,6 +16,7 @@ import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -169,6 +170,7 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
     await addViaApi(core, 'B root', ROOT_B);
     await scanLibrary(store);
     const bag = {
+      state: createState(store),
       cfg,
       libraries,
       user: createUserService(store, cfg),

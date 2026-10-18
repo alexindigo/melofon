@@ -4,6 +4,7 @@ import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
@@ -34,6 +35,7 @@ async function router() {
   const core = await pathfinder({ roots: ['core/'], app: {} });
   const layers = await loadLayers({
     app: {
+      state: { declare() {} },
       cfg: { version: '0.0.0-test' },
       user: {
         auth: () => Promise.resolve(null),
@@ -62,6 +64,7 @@ Deno.test('H1 regression: authenticated discovery supplies the semantic array', 
   const core = await pathfinder({ roots: ['core/'], app: {} });
   const layers = await loadLayers({
     app: {
+      state: { declare() {} },
       cfg: {},
       user: {
         auth: () =>
@@ -218,6 +221,7 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
       core,
       await loadLayers({
         app: {
+          state: createState(store),
           cfg,
           libraries,
           library,

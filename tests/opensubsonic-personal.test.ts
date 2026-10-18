@@ -20,6 +20,7 @@ import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 type Envelope = Record<string, unknown> & {
@@ -68,6 +69,7 @@ async function setup(split = false) {
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     scan,

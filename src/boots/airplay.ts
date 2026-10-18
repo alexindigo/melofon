@@ -74,6 +74,12 @@ export function createAirplayBoot(
   deps: AirplayBootDeps,
 ): { close(): Promise<void> } {
   const { outputs, playback, media, notify } = deps;
+  // Keep the existing permissive off/list parser (including clamping) at its owner.
+  deps.state?.declare(AIRPLAY_RETRY_KEY, {
+    type: 'string',
+    default: DEFAULT_SECONDS.join(','),
+    description: 'Retry delays in seconds, or off; delays are clamped to 0–60',
+  });
   const log = deps.log ?? scopedLog('airplay');
   const devices = deps.devices;
   const retryTimer = deps.retryTimer ??

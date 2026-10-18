@@ -11,6 +11,7 @@ import { createUserService } from '../src/user.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 import {
   albumsByLabel as subsonicAlbumOrder,
@@ -211,6 +212,7 @@ Deno.test('scan album facts render bracket labels and placeholder ids at both pr
     const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
     const layers = await loadLayers({
       app: {
+        state: createState(store),
         cfg,
         library,
         user: createUserService(store, cfg),

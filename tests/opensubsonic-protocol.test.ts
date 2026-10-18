@@ -47,6 +47,7 @@ async function router(
       },
     },
     state: {
+      declare() {},
       get(key: string) {
         calls.state.push(key);
         return Promise.resolve(key === JSONP_KEY ? jsonp : null);

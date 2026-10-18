@@ -3,7 +3,7 @@
 // never imports a layer by name. Layers get the injected service bag
 // (app.user, app.library, …, cfg) — never a DuckDB handle.
 //
-// manifest.json: `port` and `headers` are reserved sniff keys; every other
+// manifest.json: `port`, `headers` and `settings` are reserved; every other
 // key declares a mount — folder (under the layer dir) → URL prefix:
 //
 //   { "rest": "/rest" }   →   layers/<name>/rest/ answered at /rest/…
@@ -17,6 +17,7 @@
 import { pathfinder } from '@pathfinder/pathfinder';
 import type { PathfinderApp } from '@pathfinder/pathfinder';
 import { scopedLog } from './logging.ts';
+import type { State } from './state.ts';
 
 export interface HeaderMatch {
   name: string;
@@ -40,7 +41,7 @@ export interface Layer {
   dir: string;
 }
 
-const RESERVED = new Set(['port', 'headers']);
+const RESERVED = new Set(['port', 'headers', 'settings']);
 
 // Manifest `port`: number | number[] | undefined → number[]. Anything else
 // (non-int, 0, >65535, mixed junk) is a load-time error naming the file.
@@ -82,6 +83,23 @@ export async function loadLayers(opts: {
       manifest = JSON.parse(await Deno.readTextFile(`${dir}/manifest.json`));
     } catch (err) {
       if (!(err instanceof Deno.errors.NotFound)) throw err;
+    }
+    if (manifest.settings !== undefined) {
+      if (
+        manifest.settings === null || typeof manifest.settings !== 'object' ||
+        Array.isArray(manifest.settings)
+      ) {
+        throw new Error(
+          `${dir}/manifest.json — settings must map keys to schemas`,
+        );
+      }
+      const state = (opts.app as { state?: Pick<State, 'declare'> }).state;
+      if (!state) {
+        throw new Error(`${dir}/manifest.json — settings service is required`);
+      }
+      for (const [key, schema] of Object.entries(manifest.settings)) {
+        state.declare(key, schema);
+      }
     }
     const mountKeys = Object.keys(manifest).filter((k) => !RESERVED.has(k))
       .sort();

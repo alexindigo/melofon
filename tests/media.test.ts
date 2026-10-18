@@ -20,6 +20,7 @@ import { createMedia } from '../src/media.ts';
 import { createZip } from '../src/zip.ts';
 import { BlobReader, Uint8ArrayWriter, ZipReader } from '@zip-js/zip-js';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -42,6 +43,7 @@ async function setup() {
   const scan = createScan(store);
   await scan.run();
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     scan,

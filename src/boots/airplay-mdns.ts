@@ -71,6 +71,12 @@ export function createAirplayDiscovery(
   close(): void;
 } {
   const { outputs, state } = deps;
+  state.declare(MDNS_KEY, {
+    type: 'string',
+    enum: ['on', 'off'],
+    default: 'on',
+    description: 'Discover AirPlay outputs on the local network',
+  });
   const log = deps.log ?? scopedLog('airplay-discovery');
   const createBrowser = deps.createBrowser ??
     ((onService: (event: 'up' | 'down', service: MdnsService) => void) =>
@@ -239,7 +245,7 @@ export function createAirplayDiscovery(
     discovered.clear();
   };
 
-  void state.get(MDNS_KEY).then((value) => {
+  void state.getTyped(MDNS_KEY).then((value) => {
     if (value !== 'off') start();
   });
   const unsubscribe = state.onChange((key, value) => {

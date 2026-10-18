@@ -25,6 +25,10 @@ function fakeState(initial: Record<string, string> = {}): State & {
   const store = new Map(Object.entries(initial));
   const listeners = new Set<(key: string, value: string) => void>();
   return {
+    declare() {},
+    getTyped: (key) => Promise.resolve(store.get(key)),
+    getWithRevision: (key) =>
+      Promise.resolve({ value: store.get(key) ?? null, revision: 0 }),
     get: (key) => Promise.resolve(store.get(key) ?? null),
     set: (key, value) => {
       store.set(key, value);

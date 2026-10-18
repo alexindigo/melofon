@@ -15,6 +15,7 @@ import { openStore } from '../src/store/index.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createListens } from '../src/listens.ts';
@@ -229,6 +230,7 @@ async function setupWire() {
     log,
   });
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     user: createUserService(store, cfg),

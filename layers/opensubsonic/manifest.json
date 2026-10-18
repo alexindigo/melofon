@@ -1,3 +1,11 @@
 {
-  "rest": "/rest"
+  "rest": "/rest",
+  "settings": {
+    "opensubsonic.jsonp": {
+      "type": "string",
+      "enum": ["on", "off"],
+      "default": "off",
+      "description": "Enable JSONP responses"
+    }
+  }
 }

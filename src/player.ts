@@ -18,6 +18,7 @@ import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
+  CONNECTION_STRATEGIES,
   CONNECTION_STRATEGY_DEFAULT_KEY,
   type ConnectionStrategy,
   DEFAULT_CONNECTION_STRATEGY,
@@ -598,6 +599,12 @@ export function createOutputs(
     log?: Log;
   } = {},
 ): Outputs {
+  state?.declare(CONNECTION_STRATEGY_DEFAULT_KEY, {
+    type: 'string',
+    enum: Object.keys(CONNECTION_STRATEGIES),
+    default: DEFAULT_CONNECTION_STRATEGY,
+    description: 'Connection strategy assigned to new AirPlay outputs',
+  });
   const emit = (types: string[]) => notify?.emit(types);
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];

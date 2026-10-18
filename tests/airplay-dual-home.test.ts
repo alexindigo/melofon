@@ -82,6 +82,7 @@ function fixture(choice: ConnectionStrategy, retry = '0,0') {
     },
   } as unknown as Media;
   const state = {
+    declare() {},
     get: () => Promise.resolve(retry),
     onChange: () => () => {},
   } as unknown as State;

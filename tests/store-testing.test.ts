@@ -18,7 +18,9 @@ async function fixture() {
 Deno.test('rawSql preserves driver rows while semantic operations return plain data', async () => {
   const t = await fixture();
   try {
-    await t.sql.run("INSERT INTO state VALUES ('seeded', 'value')");
+    await t.sql.run(
+      "INSERT INTO state (key, value) VALUES ('seeded', 'value')",
+    );
     assertEquals(await t.store.state.get('seeded'), 'value');
     assertEquals(await t.sql.all('SELECT count(*) AS n FROM state'), [{
       n: 1n,
@@ -86,11 +88,14 @@ Deno.test('rawSql rejects statement batches before any prefix can execute', asyn
         const suffix of [
           'BEGIN',
           '/* outer /* inner */ */ COMMIT',
-          "INSERT INTO state VALUES ('other', 'lost')",
+          "INSERT INTO state (key, value) VALUES ('other', 'lost')",
         ]
       ) {
         await assertRejects(
-          () => query(`INSERT INTO state VALUES ('prefix', 'lost'); ${suffix}`),
+          () =>
+            query(
+              `INSERT INTO state (key, value) VALUES ('prefix', 'lost'); ${suffix}`,
+            ),
           Error,
           'only one statement',
         );

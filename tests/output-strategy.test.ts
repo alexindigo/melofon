@@ -237,6 +237,9 @@ Deno.test('strategies: late initial default read cannot undo a newer live write'
   let release!: (value: string) => void;
   let reading = false;
   const state = {
+    declare() {},
+    getTyped: () => Promise.resolve(undefined),
+    getWithRevision: () => Promise.resolve({ value: null, revision: 0 }),
     get: () => {
       reading = true;
       return new Promise<string>((resolve) => release = resolve);
@@ -268,6 +271,9 @@ Deno.test('strategies: late initial default read cannot undo a newer live write'
 Deno.test('strategies: failed or invalid initial read never assigns an irreversible default', async () => {
   for (const value of ['corrupt', null]) {
     const state = {
+      declare() {},
+      getTyped: () => Promise.resolve(undefined),
+      getWithRevision: () => Promise.resolve({ value: null, revision: 0 }),
       get: () =>
         value === null
           ? Promise.reject(new Error('read failed'))

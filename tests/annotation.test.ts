@@ -17,6 +17,7 @@ import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -41,6 +42,7 @@ async function setup() {
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     user: createUserService(store, cfg),

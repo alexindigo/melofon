@@ -5,10 +5,7 @@
 // command-provenance): the key name, never the value (it may be sensitive).
 import { sourceFromRequest } from '../../../src/player.ts';
 import type { Log } from '../../../src/logging.ts';
-import {
-  CONNECTION_STRATEGY_DEFAULT_KEY,
-  isConnectionStrategy,
-} from '../../../src/connection-strategy.ts';
+import { SettingsValidationError } from '../../../src/settings-schema.ts';
 
 export default async function (
   request: {
@@ -38,18 +35,17 @@ export default async function (
       status: 400,
     });
   }
-  if (
-    request.params.key === CONNECTION_STRATEGY_DEFAULT_KEY &&
-    !isConnectionStrategy(value)
-  ) {
-    return Response.json({ error: 'invalid AirPlay connection strategy' }, {
-      status: 400,
-    });
+  try {
+    await context.app.state.set(request.params.key, value);
+  } catch (error) {
+    if (error instanceof SettingsValidationError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    throw error;
   }
   context.app.log.event('config_changed', {
     key: request.params.key,
     source: sourceFromRequest(request),
   });
-  await context.app.state.set(request.params.key, value);
   return { ok: true };
 }

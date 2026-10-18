@@ -138,6 +138,13 @@ async function dnsReceiver(port: number) {
 }
 
 const quietState: State = {
+  declare() {},
+  getTyped(key) {
+    return this.get(key).then((value) => value ?? undefined);
+  },
+  getWithRevision(key) {
+    return this.get(key).then((value) => ({ value, revision: 0 }));
+  },
   get: (key) => Promise.resolve(key === 'airplay.mdns' ? 'off' : null),
   set: () => Promise.resolve(),
   seedIfUnset: () => Promise.resolve(false),

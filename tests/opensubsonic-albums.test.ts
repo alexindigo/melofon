@@ -14,6 +14,7 @@ import { createArtwork } from '../src/artwork.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createZip } from '../src/zip.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 import { tagged } from './helpers/tagged.ts';
 
@@ -89,6 +90,7 @@ async function setup(fn: (s: Setup) => Promise<void>) {
       core,
       await loadLayers({
         app: {
+          state: createState(store),
           cfg,
           library,
           libraries,

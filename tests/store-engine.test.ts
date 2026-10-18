@@ -24,7 +24,7 @@ Deno.test('store engine runs reads and writes exclusively in arrival order', asy
       order.push('first');
       started.resolve();
       await release.promise;
-      await q.run("INSERT INTO state VALUES ('key', 'value')");
+      await q.run("INSERT INTO state (key, value) VALUES ('key', 'value')");
     });
     await started.promise;
     const waiting = Array.from(
@@ -68,7 +68,7 @@ Deno.test('store engine releases a throwing slot and rolls back failed atomic wo
     );
     await assertRejects(() =>
       atomic(engine, async (q) => {
-        await q.run("INSERT INTO state VALUES ('lost', 'value')");
+        await q.run("INSERT INTO state (key, value) VALUES ('lost', 'value')");
         await q.run('INSERT INTO absent_table VALUES (1)');
       })
     );
@@ -110,7 +110,7 @@ Deno.test('store engine runs schema on both first open and reopen', async () => 
       0,
     );
     await engine.exclusive(async (q) => {
-      await q.run("INSERT INTO state VALUES ('kept', 'value')");
+      await q.run("INSERT INTO state (key, value) VALUES ('kept', 'value')");
       await q.run('DROP TABLE bookmarks');
     });
     await engine.close();
@@ -119,10 +119,13 @@ Deno.test('store engine runs schema on both first open and reopen', async () => 
       await engine.exclusive((q) => q.all('SELECT track_id FROM bookmarks')),
       [],
     );
-    assertEquals(await engine.exclusive((q) => q.all('SELECT * FROM state')), [{
-      key: 'kept',
-      value: 'value',
-    }]);
+    assertEquals(
+      await engine.exclusive((q) => q.all('SELECT key, value FROM state')),
+      [{
+        key: 'kept',
+        value: 'value',
+      }],
+    );
   } finally {
     await engine.close();
     await Deno.remove(dir, { recursive: true });
@@ -195,7 +198,7 @@ Deno.test('store engine close drains accepted work and rejects new operations', 
     const write = engine.exclusive(async (q) => {
       started.resolve();
       await release.promise;
-      await q.run("INSERT INTO state VALUES ('drained', 'value')");
+      await q.run("INSERT INTO state (key, value) VALUES ('drained', 'value')");
     });
     await started.promise;
     const closing = engine.close();

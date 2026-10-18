@@ -26,6 +26,7 @@ import { createListens } from '../src/listens.ts';
 import { createStream } from '../src/stream.ts';
 import { createMedia } from '../src/media.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
@@ -48,6 +49,7 @@ async function setup() {
   await scanLibrary(store);
   const library = createLibrary(store);
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     user: createUserService(store, cfg),

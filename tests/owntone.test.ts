@@ -16,6 +16,7 @@ import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
 
 const HOOK = 3689;
@@ -42,6 +43,7 @@ async function setup(env: Record<string, string> = {}) {
   const player = createPlayer();
   const library = createLibrary(store);
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     library,

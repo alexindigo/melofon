@@ -597,6 +597,7 @@ function settings(initial: Promise<string | null>) {
   let listener: (key: string, value: string | null) => void = () => {};
   return {
     state: {
+      declare() {},
       get: () => initial,
       onChange: (fn: typeof listener) => {
         listener = fn;

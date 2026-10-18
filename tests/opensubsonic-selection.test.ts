@@ -11,6 +11,7 @@ import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { createUserService } from '../src/user.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const id = (n: number) => n.toString(16).padStart(8, '0') + '0'.repeat(24);
@@ -115,6 +116,7 @@ async function setup(large = false) {
   }
   const library = createLibrary(store);
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     library,

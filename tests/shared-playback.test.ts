@@ -24,6 +24,7 @@ import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
+import { createState } from '../src/state.ts';
 
 const HOOK = 3689;
 const DEFAULT_PORT = 4534;
@@ -53,6 +54,7 @@ async function setup() {
   const library = createLibrary(store);
   const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
   const bag = {
+    state: createState(store),
     cfg,
     libraries,
     user: createUserService(store, cfg),
