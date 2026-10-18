@@ -1,4 +1,4 @@
-import { atomic, type Engine, esc } from './engine.ts';
+import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import type { EntityType } from './candidates.ts';
 
 export interface LookupInput {
@@ -34,40 +34,43 @@ const projection =
   epoch_ms(queued_at) AS queuedAtMs, epoch_ms(started_at) AS startedAtMs,
   epoch_ms(finished_at) AS finishedAtMs, epoch_ms(not_before) AS notBeforeMs`;
 
+/** Store-internal composition: the queue remains the sole lookup_jobs writer. */
+export async function enqueueLookups(
+  q: Queries,
+  jobs: LookupInput[],
+): Promise<string[]> {
+  const ids: string[] = [];
+  for (const job of jobs) {
+    const match = `plugin = ${esc(job.plugin)} AND entity_type = ${
+      esc(job.entityType)
+    }
+      AND entity_id = ${esc(job.entityId)} AND facts_hash = ${
+      esc(job.factsHash)
+    }`;
+    const states = job.mode === 'all'
+      ? "('waiting', 'active')"
+      : "('waiting', 'active', 'done')";
+    if (
+      (await q.all(
+        `SELECT 1 FROM lookup_jobs WHERE ${match} AND state IN ${states} LIMIT 1`,
+      )).length
+    ) continue;
+    const id = crypto.randomUUID();
+    await q.run(`INSERT INTO lookup_jobs
+      (id, plugin, entity_type, entity_id, facts_hash, mode, state, queued_at, not_before)
+      VALUES (${esc(id)}, ${esc(job.plugin)}, ${esc(job.entityType)}, ${
+      esc(job.entityId)
+    },
+        ${esc(job.factsHash)}, ${esc(job.mode)}, 'waiting', now(), now())`);
+    ids.push(id);
+  }
+  return ids;
+}
+
 export function createLookupsStore(engine: Engine) {
   return {
     enqueue(jobs: LookupInput[]): Promise<string[]> {
-      return atomic(engine, async (q) => {
-        const ids: string[] = [];
-        for (const job of jobs) {
-          const match = `plugin = ${esc(job.plugin)} AND entity_type = ${
-            esc(job.entityType)
-          }
-            AND entity_id = ${esc(job.entityId)} AND facts_hash = ${
-            esc(job.factsHash)
-          }`;
-          // Pending work is also coalesced so overlapping scans cannot fan out duplicates.
-          const states = job.mode === 'all'
-            ? "('waiting', 'active')"
-            : "('waiting', 'active', 'done')";
-          if (
-            (await q.all(
-              `SELECT 1 FROM lookup_jobs WHERE ${match} AND state IN ${states} LIMIT 1`,
-            )).length
-          ) continue;
-          const id = crypto.randomUUID();
-          await q.run(`INSERT INTO lookup_jobs
-            (id, plugin, entity_type, entity_id, facts_hash, mode, state, queued_at, not_before)
-            VALUES (${esc(id)}, ${esc(job.plugin)}, ${esc(job.entityType)}, ${
-            esc(job.entityId)
-          },
-              ${esc(job.factsHash)}, ${
-            esc(job.mode)
-          }, 'waiting', now(), now())`);
-          ids.push(id);
-        }
-        return ids;
-      });
+      return atomic(engine, (q) => enqueueLookups(q, jobs));
     },
     claimNext(plugin: string): Promise<LookupJob | null> {
       return atomic(engine, async (q) => {

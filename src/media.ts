@@ -20,6 +20,7 @@ import {
   AV_CODEC_ID_MP3,
   AV_CODEC_ID_OPUS,
   AV_CODEC_ID_VORBIS,
+  AV_DISPOSITION_ATTACHED_PIC,
   AV_NOPTS_VALUE,
   AV_SAMPLE_FMT_S16,
   AV_TIME_BASE,
@@ -32,6 +33,7 @@ import {
   AVSEEK_FLAG_BACKWARD,
   Decoder,
   Demuxer,
+  Dictionary,
   Encoder,
   FF_ENCODER_AAC,
   FF_ENCODER_LIBMP3LAME,
@@ -42,6 +44,8 @@ import {
   Muxer,
   pipeline,
 } from 'node-av';
+import { Buffer } from 'node:buffer';
+import { extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { type Log, scopedLog } from './logging.ts';
 
@@ -252,6 +256,146 @@ const PCM_BYTES_PER_SAMPLE = 2 * PCM_CHANNELS; // s16le interleaved
 
 // HLS segment length in seconds (Airsonic's SEGMENT_DURATION, probed).
 const HLS_SEGMENT_SECONDS = 10;
+
+/** Picture-only stream copy. The caller owns verification and atomic publish.
+ * Ogg attaches images using its native FLAC PICTURE comment (not a JPEG stream).
+ * All native FFmpeg access stays at the media boundary. */
+export async function remuxPicture(
+  path: string,
+  imagePath: string,
+  outputPath: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  await using input = await Demuxer.open(path, { signal });
+  await using image = await Demuxer.open(imagePath, { signal });
+  const picture = image.video();
+  if (!picture) throw new Error('Cover has no image stream');
+  const format = extname(path).slice(1).toLowerCase();
+  const ogg = input.formatName.split(',').includes('ogg');
+  let block: string | undefined;
+  if (ogg) {
+    const bytes = await Deno.readFile(imagePath);
+    const codec = avGetCodecName(picture.codecpar.codecId);
+    const mime = Buffer.from(`image/${codec === 'mjpeg' ? 'jpeg' : codec}`);
+    const buffer = Buffer.alloc(32 + mime.length + bytes.length);
+    let offset = 0;
+    const uint = (n: number) => {
+      buffer.writeUInt32BE(Math.max(0, n), offset);
+      offset += 4;
+    };
+    uint(3);
+    uint(mime.length);
+    mime.copy(buffer, offset);
+    offset += mime.length;
+    uint(0);
+    uint(picture.codecpar.width);
+    uint(picture.codecpar.height);
+    uint(picture.codecpar.bitsPerCodedSample);
+    uint(0);
+    uint(bytes.length);
+    buffer.set(bytes, offset);
+    block = buffer.toString('base64');
+  }
+  const withoutPictures = (entries: Record<string, string>) =>
+    Object.fromEntries(
+      Object.entries(entries).filter(([key]) =>
+        !/^(METADATA_BLOCK_PICTURE|COVERART|COVERARTMIME)$/i.test(key)
+      ),
+    );
+  await using output = await Muxer.open(outputPath, {
+    input,
+    format: format === 'm4a' ? 'mp4' : format === 'opus' ? 'ogg' : format,
+    signal,
+    copyPriorStart: 1,
+    copyInitialNonkeyframes: true,
+    options: format === 'mp3' || format === 'm4a'
+      ? { fflags: '+bitexact' }
+      : {},
+    configure(ctx) {
+      const entries = withoutPictures(input.metadata);
+      // FFmpeg replaces "encoder" at mux initialization. ID3's native TSSE
+      // spelling plus bitexact preserves the existing value instead.
+      if (format === 'mp3' && entries.encoder) {
+        entries.TSSE = entries.encoder;
+        delete entries.encoder;
+      }
+      // The MOV muxer writes ©too from encoding_tool, not encoder. Bitexact
+      // suppresses its default tool atom when the input did not have one.
+      if (format === 'm4a' && entries.encoder !== undefined) {
+        entries.encoding_tool = entries.encoder;
+      }
+      using metadata = Dictionary.fromObject(entries);
+      ctx.metadata = metadata;
+    },
+  });
+  const mapping = new Map<number, number>();
+  for (const stream of input.streams) {
+    if (stream.hasDisposition(AV_DISPOSITION_ATTACHED_PIC)) continue;
+    const index = output.addStream(stream);
+    mapping.set(stream.index, index);
+    if (block !== undefined) {
+      using original = stream.metadata;
+      using metadata = Dictionary.fromObject({
+        ...withoutPictures(original?.getAll() ?? {}),
+        METADATA_BLOCK_PICTURE: block,
+      });
+      output.getStream(index)!.metadata = metadata;
+    }
+  }
+  const pictureIndex = ogg ? undefined : output.addStream(picture);
+  if (pictureIndex !== undefined) {
+    output.getStream(pictureIndex)!.disposition = AV_DISPOSITION_ATTACHED_PIC;
+  }
+  const packets = input.packets();
+  if (format === 'flac') {
+    // The first audio packet initializes the muxer's header, which waits for
+    // its attached picture before writing Vorbis comments. Restore metadata
+    // in that window, after init_muxer replaced encoder but before the picture
+    // packet completes flac_finish_header. Keep this same packet iterator so
+    // no compressed audio is dropped or replayed.
+    let initialized = false;
+    while (!initialized) {
+      const next = await packets.next();
+      if (next.done) throw new Error('FLAC has no audio packets');
+      const packet = next.value;
+      if (!packet) continue;
+      try {
+        const index = mapping.get(packet.streamIndex);
+        if (index !== undefined) {
+          await output.writePacket(packet, index);
+          initialized = true;
+        }
+      } finally {
+        packet.free();
+      }
+    }
+    using metadata = Dictionary.fromObject(withoutPictures(input.metadata));
+    output.getFormatContext().metadata = metadata;
+  }
+  if (pictureIndex !== undefined) {
+    for await (const packet of image.packets()) {
+      if (!packet) continue;
+      try {
+        await output.writePacket(packet, pictureIndex);
+      } finally {
+        packet.free();
+      }
+    }
+    await output.writePacket(null, pictureIndex);
+  }
+  for await (const packet of packets) {
+    if (!packet) continue;
+    try {
+      signal?.throwIfAborted();
+      const index = mapping.get(packet.streamIndex);
+      if (index !== undefined) await output.writePacket(packet, index);
+    } finally {
+      packet.free();
+    }
+  }
+  await output.close();
+}
 
 export function createMedia(log: Log = scopedLog('media')): Media {
   // One remux per target at a time (two clients asking for the same video

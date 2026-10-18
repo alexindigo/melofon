@@ -1,4 +1,5 @@
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
+import { enqueueLookups } from './lookups.ts';
 
 export type EntityType = 'album' | 'song' | 'artist';
 export type CandidateState = 'open' | 'accepted' | 'rejected' | 'edited';
@@ -76,6 +77,35 @@ async function add(q: Queries, list: CandidateInput[]): Promise<Candidate[]> {
 
 export function createCandidatesStore(engine: Engine) {
   return {
+    byId(id: string): Promise<Candidate | null> {
+      return engine.exclusive(async (q) =>
+        (await read(q, `WHERE id = ${esc(id)}`))[0] ?? null
+      );
+    },
+    /** The decision and its durable work commit together, with no nested slot. */
+    acceptCover(id: string): Promise<void> {
+      return atomic(engine, async (q) => {
+        const candidate = (await read(q, `WHERE id = ${esc(id)}`))[0];
+        if (
+          !candidate || candidate.entityType !== 'album' ||
+          candidate.kind !== 'cover'
+        ) {
+          throw new Error('Album cover candidate not found');
+        }
+        await enqueueLookups(q, [{
+          plugin: 'core.unify',
+          entityType: 'album',
+          entityId: candidate.entityId,
+          factsHash: candidate.id,
+          mode: 'all',
+        }]);
+        await q.run(
+          `UPDATE candidates SET state = 'accepted', decided_at = now() WHERE id = ${
+            esc(id)
+          }`,
+        );
+      });
+    },
     addCandidates(list: CandidateInput[]): Promise<Candidate[]> {
       return atomic(engine, (q) => add(q, list));
     },
@@ -116,6 +146,38 @@ export function createCandidatesStore(engine: Engine) {
         }`)
       );
     },
+    /** Archived pictures remain selectable after scan reconciles live conflicts. */
+    preserveLocal(albumId: string, versions: LocalVersion[]): Promise<void> {
+      return atomic(engine, async (q) => {
+        await add(
+          q,
+          versions.map((version) => ({
+            ...version,
+            entityType: 'album',
+            entityId: albumId,
+            kind: 'cover',
+            source: 'local',
+            confidence: null,
+            details: { ...version.details, preserved: true },
+          })),
+        );
+        for (const version of versions) {
+          const rows = await read(
+            q,
+            `WHERE entity_type = 'album' AND entity_id = ${esc(albumId)}
+            AND source = 'local' AND image_hash = ${esc(version.imageHash)}`,
+          );
+          for (const row of rows) {
+            await q.run(
+              `UPDATE candidates SET details = ${
+                esc(JSON.stringify({ ...row.details, preserved: true }))
+              }
+              WHERE id = ${esc(row.id)}`,
+            );
+          }
+        }
+      });
+    },
     replaceLocal(albumId: string, versions: LocalVersion[]): Promise<void> {
       return atomic(engine, async (q) => {
         const scope = `entity_type = 'album' AND entity_id = ${
@@ -123,6 +185,7 @@ export function createCandidatesStore(engine: Engine) {
         } AND source = 'local' AND state = 'open'`;
         const hashes = versions.map((v) => esc(v.imageHash));
         await q.run(`DELETE FROM candidates WHERE ${scope}
+          AND json_extract_string(details, '$.preserved') IS DISTINCT FROM 'true'
           ${
           hashes.length ? `AND image_hash NOT IN (${hashes.join(',')})` : ''
         }`);

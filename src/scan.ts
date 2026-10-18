@@ -14,6 +14,7 @@ import type {
 import type { Notify } from './notify.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
+  embeddedPictures as picturesFromMetadata,
   imageExtension,
   imageHash,
   isCoverFile,
@@ -198,7 +199,7 @@ export async function scanLibrary(
           genre = meta.common.genre?.[0]?.trim() || null;
           year = meta.common.year ?? null;
           pictures = await Promise.all(
-            (meta.common.picture ?? []).map(async (picture) => ({
+            picturesFromMetadata(meta).map(async (picture) => ({
               imageHash: await imageHash(picture.data),
               imageExt: imageExtension(picture.format),
               libraryId: source.id,

@@ -1,11 +1,48 @@
 // Core owns image files and hashing. Store operations only receive references.
-import { link, mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import {
+  access,
+  link,
+  mkdir,
+  open,
+  readFile,
+  stat,
+  unlink,
+} from 'node:fs/promises';
 import type { LibraryRow } from './store/catalog.ts';
+import type { IAudioMetadata, IPicture } from 'music-metadata';
 
 type ImageLibrary = Pick<LibraryRow, 'path'>;
 export interface ImageReference {
   hash: string;
   ext: string;
+}
+
+/** One picture reader for scan, artwork and unifying. music-metadata exposes
+ * deprecated Vorbis COVERART only as a native tag, not as common.picture. */
+export function embeddedPictures(meta: IAudioMetadata): IPicture[] {
+  const pictures = [...meta.common.picture ?? []];
+  const native = Object.values(meta.native).flat();
+  const mime = native.find((tag) => tag.id.toUpperCase() === 'COVERARTMIME')
+    ?.value;
+  for (const tag of native) {
+    if (tag.id.toUpperCase() !== 'COVERART') continue;
+    if (typeof tag.value !== 'string') throw new Error('Invalid legacy cover');
+    const data = Uint8Array.from(
+      atob(tag.value.replace(/\s/g, '')),
+      (c) => c.charCodeAt(0),
+    );
+    let format = typeof mime === 'string' ? mime : undefined;
+    if (!format) {
+      if (data[0] === 0xff && data[1] === 0xd8) format = 'image/jpeg';
+      else if (data[0] === 0x89 && data[1] === 0x50) format = 'image/png';
+    }
+    if (!data.length || !format || !/^image\/[a-z0-9]+$/i.test(format)) {
+      throw new Error('Invalid legacy cover MIME or data');
+    }
+    pictures.push({ data, format });
+  }
+  return pictures;
 }
 
 export function isCoverFile(name: string): boolean {
@@ -58,6 +95,8 @@ export async function libraryImagesWritable(
 ): Promise<boolean> {
   const probe = `${imageDirectory(library)}/.probe-${crypto.randomUUID()}`;
   try {
+    // An old writable cache is not authority to write into a now-read-only root.
+    await access(library.path, constants.W_OK);
     await mkdir(imageDirectory(library), { recursive: true });
     const file = await open(probe, 'wx', 0o600);
     await file.close();

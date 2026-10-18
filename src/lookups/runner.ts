@@ -12,6 +12,7 @@ import {
 } from '../images.ts';
 import type { Notify } from '../notify.ts';
 import { type Log, scopedLog } from '../logging.ts';
+import { createUnify, type UnifyHandler } from '../unify.ts';
 import { type Capability, discoverLookups, HOST_PATTERN } from './manifest.ts';
 import { LookupHost, LookupRevoked } from './host.ts';
 import {
@@ -90,11 +91,13 @@ export async function createLookupRunner(options: {
   library?: Library;
   network?: LookupNetwork;
   log?: Log;
+  unify?: UnifyHandler;
 }) {
   const { store, state } = options;
   const log = options.log ?? scopedLog('lookups');
   const library = options.library ?? createLibrary(store);
   const network = options.network ?? createLookupNetwork({ log });
+  const unify = options.unify ?? createUnify(store);
   const declarations = {
     jobTimeoutSeconds: {
       type: 'integer',
@@ -146,7 +149,7 @@ export async function createLookupRunner(options: {
   }
   let closed = false;
   const shutdown = new AbortController();
-  const busy = new Map<LookupHost, Promise<void>>();
+  const busy = new Map<LookupHost | string, Promise<void>>();
   let configuration = Promise.resolve();
   const revisions = new Map<LookupHost, number>();
   let intake = Promise.resolve();
@@ -287,16 +290,22 @@ export async function createLookupRunner(options: {
     );
     return task;
   };
-  async function execute(host: LookupHost, job: LookupJob) {
+  async function execute(host: LookupHost | undefined, job: LookupJob) {
     const budget = await limits();
     const controller = new AbortController();
     const signal = AbortSignal.any([shutdown.signal, controller.signal]);
     const timer = setTimeout(() => {
       controller.abort(new Error('Lookup job timed out'));
-      host.revoke('Lookup job timed out', false);
+      host?.revoke('Lookup job timed out', false);
     }, budget.timeoutMs);
     try {
       if (closed) throw new LookupRevoked('Runner closed');
+      if (!host) {
+        await unify(job, signal);
+        signal.throwIfAborted();
+        await store.lookups.finish(job.id, { state: 'done' });
+        return;
+      }
       const facts = await albumFacts(store, job.entityId);
       let capability: Capability | undefined;
       if (facts) {
@@ -377,10 +386,11 @@ export async function createLookupRunner(options: {
       await store.candidates.addCandidates(candidates);
       await store.lookups.finish(job.id, { state: 'done' });
     } catch (error) {
-      log.event('lookup_failed', { plugin: host.plugin.id, error });
+      log.event('lookup_failed', { plugin: job.plugin, error });
       const disabled = closed || error instanceof LookupRevoked ||
-        await state.getTyped(`lookups.plugin.${host.plugin.id}.enabled`) ===
-          false;
+        (host !== undefined &&
+          await state.getTyped(`lookups.plugin.${host.plugin.id}.enabled`) ===
+            false);
       const max = await numeric('maxAttempts');
       const delays = await state.getTyped(
         'lookups.retryDelaysSeconds',
@@ -404,25 +414,28 @@ export async function createLookupRunner(options: {
   }
   function pump() {
     if (closed) return;
-    for (const host of hosts) {
-      if (
-        !host.plugin.manifest || host.state === 'disabled' ||
-        host.state === 'stopping' || busy.has(host)
-      ) continue;
+    const queues = [undefined, ...hosts];
+    for (const host of queues) {
+      const key = host ?? 'core.unify';
+      const plugin = host?.plugin.id ?? 'core.unify';
+      const available = () =>
+        !host ||
+        (host.plugin.manifest !== undefined && host.state !== 'disabled' &&
+          host.state !== 'stopping');
+      if (!available() || busy.has(key)) continue;
       const task = (async () => {
         while (!closed) {
           await configuration;
           if (
-            closed || host.state === 'disabled' || host.state === 'stopping'
+            closed || !available()
           ) return;
-          const job = await store.lookups.claimNext(host.plugin.id);
+          const job = await store.lookups.claimNext(plugin);
           if (!job) return;
           await execute(host, job);
         }
-      })().catch((error) =>
-        log.event('lookup_failed', { plugin: host.plugin.id, error })
-      ).finally(() => busy.delete(host));
-      busy.set(host, task);
+      })().catch((error) => log.event('lookup_failed', { plugin, error }))
+        .finally(() => busy.delete(key));
+      busy.set(key, task);
     }
   }
   const unsubscribeNotify = options.notify?.subscribe((types) => {

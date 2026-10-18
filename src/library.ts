@@ -2,7 +2,12 @@
 import { parseFile } from 'music-metadata';
 import type { Store } from './store/index.ts';
 import type { CatalogReads, LyricsRow } from './store/catalog.ts';
-import { imageContentType, isCoverFile, readCandidateImage } from './images.ts';
+import {
+  embeddedPictures,
+  imageContentType,
+  isCoverFile,
+  readCandidateImage,
+} from './images.ts';
 export type {
   AlbumRow,
   ArtistRow,
@@ -72,7 +77,7 @@ export function createLibrary(store: Store): Library {
       if (path === null) return null;
       try {
         const meta = await parseFile(path);
-        const picture = meta.common.picture?.[0];
+        const picture = embeddedPictures(meta)[0];
         if (!picture) return null;
         return { bytes: picture.data, format: picture.format };
       } catch {
