@@ -4,6 +4,7 @@
   "description": "Household music server: library + HTTP streamer + speaker control",
   "license": "AGPL-3.0-or-later",
   "exports": "./main.ts",
+  "unstable": ["worker-options"],
   "tasks": {
     "check": "deno fmt --check && deno lint && deno check main.ts src/*.ts core/health/get.ts tests/*.ts \"layers/**/*.ts\"",
     "fmt": "deno fmt",

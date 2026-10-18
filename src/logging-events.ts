@@ -53,6 +53,15 @@ export interface EventFacts {
   scan_skipped: { path: string } & ErrorFacts;
   scan_fingerprint_failed: { path: string } & ErrorFacts;
   scan_failed: ErrorFacts;
+  lookup_request: { plugin: string; host: string; status: string | number };
+  lookup_lifecycle: {
+    plugin: string;
+    state: string;
+    generation?: string;
+    error?: string;
+  };
+  lookup_plugin_log: { plugin: string; payload: unknown };
+  lookup_failed: { plugin: string } & ErrorFacts;
   restore_complete: {
     queued: number;
     state: string;
@@ -198,6 +207,30 @@ export const events: Record<EventId, EventDefinition> = {
     'path error',
   ),
   scan_failed: definition('scan', 'error', 'Library scan failed', 'error'),
+  lookup_request: definition(
+    'lookups',
+    'info',
+    'Lookup outbound request',
+    'plugin host status',
+  ),
+  lookup_lifecycle: definition(
+    'lookups',
+    'info',
+    'Lookup plugin lifecycle',
+    'plugin state generation error',
+  ),
+  lookup_plugin_log: definition(
+    'lookups',
+    'info',
+    'Lookup plugin message',
+    'plugin payload',
+  ),
+  lookup_failed: definition(
+    'lookups',
+    'error',
+    'Lookup failed',
+    'plugin error',
+  ),
   scan_fingerprint_failed: definition(
     'scan',
     'warn',

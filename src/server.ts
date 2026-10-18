@@ -28,6 +28,7 @@ import { createPersistence } from './persistence.ts';
 import { createPlayback } from './playback.ts';
 import { createNotify } from './notify.ts';
 import { createState } from './state.ts';
+import { createLookupRunner } from './lookups/runner.ts';
 import { createAirplayBoot } from './boots/airplay.ts';
 import { createAirplayDiscovery } from './boots/airplay-mdns.ts';
 import { createAirplayDevices } from './boots/airplay-device.ts';
@@ -54,6 +55,12 @@ const state = createState(store);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
 const scan = createScan(store, media, { notify });
+const lookups = await createLookupRunner({
+  store,
+  state,
+  dataDir: cfg.dataDir,
+  notify,
+});
 const counts = await scan.run();
 log.event('scan_complete', counts);
 const env = Deno.env.toObject();
@@ -304,6 +311,7 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(engineClock);
+  await lookups.close();
   discovery.close();
   airplay.close();
   await Promise.all(servers.map((server) => server.shutdown()));
