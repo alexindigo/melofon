@@ -20,6 +20,8 @@ interface Candidate {
     country: string;
     albumSimilarity: number;
     artistSimilarity: number | null;
+    /** Album names equal only once edition notes are removed from both. */
+    editionNotesIgnored: boolean;
   };
 }
 type LookupResult = { candidates: Candidate[] } | {
@@ -27,11 +29,51 @@ type LookupResult = { candidates: Candidate[] } | {
   reason: string;
 };
 
-// Same leading articles as the OpenSubsonic index; no dependency on a hat.
+// Matching keeps every word, leading articles included: "A Night at the
+// Opera" and "The Night at the Opera" are different titles. Dropping articles
+// is for sorting and indexing, never for deciding two names are the same.
 function normalize(name: string): string {
   return name.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
-    .replace(/^(?:the|el|la|los|las|le|les|os|as|o|a) /, '');
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+// A bracketed part made only of edition words (with years, ordinals, `&`) is
+// an edition note: "(Remastered 2009)", "[2019 Remix & Remaster]",
+// "(50th Anniversary Edition)". Brackets with any other word ("(Live)",
+// "(Vol. 2)") are part of the name.
+const EDITION_WORDS = new Set([
+  'remaster',
+  'remastered',
+  'remastering',
+  'deluxe',
+  'edition',
+  'expanded',
+  'anniversary',
+  'bonus',
+  'track',
+  'tracks',
+  'version',
+  'mix',
+  'remix',
+  'mono',
+  'stereo',
+  'super',
+  'special',
+  'legacy',
+  "collector's",
+  'collectors',
+  'reissue',
+]);
+function withoutEditionNotes(name: string): string {
+  return name.replace(/[([]([^()[\]]*)[)\]]/g, (whole, inner: string) => {
+    const words = inner.toLowerCase().split(/[\s,&+/-]+/).filter(Boolean);
+    const edition = words.length > 0 && words.every((w) =>
+      EDITION_WORDS.has(w) || /^\d+(st|nd|rd|th)?$/.test(w)
+    ) && words.some((w) =>
+      EDITION_WORDS.has(w)
+    );
+    return edition ? ' ' : whole;
+  });
 }
 
 /** Normalized Levenshtein similarity, over Unicode code points. */
@@ -77,6 +119,7 @@ export default {
   ): Promise<LookupResult> {
     if (item.name === null) return { candidates: [] };
     const albumName = normalize(item.name);
+    const albumBase = normalize(withoutEditionNotes(item.name));
     // Empty normalized names carry no evidence to compare either.
     if (!albumName) return { candidates: [] };
     const countries = ctx.settings.countries;
@@ -113,14 +156,19 @@ export default {
         typeof result.artistName !== 'string' ||
         typeof result.artworkUrl100 !== 'string'
       ) throw new Error('Invalid iTunes album result');
+      const exactAlbum = albumName === normalize(result.collectionName);
+      // Medium matching compares names with edition notes removed.
       const albumSimilarity = similarity(
-        albumName,
-        normalize(result.collectionName),
+        albumBase,
+        normalize(withoutEditionNotes(result.collectionName)),
       );
       const artistSimilarity = artistName
         ? similarity(artistName, normalize(result.artistName))
         : null;
-      const confidence = albumSimilarity === 1 && artistSimilarity === 1
+      // Strong only when the names are equal as they are (edition notes
+      // included); equal only without edition notes stays medium (user
+      // decision 2026-10-18).
+      const confidence = exactAlbum && artistSimilarity === 1
         ? 'strong'
         : (artistSimilarity === null
             ? albumSimilarity === 1
@@ -146,6 +194,7 @@ export default {
           country,
           albumSimilarity,
           artistSimilarity,
+          editionNotesIgnored: !exactAlbum && albumSimilarity === 1,
         },
       });
     }

@@ -91,6 +91,7 @@ Deno.test('iTunes exact match returns strong, 1200 artwork and complete evidence
           country: 'us',
           albumSimilarity: 1,
           artistSimilarity: 1,
+          editionNotesIgnored: false,
         },
       }]);
       assertEquals(hits.length, 1);
@@ -112,7 +113,8 @@ Deno.test('iTunes close match is medium and stores actual similarity scores', as
     assertEquals(result.candidates.length, 1);
     assertEquals(result.candidates[0].confidence, 'medium');
     assertEquals(result.candidates[0].evidence.albumSimilarity, 1 - 1 / 11);
-    assertEquals(result.candidates[0].evidence.artistSimilarity, 1 - 1 / 7);
+    // Leading articles are kept: "the beatles" vs "the beatle".
+    assertEquals(result.candidates[0].evidence.artistSimilarity, 1 - 1 / 11);
   });
 });
 
@@ -124,15 +126,89 @@ for (const name of ['unrelated', 'empty']) {
   });
 }
 
-for (const article of 'The El La Los Las Le Les Os As O A'.split(' ')) {
-  Deno.test(`iTunes normalizes accents, punctuation, case, spaces and leading ${article}`, async () => {
+Deno.test('iTunes normalizes accents, punctuation, case and spaces', async () => {
+  const data = await fixture('exact');
+  data.results[0].collectionName = '  ÁBBEY--ROAD!! ';
+  data.results[0].artistName = 'THE  BÉATLES';
+  await withResponse(Response.json(data), async (ctx) => {
+    const result = await lookup(album(), ctx);
+    assert('candidates' in result);
+    assertEquals(result.candidates[0].confidence, 'strong');
+  });
+});
+
+// Matching keeps leading articles (user decision 2026-10-18): a different
+// article is a different title, never a strong match.
+for (
+  const [ours, theirs, ourArtist, theirArtist, confidence] of [
+    [
+      'A Night at the Opera',
+      'The Night at the Opera',
+      'Queen',
+      'Queen',
+      'medium',
+    ],
+    [
+      'A Night at the Opera',
+      'The Night at the Opera',
+      'Queen',
+      'DJ Someone',
+      null,
+    ],
+    // 'the beatles' vs 'beatles': 1 - 4/11 < .75, so a missing article is no match.
+    ['Abbey Road', 'Abbey Road', 'The Beatles', 'Beatles', null],
+  ] as const
+) {
+  Deno.test(`iTunes keeps leading articles: ${ours}/${ourArtist} vs ${theirs}/${theirArtist}: ${confidence ?? 'dropped'}`, async () => {
     const data = await fixture('exact');
-    data.results[0].collectionName = '  ÁBBEY--ROAD!! ';
-    data.results[0].artistName = `${article} BÉATLES`;
+    data.results[0].collectionName = theirs;
+    data.results[0].artistName = theirArtist;
     await withResponse(Response.json(data), async (ctx) => {
-      const result = await lookup(album(), ctx);
+      const result = await lookup(album(ours, ourArtist), ctx);
       assert('candidates' in result);
-      assertEquals(result.candidates[0].confidence, 'strong');
+      assertEquals(
+        result.candidates.map((c) => c.confidence),
+        confidence ? [confidence] : [],
+      );
+    });
+  });
+}
+
+// Edition notes (user decision 2026-10-18): equal only once bracketed edition
+// notes are removed is medium, never strong; other brackets are the name.
+for (
+  const [ours, theirs, confidence, ignored] of [
+    ['Abbey Road', 'Abbey Road (Remastered)', 'medium', true],
+    ['Abbey Road', 'Abbey Road (Remastered 2009)', 'medium', true],
+    [
+      'Abbey Road',
+      'Abbey Road (Super Deluxe Edition) [2019 Remix & Remaster]',
+      'medium',
+      true,
+    ],
+    ['Abbey Road', 'Abbey Road (50th Anniversary Edition)', 'medium', true],
+    ['Abbey Road (Remastered)', 'Abbey Road', 'medium', true],
+    ['Abbey Road (Remastered)', 'Abbey Road (Remastered)', 'strong', false],
+    ['Live Killers', 'Live Killers (Live)', null, false],
+    ['Abbey Road', 'Abbey Road (Vol. 2)', null, false],
+  ] as const
+) {
+  Deno.test(`iTunes edition notes: ${ours} vs ${theirs}: ${confidence ?? 'dropped'}`, async () => {
+    const data = await fixture('exact');
+    data.results[0].collectionName = theirs;
+    await withResponse(Response.json(data), async (ctx) => {
+      const result = await lookup(album(ours), ctx);
+      assert('candidates' in result);
+      assertEquals(
+        result.candidates.map((c) => c.confidence),
+        confidence ? [confidence] : [],
+      );
+      if (confidence) {
+        assertEquals(
+          result.candidates[0].evidence.editionNotesIgnored,
+          ignored,
+        );
+      }
     });
   });
 }
