@@ -15,6 +15,25 @@ export type ResponseFormat =
   | { type: 'json' }
   | { type: 'jsonp'; callback: string };
 
+export interface LyricsEntryRow {
+  language: string;
+  synced: boolean;
+  offset?: number;
+  artist?: string;
+  title?: string;
+  lines: {
+    start?: number;
+    text: string;
+    cues?: {
+      start: number;
+      end?: number;
+      text: string;
+      byteStart: number;
+      byteEnd: number;
+    }[];
+  }[];
+}
+
 export interface HatRequest {
   params: Record<string, string>;
   query: URLSearchParams;
@@ -133,6 +152,7 @@ export interface HatContext {
         artist?: string;
         title?: string;
       }): Promise<LyricsRow | null>;
+      lyricsBySongId(id: string): Promise<LyricsEntryRow[]>;
     };
     annotation: {
       /** Appends a star (a like); core classifies the id. false when the id

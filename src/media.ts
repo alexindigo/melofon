@@ -20,6 +20,7 @@ import {
   AV_CODEC_ID_MP3,
   AV_CODEC_ID_OPUS,
   AV_CODEC_ID_VORBIS,
+  AV_DICT_MULTIKEY,
   AV_DISPOSITION_ATTACHED_PIC,
   AV_NOPTS_VALUE,
   AV_SAMPLE_FMT_S16,
@@ -49,6 +50,7 @@ import {
 import { Buffer } from 'node:buffer';
 import { extname } from 'node:path';
 import { createHash } from 'node:crypto';
+import { type IAudioMetadata, parseFile } from 'music-metadata';
 import { type Log, scopedLog } from './logging.ts';
 import type { State } from './state.ts';
 
@@ -298,6 +300,224 @@ const PCM_BYTES_PER_SAMPLE = 2 * PCM_CHANNELS; // s16le interleaved
 // HLS segment length in seconds (Airsonic's SEGMENT_DURATION, probed).
 const HLS_SEGMENT_SECONDS = 10;
 
+/** Keep the existing native PICTURE-comment representation shared by picture
+ * replacement and metadata-only stream copies. No image is synthesized. */
+function pictureComment(picture: {
+  type: number;
+  format: string;
+  description?: string;
+  width: number;
+  height: number;
+  depth: number;
+  colors?: number;
+  data: Uint8Array;
+}): string {
+  const mime = Buffer.from(picture.format);
+  const description = Buffer.from(picture.description ?? '');
+  const bytes = Buffer.alloc(
+    32 + mime.length + description.length + picture.data.length,
+  );
+  let offset = 0;
+  const uint = (n: number) => {
+    bytes.writeUInt32BE(n, offset);
+    offset += 4;
+  };
+  const text = (value: Buffer) => {
+    uint(value.length);
+    bytes.set(value, offset);
+    offset += value.length;
+  };
+  uint(picture.type);
+  text(mime);
+  text(description);
+  uint(picture.width);
+  uint(picture.height);
+  uint(picture.depth);
+  uint(picture.colors ?? 0);
+  uint(picture.data.length);
+  bytes.set(picture.data, offset);
+  return bytes.toString('base64');
+}
+
+/** Known native mux limitations are refused before reserving files or backups.
+ * Full fingerprint/tag/read-back verification remains the publication gate. */
+export function lyricsWriteRefusal(
+  path: string,
+  meta: IAudioMetadata,
+): string | null {
+  const format = extname(path).slice(1).toLowerCase();
+  if (format === 'mp3') return 'lyrics write not supported for MP3 yet';
+  if (!['flac', 'm4a', 'ogg', 'opus'].includes(format)) {
+    return `lyrics write not supported for ${format}`;
+  }
+  if (
+    format === 'flac' && !meta.common.picture?.length &&
+    Object.values(meta.native).flat().some((tag) =>
+      /^encoder(?:-|$)/i.test(tag.id)
+    )
+  ) return 'lyrics write would change the FLAC ENCODER tag';
+  return null;
+}
+
+/** Lyrics-only native stream copy. Attached packets and all other streams are
+ * retained. FLAC with art uses the same post-init picture window as covers;
+ * no-art FLAC uses bitexact only after the preflight ruled out encoder loss. */
+export async function remuxLyrics(
+  path: string,
+  text: string,
+  outputPath: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const meta = await parseFile(path);
+  const refusal = lyricsWriteRefusal(path, meta);
+  if (refusal) throw new Error(refusal);
+  const format = extname(path).slice(1).toLowerCase();
+  await using input = await Demuxer.open(path, { signal });
+  const ogg = input.formatName.split(',').includes('ogg');
+  const replace = (
+    entries: Record<string, string>,
+  ): Record<string, string> => ({
+    ...Object.fromEntries(
+      Object.entries(entries).filter(([key]) =>
+        !/^(lyrics|USLT|SYLT|©lyr)$/i.test(key)
+      ),
+    ),
+    lyrics: text,
+  });
+  const global = replace(input.metadata);
+  if (format === 'm4a' && global.encoder !== undefined) {
+    global.encoding_tool = global.encoder;
+  }
+  await using output = await Muxer.open(outputPath, {
+    input,
+    format: format === 'm4a' ? 'mp4' : format === 'opus' ? 'ogg' : format,
+    signal,
+    copyPriorStart: 1,
+    copyInitialNonkeyframes: true,
+    options: { fflags: '+bitexact' },
+    configure(ctx) {
+      using dict = Dictionary.fromObject(global);
+      ctx.metadata = dict;
+    },
+  });
+  const mapping = new Map<number, number>();
+  // Ogg represents its pictures as comments, not additional image streams.
+  // music-metadata supplies all original PICTURE fields; use the same serializer
+  // as remuxPicture, preserving descriptions, dimensions, depth and type too.
+  const pictureTypes = [
+    'Other',
+    "32x32 pixels 'file icon' (PNG only)",
+    'Other file icon',
+    'Cover (front)',
+    'Cover (back)',
+    'Leaflet page',
+    'Media (e.g. label side of CD)',
+    'Lead artist/lead performer/soloist',
+    'Artist/performer',
+    'Conductor',
+    'Band/Orchestra',
+    'Composer',
+    'Lyricist/text writer',
+    'Recording Location',
+    'During recording',
+    'During performance',
+    'Movie/video screen capture',
+    'A bright coloured fish',
+    'Illustration',
+    'Band/artist logotype',
+    'Publisher/Studio logotype',
+  ];
+  const comments = Object.values(meta.native).flat().filter((tag) =>
+    /^METADATA_BLOCK_PICTURE$/i.test(tag.id)
+  ).map((tag) => {
+    const p = tag.value as {
+      type: string;
+      format: string;
+      description: string;
+      width: number;
+      height: number;
+      colour_depth: number;
+      indexed_color: number;
+      data: Uint8Array;
+    };
+    const type = pictureTypes.indexOf(p.type);
+    if (type < 0) throw new Error('Cannot preserve unknown picture type');
+    return pictureComment({
+      ...p,
+      type,
+      depth: p.colour_depth,
+      colors: p.indexed_color,
+    });
+  });
+  for (const stream of input.streams) {
+    if (ogg && stream.hasDisposition(AV_DISPOSITION_ATTACHED_PIC)) continue;
+    const index = output.addStream(stream);
+    mapping.set(stream.index, index);
+    if (ogg && stream.codecpar.codecType === AVMEDIA_TYPE_AUDIO) {
+      using original = stream.metadata;
+      using dict = Dictionary.fromObject(replace(original?.getAll() ?? {}));
+      for (const comment of comments) {
+        dict.set('METADATA_BLOCK_PICTURE', comment, AV_DICT_MULTIKEY);
+      }
+      output.getStream(index)!.metadata = dict;
+    }
+  }
+  const packets = input.packets();
+  if (format === 'flac' && meta.common.picture?.length) {
+    // Initialize with a real audio packet, then restore before any picture can
+    // complete the comments header. Keep this iterator; never replay audio.
+    const pictures = [];
+    try {
+      while (true) {
+        const next = await packets.next();
+        if (next.done) throw new Error('FLAC has no audio packets');
+        const packet = next.value;
+        if (!packet) continue;
+        if (
+          input.streams[packet.streamIndex].hasDisposition(
+            AV_DISPOSITION_ATTACHED_PIC,
+          )
+        ) {
+          // These demuxed packets carry a real stream timebase. attachedPic's
+          // raw packet has timebase 0/1 and cannot enter node-av's rescaler.
+          pictures.push(packet);
+          continue;
+        }
+        try {
+          await output.writePacket(packet, mapping.get(packet.streamIndex)!);
+        } finally {
+          packet.free();
+        }
+        break;
+      }
+      using dict = Dictionary.fromObject(global);
+      output.getFormatContext().metadata = dict;
+      for (const packet of pictures) {
+        await output.writePacket(packet, mapping.get(packet.streamIndex)!);
+      }
+    } finally {
+      for (const packet of pictures) packet.free();
+    }
+  }
+  for await (const packet of packets) {
+    if (!packet) continue;
+    try {
+      signal?.throwIfAborted();
+      if (
+        input.streams[packet.streamIndex].hasDisposition(
+          AV_DISPOSITION_ATTACHED_PIC,
+        ) && ogg
+      ) continue;
+      const index = mapping.get(packet.streamIndex);
+      if (index !== undefined) await output.writePacket(packet, index);
+    } finally {
+      packet.free();
+    }
+  }
+  await output.close();
+}
+
 /** Picture-only stream copy. The caller owns verification and atomic publish.
  * Ogg attaches images using its native FLAC PICTURE comment (not a JPEG stream).
  * All native FFmpeg access stays at the media boundary. */
@@ -318,25 +538,14 @@ export async function remuxPicture(
   if (ogg) {
     const bytes = await Deno.readFile(imagePath);
     const codec = avGetCodecName(picture.codecpar.codecId);
-    const mime = Buffer.from(`image/${codec === 'mjpeg' ? 'jpeg' : codec}`);
-    const buffer = Buffer.alloc(32 + mime.length + bytes.length);
-    let offset = 0;
-    const uint = (n: number) => {
-      buffer.writeUInt32BE(Math.max(0, n), offset);
-      offset += 4;
-    };
-    uint(3);
-    uint(mime.length);
-    mime.copy(buffer, offset);
-    offset += mime.length;
-    uint(0);
-    uint(picture.codecpar.width);
-    uint(picture.codecpar.height);
-    uint(picture.codecpar.bitsPerCodedSample);
-    uint(0);
-    uint(bytes.length);
-    buffer.set(bytes, offset);
-    block = buffer.toString('base64');
+    block = pictureComment({
+      type: 3,
+      format: `image/${codec === 'mjpeg' ? 'jpeg' : codec}`,
+      width: picture.codecpar.width,
+      height: picture.codecpar.height,
+      depth: Math.max(0, picture.codecpar.bitsPerCodedSample),
+      data: bytes,
+    });
   }
   const withoutPictures = (entries: Record<string, string>) =>
     Object.fromEntries(

@@ -1,5 +1,5 @@
 // layers/opensubsonic/rest/getLyrics/get.ts — GET /rest/getLyrics.
-// Embedded (USLT) lyrics only — no external agent. When the song or the tag
+// Shared core lyrics service. When the song or its local lyrics
 // is missing the lyrics element carries an empty `value` (the schema
 // requires the key; a bare empty element breaks strict Decodable clients).
 import { ok } from '#opensubsonic/envelope.ts';

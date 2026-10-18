@@ -298,10 +298,12 @@ Deno.test('H5 extensions advertise implemented offset and transcoding versions',
     const response = await s.request('getOpenSubsonicExtensions');
     const extensions =
       (await response.json())['subsonic-response'].openSubsonicExtensions;
-    assertEquals(extensions, [{ name: 'formPost', versions: [1] }, {
-      name: 'transcodeOffset',
-      versions: [1],
-    }, { name: 'transcoding', versions: [1] }]);
+    assertEquals(extensions, [
+      { name: 'formPost', versions: [1] },
+      { name: 'transcodeOffset', versions: [1] },
+      { name: 'transcoding', versions: [1] },
+      { name: 'songLyrics', versions: [1, 2] },
+    ]);
   } finally {
     await s.close();
   }

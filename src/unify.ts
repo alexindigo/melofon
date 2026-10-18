@@ -1,8 +1,9 @@
 // Core owns picture backups, integrity checks and atomic filesystem publication.
 // Store slots never contain filesystem or media work.
 import { constants } from 'node:fs';
+import { Buffer } from 'node:buffer';
 import { access } from 'node:fs/promises';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, extname, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { type IAudioMetadata, parseFile } from 'music-metadata';
 import type { Store } from './store/index.ts';
@@ -18,7 +19,21 @@ import {
   readCandidateImage,
   writeCandidateImage,
 } from './images.ts';
-import { createMedia, remuxPicture } from './media.ts';
+import {
+  createMedia,
+  lyricsWriteRefusal,
+  remuxLyrics,
+  remuxPicture,
+} from './media.ts';
+import {
+  createLyrics,
+  embeddedLyrics,
+  lyricsHash,
+  lyricsSidecars,
+  type LyricsSource,
+  readLyricsSidecar,
+  serializeLyrics,
+} from './lyrics.ts';
 
 export type UnifyHandler = (
   job: LookupJob,
@@ -144,19 +159,203 @@ async function syncFile(path: string) {
   await file.sync();
 }
 
+/** A lyrics choice already contains its bounded text. Resolving it does no
+ * filesystem writes, so unsupported jobs can fail without cache/backup probes. */
+export async function materializeLyrics(store: Store, candidate: Candidate) {
+  if (candidate.entityType !== 'song' || candidate.kind !== 'lyrics') {
+    throw new Error('Not a song lyrics candidate');
+  }
+  const song = await store.catalog.getSong(candidate.entityId);
+  if (!song) throw new Error('Candidate song is missing');
+  const library = (await store.catalog.listLibraries()).find((l) =>
+    l.id === song.libraryId
+  );
+  if (!library || library.id !== candidate.libraryId) {
+    throw new Error('Candidate library is missing');
+  }
+  const source = candidate.details.lyrics as LyricsSource | undefined;
+  if (
+    !source?.entry || await lyricsHash(source.entry) !== candidate.imageHash
+  ) throw new Error('Candidate lyrics are missing or their hash differs');
+  await inLibrary(song.path, library.path);
+  await access(library.path, constants.W_OK);
+  await access(dirname(song.path), constants.W_OK);
+  await access(song.path, constants.W_OK);
+  return { song, library, entry: source.entry };
+}
+
+function nonLyricsTags(meta: IAudioMetadata) {
+  const { lyrics: _lyrics, ...common } = meta.common;
+  const native = Object.values(meta.native).flat()
+    .filter((tag) => !/^(USLT|ULT|SYLT|LYRICS|©lyr)$/i.test(tag.id))
+    .map((tag) => JSON.stringify(tag)).sort();
+  return { common, native };
+}
+
+async function unifyLyrics(
+  store: Store,
+  candidate: Candidate,
+  signal: AbortSignal,
+  remux: typeof remuxLyrics,
+) {
+  const { song, library, entry } = await materializeLyrics(store, candidate);
+  const beforeStat = signature(await Deno.stat(song.path));
+  const beforeMeta = await parseFile(song.path);
+  const refusal = lyricsWriteRefusal(song.path, beforeMeta);
+  if (refusal) throw new Error(refusal);
+  const lyrics = createLyrics(store);
+  const limit = await lyrics.maxBytes();
+  const text = serializeLyrics(entry);
+  if (new TextEncoder().encode(text).length > limit) {
+    throw new Error('Chosen lyrics exceed lyrics.maxBytes');
+  }
+  const media = createMedia();
+  const before = await media.fingerprint(song.path);
+  if (!before.fingerprint) throw new Error('No afp/1 fingerprint');
+  const backup = async (source: LyricsSource | Omit<LyricsSource, 'entry'>) => {
+    const hash = 'entry' in source
+      ? await lyricsHash(source.entry)
+      : await imageHash(new TextEncoder().encode(JSON.stringify(source)));
+    await store.candidates.preserveLocal(song.id, [{
+      libraryId: library.id,
+      imageHash: hash,
+      imageExt: 'lyrics',
+      origin: source.origin === 'embedded'
+        ? song.id
+        : source.origin.slice(library.path.length + 1),
+      details: { lyrics: source },
+    }], 'lyrics');
+  };
+  // Preserve all native entries, even malformed ones that are not displayable.
+  for (
+    const tag of Object.values(beforeMeta.native).flat().filter((tag) =>
+      /^(USLT|ULT|SYLT|LYRICS|©lyr)$/i.test(tag.id)
+    )
+  ) {
+    const source =
+      embeddedLyrics({ ...beforeMeta, native: { original: [tag] } })[0] ??
+        { origin: 'embedded', native: tag };
+    if (new TextEncoder().encode(JSON.stringify(source)).length > limit) {
+      throw new Error('Original lyrics exceed lyrics.maxBytes');
+    }
+    await backup(source);
+  }
+  const snapshotSidecars = async () => {
+    const stats = new Map<string, ReturnType<typeof signature>>();
+    for (const path of await lyricsSidecars(song.path)) {
+      await inLibrary(path, library.path);
+      await access(path, constants.W_OK);
+      const { bytes, entry, stat } = await readLyricsSidecar(path, limit);
+      await backup({
+        ...(entry ? { entry } : {}),
+        origin: path,
+        bytes: Buffer.from(bytes).toString('base64'),
+      });
+      stats.set(path, signature(stat));
+    }
+    return stats;
+  };
+  await snapshotSidecars();
+  const temporary = `${dirname(song.path)}/.unify-${crypto.randomUUID()}`;
+  const sideTemporary = `${dirname(song.path)}/.unify-${crypto.randomUUID()}`;
+  const destination = song.path.slice(0, -extname(song.path).length) +
+    (entry.synced ? '.lrc' : '.txt');
+  const unchanged = async (
+    path: string,
+    expected?: ReturnType<typeof signature>,
+  ) => {
+    const current = await Deno.lstat(path).then(async (stat) => {
+      await inLibrary(path, library.path);
+      return signature(stat);
+    }, (error) => {
+      if (error instanceof Deno.errors.NotFound) return undefined;
+      throw error;
+    });
+    if (!isDeepStrictEqual(current, expected)) {
+      throw new Error(`File changed before lyrics publication: ${path}`);
+    }
+  };
+  try {
+    signal.throwIfAborted();
+    (await Deno.open(temporary, { createNew: true, write: true, mode: 0o600 }))
+      .close();
+    await remux(song.path, text, temporary, signal);
+    if (!isDeepStrictEqual(await media.fingerprint(temporary), before)) {
+      throw new Error('Remux changed afp/1 fingerprint');
+    }
+    const afterMeta = await parseFile(temporary);
+    if (
+      !isDeepStrictEqual(nonLyricsTags(afterMeta), nonLyricsTags(beforeMeta))
+    ) throw new Error('Remux changed a non-lyrics tag');
+    if (
+      !isDeepStrictEqual(embeddedLyrics(afterMeta).map((s) => s.entry), [entry])
+    ) throw new Error('Remux did not embed the exact chosen lyrics');
+    // Edits/additions made during remux are also archived before replacement.
+    const sideStats = await snapshotSidecars();
+    const mode = (await Deno.stat(song.path)).mode! & 0o777;
+    await Deno.chmod(temporary, mode);
+    await syncFile(temporary);
+    await Deno.writeTextFile(sideTemporary, text, {
+      createNew: true,
+      mode: 0o644,
+    });
+    await syncFile(sideTemporary);
+    signal.throwIfAborted();
+    const current = await store.candidates.byId(candidate.id);
+    if (!current || current.state === 'rejected') {
+      throw new Error('Lyrics choice was withdrawn');
+    }
+    await access(library.path, constants.W_OK);
+    await access(song.path, constants.W_OK);
+    await unchanged(song.path, beforeStat);
+    await unchanged(destination, sideStats.get(destination));
+    for (const [path, stat] of sideStats) await unchanged(path, stat);
+    // Refuse an unbacked new sidecar instead of racing it out of existence.
+    if (
+      !isDeepStrictEqual(await lyricsSidecars(song.path), [...sideStats.keys()])
+    ) throw new Error('Sidecars changed before lyrics publication');
+    await Deno.rename(temporary, song.path);
+    await Deno.rename(sideTemporary, destination);
+    for (const [path, stat] of sideStats) {
+      if (path === destination) continue;
+      await unchanged(path, stat);
+      await Deno.remove(path);
+    }
+    await syncFile(dirname(song.path));
+    await store.candidates.setState(candidate.id, 'accepted');
+  } finally {
+    for (const path of [temporary, sideTemporary]) {
+      await Deno.remove(path).catch((error) => {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      });
+    }
+  }
+}
+
 export function createUnify(
   store: Store,
-  options: { remux?: typeof remuxPicture } = {},
+  options: { remux?: typeof remuxPicture; remuxLyrics?: typeof remuxLyrics } =
+    {},
 ): UnifyHandler {
   const media = createMedia();
   const remux = options.remux ?? remuxPicture;
   return async (job, signal) => {
     signal.throwIfAborted();
     const candidate = await store.candidates.byId(job.factsHash);
-    if (!candidate || candidate.state !== 'accepted') return;
+    if (!candidate || candidate.state === 'rejected') return;
     if (candidate.entityId !== job.entityId) {
       throw new Error('Unify job target differs');
     }
+    if (candidate.kind === 'lyrics') {
+      await unifyLyrics(
+        store,
+        candidate,
+        signal,
+        options.remuxLyrics ?? remuxLyrics,
+      );
+      return;
+    }
+    if (candidate.state !== 'accepted') return;
     const { album, library, dirs, directory, imagePath, bytes } =
       await materializeCandidate(store, candidate);
     const coverPaths = await covers(dirs);

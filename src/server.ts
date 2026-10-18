@@ -12,6 +12,7 @@ import { createScan } from './scan.ts';
 import { createUserService } from './user.ts';
 import { createLibraries } from './libraries.ts';
 import { createLibrary } from './library.ts';
+import { createLyrics } from './lyrics.ts';
 import { createAnnotation } from './annotation.ts';
 import { createListens } from './listens.ts';
 import { createIdentity } from './identity.ts';
@@ -52,9 +53,10 @@ const libraries = createLibraries(store);
 const notify = createNotify();
 const state = createState(store);
 const media = createMedia(undefined, state);
+const lyrics = createLyrics(store, state);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
-const scan = createScan(store, media, { notify });
+const scan = createScan(store, media, { notify, lyrics });
 const lookups = await createLookupRunner({
   store,
   state,
@@ -95,7 +97,7 @@ const discovery = createAirplayDiscovery({
   devices: airplay,
   savedOutput: (id) => persistence.savedOutput(id),
 });
-const library = createLibrary(store);
+const library = createLibrary(store, lyrics);
 const player = createPlayer();
 const nowPlaying = createNowPlaying(store);
 const playback = createPlayback({

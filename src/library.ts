@@ -2,6 +2,7 @@
 import { parseFile } from 'music-metadata';
 import type { Store } from './store/index.ts';
 import type { CatalogReads, LyricsRow } from './store/catalog.ts';
+import { createLyrics, type Lyrics, type LyricsEntry } from './lyrics.ts';
 import {
   embeddedPictures,
   imageContentType,
@@ -21,13 +22,15 @@ export type {
 export interface Library extends
   Omit<
     CatalogReads,
+    | 'songsForLyrics'
     | 'songForLyrics'
     | 'coverSongPath'
     | 'albumSongPath'
     | 'albumCoverDirectories'
   > {
-  /** Embedded (USLT) lyrics of the best artist/title match. */
+  /** Lyrics of the bounded best artist/title match, from the shared service. */
   lyrics(query: { artist?: string; title?: string }): Promise<LyricsRow | null>;
+  lyricsBySongId(id: string): Promise<LyricsEntry[]>;
   /** Embedded (APIC) cover of an album's first song, or of a song id itself. */
   embeddedCover(
     id: string,
@@ -40,7 +43,10 @@ export interface Library extends
   ): Promise<{ bytes: Uint8Array; format: string } | null>;
 }
 
-export function createLibrary(store: Store): Library {
+export function createLibrary(
+  store: Store,
+  lyrics: Lyrics = createLyrics(store),
+): Library {
   const catalog = store.catalog;
   return {
     listArtists: catalog.listArtists,
@@ -59,19 +65,8 @@ export function createLibrary(store: Store): Library {
     listSongs: catalog.listSongs,
     listGenres: catalog.listGenres,
     songsByGenre: catalog.songsByGenre,
-    async lyrics(query) {
-      const song = await catalog.songForLyrics(query);
-      if (!song) return null;
-      let text: string | undefined;
-      try {
-        const meta = await parseFile(song.path);
-        text = meta.common.lyrics?.[0]?.text?.trim() || undefined;
-      } catch {
-        return null; // unreadable file — treated as no lyrics
-      }
-      if (text === undefined) return null;
-      return { artist: song.artistName, title: song.title, text };
-    },
+    lyrics: lyrics.legacy,
+    lyricsBySongId: lyrics.bySongId,
     async embeddedCover(id) {
       const path = await catalog.coverSongPath(id);
       if (path === null) return null;

@@ -53,12 +53,15 @@ function xmlElement(tag: string, value: unknown): string {
   let text: string | null = null;
   for (const [key, val] of Object.entries(obj)) {
     if (val === null || val === undefined) continue;
-    if (key === 'value' && isScalar(val)) {
+    if (key === 'value' && isScalar(val) && tag !== 'cueLine') {
       text = String(val);
       continue;
     }
     if (isScalar(val)) attrs += ` ${key}="${escapeXml(String(val))}"`;
-    else children += xmlElement(key, val);
+    else {children += xmlElement(
+        tag === 'structuredLyrics' && key === 'agents' ? 'agent' : key,
+        val,
+      );}
   }
   const inner = children + (text === null ? '' : escapeXml(text));
   return inner === ''

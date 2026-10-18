@@ -2,6 +2,7 @@
 import * as duckdb from '@duckdb/node-api';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { type Log, scopedLog } from '../logging.ts';
+import { upgradeCandidates } from './candidates.ts';
 
 // Debug spans behind MELOFON_DEBUG_LOG_REQUEST (plans/diag-request-trace):
 // [db] begin/end for run + runAndReadAll — sql truncated to the verb plus
@@ -201,6 +202,7 @@ export async function openEngine(
       for (const statement of schema.split(';')) {
         if (statement.trim() !== '') await q.run(statement);
       }
+      await upgradeCandidates(q, schema);
     });
   } catch (error) {
     await close();

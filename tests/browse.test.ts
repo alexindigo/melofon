@@ -261,10 +261,15 @@ Deno.test('getMusicFolders and getOpenSubsonicExtensions answer Feishin probes',
     const extensions = await get(app, 'getOpenSubsonicExtensions');
     assertEquals(
       extensions.openSubsonicExtensions,
-      [{ name: 'formPost', versions: [1] }, {
-        name: 'transcodeOffset',
-        versions: [1],
-      }, { name: 'transcoding', versions: [1] }],
+      [
+        { name: 'formPost', versions: [1] },
+        {
+          name: 'transcodeOffset',
+          versions: [1],
+        },
+        { name: 'transcoding', versions: [1] },
+        { name: 'songLyrics', versions: [1, 2] },
+      ],
     );
   } finally {
     await close();

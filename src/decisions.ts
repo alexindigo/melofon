@@ -1,5 +1,5 @@
 import type { Store } from './store/index.ts';
-import { materializeCandidate } from './unify.ts';
+import { materializeCandidate, materializeLyrics } from './unify.ts';
 
 export function createDecisions(store: Store) {
   return {
@@ -7,8 +7,10 @@ export function createDecisions(store: Store) {
       const candidate = await store.candidates.byId(candidateId);
       if (!candidate) throw new Error('Candidate not found');
       // All filesystem checks precede the atomic decision + queue operation.
-      await materializeCandidate(store, candidate);
-      await store.candidates.acceptCover(candidateId);
+      if (candidate.kind === 'lyrics') {
+        await materializeLyrics(store, candidate);
+      } else await materializeCandidate(store, candidate);
+      await store.candidates.accept(candidateId);
     },
     async reject(candidateId: string): Promise<void> {
       if (!await store.candidates.byId(candidateId)) {

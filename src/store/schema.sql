@@ -247,13 +247,14 @@ CREATE TABLE IF NOT EXISTS album_events (
 );
 
 -- Kept satellite proposals and persistent lookup work, never rebuilt by scans.
+ALTER TABLE files ADD COLUMN IF NOT EXISTS has_lyrics BOOLEAN DEFAULT false;
 CREATE SEQUENCE IF NOT EXISTS candidate_seq;
 CREATE TABLE IF NOT EXISTS candidates (
   id VARCHAR PRIMARY KEY,
   seq BIGINT DEFAULT nextval('candidate_seq'),
   entity_type VARCHAR NOT NULL CHECK (entity_type IN ('album', 'song', 'artist')),
   entity_id VARCHAR NOT NULL,
-  kind VARCHAR NOT NULL CHECK (kind IN ('cover', 'fields')),
+  kind VARCHAR NOT NULL CHECK (kind IN ('cover', 'fields', 'lyrics')),
   source VARCHAR NOT NULL,
   confidence VARCHAR CHECK (confidence IN ('strong', 'medium', 'low')),
   state VARCHAR NOT NULL CHECK (state IN ('open', 'accepted', 'rejected', 'edited')),

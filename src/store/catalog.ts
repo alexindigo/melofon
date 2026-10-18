@@ -164,6 +164,10 @@ export interface CatalogReads {
     genre: string,
     opts: { size: number; offset: number; folderId?: string },
   ): Promise<SongRow[]>;
+  songsForLyrics(
+    query: { artist?: string; title?: string },
+    limit: number,
+  ): Promise<SongRow[]>;
   songForLyrics(
     query: { artist?: string; title?: string },
   ): Promise<SongRow | null>;
@@ -665,21 +669,33 @@ function catalogReads(q: Queries): CatalogReads {
       return (res as unknown as SongSqlRow[]).map(songOf);
     },
 
-    async songForLyrics(query) {
+    async songsForLyrics(query, limit) {
       const wheres: string[] = [];
       if (query.artist !== undefined) {
-        wheres.push(`ar.name ILIKE ${esc(query.artist)}`);
+        wheres.push(
+          `(lower(ar.name) = lower(${
+            esc(query.artist)
+          }) OR EXISTS (SELECT 1 FROM artists aa WHERE aa.id = al.album_artist_id AND lower(aa.name) = lower(${
+            esc(query.artist)
+          })))`,
+        );
       }
       if (query.title !== undefined) {
-        wheres.push(`${SONG_TITLE} ILIKE ${esc(query.title)}`);
+        // Equality treats % and _ literally: there is no SQL pattern to escape.
+        wheres.push(`lower(f.title) = lower(${esc(query.title)})`);
       }
-      if (wheres.length === 0) return null;
+      if (wheres.length === 0) return [];
       const res = await q.all(
         `${SONG_SELECT} WHERE ${wheres.join(' AND ')}
-         ORDER BY ${SONG_TITLE}, f.id LIMIT 1`,
+         ORDER BY f.has_lyrics DESC, f.mtime DESC NULLS LAST, f.id LIMIT ${
+          Math.max(0, Math.trunc(limit))
+        }`,
       );
-      const row = (res as unknown as SongSqlRow[])[0];
-      return row ? songOf(row) : null;
+      return (res as unknown as SongSqlRow[]).map(songOf);
+    },
+
+    async songForLyrics(query) {
+      return (await this.songsForLyrics(query, 1))[0] ?? null;
     },
 
     async coverSongPath(id) {
@@ -779,6 +795,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
     listGenres: () => engine.exclusive((q) => catalogReads(q).listGenres()),
     songsByGenre: (...args) =>
       engine.exclusive((q) => catalogReads(q).songsByGenre(...args)),
+    songsForLyrics: (query, limit) =>
+      engine.exclusive((q) => catalogReads(q).songsForLyrics(query, limit)),
     songForLyrics: (query) =>
       engine.exclusive((q) => catalogReads(q).songForLyrics(query)),
     coverSongPath: (id) =>
@@ -847,6 +865,7 @@ export interface CatalogFile {
   genre: string | null;
   year: number | null;
   isVideo: boolean;
+  hasLyrics?: boolean;
 }
 
 export interface CatalogEvent {
@@ -976,8 +995,8 @@ async function replaceCatalog(
 
   const fileStmt = await q.prepare(
     `INSERT INTO files (id, path, library_id, mtime, size, title, album_id,
-        artist_id, track, disc, duration_ms, genre, year, is_video)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        artist_id, track, disc, duration_ms, genre, year, is_video, has_lyrics)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   try {
     for (const file of files) {
@@ -1005,6 +1024,7 @@ async function replaceCatalog(
       if (file.year === null) fileStmt.bindNull(13);
       else fileStmt.bindInteger(13, file.year);
       fileStmt.bindBoolean(14, file.isVideo);
+      fileStmt.bindBoolean(15, file.hasLyrics ?? false);
       await fileStmt.run();
     }
   } finally {

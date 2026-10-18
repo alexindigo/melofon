@@ -6,7 +6,7 @@ export type CandidateState = 'open' | 'accepted' | 'rejected' | 'edited';
 export interface CandidateInput {
   entityType: EntityType;
   entityId: string;
-  kind: 'cover' | 'fields';
+  kind: 'cover' | 'fields' | 'lyrics';
   source: string;
   confidence: 'strong' | 'medium' | 'low' | null;
   imageHash: string;
@@ -50,9 +50,9 @@ async function add(q: Queries, list: CandidateInput[]): Promise<Candidate[]> {
     const match = `entity_type = ${esc(input.entityType)} AND entity_id = ${
       esc(input.entityId)
     }
-      AND source = ${esc(input.source)} AND image_hash = ${
-      esc(input.imageHash)
-    }`;
+      AND kind = ${esc(input.kind)} AND source = ${
+      esc(input.source)
+    } AND image_hash = ${esc(input.imageHash)}`;
     if (
       (await q.all(`SELECT 1 FROM candidates WHERE ${match} LIMIT 1`)).length
     ) continue;
@@ -76,6 +76,32 @@ async function add(q: Queries, list: CandidateInput[]): Promise<Candidate[]> {
 }
 
 export function createCandidatesStore(engine: Engine) {
+  const accept = (id: string): Promise<void> =>
+    atomic(engine, async (q) => {
+      const candidate = (await read(q, `WHERE id = ${esc(id)}`))[0];
+      if (
+        !candidate || !(
+          candidate.entityType === 'album' && candidate.kind === 'cover' ||
+          candidate.entityType === 'song' && candidate.kind === 'lyrics'
+        )
+      ) throw new Error('Unifiable candidate not found');
+      await enqueueLookups(q, [{
+        plugin: 'core.unify',
+        entityType: candidate.entityType,
+        entityId: candidate.entityId,
+        factsHash: candidate.id,
+        mode: 'all',
+      }]);
+      // Lyrics are confirmed only after publication. In particular an unsupported
+      // native write must leave the choice open while its job reports failure.
+      await q.run(
+        `UPDATE candidates SET state = ${
+          esc(candidate.kind === 'lyrics' ? 'open' : 'accepted')
+        }, decided_at = ${
+          candidate.kind === 'lyrics' ? 'NULL' : 'now()'
+        } WHERE id = ${esc(id)}`,
+      );
+    });
   return {
     byId(id: string): Promise<Candidate | null> {
       return engine.exclusive(async (q) =>
@@ -83,29 +109,8 @@ export function createCandidatesStore(engine: Engine) {
       );
     },
     /** The decision and its durable work commit together, with no nested slot. */
-    acceptCover(id: string): Promise<void> {
-      return atomic(engine, async (q) => {
-        const candidate = (await read(q, `WHERE id = ${esc(id)}`))[0];
-        if (
-          !candidate || candidate.entityType !== 'album' ||
-          candidate.kind !== 'cover'
-        ) {
-          throw new Error('Album cover candidate not found');
-        }
-        await enqueueLookups(q, [{
-          plugin: 'core.unify',
-          entityType: 'album',
-          entityId: candidate.entityId,
-          factsHash: candidate.id,
-          mode: 'all',
-        }]);
-        await q.run(
-          `UPDATE candidates SET state = 'accepted', decided_at = now() WHERE id = ${
-            esc(id)
-          }`,
-        );
-      });
-    },
+    accept,
+    acceptCover: accept,
     addCandidates(list: CandidateInput[]): Promise<Candidate[]> {
       return atomic(engine, (q) => add(q, list));
     },
@@ -147,15 +152,20 @@ export function createCandidatesStore(engine: Engine) {
       );
     },
     /** Archived pictures remain selectable after scan reconciles live conflicts. */
-    preserveLocal(albumId: string, versions: LocalVersion[]): Promise<void> {
+    preserveLocal(
+      albumId: string,
+      versions: LocalVersion[],
+      kind: 'cover' | 'lyrics' = 'cover',
+    ): Promise<void> {
+      const entityType = kind === 'lyrics' ? 'song' : 'album';
       return atomic(engine, async (q) => {
         await add(
           q,
           versions.map((version) => ({
             ...version,
-            entityType: 'album',
+            entityType,
             entityId: albumId,
-            kind: 'cover',
+            kind,
             source: 'local',
             confidence: null,
             details: { ...version.details, preserved: true },
@@ -164,13 +174,35 @@ export function createCandidatesStore(engine: Engine) {
         for (const version of versions) {
           const rows = await read(
             q,
-            `WHERE entity_type = 'album' AND entity_id = ${esc(albumId)}
-            AND source = 'local' AND image_hash = ${esc(version.imageHash)}`,
+            `WHERE entity_type = ${esc(entityType)} AND entity_id = ${
+              esc(albumId)
+            }
+            AND kind = ${esc(kind)} AND source = 'local' AND image_hash = ${
+              esc(version.imageHash)
+            }`,
           );
           for (const row of rows) {
+            const backups = [
+              ...(Array.isArray(row.details.backups)
+                ? row.details.backups
+                : []),
+            ];
+            if (
+              kind === 'lyrics' && version.details?.lyrics !== undefined &&
+              !backups.some((backup) =>
+                JSON.stringify(backup) ===
+                  JSON.stringify(version.details!.lyrics)
+              )
+            ) backups.push(version.details.lyrics);
             await q.run(
               `UPDATE candidates SET details = ${
-                esc(JSON.stringify({ ...row.details, preserved: true }))
+                esc(
+                  JSON.stringify({
+                    ...row.details,
+                    preserved: true,
+                    ...(kind === 'lyrics' ? { backups } : {}),
+                  }),
+                )
               }
               WHERE id = ${esc(row.id)}`,
             );
@@ -178,13 +210,26 @@ export function createCandidatesStore(engine: Engine) {
         }
       });
     },
-    replaceLocal(albumId: string, versions: LocalVersion[]): Promise<void> {
+    replaceLocal(
+      albumId: string,
+      versions: LocalVersion[],
+      kind: 'cover' | 'lyrics' = 'cover',
+    ): Promise<void> {
+      const entityType = kind === 'lyrics' ? 'song' : 'album';
       return atomic(engine, async (q) => {
-        const scope = `entity_type = 'album' AND entity_id = ${
+        const scope = `entity_type = ${esc(entityType)} AND kind = ${
+          esc(kind)
+        } AND entity_id = ${
           esc(albumId)
         } AND source = 'local' AND state = 'open'`;
+        // Open-until-published lyrics choices are protected by their durable job.
+        const unrequested = kind === 'lyrics'
+          ? `AND NOT EXISTS (SELECT 1 FROM lookup_jobs j WHERE j.plugin = 'core.unify'
+            AND j.facts_hash = candidates.id AND j.state IN ('waiting', 'active'))`
+          : '';
         const hashes = versions.map((v) => esc(v.imageHash));
         await q.run(`DELETE FROM candidates WHERE ${scope}
+          ${unrequested}
           AND json_extract_string(details, '$.preserved') IS DISTINCT FROM 'true'
           ${
           hashes.length ? `AND image_hash NOT IN (${hashes.join(',')})` : ''
@@ -196,14 +241,24 @@ export function createCandidatesStore(engine: Engine) {
             esc(version.imageExt)
           }
             WHERE ${scope} AND image_hash = ${esc(version.imageHash)}`);
+          if (kind === 'lyrics' && version.details) {
+            await q.run(
+              `UPDATE candidates SET details = ${
+                esc(JSON.stringify(version.details))
+              }
+            WHERE ${scope} AND image_hash = ${esc(version.imageHash)}
+            ${unrequested}
+            AND json_extract_string(details, '$.preserved') IS DISTINCT FROM 'true'`,
+            );
+          }
         }
         await add(
           q,
           versions.map((v) => ({
             ...v,
-            entityType: 'album',
+            entityType,
             entityId: albumId,
-            kind: 'cover',
+            kind,
             source: 'local',
             confidence: null,
           })),
@@ -211,4 +266,35 @@ export function createCandidatesStore(engine: Engine) {
       });
     },
   };
+}
+
+/** DuckDB cannot alter a CHECK constraint. Upgrade the kept table atomically
+ * using its canonical DDL, preserving every row, decision and sequence value. */
+export async function upgradeCandidates(q: Queries, schema: string) {
+  const constraints = await q.all<{ constraint_text: string }>(
+    `SELECT constraint_text FROM duckdb_constraints() WHERE table_name = 'candidates' AND constraint_type = 'CHECK'`,
+  );
+  if (
+    !constraints.some((row) =>
+      row.constraint_text.includes('kind') &&
+      !row.constraint_text.includes('lyrics')
+    )
+  ) return;
+  const definition = schema.split(';').find((sql) =>
+    /CREATE TABLE IF NOT EXISTS candidates\s*\(/.test(sql)
+  );
+  if (!definition) throw new Error('Missing canonical candidates schema');
+  await q.run('BEGIN TRANSACTION');
+  try {
+    await q.run('ALTER TABLE candidates RENAME TO candidates_before_lyrics');
+    await q.run(definition);
+    await q.run(
+      'INSERT INTO candidates SELECT * FROM candidates_before_lyrics',
+    );
+    await q.run('DROP TABLE candidates_before_lyrics');
+    await q.run('COMMIT');
+  } catch (error) {
+    await q.run('ROLLBACK');
+    throw error;
+  }
 }

@@ -21,6 +21,7 @@ import {
   libraryImagesWritable,
 } from './images.ts';
 import type { LocalVersion } from './store/candidates.ts';
+import { createLyrics, type Lyrics, type LyricsSource } from './lyrics.ts';
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
@@ -89,6 +90,7 @@ export async function scanLibrary(
   store: Store,
   media?: Media,
   log: Log = scopedLog('scan'),
+  lyrics: Lyrics = createLyrics(store),
 ): Promise<ScanCounts> {
   let media_: Media | undefined = media;
   const fallbackMedia = () => (media_ ??= createMedia());
@@ -117,6 +119,7 @@ export async function scanLibrary(
   const files: FileIn[] = [];
   const embeddedPictures = new Map<FileIn, Omit<LocalVersion, 'origin'>[]>();
   const coverPictures = new Map<string, LocalVersion>();
+  const songLyrics = new Map<FileIn, LyricsSource[]>();
   let skipped = 0;
 
   for (const source of sources) {
@@ -246,6 +249,9 @@ export async function scanLibrary(
           isVideo,
         };
         files.push(file);
+        const localLyrics = await lyrics.sources(abs);
+        file.hasLyrics = localLyrics.length > 0;
+        songLyrics.set(file, localLyrics);
         embeddedPictures.set(file, pictures);
         albumInputs.set(file, {
           libraryId: source.id,
@@ -394,6 +400,13 @@ export async function scanLibrary(
         : [],
     );
   }
+  for (const file of files) {
+    await lyrics.reconcile(
+      file.id,
+      sources.find((source) => source.id === file.libraryId)!,
+      songLyrics.get(file) ?? [],
+    );
+  }
   return {
     files: files.length,
     skipped,
@@ -424,7 +437,7 @@ export interface ScanService {
 export function createScan(
   store: Store,
   media?: Media,
-  opts?: { notify?: Notify; log?: Log },
+  opts?: { notify?: Notify; log?: Log; lyrics?: Lyrics },
 ): ScanService {
   const log = opts?.log ?? scopedLog('scan');
   let pending: Promise<ScanCounts> | null = null;
@@ -435,7 +448,7 @@ export function createScan(
     if (pending !== null) return pending;
     lastScanStartedMs = Date.now();
     pending = (async () => {
-      const counts = await scanLibrary(store, media, log);
+      const counts = await scanLibrary(store, media, log, opts?.lyrics);
       count = counts.files;
       lastScanMs = Date.now();
       // Core emits after successful completion; hats just consume the event.
