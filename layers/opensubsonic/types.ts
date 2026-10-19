@@ -324,6 +324,20 @@ export interface ArtistRow {
 }
 
 export interface AlbumRow {
+  metadata?: {
+    musicBrainzId: string | null;
+    recordLabels: string[] | null;
+    releaseTypes: string[] | null;
+    genres: string[] | null;
+    moods: string[] | null;
+    releaseDate: string | null;
+    originalReleaseDate: string | null;
+    compilation: boolean | null;
+    version: string | null;
+    sortName: string | null;
+    explicit: string | null;
+    discTitles: { disc: number; title: string }[] | null;
+  };
   id: string;
   name: string | null;
   artistId: string | null;
@@ -338,6 +352,25 @@ export interface AlbumRow {
 }
 
 export interface SongRow {
+  metadata?: {
+    bitRate: number | null;
+    bitDepth: number | null;
+    sampleRate: number | null;
+    channels: number | null;
+    trackGain: number | null;
+    trackPeak: number | null;
+    albumGain: number | null;
+    albumPeak: number | null;
+    baseGain: number | null;
+    recordingMbid: string | null;
+    isrc: string[] | null;
+    genres: string[] | null;
+    moods: string[] | null;
+    comment: string | null;
+    sortTitle: string | null;
+    bpm: number | null;
+    explicit: string | null;
+  };
   id: string;
   path: string;
   libraryId: string | null;

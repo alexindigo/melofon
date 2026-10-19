@@ -3,6 +3,13 @@ import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { userIdForName } from './users.ts';
 import { artistAlbumFolderFilter } from './catalog-sql.ts';
 import { isAlbumFolderHint } from '../albums.ts';
+import type { AlbumMetadata, SongMetadata } from '../metadata.ts';
+import {
+  albumMetadataColumns,
+  metadataSelect,
+  songMetadataColumns,
+  writeMetadata,
+} from './catalog-metadata.ts';
 import type {
   Album,
   AlbumEvent,
@@ -19,6 +26,7 @@ export interface ArtistRow {
 }
 
 export interface AlbumRow {
+  metadata?: AlbumMetadata;
   id: string;
   name: string | null;
   artistId: string | null;
@@ -34,6 +42,7 @@ export interface AlbumRow {
 }
 
 export interface SongRow {
+  metadata?: SongMetadata;
   id: string;
   path: string;
   /** Source this file was scanned from (null only for pre-M3 rows). */
@@ -218,6 +227,7 @@ function sortKeySql(column: string, articles?: string[]): string {
 }
 
 interface SongSqlRow {
+  metadata_json: string | null;
   id: string;
   path: string;
   library_id: string | null;
@@ -244,6 +254,9 @@ function songOf(row: SongSqlRow): SongRow {
   return {
     id: row.id,
     path: row.path,
+    ...(row.metadata_json === null
+      ? {}
+      : { metadata: JSON.parse(row.metadata_json) }),
     libraryId: row.library_id,
     libraryPath: row.library_path,
     title: row.title,
@@ -273,7 +286,8 @@ const SONG_SELECT = `
   SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title, ${SONG_FILE_NAME} AS file_name,
          f.album_id, al.name AS album_name, al.folder_name AS album_folder_name, f.artist_id,
          ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
-         f.genre, f.year, f.is_video, epoch_ms(fi.first_seen_at) AS first_seen_ms
+         f.genre, f.year, f.is_video, epoch_ms(fi.first_seen_at) AS first_seen_ms,
+         ${metadataSelect(songMetadataColumns, 'f')}
   FROM files f
   LEFT JOIN albums al ON al.id = f.album_id
   LEFT JOIN artists ar ON ar.id = f.artist_id
@@ -281,6 +295,7 @@ const SONG_SELECT = `
   LEFT JOIN file_identity fi ON fi.id = f.id`;
 
 interface AlbumSqlRow {
+  metadata_json: string | null;
   id: string;
   name: string | null;
   album_artist_id: string | null;
@@ -295,6 +310,9 @@ interface AlbumSqlRow {
 
 function albumOf(row: AlbumSqlRow): AlbumRow {
   return {
+    ...(row.metadata_json === null
+      ? {}
+      : { metadata: JSON.parse(row.metadata_json) }),
     id: row.id,
     name: row.name,
     artistId: row.album_artist_id,
@@ -362,7 +380,8 @@ function albumSelect(q: AlbumQuery = {}): string {
   return `
   SELECT al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
-         MAX(f.year) AS year, epoch_ms(MIN(fi.first_seen_at)) AS created_ms
+          MAX(f.year) AS year, epoch_ms(MIN(fi.first_seen_at)) AS created_ms,
+          ${metadataSelect(albumMetadataColumns, 'al', true)}
   FROM albums al
   LEFT JOIN artists ar ON ar.id = al.album_artist_id
   LEFT JOIN files f ON f.album_id = al.id
@@ -849,6 +868,7 @@ export interface CatalogIdentity extends CatalogFileStat {
 }
 
 export interface CatalogFile {
+  metadata?: SongMetadata;
   id: string;
   path: string;
   rel: string;
@@ -877,7 +897,7 @@ export interface CatalogEvent {
 
 export interface CatalogSnapshot {
   artists: { id: string; name: string }[];
-  albums: Album[];
+  albums: (Album & { metadata?: AlbumMetadata })[];
   albumIdentities: AlbumIdentity[];
   albumEvents: AlbumEvent[];
   files: CatalogFile[];
@@ -988,6 +1008,7 @@ async function replaceCatalog(
       albumStmt.bindVarchar(6, album.rootDir);
       albumStmt.bindVarchar(7, album.folderName);
       await albumStmt.run();
+      await writeMetadata(q, 'albums', album.id, album.metadata);
     }
   } finally {
     albumStmt.destroySync();
@@ -1026,6 +1047,7 @@ async function replaceCatalog(
       fileStmt.bindBoolean(14, file.isVideo);
       fileStmt.bindBoolean(15, file.hasLyrics ?? false);
       await fileStmt.run();
+      await writeMetadata(q, 'files', file.id, file.metadata);
     }
   } finally {
     fileStmt.destroySync();

@@ -1,7 +1,6 @@
 // The scan owns catalog rebuilds and retained file identity. Song ids are
 // assigned once, then resolved before rebuilding files so user state follows
 // unambiguous external moves. All identity/catalog writes share one transaction.
-import { parseFile } from 'music-metadata';
 import { type AlbumInput, groupAlbums, stableId } from './albums.ts';
 import { type AudioFingerprint, createMedia, type Media } from './media.ts';
 import type { Store } from './store/index.ts';
@@ -22,6 +21,17 @@ import {
 } from './images.ts';
 import type { LocalVersion } from './store/candidates.ts';
 import { createLyrics, type Lyrics, type LyricsSource } from './lyrics.ts';
+import {
+  albumMetadata,
+  metadataFromTags,
+  type SongMetadata,
+} from './metadata.ts';
+import { createState, type State } from './state.ts';
+import {
+  createTagReader,
+  declareTagSettings,
+  type TagReader,
+} from './scan-tags.ts';
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
@@ -91,7 +101,10 @@ export async function scanLibrary(
   media?: Media,
   log: Log = scopedLog('scan'),
   lyrics: Lyrics = createLyrics(store),
+  options: { state?: State; tagReader?: TagReader } = {},
 ): Promise<ScanCounts> {
+  using tagReader = options.tagReader ??
+    createTagReader(options.state ?? createState(store));
   let media_: Media | undefined = media;
   const fallbackMedia = () => (media_ ??= createMedia());
   const sources = await store.catalog.listLibraries();
@@ -178,9 +191,11 @@ export async function scanLibrary(
         let genre: string | null = null;
         let year: number | null = null;
         let isVideo = false;
+        let metadata: SongMetadata;
         let pictures: Omit<LocalVersion, 'origin'>[] = [];
         try {
-          const meta = await parseFile(abs);
+          const meta = await tagReader.read(abs);
+          metadata = metadataFromTags(meta);
           // Garbage bytes can resolve with an empty format rather than throw.
           if (
             meta.format.container === undefined &&
@@ -199,7 +214,7 @@ export async function scanLibrary(
             durationMs = Math.round(meta.format.duration * 1000);
           }
           // TCON is multi-valued; keep its first value, as before.
-          genre = meta.common.genre?.[0]?.trim() || null;
+          genre = metadata.genres[0] ?? null;
           year = meta.common.year ?? null;
           pictures = await Promise.all(
             picturesFromMetadata(meta).map(async (picture) => ({
@@ -208,7 +223,8 @@ export async function scanLibrary(
               libraryId: source.id,
             })),
           );
-        } catch {
+        } catch (error) {
+          log.event('scan_tags_failed', { path: abs, error });
           skipped++;
           continue; // unreadable tags — skip the file, keep scanning
         }
@@ -225,6 +241,15 @@ export async function scanLibrary(
         } else if (durationMs === null) {
           durationMs = (await fallbackMedia().probe(abs)).durationMs;
         }
+        // Same selected stream as the decoder/transcoder (Demuxer.audio()).
+        // Container averages and the tag parser's first stream are not audio facts.
+        const details = await fallbackMedia().describeAudio(abs);
+        metadata.bitRate = details?.audioBitrate === undefined
+          ? null
+          : details.audioBitrate / 1000;
+        metadata.bitDepth = details?.audioBitdepth ?? null;
+        metadata.sampleRate = details?.audioSamplerate ?? null;
+        metadata.channels = details?.audioChannels ?? null;
 
         let artistId: string | null = null;
         if (trackArtist !== undefined) {
@@ -247,6 +272,7 @@ export async function scanLibrary(
           genre,
           year,
           isVideo,
+          metadata,
         };
         files.push(file);
         const localLyrics = await lyrics.sources(abs);
@@ -353,7 +379,12 @@ export async function scanLibrary(
   }
   await store.catalog.replaceCatalog({
     artists: [...artists.values()],
-    albums: grouped.albums,
+    albums: grouped.albums.map((album) => ({
+      ...album,
+      metadata: albumMetadata(
+        files.filter((file) => file.albumId === album.id),
+      ),
+    })),
     albumIdentities: grouped.identities,
     albumEvents: grouped.events,
     files,
@@ -437,9 +468,11 @@ export interface ScanService {
 export function createScan(
   store: Store,
   media?: Media,
-  opts?: { notify?: Notify; log?: Log; lyrics?: Lyrics },
+  opts?: { notify?: Notify; log?: Log; lyrics?: Lyrics; state?: State },
 ): ScanService {
   const log = opts?.log ?? scopedLog('scan');
+  const state = opts?.state ?? createState(store);
+  declareTagSettings(state);
   let pending: Promise<ScanCounts> | null = null;
   let count = 0;
   let lastScanMs: number | null = null;
@@ -448,7 +481,9 @@ export function createScan(
     if (pending !== null) return pending;
     lastScanStartedMs = Date.now();
     pending = (async () => {
-      const counts = await scanLibrary(store, media, log, opts?.lyrics);
+      const counts = await scanLibrary(store, media, log, opts?.lyrics, {
+        state,
+      });
       count = counts.files;
       lastScanMs = Date.now();
       // Core emits after successful completion; hats just consume the event.

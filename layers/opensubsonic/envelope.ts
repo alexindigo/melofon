@@ -48,11 +48,33 @@ function xmlElement(tag: string, value: unknown): string {
     return `<${tag}>${escapeXml(String(value))}</${tag}>`;
   }
   const obj = value as Record<string, unknown>;
+  if (
+    ['replayGain', 'releaseDate', 'originalReleaseDate'].includes(tag) &&
+    Object.keys(obj).length === 0
+  ) return '';
   let attrs = '';
   let children = '';
   let text: string | null = null;
   for (const [key, val] of Object.entries(obj)) {
     if (val === null || val === undefined) continue;
+    // Navidrome's H7 optional attributes use omitempty on XML, while JSON
+    // reports supported fields even without data. ReplayGain zero is real.
+    if (
+      [
+        'bitRate',
+        'bitDepth',
+        'samplingRate',
+        'channelCount',
+        'discNumber',
+        'bpm',
+        'comment',
+        'sortName',
+        'musicBrainzId',
+        'explicitStatus',
+        'version',
+        'isCompilation',
+      ].includes(key) && (val === '' || val === 0 || val === false)
+    ) continue;
     if (key === 'value' && isScalar(val) && tag !== 'cueLine') {
       text = String(val);
       continue;

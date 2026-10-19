@@ -6,6 +6,19 @@ type Tokenizer = Parameters<typeof parseFromTokenizer>[0];
 type Token<T> = { len: number; get(bytes: Uint8Array, offset: number): T };
 
 export async function lyricsMetadata(path: string, maxBytes: number) {
+  return await boundedMetadata(path, maxBytes, {
+    duration: false,
+    skipCovers: true,
+    skipPostHeaders: true,
+  });
+}
+
+// Shared input boundary; the caller chooses whether pictures/post-tags matter.
+export async function boundedMetadata(
+  path: string,
+  maxBytes: number,
+  options: Parameters<typeof parseFromTokenizer>[1],
+) {
   using file = await Deno.open(path, { read: true });
   const stat = await file.stat();
   let position = 0;
@@ -14,7 +27,7 @@ export async function lyricsMetadata(path: string, maxBytes: number) {
     // Never read an oversized declared tag, even its prefix. The cumulative
     // budget also bounds packetized/multi-part comment blocks.
     if (!Number.isSafeInteger(length) || length < 0 || length > remaining) {
-      throw new Error('Lyrics metadata exceeds lyrics.maxBytes');
+      throw new Error('Metadata exceeds read budget');
     }
     const available = Math.min(length, Math.max(0, stat.size - at));
     if (!mayBeLess && available !== length) {
@@ -81,9 +94,5 @@ export async function lyricsMetadata(path: string, maxBytes: number) {
     close: () => Promise.resolve(),
     abort: () => Promise.resolve(),
   };
-  return await parseFromTokenizer(tokenizer, {
-    duration: false,
-    skipCovers: true,
-    skipPostHeaders: true,
-  });
+  return await parseFromTokenizer(tokenizer, options);
 }

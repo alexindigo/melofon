@@ -52,6 +52,7 @@ export interface EventFacts {
   };
   scan_skipped: { path: string } & ErrorFacts;
   scan_fingerprint_failed: { path: string } & ErrorFacts;
+  scan_tags_failed: { path: string } & ErrorFacts;
   scan_failed: ErrorFacts;
   lookup_request: { plugin: string; host: string; status: string | number };
   lookup_lifecycle: {
@@ -244,6 +245,7 @@ export const events: Record<EventId, EventDefinition> = {
     'Audio fingerprint failed',
     'path error',
   ),
+  scan_tags_failed: definition('scan', 'warn', 'Tags skipped', 'path error'),
   restore_complete: definition(
     'player',
     'info',

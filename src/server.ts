@@ -56,7 +56,7 @@ const media = createMedia(undefined, state);
 const lyrics = createLyrics(store, state);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
-const scan = createScan(store, media, { notify, lyrics });
+const scan = createScan(store, media, { notify, lyrics, state });
 const lookups = await createLookupRunner({
   store,
   state,

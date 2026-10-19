@@ -6,6 +6,10 @@
 // Shared module at the layer root, outside the walked mount tree.
 import { fail } from '#opensubsonic/envelope.ts';
 import {
+  albumMetadataFields,
+  songMetadataFields,
+} from '#opensubsonic/metadata.ts';
+import {
   boundedCountParam,
   folderIdParam,
   requiredParam,
@@ -139,7 +143,11 @@ export function albumId3Of(
   album: AlbumRow,
   p: Personal,
 ): Record<string, unknown> {
-  return { ...albumBaseOf(album), ...albumId3Fields(p.album(album.id)) };
+  return {
+    ...albumBaseOf(album),
+    ...albumMetadataFields(album),
+    ...albumId3Fields(p.album(album.id)),
+  };
 }
 
 // Pre-ID3 album shape (getAlbumList / search2 / getStarred): the ID3 fields
@@ -155,6 +163,8 @@ export function albumV1Of(
     album: albumLabel(album),
     title: albumLabel(album),
     isDir: true,
+    mediaType: 'album',
+    ...albumMetadataFields(album),
     ...childFields(p.album(album.id)),
   };
 }
@@ -200,6 +210,7 @@ export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
     // stream the same id as audio via ExtractAudio.
     type: song.isVideo ? 'video' : 'music',
     isVideo: song.isVideo,
+    ...songMetadataFields(song),
     ...childFields(p.song(song.id)),
   };
 }
