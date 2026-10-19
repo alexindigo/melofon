@@ -178,6 +178,7 @@ export interface HatContext {
 
 // Domain rows, declared structurally (the hat does not import src/).
 export interface SongRow {
+  pictureHash?: string | null;
   id: string;
   path: string;
   title: string | null;

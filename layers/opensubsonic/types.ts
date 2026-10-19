@@ -296,6 +296,12 @@ export interface HatContext {
       archive(entries: { name: string; path: string }[]): Promise<Blob>;
     };
     artwork: {
+      get(id: string, options?: { size?: number; username?: string }): Promise<
+        { kind: 'unknown' } | {
+          kind: 'image' | 'placeholder';
+          response: Response;
+        }
+      >;
       cover(id: string): Promise<Response>;
       placeholder(): Response;
     };
@@ -352,6 +358,7 @@ export interface AlbumRow {
 }
 
 export interface SongRow {
+  pictureHash?: string | null;
   metadata?: {
     bitRate: number | null;
     bitDepth: number | null;

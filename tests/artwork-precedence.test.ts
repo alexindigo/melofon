@@ -96,7 +96,8 @@ Deno.test('artwork song own picture wins; songs without one follow album file, f
     );
     await expect(await artwork.cover(album.id), placeholder, 'image/png');
     await expect(await artwork.cover(songs[2].id), placeholder, 'image/png');
-    await expect(await artwork.cover('missing'), placeholder, 'image/png');
+    // Unknown is not a known entity with absent art (Navidrome media_retrieval.go:74-76).
+    assertEquals((await artwork.cover('missing')).status, 404);
   });
 });
 

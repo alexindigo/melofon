@@ -11,6 +11,7 @@
 // ReadableStream (chunked HTTP, never buffered whole, no ffmpeg CLI).
 import {
   AV_CHANNEL_LAYOUT_STEREO,
+  AV_CODEC_FLAG_QSCALE,
   AV_CODEC_ID_AAC,
   AV_CODEC_ID_ALAC,
   AV_CODEC_ID_FLAC,
@@ -23,6 +24,8 @@ import {
   AV_DICT_MULTIKEY,
   AV_DISPOSITION_ATTACHED_PIC,
   AV_NOPTS_VALUE,
+  AV_PIX_FMT_RGBA,
+  AV_PIX_FMT_YUVJ420P,
   AV_SAMPLE_FMT_S16,
   AV_TIME_BASE,
   AV_TIME_BASE_Q,
@@ -30,6 +33,7 @@ import {
   avGetCodecName,
   AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
+  type AVPixelFormat,
   avRescaleQ,
   AVSEEK_FLAG_BACKWARD,
   Codec,
@@ -41,11 +45,18 @@ import {
   FF_ENCODER_LIBMP3LAME,
   FF_ENCODER_LIBOPUS,
   FF_ENCODER_LIBVORBIS,
+  FF_ENCODER_LIBWEBP_ANIM,
+  FF_ENCODER_MJPEG,
+  FF_ENCODER_PNG,
+  FF_QP2LAMBDA,
   FFmpegError,
   FilterAPI,
+  Frame,
   Log as FFmpegLog,
   Muxer,
   pipeline,
+  SoftwareScaleContext,
+  SWS_BICUBIC,
 } from 'node-av';
 import { Buffer } from 'node:buffer';
 import { extname } from 'node:path';
@@ -645,6 +656,253 @@ export async function remuxPicture(
     }
   }
   await output.close();
+}
+
+// Artwork's native boundary. Callers inspect image headers and admit work first.
+// Fresh frames intentionally carry neither EXIF orientation nor ICC side data.
+function imageFrame(
+  width: number,
+  height: number,
+  format: AVPixelFormat,
+): Frame {
+  const frame = new Frame();
+  frame.alloc();
+  frame.width = width;
+  frame.height = height;
+  frame.format = format;
+  frame.timeBase = { num: 1, den: 1000 };
+  frame.pts = 0n;
+  FFmpegError.throwIfError(frame.allocBuffer(), 'allocate artwork frame');
+  return frame;
+}
+
+async function scaleImage(
+  frame: Frame,
+  width: number,
+  height: number,
+  format: AVPixelFormat,
+): Promise<Frame> {
+  const result = imageFrame(width, height, format);
+  try {
+    using scaler = new SoftwareScaleContext();
+    scaler.getContext(
+      frame.width,
+      frame.height,
+      frame.format as AVPixelFormat,
+      width,
+      height,
+      format,
+      SWS_BICUBIC,
+    );
+    FFmpegError.throwIfError(
+      await scaler.scaleFrame(result, frame),
+      'scale artwork',
+    );
+    return result;
+  } catch (error) {
+    result.free();
+    throw error;
+  }
+}
+
+async function encodeImage(
+  frame: Frame,
+  format: 'png' | 'jpeg',
+  quality: number,
+): Promise<Uint8Array> {
+  // mjpeg uses qscale 2..31, inverse to the human-facing 1..100 quality.
+  const qscale = Math.round(31 - quality * 29 / 100);
+  await using encoder = await Encoder.create(
+    Codec.findEncoderByName(
+      format === 'png' ? FF_ENCODER_PNG : FF_ENCODER_MJPEG,
+    )!,
+    {
+      context: format === 'jpeg'
+        ? { flags: AV_CODEC_FLAG_QSCALE, globalQuality: qscale * FF_QP2LAMBDA }
+        : {},
+    },
+  );
+  const chunks: Buffer[] = [];
+  for (const item of [frame, null]) {
+    for (const packet of await encoder.encodeAll(item)) {
+      try {
+        if (packet.data) chunks.push(Buffer.from(packet.data));
+      } finally {
+        packet.free();
+      }
+    }
+  }
+  if (!chunks.length) throw new Error('Artwork encoder returned no bytes');
+  return Buffer.concat(chunks);
+}
+
+export async function resizeImage(
+  bytes: Uint8Array,
+  width: number,
+  height: number,
+  format: 'png' | 'jpeg',
+  quality: number,
+): Promise<Uint8Array> {
+  await using input = await Demuxer.open(Buffer.from(bytes));
+  const stream = input.video();
+  if (!stream) throw new Error('Image has no video stream');
+  await using decoder = await Decoder.create(stream);
+  for await (const frame of decoder.frames(input.packets(stream.index))) {
+    if (!frame) continue;
+    try {
+      using scaled = await scaleImage(
+        frame,
+        width,
+        height,
+        format === 'png' ? AV_PIX_FMT_RGBA : AV_PIX_FMT_YUVJ420P,
+      );
+      return await encodeImage(scaled, format, quality);
+    } finally {
+      frame.free();
+    }
+  }
+  throw new Error('Image has no decoded frame');
+}
+
+/** Navidrome resolve.go:415-421: ABBA for two, ABCA for three; one tile alone. */
+export async function playlistImage(
+  images: Uint8Array[],
+  tileSize: number,
+): Promise<Uint8Array> {
+  const tiles: Frame[] = [];
+  try {
+    for (const bytes of images) {
+      try {
+        await using input = await Demuxer.open(Buffer.from(bytes));
+        const stream = input.video();
+        if (!stream) continue;
+        await using decoder = await Decoder.create(stream);
+        for await (const frame of decoder.frames(input.packets(stream.index))) {
+          if (!frame) continue;
+          try {
+            using rgba = await scaleImage(
+              frame,
+              frame.width,
+              frame.height,
+              AV_PIX_FMT_RGBA,
+            );
+            // Center crop at the owning image boundary, not per-quadrant offsets.
+            const side = Math.min(rgba.width, rgba.height);
+            using cropped = imageFrame(side, side, AV_PIX_FMT_RGBA);
+            const src = rgba.data![0], dst = cropped.data![0];
+            const x = Math.floor((rgba.width - side) / 2),
+              y = Math.floor((rgba.height - side) / 2);
+            for (let row = 0; row < side; row++) {
+              dst.set(
+                src.subarray(
+                  (y + row) * rgba.linesize[0] + x * 4,
+                  (y + row) * rgba.linesize[0] + (x + side) * 4,
+                ),
+                row * cropped.linesize[0],
+              );
+            }
+            tiles.push(
+              await scaleImage(
+                cropped,
+                tileSize / 2,
+                tileSize / 2,
+                AV_PIX_FMT_RGBA,
+              ),
+            );
+          } finally {
+            frame.free();
+          }
+          break;
+        }
+      } catch { /* Navidrome resolve.go:399-403 skips an undecodable tile. */ }
+    }
+    if (!tiles.length) throw new Error('No playlist tiles');
+    const order = tiles.length === 1
+      ? [0]
+      : tiles.length === 2
+      ? [0, 1, 1, 0]
+      : tiles.length === 3
+      ? [0, 1, 2, 0]
+      : [0, 1, 2, 3];
+    const side = order.length === 1 ? tileSize / 2 : tileSize;
+    using canvas = imageFrame(side, side, AV_PIX_FMT_RGBA);
+    for (const [pos, index] of order.entries()) {
+      const tile = tiles[index], dst = canvas.data![0], src = tile.data![0];
+      const x = pos % 2 * tile.width, y = Math.floor(pos / 2) * tile.height;
+      for (let row = 0; row < tile.height; row++) {
+        dst.set(
+          src.subarray(
+            row * tile.linesize[0],
+            row * tile.linesize[0] + tile.width * 4,
+          ),
+          (y + row) * canvas.linesize[0] + x * 4,
+        );
+      }
+    }
+    return await encodeImage(canvas, 'png', 75);
+  } finally {
+    for (const frame of tiles) frame.free();
+  }
+}
+
+/** Best-effort animated GIF conversion; callers retain original on any failure. */
+export async function animatedImage(
+  bytes: Uint8Array,
+  size: number,
+  quality: number,
+): Promise<Uint8Array> {
+  const codec = Codec.findEncoderByName(FF_ENCODER_LIBWEBP_ANIM);
+  if (!codec) throw new Error('No animated WebP encoder');
+  await using input = await Demuxer.open(Buffer.from(bytes));
+  const stream = input.video();
+  if (!stream) throw new Error('No GIF stream');
+  await using decoder = await Decoder.create(stream);
+  await using encoder = await Encoder.create(codec, {
+    options: { quality },
+    autoFormat: true,
+  });
+  const chunks: Buffer[] = [];
+  await using output = await Muxer.open({
+    write(chunk) {
+      chunks.push(Buffer.from(chunk));
+      return chunk.length;
+    },
+  }, { format: 'webp' });
+  const index = output.addStream(encoder);
+  async function* frames() {
+    for await (const frame of decoder.frames(input.packets(stream!.index))) {
+      // node-av encoders flush only on an explicit EOF, not iterator completion.
+      if (!frame) {
+        yield null;
+        continue;
+      }
+      try {
+        const ratio = Math.min(1, size / Math.max(frame.width, frame.height));
+        using scaled = await scaleImage(
+          frame,
+          Math.max(1, Math.floor(frame.width * ratio)),
+          Math.max(1, Math.floor(frame.height * ratio)),
+          AV_PIX_FMT_RGBA,
+        );
+        scaled.pts = frame.pts;
+        scaled.duration = frame.duration;
+        scaled.timeBase = frame.timeBase;
+        yield scaled;
+      } finally {
+        frame.free();
+      }
+    }
+  }
+  for await (const packet of encoder.packets(frames())) {
+    if (!packet) continue;
+    try {
+      await output.writePacket(packet, index);
+    } finally {
+      packet.free();
+    }
+  }
+  await output.close();
+  return Buffer.concat(chunks);
 }
 
 export function createMedia(

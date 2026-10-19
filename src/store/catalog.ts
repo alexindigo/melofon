@@ -42,6 +42,7 @@ export interface AlbumRow {
 }
 
 export interface SongRow {
+  pictureHash?: string | null;
   metadata?: SongMetadata;
   id: string;
   path: string;
@@ -227,6 +228,7 @@ function sortKeySql(column: string, articles?: string[]): string {
 }
 
 interface SongSqlRow {
+  picture_hash: string | null;
   metadata_json: string | null;
   id: string;
   path: string;
@@ -254,6 +256,7 @@ function songOf(row: SongSqlRow): SongRow {
   return {
     id: row.id,
     path: row.path,
+    pictureHash: row.picture_hash,
     ...(row.metadata_json === null
       ? {}
       : { metadata: JSON.parse(row.metadata_json) }),
@@ -286,7 +289,7 @@ const SONG_SELECT = `
   SELECT f.id, f.path, f.library_id, l.path AS library_path, f.title, ${SONG_FILE_NAME} AS file_name,
          f.album_id, al.name AS album_name, al.folder_name AS album_folder_name, f.artist_id,
          ar.name AS artist_name, f.track, f.disc, f.duration_ms, f.size,
-         f.genre, f.year, f.is_video, epoch_ms(fi.first_seen_at) AS first_seen_ms,
+         f.genre, f.year, f.is_video, f.picture_hash, epoch_ms(fi.first_seen_at) AS first_seen_ms,
          ${metadataSelect(songMetadataColumns, 'f')}
   FROM files f
   LEFT JOIN albums al ON al.id = f.album_id
@@ -868,6 +871,7 @@ export interface CatalogIdentity extends CatalogFileStat {
 }
 
 export interface CatalogFile {
+  pictureHash?: string | null;
   metadata?: SongMetadata;
   id: string;
   path: string;
@@ -1016,8 +1020,8 @@ async function replaceCatalog(
 
   const fileStmt = await q.prepare(
     `INSERT INTO files (id, path, library_id, mtime, size, title, album_id,
-        artist_id, track, disc, duration_ms, genre, year, is_video, has_lyrics)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        artist_id, track, disc, duration_ms, genre, year, is_video, has_lyrics, picture_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   try {
     for (const file of files) {
@@ -1046,6 +1050,8 @@ async function replaceCatalog(
       else fileStmt.bindInteger(13, file.year);
       fileStmt.bindBoolean(14, file.isVideo);
       fileStmt.bindBoolean(15, file.hasLyrics ?? false);
+      if (file.pictureHash == null) fileStmt.bindNull(16);
+      else fileStmt.bindVarchar(16, file.pictureHash);
       await fileStmt.run();
       await writeMetadata(q, 'files', file.id, file.metadata);
     }

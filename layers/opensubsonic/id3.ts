@@ -193,7 +193,7 @@ export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
       : song.albumName ?? `[${song.albumFolderName}]`,
     artist: song.artistName ?? undefined,
     track: song.track ?? undefined,
-    coverArt: song.albumId ?? undefined,
+    coverArt: song.pictureHash ? song.id : song.albumId ?? undefined,
     size: song.size ?? undefined,
     contentType: song.contentType,
     suffix: song.suffix,
@@ -215,8 +215,7 @@ export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
   };
 }
 
-// Subsonic playlist payload. No coverArt: getCoverArt does not resolve
-// playlist IDs in M2. `public` is always false (single-household server).
+// Playlist artwork is resolved by core through the caller's visibility check.
 export function playlistOf(
   playlist: PlaylistRow,
   owner: string,
@@ -224,6 +223,7 @@ export function playlistOf(
   return {
     id: playlist.id,
     name: playlist.name,
+    coverArt: `pl-${playlist.id}`,
     comment: playlist.comment ?? undefined,
     owner,
     public: false,

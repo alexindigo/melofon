@@ -1,5 +1,5 @@
 // app.library keeps filesystem/tag work outside the store's exclusive queue.
-import { parseFile } from 'music-metadata';
+import { boundedMetadata } from './lyrics-metadata.ts';
 import type { Store } from './store/index.ts';
 import type { CatalogReads, LyricsRow } from './store/catalog.ts';
 import { createLyrics, type Lyrics, type LyricsEntry } from './lyrics.ts';
@@ -34,12 +34,14 @@ export interface Library extends
   /** Embedded (APIC) cover of an album's first song, or of a song id itself. */
   embeddedCover(
     id: string,
+    maxBytes?: number,
   ): Promise<{ bytes: Uint8Array; format: string } | null>;
   /** Absolute path of cover.{jpg,jpeg,png,webp} in album folder/root. */
   albumCoverPath(id: string): Promise<string | null>;
   /** Strong open album proposal, resolved outside the store slot. */
   candidateCover(
     id: string,
+    maxBytes?: number,
   ): Promise<{ bytes: Uint8Array; format: string } | null>;
 }
 
@@ -67,11 +69,11 @@ export function createLibrary(
     songsByGenre: catalog.songsByGenre,
     lyrics: lyrics.legacy,
     lyricsBySongId: lyrics.bySongId,
-    async embeddedCover(id) {
+    async embeddedCover(id, maxBytes = Infinity) {
       const path = await catalog.coverSongPath(id);
       if (path === null) return null;
       try {
-        const meta = await parseFile(path);
+        const meta = await boundedMetadata(path, maxBytes, { duration: false });
         const picture = embeddedPictures(meta)[0];
         if (!picture) return null;
         return { bytes: picture.data, format: picture.format };
@@ -100,7 +102,7 @@ export function createLibrary(
       }
       return null;
     },
-    async candidateCover(id) {
+    async candidateCover(id, maxBytes) {
       const candidate = await store.candidates.strongestOpen(
         'album',
         id,
@@ -115,6 +117,7 @@ export function createLibrary(
         library,
         candidate.imageHash,
         candidate.imageExt,
+        maxBytes,
       );
       return bytes === null
         ? null

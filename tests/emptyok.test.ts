@@ -138,13 +138,10 @@ Deno.test('getAvatar serves the cover placeholder tile', async () => {
     assertEquals([...avatarBytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
 
     const cover = await app(
-      new Request(`http://x/rest/getCoverArt?${AUTH}&id=no-such-cover`),
+      new Request(`http://x/rest/getCoverArt?${AUTH}&id=no-such-cover&f=json`),
     );
-    assertEquals(
-      avatarBytes,
-      new Uint8Array(await cover.arrayBuffer()),
-      'avatar and missing cover are the same tile',
-    );
+    // Unknown entity ≠ known entity without art (Navidrome media_retrieval.go:74-76).
+    assertEquals((await cover.json())['subsonic-response'].error.code, 70);
   } finally {
     await close();
   }

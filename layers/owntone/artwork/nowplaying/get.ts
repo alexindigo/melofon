@@ -9,5 +9,7 @@ export default async (_request: unknown, context: HatContext) => {
   const view = await context.app.playback.playerView();
   if (view.current === null) return notFound();
   const song = view.current.song;
-  return context.app.artwork.cover(song.albumId ?? song.id);
+  return context.app.artwork.cover(
+    song.pictureHash ? song.id : song.albumId ?? song.id,
+  );
 };

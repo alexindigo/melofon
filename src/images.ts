@@ -1,14 +1,6 @@
 // Core owns image files and hashing. Store operations only receive references.
 import { constants } from 'node:fs';
-import {
-  access,
-  link,
-  mkdir,
-  open,
-  readFile,
-  stat,
-  unlink,
-} from 'node:fs/promises';
+import { access, link, mkdir, open, stat, unlink } from 'node:fs/promises';
 import type { LibraryRow } from './store/catalog.ts';
 import type { IAudioMetadata, IPicture } from 'music-metadata';
 
@@ -152,15 +144,33 @@ export async function readCandidateImage(
   library: ImageLibrary,
   hash: string,
   ext: string,
+  maxBytes = Infinity,
 ): Promise<Uint8Array | null> {
   try {
-    return new Uint8Array(
-      await readFile(candidateImagePath(library, hash, ext)),
-    );
+    return await readImage(candidateImagePath(library, hash, ext), maxBytes);
   } catch (error) {
     if (readOnly(error) || (error as { code?: string }).code === 'ENOENT') {
       return null;
     }
     throw error;
   }
+}
+
+/** Bound allocation and reads even if the file grows after stat. */
+export async function readImage(
+  path: string,
+  maxBytes: number,
+): Promise<Uint8Array | null> {
+  using file = await Deno.open(path, { read: true });
+  const stat = await file.stat();
+  if (!stat.isFile || stat.size > maxBytes) return null;
+  const bytes = new Uint8Array(stat.size);
+  let at = 0;
+  while (at < bytes.length) {
+    const n = await file.read(bytes.subarray(at));
+    if (n === null) return null;
+    at += n;
+  }
+  if (await file.read(new Uint8Array(1)) !== null) return null;
+  return bytes;
 }

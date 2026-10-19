@@ -185,6 +185,7 @@ if (restoreSnapshot !== null) {
     positionMs: restoreSnapshot.positionMs,
   });
 }
+const playlists = createPlaylists(store);
 const bag = {
   log,
   cfg,
@@ -196,14 +197,14 @@ const bag = {
   library,
   annotation: createAnnotation(store),
   listens: createListens(store),
-  playlists: createPlaylists(store),
+  playlists,
   clientQueue: createClientQueue(store),
   bookmarks: createBookmarks(store),
   nowPlaying,
   playback,
   stream: createStream(media, playback, cfg),
   zip: createZip(),
-  artwork: createArtwork(library),
+  artwork: createArtwork(library, { state, dataDir: cfg.dataDir, playlists }),
   player,
   outputs,
   notify,

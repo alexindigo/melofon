@@ -273,6 +273,7 @@ export async function scanLibrary(
           year,
           isVideo,
           metadata,
+          pictureHash: pictures[0]?.imageHash ?? null,
         };
         files.push(file);
         const localLyrics = await lyrics.sources(abs);

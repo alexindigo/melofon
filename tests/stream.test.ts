@@ -1,6 +1,6 @@
 // tests/stream.test.ts — stream (original bytes, Range, no scrobble) and
 // getCoverArt (cover.jpg / placeholder) over the fixture library.
-import { assert, assertEquals } from '@std/assert';
+import { assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
 import { seedFirstUser } from '../src/users.ts';
@@ -205,18 +205,15 @@ Deno.test('getCoverArt serves embedded art for album, song, and artist ids', asy
   }
 });
 
-Deno.test('getCoverArt falls back to the placeholder for unknown covers', async () => {
+Deno.test('getCoverArt reports error 70 for unknown entities', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getCoverArt?${AUTH}&id=no-such-id`),
+      new Request(`http://x/rest/getCoverArt?${AUTH}&id=no-such-id&f=json`),
     );
     assertEquals(res.status, 200);
-    assertEquals(res.headers.get('content-type'), 'image/png');
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    assert(bytes.length > 100);
-    // PNG magic bytes
-    assertEquals(Array.from(bytes.slice(0, 4)), [0x89, 0x50, 0x4e, 0x47]);
+    // Navidrome server/subsonic/media_retrieval.go:74-76.
+    assertEquals((await res.json())['subsonic-response'].error.code, 70);
   } finally {
     await close();
   }
