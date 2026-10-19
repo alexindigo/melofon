@@ -204,7 +204,7 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
     );
 
     // getUser.folder carries the same wire ids (never a synthetic 0).
-    const user = await get('getUser');
+    const user = await get('getUser', '&username=admin');
     const folder = (user.user as { folder: number[] }).folder;
     const byNum = (x: number, y: number) => x - y;
     assertEquals(

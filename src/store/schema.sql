@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS users (
   password_enc VARCHAR NOT NULL,
   created_at TIMESTAMPTZ NOT NULL
 );
+-- H9: users.ts migrates only unset roles, then installs the regular-user default.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR;
 -- M3 scan sources: disjoint folders, one OpenSubsonic music folder per row.
 -- Keep-on-rescan: the scan reads this table, never writes it.
 CREATE TABLE IF NOT EXISTS libraries (
@@ -132,6 +134,8 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
   track_id VARCHAR NOT NULL,
   PRIMARY KEY (playlist_id, position)
 );
+-- H9: existing and new playlists are private unless their owner publishes them.
+ALTER TABLE playlists ADD COLUMN IF NOT EXISTS public BOOLEAN DEFAULT false;
 CREATE TABLE IF NOT EXISTS play_queues (
   user_id VARCHAR PRIMARY KEY,
   current_id VARCHAR,

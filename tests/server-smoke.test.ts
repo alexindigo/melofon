@@ -131,7 +131,7 @@ Deno.test('OpenSubsonic over the socket: public, form, mixed, XML and JSONP', as
 
     const form = await fetch(`${base}/rest/getUser`, {
       method: 'POST',
-      body: new URLSearchParams({ ...AUTH, f: 'json' }),
+      body: new URLSearchParams({ ...AUTH, f: 'json', username: USER }),
     });
     assertEquals((await form.json())['subsonic-response'].status, 'ok');
 

@@ -314,7 +314,7 @@ Deno.test('getUser returns the authenticated user', async () => {
   const { app, close } = await setup();
   try {
     const res = await app(
-      new Request(`http://x/rest/getUser?${AUTH}&f=json`),
+      new Request(`http://x/rest/getUser?${AUTH}&f=json&username=admin`),
     );
     const body = await jsonBody(res);
     assertEquals(body.status, 'ok');

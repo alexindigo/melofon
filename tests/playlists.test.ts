@@ -1,6 +1,6 @@
 // tests/playlists.test.ts — M2 playlists over the opensubsonic hat: create
 // (by name, with songs), replace-by-playlistId, getPlaylist entries in order,
-// getPlaylists (Navidrome quirk: ignores username), updatePlaylist
+// getPlaylists, updatePlaylist
 // (rename/comment/add/remove), deletePlaylist, ownership-as-404.
 import { assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
@@ -121,15 +121,13 @@ Deno.test('createPlaylist with songs, then getPlaylist lists entries in order', 
   }
 });
 
-Deno.test('getPlaylists ignores the username param (Navidrome quirk)', async () => {
+Deno.test('getPlaylists rejects an unknown target username for an admin', async () => {
   const { app, songIds, close } = await setup();
   try {
     await call(app, 'createPlaylist', `&name=Mine&songId=${songIds[0]}`);
     const list = await call(app, 'getPlaylists', '&username=someoneelse');
-    const playlists = (list.playlists as { playlist: PlaylistPayload[] })
-      .playlist;
-    assertEquals(playlists.length, 1);
-    assertEquals(playlists[0].owner, 'admin');
+    assertEquals(list.status, 'failed');
+    assertEquals((list.error as { code: number }).code, 70);
   } finally {
     await close();
   }

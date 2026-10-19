@@ -58,6 +58,11 @@ export interface HatContext {
       get(key: string): Promise<string | null>;
     };
     user: {
+      get(
+        caller: string,
+        username: string,
+      ): Promise<UserProfile | null | 'forbidden'>;
+      list(caller: string): Promise<UserProfile[] | 'forbidden'>;
       auth(username: string, password: string): Promise<StateUser | null>;
       authMd5(
         username: string,
@@ -201,28 +206,35 @@ export interface HatContext {
     };
     playlists: {
       list(username: string): Promise<PlaylistRow[]>;
+      visible(
+        username: string,
+        forUsername?: string,
+      ): Promise<PlaylistRow[] | null | 'forbidden'>;
       get(username: string, id: string): Promise<PlaylistWithTracks | null>;
       create(
         username: string,
         name: string,
         trackIds: string[],
+        public_?: boolean,
       ): Promise<PlaylistWithTracks>;
       setTracks(
         username: string,
         id: string,
         trackIds: string[],
-      ): Promise<PlaylistWithTracks | null>;
+        public_?: boolean,
+      ): Promise<PlaylistWithTracks | null | 'forbidden'>;
       update(
         username: string,
         id: string,
         opts: {
           name?: string;
           comment?: string;
+          public?: boolean;
           addTrackIds?: string[];
           removeAtPositions?: number[];
         },
-      ): Promise<PlaylistWithTracks | null>;
-      delete(username: string, id: string): Promise<boolean>;
+      ): Promise<PlaylistWithTracks | null | 'forbidden'>;
+      delete(username: string, id: string): Promise<boolean | 'forbidden'>;
     };
     clientQueue: {
       get(username: string): Promise<PlayQueueRow | null>;
@@ -435,10 +447,17 @@ export interface PlayRow {
   lastPlayedMs: number | null;
 }
 
+export interface UserProfile {
+  username: string;
+  role: 'admin' | 'user';
+}
+
 export interface PlaylistRow {
   id: string;
   name: string;
   comment: string | null;
+  owner: string;
+  public: boolean;
   createdAtMs: number;
   changedAtMs: number;
   songCount: number;

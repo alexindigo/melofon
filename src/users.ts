@@ -6,6 +6,26 @@
 import { encodeHex } from '@std/encoding/hex';
 import type { Config } from './config.ts';
 import type { Store } from './store/index.ts';
+export type { UserProfile } from './store/users.ts';
+
+/** Directory access is core policy, separate from credential verification. */
+export function createUsers(store: Store) {
+  return {
+    async get(caller: string, username: string) {
+      const user = await store.users.profile(caller);
+      if (user === null || (caller !== username && user.role !== 'admin')) {
+        return 'forbidden' as const;
+      }
+      return await store.users.profile(username);
+    },
+    async list(caller: string) {
+      if ((await store.users.profile(caller))?.role !== 'admin') {
+        return 'forbidden' as const;
+      }
+      return await store.users.profiles();
+    },
+  };
+}
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

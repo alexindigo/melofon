@@ -1,6 +1,10 @@
 // layers/opensubsonic/rest/updatePlaylist/get.ts — GET /rest/updatePlaylist.
-import { notFound, ok } from '#opensubsonic/envelope.ts';
-import { integerParam, requiredParam } from '#opensubsonic/params.ts';
+import { fail, notFound, ok } from '#opensubsonic/envelope.ts';
+import {
+  integerParam,
+  optionalBool,
+  requiredParam,
+} from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
@@ -16,10 +20,14 @@ export default async (_request: HatRequest, context: HatContext) => {
     {
       name: params.get('name') ?? undefined,
       comment: params.get('comment') ?? undefined,
+      public: optionalBool(params.get('public')),
       addTrackIds: params.getAll('songIdToAdd'),
       removeAtPositions,
     },
   );
+  if (updated === 'forbidden') {
+    return fail(context, 50, 'User is not authorized for the given operation');
+  }
   if (updated === null) return notFound(context);
   return ok(context, {});
 };

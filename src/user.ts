@@ -6,7 +6,7 @@
 // password are indistinguishable to the caller (no user enumeration).
 import type { Config } from './config.ts';
 import type { Store } from './store/index.ts';
-import { decryptPassword } from './users.ts';
+import { createUsers, decryptPassword, type UserProfile } from './users.ts';
 
 export interface StateUser {
   username: string;
@@ -14,6 +14,11 @@ export interface StateUser {
 }
 
 export interface UserService {
+  get(
+    caller: string,
+    username: string,
+  ): Promise<UserProfile | null | 'forbidden'>;
+  list(caller: string): Promise<UserProfile[] | 'forbidden'>;
   /** Classic password (Subsonic `p`, later Jellyfin AuthenticateByName). */
   auth(username: string, password: string): Promise<StateUser | null>;
   /** Subsonic `t`+`s`: token = md5(password + salt), lowercase hex. */
@@ -33,6 +38,7 @@ export function createUserService(store: Store, cfg: Config): UserService {
   }
 
   return {
+    ...createUsers(store),
     async auth(username, password) {
       const stored = await passwordOf(username);
       if (stored === null || stored !== password) return null;

@@ -44,7 +44,7 @@ async function setup(large = false) {
   };
   await seedFirstUser(store, cfg);
   await rawSql(db).run(
-    `INSERT INTO users VALUES ('bob-id', 'bob', ${
+    `INSERT INTO users (id, name, password_enc, created_at) VALUES ('bob-id', 'bob', ${
       sql(await encryptPassword(cfg.secret, 'test'))
     }, now())`,
   );

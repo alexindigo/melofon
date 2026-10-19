@@ -1,8 +1,8 @@
 // layers/opensubsonic/rest/createPlaylist/get.ts — GET /rest/createPlaylist.
 // With `playlistId`: replace that playlist's tracks. With `name`: create.
-import { notFound, ok } from '#opensubsonic/envelope.ts';
+import { fail, notFound, ok } from '#opensubsonic/envelope.ts';
 import { entriesFor, playlistOf } from '#opensubsonic/id3.ts';
-import { requiredParam } from '#opensubsonic/params.ts';
+import { optionalBool, requiredParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
@@ -15,7 +15,15 @@ export default async (_request: HatRequest, context: HatContext) => {
       username,
       playlistId,
       trackIds,
+      optionalBool(params.get('public')),
     );
+    if (updated === 'forbidden') {
+      return fail(
+        context,
+        50,
+        'User is not authorized for the given operation',
+      );
+    }
     if (updated === null) return notFound(context);
     return ok(context, {
       playlist: {
@@ -30,6 +38,7 @@ export default async (_request: HatRequest, context: HatContext) => {
     username,
     name,
     trackIds,
+    optionalBool(params.get('public')),
   );
   return ok(context, {
     playlist: {

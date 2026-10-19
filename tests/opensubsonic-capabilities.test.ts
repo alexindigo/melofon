@@ -277,9 +277,13 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
     );
     const rows = await rawSql(db).all('SELECT rating FROM ratings');
     assertEquals(Number(rows[0].rating), 4);
+    const userQuery = new URLSearchParams({ username: cfg.user });
     const user = await body(
       await app(
-        new Request('http://x/rest/getUser', { method: 'POST', body: AUTH }),
+        new Request(`http://x/rest/getUser?${userQuery}`, {
+          method: 'POST',
+          body: AUTH,
+        }),
       ),
     );
     assertEquals(user.user.username, cfg.user);
@@ -306,7 +310,7 @@ Deno.test('H1 all existing POST operations reexport their corresponding GET cons
     }
   }
   await visit('layers/opensubsonic/rest');
-  assertEquals(count, 61);
+  assertEquals(count, 62);
 });
 
 Deno.test('H1 semantic projection preserves repeated extensions and versions without changing advertised facts', async () => {

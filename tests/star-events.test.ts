@@ -24,7 +24,7 @@ async function freshDir(): Promise<string> {
 
 async function addUser(db: Store, id: string, name: string): Promise<void> {
   await rawSql(db).run(
-    `INSERT INTO users VALUES ('${id}', '${name}', 'unused', now())`,
+    `INSERT INTO users (id, name, password_enc, created_at) VALUES ('${id}', '${name}', 'unused', now())`,
   );
 }
 

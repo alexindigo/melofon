@@ -146,7 +146,9 @@ Deno.test('store.annotations.starred returns live latest stars with complete his
 Deno.test('store.annotations.facts includes defaults and orphans, deduplicates ids and keeps averages unrounded', async () => {
   const t = await domainFixture(createAnnotationsStore);
   try {
-    await t.run("INSERT INTO users VALUES ('w', 'carol', 'encrypted', now())");
+    await t.run(
+      "INSERT INTO users (id, name, password_enc, created_at) VALUES ('w', 'carol', 'encrypted', now())",
+    );
     await t.domain.setRating('alice', 'orphan', 1);
     await t.domain.setRating('bob', 'orphan', 1);
     await t.domain.setRating('carol', 'orphan', 2);

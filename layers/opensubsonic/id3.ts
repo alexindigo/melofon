@@ -218,15 +218,16 @@ export function childOf(song: SongRow, p: Personal): Record<string, unknown> {
 // Playlist artwork is resolved by core through the caller's visibility check.
 export function playlistOf(
   playlist: PlaylistRow,
-  owner: string,
+  caller: string,
 ): Record<string, unknown> {
   return {
     id: playlist.id,
     name: playlist.name,
     coverArt: `pl-${playlist.id}`,
     comment: playlist.comment ?? undefined,
-    owner,
-    public: false,
+    owner: playlist.owner,
+    public: playlist.public,
+    readonly: caller !== playlist.owner,
     songCount: playlist.songCount,
     duration: Math.round(playlist.durationMs / 1000),
     created: new Date(playlist.createdAtMs).toISOString(),

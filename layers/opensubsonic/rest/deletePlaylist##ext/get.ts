@@ -1,5 +1,5 @@
 // layers/opensubsonic/rest/deletePlaylist/get.ts — GET /rest/deletePlaylist.
-import { notFound, ok } from '#opensubsonic/envelope.ts';
+import { fail, notFound, ok } from '#opensubsonic/envelope.ts';
 import { requiredParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
@@ -10,6 +10,9 @@ export default async (_request: HatRequest, context: HatContext) => {
     context.state.user!.username,
     id,
   );
+  if (deleted === 'forbidden') {
+    return fail(context, 50, 'User is not authorized for the given operation');
+  }
   if (!deleted) return notFound(context);
   return ok(context, {});
 };

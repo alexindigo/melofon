@@ -511,7 +511,7 @@ Deno.test('H7 reopen and rescan fill derived metadata without changing kept user
       `INSERT INTO listens SELECT id, '${song.id}', now(), 1000, 'h7' FROM users`,
     );
     await q.run(
-      `INSERT INTO playlists SELECT 'playlist', id, 'Kept', NULL, now(), now() FROM users`,
+      `INSERT INTO playlists (id, user_id, name, comment, created_at, changed_at) SELECT 'playlist', id, 'Kept', NULL, now(), now() FROM users`,
     );
     await q.run(
       `INSERT INTO playlist_tracks VALUES ('playlist', 0, '${song.id}')`,

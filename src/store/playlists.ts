@@ -5,6 +5,8 @@ export interface PlaylistRow {
   id: string;
   name: string;
   comment: string | null;
+  owner: string;
+  public: boolean;
   createdAtMs: number;
   changedAtMs: number;
   songCount: number;
@@ -18,6 +20,7 @@ export interface PlaylistWithTracks extends PlaylistRow {
 export interface PlaylistUpdate {
   name?: string;
   comment?: string;
+  public?: boolean;
   addTrackIds?: string[];
   removeAtPositions?: number[];
 }
@@ -26,6 +29,8 @@ interface PlaylistSqlRow {
   id: string;
   name: string;
   comment: string | null;
+  owner: string;
+  public: boolean;
   created_ms: number;
   changed_ms: number;
   song_count: number;
@@ -37,6 +42,8 @@ function playlistOf(row: PlaylistSqlRow): PlaylistRow {
     id: row.id,
     name: row.name,
     comment: row.comment,
+    owner: row.owner,
+    public: row.public,
     createdAtMs: Number(row.created_ms),
     changedAtMs: Number(row.changed_ms),
     songCount: Number(row.song_count),
@@ -45,19 +52,20 @@ function playlistOf(row: PlaylistSqlRow): PlaylistRow {
 }
 
 const PLAYLIST_SELECT = `
-  SELECT p.id, p.name, p.comment,
+  SELECT p.id, p.name, p.comment, u.name AS owner, p.public,
          epoch_ms(p.created_at)::BIGINT AS created_ms,
          epoch_ms(p.changed_at)::BIGINT AS changed_ms,
-         COUNT(pt.track_id) AS song_count,
+         COUNT(f.id) AS song_count,
          COALESCE(SUM(f.duration_ms), 0) AS duration_ms
   FROM playlists p
+  JOIN users u ON u.id = p.user_id
   LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
   LEFT JOIN files f ON f.id = pt.track_id`;
 
 async function trackIdsOf(q: Queries, playlistId: string): Promise<string[]> {
   const rows = await q.all<{ track_id: string }>(
-    `SELECT track_id FROM playlist_tracks
-       WHERE playlist_id = ${esc(playlistId)} ORDER BY position`,
+    `SELECT pt.track_id FROM playlist_tracks pt JOIN files f ON f.id = pt.track_id
+       WHERE pt.playlist_id = ${esc(playlistId)} ORDER BY pt.position`,
   );
   return rows.map((r) => r.track_id);
 }
@@ -86,7 +94,7 @@ async function getOwned(
   const rows = await q.all<PlaylistSqlRow>(
     `${PLAYLIST_SELECT}
        WHERE p.id = ${esc(id)} AND p.user_id = ${esc(userId_)}
-       GROUP BY p.id, p.name, p.comment, p.created_at, p.changed_at`,
+        GROUP BY p.id, p.name, p.comment, u.name, p.public, p.created_at, p.changed_at`,
   );
   const row = rows[0];
   if (!row) return null;
@@ -101,16 +109,34 @@ async function bumpChanged(q: Queries, playlistId: string): Promise<void> {
 
 export function createPlaylistsStore(engine: Engine) {
   return {
-    list(username: string): Promise<PlaylistRow[]> {
+    list(username?: string, includePublic = false): Promise<PlaylistRow[]> {
       return engine.exclusive(async (q) => {
-        const userId_ = await requireUserId(q, username);
+        const userId_ = username === undefined
+          ? null
+          : await requireUserId(q, username);
         const rows = await q.all<PlaylistSqlRow>(
           `${PLAYLIST_SELECT}
-         WHERE p.user_id = ${esc(userId_)}
-         GROUP BY p.id, p.name, p.comment, p.created_at, p.changed_at
-         ORDER BY p.name`,
+         WHERE ${
+            userId_ === null
+              ? 'true'
+              : `(p.user_id = ${esc(userId_)}${
+                includePublic ? ' OR p.public' : ''
+              })`
+          }
+         GROUP BY p.id, p.name, p.comment, u.name, p.public, p.created_at, p.changed_at
+         ORDER BY p.name, p.id`,
         );
         return rows.map(playlistOf);
+      });
+    },
+    find(id: string): Promise<PlaylistWithTracks | null> {
+      return engine.exclusive(async (q) => {
+        const [row] = await q.all<PlaylistSqlRow>(`${PLAYLIST_SELECT}
+          WHERE p.id = ${esc(id)}
+          GROUP BY p.id, p.name, p.comment, u.name, p.public, p.created_at, p.changed_at`);
+        return row
+          ? { ...playlistOf(row), trackIds: await trackIdsOf(q, id) }
+          : null;
       });
     },
     get(username: string, id: string): Promise<PlaylistWithTracks | null> {
@@ -122,6 +148,7 @@ export function createPlaylistsStore(engine: Engine) {
       username: string,
       name: string,
       trackIds: string[],
+      public_ = false,
     ): Promise<PlaylistWithTracks> {
       return engine.exclusive(async (q) => {
         const userId_ = await requireUserId(q, username);
@@ -129,8 +156,10 @@ export function createPlaylistsStore(engine: Engine) {
         await q.run('BEGIN TRANSACTION');
         try {
           await q.run(
-            `INSERT INTO playlists (id, user_id, name, created_at, changed_at)
-           VALUES (${esc(id)}, ${esc(userId_)}, ${esc(name)}, now(), now())`,
+            `INSERT INTO playlists (id, user_id, name, created_at, changed_at, public)
+           VALUES (${esc(id)}, ${esc(userId_)}, ${
+              esc(name)
+            }, now(), now(), ${public_})`,
           );
           await rewriteTracks(q, id, trackIds);
           await q.run('COMMIT');
@@ -145,6 +174,7 @@ export function createPlaylistsStore(engine: Engine) {
       username: string,
       id: string,
       trackIds: string[],
+      public_?: boolean,
     ): Promise<PlaylistWithTracks | null> {
       return engine.exclusive(async (q) => {
         const userId_ = await requireUserId(q, username);
@@ -152,6 +182,11 @@ export function createPlaylistsStore(engine: Engine) {
         await q.run('BEGIN TRANSACTION');
         try {
           await rewriteTracks(q, id, trackIds);
+          if (public_ !== undefined) {
+            await q.run(
+              `UPDATE playlists SET public = ${public_} WHERE id = ${esc(id)}`,
+            );
+          }
           await bumpChanged(q, id);
           await q.run('COMMIT');
         } catch (err) {
@@ -186,17 +221,37 @@ export function createPlaylistsStore(engine: Engine) {
               }`,
             );
           }
-          let trackIds = existing.trackIds;
-          if (opts.removeAtPositions !== undefined) {
-            const drop = new Set(
-              [...opts.removeAtPositions].sort((a, b) => b - a),
+          if (opts.public !== undefined) {
+            await q.run(
+              `UPDATE playlists SET public = ${opts.public} WHERE id = ${
+                esc(id)
+              }`,
             );
-            trackIds = trackIds.filter((_, i) => !drop.has(i));
+          }
+          // Resolve visible indices and edit the stored occurrences in this one
+          // exclusive transaction. Orphans stay at their original relative place.
+          const occurrences = await q.all<
+            { track_id: string; visible: boolean }
+          >(
+            `SELECT pt.track_id, f.id IS NOT NULL AS visible FROM playlist_tracks pt
+             LEFT JOIN files f ON f.id = pt.track_id
+             WHERE pt.playlist_id = ${esc(id)} ORDER BY pt.position`,
+          );
+          let trackIds = occurrences.map((r) => r.track_id);
+          if (opts.removeAtPositions !== undefined) {
+            const drop = new Set(opts.removeAtPositions);
+            let visibleIndex = 0;
+            trackIds = occurrences.filter((row) =>
+              !row.visible || !drop.has(visibleIndex++)
+            ).map((row) => row.track_id);
           }
           if (opts.addTrackIds !== undefined) {
             trackIds = [...trackIds, ...opts.addTrackIds];
           }
-          if (trackIds !== existing.trackIds) {
+          if (
+            opts.removeAtPositions !== undefined ||
+            opts.addTrackIds !== undefined
+          ) {
             await rewriteTracks(q, id, trackIds);
           }
           await bumpChanged(q, id);

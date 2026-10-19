@@ -34,6 +34,13 @@ export function integerParam(raw: string | null): number | null {
   return raw === null ? null : legacyInteger(raw);
 }
 
+/** Optional metadata boolean, using Navidrome req.Bool's true tokens. */
+export function optionalBool(raw: string | null): boolean | undefined {
+  return raw === null
+    ? undefined
+    : ['true', 'on', '1'].includes(raw.toLowerCase());
+}
+
 /** Body-number policy: optional callers handle absence, never coerce strings. */
 export function jsonIntegerParam(value: unknown): value is number {
   return jsonInteger(value);

@@ -34,6 +34,8 @@ Deno.test('store.playlists.list sorts owned playlists and returns numeric aggreg
         id: a.id,
         name: "A'",
         comment: null,
+        owner: 'alice',
+        public: false,
         createdAtMs: a.createdAtMs,
         changedAtMs: a.changedAtMs,
         songCount: 0,
@@ -43,9 +45,11 @@ Deno.test('store.playlists.list sorts owned playlists and returns numeric aggreg
         id: z.id,
         name: 'Z',
         comment: null,
+        owner: 'alice',
+        public: false,
         createdAtMs: z.createdAtMs,
         changedAtMs: z.changedAtMs,
-        songCount: 3,
+        songCount: 2,
         durationMs: 2500,
       },
     ]);
@@ -55,7 +59,7 @@ Deno.test('store.playlists.list sorts owned playlists and returns numeric aggreg
   }
 });
 
-Deno.test('store.playlists.get preserves track order, duplicates and orphan ids while hiding other owners', async () => {
+Deno.test('store.playlists.get returns visible order and duplicates, retains orphans and scopes to owner', async () => {
   const t = await fixture();
   try {
     const created = await t.domain.create('alice', 'Mix', [
@@ -65,7 +69,11 @@ Deno.test('store.playlists.get preserves track order, duplicates and orphan ids 
       "gone'",
     ]);
     assertEquals(await t.domain.get('alice', created.id), created);
-    assertEquals(created.trackIds, ['second', 'song', 'second', "gone'"]);
+    assertEquals(created.trackIds, ['second', 'song', 'second']);
+    assertEquals(
+      await t.all('SELECT track_id FROM playlist_tracks ORDER BY position'),
+      ['second', 'song', 'second', "gone'"].map((track_id) => ({ track_id })),
+    );
     assertEquals(created.durationMs, 6750);
     assertEquals(await t.domain.get('bob', created.id), null);
     assertEquals(await t.domain.get('alice', "missing'"), null);

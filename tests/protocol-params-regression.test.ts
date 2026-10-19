@@ -1072,7 +1072,9 @@ for (const [index, contentType] of formTypes.entries()) {
         );
         return (await response.json())['subsonic-response'];
       };
-      const user = await post('getUser', s.auth());
+      const userParams = s.auth();
+      userParams.set('username', s.cfg.user);
+      const user = await post('getUser', userParams);
       assertEquals(user.status, 'ok');
       assertEquals((user.user as { username: string }).username, s.cfg.user);
       const rating = s.auth();

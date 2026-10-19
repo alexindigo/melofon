@@ -190,7 +190,7 @@ Deno.test('H8 artwork consumer contract', async (t) => {
   try {
     await seedFirstUser(store, cfg);
     await rawSql(store).run(
-      "INSERT INTO users SELECT 'other', 'other', password_enc, now() FROM users WHERE name='admin'",
+      "INSERT INTO users (id, name, password_enc, created_at) SELECT 'other', 'other', password_enc, now() FROM users WHERE name='admin'",
     );
     const root = `${dir}/music`;
     await Deno.mkdir(root);

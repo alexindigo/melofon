@@ -25,7 +25,7 @@ export async function domainFixture<T>(factory: (engine: Engine) => T) {
     engine.exclusive((q) => q.all<R>(sql));
   const run = (sql: string) => engine.exclusive((q) => q.run(sql));
   await run(
-    "INSERT INTO users VALUES ('u', 'alice', 'encrypted', now()), ('v', 'bob', 'other', now())",
+    "INSERT INTO users (id, name, password_enc, created_at) VALUES ('u', 'alice', 'encrypted', now()), ('v', 'bob', 'other', now())",
   );
   await run("INSERT INTO artists VALUES ('artist', 'Artist')");
   await run(
