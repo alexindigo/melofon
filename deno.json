@@ -15,11 +15,13 @@
   "imports": {
     "#opensubsonic/": "./layers/opensubsonic/",
     "#owntone/": "./layers/owntone/",
+    "@charlesw/taglib-wasm": "jsr:@charlesw/taglib-wasm@2.4.0",
     "@duckdb/node-api": "npm:@duckdb/node-api@1.5.5-r.5",
     "@pathfinder/pathfinder": "jsr:@pathfinder/pathfinder@0.2.4",
     "@std/assert": "jsr:@std/assert@1",
     "@std/encoding": "jsr:@std/encoding@^1.0.11",
     "@std/http": "jsr:@std/http@1",
+    "@types/node": "npm:@types/node@26.2.0",
     "@zip-js/zip-js": "jsr:@zip-js/zip-js@2",
     "music-metadata": "npm:music-metadata@11",
     "node-av": "npm:node-av@6.2.0-beta.24"

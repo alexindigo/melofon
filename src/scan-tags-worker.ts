@@ -33,3 +33,6 @@ addEventListener('message', async (event) => {
     });
   }
 });
+// Loaded and listening: the host starts the per-file parse timer only after this,
+// so module loading (cold caches on a fresh install) never counts against it.
+postMessage({ ready: true });

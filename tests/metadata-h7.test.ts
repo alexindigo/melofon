@@ -609,6 +609,46 @@ Deno.test('H7 standard M4A edition date and Vorbis publisher aliases are preserv
   }
 });
 
+Deno.test('H7 slow tag-worker startup does not count against the per-file parse timeout', async () => {
+  const s = await setup(async (root) => {
+    await mp3(`${root}/one.mp3`);
+  });
+  try {
+    const state = createState(s.store());
+    const workerPath = `${s.dir}/slow-start-worker.ts`;
+    const production =
+      new URL('../src/scan-tags-worker.ts', import.meta.url).href;
+    // Loading takes longer than the parse budget; parsing itself is fast.
+    await Deno.writeTextFile(
+      workerPath,
+      `await new Promise((r) => setTimeout(r, 1200));
+      await import(${JSON.stringify(production)});`,
+    );
+    const reader = createTagReader(state, new URL(`file://${workerPath}`));
+    await state.set('scan.tagParseTimeoutSeconds', '0.5');
+    const events: string[] = [];
+    const counts = await scanLibrary(
+      s.store(),
+      undefined,
+      {
+        event(kind) {
+          events.push(kind);
+        },
+      },
+      undefined,
+      { state, tagReader: reader },
+    );
+    assertEquals(
+      [counts.files, counts.skipped],
+      [1, 0],
+      JSON.stringify(events),
+    );
+    reader[Symbol.dispose]();
+  } finally {
+    await s.close();
+  }
+});
+
 Deno.test('H7 parser timeout terminates synchronous work, skips that file and completes the scan', async () => {
   const s = await setup(async (root) => {
     await mp3(`${root}/slow.mp3`);
