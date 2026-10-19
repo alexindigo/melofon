@@ -14,12 +14,14 @@ import { scanLibrary } from '../src/scan.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 import { lyricMp3 } from './helpers/lyrics.ts';
-import { createMedia, remuxLyrics, remuxPicture } from '../src/media.ts';
+import { createMedia } from '../src/media.ts';
+import { writeTags } from '../src/tags.ts';
 import { createUnify } from '../src/unify.ts';
 import { createDecisions } from '../src/decisions.ts';
 import { createLookupRunner } from '../src/lookups/runner.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { eventually } from './helpers/lookup.ts';
+import { vorbisVendor } from './helpers/vorbis-vendor.ts';
 
 type WireLyrics = {
   lang: string;
@@ -439,53 +441,61 @@ async function writableFixture(
 ) {
   const path = `${root}/song.${format}`;
   const seed = `${root}/.seed`;
-  if (format === 'ogg' || format === 'opus') {
-    const encoded = (await createMedia().transcodeAudio(MP3, format))!;
-    await Deno.writeFile(
-      seed,
-      new Uint8Array(await new Response(encoded.stream).arrayBuffer()),
-    );
-  } else await Deno.copyFile(`tests/fixtures/media/clip.${format}`, seed);
-  await using input = await Demuxer.open(seed);
-  await using mux = await Muxer.open(path, {
-    input,
-    format: format === 'm4a' ? 'mp4' : format === 'opus' ? 'ogg' : format,
-    options: format === 'flac' && !encoder ? { fflags: '+bitexact' } : {},
-    configure(ctx) {
-      using dict = Dictionary.fromObject({
-        ...input.metadata,
-        lyrics: 'Old embedded words',
-        comment: 'Keep this native comment',
-      });
-      ctx.metadata = dict;
-    },
-  });
-  const mapping = new Map(input.streams.map((stream) => {
-    const index = mux.addStream(stream);
+  if (format === 'mp3') {
+    await lyricMp3(path, [{ lang: 'eng', text: 'Old embedded words' }], {
+      TSSE: 'Original tool',
+      TXXX: 'Keep this native comment',
+    });
+  } else {
     if (format === 'ogg' || format === 'opus') {
-      using original = stream.metadata;
-      using dict = Dictionary.fromObject({
-        ...original?.getAll(),
-        encoder: 'Original tool',
-        lyrics: 'Old embedded words',
-        H6_KEEP: 'Unknown native tag',
-      });
-      mux.getStream(index)!.metadata = dict;
+      const encoded = (await createMedia().transcodeAudio(MP3, format))!;
+      await Deno.writeFile(
+        seed,
+        new Uint8Array(await new Response(encoded.stream).arrayBuffer()),
+      );
+    } else await Deno.copyFile(`tests/fixtures/media/clip.${format}`, seed);
+    await using input = await Demuxer.open(seed);
+    await using mux = await Muxer.open(path, {
+      input,
+      format: format === 'm4a' ? 'mp4' : format === 'opus' ? 'ogg' : format,
+      options: format === 'flac' && !encoder ? { fflags: '+bitexact' } : {},
+      configure(ctx) {
+        using dict = Dictionary.fromObject({
+          ...input.metadata,
+          lyrics: 'Old embedded words',
+          comment: 'Keep this native comment',
+        });
+        ctx.metadata = dict;
+      },
+    });
+    const mapping = new Map(input.streams.map((stream) => {
+      const index = mux.addStream(stream);
+      if (format === 'ogg' || format === 'opus') {
+        using original = stream.metadata;
+        using dict = Dictionary.fromObject({
+          ...original?.getAll(),
+          encoder: 'Original tool',
+          lyrics: 'Old embedded words',
+          H6_KEEP: 'Unknown native tag',
+        });
+        mux.getStream(index)!.metadata = dict;
+      }
+      return [stream.index, index];
+    }));
+    for await (const packet of input.packets()) {
+      if (!packet) continue;
+      try {
+        await mux.writePacket(packet, mapping.get(packet.streamIndex)!);
+      } finally {
+        packet.free();
+      }
     }
-    return [stream.index, index];
-  }));
-  for await (const packet of input.packets()) {
-    if (!packet) continue;
-    try {
-      await mux.writePacket(packet, mapping.get(packet.streamIndex)!);
-    } finally {
-      packet.free();
-    }
+    await mux.close();
   }
-  await mux.close();
   if (art) {
-    await remuxPicture(path, JPEG, `${root}/.pictured`);
-    await Deno.rename(`${root}/.pictured`, path);
+    await writeTags(path, {
+      picture: { bytes: await Deno.readFile(JPEG), mime: 'image/jpeg' },
+    });
   }
   if (encoder && (format === 'flac' || format === 'm4a')) {
     const bytes = Buffer.from(await Deno.readFile(path));
@@ -502,7 +512,7 @@ async function writableFixture(
     assert(count > 0);
     await Deno.writeFile(path, bytes);
   }
-  await Deno.remove(seed);
+  if (format !== 'mp3') await Deno.remove(seed);
   await Deno.writeTextFile(
     `${root}/song.ELRC`,
     '[lang:rus]\n[offset:-10]\n[00:01.000]<00:01.000>Привет <00:01.500>🌍<00:02.000>',
@@ -521,15 +531,17 @@ async function otherTags(path: string) {
 
 for (
   const [format, art, encoder] of [
+    ['mp3', false, true],
     ['flac', true, true],
     ['flac', false, false],
+    ['flac', false, true],
     ['m4a', true, true],
     ['ogg', true, true],
     ['opus', true, true],
   ] as const
 ) {
   for (const synced of [true, false]) {
-    Deno.test(`H6 queued lyrics unify ${format} art=${art} synced=${synced}: HTTP, sidecar, backups, all tags, afp/1 and kept identity`, async () => {
+    Deno.test(`H6 queued lyrics unify ${format} art=${art} encoder=${encoder} synced=${synced}: HTTP, sidecar, backups, all tags, afp/1 and kept identity`, async () => {
       const s = await setup((root) =>
         writableFixture(root, format, art, encoder)
       );
@@ -539,6 +551,8 @@ for (
         const path = `${s.root}/song.${format}`;
         const beforeTags = await otherTags(path);
         const beforeFingerprint = await createMedia().fingerprint(path);
+        const vendor = await vorbisVendor(path);
+        if (format === 'ogg' || format === 'opus') assert(vendor?.length);
         const beforeIdentity = await s.store.catalog.identitySnapshot();
         const oldSidecars = await Promise.all(
           ['ELRC', 'TXT'].map(async (ext) => ({
@@ -577,6 +591,7 @@ for (
           [{ state: 'done', last_error: null }],
         );
         assertEquals(await otherTags(path), beforeTags);
+        assertEquals(await vorbisVendor(path), vendor);
         assertEquals(await createMedia().fingerprint(path), beforeFingerprint);
         const [reply] = await s.lyrics(song.id, 'true');
         assertEquals(reply.line, expected);
@@ -654,76 +669,6 @@ for (
       }
     });
   }
-}
-
-for (const format of ['mp3', 'flac']) {
-  Deno.test(`H6 refuses ${format} lyrics before any filesystem change; failed job leaves candidate open`, async () => {
-    const s = await setup(async (root) => {
-      if (format === 'mp3') {
-        await lyricMp3(`${root}/song.mp3`, [{ text: 'Original lyrics' }]);
-        await Deno.writeTextFile(`${root}/song.txt`, 'Different');
-      } else await writableFixture(root, 'flac', false);
-    });
-    let runner: Awaited<ReturnType<typeof createLookupRunner>> | undefined;
-    try {
-      const [song] = await s.songs();
-      const path = `${s.root}/song.${format}`;
-      const before = await Deno.readFile(path), stat = await Deno.stat(path);
-      const listing = [...Deno.readDirSync(s.root)].map((e) => e.name).sort();
-      const cache = [...Deno.readDirSync(`${s.root}/.melofon/candidates`)].map((
-        e,
-      ) => e.name).sort();
-      const candidate =
-        (await s.store.candidates.candidatesFor('song', song.id)).find((c) =>
-          c.kind === 'lyrics'
-        )!;
-      await s.state.set('lookups.maxAttempts', '1');
-      await createDecisions(s.store).accept(candidate.id);
-      runner = await createLookupRunner({
-        store: s.store,
-        state: s.state,
-        dataDir: `${s.dir}/data`,
-        builtin: `${s.dir}/no-plugins`,
-      });
-      await eventually(async () =>
-        (await s.store.lookups.stats('core.unify')).failed === 1
-      );
-      const [job] = await rawSql(s.store).all<{ last_error: string }>(
-        'SELECT last_error FROM lookup_jobs',
-      );
-      assert(
-        job.last_error.includes(
-          format === 'mp3'
-            ? 'lyrics write not supported for MP3 yet'
-            : 'lyrics write would change the FLAC ENCODER tag',
-        ),
-      );
-      assertEquals(
-        (await s.store.candidates.byId(candidate.id))!.state,
-        'open',
-      );
-      assertEquals(await Deno.readFile(path), before);
-      assertEquals((await Deno.stat(path)).mtime, stat.mtime);
-      assertEquals(
-        [...Deno.readDirSync(s.root)].map((e) => e.name).sort(),
-        listing,
-      );
-      assertEquals(
-        [...Deno.readDirSync(`${s.root}/.melofon/candidates`)].map((e) =>
-          e.name
-        ).sort(),
-        cache,
-      );
-      assert(
-        (await s.store.candidates.candidatesFor('song', song.id)).every((c) =>
-          !c.details.preserved
-        ),
-      );
-    } finally {
-      await runner?.close();
-      await s.close();
-    }
-  });
 }
 
 Deno.test('H6 POST form, UTF16BE, exact cap boundary and malformed enhanced fallback reach the consumer', async () => {
@@ -836,9 +781,15 @@ Deno.test('H6 read-only library rejects a stale lyrics choice and a read-only sc
   }
 });
 
-for (const damage of ['audio', 'tags']) {
+for (const damage of ['audio', 'tags', 'id3v1']) {
   Deno.test(`H6 lyrics integrity guard rejects changed ${damage} without publishing either original`, async () => {
-    const s = await setup((root) => writableFixture(root, 'flac', true));
+    const s = await setup((root) =>
+      writableFixture(
+        root,
+        damage === 'id3v1' ? 'mp3' : 'flac',
+        damage !== 'id3v1',
+      )
+    );
     let runner: Awaited<ReturnType<typeof createLookupRunner>> | undefined;
     try {
       const [song] = await s.songs();
@@ -850,13 +801,18 @@ for (const damage of ['audio', 'tags']) {
         )!;
       await s.state.set('lookups.maxAttempts', '1');
       const unify = createUnify(s.store, {
-        remuxLyrics: async (_path, _text, output) => {
-          await Deno.copyFile(
-            damage === 'audio'
-              ? 'tests/fixtures/library/Fixture Artist/Fixture Album/02 - Second Song.mp3'
-              : 'tests/fixtures/media/clip.flac',
-            output,
-          );
+        writeTags: async (output, change) => {
+          if (damage === 'id3v1') {
+            await writeTags(output, change);
+            const trailer = Buffer.alloc(128);
+            trailer.write('TAGUnrequested title');
+            await Deno.writeFile(output, trailer, { append: true });
+          } else {await Deno.copyFile(
+              damage === 'audio'
+                ? 'tests/fixtures/library/Fixture Artist/Fixture Album/02 - Second Song.mp3'
+                : 'tests/fixtures/media/clip.flac',
+              output,
+            );}
         },
       });
       await createDecisions(s.store).accept(candidate.id);
@@ -906,8 +862,8 @@ Deno.test('H6 backs up sidecars changed during remux, then an archived choice re
       .find((c) => c.origin.endsWith('.ELRC'))!;
     let mutate = true;
     const unify = createUnify(s.store, {
-      remuxLyrics: async (...args) => {
-        await remuxLyrics(...args);
+      writeTags: async (...args) => {
+        await writeTags(...args);
         if (mutate) {
           await Deno.writeTextFile(
             `${s.root}/song.TXT`,

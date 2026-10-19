@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { tagged } from './tagged.ts';
 
-/** Fixture-only native ID3 frames; product code never writes ID3 itself. */
+/** Fixture-only ID3 containers over real compressed audio. */
 export async function lyricMp3(
   path: string,
   entries: {

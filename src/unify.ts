@@ -19,12 +19,8 @@ import {
   readCandidateImage,
   writeCandidateImage,
 } from './images.ts';
-import {
-  createMedia,
-  lyricsWriteRefusal,
-  remuxLyrics,
-  remuxPicture,
-} from './media.ts';
+import { createMedia } from './media.ts';
+import { unchangedTagFacts, writeTags } from './tags.ts';
 import {
   createLyrics,
   embeddedLyrics,
@@ -128,15 +124,7 @@ export async function materializeCandidate(store: Store, candidate: Candidate) {
 
 /** Compare every parsed tag, including unknown/native tags, with pictures alone removed. */
 function tagFacts(meta: IAudioMetadata) {
-  const { picture: _picture, ...common } = meta.common;
-  const native = Object.values(meta.native).flat()
-    .filter((tag) =>
-      !/^(APIC|PIC|covr|METADATA_BLOCK_PICTURE|COVERART|COVERARTMIME)$/i.test(
-        tag.id,
-      )
-    )
-    .map((tag) => JSON.stringify(tag)).sort();
-  return { common, native };
+  return unchangedTagFacts(meta, { picture: true });
 }
 
 function signature(stat: Deno.FileInfo) {
@@ -159,8 +147,8 @@ async function syncFile(path: string) {
   await file.sync();
 }
 
-/** A lyrics choice already contains its bounded text. Resolving it does no
- * filesystem writes, so unsupported jobs can fail without cache/backup probes. */
+/** A lyrics choice already contains its bounded text. Resolving it checks
+ * current ownership and write permission without changing the filesystem. */
 export async function materializeLyrics(store: Store, candidate: Candidate) {
   if (candidate.entityType !== 'song' || candidate.kind !== 'lyrics') {
     throw new Error('Not a song lyrics candidate');
@@ -185,24 +173,18 @@ export async function materializeLyrics(store: Store, candidate: Candidate) {
 }
 
 function nonLyricsTags(meta: IAudioMetadata) {
-  const { lyrics: _lyrics, ...common } = meta.common;
-  const native = Object.values(meta.native).flat()
-    .filter((tag) => !/^(USLT|ULT|SYLT|LYRICS|©lyr)$/i.test(tag.id))
-    .map((tag) => JSON.stringify(tag)).sort();
-  return { common, native };
+  return unchangedTagFacts(meta, { lyrics: true });
 }
 
 async function unifyLyrics(
   store: Store,
   candidate: Candidate,
   signal: AbortSignal,
-  remux: typeof remuxLyrics,
+  write: typeof writeTags,
 ) {
   const { song, library, entry } = await materializeLyrics(store, candidate);
   const beforeStat = signature(await Deno.stat(song.path));
   const beforeMeta = await parseFile(song.path);
-  const refusal = lyricsWriteRefusal(song.path, beforeMeta);
-  if (refusal) throw new Error(refusal);
   const lyrics = createLyrics(store);
   const limit = await lyrics.maxBytes();
   const text = serializeLyrics(entry);
@@ -279,18 +261,37 @@ async function unifyLyrics(
     signal.throwIfAborted();
     (await Deno.open(temporary, { createNew: true, write: true, mode: 0o600 }))
       .close();
-    await remux(song.path, text, temporary, signal);
+    await Deno.copyFile(song.path, temporary);
+    await write(temporary, {
+      lyrics: {
+        text,
+        lang: entry.language,
+        ...(entry.synced
+          ? {
+            synced: entry.lines.map((line) => ({
+              timeMs: line.start!,
+              text: `\n${line.text}`,
+            })),
+          }
+          : {}),
+      },
+    }, signal);
     if (!isDeepStrictEqual(await media.fingerprint(temporary), before)) {
-      throw new Error('Remux changed afp/1 fingerprint');
+      throw new Error('Tag write changed afp/1 fingerprint');
     }
     const afterMeta = await parseFile(temporary);
     if (
       !isDeepStrictEqual(nonLyricsTags(afterMeta), nonLyricsTags(beforeMeta))
-    ) throw new Error('Remux changed a non-lyrics tag');
+    ) throw new Error('Tag write changed a non-lyrics tag');
     if (
-      !isDeepStrictEqual(embeddedLyrics(afterMeta).map((s) => s.entry), [entry])
-    ) throw new Error('Remux did not embed the exact chosen lyrics');
-    // Edits/additions made during remux are also archived before replacement.
+      !isDeepStrictEqual(
+        embeddedLyrics(afterMeta).filter((source) =>
+          (source.native as { id: string }).id !== 'SYLT'
+        ).map((s) => s.entry),
+        [entry],
+      )
+    ) throw new Error('Tag write did not embed the exact chosen lyrics');
+    // Edits/additions made during tagging are also archived before replacement.
     const sideStats = await snapshotSidecars();
     const mode = (await Deno.stat(song.path)).mode! & 0o777;
     await Deno.chmod(temporary, mode);
@@ -334,11 +335,10 @@ async function unifyLyrics(
 
 export function createUnify(
   store: Store,
-  options: { remux?: typeof remuxPicture; remuxLyrics?: typeof remuxLyrics } =
-    {},
+  options: { writeTags?: typeof writeTags } = {},
 ): UnifyHandler {
   const media = createMedia();
-  const remux = options.remux ?? remuxPicture;
+  const write = options.writeTags ?? writeTags;
   return async (job, signal) => {
     signal.throwIfAborted();
     const candidate = await store.candidates.byId(job.factsHash);
@@ -351,12 +351,12 @@ export function createUnify(
         store,
         candidate,
         signal,
-        options.remuxLyrics ?? remuxLyrics,
+        write,
       );
       return;
     }
     if (candidate.state !== 'accepted') return;
-    const { album, library, dirs, directory, imagePath, bytes } =
+    const { album, library, dirs, directory, bytes } =
       await materializeCandidate(store, candidate);
     const coverPaths = await covers(dirs);
     const versions = new Map<string, LocalVersion>();
@@ -430,27 +430,31 @@ export function createUnify(
         const before = await media.fingerprint(song.path);
         if (!before.fingerprint) throw new Error('No afp/1 fingerprint');
         // Reserve a private same-folder file; no recognized media suffix, so a
-        // concurrent scan cannot index an incomplete remux.
+        // concurrent scan cannot index an incomplete tag write.
         (await Deno.open(temporary, {
           createNew: true,
           write: true,
           mode: 0o600,
         })).close();
-        await remux(song.path, imagePath, temporary, signal);
+        await Deno.copyFile(song.path, temporary);
+        const ext = imageExtension(candidate.imageExt);
+        await write(temporary, {
+          picture: { bytes, mime: `image/${ext === 'jpg' ? 'jpeg' : ext}` },
+        }, signal);
         const after = await media.fingerprint(temporary);
         if (!isDeepStrictEqual(after, before)) {
-          throw new Error('Remux changed afp/1 fingerprint');
+          throw new Error('Tag write changed afp/1 fingerprint');
         }
         const afterMeta = await parseFile(temporary);
         if (!isDeepStrictEqual(tagFacts(afterMeta), tagFacts(beforeMeta))) {
-          throw new Error('Remux changed a non-picture tag');
+          throw new Error('Tag write changed a non-picture tag');
         }
         if (
           afterMeta.common.picture?.length !== 1 ||
           await imageHash(afterMeta.common.picture[0].data) !==
             candidate.imageHash
         ) {
-          throw new Error('Remux did not embed the exact chosen picture');
+          throw new Error('Tag write did not embed the exact chosen picture');
         }
         signal.throwIfAborted();
         await inLibrary(song.path, library.path);
@@ -460,7 +464,7 @@ export function createUnify(
             signature(beforeStat),
           )
         ) {
-          throw new Error('Track changed during remux');
+          throw new Error('Track changed during tag write');
         }
         await Deno.chmod(temporary, beforeStat.mode! & 0o777);
         await syncFile(temporary);

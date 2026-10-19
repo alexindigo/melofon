@@ -6,7 +6,8 @@ import { openStore, type Store } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { createDecisions } from '../src/decisions.ts';
 import { createUnify, type UnifyHandler } from '../src/unify.ts';
-import { createMedia, remuxPicture } from '../src/media.ts';
+import { createMedia } from '../src/media.ts';
+import { writeTags } from '../src/tags.ts';
 import { createState } from '../src/state.ts';
 import { createLookupRunner } from '../src/lookups/runner.ts';
 import { createLibrary } from '../src/library.ts';
@@ -20,6 +21,7 @@ import {
 } from '../src/images.ts';
 import { pictured } from './helpers/pictured.ts';
 import { eventually } from './helpers/lookup.ts';
+import { vorbisVendor } from './helpers/vorbis-vendor.ts';
 
 const MP3 =
   'tests/fixtures/library/Fixture Artist/Fixture Album/01 - First Song.mp3';
@@ -111,9 +113,9 @@ async function fixture(
       path,
     );}
   if (oldPicture) {
-    const output = `${root}/Album/.seed`;
-    await remuxPicture(path, JPEG, output);
-    await Deno.rename(output, path);
+    await writeTags(path, {
+      picture: { bytes: await Deno.readFile(JPEG), mime: 'image/jpeg' },
+    });
     assertEquals(await pictureBytes(path), [await Deno.readFile(JPEG)]);
   }
   return path;
@@ -244,6 +246,8 @@ for (const format of ['mp3', 'flac', 'm4a', 'ogg', 'opus']) {
       const path = `${root}/Album/song.${format}`;
       const beforeTags = await tags(path);
       const beforeFingerprint = await createMedia().fingerprint(path);
+      const vendor = await vorbisVendor(path);
+      if (format === 'ogg' || format === 'opus') assert(vendor?.length);
       const beforeIdentity = await store.catalog.identitySnapshot();
       const current = (await store.catalog.getAlbum(albumId))!;
       const oldCover = await Deno.readFile(`${root}/Album/cover.jpg`);
@@ -270,6 +274,7 @@ for (const format of ['mp3', 'flac', 'm4a', 'ogg', 'opus']) {
           Deno.errors.NotFound,
         );
         assertEquals(await tags(path), beforeTags);
+        assertEquals(await vorbisVendor(path), vendor);
         assertEquals(
           await createMedia().fingerprint(path),
           beforeFingerprint,
@@ -409,8 +414,8 @@ Deno.test('covers changed or added while tracks are remuxing are backed up befor
     const added = new Uint8Array([...jpg, 21]);
     await Deno.writeFile(`${root}/Album/cover.jpg`, jpg);
     const unify = createUnify(store, {
-      remux: async (...args) => {
-        await remuxPicture(...args);
+      writeTags: async (...args) => {
+        await writeTags(...args);
         await Deno.writeFile(`${root}/Album/cover.jpg`, updated);
         await Deno.writeFile(`${root}/Album/cover.jpeg`, added);
       },
@@ -527,10 +532,13 @@ Deno.test('permission failure mid-unify keeps completed tracks and the same pers
     await state.set('lookups.maxAttempts', '2');
     await state.set('lookups.retryDelaysSeconds', '1');
     const unify = createUnify(store, {
-      remux: async (...args) => {
-        writes.push(args[0]);
-        await remuxPicture(...args);
-        if (args[0] === first) await Deno.chmod(second, 0o444);
+      writeTags: async (...args) => {
+        const target = (await parseFile(args[0])).common.track.no === 1
+          ? first
+          : second;
+        writes.push(target);
+        await writeTags(...args);
+        if (target === first) await Deno.chmod(second, 0o444);
       },
     });
     await createDecisions(store).accept(candidateId);
@@ -789,7 +797,7 @@ Deno.test('multipart albums publish one root cover and back up/remove every othe
   });
 });
 
-for (const damage of ['audio', 'tags']) {
+for (const damage of ['audio', 'tags', 'id3v1']) {
   Deno.test(`unify rejects a remux that changes ${damage} before replacing the original`, async () => {
     await setup(async ({ store, root, dir, candidateId }) => {
       const path = `${root}/Album/song.mp3`;
@@ -797,12 +805,17 @@ for (const damage of ['audio', 'tags']) {
       const state = createState(store);
       await state.set('lookups.maxAttempts', '1');
       const unify = createUnify(store, {
-        remux: async (_path, _image, output) => {
+        writeTags: async (output, change) => {
           if (damage === 'audio') {
             await Deno.copyFile(
               'tests/fixtures/library/Fixture Artist/Fixture Album/02 - Second Song.mp3',
               output,
             );
+          } else if (damage === 'id3v1') {
+            await writeTags(output, change);
+            const trailer = Buffer.alloc(128);
+            trailer.write('TAGUnrequested title');
+            await Deno.writeFile(output, trailer, { append: true });
           } else await pictured(output, undefined, { TIT2: 'Different title' });
         },
       });
