@@ -549,7 +549,13 @@ export async function createLookupRunner(options: {
   }, 86400000);
   return {
     hosts,
-    reference: { get: reference.get, refresh: reference.refresh },
+    reference: {
+      get: reference.get,
+      refresh: reference.refresh,
+      similarTracks: reference.similarTracks,
+      topTracks: reference.topTracks,
+      similarArtists: reference.similarArtists,
+    },
     afterScan: () => queueIntake('missing'),
     request(
       target: { type: 'album' | 'song' | 'library'; id: string },

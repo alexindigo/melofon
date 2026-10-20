@@ -51,6 +51,7 @@ function track(raw: unknown): ExternalTrack {
   const r = object(raw, [
     'title',
     'artist',
+    'artistMbid',
     'album',
     'durationMs',
     'mbid',
@@ -66,6 +67,7 @@ function track(raw: unknown): ExternalTrack {
   return {
     title,
     ...(r.artist === undefined ? {} : { artist: text(r.artist) }),
+    ...(r.artistMbid === undefined ? {} : { artistMbid: mbid(r.artistMbid) }),
     ...(r.album === undefined ? {} : { album: text(r.album) }),
     ...(r.durationMs === undefined
       ? {}

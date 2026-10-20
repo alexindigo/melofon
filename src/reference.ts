@@ -7,6 +7,7 @@ import {
   type ReferenceValues,
 } from './reference-types.ts';
 import type { ReferenceCapability } from './lookups/manifest.ts';
+import { createReferenceMatcher } from './reference-matcher.ts';
 
 export interface ReferenceProvider {
   plugin: string;
@@ -26,6 +27,7 @@ export function createReference(options: {
   now?: () => number;
 }) {
   const { store, state } = options;
+  const matcher = createReferenceMatcher(store, state);
   const now = options.now ?? Date.now;
   state.declare('reference.order', {
     type: 'array',
@@ -63,7 +65,7 @@ export function createReference(options: {
     };
     return available.sort((a, b) => rank(a.plugin) - rank(b.plugin));
   };
-  return {
+  const service = {
     async get(
       type: ReferenceType,
       id: string,
@@ -100,6 +102,33 @@ export function createReference(options: {
     async refresh(type: ReferenceType, id: string): Promise<void> {
       await options.enqueue(type, id, await providers(type));
     },
+    async similarTracks(
+      trackId: string,
+      count: number,
+      user: string,
+    ): Promise<string[]> {
+      const values = await service.get('track', trackId, ['track.similar']);
+      return values['track.similar']?.length
+        ? matcher.tracks(values['track.similar'], count, user, trackId)
+        : store.referenceMatcher.genreTracks(trackId, count);
+    },
+    async topTracks(
+      artistId: string,
+      count: number,
+      user: string,
+    ): Promise<string[]> {
+      const values = await service.get('artist', artistId, [
+        'artist.topTracks',
+      ]);
+      return matcher.tracks(values['artist.topTracks'] ?? [], count, user);
+    },
+    async similarArtists(artistId: string, count: number) {
+      if (!Number.isSafeInteger(count) || count < 0) {
+        throw new RangeError('Invalid reference count');
+      }
+      const values = await service.get('artist', artistId, ['artist.similar']);
+      return matcher.artists((values['artist.similar'] ?? []).slice(0, count));
+    },
     async record(
       type: ReferenceType,
       id: string,
@@ -117,8 +146,9 @@ export function createReference(options: {
       );
     },
   };
+  return service;
 }
 export type Reference = Pick<
   ReturnType<typeof createReference>,
-  'get' | 'refresh'
+  'get' | 'refresh' | 'similarTracks' | 'topTracks' | 'similarArtists'
 >;

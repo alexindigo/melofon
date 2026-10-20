@@ -18,6 +18,7 @@ export interface ExternalArtist {
 export interface ExternalTrack {
   title: string;
   artist?: string;
+  artistMbid?: string;
   album?: string;
   durationMs?: number;
   mbid?: string;
