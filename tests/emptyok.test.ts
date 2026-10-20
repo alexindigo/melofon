@@ -83,7 +83,7 @@ const EMPTY_OK: [string, Record<string, unknown>, string][] = [
   ['getArtistInfo', { artistInfo: {} }, '<artistInfo/>'],
   ['getArtistInfo2', { artistInfo2: {} }, '<artistInfo2/>'],
   ['getAlbumInfo', { albumInfo: {} }, '<albumInfo/>'],
-  ['getAlbumInfo2', { albumInfo2: {} }, '<albumInfo2/>'],
+  ['getAlbumInfo2', { albumInfo: {} }, '<albumInfo/>'],
 ];
 
 Deno.test('empty-ok ops return the golden empty payload as JSON and XML', async () => {
