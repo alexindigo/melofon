@@ -32,7 +32,7 @@ async function addUser(db: Store, id: string, name: string): Promise<void> {
 // song s3. Ids are plain literals (kind-distinct, like the scan's hashes).
 async function seedCatalog(db: Store): Promise<void> {
   await rawSql(db).run(
-    "INSERT INTO artists VALUES ('ar1', 'One'), ('ar2', 'Two')",
+    "INSERT INTO artists (id, name) VALUES ('ar1', 'One'), ('ar2', 'Two')",
   );
   await rawSql(db).run(
     "INSERT INTO albums (id, name, album_artist_id) VALUES ('al1', 'First', 'ar1'), ('al2', 'Second', 'ar2')",

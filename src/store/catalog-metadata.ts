@@ -14,6 +14,8 @@ export const songMetadataColumns: Record<keyof SongMetadata, string> = {
   albumPeak: 'album_peak',
   baseGain: 'base_gain',
   recordingMbid: 'recording_mbid',
+  artistMbid: 'artist_mbid',
+  albumArtistMbid: 'album_artist_mbid',
   isrc: 'isrc',
   genres: 'genres',
   moods: 'moods',

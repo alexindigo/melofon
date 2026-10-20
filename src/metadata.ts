@@ -12,6 +12,8 @@ export interface SongMetadata {
   albumPeak: number | null;
   baseGain: number | null;
   recordingMbid: string | null;
+  artistMbid: string | null;
+  albumArtistMbid: string | null;
   isrc: string[];
   genres: string[];
   moods: string[];
@@ -96,6 +98,8 @@ export function metadataFromTags(meta: IAudioMetadata): SongMetadata {
     // music-metadata does not publish OpusHead.outputGain in its result.
     baseGain: null,
     recordingMbid: text(common.musicbrainz_recordingid),
+    artistMbid: text(common.musicbrainz_artistid?.[0]),
+    albumArtistMbid: text(common.musicbrainz_albumartistid?.[0]),
     isrc: strings(common.isrc),
     genres: strings(common.genre?.flatMap((value) => value.split(/[;,/]/))),
     moods: strings(
@@ -145,6 +149,40 @@ export function metadataFromTags(meta: IAudioMetadata): SongMetadata {
     ),
     albumSortName: text(common.albumsort),
   };
+}
+
+// Count files, not credits: the same id in both roles on one file is one vote.
+// Only actual tag names own an id, never an inferred album-artist fallback.
+export function artistMusicBrainzIds(
+  files: {
+    trackArtist: string | null;
+    albumArtistTag: string | null;
+    metadata?: SongMetadata;
+  }[],
+): Map<string, string> {
+  const counts = new Map<string, Map<string, number>>();
+  for (const file of files) {
+    const credits = [
+      [file.trackArtist, file.metadata?.artistMbid],
+      [file.albumArtistTag, file.metadata?.albumArtistMbid],
+    ] as const;
+    const seen = new Set<string>();
+    for (const [name, id] of credits) {
+      if (!name || !id) continue;
+      const key = JSON.stringify([name, id]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const votes = counts.get(name) ?? new Map<string, number>();
+      votes.set(id, (votes.get(id) ?? 0) + 1);
+      counts.set(name, votes);
+    }
+  }
+  return new Map([...counts].map(([name, votes]) => {
+    const [id] = [...votes].sort(([a, n], [b, m]) =>
+      m - n || (a < b ? -1 : a > b ? 1 : 0)
+    )[0];
+    return [name, id];
+  }));
 }
 
 export function albumMetadata(

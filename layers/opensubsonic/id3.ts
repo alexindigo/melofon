@@ -103,6 +103,8 @@ export function artistId3Of(
     id: artist.id,
     name: artist.name,
     albumCount: artist.albumCount,
+    // ArtistID3.md:52,65: supported field, empty JSON default when unknown.
+    musicBrainzId: artist.musicBrainzId ?? '',
     ...artistFields(p.artist(artist.id)),
   };
 }

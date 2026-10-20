@@ -206,7 +206,9 @@ async function setup() {
   const source = await libraries.add('Music', `${dir}/music`);
   for (let n = 1; n <= 3; n++) {
     await rawSql(db).run(
-      `INSERT INTO artists VALUES (${quote(id(10 + n))}, 'Artist ${n}')`,
+      `INSERT INTO artists (id, name) VALUES (${
+        quote(id(10 + n))
+      }, 'Artist ${n}')`,
     );
     await rawSql(db).run(
       `INSERT INTO albums (id, name, album_artist_id) VALUES (${

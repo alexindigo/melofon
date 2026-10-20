@@ -23,6 +23,7 @@ import type { LocalVersion } from './store/candidates.ts';
 import { createLyrics, type Lyrics, type LyricsSource } from './lyrics.ts';
 import {
   albumMetadata,
+  artistMusicBrainzIds,
   metadataFromTags,
   type SongMetadata,
 } from './metadata.ts';
@@ -378,8 +379,15 @@ export async function scanLibrary(
       });
     }
   }
+  const artistMbids = artistMusicBrainzIds(files.map((file) => ({
+    ...albumInputs.get(file)!,
+    metadata: file.metadata,
+  })));
   await store.catalog.replaceCatalog({
-    artists: [...artists.values()],
+    artists: [...artists.values()].map((artist) => ({
+      ...artist,
+      musicBrainzId: artistMbids.get(artist.name) ?? null,
+    })),
     albums: grouped.albums.map((album) => ({
       ...album,
       metadata: albumMetadata(

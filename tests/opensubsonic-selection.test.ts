@@ -58,7 +58,7 @@ async function setup(large = false) {
   // Insert deliberately reverse-ID order with equal labels: ordering must not
   // accidentally rely on insertion/physical row order.
   await rawSql(db).run(
-    `INSERT INTO artists VALUES (${sql(id(12))}, 'Same'), (${
+    `INSERT INTO artists (id, name) VALUES (${sql(id(12))}, 'Same'), (${
       sql(id(11))
     }, 'Same')`,
   );
@@ -89,7 +89,7 @@ async function setup(large = false) {
     // Separate 501-album/501-song eligible pool. Fixed IDs and identical label,
     // source/year/genre/mTime; tests can independently enumerate its exact set.
     await rawSql(db).run(
-      `INSERT INTO artists SELECT lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24), 'Bulk' FROM range(501) r(i)`,
+      `INSERT INTO artists (id, name) SELECT lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24), 'Bulk' FROM range(501) r(i)`,
     );
     await rawSql(db).run(
       `INSERT INTO albums (id, name, album_artist_id) SELECT lpad(lower(to_hex(1000+i)),8,'0') || repeat('0',24), 'Bulk', lpad(lower(to_hex(3000+i)),8,'0') || repeat('0',24) FROM range(501) r(i)`,

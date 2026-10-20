@@ -20,6 +20,7 @@ import type {
 export interface ArtistRow {
   id: string;
   name: string;
+  musicBrainzId: string | null;
   albumCount: number;
   /** Present on article-aware lists; the exact key used for ordering/grouping. */
   sortKey?: string;
@@ -416,40 +417,48 @@ function catalogReads(q: Queries): CatalogReads {
     all: boolean,
   ): Promise<ArtistRow | null> {
     const res = await q.all(
-      `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
+      `SELECT ar.id, ar.name, ar.musicbrainz_id, COUNT(al.id) AS album_count
        FROM artists ar
        ${all ? 'LEFT JOIN' : 'JOIN'} albums al ON al.album_artist_id = ar.id
        WHERE ar.id = ${esc(id)}
-       GROUP BY ar.id, ar.name`,
+       GROUP BY ar.id, ar.name, ar.musicbrainz_id`,
     );
     const row = (res as {
       id: string;
       name: string;
+      musicbrainz_id: string | null;
       album_count: number | bigint;
     }[])[0];
     return row
-      ? { id: row.id, name: row.name, albumCount: Number(row.album_count) }
+      ? {
+        id: row.id,
+        name: row.name,
+        musicBrainzId: row.musicbrainz_id,
+        albumCount: Number(row.album_count),
+      }
       : null;
   }
   return {
     async listArtists(folderId, opts = {}): Promise<ArtistRow[]> {
       const key = sortKeySql('ar.name', opts.ignoredArticles);
       const res = await q.all(
-        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count, ${key} AS sort_key
+        `SELECT ar.id, ar.name, ar.musicbrainz_id, COUNT(al.id) AS album_count, ${key} AS sort_key
          FROM artists ar
          JOIN albums al ON al.album_artist_id = ar.id
          WHERE 1 = 1 ${artistAlbumFolderFilter(folderId)}
-         GROUP BY ar.id, ar.name
+         GROUP BY ar.id, ar.name, ar.musicbrainz_id
           ORDER BY sort_key, ar.id`,
       );
       return (res as {
         id: string;
         name: string;
+        musicbrainz_id: string | null;
         album_count: number | bigint;
         sort_key: string;
       }[]).map((row) => ({
         id: row.id,
         name: row.name,
+        musicBrainzId: row.musicbrainz_id,
         albumCount: Number(row.album_count),
         ...(opts.ignoredArticles === undefined
           ? {}
@@ -587,11 +596,11 @@ function catalogReads(q: Queries): CatalogReads {
     async search3(query, opts) {
       const like = `'%' || ${esc(query)} || '%'`;
       const artistRes = await q.all(
-        `SELECT ar.id, ar.name, COUNT(al.id) AS album_count
+        `SELECT ar.id, ar.name, ar.musicbrainz_id, COUNT(al.id) AS album_count
            FROM artists ar
            JOIN albums al ON al.album_artist_id = ar.id
            WHERE ar.name ILIKE ${like} ${artistAlbumFolderFilter(opts.folderId)}
-           GROUP BY ar.id, ar.name
+           GROUP BY ar.id, ar.name, ar.musicbrainz_id
             ORDER BY ar.name, ar.id
            LIMIT ${opts.artistCount} OFFSET ${opts.artistOffset}`,
       );
@@ -612,10 +621,12 @@ function catalogReads(q: Queries): CatalogReads {
         artists: (artistRes as {
           id: string;
           name: string;
+          musicbrainz_id: string | null;
           album_count: number | bigint;
         }[]).map((row) => ({
           id: row.id,
           name: row.name,
+          musicBrainzId: row.musicbrainz_id,
           albumCount: Number(row.album_count),
         })),
         albums: (albumRes as unknown as AlbumSqlRow[]).map(
@@ -900,7 +911,7 @@ export interface CatalogEvent {
 }
 
 export interface CatalogSnapshot {
-  artists: { id: string; name: string }[];
+  artists: { id: string; name: string; musicBrainzId?: string | null }[];
   albums: (Album & { metadata?: AlbumMetadata })[];
   albumIdentities: AlbumIdentity[];
   albumEvents: AlbumEvent[];
@@ -985,12 +996,14 @@ async function replaceCatalog(
   await q.run('DELETE FROM artists');
 
   const artistStmt = await q.prepare(
-    'INSERT INTO artists (id, name) VALUES (?, ?)',
+    'INSERT INTO artists (id, name, musicbrainz_id) VALUES (?, ?, ?)',
   );
   try {
     for (const artist of artists) {
       artistStmt.bindVarchar(1, artist.id);
       artistStmt.bindVarchar(2, artist.name);
+      if (artist.musicBrainzId == null) artistStmt.bindNull(3);
+      else artistStmt.bindVarchar(3, artist.musicBrainzId);
       await artistStmt.run();
     }
   } finally {

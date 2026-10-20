@@ -348,10 +348,13 @@ Deno.test('store.catalog artist and album reads return plain rows, scoped counts
     await t.run(
       "UPDATE files SET library_id = 'lib', duration_ms = 1200, year = 2001 WHERE id = 'song'",
     );
-    await t.run("INSERT INTO artists VALUES ('performer', 'Performer')");
+    await t.run(
+      "INSERT INTO artists (id, name) VALUES ('performer', 'Performer')",
+    );
     assertEquals(await t.domain.listArtists(), [{
       id: 'artist',
       name: 'Artist',
+      musicBrainzId: null,
       albumCount: 1,
     }]);
     assertEquals(await t.domain.listArtists('missing'), []);
@@ -359,6 +362,7 @@ Deno.test('store.catalog artist and album reads return plain rows, scoped counts
     assertEquals(await t.domain.artistById('performer'), {
       id: 'performer',
       name: 'Performer',
+      musicBrainzId: null,
       albumCount: 0,
     });
     const album = {

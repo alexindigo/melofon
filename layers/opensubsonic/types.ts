@@ -346,6 +346,7 @@ export interface LibraryFolderRow {
 export interface ArtistRow {
   id: string;
   name: string;
+  musicBrainzId?: string | null;
   albumCount: number;
   sortKey?: string;
 }
@@ -391,6 +392,8 @@ export interface SongRow {
     albumPeak: number | null;
     baseGain: number | null;
     recordingMbid: string | null;
+    artistMbid: string | null;
+    albumArtistMbid: string | null;
     isrc: string[] | null;
     genres: string[] | null;
     moods: string[] | null;
