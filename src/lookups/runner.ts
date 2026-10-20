@@ -96,7 +96,7 @@ export async function createLookupRunner(options: {
   const { store, state } = options;
   const log = options.log ?? scopedLog('lookups');
   const library = options.library ?? createLibrary(store);
-  const network = options.network ?? createLookupNetwork({ log });
+  const network = options.network ?? createLookupNetwork({ log, state });
   const unify = options.unify ?? createUnify(store);
   const declarations = {
     jobTimeoutSeconds: {
