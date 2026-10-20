@@ -3,6 +3,7 @@
 // mapping. Shared module at the layer root, outside the walked mount tree.
 import { fail } from '#opensubsonic/envelope.ts';
 import {
+  decimalNumber,
   jsonInteger,
   legacyInteger,
   safeInteger,
@@ -32,6 +33,14 @@ export async function params(request: HatRequest): Promise<URLSearchParams> {
 // Whole-number entry point for route-specific required/range/filter contracts.
 export function integerParam(raw: string | null): number | null {
   return raw === null ? null : legacyInteger(raw);
+}
+
+export function decimalParam(raw: string | null): number | null {
+  return raw === null ? null : decimalNumber(raw);
+}
+
+export function safeIntegerParam(raw: string | null): number | null {
+  return raw === null ? null : safeInteger(raw);
 }
 
 /** Optional metadata boolean, using Navidrome req.Bool's true tokens. */

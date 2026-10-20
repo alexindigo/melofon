@@ -91,6 +91,7 @@ Deno.test('playback commands emit: engine → player/options/volume/queue', () =
     player,
     nowPlaying: {
       set: () => Promise.resolve(),
+      report: () => Promise.resolve(),
       clearByStreamId: () => Promise.resolve(true),
       list: () => Promise.resolve([]),
     },

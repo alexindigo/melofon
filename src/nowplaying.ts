@@ -1,22 +1,127 @@
-// app.nowPlaying: client sessions (plane B), written via playback commands.
+// Core client-session lifecycle and clock. Store owns all persistence.
 import type { Store } from './store/index.ts';
 import type { NowPlayingRow } from './store/nowplaying.ts';
+import { createState, type State } from './state.ts';
+import { createListens, type Listens } from './listens.ts';
 export type { NowPlayingRow } from './store/nowplaying.ts';
 
+export interface PlaybackReport {
+  username: string;
+  client: string;
+  trackId: string;
+  state: 'starting' | 'playing' | 'paused' | 'stopped';
+  positionMs: number;
+  playbackRate: number;
+  ignoreScrobble: boolean;
+}
+
 export interface NowPlaying {
-  /** Replace the (user, client) row — a new play supersedes the old one. */
   set(
     username: string,
     client: string,
     trackId: string,
     streamId: string,
     positionMs?: number,
+    durationMs?: number | null,
   ): Promise<void>;
-  /** Clear only the row whose streamId is still current. */
+  report(report: PlaybackReport, durationMs: number | null): Promise<void>;
   clearByStreamId(streamId: string): Promise<boolean>;
   list(): Promise<NowPlayingRow[]>;
 }
 
-export function createNowPlaying(store: Store): NowPlaying {
-  return store.nowPlaying;
+export function createNowPlaying(store: Store, options: {
+  state?: State;
+  listens?: Listens;
+  now?: () => number;
+} = {}): NowPlaying {
+  const state = options.state ?? createState(store);
+  const listens = options.listens ?? createListens(store);
+  const now = options.now ?? Date.now;
+  for (
+    const key of [
+      'playback.sessionGraceMinutes',
+      'playback.pausedSessionMinutes',
+    ]
+  ) {
+    state.declare(key, { type: 'number', minimum: 0, default: 30 });
+  }
+  const expiry = async (at: number) => ({
+    plannedBeforeMs: at -
+      (await state.getTyped('playback.sessionGraceMinutes') as number) * 60000,
+    pausedBeforeMs: at -
+      (await state.getTyped('playback.pausedSessionMinutes') as number) * 60000,
+  });
+  return {
+    set(username, client, trackId, streamId, positionMs, durationMs) {
+      return store.nowPlaying.set(
+        username,
+        client,
+        trackId,
+        streamId,
+        positionMs,
+        {
+          state: 'playing',
+          playbackRate: 1,
+          reportedAtMs: now(),
+          durationMs: durationMs ?? null,
+          restart: true,
+        },
+      );
+    },
+    async report(report, durationMs) {
+      const at = now();
+      if (report.state === 'stopped') {
+        const session = await store.nowPlaying.take(
+          report.username,
+          report.client,
+          report.trackId,
+          await expiry(at),
+        );
+        if (
+          session && !report.ignoreScrobble && durationMs !== null &&
+          durationMs > 0 &&
+          report.positionMs >= Math.min(durationMs / 2, 240000)
+        ) {
+          await listens.record(report.username, report.trackId, {
+            source: 'opensubsonic',
+            durationMs,
+            playedAtMs: at,
+          });
+        }
+        return;
+      }
+      // Purge before updating, including when an offline client reconnects.
+      await store.nowPlaying.list(await expiry(at));
+      await store.nowPlaying.set(
+        report.username,
+        report.client,
+        report.trackId,
+        crypto.randomUUID(),
+        report.positionMs,
+        {
+          state: report.state,
+          playbackRate: report.playbackRate,
+          reportedAtMs: at,
+          durationMs,
+          restart: report.state === 'starting',
+        },
+      );
+    },
+    clearByStreamId: store.nowPlaying.clearByStreamId,
+    async list() {
+      const at = now();
+      return (await store.nowPlaying.list(await expiry(at))).map((row) => ({
+        ...row,
+        positionMs: Math.trunc(
+          Math.min(
+            row.durationMs ?? Infinity,
+            (row.positionMs ?? 0) +
+              (row.state === 'playing'
+                ? Math.max(0, at - row.reportedAtMs) * row.playbackRate
+                : 0),
+          ),
+        ),
+      }));
+    },
+  };
 }

@@ -5,6 +5,7 @@ import { type Log, scopedLog } from '../logging.ts';
 import { upgradeCandidates } from './candidates.ts';
 import { upgradeUsers } from './users.ts';
 import { upgradeClientQueues } from './clientqueue.ts';
+import { upgradeNowPlaying } from './nowplaying.ts';
 
 // Debug spans behind MELOFON_DEBUG_LOG_REQUEST (plans/diag-request-trace):
 // [db] begin/end for run + runAndReadAll — sql truncated to the verb plus
@@ -207,6 +208,7 @@ export async function openEngine(
       await upgradeCandidates(q, schema);
       await upgradeUsers(q);
       await upgradeClientQueues(q, schema);
+      await upgradeNowPlaying(q);
     });
   } catch (error) {
     await close();

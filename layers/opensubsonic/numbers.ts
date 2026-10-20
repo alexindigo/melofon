@@ -78,6 +78,17 @@ export function safeInteger(raw: string): number | null {
   return Number.isSafeInteger(value) ? value : null;
 }
 
+/** Fractional wire numbers (playback speed); preserve NaN/Infinity for range errors. */
+export function decimalNumber(raw: string): number | null {
+  const token = raw.trim();
+  if (
+    !/^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|Infinity|NaN)$/.test(
+      token,
+    )
+  ) return null;
+  return Number(token);
+}
+
 /** JSON has already classified the token as a number; strings are never coerced. */
 export function jsonInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value);

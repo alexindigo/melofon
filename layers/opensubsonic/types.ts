@@ -270,6 +270,15 @@ export interface HatContext {
         positionMs?: number;
       }): Promise<void>;
       reportStopped(opts: { streamId: string }): Promise<void>;
+      reportPlayback(report: {
+        username: string;
+        client: string;
+        trackId: string;
+        state: 'starting' | 'playing' | 'paused' | 'stopped';
+        positionMs: number;
+        playbackRate: number;
+        ignoreScrobble: boolean;
+      }): Promise<boolean>;
       nowPlayingView(): Promise<NowPlayingViewRow[]>;
     };
     stream: {
@@ -516,4 +525,8 @@ export interface NowPlayingViewRow {
   song: SongRow;
   positionMs: number | null;
   startedAtMs: number;
+  reportedAtMs: number;
+  state: 'starting' | 'playing' | 'paused';
+  playbackRate: number;
+  playerId: number;
 }

@@ -172,6 +172,18 @@ CREATE TABLE IF NOT EXISTS now_playing (
   PRIMARY KEY (user_id, client)
 );
 ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS stream_id VARCHAR;
+-- G2: retained client identity is separate from the ephemeral playback session.
+CREATE SEQUENCE IF NOT EXISTS client_player_number START 1;
+CREATE TABLE IF NOT EXISTS client_players (
+  user_id VARCHAR NOT NULL,
+  client VARCHAR NOT NULL,
+  player_id BIGINT DEFAULT nextval('client_player_number') UNIQUE NOT NULL,
+  PRIMARY KEY (user_id, client)
+);
+ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS state VARCHAR DEFAULT 'playing';
+ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS playback_rate DOUBLE DEFAULT 1;
+ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS reported_at TIMESTAMPTZ;
+ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS duration_ms BIGINT;
 -- M6: internal state (app.state) — operator-owned live config. The /_/config
 -- endpoints are its face, and the Settings UI (M5) will be a form on them.
 CREATE TABLE IF NOT EXISTS state (

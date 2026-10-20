@@ -236,7 +236,9 @@ async function setup() {
   const playlist = await playlists.create(cfg.user, 'Mix', songIds);
   const bookmarks = createBookmarks(store);
   const clientQueue = createClientQueue(store);
-  const nowPlaying = createNowPlaying(store);
+  // Numeric mapping tests observe the exact reported position, without clock drift.
+  const sessionTime = Date.now();
+  const nowPlaying = createNowPlaying(store, { now: () => sessionTime });
   const notify = createNotify();
   const player = createPlayer();
   const playback = createPlayback({ player, library, nowPlaying, cfg, notify });
@@ -1256,6 +1258,7 @@ Deno.test('MIME facade non-form types retain query auth and exact public discove
           { name: 'transcoding', versions: [1] },
           { name: 'songLyrics', versions: [1, 2] },
           { name: 'indexBasedQueue', versions: [1] },
+          { name: 'playbackReport', versions: [1] },
         ]);
         assertEquals(Object.keys(body).sort(), [
           'openSubsonic',

@@ -15,7 +15,7 @@
 //   queueView()       the engine queue (real queue-local ids)
 //   nowPlayingView()  all B sessions + the engine's current when play/pause
 import type { Library, SongRow } from './library.ts';
-import type { NowPlaying } from './nowplaying.ts';
+import type { NowPlaying, PlaybackReport } from './nowplaying.ts';
 import type { Notify } from './notify.ts';
 import { type Log, scopedLog } from './logging.ts';
 import type {
@@ -46,11 +46,16 @@ export interface NowPlayingViewRow {
   song: SongRow;
   positionMs: number | null;
   startedAtMs: number;
+  reportedAtMs: number;
+  state: 'starting' | 'playing' | 'paused';
+  playbackRate: number;
+  playerId: number;
 }
 
 export interface Playback {
   reportPlaying(report: ReportPlaying): Promise<void>;
   reportStopped(opts: { streamId: string }): Promise<void>;
+  reportPlayback(report: PlaybackReport): Promise<boolean>;
 
   /** Mutating commands take an optional provenance source (plan
    * command-provenance): hats pass the request's peer/user-agent; omitted
@@ -180,6 +185,8 @@ export function createPlayback(deps: {
   }, 1000);
   return {
     async reportPlaying(report) {
+      // Queue the session write before an abort can queue its clear. Catalog
+      // duration is resolved by the store's session view, not awaited here.
       await nowPlaying.set(
         report.username,
         report.client,
@@ -193,6 +200,14 @@ export function createPlayback(deps: {
     async reportStopped({ streamId }) {
       // Clears only when this streamId is still the session's current one.
       if (await nowPlaying.clearByStreamId(streamId)) emit(['player']);
+    },
+
+    async reportPlayback(report) {
+      const song = await library.getSong(report.trackId);
+      if (!song) return false;
+      await nowPlaying.report(report, song.durationMs);
+      emit(['player']);
+      return true;
     },
 
     play(source) {
@@ -372,6 +387,10 @@ export function createPlayback(deps: {
           song: status.current.song,
           positionMs: status.itemProgressMs,
           startedAtMs: Date.now(),
+          reportedAtMs: Date.now(),
+          state: status.state === 'play' ? 'playing' : 'paused',
+          playbackRate: 1,
+          playerId: 0,
         });
       }
       for (const row of await nowPlaying.list()) {
@@ -383,6 +402,10 @@ export function createPlayback(deps: {
           song,
           positionMs: row.positionMs,
           startedAtMs: row.startedAtMs,
+          reportedAtMs: row.reportedAtMs,
+          state: row.state,
+          playbackRate: row.playbackRate,
+          playerId: row.playerId,
         });
       }
       return out;

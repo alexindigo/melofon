@@ -107,7 +107,7 @@ Deno.test('scrobble submission=false lists the song in getNowPlaying', async () 
     assertEquals(entries[0].title, songIds[0].title);
     assertEquals(entries[0].username, 'admin');
     assertEquals(entries[0].playerName, 'melofon-test');
-    assertEquals(entries[0].playerId, 0);
+    assertEquals(entries[0].playerId, 1);
     assertEquals(entries[0].minutesAgo, 0);
     // The amendment: now-playing never appends listens.
     assertEquals(await listensCount(db), 0);

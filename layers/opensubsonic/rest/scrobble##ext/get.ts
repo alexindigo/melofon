@@ -6,8 +6,8 @@
 // play_count update; never from stream); ids outside the catalog are skipped
 // and the answer is still ok. When `time` values are sent, there must be one
 // per id (Navidrome: code 0 otherwise).
-// A now-playing notification is one core command — playback.reportPlaying
-// replaces the (user, client) session row; it never appends listens and the
+// A now-playing notification is one core command — playback.reportPlayback
+// updates the (user, client) playing session; it never appends listens and the
 // hat never touches the session table itself. Navidrome takes only the first
 // id on this path; `position` is seconds.
 import { fail, ok } from '#opensubsonic/envelope.ts';
@@ -26,14 +26,16 @@ export default async (_request: HatRequest, context: HatContext) => {
     TRUE.has(flag.toLowerCase());
   if (!submission) {
     const rawPosition = Number(params.get('position') ?? '0');
-    await context.app.playback.reportPlaying({
+    await context.app.playback.reportPlayback({
       username: context.state.user!.username,
       client: params.get('c')!,
       trackId: ids[0],
-      streamId: crypto.randomUUID(),
+      state: 'playing',
+      playbackRate: 1,
+      ignoreScrobble: false,
       positionMs: Number.isFinite(rawPosition) && rawPosition >= 0
         ? rawPosition * 1000
-        : undefined,
+        : 0,
     });
     return ok(context, {});
   }

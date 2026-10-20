@@ -99,7 +99,7 @@ const discovery = createAirplayDiscovery({
 });
 const library = createLibrary(store, lyrics);
 const player = createPlayer();
-const nowPlaying = createNowPlaying(store);
+const nowPlaying = createNowPlaying(store, { state });
 const playback = createPlayback({
   player,
   nowPlaying,
