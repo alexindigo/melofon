@@ -2,6 +2,47 @@ import { assertEquals, assertMatch, assertThrows } from '@std/assert';
 import { discoverLookups, parseManifest } from '../src/lookups/manifest.ts';
 import { lookupManifest, lookupPlugin } from './helpers/lookup.ts';
 
+Deno.test('reference capabilities use typed vocabulary without candidates or photos', () => {
+  const artist = {
+    id: 'artist',
+    accepts: 'artist',
+    provides: [
+      'artist.biography',
+      'artist.url',
+      'artist.id.mbid',
+      'artist.similar',
+      'artist.topTracks',
+    ],
+    requires: ['artist.id.mbid'],
+  };
+  const track = {
+    id: 'track',
+    accepts: 'track',
+    provides: ['track.similar'],
+    requires: ['track.id.isrc'],
+  };
+  const capabilities = [artist, track];
+  assertEquals(
+    parseManifest(lookupManifest({ capabilities }), 'fixture').capabilities,
+    capabilities,
+  );
+  for (
+    const capability of [
+      { ...artist, provides: ['artist.biography', 'album.image.front'] },
+      { ...artist, provides: ['artist.image.primary'] },
+      { ...artist, provides: ['artist.unknown'] },
+      { ...artist, provides: ['track.similar'] },
+      { ...track, provides: ['artist.similar'] },
+      { ...artist, provides: [] },
+      { ...artist, provides: ['artist.url', 'artist.url'] },
+    ]
+  ) {
+    assertThrows(() =>
+      parseManifest(lookupManifest({ capabilities: [capability] }), 'fixture')
+    );
+  }
+});
+
 Deno.test('lookup manifest contract, identity, capabilities and settings are strict', () => {
   const manifest = parseManifest(lookupManifest(), 'fixture');
   assertEquals([

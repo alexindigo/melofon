@@ -13,7 +13,19 @@ import {
 import type { Notify } from '../notify.ts';
 import { type Log, scopedLog } from '../logging.ts';
 import { createUnify, type UnifyHandler } from '../unify.ts';
-import { type Capability, discoverLookups, HOST_PATTERN } from './manifest.ts';
+import {
+  type Capability,
+  discoverLookups,
+  HOST_PATTERN,
+  isReference,
+} from './manifest.ts';
+import {
+  type ArtistFacts,
+  referenceFacts,
+  type TrackFacts,
+} from './reference-facts.ts';
+import { createReference, type ReferenceProvider } from '../reference.ts';
+import type { ReferenceType } from '../reference-types.ts';
 import { LookupHost, LookupRevoked } from './host.ts';
 import {
   createLookupNetwork,
@@ -74,7 +86,7 @@ export async function albumFacts(
 }
 export async function factsHash(
   capability: Capability,
-  facts: AlbumFacts,
+  facts: AlbumFacts | ArtistFacts | TrackFacts,
 ): Promise<string> {
   return await imageHash(
     new TextEncoder().encode(
@@ -92,6 +104,7 @@ export async function createLookupRunner(options: {
   network?: LookupNetwork;
   log?: Log;
   unify?: UnifyHandler;
+  now?: () => number;
 }) {
   const { store, state } = options;
   const log = options.log ?? scopedLog('lookups');
@@ -213,7 +226,9 @@ export async function createLookupRunner(options: {
     if (
       !hosts.some((host) =>
         host.state !== 'disabled' &&
-        host.plugin.manifest?.capabilities.some((c) => c.requires.length === 0)
+        host.plugin.manifest?.capabilities.some((c) =>
+          !isReference(c) && c.requires.length === 0
+        )
       )
     ) return;
     let ids: string[];
@@ -265,7 +280,7 @@ export async function createLookupRunner(options: {
         if (!host.plugin.manifest || host.state === 'disabled') continue;
         for (const capability of host.plugin.manifest.capabilities) {
           // L4 parses dependency vocabulary; chaining is deliberately outside this item.
-          if (capability.requires.length) continue;
+          if (isReference(capability) || capability.requires.length) continue;
           jobs.push({
             plugin: host.plugin.id,
             entityType: 'album',
@@ -306,12 +321,23 @@ export async function createLookupRunner(options: {
         await store.lookups.finish(job.id, { state: 'done' });
         return;
       }
-      const facts = await albumFacts(store, job.entityId);
+      const facts = job.entityType === 'album'
+        ? await albumFacts(store, job.entityId)
+        : await referenceFacts(
+          store,
+          job.entityType === 'song' ? 'track' : 'artist',
+          job.entityId,
+        );
       let capability: Capability | undefined;
       if (facts) {
         for (
           const c of host.plugin.manifest!.capabilities
-        ) if (await factsHash(c, facts) === job.factsHash) capability = c;
+        ) {
+          if (
+            c.accepts === facts.type &&
+            await factsHash(c, facts) === job.factsHash
+          ) capability = c;
+        }
       }
       if (!facts || !capability) {
         await store.lookups.finish(job.id, { state: 'done' });
@@ -331,6 +357,21 @@ export async function createLookupRunner(options: {
         });
         return;
       }
+      if (isReference(capability)) {
+        if (!('values' in result)) throw new Error('Expected reference values');
+        signal.throwIfAborted();
+        authority.signal.throwIfAborted();
+        await reference.record(
+          capability.accepts,
+          job.entityId,
+          host.plugin.id,
+          capability.provides,
+          result.values,
+        );
+        await store.lookups.finish(job.id, { state: 'done' });
+        return;
+      }
+      if (!('candidates' in result)) throw new Error('Expected candidates');
       const candidates: CandidateInput[] = [];
       for (const candidate of result.candidates) {
         const target = await albumFacts(store, candidate.target.id);
@@ -441,11 +482,64 @@ export async function createLookupRunner(options: {
   const unsubscribeNotify = options.notify?.subscribe((types) => {
     if (types.includes('database')) void queueIntake('missing').catch(() => {});
   });
+  const reference = createReference({
+    store,
+    state,
+    now: options.now,
+    async providers(type) {
+      const result: ReferenceProvider[] = [];
+      for (const host of hosts) {
+        if (
+          !host.plugin.manifest ||
+          await state.getTyped(`lookups.plugin.${host.plugin.id}.enabled`) ===
+            false
+        ) continue;
+        for (const capability of host.plugin.manifest.capabilities) {
+          if (isReference(capability) && capability.accepts === type) {
+            result.push({ plugin: host.plugin.id, capability });
+          }
+        }
+      }
+      return result;
+    },
+    async enqueue(
+      type: ReferenceType,
+      id: string,
+      providers: ReferenceProvider[],
+    ) {
+      if (closed || !providers.length) return;
+      const facts = await referenceFacts(store, type, id);
+      if (!facts) return;
+      const jobs: LookupInput[] = [];
+      for (const { plugin, capability } of providers) {
+        if (
+          await state.getTyped(`lookups.plugin.${plugin}.enabled`) === false
+        ) continue;
+        const has = (name: string) => {
+          const prefix = `${type}.id.`;
+          return name.startsWith(prefix) &&
+            Boolean(facts.ids[name.slice(prefix.length)]);
+        };
+        if (!capability.requires.every(has)) continue;
+        jobs.push({
+          plugin,
+          entityType: type === 'track' ? 'song' : 'artist',
+          entityId: id,
+          factsHash: await factsHash(capability, facts),
+          mode: 'all',
+        });
+      }
+      if (!closed) await store.lookups.enqueue(jobs);
+      pump();
+    },
+  });
   const poll = setInterval(pump, 50);
-  const housekeeping = async () =>
-    store.lookups.purgeDone(
+  const housekeeping = async () => {
+    await store.lookups.purgeDone(
       Date.now() - await numeric('doneRetentionDays') * 86400000,
     );
+    await store.reference.purgeOrphans();
+  };
   await housekeeping();
   let cleanup = Promise.resolve();
   const daily = setInterval(() => {
@@ -455,6 +549,7 @@ export async function createLookupRunner(options: {
   }, 86400000);
   return {
     hosts,
+    reference: { get: reference.get, refresh: reference.refresh },
     afterScan: () => queueIntake('missing'),
     request(
       target: { type: 'album' | 'song' | 'library'; id: string },

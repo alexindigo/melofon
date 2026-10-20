@@ -329,6 +329,16 @@ CREATE TABLE IF NOT EXISTS candidates (
   details JSON NOT NULL
 );
 CREATE SEQUENCE IF NOT EXISTS lookup_job_seq;
+-- Reference knowledge is kept independently of catalog rebuilds and candidates.
+CREATE TABLE IF NOT EXISTS reference_facts (
+  entity_type VARCHAR NOT NULL CHECK (entity_type IN ('artist', 'track')),
+  entity_id VARCHAR NOT NULL,
+  name VARCHAR NOT NULL,
+  plugin VARCHAR NOT NULL,
+  value JSON,
+  fetched_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (entity_type, entity_id, name, plugin)
+);
 CREATE TABLE IF NOT EXISTS lookup_jobs (
   id VARCHAR PRIMARY KEY,
   seq BIGINT DEFAULT nextval('lookup_job_seq'),

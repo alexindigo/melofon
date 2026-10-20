@@ -12,6 +12,7 @@ import { createPlaybackStore } from './playback.ts';
 import { createCatalogStore } from './catalog.ts';
 import { createCandidatesStore } from './candidates.ts';
 import { createLookupsStore } from './lookups.ts';
+import { createReferenceStore } from './reference.ts';
 
 export interface Store {
   users: ReturnType<typeof createUsersStore>;
@@ -26,6 +27,7 @@ export interface Store {
   catalog: ReturnType<typeof createCatalogStore>;
   candidates: ReturnType<typeof createCandidatesStore>;
   lookups: ReturnType<typeof createLookupsStore>;
+  reference: ReturnType<typeof createReferenceStore>;
   ping(): Promise<void>;
   close(): Promise<void>;
 }
@@ -48,6 +50,7 @@ export async function openStore(
     catalog: createCatalogStore(engine),
     candidates: createCandidatesStore(engine),
     lookups: createLookupsStore(engine),
+    reference: createReferenceStore(engine),
     ping: engine.ping,
     close: engine.close,
   };

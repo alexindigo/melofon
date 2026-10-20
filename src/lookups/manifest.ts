@@ -1,5 +1,10 @@
 import { basename, resolve, sep } from 'node:path';
 import {
+  type ReferenceName,
+  referenceNames,
+  type ReferenceType,
+} from '../reference-types.ts';
+import {
   parseSettingsSchema,
   type SettingsSchema,
 } from '../settings-schema.ts';
@@ -7,11 +12,23 @@ import {
 export const CONTRACT = 1;
 export const HOST_PATTERN =
   '^(?:\\*\\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*$';
-export interface Capability {
+export interface CandidateCapability {
   id: string;
   accepts: 'album';
   provides: ['album.image.front'];
   requires: string[];
+}
+export interface ReferenceCapability {
+  id: string;
+  accepts: ReferenceType;
+  provides: ReferenceName[];
+  requires: string[];
+}
+export type Capability = CandidateCapability | ReferenceCapability;
+export function isReference(
+  capability: Capability,
+): capability is ReferenceCapability {
+  return capability.accepts !== 'album';
 }
 export interface Manifest {
   contract: 1;
@@ -76,6 +93,11 @@ function strings(raw: unknown): string[] {
   return raw.map(text);
 }
 function dataName(name: string): boolean {
+  if (
+    [...referenceNames('artist'), ...referenceNames('track')].includes(
+      name as ReferenceName,
+    )
+  ) return true;
   return /^(?:album\.image\.(?:front|back|disc|booklet)|artist\.image\.(?:primary|backdrop)|album\.(?:name|year|artist|discs|genre|notes)|track\.(?:title|artist|number|disc|genre|lyrics)|artist\.biography|(?:album|track|artist)\.id\.[a-z][a-z0-9-]*|file\.track|folder\.album)$/
     .test(name);
 }
@@ -114,23 +136,36 @@ export function parseManifest(raw: unknown, id: string): Manifest {
       throw new Error('Invalid or duplicate capability id');
     }
     ids.add(cid);
-    if (c.accepts !== 'album') {
+    if (
+      c.accepts !== 'album' && c.accepts !== 'artist' && c.accepts !== 'track'
+    ) {
       throw new Error(`${c.accepts}: not supported yet`);
     }
     const provides = strings(c.provides);
-    if (provides.length !== 1 || provides[0] !== 'album.image.front') {
+    if (
+      !provides.length || new Set(provides).size !== provides.length ||
+      (c.accepts === 'album'
+        ? provides.length !== 1 || provides[0] !== 'album.image.front'
+        : !provides.every((name) =>
+          referenceNames(c.accepts as ReferenceType).includes(
+            name as ReferenceName,
+          )
+        ))
+    ) {
       throw new Error('Output not supported yet');
     }
     const requires = strings(c.requires ?? []);
     if (!requires.every(dataName)) {
       throw new Error('Unknown requires data name');
     }
-    return {
-      id: cid,
-      accepts: 'album',
-      provides: ['album.image.front'],
-      requires,
-    };
+    return c.accepts === 'album'
+      ? { id: cid, accepts: 'album', provides: ['album.image.front'], requires }
+      : {
+        id: cid,
+        accepts: c.accepts,
+        provides: provides as ReferenceName[],
+        requires,
+      };
   });
   const n = object(m.network ?? { hosts: [], ratePerMinute: 60 }, [
     'hosts',

@@ -118,6 +118,7 @@ const app = {
   airplay,
   outputAdmission,
   identity: createIdentity(store),
+  reference: lookups.reference,
   log: scopedLog('core'),
 };
 const core = await pathfinder({ roots: ['core/'], app });
@@ -195,6 +196,7 @@ const bag = {
   media,
   user: createUserService(store, cfg),
   library,
+  reference: lookups.reference,
   annotation: createAnnotation(store),
   listens: createListens(store),
   playlists,

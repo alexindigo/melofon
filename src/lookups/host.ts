@@ -4,6 +4,7 @@ import type { SettingValue } from '../settings-schema.ts';
 import {
   type Capability,
   type DiscoveredPlugin,
+  isReference,
   object,
   validatePluginTree,
 } from './manifest.ts';
@@ -12,6 +13,8 @@ import {
   type NetworkAuthority,
   parentGrant,
 } from './net.ts';
+import type { ReferenceValues } from '../reference-types.ts';
+import { parseReferenceValues } from './reference-values.ts';
 
 export type PluginState =
   | 'discovered'
@@ -29,6 +32,8 @@ export interface LookupCandidate {
   evidence?: Record<string, unknown>;
 }
 export type LookupResult = { candidates: LookupCandidate[] } | {
+  values: ReferenceValues;
+} | {
   retryAfter: number;
   reason: string;
 };
@@ -36,14 +41,23 @@ export function parseResult(
   raw: unknown,
   capability: Capability,
 ): LookupResult {
-  const r = object(raw, ['candidates', 'retryAfter', 'reason']);
+  const r = object(
+    raw,
+    isReference(capability)
+      ? ['values', 'retryAfter', 'reason']
+      : ['candidates', 'retryAfter', 'reason'],
+  );
   if ('retryAfter' in r) {
     if (
-      'candidates' in r || typeof r.retryAfter !== 'number' ||
+      'candidates' in r || 'values' in r || typeof r.retryAfter !== 'number' ||
       !Number.isFinite(r.retryAfter) || r.retryAfter < 0 ||
       typeof r.reason !== 'string'
     ) throw new Error('Invalid retry-later outcome');
     return { retryAfter: r.retryAfter, reason: r.reason };
+  }
+  if (isReference(capability)) {
+    if ('reason' in r) throw new Error('Invalid reference outcome');
+    return { values: parseReferenceValues(r.values, capability.provides) };
   }
   if ('reason' in r || !Array.isArray(r.candidates)) {
     throw new Error('Invalid lookup outcome');
