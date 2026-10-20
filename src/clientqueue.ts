@@ -9,7 +9,7 @@ export interface ClientQueue {
     username: string,
     queue: {
       trackIds: string[];
-      currentId?: string;
+      currentIndex?: number;
       positionMs?: number;
       changedBy?: string;
     },

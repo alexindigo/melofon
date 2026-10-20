@@ -242,7 +242,7 @@ export interface HatContext {
         username: string,
         queue: {
           trackIds: string[];
-          currentId?: string;
+          currentIndex?: number;
           positionMs?: number;
           changedBy?: string;
         },
@@ -470,8 +470,8 @@ export interface PlaylistWithTracks extends PlaylistRow {
 
 export interface PlayQueueRow {
   trackIds: string[];
-  currentId: string | null;
-  positionMs: number | null;
+  currentIndex: number;
+  positionMs: number;
   changedAtMs: number;
   /** Name of the client that saved the queue (null on pre-M4.5 rows). */
   changedBy: string | null;

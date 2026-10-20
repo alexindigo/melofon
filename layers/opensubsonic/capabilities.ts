@@ -10,6 +10,7 @@ export const CAPABILITIES: readonly Capability[] = Object.freeze([
   Object.freeze({ name: 'transcodeOffset', versions: Object.freeze([1]) }),
   Object.freeze({ name: 'transcoding', versions: Object.freeze([1]) }),
   Object.freeze({ name: 'songLyrics', versions: Object.freeze([1, 2]) }),
+  Object.freeze({ name: 'indexBasedQueue', versions: Object.freeze([1]) }),
 ]);
 
 // One semantic projection for JSON and the envelope's repeated-array XML.

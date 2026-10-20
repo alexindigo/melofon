@@ -269,6 +269,7 @@ Deno.test('getMusicFolders and getOpenSubsonicExtensions answer Feishin probes',
         },
         { name: 'transcoding', versions: [1] },
         { name: 'songLyrics', versions: [1, 2] },
+        { name: 'indexBasedQueue', versions: [1] },
       ],
     );
   } finally {

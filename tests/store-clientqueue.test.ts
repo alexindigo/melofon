@@ -2,17 +2,18 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createClientQueueStore } from '../src/store/clientqueue.ts';
 import { domainFixture } from './helpers/store.ts';
 
-Deno.test('store.clientQueue.get returns plain arrays and nullable fields', async () => {
+Deno.test('store.clientQueue.get returns plain arrays, index and position defaults', async () => {
   const t = await domainFixture(createClientQueueStore);
   try {
     assertEquals(await t.domain.get('alice'), null);
+    await t.run("INSERT INTO files (id, path) VALUES ('song''', '/quoted')");
     await t.domain.save('alice', { trackIds: ['song', "song'", 'song'] });
     const row = await t.domain.get('alice');
     assert(row);
     assertEquals(row.trackIds, ['song', "song'", 'song']);
-    assertEquals([row.currentId, row.positionMs, row.changedBy], [
-      null,
-      null,
+    assertEquals([row.currentIndex, row.positionMs, row.changedBy], [
+      0,
+      0,
       null,
     ]);
     assert(Number.isFinite(row.changedAtMs));
@@ -28,7 +29,7 @@ Deno.test('store.clientQueue.save replaces atomically and retains the previous q
   try {
     await t.domain.save('alice', {
       trackIds: ['song'],
-      currentId: 'song',
+      currentIndex: 0,
       positionMs: 12.9,
       changedBy: "phone'",
     });
@@ -42,7 +43,7 @@ Deno.test('store.clientQueue.save replaces atomically and retains the previous q
     );
     assertEquals(await t.domain.get('alice'), before);
     await t.domain.save('alice', { trackIds: [] });
-    assertEquals((await t.domain.get('alice'))?.trackIds, []);
+    assertEquals(await t.domain.get('alice'), null);
   } finally {
     await t.close();
   }

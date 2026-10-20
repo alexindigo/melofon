@@ -138,10 +138,11 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
 ALTER TABLE playlists ADD COLUMN IF NOT EXISTS public BOOLEAN DEFAULT false;
 CREATE TABLE IF NOT EXISTS play_queues (
   user_id VARCHAR PRIMARY KEY,
-  current_id VARCHAR,
+  current_index INTEGER,
   position_ms INTEGER,
   changed_at TIMESTAMPTZ NOT NULL,
-  track_ids VARCHAR[] NOT NULL
+  track_ids VARCHAR[] NOT NULL,
+  changed_by VARCHAR
 );
 -- M4.5: the saving client's name (the Subsonic `c` param), for the required
 -- PlayQueue.changedBy wire field. NULL on rows saved before M4.5.

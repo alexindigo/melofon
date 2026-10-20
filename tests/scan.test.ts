@@ -163,7 +163,7 @@ Deno.test('rescan keeps user-state rows (listens/stars/ratings/playlists/play_qu
       "INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES ('p1', 0, 't1')",
     );
     await rawSql(db).run(
-      "INSERT INTO play_queues (user_id, current_id, position_ms, changed_at, track_ids) VALUES ('u1', 't1', 0, now(), ['t1'])",
+      "INSERT INTO play_queues (user_id, current_index, position_ms, changed_at, track_ids) VALUES ('u1', 0, 0, now(), ['t1'])",
     );
 
     await scanLibrary(store);

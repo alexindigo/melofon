@@ -28,7 +28,7 @@ Deno.test('number classification is independently plugin-owned and routes cannot
       'params.ts': 2,
       // Intentionally fractional positions/seconds/timestamps.
       'rest/createBookmark##ext/get.ts': 1,
-      'rest/savePlayQueue##ext/get.ts': 1,
+      'playqueue.ts': 1,
       'rest/scrobble##ext/get.ts': 2,
       // Digit-syntax bitrate gate and syntactically classified rendition names.
       'rest/stream##ext/get.ts': 1,

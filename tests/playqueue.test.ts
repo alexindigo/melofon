@@ -138,18 +138,18 @@ Deno.test('savePlayQueue upserts: one row per user, latest wins', async () => {
     const body = await call(app, 'getPlayQueue');
     const queue = body.playQueue as PlayQueuePayload;
     assertEquals(queue.entry.map((s) => s.id), [b, a]);
-    assertEquals(queue.position, undefined);
+    assertEquals(queue.position, 0);
   } finally {
     await close();
   }
 });
 
-Deno.test('savePlayQueue accepts an empty queue', async () => {
+Deno.test('savePlayQueue clears an empty queue', async () => {
   const { app, close } = await setup();
   try {
     assertEquals((await call(app, 'savePlayQueue')).status, 'ok');
     const body = await call(app, 'getPlayQueue');
-    assertEquals((body.playQueue as PlayQueuePayload).entry.length, 0);
+    assertEquals(body.playQueue, undefined);
   } finally {
     await close();
   }
