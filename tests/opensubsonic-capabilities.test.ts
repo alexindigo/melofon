@@ -32,6 +32,7 @@ const EXPECTED = [
   { name: 'indexBasedQueue', versions: [1] },
   { name: 'playbackReport', versions: [1] },
   { name: 'topSongsByArtistId', versions: [1] },
+  { name: 'getPodcastEpisode', versions: [1] },
 ];
 const OP = 'getOpenSubsonicExtensions';
 const AUTH = new URLSearchParams({
@@ -313,7 +314,7 @@ Deno.test('H1 all existing POST operations reexport their corresponding GET cons
     }
   }
   await visit('layers/opensubsonic/rest');
-  assertEquals(count, 68);
+  assertEquals(count, 74);
 });
 
 Deno.test('H1 semantic projection preserves repeated extensions and versions without changing advertised facts', async () => {

@@ -272,6 +272,17 @@ export interface HatContext {
       ): Promise<StationResult | null>;
       delete(id: string): Promise<boolean>;
     };
+    podcasts: {
+      channels(): Promise<PodcastChannelRow[]>;
+      episodes(channelId: string): Promise<PodcastEpisodeRow[]>;
+      newest(count: number): Promise<PodcastEpisodeRow[]>;
+      episode(id: string): Promise<PodcastEpisodeRow | null>;
+      addChannel(url: string): Promise<PodcastChannelRow>;
+      refresh(): Promise<void>;
+      download(id: string): Promise<PodcastEpisodeRow | null>;
+      deleteChannel(id: string): Promise<boolean>;
+      deleteEpisode(id: string): Promise<boolean>;
+    };
     clientQueue: {
       get(username: string): Promise<PlayQueueRow | null>;
       save(
@@ -377,6 +388,37 @@ export interface HatContext {
 }
 
 // Domain rows, declared structurally (the hat does not import src/).
+export type PodcastStatus =
+  | 'new'
+  | 'downloading'
+  | 'completed'
+  | 'error'
+  | 'deleted'
+  | 'skipped';
+export interface PodcastChannelRow {
+  id: string;
+  feedUrl: string;
+  title: string | null;
+  description: string | null;
+  imageUrl: string | null;
+  imagePath: string | null;
+  status: PodcastStatus;
+  errorMessage: string | null;
+}
+export interface PodcastEpisodeRow {
+  id: string;
+  channelId: string;
+  title: string | null;
+  description: string | null;
+  publishDate: string | null;
+  duration: number | null;
+  contentType: string | null;
+  filePath: string | null;
+  size: number | null;
+  status: PodcastStatus;
+  streamId?: string;
+}
+
 export interface StationInput {
   name: string;
   streamUrl: string;

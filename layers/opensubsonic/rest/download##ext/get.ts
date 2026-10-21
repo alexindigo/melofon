@@ -4,15 +4,17 @@
 // tree path. Missing id → code 70.
 import { notFound } from '#opensubsonic/envelope.ts';
 import { zipEntriesFor } from '#opensubsonic/id3.ts';
+import { mediaReadRequest } from '#opensubsonic/media-request.ts';
 import { requiredParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (request: HatRequest, context: HatContext) => {
   const id = requiredParam(context, 'id');
   if (id instanceof Response) return id;
-  const path = await context.app.library.songPath(id);
-  if (path !== null) {
-    const res = await context.app.stream.file(request._raw, path);
+  const source = await context.app.stream.source(id);
+  if (source !== null) {
+    const { path } = source;
+    const res = await context.app.stream.file(mediaReadRequest(request), path);
     const name = (path.split('/').pop() ?? 'download').replaceAll('"', '');
     const headers = new Headers(res.headers);
     headers.set('content-disposition', `attachment; filename="${name}"`);

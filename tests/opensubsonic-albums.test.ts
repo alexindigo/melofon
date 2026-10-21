@@ -7,6 +7,7 @@ import { seedFirstUser } from '../src/users.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibrary } from '../src/library.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createUserService } from '../src/user.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
@@ -101,6 +102,7 @@ async function setup(fn: (s: Setup) => Promise<void>) {
           }),
           cfg,
           library,
+          stream: { source: createFileSource(library) },
           libraries,
           scan,
           user: createUserService(store, cfg),

@@ -1,4 +1,5 @@
 import { intParam } from '#opensubsonic/params.ts';
+import { mediaReadRequest } from '#opensubsonic/media-request.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (request: HatRequest, context: HatContext) => {
@@ -13,7 +14,7 @@ export default async (request: HatRequest, context: HatContext) => {
   }
   const song = await context.app.library.getSong(id);
   if (!song) return new Response('Media not found', { status: 404 });
-  return context.app.stream.negotiated(request._raw, song, token, {
+  return context.app.stream.negotiated(mediaReadRequest(request), song, token, {
     username: context.state.user!.username,
     client: params.get('c') ?? 'opensubsonic',
     trackId: id,

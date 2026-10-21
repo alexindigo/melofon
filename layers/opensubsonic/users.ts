@@ -12,7 +12,7 @@ export function userOf(user: UserProfile, folder: number[]) {
     playlistRole: true,
     coverArtRole: true,
     commentRole: false,
-    podcastRole: false,
+    podcastRole: user.role === 'admin',
     streamRole: true,
     jukeboxRole: false,
     shareRole: false,

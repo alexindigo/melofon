@@ -272,6 +272,7 @@ Deno.test('getMusicFolders and getOpenSubsonicExtensions answer Feishin probes',
         { name: 'indexBasedQueue', versions: [1] },
         { name: 'playbackReport', versions: [1] },
         { name: 'topSongsByArtistId', versions: [1] },
+        { name: 'getPodcastEpisode', versions: [1] },
       ],
     );
   } finally {

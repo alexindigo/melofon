@@ -17,6 +17,7 @@ import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 import { createReference } from '../src/reference.ts';
 import { createRadio } from '../src/radio.ts';
+import { createPodcasts } from '../src/podcasts.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -39,8 +40,10 @@ async function setup() {
   await scan.run();
   const library = createLibrary(store);
   const state = createState(store);
+  const podcasts = await createPodcasts({ store, state, dataDir: dir });
   const bag = {
     state,
+    podcasts,
     radio: createRadio(store),
     reference: createReference({
       store,
@@ -61,6 +64,7 @@ async function setup() {
     db,
     app,
     close: async () => {
+      await podcasts.close();
       await db.close();
       await Deno.remove(dir, { recursive: true });
     },

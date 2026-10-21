@@ -6,6 +6,7 @@
 // never clears a newer stream). Never a listens row — stream is not a
 // scrobble. The hat only parses, calls, encodes.
 import { fail, notFound } from '#opensubsonic/envelope.ts';
+import { mediaReadRequest } from '#opensubsonic/media-request.ts';
 import { intParam, requiredParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
@@ -19,7 +20,7 @@ export default async (request: HatRequest, context: HatContext) => {
     ? Number(rawBitRate)
     : undefined;
   const res = await context.app.stream.play(
-    request._raw,
+    mediaReadRequest(request),
     source,
     context.state.params!.get('format') ?? undefined,
     source.trackId
