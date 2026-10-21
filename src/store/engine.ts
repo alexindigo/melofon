@@ -110,7 +110,13 @@ export async function openEngine(
   const instance = await duckdb.DuckDBInstance.create(
     `${dataDir}/melofon.duckdb`,
   );
-  const conn = await instance.connect();
+  let conn: duckdb.DuckDBConnection;
+  try {
+    conn = await instance.connect();
+  } catch (error) {
+    instance.closeSync();
+    throw error;
+  }
   // Bind to the unmodified connection: runAndReadAll internally calls this.run.
   // Instrument external entries only, not that driver-internal recursion.
   const queries = {
@@ -173,6 +179,14 @@ export async function openEngine(
     return result;
   }
 
+  function closeNative(): void {
+    try {
+      conn.closeSync();
+    } finally {
+      instance.closeSync();
+    }
+  }
+
   function close(): Promise<void> {
     if (slots.getStore()?.active) {
       return Promise.reject(
@@ -182,10 +196,14 @@ export async function openEngine(
     if (!closed) {
       closing = true;
       if (pending === 0) {
-        conn.closeSync();
-        closed = Promise.resolve();
+        try {
+          closeNative();
+          closed = Promise.resolve();
+        } catch (error) {
+          closed = Promise.reject(error);
+        }
       } else {
-        closed = tail.then(() => conn.closeSync());
+        closed = tail.then(closeNative);
       }
     }
     return closed;

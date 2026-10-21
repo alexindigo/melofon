@@ -58,6 +58,11 @@ export async function openStore(
     close: engine.close,
   };
   registerStore(store, engine);
-  await store.lookups.resetActive();
+  try {
+    await store.lookups.resetActive();
+  } catch (error) {
+    await engine.close();
+    throw error;
+  }
   return store;
 }
