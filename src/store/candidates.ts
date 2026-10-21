@@ -11,7 +11,8 @@ export interface CandidateInput {
   confidence: 'strong' | 'medium' | 'low' | null;
   imageHash: string;
   imageExt: string;
-  libraryId: string;
+  /** null for artist images kept in the server's data directory. */
+  libraryId: string | null;
   /** Source URL, library-relative image path, or kept song id. */
   origin: string;
   details?: Record<string, unknown>;
@@ -64,7 +65,7 @@ async function add(q: Queries, list: CandidateInput[]): Promise<Candidate[]> {
         ${esc(input.kind)}, ${esc(input.source)},
         ${input.confidence === null ? 'NULL' : esc(input.confidence)}, 'open',
         ${esc(input.imageHash)}, ${esc(input.imageExt)}, ${
-      esc(input.libraryId)
+      input.libraryId === null ? 'NULL' : esc(input.libraryId)
     },
         ${esc(input.origin)}, to_timestamp(${
       input.foundAtMs ?? Date.now()
@@ -81,7 +82,9 @@ export function createCandidatesStore(engine: Engine) {
       const candidate = (await read(q, `WHERE id = ${esc(id)}`))[0];
       if (
         !candidate || !(
-          candidate.entityType === 'album' && candidate.kind === 'cover' ||
+          (candidate.entityType === 'album' ||
+              candidate.entityType === 'artist') &&
+            candidate.kind === 'cover' ||
           candidate.entityType === 'song' && candidate.kind === 'lyrics'
         )
       ) throw new Error('Unifiable candidate not found');
@@ -111,6 +114,17 @@ export function createCandidatesStore(engine: Engine) {
     /** The decision and its durable work commit together, with no nested slot. */
     accept,
     acceptCover: accept,
+    acceptedArtistPhoto(id: string): Promise<Candidate | null> {
+      return engine.exclusive(async (q) =>
+        (await read(
+          q,
+          `WHERE entity_type = 'artist' AND entity_id = ${
+            esc(id)
+          } AND kind = 'cover'
+         AND state IN ('accepted', 'edited') ORDER BY decided_at DESC, seq DESC LIMIT 1`,
+        ))[0] ?? null
+      );
+    },
     addCandidates(list: CandidateInput[]): Promise<Candidate[]> {
       return atomic(engine, (q) => add(q, list));
     },
@@ -156,8 +170,9 @@ export function createCandidatesStore(engine: Engine) {
       albumId: string,
       versions: LocalVersion[],
       kind: 'cover' | 'lyrics' = 'cover',
+      targetType?: EntityType,
     ): Promise<void> {
-      const entityType = kind === 'lyrics' ? 'song' : 'album';
+      const entityType = targetType ?? (kind === 'lyrics' ? 'song' : 'album');
       return atomic(engine, async (q) => {
         await add(
           q,
@@ -214,8 +229,9 @@ export function createCandidatesStore(engine: Engine) {
       albumId: string,
       versions: LocalVersion[],
       kind: 'cover' | 'lyrics' = 'cover',
+      targetType?: EntityType,
     ): Promise<void> {
-      const entityType = kind === 'lyrics' ? 'song' : 'album';
+      const entityType = targetType ?? (kind === 'lyrics' ? 'song' : 'album');
       return atomic(engine, async (q) => {
         const scope = `entity_type = ${esc(entityType)} AND kind = ${
           esc(kind)
@@ -237,9 +253,9 @@ export function createCandidatesStore(engine: Engine) {
         // Refresh live references after a move without changing a decision or its history.
         for (const version of versions) {
           await q.run(`UPDATE candidates SET origin = ${esc(version.origin)},
-            library_id = ${esc(version.libraryId)}, image_ext = ${
-            esc(version.imageExt)
-          }
+            library_id = ${
+            version.libraryId === null ? 'NULL' : esc(version.libraryId)
+          }, image_ext = ${esc(version.imageExt)}
             WHERE ${scope} AND image_hash = ${esc(version.imageHash)}`);
           if (kind === 'lyrics' && version.details) {
             await q.run(
@@ -268,16 +284,26 @@ export function createCandidatesStore(engine: Engine) {
   };
 }
 
-/** DuckDB cannot alter a CHECK constraint. Upgrade the kept table atomically
+/** DuckDB cannot alter a CHECK constraint, and DROP NOT NULL on this sequence-
+ * backed table is not WAL-replay safe. Upgrade the kept table atomically
  * using its canonical DDL, preserving every row, decision and sequence value. */
 export async function upgradeCandidates(q: Queries, schema: string) {
-  const constraints = await q.all<{ constraint_text: string }>(
-    `SELECT constraint_text FROM duckdb_constraints() WHERE table_name = 'candidates' AND constraint_type = 'CHECK'`,
+  const constraints = await q.all<
+    {
+      constraint_text: string;
+      constraint_type: string;
+      constraint_column_names: string[];
+    }
+  >(
+    `SELECT constraint_text, constraint_type, constraint_column_names FROM duckdb_constraints() WHERE table_name = 'candidates'`,
   );
   if (
     !constraints.some((row) =>
-      row.constraint_text.includes('kind') &&
-      !row.constraint_text.includes('lyrics')
+      (row.constraint_type === 'CHECK' &&
+        row.constraint_text.includes('kind') &&
+        !row.constraint_text.includes('lyrics')) ||
+      (row.constraint_type === 'NOT NULL' &&
+        row.constraint_column_names.includes('library_id'))
     )
   ) return;
   const definition = schema.split(';').find((sql) =>

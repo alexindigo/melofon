@@ -29,7 +29,7 @@ Deno.test('reference capabilities use typed vocabulary without candidates or pho
   for (
     const capability of [
       { ...artist, provides: ['artist.biography', 'album.image.front'] },
-      { ...artist, provides: ['artist.image.primary'] },
+      { ...artist, provides: ['artist.biography', 'artist.image.primary'] },
       { ...artist, provides: ['artist.unknown'] },
       { ...artist, provides: ['track.similar'] },
       { ...track, provides: ['artist.similar'] },

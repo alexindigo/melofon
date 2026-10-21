@@ -12,12 +12,17 @@ import {
 export const CONTRACT = 1;
 export const HOST_PATTERN =
   '^(?:\\*\\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*$';
-export interface CandidateCapability {
+export type CandidateCapability = {
   id: string;
   accepts: 'album';
   provides: ['album.image.front'];
   requires: string[];
-}
+} | {
+  id: string;
+  accepts: 'artist';
+  provides: ['artist.image.primary'];
+  requires: string[];
+};
 export interface ReferenceCapability {
   id: string;
   accepts: ReferenceType;
@@ -28,7 +33,8 @@ export type Capability = CandidateCapability | ReferenceCapability;
 export function isReference(
   capability: Capability,
 ): capability is ReferenceCapability {
-  return capability.accepts !== 'album';
+  return capability.accepts !== 'album' &&
+    capability.provides[0] !== 'artist.image.primary';
 }
 export interface Manifest {
   contract: 1;
@@ -146,6 +152,9 @@ export function parseManifest(raw: unknown, id: string): Manifest {
       !provides.length || new Set(provides).size !== provides.length ||
       (c.accepts === 'album'
         ? provides.length !== 1 || provides[0] !== 'album.image.front'
+        : c.accepts === 'artist' && provides.length === 1 &&
+            provides[0] === 'artist.image.primary'
+        ? false
         : !provides.every((name) =>
           referenceNames(c.accepts as ReferenceType).includes(
             name as ReferenceName,
@@ -160,6 +169,13 @@ export function parseManifest(raw: unknown, id: string): Manifest {
     }
     return c.accepts === 'album'
       ? { id: cid, accepts: 'album', provides: ['album.image.front'], requires }
+      : c.accepts === 'artist' && provides[0] === 'artist.image.primary'
+      ? {
+        id: cid,
+        accepts: 'artist',
+        provides: ['artist.image.primary'],
+        requires,
+      }
       : {
         id: cid,
         accepts: c.accepts,

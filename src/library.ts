@@ -4,10 +4,12 @@ import type { Store } from './store/index.ts';
 import type { CatalogReads, LyricsRow } from './store/catalog.ts';
 import { createLyrics, type Lyrics, type LyricsEntry } from './lyrics.ts';
 import {
+  artistImagePaths,
   embeddedPictures,
   imageContentType,
   isCoverFile,
   readCandidateImage,
+  readImage,
 } from './images.ts';
 export type {
   AlbumRow,
@@ -43,17 +45,58 @@ export interface Library extends
     id: string,
     maxBytes?: number,
   ): Promise<{ bytes: Uint8Array; format: string } | null>;
+  artistPhoto(
+    id: string,
+    maxBytes?: number,
+  ): Promise<{ bytes: Uint8Array; format: string } | null>;
+  artistPhotoMissing(id: string): Promise<boolean>;
 }
 
 export function createLibrary(
   store: Store,
   lyrics: Lyrics = createLyrics(store),
+  options: { dataDir?: string } = {},
 ): Library {
   const catalog = store.catalog;
+  const localArtistPath = async (id: string) => {
+    const folder = await catalog.artistFolder(id);
+    return folder
+      ? (await artistImagePaths(folder.directory))[0] ?? null
+      : null;
+  };
   return {
+    artistFolder: catalog.artistFolder,
+    async artistPhotoMissing(id) {
+      return !await localArtistPath(id) &&
+        !await store.candidates.acceptedArtistPhoto(id);
+    },
+    async artistPhoto(id, maxBytes = Infinity) {
+      const local = await localArtistPath(id);
+      if (local) {
+        try {
+          const bytes = await readImage(local, maxBytes);
+          if (bytes) {
+            return { bytes, format: imageContentType(local.split('.').pop()!) };
+          }
+        } catch { /* A vanished local picture falls through. */ }
+      }
+      const candidate = await store.candidates.acceptedArtistPhoto(id) ??
+        await store.candidates.strongestOpen('artist', id, 'cover');
+      if (!candidate || !options.dataDir) return null;
+      const bytes = await readCandidateImage(
+        { path: options.dataDir },
+        candidate.imageHash,
+        candidate.imageExt,
+        maxBytes,
+      );
+      return bytes
+        ? { bytes, format: imageContentType(candidate.imageExt) }
+        : null;
+    },
     listArtists: catalog.listArtists,
     getArtist: catalog.getArtist,
     artistById: catalog.artistById,
+    artistIds: catalog.artistIds,
     albumsByArtist: catalog.albumsByArtist,
     albumsWithoutArtist: catalog.albumsWithoutArtist,
     listAlbums: catalog.listAlbums,

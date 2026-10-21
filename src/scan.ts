@@ -13,6 +13,7 @@ import type {
 import type { Notify } from './notify.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
+  artistImagePaths,
   embeddedPictures as picturesFromMetadata,
   imageExtension,
   imageHash,
@@ -445,6 +446,30 @@ export async function scanLibrary(
       file.id,
       sources.find((source) => source.id === file.libraryId)!,
       songLyrics.get(file) ?? [],
+    );
+  }
+  for (const artist of artists.values()) {
+    const folder = await store.catalog.artistFolder(artist.id);
+    const versions = new Map<string, LocalVersion>();
+    if (folder) {
+      for (const path of await artistImagePaths(folder.directory)) {
+        const imageHashValue = await imageHash(await Deno.readFile(path));
+        versions.set(imageHashValue, {
+          imageHash: imageHashValue,
+          imageExt: imageExtension(extOf(path).slice(1)),
+          libraryId: folder.libraryId,
+          origin: path.slice(
+            sources.find((source) => source.id === folder.libraryId)!.path
+              .length + 1,
+          ),
+        });
+      }
+    }
+    await store.candidates.replaceLocal(
+      artist.id,
+      versions.size > 1 ? [...versions.values()] : [],
+      'cover',
+      'artist',
     );
   }
   return {

@@ -135,6 +135,8 @@ export function createArtwork(library: Library, options: {
       return await library.candidateCover(id, maxBytes);
     }
     if (await library.artistById(id) !== null) {
+      const photo = await library.artistPhoto(id, maxBytes);
+      if (photo) return photo;
       const albums = await library.albumsByArtist(id);
       return albums.length ? await resolve(albums[0].id, maxBytes) : null;
     }

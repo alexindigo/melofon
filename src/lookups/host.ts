@@ -25,9 +25,11 @@ export type PluginState =
   | 'stopping';
 export class LookupRevoked extends Error {}
 export interface LookupCandidate {
-  target: { type: 'album'; id: string };
+  target: { type: 'album' | 'artist'; id: string };
   confidence: 'strong' | 'medium' | 'low';
-  values: { 'album.image.front': { url: string } };
+  values: Partial<
+    Record<'album.image.front' | 'artist.image.primary', { url: string }>
+  >;
   ids?: Record<string, string>;
   evidence?: Record<string, unknown>;
 }
@@ -73,13 +75,14 @@ export function parseResult(
       ]);
       const target = object(c.target, ['type', 'id']);
       if (
-        target.type !== 'album' || typeof target.id !== 'string' || !target.id
+        target.type !== capability.accepts || typeof target.id !== 'string' ||
+        !target.id
       ) throw new Error('Invalid candidate target');
       if (
         !['strong', 'medium', 'low'].includes(String(c.confidence))
       ) throw new Error('Invalid candidate confidence');
       const values = object(c.values, capability.provides);
-      const image = object(values['album.image.front'], ['url']);
+      const image = object(values[capability.provides[0]], ['url']);
       if (
         typeof image.url !== 'string' ||
         !['http:', 'https:'].includes(new URL(image.url).protocol)

@@ -26,6 +26,7 @@ import {
 } from './reference-facts.ts';
 import { createReference, type ReferenceProvider } from '../reference.ts';
 import type { ReferenceType } from '../reference-types.ts';
+import { imageHeader } from '../image-header.ts';
 import { LookupHost, LookupRevoked } from './host.ts';
 import {
   createLookupNetwork,
@@ -108,9 +109,11 @@ export async function createLookupRunner(options: {
 }) {
   const { store, state } = options;
   const log = options.log ?? scopedLog('lookups');
-  const library = options.library ?? createLibrary(store);
+  const library = options.library ??
+    createLibrary(store, undefined, { dataDir: options.dataDir });
   const network = options.network ?? createLookupNetwork({ log, state });
-  const unify = options.unify ?? createUnify(store);
+  const unify = options.unify ??
+    createUnify(store, { dataDir: options.dataDir });
   const declarations = {
     jobTimeoutSeconds: {
       type: 'integer',
@@ -219,20 +222,21 @@ export async function createLookupRunner(options: {
 
   async function enqueue(
     mode: 'missing' | 'all',
-    target?: { type: 'album' | 'song' | 'library'; id: string },
+    target?: { type: 'album' | 'song' | 'library' | 'artist'; id: string },
   ) {
     if (closed) return;
     await configuration;
-    if (
-      !hosts.some((host) =>
+    const accepts = (type: 'album' | 'artist') =>
+      hosts.some((host) =>
         host.state !== 'disabled' &&
         host.plugin.manifest?.capabilities.some((c) =>
-          !isReference(c) && c.requires.length === 0
+          !isReference(c) && c.accepts === type
         )
-      )
-    ) return;
+      );
+    if (!accepts('album') && !accepts('artist')) return;
     let ids: string[];
-    if (target?.type === 'album') ids = [target.id];
+    if (!accepts('album') || target?.type === 'artist') ids = [];
+    else if (target?.type === 'album') ids = [target.id];
     else if (target?.type === 'song') {
       const song = await library.getSong(target.id);
       ids = song?.albumId ? [song.albumId] : [];
@@ -280,7 +284,10 @@ export async function createLookupRunner(options: {
         if (!host.plugin.manifest || host.state === 'disabled') continue;
         for (const capability of host.plugin.manifest.capabilities) {
           // L4 parses dependency vocabulary; chaining is deliberately outside this item.
-          if (isReference(capability) || capability.requires.length) continue;
+          if (
+            isReference(capability) || capability.accepts !== 'album' ||
+            capability.requires.length
+          ) continue;
           jobs.push({
             plugin: host.plugin.id,
             entityType: 'album',
@@ -292,12 +299,47 @@ export async function createLookupRunner(options: {
       }
       if (jobs.length >= 100) await store.lookups.enqueue(jobs.splice(0));
     }
+    const artists = !accepts('artist')
+      ? []
+      : target?.type === 'artist'
+      ? [target.id]
+      : target && target.type !== 'library'
+      ? []
+      : await library.artistIds(target?.id);
+    for (const id of artists) {
+      if (closed) return;
+      const facts = await referenceFacts(store, 'artist', id);
+      if (
+        !facts || (mode === 'missing' && !await library.artistPhotoMissing(id))
+      ) continue;
+      for (const host of hosts) {
+        if (!host.plugin.manifest || host.state === 'disabled') continue;
+        for (const capability of host.plugin.manifest.capabilities) {
+          if (isReference(capability) || capability.accepts !== 'artist') {
+            continue;
+          }
+          if (
+            !capability.requires.every((name) =>
+              name.startsWith('artist.id.') &&
+              Boolean(facts.ids[name.slice('artist.id.'.length)])
+            )
+          ) continue;
+          jobs.push({
+            plugin: host.plugin.id,
+            entityType: 'artist',
+            entityId: id,
+            factsHash: await factsHash(capability, facts),
+            mode,
+          });
+        }
+      }
+    }
     if (!closed && jobs.length) await store.lookups.enqueue(jobs);
     pump();
   }
   const queueIntake = (
     mode: 'missing' | 'all',
-    target?: { type: 'album' | 'song' | 'library'; id: string },
+    target?: { type: 'album' | 'song' | 'library' | 'artist'; id: string },
   ) => {
     const task = intake.then(() => enqueue(mode, target));
     intake = task.catch((error) =>
@@ -374,13 +416,19 @@ export async function createLookupRunner(options: {
       if (!('candidates' in result)) throw new Error('Expected candidates');
       const candidates: CandidateInput[] = [];
       for (const candidate of result.candidates) {
-        const target = await albumFacts(store, candidate.target.id);
+        const artist = candidate.target.type === 'artist';
+        const target = artist
+          ? await referenceFacts(store, 'artist', candidate.target.id)
+          : await albumFacts(store, candidate.target.id);
         if (!target) throw new Error('Candidate target not in catalog');
-        const destination = (await store.catalog.listLibraries()).find((l) =>
-          l.id === target.library.id
-        )!;
+        const libraryId = 'library' in target ? target.library.id : null;
+        const destination = artist
+          ? { path: options.dataDir }
+          : (await store.catalog.listLibraries()).find((l) =>
+            l.id === libraryId
+          )!;
         if (!await libraryImagesWritable(destination)) continue;
-        const url = candidate.values['album.image.front'].url;
+        const url = candidate.values[capability.provides[0]]!.url;
         const response = await network.fetch(
           authority,
           url,
@@ -393,11 +441,15 @@ export async function createLookupRunner(options: {
         if (!response.ok || !/^image\/[a-z0-9]+$/.test(contentType)) {
           throw new Error('Lookup image response is not an image');
         }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (artist && !imageHeader(bytes)) {
+          throw new Error('Lookup photo bytes are not an image');
+        }
         let reference;
         try {
           reference = await writeCandidateImage(
             destination,
-            new Uint8Array(await response.arrayBuffer()),
+            bytes,
             imageExtension(contentType),
           );
         } catch (error) {
@@ -407,14 +459,14 @@ export async function createLookupRunner(options: {
         if (!reference) continue;
         authority.signal.throwIfAborted();
         candidates.push({
-          entityType: 'album',
+          entityType: artist ? 'artist' : 'album',
           entityId: target.id,
           kind: 'cover',
           source: host.plugin.id,
           confidence: candidate.confidence,
           imageHash: reference.hash,
           imageExt: reference.ext,
-          libraryId: target.library.id,
+          libraryId,
           origin: url,
           details: {
             ...candidate.evidence,
@@ -558,7 +610,7 @@ export async function createLookupRunner(options: {
     },
     afterScan: () => queueIntake('missing'),
     request(
-      target: { type: 'album' | 'song' | 'library'; id: string },
+      target: { type: 'album' | 'song' | 'library' | 'artist'; id: string },
       mode: 'all',
     ) {
       return queueIntake(mode, target);

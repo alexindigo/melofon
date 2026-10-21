@@ -10,6 +10,7 @@ import type { Store } from './store/index.ts';
 import type { Candidate, LocalVersion } from './store/candidates.ts';
 import type { LookupJob } from './store/lookups.ts';
 import {
+  artistImagePaths,
   candidateImagePath,
   embeddedPictures,
   imageExtension,
@@ -20,6 +21,7 @@ import {
   writeCandidateImage,
 } from './images.ts';
 import { createMedia } from './media.ts';
+import { imageHeader } from './image-header.ts';
 import { unchangedTagFacts, writeTags } from './tags.ts';
 import {
   createLyrics,
@@ -120,6 +122,159 @@ export async function materializeCandidate(store: Store, candidate: Candidate) {
       candidate.imageExt,
     ),
   };
+}
+
+/** Artist proposals always have a durable data-dir copy, even when publication
+ * can additionally make the choice visible to other library readers. */
+export async function materializeArtistPhoto(
+  store: Store,
+  candidate: Candidate,
+  dataDir?: string,
+) {
+  if (
+    candidate.entityType !== 'artist' || candidate.kind !== 'cover' || !dataDir
+  ) {
+    throw new Error('Not an artist photo candidate or data directory missing');
+  }
+  if (!await store.catalog.artistById(candidate.entityId)) {
+    throw new Error('Candidate artist is missing');
+  }
+  const folder = await store.catalog.artistFolder(candidate.entityId);
+  const storage = { path: dataDir };
+  let bytes = await readCandidateImage(
+    storage,
+    candidate.imageHash,
+    candidate.imageExt,
+  );
+  if (!bytes && folder && candidate.source === 'local') {
+    for (const path of await artistImagePaths(folder.directory)) {
+      const image = await Deno.readFile(path);
+      if (await imageHash(image) === candidate.imageHash) {
+        bytes = image;
+        break;
+      }
+    }
+  }
+  if (
+    !bytes || !imageHeader(bytes) ||
+    await imageHash(bytes) !== candidate.imageHash
+  ) {
+    throw new Error('Artist photo is missing, invalid or its hash differs');
+  }
+  if (!await writeCandidateImage(storage, bytes, candidate.imageExt)) {
+    throw new Error('Photo data directory is read-only');
+  }
+  return { bytes, folder, storage };
+}
+
+async function unifyArtistPhoto(
+  store: Store,
+  candidate: Candidate,
+  signal: AbortSignal,
+  dataDir?: string,
+) {
+  const { bytes, folder, storage } = await materializeArtistPhoto(
+    store,
+    candidate,
+    dataDir,
+  );
+  if (!folder) return;
+  const library = (await store.catalog.listLibraries()).find((row) =>
+    row.id === folder.libraryId
+  );
+  if (!library) return;
+  // Read-only artist libraries still accept into server data. No write probes
+  // or hidden directories are created in those libraries.
+  try {
+    await access(library.path, constants.W_OK);
+    await access(folder.directory, constants.W_OK);
+  } catch (error) {
+    if (['EACCES', 'EROFS'].includes((error as { code?: string }).code ?? '')) {
+      return;
+    }
+    throw error;
+  }
+  await inLibrary(folder.directory, library.path);
+  const paths = await artistImagePaths(folder.directory);
+  const stats = new Map<string, ReturnType<typeof signature>>();
+  const backups: LocalVersion[] = [];
+  for (const path of paths) {
+    await inLibrary(path, library.path);
+    const before = signature(await Deno.stat(path));
+    const image = await Deno.readFile(path);
+    const ref = await writeCandidateImage(
+      storage,
+      image,
+      extname(path).slice(1),
+    );
+    if (!ref) throw new Error('Cannot back up artist photo');
+    if (!isDeepStrictEqual(before, signature(await Deno.stat(path)))) {
+      throw new Error('Artist photo changed during backup');
+    }
+    stats.set(path, before);
+    if (ref.hash !== candidate.imageHash) {
+      backups.push({
+        imageHash: ref.hash,
+        imageExt: ref.ext,
+        libraryId: null,
+        origin: path.slice(library.path.length + 1),
+      });
+    }
+  }
+  await store.candidates.preserveLocal(
+    candidate.entityId,
+    backups,
+    'cover',
+    'artist',
+  );
+  const destination = `${folder.directory}/artist.${
+    imageExtension(candidate.imageExt)
+  }`;
+  const temporary = `${folder.directory}/.unify-${crypto.randomUUID()}`;
+  const unchanged = async (path: string) => {
+    const current = await Deno.lstat(path).then(async (stat) => {
+      await inLibrary(path, library.path);
+      return signature(stat);
+    }, (error) => {
+      if (error instanceof Deno.errors.NotFound) return undefined;
+      throw error;
+    });
+    if (!isDeepStrictEqual(current, stats.get(path))) {
+      throw new Error('Artist photo changed before publication');
+    }
+  };
+  try {
+    await Deno.writeFile(temporary, bytes, { createNew: true, mode: 0o644 });
+    await syncFile(temporary);
+    signal.throwIfAborted();
+    if (
+      !isDeepStrictEqual(
+        folder,
+        await store.catalog.artistFolder(candidate.entityId),
+      )
+    ) throw new Error('Artist folder changed before publication');
+    const current = await store.candidates.byId(candidate.id);
+    if (!current || current.state === 'rejected') {
+      throw new Error('Photo choice was withdrawn');
+    }
+    await access(library.path, constants.W_OK);
+    if (!isDeepStrictEqual(paths, await artistImagePaths(folder.directory))) {
+      throw new Error('Artist photos changed before publication');
+    }
+    for (const path of new Set([...paths, destination])) await unchanged(path);
+    await Deno.rename(temporary, destination);
+    for (const path of paths) {
+      if (path !== destination) {
+        await unchanged(path);
+        await Deno.remove(path);
+      }
+    }
+    await syncFile(folder.directory);
+  } finally {
+    await Deno.remove(temporary).catch((error) => {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    });
+  }
 }
 
 /** Compare every parsed tag, including unknown/native tags, with pictures alone removed. */
@@ -335,7 +490,7 @@ async function unifyLyrics(
 
 export function createUnify(
   store: Store,
-  options: { writeTags?: typeof writeTags } = {},
+  options: { writeTags?: typeof writeTags; dataDir?: string } = {},
 ): UnifyHandler {
   const media = createMedia();
   const write = options.writeTags ?? writeTags;
@@ -356,6 +511,10 @@ export function createUnify(
       return;
     }
     if (candidate.state !== 'accepted') return;
+    if (candidate.entityType === 'artist') {
+      await unifyArtistPhoto(store, candidate, signal, options.dataDir);
+      return;
+    }
     const { album, library, dirs, directory, bytes } =
       await materializeCandidate(store, candidate);
     const coverPaths = await covers(dirs);

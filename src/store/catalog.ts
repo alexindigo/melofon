@@ -3,6 +3,7 @@ import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { userIdForName } from './users.ts';
 import { artistAlbumFolderFilter } from './catalog-sql.ts';
 import { isAlbumFolderHint } from '../albums.ts';
+import { dirname } from 'node:path';
 import type { AlbumMetadata, SongMetadata } from '../metadata.ts';
 import {
   albumMetadataColumns,
@@ -109,6 +110,8 @@ export interface CatalogReads {
   getArtist(id: string): Promise<ArtistRow | null>;
   /** Any catalog artist, including track-only performers with zero albums. */
   artistById(id: string): Promise<ArtistRow | null>;
+  /** Every present artist, including track-only performers, scoped to a library. */
+  artistIds(folderId?: string): Promise<string[]>;
   /** Albums of one album artist, alphabetically. */
   albumsByArtist(artistId: string): Promise<AlbumRow[]>;
   albumsWithoutArtist(
@@ -186,6 +189,10 @@ export interface CatalogReads {
   albumSongPath(id: string): Promise<string | null>;
   /** Track directories first, then an eligible album-only root directory. */
   albumCoverDirectories(id: string): Promise<string[]>;
+  /** Exclusive parent of every album directory, within exactly one library. */
+  artistFolder(
+    id: string,
+  ): Promise<{ directory: string; libraryId: string } | null>;
 }
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -473,6 +480,14 @@ function catalogReads(q: Queries): CatalogReads {
     async artistById(id) {
       return await resolveArtist(id, true);
     },
+    async artistIds(folderId) {
+      return (await q.all<{ id: string }>(`SELECT ar.id FROM artists ar
+        WHERE EXISTS (SELECT 1 FROM files f LEFT JOIN albums al ON al.id = f.album_id
+          WHERE (f.artist_id = ar.id OR al.album_artist_id = ar.id)
+          ${
+        folderId === undefined ? '' : `AND f.library_id = ${esc(folderId)}`
+      }) ORDER BY ar.id`)).map((row) => row.id);
+    },
 
     async albumsByArtist(artistId) {
       const res = await q.all(
@@ -756,6 +771,45 @@ function catalogReads(q: Queries): CatalogReads {
       return row?.path ?? null;
     },
 
+    async artistFolder(id) {
+      const rows = await q.all<
+        {
+          root: string;
+          libraryId: string;
+          artistId: string | null;
+          libraryPath: string;
+        }
+      >(
+        `SELECT al.root_dir AS root, al.library_id AS libraryId,
+          al.album_artist_id AS artistId, l.path AS libraryPath
+         FROM albums al JOIN libraries l ON l.id = al.library_id`,
+      );
+      const own = rows.filter((row) => row.artistId === id);
+      if (!own.length || new Set(own.map((row) => row.libraryId)).size !== 1) {
+        return null;
+      }
+      const root = own[0].libraryPath.replace(/\/+$/, '');
+      // An artist holds albums: never mistake the album's own directory for
+      // its artist folder, including when the artist has only one album.
+      let directory = dirname(`${root}/${own[0].root}`);
+      for (const row of own.slice(1)) {
+        const parent = dirname(`${root}/${row.root}`);
+        while (parent !== directory && !parent.startsWith(`${directory}/`)) {
+          const next = dirname(directory);
+          if (next === directory) return null;
+          directory = next;
+        }
+      }
+      if (directory === root || !directory.startsWith(`${root}/`)) return null;
+      if (
+        rows.some((row) =>
+          row.libraryId === own[0].libraryId && row.artistId !== id &&
+          (`${root}/${row.root}` === directory ||
+            `${root}/${row.root}`.startsWith(`${directory}/`))
+        )
+      ) return null;
+      return { directory, libraryId: own[0].libraryId };
+    },
     async albumCoverDirectories(id) {
       const rows = await q.all<{
         dir: string;
@@ -803,6 +857,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).listArtists(...args)),
     getArtist: (id) => engine.exclusive((q) => catalogReads(q).getArtist(id)),
     artistById: (id) => engine.exclusive((q) => catalogReads(q).artistById(id)),
+    artistIds: (folderId) =>
+      engine.exclusive((q) => catalogReads(q).artistIds(folderId)),
     albumsByArtist: (id) =>
       engine.exclusive((q) => catalogReads(q).albumsByArtist(id)),
     albumsWithoutArtist: (...args) =>
@@ -838,6 +894,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).albumSongPath(id)),
     albumCoverDirectories: (id) =>
       engine.exclusive((q) => catalogReads(q).albumCoverDirectories(id)),
+    artistFolder: (id) =>
+      engine.exclusive((q) => catalogReads(q).artistFolder(id)),
   };
 }
 

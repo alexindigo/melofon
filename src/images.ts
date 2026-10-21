@@ -41,6 +41,32 @@ export function isCoverFile(name: string): boolean {
   return /^cover\.(jpg|jpeg|png|webp)$/i.test(name);
 }
 
+export function isArtistFile(name: string): boolean {
+  return /^artist\.(jpg|jpeg|png|webp)$/i.test(name);
+}
+
+/** Extension priority is explicit, independent of directory enumeration/case. */
+export async function artistImagePaths(directory: string): Promise<string[]> {
+  const names: string[] = [];
+  try {
+    for await (const entry of Deno.readDir(directory)) {
+      if (entry.isFile && isArtistFile(entry.name)) names.push(entry.name);
+    }
+  } catch (error) {
+    if (
+      !(error instanceof Deno.errors.NotFound ||
+        error instanceof Deno.errors.PermissionDenied)
+    ) throw error;
+  }
+  const rank = (name: string) =>
+    ['jpg', 'jpeg', 'png', 'webp'].indexOf(
+      name.split('.').pop()!.toLowerCase(),
+    );
+  return names.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b)).map((
+    name,
+  ) => `${directory}/${name}`);
+}
+
 export function imageExtension(format: string): string {
   const ext = format.toLowerCase().replace(/^image\//, '');
   if (!/^[a-z0-9]+$/.test(ext)) throw new Error('Invalid image extension');

@@ -322,7 +322,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   state VARCHAR NOT NULL CHECK (state IN ('open', 'accepted', 'rejected', 'edited')),
   image_hash VARCHAR NOT NULL,
   image_ext VARCHAR NOT NULL,
-  library_id VARCHAR NOT NULL,
+  library_id VARCHAR,
   origin VARCHAR NOT NULL,
   found_at TIMESTAMPTZ NOT NULL,
   decided_at TIMESTAMPTZ,
