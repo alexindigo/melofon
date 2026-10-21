@@ -263,6 +263,15 @@ export interface HatContext {
       ): Promise<PlaylistWithTracks | null | 'forbidden'>;
       delete(username: string, id: string): Promise<boolean | 'forbidden'>;
     };
+    radio: {
+      list(): Promise<StationRow[]>;
+      create(input: StationInput): Promise<StationResult>;
+      update(
+        id: string,
+        input: StationInput,
+      ): Promise<StationResult | null>;
+      delete(id: string): Promise<boolean>;
+    };
     clientQueue: {
       get(username: string): Promise<PlayQueueRow | null>;
       save(
@@ -365,6 +374,16 @@ export interface HatContext {
 }
 
 // Domain rows, declared structurally (the hat does not import src/).
+export interface StationInput {
+  name: string;
+  streamUrl: string;
+  homePageUrl: string | null;
+}
+export interface StationRow extends StationInput {
+  id: string;
+}
+export type StationResult = StationRow | { invalid: string };
+
 export interface LibraryFolderRow {
   id: string;
   name: string;

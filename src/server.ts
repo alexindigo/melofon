@@ -17,6 +17,7 @@ import { createAnnotation } from './annotation.ts';
 import { createListens } from './listens.ts';
 import { createIdentity } from './identity.ts';
 import { createPlaylists } from './playlists.ts';
+import { createRadio } from './radio.ts';
 import { createClientQueue } from './clientqueue.ts';
 import { createBookmarks } from './bookmarks.ts';
 import { createNowPlaying } from './nowplaying.ts';
@@ -206,6 +207,7 @@ const bag = {
   annotation: createAnnotation(store),
   listens: createListens(store),
   playlists,
+  radio: createRadio(store),
   clientQueue: createClientQueue(store),
   bookmarks: createBookmarks(store),
   nowPlaying,

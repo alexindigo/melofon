@@ -1,5 +1,5 @@
 // tests/emptyok.test.ts — M3 empty-ok stubs: features melofon is not
-// building (podcasts, chat, shares, internet radio, album infos) return the
+// building (podcasts, chat, shares, album infos) return the
 // correct empty payload, golden-tested in BOTH JSON and XML — never the
 // dispatch fallback's "Not implemented" envelope, never an uncaught 500.
 // getAvatar serves the same placeholder tile as a missing cover.
@@ -16,6 +16,7 @@ import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 import { createReference } from '../src/reference.ts';
+import { createRadio } from '../src/radio.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -40,6 +41,7 @@ async function setup() {
   const state = createState(store);
   const bag = {
     state,
+    radio: createRadio(store),
     reference: createReference({
       store,
       state,

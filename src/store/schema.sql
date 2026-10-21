@@ -18,6 +18,15 @@ CREATE TABLE IF NOT EXISTS libraries (
   name VARCHAR NOT NULL,
   path VARCHAR UNIQUE NOT NULL
 );
+-- Shared stations are kept on rescan. CREATE also upgrades existing installs.
+CREATE TABLE IF NOT EXISTS radio_stations (
+  id VARCHAR PRIMARY KEY,
+  name VARCHAR NOT NULL,
+  stream_url VARCHAR NOT NULL,
+  home_page_url VARCHAR,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
 CREATE TABLE IF NOT EXISTS artists (
   id VARCHAR PRIMARY KEY,
   name VARCHAR NOT NULL

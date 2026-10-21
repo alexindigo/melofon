@@ -8,6 +8,7 @@ import { createNowPlayingStore } from './nowplaying.ts';
 import { createListensStore } from './listens.ts';
 import { createAnnotationsStore } from './annotations.ts';
 import { createPlaylistsStore } from './playlists.ts';
+import { createRadioStore } from './radio.ts';
 import { createPlaybackStore } from './playback.ts';
 import { createCatalogStore } from './catalog.ts';
 import { createCandidatesStore } from './candidates.ts';
@@ -24,6 +25,7 @@ export interface Store {
   listens: ReturnType<typeof createListensStore>;
   annotations: ReturnType<typeof createAnnotationsStore>;
   playlists: ReturnType<typeof createPlaylistsStore>;
+  radio: ReturnType<typeof createRadioStore>;
   playback: ReturnType<typeof createPlaybackStore>;
   catalog: ReturnType<typeof createCatalogStore>;
   candidates: ReturnType<typeof createCandidatesStore>;
@@ -48,6 +50,7 @@ export async function openStore(
     listens: createListensStore(engine),
     annotations: createAnnotationsStore(engine),
     playlists: createPlaylistsStore(engine),
+    radio: createRadioStore(engine),
     playback: createPlaybackStore(engine),
     catalog: createCatalogStore(engine),
     candidates: createCandidatesStore(engine),
