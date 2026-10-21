@@ -1,0 +1,73 @@
+{
+  "data": [
+    {
+      "id": 116348464,
+      "title": "Here Comes The Sun (Remastered 2009)",
+      "duration": 184,
+      "artist": {
+        "id": 1,
+        "name": "The Beatles",
+        "tracklist": "https://api.deezer.com/artist/1/top?limit=50",
+        "type": "artist"
+      },
+      "album": {
+        "id": 12047952,
+        "title": "Abbey Road (Remastered 2009)",
+        "cover": "https://api.deezer.com/album/12047952/image",
+        "cover_small": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/56x56-000000-80-0-0.jpg",
+        "cover_medium": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/250x250-000000-80-0-0.jpg",
+        "cover_big": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/500x500-000000-80-0-0.jpg",
+        "cover_xl": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/1000x1000-000000-80-0-0.jpg",
+        "md5_image": "aa94ab293730bb7845d2aa8c672b2c29",
+        "tracklist": "https://api.deezer.com/album/12047952/tracks",
+        "type": "album"
+      }
+    },
+    {
+      "id": 116348452,
+      "title": "Come Together (Remastered 2009)",
+      "duration": 258,
+      "artist": {
+        "id": 1,
+        "name": "The Beatles",
+        "tracklist": "https://api.deezer.com/artist/1/top?limit=50",
+        "type": "artist"
+      },
+      "album": {
+        "id": 12047952,
+        "title": "Abbey Road (Remastered 2009)",
+        "cover": "https://api.deezer.com/album/12047952/image",
+        "cover_small": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/56x56-000000-80-0-0.jpg",
+        "cover_medium": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/250x250-000000-80-0-0.jpg",
+        "cover_big": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/500x500-000000-80-0-0.jpg",
+        "cover_xl": "https://cdn-images.dzcdn.net/images/cover/aa94ab293730bb7845d2aa8c672b2c29/1000x1000-000000-80-0-0.jpg",
+        "md5_image": "aa94ab293730bb7845d2aa8c672b2c29",
+        "tracklist": "https://api.deezer.com/album/12047952/tracks",
+        "type": "album"
+      }
+    },
+    {
+      "id": 116348252,
+      "title": "Drive My Car (Remastered 2009)",
+      "duration": 148,
+      "artist": {
+        "id": 1,
+        "name": "The Beatles",
+        "tracklist": "https://api.deezer.com/artist/1/top?limit=50",
+        "type": "artist"
+      },
+      "album": {
+        "id": 12047936,
+        "title": "Rubber Soul (Remastered 2009)",
+        "cover": "https://api.deezer.com/album/12047936/image",
+        "cover_small": "https://cdn-images.dzcdn.net/images/cover/da80520440d5d29876b9df3e375793b5/56x56-000000-80-0-0.jpg",
+        "cover_medium": "https://cdn-images.dzcdn.net/images/cover/da80520440d5d29876b9df3e375793b5/250x250-000000-80-0-0.jpg",
+        "cover_big": "https://cdn-images.dzcdn.net/images/cover/da80520440d5d29876b9df3e375793b5/500x500-000000-80-0-0.jpg",
+        "cover_xl": "https://cdn-images.dzcdn.net/images/cover/da80520440d5d29876b9df3e375793b5/1000x1000-000000-80-0-0.jpg",
+        "md5_image": "da80520440d5d29876b9df3e375793b5",
+        "tracklist": "https://api.deezer.com/album/12047936/tracks",
+        "type": "album"
+      }
+    }
+  ]
+}

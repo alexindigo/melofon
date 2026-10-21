@@ -1,0 +1,67 @@
+{
+  "contract": 1,
+  "name": "Deezer",
+  "version": "1.0.0",
+  "description": "Artist photos, related artists, top songs and biographies from Deezer",
+  "website": "https://www.deezer.com",
+  "capabilities": [
+    {
+      "id": "artist-photo",
+      "accepts": "artist",
+      "provides": ["artist.image.primary"],
+      "requires": []
+    },
+    {
+      "id": "artist-reference",
+      "accepts": "artist",
+      "provides": [
+        "artist.similar",
+        "artist.topTracks",
+        "artist.biography",
+        "artist.url"
+      ],
+      "requires": []
+    }
+  ],
+  "network": {
+    "hosts": [
+      "api.deezer.com",
+      "auth.deezer.com",
+      "pipe.deezer.com",
+      "cdn-images.dzcdn.net"
+    ],
+    "reason": "Search artists, fetch related artists, top songs and anonymous biographies, and download artist photos",
+    "ratePerMinute": 20
+  },
+  "settings": {
+    "type": "object",
+    "properties": {
+      "language": {
+        "type": "string",
+        "default": "en",
+        "title": "Biography language"
+      },
+      "searchLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 50,
+        "title": "Artist search results"
+      },
+      "topTrackLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 100,
+        "title": "Top songs to fetch"
+      },
+      "retrySeconds": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 86400,
+        "default": 600,
+        "title": "Quota cooldown (seconds)"
+      }
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "data": [
+    {
+      "id": 226,
+      "name": "John Lennon",
+      "link": "https://www.deezer.com/artist/226",
+      "picture": "https://api.deezer.com/artist/226/image",
+      "picture_small": "https://cdn-images.dzcdn.net/images/artist/ef6244c655e8cbe91eeb56bb6f934176/56x56-000000-80-0-0.jpg",
+      "picture_medium": "https://cdn-images.dzcdn.net/images/artist/ef6244c655e8cbe91eeb56bb6f934176/250x250-000000-80-0-0.jpg",
+      "picture_big": "https://cdn-images.dzcdn.net/images/artist/ef6244c655e8cbe91eeb56bb6f934176/500x500-000000-80-0-0.jpg",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist/ef6244c655e8cbe91eeb56bb6f934176/1000x1000-000000-80-0-0.jpg",
+      "nb_album": 47,
+      "nb_fan": 2607687,
+      "radio": true,
+      "tracklist": "https://api.deezer.com/artist/226/top?limit=50",
+      "type": "artist"
+    },
+    {
+      "id": 1446,
+      "name": "Paul McCartney",
+      "link": "https://www.deezer.com/artist/1446",
+      "picture": "https://api.deezer.com/artist/1446/image",
+      "picture_small": "https://cdn-images.dzcdn.net/images/artist/870984f223d5311f04e7791732a9f366/56x56-000000-80-0-0.jpg",
+      "picture_medium": "https://cdn-images.dzcdn.net/images/artist/870984f223d5311f04e7791732a9f366/250x250-000000-80-0-0.jpg",
+      "picture_big": "https://cdn-images.dzcdn.net/images/artist/870984f223d5311f04e7791732a9f366/500x500-000000-80-0-0.jpg",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist/870984f223d5311f04e7791732a9f366/1000x1000-000000-80-0-0.jpg",
+      "nb_album": 98,
+      "nb_fan": 1806155,
+      "radio": true,
+      "tracklist": "https://api.deezer.com/artist/1446/top?limit=50",
+      "type": "artist"
+    },
+    {
+      "id": 11,
+      "name": "The Rolling Stones",
+      "link": "https://www.deezer.com/artist/11",
+      "picture": "https://api.deezer.com/artist/11/image",
+      "picture_small": "https://cdn-images.dzcdn.net/images/artist/cac467bef484959b4ad503c4cb7ef83d/56x56-000000-80-0-0.jpg",
+      "picture_medium": "https://cdn-images.dzcdn.net/images/artist/cac467bef484959b4ad503c4cb7ef83d/250x250-000000-80-0-0.jpg",
+      "picture_big": "https://cdn-images.dzcdn.net/images/artist/cac467bef484959b4ad503c4cb7ef83d/500x500-000000-80-0-0.jpg",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist/cac467bef484959b4ad503c4cb7ef83d/1000x1000-000000-80-0-0.jpg",
+      "nb_album": 127,
+      "nb_fan": 7113558,
+      "radio": true,
+      "tracklist": "https://api.deezer.com/artist/11/top?limit=50",
+      "type": "artist"
+    }
+  ]
+}
