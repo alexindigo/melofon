@@ -1,5 +1,5 @@
 // tests/emptyok.test.ts — M3 empty-ok stubs: features melofon is not
-// building (podcasts, chat, shares, radio, similar/top, infos) return the
+// building (podcasts, chat, shares, internet radio, album infos) return the
 // correct empty payload, golden-tested in BOTH JSON and XML — never the
 // dispatch fallback's "Not implemented" envelope, never an uncaught 500.
 // getAvatar serves the same placeholder tile as a missing cover.
@@ -15,6 +15,7 @@ import { createArtwork } from '../src/artwork.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
+import { createReference } from '../src/reference.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -36,8 +37,15 @@ async function setup() {
   const scan = createScan(store);
   await scan.run();
   const library = createLibrary(store);
+  const state = createState(store);
   const bag = {
-    state: createState(store),
+    state,
+    reference: createReference({
+      store,
+      state,
+      providers: () => Promise.resolve([]),
+      enqueue: () => Promise.resolve(),
+    }),
     cfg,
     libraries,
     scan,
@@ -77,11 +85,7 @@ const EMPTY_OK: [string, Record<string, unknown>, string][] = [
     { internetRadioStations: { internetRadioStation: [] } },
     '<internetRadioStations/>',
   ],
-  ['getSimilarSongs', { similarSongs: { song: [] } }, '<similarSongs/>'],
-  ['getSimilarSongs2', { similarSongs2: { song: [] } }, '<similarSongs2/>'],
   ['getTopSongs', { topSongs: { song: [] } }, '<topSongs/>'],
-  ['getArtistInfo', { artistInfo: {} }, '<artistInfo/>'],
-  ['getArtistInfo2', { artistInfo2: {} }, '<artistInfo2/>'],
   ['getAlbumInfo', { albumInfo: {} }, '<albumInfo/>'],
   ['getAlbumInfo2', { albumInfo: {} }, '<albumInfo/>'],
 ];
@@ -90,8 +94,9 @@ Deno.test('empty-ok ops return the golden empty payload as JSON and XML', async 
   const { app, close } = await setup();
   try {
     for (const [op, jsonPayload, xmlElement] of EMPTY_OK) {
+      const args = op === 'getTopSongs' ? '&artist=not-in-library' : '';
       const jsonRes = await app(
-        new Request(`http://x/rest/${op}?${AUTH}&f=json`),
+        new Request(`http://x/rest/${op}?${AUTH}&f=json${args}`),
       );
       assertEquals(jsonRes.status, 200, `${op} JSON status`);
       const json = await jsonRes.json();
@@ -111,13 +116,33 @@ Deno.test('empty-ok ops return the golden empty payload as JSON and XML', async 
       );
 
       const xmlRes = await app(
-        new Request(`http://x/rest/${op}?${AUTH}`),
+        new Request(`http://x/rest/${op}?${AUTH}${args}`),
       );
       assertEquals(xmlRes.status, 200, `${op} XML status`);
       assertEquals(
         await xmlRes.text(),
         `${XML_HEAD}${xmlElement}</subsonic-response>`,
         `${op} XML body`,
+      );
+    }
+    // These are implemented endpoints now, with spec-required arguments.
+    for (
+      const op of [
+        'getSimilarSongs',
+        'getSimilarSongs2',
+        'getTopSongs',
+        'getArtistInfo',
+        'getArtistInfo2',
+      ]
+    ) {
+      const json = await app(new Request(`http://x/rest/${op}?${AUTH}&f=json`));
+      assertEquals((await json.json())['subsonic-response'].error.code, 10);
+      const xml = await app(new Request(`http://x/rest/${op}?${AUTH}`));
+      assertEquals(
+        await xml.text(),
+        `${
+          XML_HEAD.replace('status="ok"', 'status="failed"')
+        }<error code="10" message="Required parameter is missing"/></subsonic-response>`,
       );
     }
   } finally {

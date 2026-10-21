@@ -607,6 +607,8 @@ export async function createLookupRunner(options: {
       similarTracks: reference.similarTracks,
       topTracks: reference.topTracks,
       similarArtists: reference.similarArtists,
+      artistByName: reference.artistByName,
+      radio: reference.radio,
     },
     afterScan: () => queueIntake('missing'),
     request(

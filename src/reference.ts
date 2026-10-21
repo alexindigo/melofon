@@ -25,10 +25,12 @@ export function createReference(options: {
     providers: ReferenceProvider[],
   ) => Promise<void>;
   now?: () => number;
+  random?: () => number;
 }) {
   const { store, state } = options;
   const matcher = createReferenceMatcher(store, state);
   const now = options.now ?? Date.now;
+  const random = options.random ?? Math.random;
   state.declare('reference.order', {
     type: 'array',
     items: { type: 'string', pattern: '^[a-z0-9][a-z0-9-]*$' },
@@ -46,6 +48,82 @@ export function createReference(options: {
     maximum: 10000,
     default: 100,
   });
+  for (
+    const [name, value] of Object.entries({
+      radioAlbumSeeds: 5,
+      radioSimilarArtists: 15,
+      radioMinTopTracks: 20,
+    })
+  ) {
+    state.declare(`reference.${name}`, {
+      type: 'integer',
+      minimum: 1,
+      maximum: 10000,
+      default: value,
+    });
+  }
+  state.declare('reference.radioArtistWeight', {
+    type: 'number',
+    minimum: 1,
+    maximum: 100,
+    default: 3.5,
+  });
+  const setting = async (name: string) =>
+    await state.getTyped(`reference.${name}`) as number;
+  const validCount = (count: number) => {
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new RangeError('Invalid reference count');
+    }
+  };
+  const shuffle = (ids: string[]) => {
+    for (let i = ids.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [ids[i], ids[j]] = [ids[j], ids[i]];
+    }
+    return ids;
+  };
+  const artistMix = async (
+    artistId: string,
+    count: number,
+    user: string,
+    exclude?: string,
+  ) => {
+    const similar = await service.similarArtists(
+      artistId,
+      await setting('radioSimilarArtists'),
+      true,
+    );
+    const artists = [
+      artistId,
+      ...similar.flatMap((a) => a.present ? [a.id] : []),
+    ];
+    const topCount = Math.max(count, await setting('radioMinTopTracks'));
+    const seedWeight = await setting('radioArtistWeight');
+    const weights = new Map<string, number>();
+    for (const id of new Set(artists)) {
+      const tracks = await service.topTracks(id, topCount, user);
+      tracks.forEach((track, index) => {
+        if (track === exclude) return;
+        const weight = id === artistId
+          ? topCount * seedWeight - index
+          : topCount - index;
+        weights.set(track, (weights.get(track) ?? 0) + weight);
+      });
+    }
+    const result: string[] = [];
+    while (weights.size && result.length < count) {
+      let pick = random() * [...weights.values()].reduce((a, b) => a + b, 0);
+      for (const [id, weight] of weights) {
+        pick -= weight;
+        if (pick < 0) {
+          result.push(id);
+          weights.delete(id);
+          break;
+        }
+      }
+    }
+    return result;
+  };
   const capLists = async (
     values: ReferenceValues,
   ): Promise<ReferenceValues> => {
@@ -117,17 +195,58 @@ export function createReference(options: {
       count: number,
       user: string,
     ): Promise<string[]> {
+      validCount(count);
       const values = await service.get('artist', artistId, [
         'artist.topTracks',
       ]);
-      return matcher.tracks(values['artist.topTracks'] ?? [], count, user);
+      return values['artist.topTracks']?.length
+        ? matcher.tracks(values['artist.topTracks'], count, user)
+        : store.referenceMatcher.localTopTracks(artistId, count, user);
     },
-    async similarArtists(artistId: string, count: number) {
+    artistByName: store.referenceMatcher.artistByName,
+    /** Unknown seed is distinct from a known seed with an empty local mix. */
+    async radio(
+      seedId: string,
+      count: number,
+      user: string,
+    ): Promise<string[] | null> {
+      validCount(count);
+      const song = await store.catalog.getSong(seedId);
+      if (song) {
+        if (!count) return [];
+        const tracks = await service.similarTracks(seedId, count, user);
+        if (tracks.length < count && song.artistId) {
+          tracks.push(...await artistMix(song.artistId, count, user, seedId));
+        }
+        return [...new Set(tracks)].filter((id) => id !== seedId).slice(
+          0,
+          count,
+        );
+      }
+      const album = await store.catalog.getAlbum(seedId);
+      if (album) {
+        if (!count) return [];
+        const seeds = shuffle(album.songs.map((s) => s.id))
+          .slice(0, await setting('radioAlbumSeeds'));
+        const tracks: string[] = [];
+        for (const id of seeds) {
+          tracks.push(...await service.similarTracks(id, count, user));
+        }
+        return shuffle([...new Set(tracks)]).slice(0, count);
+      }
+      const artist = await store.catalog.artistById(seedId);
+      return artist ? count ? artistMix(seedId, count, user) : [] : null;
+    },
+    async similarArtists(artistId: string, count: number, presentOnly = false) {
       if (!Number.isSafeInteger(count) || count < 0) {
         throw new RangeError('Invalid reference count');
       }
       const values = await service.get('artist', artistId, ['artist.similar']);
-      return matcher.artists((values['artist.similar'] ?? []).slice(0, count));
+      const artists = await matcher.artists(values['artist.similar'] ?? []);
+      return (presentOnly ? artists.filter((a) => a.present) : artists).slice(
+        0,
+        count,
+      );
     },
     async record(
       type: ReferenceType,
@@ -150,5 +269,11 @@ export function createReference(options: {
 }
 export type Reference = Pick<
   ReturnType<typeof createReference>,
-  'get' | 'refresh' | 'similarTracks' | 'topTracks' | 'similarArtists'
+  | 'get'
+  | 'refresh'
+  | 'similarTracks'
+  | 'topTracks'
+  | 'similarArtists'
+  | 'artistByName'
+  | 'radio'
 >;

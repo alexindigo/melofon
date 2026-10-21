@@ -23,6 +23,8 @@ interface Image {
 }
 
 export interface ArtworkService {
+  /** A real artist photo, never the first-album artwork fallback. */
+  hasArtistPhoto(id: string): Promise<boolean>;
   get(id: string, options?: Options): Promise<ArtworkResult>;
   /** HTTP-native convenience for OwnTone: unknown is 404, never error 70. */
   cover(id: string, options?: Options): Promise<Response>;
@@ -272,6 +274,12 @@ export function createArtwork(library: Library, options: {
     return { kind: 'image', response: response(source) };
   }
   return {
+    async hasArtistPhoto(id) {
+      return !!await library.artistPhoto(
+        id,
+        await setting('maxSourceMegabytes') * 1024 * 1024,
+      );
+    },
     placeholder,
     get,
     async cover(id, opts) {

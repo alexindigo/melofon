@@ -79,6 +79,12 @@ function xmlElement(tag: string, value: unknown): string {
       text = String(val);
       continue;
     }
+    // ArtistInfoBase fields are XML elements, not the catalog DTO attributes
+    // (Navidrome responses.go:420-436). Applies to both info projections.
+    if ((tag === 'artistInfo' || tag === 'artistInfo2') && isScalar(val)) {
+      children += xmlElement(key, val);
+      continue;
+    }
     if (isScalar(val)) attrs += ` ${key}="${escapeXml(String(val))}"`;
     else {children += xmlElement(
         tag === 'structuredLyrics' && key === 'agents' ? 'agent' : key,

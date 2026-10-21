@@ -305,6 +305,7 @@ Deno.test('H5 extensions advertise implemented offset and transcoding versions',
       { name: 'songLyrics', versions: [1, 2] },
       { name: 'indexBasedQueue', versions: [1] },
       { name: 'playbackReport', versions: [1] },
+      { name: 'topSongsByArtistId', versions: [1] },
     ]);
   } finally {
     await s.close();

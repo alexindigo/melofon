@@ -73,6 +73,33 @@ export interface HatContext {
     libraries: {
       list(): Promise<LibraryFolderRow[]>;
     };
+    /** Read-only local reference projection; refresh scheduling belongs to core. */
+    reference: {
+      get(
+        type: 'artist',
+        id: string,
+        names:
+          readonly ('artist.biography' | 'artist.url' | 'artist.id.mbid')[],
+      ): Promise<{
+        'artist.biography'?: { text: string; language?: string };
+        'artist.url'?: { url: string };
+        'artist.id.mbid'?: string;
+      }>;
+      artistByName(name: string): Promise<string | null>;
+      topTracks(id: string, count: number, user: string): Promise<string[]>;
+      radio(id: string, count: number, user: string): Promise<string[] | null>;
+      similarArtists(
+        id: string,
+        count: number,
+        presentOnly?: boolean,
+      ): Promise<(
+        { present: true; id: string } | {
+          present: false;
+          name: string;
+          mbid?: string;
+        }
+      )[]>;
+    };
     scan: {
       status(): Promise<ScanStatusRow>;
       /** Background scan; resolves when done (the op does not await it). */
@@ -317,6 +344,7 @@ export interface HatContext {
       archive(entries: { name: string; path: string }[]): Promise<Blob>;
     };
     artwork: {
+      hasArtistPhoto(id: string): Promise<boolean>;
       get(id: string, options?: { size?: number; username?: string }): Promise<
         { kind: 'unknown' } | {
           kind: 'image' | 'placeholder';

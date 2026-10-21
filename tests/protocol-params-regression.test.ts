@@ -1261,6 +1261,7 @@ Deno.test('MIME facade non-form types retain query auth and exact public discove
           { name: 'songLyrics', versions: [1, 2] },
           { name: 'indexBasedQueue', versions: [1] },
           { name: 'playbackReport', versions: [1] },
+          { name: 'topSongsByArtistId', versions: [1] },
         ]);
         assertEquals(Object.keys(body).sort(), [
           'openSubsonic',

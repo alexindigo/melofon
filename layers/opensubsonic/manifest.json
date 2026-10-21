@@ -1,6 +1,12 @@
 {
   "rest": "/rest",
   "settings": {
+    "opensubsonic.similarSongsMax": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "default": 500
+    },
     "opensubsonic.jsonp": {
       "type": "string",
       "enum": ["on", "off"],

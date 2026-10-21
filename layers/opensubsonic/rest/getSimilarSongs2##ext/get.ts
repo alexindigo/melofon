@@ -1,7 +1,5 @@
-// layers/opensubsonic/rest/getSimilarSongs2/get.ts — GET
-// /rest/getSimilarSongs2 (see getSimilarSongs).
-import { ok } from '#opensubsonic/envelope.ts';
+import { similarSongs } from '#opensubsonic/reference.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default (_request: HatRequest, context: HatContext) =>
-  ok(context, { similarSongs2: { song: [] } });
+  similarSongs(context, 'similarSongs2');

@@ -1,5 +1,6 @@
 // Semantic catalog reads for reference matching; normalization/scoring is core's.
 import { type Engine, esc } from './engine.ts';
+import { requireUserId } from './users.ts';
 
 export interface MatchArtist {
   id: string;
@@ -17,6 +18,43 @@ export interface MatchTrack {
 const present = 'COALESCE(fi.present, true)';
 export function createReferenceMatcherStore(engine: Engine) {
   return {
+    artistByName(name: string): Promise<string | null> {
+      return engine.exclusive(async (q) =>
+        (await q.all<{ id: string }>(`
+        SELECT id FROM artists WHERE lower(name) = lower(${esc(name)})
+        ORDER BY id LIMIT 1`))[0]?.id ?? null
+      );
+    },
+    /** The requesting user's played-album pool, credited to the track artist. */
+    localTopTracks(
+      artistId: string,
+      count: number,
+      username: string,
+    ): Promise<string[]> {
+      if (!Number.isSafeInteger(count) || count < 0) {
+        return Promise.reject(new RangeError('Invalid reference count'));
+      }
+      return engine.exclusive(async (q) => {
+        const user = esc(await requireUserId(q, username));
+        return (await q.all<{ id: string }>(`
+        WITH song_plays AS (
+          SELECT track_id, count(*) AS n, max(played_at) AS latest
+          FROM listens WHERE user_id = ${user} GROUP BY track_id
+        ), album_plays AS (
+          SELECT f.album_id, sum(sp.n) AS n FROM files f
+          JOIN song_plays sp ON sp.track_id = f.id GROUP BY f.album_id
+        )
+        SELECT f.id FROM files f
+        LEFT JOIN file_identity fi ON fi.id = f.id
+        JOIN album_plays ap ON ap.album_id = f.album_id
+        LEFT JOIN song_plays sp ON sp.track_id = f.id
+        WHERE ${present} AND f.artist_id = ${esc(artistId)}
+        ORDER BY (sp.n IS NOT NULL) DESC, sp.n DESC NULLS LAST,
+          sp.latest DESC NULLS LAST, ap.n DESC, f.album_id,
+          coalesce(f.disc, 1), coalesce(f.track, 0), f.id LIMIT ${count}`))
+          .map((row) => row.id);
+      });
+    },
     artists(): Promise<MatchArtist[]> {
       return engine.exclusive((q) =>
         q.all<MatchArtist>(`

@@ -16,6 +16,7 @@ import { createZip } from '../src/zip.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
+import { createReference } from '../src/reference.ts';
 import { tagged } from './helpers/tagged.ts';
 
 type Item = Record<string, unknown> & { id: string; name: string };
@@ -85,12 +86,19 @@ async function setup(fn: (s: Setup) => Promise<void>) {
     };
     await seedFirstUser(store, cfg);
     const library = createLibrary(store);
+    const state = createState(store);
     const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
     const app = facade(
       core,
       await loadLayers({
         app: {
-          state: createState(store),
+          state,
+          reference: createReference({
+            store,
+            state,
+            providers: () => Promise.resolve([]),
+            enqueue: () => Promise.resolve(),
+          }),
           cfg,
           library,
           libraries,
