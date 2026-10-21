@@ -27,6 +27,33 @@ CREATE TABLE IF NOT EXISTS radio_stations (
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
 );
+-- Podcasts are shared server data, independent of scanned libraries.
+CREATE TABLE IF NOT EXISTS podcast_channels (
+  id VARCHAR PRIMARY KEY,
+  feed_url VARCHAR UNIQUE NOT NULL,
+  title VARCHAR,
+  description VARCHAR,
+  image_url VARCHAR,
+  status VARCHAR NOT NULL CHECK (status IN ('new','completed','error')),
+  error_message VARCHAR,
+  last_refresh_ms DOUBLE
+);
+CREATE TABLE IF NOT EXISTS podcast_episodes (
+  id VARCHAR PRIMARY KEY,
+  channel_id VARCHAR NOT NULL,
+  guid VARCHAR NOT NULL,
+  title VARCHAR,
+  description VARCHAR,
+  publish_date VARCHAR,
+  enclosure_url VARCHAR NOT NULL,
+  content_type VARCHAR,
+  enclosure_length DOUBLE,
+  duration DOUBLE,
+  status VARCHAR NOT NULL CHECK (status IN ('new','downloading','completed','error','deleted','skipped')),
+  file_path VARCHAR,
+  size DOUBLE,
+  UNIQUE (channel_id, guid)
+);
 CREATE TABLE IF NOT EXISTS artists (
   id VARCHAR PRIMARY KEY,
   name VARCHAR NOT NULL

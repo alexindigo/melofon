@@ -18,6 +18,8 @@ import { createListens } from './listens.ts';
 import { createIdentity } from './identity.ts';
 import { createPlaylists } from './playlists.ts';
 import { createRadio } from './radio.ts';
+import { createPodcasts } from './podcasts.ts';
+import { createNetwork } from './lookups/net.ts';
 import { createClientQueue } from './clientqueue.ts';
 import { createBookmarks } from './bookmarks.ts';
 import { createNowPlaying } from './nowplaying.ts';
@@ -58,11 +60,14 @@ const lyrics = createLyrics(store, state);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
 const scan = createScan(store, media, { notify, lyrics, state });
+const network = createNetwork({ state });
+const podcasts = await createPodcasts({ store, state, network });
 const lookups = await createLookupRunner({
   store,
   state,
   dataDir: cfg.dataDir,
   notify,
+  network,
 });
 const counts = await scan.run();
 log.event('scan_complete', counts);
@@ -208,6 +213,7 @@ const bag = {
   listens: createListens(store),
   playlists,
   radio: createRadio(store),
+  podcasts,
   clientQueue: createClientQueue(store),
   bookmarks: createBookmarks(store),
   nowPlaying,
@@ -325,6 +331,7 @@ async function shutdown(): Promise<void> {
   shuttingDown = true;
   clearInterval(engineClock);
   await lookups.close();
+  await podcasts.close();
   discovery.close();
   airplay.close();
   await Promise.all(servers.map((server) => server.shutdown()));

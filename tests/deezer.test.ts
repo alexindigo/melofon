@@ -83,6 +83,7 @@ async function replay() {
   // Only accelerate spacing in offline fixtures; original production manifest
   // and host approvals remain intact. Every call still uses the real network.
   const fastNetwork: typeof network = {
+    ...network,
     fetch(authority, input, init, limits) {
       return network.fetch(
         { ...authority, ratePerMinute: 600000 },

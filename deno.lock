@@ -20,6 +20,7 @@
     "jsr:@zip-js/zip-js@2": "2.8.57",
     "npm:@duckdb/node-api@1.5.5-r.5": "1.5.5-r.5",
     "npm:@types/node@26.2.0": "26.2.0",
+    "npm:fast-xml-parser@5.11.2": "5.11.2",
     "npm:music-metadata@11": "11.15.0",
     "npm:node-av@6.2.0-beta.24": "6.2.0-beta.24",
     "npm:taglib-wasm@2.4.0": "2.4.0"
@@ -160,6 +161,9 @@
     "@msgpack/msgpack@3.1.3": {
       "integrity": "sha512-47XIizs9XZXvuJgoaJUIE2lFoID8ugvc0jzSHP+Ptfk8nTbnR8g788wv48N03Kx0UkAv559HWRQ3yzOgzlRNUA=="
     },
+    "@nodable/entities@3.1.0": {
+      "integrity": "sha512-LsS/DjHr+uDM647Gru/cA8+J3a3HfhttwCKLyuoyN7yXTFCxKBtSgMQBvrW9yNPa2/zDRUNuGPaH5QUFoa4arQ=="
+    },
     "@seydx/node-av-darwin-arm64@6.2.0-beta.24": {
       "integrity": "sha512-E0fQzcfqZgqbMp1fZg7UAmsRlDM4KiBxuEAWq39ZzWG3JpO1RHzGX9XpsmQKAhJwz1+BIH5sInbW2gUQkHnUxg==",
       "os": ["darwin"],
@@ -206,6 +210,9 @@
         "undici-types"
       ]
     },
+    "anynum@1.0.1": {
+      "integrity": "sha512-N6//FLET/tXYNM/F6ABca1oH6fWB+KlTt909Le28WMDBk8oaT4vY17DCrwg2MvmuqUKt3Ni4N5dGJ/EoBgcO6A=="
+    },
     "bluebird@3.7.2": {
       "integrity": "sha512-XpNj6GDQzdfW+r2Wnn7xiSAd7TM3jzkxGXBGTtWKuSXv1xUV+azxAm8jdWZN06QTQk+2N2XB9jRDkvbmQmcRtg=="
     },
@@ -229,6 +236,25 @@
       "dependencies": [
         "readable-stream"
       ]
+    },
+    "fast-xml-builder@1.3.1": {
+      "integrity": "sha512-pIM/1n3ntFXKYrUZwW7QCK0gAW7XY+wzj1YMIV3tLDvPj/V+zTGJK5e3/4WJfwj0qWw2ElNXiTixda/R+3YSug==",
+      "dependencies": [
+        "path-expression-matcher",
+        "xml-naming"
+      ]
+    },
+    "fast-xml-parser@5.11.2": {
+      "integrity": "sha512-R9iDuNrQYeQut46cn2r2wHKn4HYzVDvDm5J1wW+koZewykv0yuO2HChTYeZtrULyHIDM9cj9TUXloCsueCQUog==",
+      "dependencies": [
+        "@nodable/entities",
+        "fast-xml-builder",
+        "is-unsafe",
+        "path-expression-matcher",
+        "strnum",
+        "xml-naming"
+      ],
+      "bin": true
     },
     "file-type@21.3.4": {
       "integrity": "sha512-Ievi/yy8DS3ygGvT47PjSfdFoX+2isQueoYP1cntFW1JLYAuS4GD7NUPGg4zv2iZfV52uDyk5w5Z0TdpRS6Q1g==",
@@ -255,6 +281,9 @@
     },
     "inherits@2.0.4": {
       "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ=="
+    },
+    "is-unsafe@2.0.2": {
+      "integrity": "sha512-HgbIHPBH0KHHCcjLfGsCvhtPTVxjaAZlXjwdz7/GQC40SjSe4sfQsar8J5VFo8JOSbarkpV0OLG95bbaNd9aAQ=="
     },
     "isarray@1.0.0": {
       "integrity": "sha512-VLghIWNM6ELQzo7zwmcg0NmTVyWKYjvIeM83yjp0wRDTmUnrM678fQbcKBo6n2CJEF0szoG//ytg+TKla89ALQ=="
@@ -307,6 +336,9 @@
     "node-int64@0.4.0": {
       "integrity": "sha512-O5lz91xSOeoXP6DulyHfllpq+Eg00MWitZIbtPfoSEvqIHdl5gfcY6hYzDWnj0qD5tz52PI08u9qUvSVeUBeHw=="
     },
+    "path-expression-matcher@1.6.2": {
+      "integrity": "sha512-enSlaiat05iasnzmgNxRj8reFdj3puY2QpNgP1aPIaVfT6nn9ICuPoFlKHk8EN22HcwewshO+mN2DGbkCEOtqQ=="
+    },
     "process-nextick-args@2.0.1": {
       "integrity": "sha512-3ouUOpQhtgrbOa17J7+uxOTpITYWaGP7/AhoR3+A+/1e9skrzelGi/dXzEYyvbxubEF6Wn2ypscTKiKJFFn1ag=="
     },
@@ -329,6 +361,12 @@
       "integrity": "sha512-n/ShnvDi6FHbbVfviro+WojiFzv+s8MPMHBczVePfUpDJLwoLT0ht1l4YwBCbi8pJAveEEdnkHyPyTP/mzRfwg==",
       "dependencies": [
         "safe-buffer"
+      ]
+    },
+    "strnum@2.5.1": {
+      "integrity": "sha512-UM4nTLWzQiDBseVxUGxN0wJzIk0UU89Qi7pKXz9qISo+lhviJikTuikBsK/oFRlpvYHvSdz0TVoLyQ+sEpYwxA==",
+      "dependencies": [
+        "anynum"
       ]
     },
     "strtok3@10.3.5": {
@@ -375,6 +413,9 @@
     },
     "win-guid@0.2.1": {
       "integrity": "sha512-gEIQU4mkgl2OPeoNrWflcJFJ3Ae2BPd4eCsHHA/XikslkIVms/nHhvnvzIZV7VLmBvtFlDOzLt9rrZT+n6D67A=="
+    },
+    "xml-naming@0.3.0": {
+      "integrity": "sha512-ghig2TBE/H11aOVgmahA3MhimvkBr6JIYknH/Dhdk10nXwdbIqBJsbfMxpvFPG8bAw77gN29aQWvKpmVoPlvPQ=="
     }
   },
   "workspace": {
@@ -386,6 +427,7 @@
       "jsr:@zip-js/zip-js@2",
       "npm:@duckdb/node-api@1.5.5-r.5",
       "npm:@types/node@26.2.0",
+      "npm:fast-xml-parser@5.11.2",
       "npm:music-metadata@11",
       "npm:node-av@6.2.0-beta.24",
       "npm:taglib-wasm@2.4.0"

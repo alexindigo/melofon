@@ -243,6 +243,8 @@ Deno.test('reference service: real Worker/network consumers, background refresh,
         manifest(),
       );
     }
+    // Direct loopback fixtures explicitly opt in to the shared outbound policy.
+    await state.set('net.allowPrivateDestinations', 'true');
     await state.set('lookups.maxAttempts', '1');
     const active = await start();
     const reference = active.reference;

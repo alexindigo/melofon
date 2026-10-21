@@ -22,6 +22,7 @@
     "@std/http": "jsr:@std/http@1",
     "@types/node": "npm:@types/node@26.2.0",
     "@zip-js/zip-js": "jsr:@zip-js/zip-js@2",
+    "fast-xml-parser": "npm:fast-xml-parser@5.11.2",
     "music-metadata": "npm:music-metadata@11",
     "node-av": "npm:node-av@6.2.0-beta.24",
     "taglib-wasm": "npm:taglib-wasm@2.4.0"

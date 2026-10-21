@@ -63,6 +63,7 @@ export interface EventFacts {
   };
   lookup_plugin_log: { plugin: string; payload: unknown };
   lookup_failed: { plugin: string } & ErrorFacts;
+  podcast_failed: ErrorFacts;
   restore_complete: {
     queued: number;
     state: string;
@@ -238,6 +239,12 @@ export const events: Record<EventId, EventDefinition> = {
     'error',
     'Lookup failed',
     'plugin error',
+  ),
+  podcast_failed: definition(
+    'podcasts',
+    'error',
+    'Podcast refresh failed',
+    'error',
   ),
   scan_fingerprint_failed: definition(
     'scan',
