@@ -8,6 +8,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createStream } from '../src/stream.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createMedia } from '../src/media.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
@@ -104,7 +105,7 @@ export async function setupH5() {
       event(id) {
         events.push(id);
       },
-    }),
+    }, createFileSource(library)),
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));

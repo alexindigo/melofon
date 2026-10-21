@@ -5,6 +5,7 @@ import type { State } from '../state.ts';
 import type { SettingValue } from '../settings-schema.ts';
 import { createLibrary, type Library } from '../library.ts';
 import {
+  declareImageDownload,
   imageExtension,
   imageHash,
   libraryImagesWritable,
@@ -108,6 +109,7 @@ export async function createLookupRunner(options: {
   now?: () => number;
 }) {
   const { store, state } = options;
+  declareImageDownload(state);
   const log = options.log ?? scopedLog('lookups');
   const library = options.library ??
     createLibrary(store, undefined, { dataDir: options.dataDir });
@@ -126,12 +128,6 @@ export async function createLookupRunner(options: {
       type: 'array',
       items: { type: 'integer', minimum: 1 },
       default: [60, 600],
-    },
-    imageMaxMegabytes: {
-      type: 'integer',
-      default: 20,
-      minimum: 1,
-      maximum: 200,
     },
     doneRetentionDays: {
       type: 'integer',
@@ -173,7 +169,8 @@ export async function createLookupRunner(options: {
     Number(await state.getTyped(`lookups.${key}`));
   const limits = async () => ({
     timeoutMs: await numeric('jobTimeoutSeconds') * 1000,
-    maxBytes: await numeric('imageMaxMegabytes') * 1024 * 1024,
+    maxBytes: Number(await state.getTyped('lookups.imageMaxMegabytes')) * 1024 *
+      1024,
   });
   const configure = async (host: LookupHost, revision: number) => {
     const manifest = host.plugin.manifest;

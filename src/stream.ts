@@ -6,6 +6,7 @@ import { Buffer } from 'node:buffer';
 import { extname } from 'node:path';
 import type { Media } from './media.ts';
 import type { Playback } from './playback.ts';
+import type { FileSource } from './file-source.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   type ClientCapabilities,
@@ -37,6 +38,7 @@ export type StreamDecision =
     channels?: number;
   };
 export interface StreamService {
+  source: FileSource;
   file(
     request: Request,
     path: string,
@@ -75,6 +77,7 @@ export function createStream(
   playback?: Playback,
   cfg?: { absentToMp3?: boolean; secret?: string },
   log: Log = scopedLog('stream'),
+  source: FileSource = () => Promise.resolve(null),
 ): StreamService {
   const secret = cfg?.secret ?? crypto.randomUUID();
   const signature = (payload: string) =>
@@ -167,6 +170,7 @@ export function createStream(
     return new Response(audio.stream, { headers });
   };
   return {
+    source,
     file: fixed,
     async play(request, file, format, identity, maxBitRateKbps, options) {
       if (format === 'raw') return fixed(request, file.path, identity);

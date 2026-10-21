@@ -3,6 +3,17 @@ import { constants } from 'node:fs';
 import { access, link, mkdir, open, stat, unlink } from 'node:fs/promises';
 import type { LibraryRow } from './store/catalog.ts';
 import type { IAudioMetadata, IPicture } from 'music-metadata';
+import type { State } from './state.ts';
+
+/** One download cap for lookup pictures and other core-owned remote images. */
+export function declareImageDownload(state: Pick<State, 'declare'>) {
+  state.declare('lookups.imageMaxMegabytes', {
+    type: 'integer',
+    default: 20,
+    minimum: 1,
+    maximum: 200,
+  });
+}
 
 type ImageLibrary = Pick<LibraryRow, 'path'>;
 export interface ImageReference {

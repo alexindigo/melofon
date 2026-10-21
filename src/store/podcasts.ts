@@ -13,6 +13,8 @@ export interface PodcastChannel {
   title: string | null;
   description: string | null;
   imageUrl: string | null;
+  imagePath: string | null;
+  imageSourceUrl: string | null;
   status: 'new' | 'completed' | 'error';
   errorMessage: string | null;
   lastRefreshMs: number | null;
@@ -33,6 +35,7 @@ export interface PodcastEpisode extends EpisodeFacts {
   status: PodcastStatus;
   filePath: string | null;
   size: number | null;
+  errorMessage: string | null;
 }
 export interface PodcastFeed {
   title: string | null;
@@ -48,11 +51,13 @@ const nullable = (value: string | number | null) =>
     : String(value);
 const CHANNEL = `SELECT id, feed_url AS "feedUrl", title, description,
   image_url AS "imageUrl", status, error_message AS "errorMessage",
-  last_refresh_ms AS "lastRefreshMs" FROM podcast_channels`;
+  last_refresh_ms AS "lastRefreshMs", image_path AS "imagePath",
+  image_source_url AS "imageSourceUrl" FROM podcast_channels`;
 const EPISODE = `SELECT id, channel_id AS "channelId", guid, title, description,
   publish_date AS "publishDate", enclosure_url AS "enclosureUrl",
   content_type AS "contentType", enclosure_length AS "enclosureLength",
-  duration, status, file_path AS "filePath", size FROM podcast_episodes`;
+  duration, status, file_path AS "filePath", size,
+  error_message AS "errorMessage" FROM podcast_episodes`;
 const ORDER = ' ORDER BY publish_date DESC NULLS LAST, id';
 const channel = async (q: Queries, id: string) =>
   (await q.all<PodcastChannel>(`${CHANNEL} WHERE id=${esc(id)}`))[0] ?? null;
@@ -107,7 +112,9 @@ export function createPodcastsStore(engine: Engine) {
             ON CONFLICT (channel_id,guid) DO UPDATE SET title=excluded.title,
               description=excluded.description,publish_date=excluded.publish_date,
               enclosure_url=excluded.enclosure_url,content_type=excluded.content_type,
-              enclosure_length=excluded.enclosure_length,duration=excluded.duration`);
+              enclosure_length=excluded.enclosure_length,
+              duration=CASE WHEN podcast_episodes.status='completed'
+                THEN podcast_episodes.duration ELSE excluded.duration END`);
         }
         return await channel(q, id);
       });
@@ -147,5 +154,59 @@ export function createPodcastsStore(engine: Engine) {
         (await q.all<PodcastEpisode>(`${EPISODE} WHERE id=${esc(id)}`))[0] ??
           null
       ),
+    queued: () =>
+      engine.exclusive((q) =>
+        q.all<PodcastEpisode>(
+          `${EPISODE} WHERE status='downloading'${ORDER}`,
+        )
+      ),
+    queue(id: string) {
+      return atomic(engine, async (q) => {
+        await q.run(
+          `UPDATE podcast_episodes SET status='downloading',error_message=NULL
+          WHERE id=${esc(id)} AND status<>'downloading'`,
+        );
+        return (await q.all<PodcastEpisode>(`${EPISODE} WHERE id=${esc(id)}`))[
+          0
+        ] ?? null;
+      });
+    },
+    finish(
+      id: string,
+      result:
+        | {
+          status: 'completed';
+          path: string;
+          size: number;
+          duration: number | null;
+        }
+        | { status: 'error'; message: string }
+        | { status: 'deleted' },
+    ) {
+      return atomic(engine, async (q) => {
+        await q.run(`UPDATE podcast_episodes SET status=${esc(result.status)},
+          file_path=${
+          result.status === 'completed' ? esc(result.path) : 'NULL'
+        },
+          size=${result.status === 'completed' ? result.size : 'NULL'},
+          error_message=${
+          result.status === 'error' ? esc(result.message) : 'NULL'
+        }
+          ${
+          result.status === 'completed'
+            ? `,duration=${nullable(result.duration)}`
+            : ''
+        }
+          WHERE id=${esc(id)}`);
+      });
+    },
+    image(id: string, path: string, sourceUrl: string) {
+      return atomic(
+        engine,
+        (q) =>
+          q.run(`UPDATE podcast_channels SET image_path=${esc(path)},
+        image_source_url=${esc(sourceUrl)} WHERE id=${esc(id)}`),
+      );
+    },
   };
 }

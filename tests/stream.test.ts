@@ -9,6 +9,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createStream } from '../src/stream.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createMedia } from '../src/media.ts';
 import { createArtwork } from '../src/artwork.ts';
 import { loadLayers } from '../src/layers.ts';
@@ -40,7 +41,13 @@ async function setup() {
     libraries,
     user: createUserService(store, cfg),
     library,
-    stream: createStream(createMedia()),
+    stream: createStream(
+      createMedia(),
+      undefined,
+      undefined,
+      undefined,
+      createFileSource(library),
+    ),
     artwork: createArtwork(library),
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });

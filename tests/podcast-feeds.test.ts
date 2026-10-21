@@ -66,18 +66,37 @@ async function setup() {
   const dir = await Deno.makeTempDir();
   const store = await openStore(`${dir}/data`);
   const state = createState(store);
+  // This fixture exercises feed facts only; downloads have their own real-file consumers.
+  state.declare('podcasts.autoDownloadNewest', {
+    type: 'integer',
+    default: 1,
+    minimum: 0,
+  });
+  await state.set('podcasts.autoDownloadNewest', '0');
   const clock = new Clock();
   let body = rss(), status = 200, hits = 0;
   const server = Deno.serve(
     { hostname: '127.0.0.1', port: 0, onListen() {} },
-    () => {
+    (request) => {
+      if (!new URL(request.url).pathname.startsWith('/feed')) {
+        return new Response(null, { status: 404 });
+      }
       hits++;
       return new Response(body, { status });
     },
   );
-  const network = createNetwork({ state });
+  const network = createNetwork({
+    state,
+    fixtures: { 'images.example.test': `http://127.0.0.1:${server.addr.port}` },
+  });
   await state.set('net.allowPrivateDestinations', 'true');
-  const podcasts = await createPodcasts({ store, state, network, clock });
+  const podcasts = await createPodcasts({
+    store,
+    state,
+    network,
+    clock,
+    dataDir: `${dir}/data`,
+  });
   await state.set('podcasts.requestsPerMinute', '600000');
   return {
     dir,
@@ -125,6 +144,7 @@ Deno.test('podcast service adds RSS facts, idempotently refreshes and keeps stab
       status: 'new',
       filePath: null,
       size: null,
+      errorMessage: null,
     });
     s.set(
       rss(
@@ -255,6 +275,7 @@ Deno.test('podcast refresh schedule uses persisted per-channel age, injected tim
       state: s.state,
       network: s.network,
       clock: s.clock,
+      dataDir: `${s.dir}/data`,
     });
     try {
       assertEquals(s.hits(), initial + 3);
@@ -308,6 +329,7 @@ Deno.test('podcast kept rows survive store reopen and deletion atomically remove
       store: reopened,
       state: createState(reopened),
       clock: new Clock(),
+      dataDir: `${s.dir}/data`,
     });
     try {
       assertEquals((await restarted.channels()).length, 2);

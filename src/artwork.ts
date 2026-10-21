@@ -8,6 +8,7 @@ import { imageHash, readImage } from './images.ts';
 import { imageHeader, withinPixels } from './image-header.ts';
 import { animatedImage, playlistImage, resizeImage } from './media.ts';
 import { createArtworkCache } from './artwork-cache.ts';
+import type { Podcasts } from './podcasts.ts';
 
 export type ArtworkResult = { kind: 'unknown' } | {
   kind: 'image' | 'placeholder';
@@ -47,6 +48,7 @@ export function createArtwork(library: Library, options: {
   state?: Pick<State, 'declare' | 'getTyped'>;
   dataDir?: string;
   playlists?: Playlists;
+  podcasts?: Pick<Podcasts, 'cover'>;
   /** Native processing port, also lets admission be exercised deterministically. */
   resize?: typeof resizeImage;
 } = {}): ArtworkService {
@@ -105,6 +107,8 @@ export function createArtwork(library: Library, options: {
     id: string,
     maxBytes: number,
   ): Promise<Image | null | 'unknown'> {
+    const podcast = await options.podcasts?.cover(id, maxBytes);
+    if (podcast !== undefined && podcast !== 'unknown') return podcast;
     const song = await library.getSong(id);
     if (song !== null) {
       const own = await library.embeddedCover(id, maxBytes);

@@ -32,6 +32,7 @@ import { projectCommandProvenance } from '../src/command-provenance.ts';
 import lastCommandGet from '../core/last-command/get.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createStream } from '../src/stream.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createUserService } from '../src/user.ts';
 import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 
@@ -241,7 +242,13 @@ async function setupWire() {
     player,
     outputs: createOutputs({ notify, log }),
     playback,
-    stream: createStream(createMedia(), playback),
+    stream: createStream(
+      createMedia(),
+      playback,
+      undefined,
+      undefined,
+      createFileSource(library),
+    ),
     notify,
     binds: createBinds(() => layers, {}),
   };

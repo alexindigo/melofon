@@ -24,6 +24,7 @@ import { createClientQueue } from './clientqueue.ts';
 import { createBookmarks } from './bookmarks.ts';
 import { createNowPlaying } from './nowplaying.ts';
 import { createStream } from './stream.ts';
+import { createFileSource } from './file-source.ts';
 import { createZip } from './zip.ts';
 import { createMedia } from './media.ts';
 import { createArtwork } from './artwork.ts';
@@ -61,7 +62,13 @@ const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
 const scan = createScan(store, media, { notify, lyrics, state });
 const network = createNetwork({ state });
-const podcasts = await createPodcasts({ store, state, network });
+const podcasts = await createPodcasts({
+  store,
+  state,
+  network,
+  media,
+  dataDir: cfg.dataDir,
+});
 const lookups = await createLookupRunner({
   store,
   state,
@@ -218,9 +225,20 @@ const bag = {
   bookmarks: createBookmarks(store),
   nowPlaying,
   playback,
-  stream: createStream(media, playback, cfg),
+  stream: createStream(
+    media,
+    playback,
+    cfg,
+    undefined,
+    createFileSource(library, podcasts),
+  ),
   zip: createZip(),
-  artwork: createArtwork(library, { state, dataDir: cfg.dataDir, playlists }),
+  artwork: createArtwork(library, {
+    state,
+    dataDir: cfg.dataDir,
+    playlists,
+    podcasts,
+  }),
   player,
   outputs,
   notify,

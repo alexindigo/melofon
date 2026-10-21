@@ -62,6 +62,7 @@ async function router(
       albumsByArtist: () => Promise.resolve([]),
     },
     playlists: { get: none },
+    stream: { source: none },
     artwork: {
       cover: () => Promise.resolve(new Response(PNG)),
       placeholder: () => new Response(PNG),

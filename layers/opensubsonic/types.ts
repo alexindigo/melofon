@@ -318,6 +318,9 @@ export interface HatContext {
       nowPlayingView(): Promise<NowPlayingViewRow[]>;
     };
     stream: {
+      source(
+        id: string,
+      ): Promise<{ path: string; isVideo: boolean; trackId?: string } | null>;
       file(
         request: Request,
         path: string,

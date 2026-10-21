@@ -243,7 +243,7 @@ export const events: Record<EventId, EventDefinition> = {
   podcast_failed: definition(
     'podcasts',
     'error',
-    'Podcast refresh failed',
+    'Podcast operation failed',
     'error',
   ),
   scan_fingerprint_failed: definition(

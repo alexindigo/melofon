@@ -16,6 +16,7 @@ import { createListens } from '../src/listens.ts';
 import { createBookmarks } from '../src/bookmarks.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createStream } from '../src/stream.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createMedia } from '../src/media.ts';
 import { createZip } from '../src/zip.ts';
 import { BlobReader, Uint8ArrayWriter, ZipReader } from '@zip-js/zip-js';
@@ -42,18 +43,25 @@ async function setup() {
   await libraries.add('Music', 'tests/fixtures/library');
   const scan = createScan(store);
   await scan.run();
+  const library = createLibrary(store);
   const bag = {
     state: createState(store),
     cfg,
     libraries,
     scan,
     user: createUserService(store, cfg),
-    library: createLibrary(store),
+    library,
     annotation: createAnnotation(store),
     listens: createListens(store),
     bookmarks: createBookmarks(store),
     playlists: createPlaylists(store),
-    stream: createStream(createMedia()),
+    stream: createStream(
+      createMedia(),
+      undefined,
+      undefined,
+      undefined,
+      createFileSource(library),
+    ),
     zip: createZip(),
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });

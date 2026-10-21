@@ -24,6 +24,7 @@ import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { createStream } from '../src/stream.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createMedia } from '../src/media.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
@@ -56,7 +57,13 @@ async function setup() {
     library,
     annotation: createAnnotation(store),
     listens: createListens(store),
-    stream: createStream(createMedia()),
+    stream: createStream(
+      createMedia(),
+      undefined,
+      undefined,
+      undefined,
+      createFileSource(library),
+    ),
   };
   const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
   const app = facade(core, await loadLayers({ app: bag }));

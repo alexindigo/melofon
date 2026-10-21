@@ -19,6 +19,7 @@ import { createNowPlaying } from '../src/nowplaying.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createStream } from '../src/stream.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createMedia } from '../src/media.ts';
 import { createNotify } from '../src/notify.ts';
 import { createBinds } from '../src/binds.ts';
@@ -65,7 +66,13 @@ async function setup() {
     player,
     outputs: createOutputs({ notify }),
     playback,
-    stream: createStream(createMedia(), playback),
+    stream: createStream(
+      createMedia(),
+      playback,
+      undefined,
+      undefined,
+      createFileSource(library),
+    ),
     notify,
     binds: createBinds(() => layers, {}),
   };

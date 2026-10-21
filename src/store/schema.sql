@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS podcast_episodes (
   size DOUBLE,
   UNIQUE (channel_id, guid)
 );
+ALTER TABLE podcast_channels ADD COLUMN IF NOT EXISTS image_path VARCHAR;
+ALTER TABLE podcast_channels ADD COLUMN IF NOT EXISTS image_source_url VARCHAR;
+ALTER TABLE podcast_episodes ADD COLUMN IF NOT EXISTS error_message VARCHAR;
 CREATE TABLE IF NOT EXISTS artists (
   id VARCHAR PRIMARY KEY,
   name VARCHAR NOT NULL

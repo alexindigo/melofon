@@ -14,6 +14,7 @@ import { createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createState } from '../src/state.ts';
 import { createStream } from '../src/stream.ts';
+import { createFileSource } from '../src/file-source.ts';
 import { createMedia } from '../src/media.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
@@ -74,7 +75,13 @@ async function setup() {
           annotation: createAnnotation(store),
           listens,
           playback,
-          stream: createStream(createMedia(), playback, cfg),
+          stream: createStream(
+            createMedia(),
+            playback,
+            cfg,
+            undefined,
+            createFileSource(library),
+          ),
           user: createUserService(store, cfg),
         },
       }),
