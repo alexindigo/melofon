@@ -75,15 +75,17 @@ Deno.test('hls.m3u8 serves a VOD media playlist with credential-carrying segment
     const body = await res.text();
     const lines = body.split('\n');
     assertEquals(lines[0], '#EXTM3U');
-    assert(lines.includes('#EXT-X-TARGETDURATION:10'));
-    // The 2s fixture: one 2s segment, then ENDLIST (VOD).
-    assert(lines.includes('#EXTINF:2,'));
+    const duration = parseFloat(
+      lines.find((l) => l.startsWith('#EXTINF:'))!.slice(8),
+    );
+    assert(duration >= 2 && duration < 2.1);
+    assert(lines.includes(`#EXT-X-TARGETDURATION:${Math.ceil(duration)}`));
     const segmentLine = lines.find((l) => l.startsWith('/rest/hls/'));
     assert(segmentLine !== undefined, `no segment URL in:\n${body}`);
     assert(segmentLine!.includes('/rest/hls/segment.ts?'));
     assert(segmentLine!.includes(`id=${videoId}`));
     assert(segmentLine!.includes('segmentIndex=0'));
-    assert(segmentLine!.includes('duration=2'));
+    assert(segmentLine!.includes(`duration=${duration}`));
     // AVPlayer sends no cookies: the credentials ride the URL.
     assert(segmentLine!.includes('u=admin'));
     assert(segmentLine!.includes('p=test'));
@@ -112,9 +114,12 @@ Deno.test('a listed segment serves video/MP2T with the TS sync byte, cached unde
     assert(bytes.length > 1000);
 
     // The remux landed in the dataDir cache (not /tmp).
-    const stat = await Deno.stat(
-      `${dir}/hls/${videoId}/source/seg0.ts`,
-    );
+    const outputs = [];
+    for await (const entry of Deno.readDir(`${dir}/hls`)) {
+      outputs.push(entry.name);
+    }
+    assertEquals(outputs.length, 1);
+    const stat = await Deno.stat(`${dir}/hls/${outputs[0]}/seg0.ts`);
     assert(stat.isFile);
   } finally {
     await close();
@@ -133,14 +138,19 @@ Deno.test('several bitRate params answer a variant playlist', async () => {
     const body = await res.text();
     const lines = body.split('\n');
     assert(
-      lines.includes('#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1000000'),
+      lines.some((l) =>
+        /^#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=\d+,RESOLUTION=480x360$/
+          .test(l)
+      ),
     );
     assert(
-      lines.includes('#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=2000000'),
+      lines.filter((l) => l.startsWith('#EXT-X-STREAM-INF:')).length === 2,
     );
     const rung = lines.find((l) => l.startsWith('/rest/hls.m3u8?'));
     assert(rung !== undefined, `no rung URL in:\n${body}`);
-    assert(rung!.includes('bitRate=1000@480x360'));
+    assert(
+      new URL(`http://x${rung}`).searchParams.get('bitRate') === '1000@480x360',
+    );
     assert(rung!.includes('u=admin'));
     assert(
       !body.includes('#EXT-X-ENDLIST'),

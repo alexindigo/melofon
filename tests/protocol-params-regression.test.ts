@@ -316,12 +316,20 @@ async function setup() {
       },
     },
     media: {
-      hlsRemux: async (_path: string, out: string) => {
+      hls: (_path: string, out: string) => {
         calls.hls.push(out);
-        await Deno.mkdir(out, { recursive: true });
-        await Deno.writeTextFile(`${out}/index.m3u8`, '#EXTM3U\n');
-        await Deno.writeTextFile(`${out}/seg0.ts`, 'fixture-segment');
-        return 1;
+        return Promise.resolve({
+          width: 320,
+          height: 180,
+          bandwidth: 1000,
+          complete: true,
+          segments: [{ duration: 10 }],
+          segment: (index: number) =>
+            Promise.resolve(
+              index === 0 ? new Response('fixture-segment').body : null,
+            ),
+          release: async () => {},
+        });
       },
     },
   };

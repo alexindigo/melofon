@@ -393,9 +393,22 @@ export interface HatContext {
       ): Promise<Response>;
     };
     media: {
-      /** Remux to 10s MPEG-TS HLS segments in outDir (stream copy);
-       *  null when the file is not remuxable or the mux fails. */
-      hlsRemux(path: string, outDir: string): Promise<number | null>;
+      hls(path: string, cacheRoot: string, options?: {
+        kbps?: number;
+        width?: number;
+        height?: number;
+        audioTrack?: number;
+      }): Promise<
+        {
+          width: number;
+          height: number;
+          bandwidth: number;
+          complete: boolean;
+          segments: { duration: number }[];
+          segment(index: number): Promise<ReadableStream<Uint8Array> | null>;
+          release(): Promise<void>;
+        } | null
+      >;
     };
     zip: {
       archive(entries: { name: string; path: string }[]): Promise<Blob>;

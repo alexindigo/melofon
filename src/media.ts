@@ -2,10 +2,10 @@
 // bindings to FFmpeg's libraries — never the ffmpeg/ffprobe CLI, never Deno
 // FFI to libav; see ~/Documents/melofon/todos/ffmpeg-deno-ffi.md for the
 // long-term binding TODO). Hats and scan see only this interface; nothing
-// else in the tree imports node-av. M4.6 adds hlsRemux: stream-copy (H.264 +
-// AAC, no re-encode) into 10s MPEG-TS HLS segments in a caller-chosen cache
-// dir. M6 adds decodePcm for the boots: the engine's current track decoded
-// to raw interleaved PCM (44100/16-bit/stereo, the RAOP default quality in
+// else in the tree imports node-av. HLS prepares H.264/AAC event/VOD outputs
+// through a core-owned bounded cache, remuxing compatible sources or encoding
+// requested renditions. M6 adds decodePcm for the boots: the engine's current
+// track decoded to raw interleaved PCM (44100/16-bit/stereo, the RAOP default quality in
 // raop.c), streamed frame by frame. The transcode slice adds transcodeAudio:
 // decode → encode → mux, STREAMED through the muxer's write callback into a
 // ReadableStream (chunked HTTP, never buffered whole, no ffmpeg CLI).
@@ -23,6 +23,7 @@ import {
   AV_CODEC_ID_VORBIS,
   AV_NOPTS_VALUE,
   AV_PIX_FMT_RGBA,
+  AV_PIX_FMT_YUV420P,
   AV_PIX_FMT_YUVJ420P,
   AV_SAMPLE_FMT_S16,
   AV_TIME_BASE,
@@ -44,6 +45,7 @@ import {
   FF_ENCODER_LIBOPUS,
   FF_ENCODER_LIBVORBIS,
   FF_ENCODER_LIBWEBP_ANIM,
+  FF_ENCODER_LIBX264,
   FF_ENCODER_MJPEG,
   FF_ENCODER_PNG,
   FF_QP2LAMBDA,
@@ -61,6 +63,13 @@ import { extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { type Log, scopedLog } from './logging.ts';
 import type { State } from './state.ts';
+import {
+  createHlsCache,
+  type HlsFacts,
+  type HlsOptions,
+  type HlsSettings,
+  type HlsView,
+} from './hls-cache.ts';
 import {
   type CaptionCue,
   type MediaTrack,
@@ -161,12 +170,12 @@ export interface Media {
       signal?: AbortSignal;
     },
   ): Promise<TranscodedAudio | null>;
-  /** Remux a video into HLS: 10s MPEG-TS segments (`seg<N>.ts`) plus FFmpeg's
-   * own `index.m3u8` in `outDir`. Stream copy — H.264 video + AAC audio only
-   * (a transcode profile for other codecs is not M4.6). Returns the segment
-   * count, or null when the file is not remuxable or the mux fails.
-   * Concurrent calls for the same target share one run. */
-  hlsRemux(path: string, outDir: string): Promise<number | null>;
+  /** Shared event/VOD output, with native segment timing and a cache lease. */
+  hls(
+    path: string,
+    cacheRoot: string,
+    options?: HlsOptions,
+  ): Promise<HlsView | null>;
   /** Audio track of `path` decoded to raw interleaved PCM — 44100 Hz,
    * 16-bit, stereo, the RAOP default quality (raop.c). Boots stream the
    * chunks to their sink; each chunk is one decoded frame's bytes (a copy,
@@ -318,9 +327,6 @@ const EMPTY: Probe = {
 const PCM_RATE = 44100;
 const PCM_CHANNELS = 2;
 const PCM_BYTES_PER_SAMPLE = 2 * PCM_CHANNELS; // s16le interleaved
-
-// HLS segment length in seconds (Airsonic's SEGMENT_DURATION, probed).
-const HLS_SEGMENT_SECONDS = 10;
 
 // Artwork's native boundary. Callers inspect image headers and admit work first.
 // Fresh frames intentionally carry neither EXIF orientation nor ICC side data.
@@ -585,61 +591,186 @@ export function createMedia(
       await state?.getTyped(`media.transcode.${format}.bitRateKbps`) ??
         TRANSCODE_PROFILES[format].bitRateKbps,
     );
-  // One remux per target at a time (two clients asking for the same video
-  // share the run, and the loser of the race never sees a half-written dir).
-  const inflight = new Map<string, Promise<number | null>>();
+  const hls = createHlsCache(encodeHls, state);
 
-  async function remux(path: string, outDir: string): Promise<number | null> {
-    let input: Demuxer | undefined;
-    let output: Muxer | undefined;
+  async function encodeHls(
+    path: string,
+    dir: string,
+    options: HlsOptions,
+    config: HlsSettings,
+    publish: (facts: HlsFacts) => Promise<void>,
+  ): Promise<HlsFacts | null> {
     try {
-      input = await Demuxer.open(path);
+      await using input = await Demuxer.open(path);
       const video = input.video();
-      if (video === undefined || video.codecpar.codecId !== AV_CODEC_ID_H264) {
-        return null; // not an H.264 video — no M4.6 transcode profile
+      const audio = options.audioTrack === undefined
+        ? input.audio()
+        : input.streams.find(
+          (s) =>
+            s.index === options.audioTrack &&
+            s.codecpar.codecType === AVMEDIA_TYPE_AUDIO,
+        );
+      if (!video || (options.audioTrack !== undefined && !audio)) return null;
+      let width = video.codecpar.width, height = video.codecpar.height;
+      if (options.width !== undefined && options.height !== undefined) {
+        width = options.width;
+        height = options.height;
+      } else if (options.kbps !== undefined) {
+        const ladder = config.ladder.map((rung) =>
+          rung.split(/[@x]/).map(Number)
+        ).sort((a, b) => a[0] - b[0]);
+        const box = ladder.find((rung) => rung[0] >= options.kbps!) ??
+          ladder.at(-1);
+        if (box) {
+          const ratio = Math.min(1, box[1] / width, box[2] / height);
+          width = Math.max(2, Math.floor(width * ratio / 2) * 2);
+          height = Math.max(2, Math.floor(height * ratio / 2) * 2);
+        }
       }
-      const audio = input.audio();
-      if (audio !== undefined && audio.codecpar.codecId !== AV_CODEC_ID_AAC) {
-        return null;
-      }
-      await Deno.mkdir(outDir, { recursive: true });
-      output = await Muxer.open(`${outDir}/index.m3u8`, {
+      const facts = { width, height };
+      const encode = options.kbps !== undefined ||
+        width !== video.codecpar.width || height !== video.codecpar.height ||
+        video.codecpar.codecId !== AV_CODEC_ID_H264 ||
+        (audio && audio.codecpar.codecId !== AV_CODEC_ID_AAC);
+      using vd = encode ? await Decoder.create(video) : undefined;
+      using ad = encode && audio ? await Decoder.create(audio) : undefined;
+      using ve = encode
+        ? await Encoder.create(FF_ENCODER_LIBX264, {
+          context: {
+            bitRate: `${options.kbps ?? config.videoKbps}k`,
+            rcMinRate: options.kbps === undefined ? 0 : `${options.kbps}k`,
+            rcMaxRate: `${options.kbps ?? config.videoKbps}k`,
+            rcBufferSize: `${(options.kbps ?? config.videoKbps) * 2}k`,
+            threadCount: config.threads,
+            gopSize: Math.max(
+              1,
+              Math.round(
+                (video.avgFrameRate.num / video.avgFrameRate.den || 30) *
+                  config.segmentSeconds,
+              ),
+            ),
+            maxBFrames: 0,
+          },
+          options: {
+            preset: config.preset,
+            ...(options.kbps === undefined ? { crf: config.quality } : {}),
+            'x264-params': options.kbps === undefined
+              ? 'nal-hrd=vbr'
+              : 'nal-hrd=cbr:filler=1',
+          },
+        })
+        : undefined;
+      using ae = encode && audio
+        ? await Encoder.create(FF_ENCODER_AAC, {
+          autoResample: true,
+          context: { bitRate: `${config.audioKbps}k` },
+        })
+        : undefined;
+      await Deno.mkdir(dir, { recursive: true });
+      await using output = await Muxer.open(`${dir}/index.m3u8`, {
         format: 'hls',
-        // input carries the metadata over (tags, dispositions).
         input,
         options: {
-          hls_time: HLS_SEGMENT_SECONDS,
-          hls_segment_filename: `${outDir}/seg%d.ts`,
+          // node-av uses AV_OPT_TYPE_DURATION, whose numeric unit is µs.
+          // This is a library option, not the CLI's seconds-valued string.
+          hls_time: config.segmentSeconds * AV_TIME_BASE,
+          hls_list_size: 0,
+          hls_playlist_type: 'event',
+          hls_segment_filename: `${dir}/seg%d.ts`,
+        },
+        configure(ctx) {
+          for (const stream of ctx.streams) stream.codecpar.codecTag = 0;
         },
       });
-      const videoIdx = output.addStream(video);
-      const audioIdx = audio === undefined ? -1 : output.addStream(audio);
-      for await (const packet of input.packets()) {
-        if (packet === null) continue; // flush signal, not media
-        if (packet.streamIndex === video.index) {
-          await output.writePacket(packet, videoIdx);
-        } else if (audio !== undefined && packet.streamIndex === audio.index) {
-          await output.writePacket(packet, audioIdx);
+      const vi = ve
+        ? output.addStream(ve, { inputStream: video })
+        : output.addStream(video);
+      const ai = ae
+        ? output.addStream(ae, { inputStream: audio })
+        : audio
+        ? output.addStream(audio)
+        : -1;
+      const write = async (
+        encoder: Encoder,
+        frame: Frame | null,
+        index: number,
+      ) => {
+        const packets = await encoder.encodeAll(frame);
+        try {
+          for (const packet of packets) {
+            await output.writePacket(packet, index);
+            // Interleaving can flush a video boundary on an audio write. The
+            // publication boundary is the muxer's manifest, not packet flags.
+            await publish(facts);
+          }
+        } finally {
+          for (const packet of packets) packet.free();
         }
-        packet.free();
+      };
+      const decode = async (
+        decoder: Decoder,
+        encoder: Encoder,
+        packet: Parameters<Decoder['decodeAll']>[0],
+        index: number,
+      ) => {
+        const frames = await decoder.decodeAll(packet);
+        try {
+          for (const frame of frames) {
+            if (index === vi) {
+              using scaled = await scaleImage(
+                frame,
+                width,
+                height,
+                AV_PIX_FMT_YUV420P,
+              );
+              scaled.pts = frame.pts;
+              scaled.duration = frame.duration;
+              scaled.timeBase = frame.timeBase;
+              await write(encoder, scaled, index);
+            } else await write(encoder, frame, index);
+          }
+        } finally {
+          for (const frame of frames) frame.free();
+        }
+      };
+      for await (const packet of input.packets()) {
+        if (!packet) continue;
+        try {
+          const isVideo = packet.streamIndex === video.index;
+          if (!isVideo && packet.streamIndex !== audio?.index) continue;
+          const index = isVideo ? vi : ai;
+          if (encode) {
+            await decode(
+              isVideo ? vd! : ad!,
+              isVideo ? ve! : ae!,
+              packet,
+              index,
+            );
+          } else {
+            await output.writePacket(packet, index);
+            await publish(facts);
+          }
+        } finally {
+          packet.free();
+        }
+      }
+      if (encode) {
+        await decode(vd!, ve!, null, vi);
+        if (ad && ae) await decode(ad, ae, null, ai);
+        await write(ve!, null, vi);
+        if (ae) await write(ae, null, ai);
       }
       await output.close();
-      let count = 0;
-      for await (const entry of Deno.readDir(outDir)) {
-        if (/^seg\d+\.ts$/.test(entry.name)) count++;
-      }
-      return count;
-    } catch (err) {
-      log.event('media_failed', { operation: 'hlsRemux', path, error: err });
+      await publish(facts);
+      return facts;
+    } catch (error) {
+      log.event('media_failed', { operation: 'hls', path, error });
       return null;
-    } finally {
-      // close() is idempotent; the normal path closed the muxer already.
-      await output?.close().catch(() => {});
-      await input?.close().catch(() => {});
     }
   }
 
   return {
+    hls,
     async captions(path, index, format) {
       try {
         await using input = await Demuxer.open(path);
@@ -1024,16 +1155,6 @@ export function createMedia(
       const completion = run();
 
       return { stream, contentType: profile.contentType, completion };
-    },
-
-    hlsRemux(path, outDir) {
-      const key = `${path}\n${outDir}`;
-      let pending = inflight.get(key);
-      if (pending === undefined) {
-        pending = remux(path, outDir).finally(() => inflight.delete(key));
-        inflight.set(key, pending);
-      }
-      return pending;
     },
 
     async decodePcm(path, opts = {}) {
