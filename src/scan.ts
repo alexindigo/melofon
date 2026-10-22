@@ -29,6 +29,7 @@ import {
   type SongMetadata,
 } from './metadata.ts';
 import { createState, type State } from './state.ts';
+import { type VideoDetails, videoDetails } from './video.ts';
 import {
   createTagReader,
   declareTagSettings,
@@ -193,6 +194,7 @@ export async function scanLibrary(
         let genre: string | null = null;
         let year: number | null = null;
         let isVideo = false;
+        let video: VideoDetails | undefined;
         let metadata: SongMetadata;
         let pictures: Omit<LocalVersion, 'origin'>[] = [];
         try {
@@ -239,6 +241,13 @@ export async function scanLibrary(
             continue;
           }
           isVideo = probe.hasVideo;
+          if (isVideo) {
+            video = await videoDetails(
+              abs,
+              probe.audioStreams ?? [],
+              probe.subtitleStreams ?? [],
+            );
+          }
           durationMs ??= probe.durationMs;
         } else if (durationMs === null) {
           durationMs = (await fallbackMedia().probe(abs)).durationMs;
@@ -274,6 +283,7 @@ export async function scanLibrary(
           genre,
           year,
           isVideo,
+          video,
           metadata,
           pictureHash: pictures[0]?.imageHash ?? null,
         };

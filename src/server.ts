@@ -111,7 +111,7 @@ const discovery = createAirplayDiscovery({
   devices: airplay,
   savedOutput: (id) => persistence.savedOutput(id),
 });
-const library = createLibrary(store, lyrics, { dataDir: cfg.dataDir });
+const library = createLibrary(store, lyrics, { dataDir: cfg.dataDir, media });
 const player = createPlayer();
 const nowPlaying = createNowPlaying(store, { state });
 const playback = createPlayback({

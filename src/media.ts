@@ -30,6 +30,7 @@ import {
   AVDISCARD_ALL,
   avGetCodecName,
   AVMEDIA_TYPE_AUDIO,
+  AVMEDIA_TYPE_SUBTITLE,
   AVMEDIA_TYPE_VIDEO,
   type AVPixelFormat,
   avRescaleQ,
@@ -60,6 +61,12 @@ import { extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { type Log, scopedLog } from './logging.ts';
 import type { State } from './state.ts';
+import {
+  type CaptionCue,
+  type MediaTrack,
+  renderCaptions,
+  TEXT_SUBTITLES,
+} from './video.ts';
 
 const ffmpegLevel = FFmpegLog.getLevel();
 FFmpegLog.setCallback(
@@ -75,6 +82,8 @@ FFmpegLog.setCallback(
 export type AudioCodecToken = string;
 
 export interface Probe {
+  audioStreams?: MediaTrack[];
+  subtitleStreams?: MediaTrack[];
   durationMs: number | null;
   hasVideo: boolean;
   hasAudio: boolean;
@@ -124,6 +133,12 @@ export interface Media {
   fingerprint(path: string): Promise<AudioFingerprint>;
   /** Never throws: unreadable/unsupported media probes as all-null/false. */
   probe(path: string): Promise<Probe>;
+  /** Extract supported text subtitle packets, preserving their stream timing. */
+  captions(
+    path: string,
+    index: number,
+    format: 'srt' | 'vtt',
+  ): Promise<string | null>;
   /** Actual selected audio stream facts, separate from the legacy probe shape. */
   describeAudio(path: string): Promise<AudioDetails | null>;
   /** Only installed, usable encoders; shared by negotiation and execution. */
@@ -625,6 +640,49 @@ export function createMedia(
   }
 
   return {
+    async captions(path, index, format) {
+      try {
+        await using input = await Demuxer.open(path);
+        const stream = input.streams.find((s) => s.index === index);
+        if (!stream || stream.codecpar.codecType !== AVMEDIA_TYPE_SUBTITLE) {
+          return null;
+        }
+        const codec = avGetCodecName(stream.codecpar.codecId);
+        if (!codec || !TEXT_SUBTITLES.has(codec)) return null;
+        const cues: CaptionCue[] = [];
+        for await (const packet of input.packets(index)) {
+          if (!packet) continue;
+          try {
+            const data = packet.data;
+            if (!data || packet.pts === AV_NOPTS_VALUE) continue;
+            let text = codec === 'mov_text'
+              ? data.subarray(2, 2 + data.readUInt16BE(0)).toString('utf8')
+              : data.toString('utf8');
+            if (codec === 'ass' || codec === 'ssa') {
+              // FFmpeg's ASS packet: ReadOrder,Layer,Style,Name,MarginL,R,V,Effect,Text.
+              text = text.split(',').slice(8).join(',')
+                .replace(/\{[^}]*\}/g, '').replaceAll('\\N', '\n').replaceAll(
+                  '\\n',
+                  '\n',
+                ).replaceAll('\\h', ' ');
+            }
+            const unit = stream.timeBase.num / stream.timeBase.den * 1000;
+            if (text) {
+              cues.push({
+                start: Number(packet.pts) * unit,
+                end: Number(packet.pts + packet.duration) * unit,
+                text,
+              });
+            }
+          } finally {
+            packet.free();
+          }
+        }
+        return renderCaptions(cues, format);
+      } catch {
+        return null;
+      }
+    },
     async describeAudio(path) {
       try {
         await using input = await Demuxer.open(path);
@@ -747,7 +805,28 @@ export function createMedia(
         const types = input.streams.map((s) => s.codecpar.codecType);
         const audio = input.audio();
         const bitrateKbps = input.bitRate;
+        const tracks = (type: number): MediaTrack[] =>
+          input.streams
+            .filter((s) => s.codecpar.codecType === type)
+            .map((s) => {
+              using metadata = s.metadata;
+              return {
+                index: s.index,
+                codec: avGetCodecName(s.codecpar.codecId),
+                language: metadata?.get('language') || null,
+                title: metadata?.get('title') || null,
+                ...(type === AVMEDIA_TYPE_AUDIO
+                  ? { channels: s.codecpar.channelLayout.nbChannels }
+                  : {}),
+              };
+            });
         return {
+          ...(types.includes(AVMEDIA_TYPE_VIDEO)
+            ? {
+              audioStreams: tracks(AVMEDIA_TYPE_AUDIO),
+              subtitleStreams: tracks(AVMEDIA_TYPE_SUBTITLE),
+            }
+            : {}),
           durationMs: seconds > 0 ? Math.round(seconds * 1000) : null,
           hasVideo: types.includes(AVMEDIA_TYPE_VIDEO),
           hasAudio: types.includes(AVMEDIA_TYPE_AUDIO),

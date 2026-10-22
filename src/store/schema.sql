@@ -96,6 +96,8 @@ ALTER TABLE files ADD COLUMN IF NOT EXISTS year INTEGER;
 -- M4: music videos share the files row with audio (probe-decided, M3.5
 -- app.media). NULL on rows scanned before M4 reads as not-video.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS is_video BOOLEAN;
+-- Scan-owned stream and caption facts, acquired on the next scan after upgrade.
+ALTER TABLE files ADD COLUMN IF NOT EXISTS video_details JSON;
 -- H8: the first embedded picture, hashed by the scanner for local conflicts.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS picture_hash VARCHAR;
 

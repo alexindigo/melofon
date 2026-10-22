@@ -163,7 +163,22 @@ export interface HatContext {
       /** Absolute path of a song's audio file (null when unknown). */
       songPath(id: string): Promise<string | null>;
       /** All music videos in the catalog (getVideos). */
-      videos(): Promise<SongRow[]>;
+      videos(folderId?: string): Promise<SongRow[]>;
+      videoDetails(id: string): Promise<
+        {
+          audio: {
+            index: number;
+            codec: string | null;
+            language: string | null;
+            title: string | null;
+          }[];
+          captions: { key: string; name: string }[];
+        } | null
+      >;
+      caption(
+        videoId: string,
+        options?: { key?: string; format?: 'srt' | 'vtt' },
+      ): Promise<{ text: string; format: 'srt' | 'vtt' } | null>;
       /** Random songs from the catalog (getRandomSongs pull-forward). */
       randomSongs(
         opts: {

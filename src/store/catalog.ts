@@ -5,6 +5,7 @@ import { artistAlbumFolderFilter } from './catalog-sql.ts';
 import { isAlbumFolderHint } from '../albums.ts';
 import { dirname } from 'node:path';
 import type { AlbumMetadata, SongMetadata } from '../metadata.ts';
+import type { VideoDetails } from '../video.ts';
 import {
   albumMetadataColumns,
   metadataSelect,
@@ -164,7 +165,8 @@ export interface CatalogReads {
   /** Absolute path of a song's audio file, for app.stream. */
   songPath(id: string): Promise<string | null>;
   /** All music videos in the catalog (getVideos). */
-  videos(): Promise<SongRow[]>;
+  videos(folderId?: string): Promise<SongRow[]>;
+  videoDetails(id: string): Promise<VideoDetails | null>;
   /** Random songs from the catalog (getRandomSongs pull-forward). */
   randomSongs(opts: RandomSongOptions): Promise<SongRow[]>;
   randomSongs(size: number, folderId?: string): Promise<SongRow[]>;
@@ -659,9 +661,21 @@ function catalogReads(q: Queries): CatalogReads {
       return row?.path ?? null;
     },
 
-    async videos() {
+    async videoDetails(id) {
+      const rows = await q.all(
+        `SELECT video_details::VARCHAR AS details FROM files WHERE id = ${
+          esc(id)
+        } AND is_video`,
+      );
+      const row = (rows as { details: string | null }[])[0];
+      return row?.details ? JSON.parse(row.details) : null;
+    },
+
+    async videos(folderId) {
       const res = await q.all(
-        `${SONG_SELECT} WHERE f.is_video ORDER BY f.path`,
+        `${SONG_SELECT} WHERE f.is_video${
+          folderId === undefined ? '' : ` AND f.library_id = ${esc(folderId)}`
+        } ORDER BY f.path`,
       );
       return (res as unknown as SongSqlRow[]).map(songOf);
     },
@@ -872,7 +886,10 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
     search3: (...args) =>
       engine.exclusive((q) => catalogReads(q).search3(...args)),
     songPath: (id) => engine.exclusive((q) => catalogReads(q).songPath(id)),
-    videos: () => engine.exclusive((q) => catalogReads(q).videos()),
+    videos: (folderId) =>
+      engine.exclusive((q) => catalogReads(q).videos(folderId)),
+    videoDetails: (id) =>
+      engine.exclusive((q) => catalogReads(q).videoDetails(id)),
     randomSongs: (input: RandomSongOptions | number, folderId?: string) =>
       engine.exclusive((q) =>
         catalogReads(q).randomSongs(
@@ -940,6 +957,7 @@ export interface CatalogIdentity extends CatalogFileStat {
 }
 
 export interface CatalogFile {
+  video?: VideoDetails;
   pictureHash?: string | null;
   metadata?: SongMetadata;
   id: string;
@@ -1125,6 +1143,13 @@ async function replaceCatalog(
       else fileStmt.bindVarchar(16, file.pictureHash);
       await fileStmt.run();
       await writeMetadata(q, 'files', file.id, file.metadata);
+      if (file.video) {
+        await q.run(
+          `UPDATE files SET video_details = ${
+            esc(JSON.stringify(file.video))
+          }::JSON WHERE id = ${esc(file.id)}`,
+        );
+      }
     }
   } finally {
     fileStmt.destroySync();

@@ -318,7 +318,7 @@ Deno.test('H1 all existing POST operations reexport their corresponding GET cons
     }
   }
   await visit('layers/opensubsonic/rest');
-  assertEquals(count, 77);
+  assertEquals(count, 78);
 });
 
 Deno.test('H1 semantic projection preserves repeated extensions and versions without changing advertised facts', async () => {

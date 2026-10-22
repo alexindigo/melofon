@@ -1,5 +1,7 @@
 // app.library keeps filesystem/tag work outside the store's exclusive queue.
 import { boundedMetadata } from './lyrics-metadata.ts';
+import { createMedia, type Media } from './media.ts';
+import { convertCaptions } from './video.ts';
 import type { Store } from './store/index.ts';
 import type { CatalogReads, LyricsRow } from './store/catalog.ts';
 import { createLyrics, type Lyrics, type LyricsEntry } from './lyrics.ts';
@@ -33,6 +35,10 @@ export interface Library extends
   /** Lyrics of the bounded best artist/title match, from the shared service. */
   lyrics(query: { artist?: string; title?: string }): Promise<LyricsRow | null>;
   lyricsBySongId(id: string): Promise<LyricsEntry[]>;
+  caption(
+    videoId: string,
+    options?: { key?: string; format?: 'srt' | 'vtt' },
+  ): Promise<{ text: string; format: 'srt' | 'vtt' } | null>;
   /** Embedded (APIC) cover of an album's first song, or of a song id itself. */
   embeddedCover(
     id: string,
@@ -55,7 +61,7 @@ export interface Library extends
 export function createLibrary(
   store: Store,
   lyrics: Lyrics = createLyrics(store),
-  options: { dataDir?: string } = {},
+  options: { dataDir?: string; media?: Media } = {},
 ): Library {
   const catalog = store.catalog;
   const localArtistPath = async (id: string) => {
@@ -66,6 +72,37 @@ export function createLibrary(
   };
   return {
     artistFolder: catalog.artistFolder,
+    videoDetails: catalog.videoDetails,
+    async caption(videoId, selection = {}) {
+      const details = await catalog.videoDetails(videoId);
+      if (!details) return null;
+      const source = selection.key !== undefined
+        ? details.captions.find((c) => c.key === selection.key)
+        : details.captions[0];
+      if (!source) return null;
+      const format = selection.format ?? source.format;
+      try {
+        if (source.file) {
+          const text = await Deno.readTextFile(source.file);
+          return {
+            text: source.format === format
+              ? text
+              : convertCaptions(text, format),
+            format,
+          };
+        }
+        const path = await catalog.songPath(videoId);
+        if (!path || source.stream === undefined) return null;
+        const text = await (options.media ?? createMedia()).captions(
+          path,
+          source.stream,
+          format,
+        );
+        return text === null ? null : { text, format };
+      } catch {
+        return null;
+      }
+    },
     async artistPhotoMissing(id) {
       return !await localArtistPath(id) &&
         !await store.candidates.acceptedArtistPhoto(id);

@@ -124,13 +124,21 @@ Deno.test('getVideos lists the fixture video as a Child with isVideo', async () 
   }
 });
 
-Deno.test('getVideoInfo answers the minimal shape; errors on bad ids', async () => {
+Deno.test('getVideoInfo answers stream facts; errors on bad ids', async () => {
   const { app, close } = await setup();
   try {
     const videos = await get(app, 'getVideos');
     const id = (videos.videos as { video: { id: string }[] }).video[0].id;
     const body = await get(app, 'getVideoInfo', `&id=${id}`);
-    assertEquals(body.videoInfo, { id });
+    const info = body.videoInfo as {
+      id: string;
+      captions: unknown[];
+      audioTrack: { id: string; name: string; languageCode: string }[];
+    };
+    assertEquals(info.id, id);
+    assertEquals(info.captions, []);
+    assertEquals(info.audioTrack.length, 1);
+    assertEquals(info.audioTrack[0].id, '1');
 
     const unknown = await get(app, 'getVideoInfo', '&id=nope');
     assertEquals((unknown.error as { code: number }).code, 70);
