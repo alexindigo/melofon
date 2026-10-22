@@ -1,7 +1,12 @@
 import { type Log, scopedLog } from '../logging.ts';
 import type { State } from '../state.ts';
 import { hostPattern } from './manifest.ts';
-import { abortable, publicAddress, resolveAddresses } from '../net-address.ts';
+import {
+  abortable,
+  publicAddress,
+  resolveAddresses,
+  unspecifiedAddress,
+} from '../net-address.ts';
 import { pinnedRequest } from '../net-transport.ts';
 
 export function matchesHost(pattern: string, host: string): boolean {
@@ -56,6 +61,7 @@ export function delay(ms: number, signal: AbortSignal): Promise<void> {
 }
 export interface NetworkAuthority {
   plugin: string;
+  /** Operator-approved hosts; also the trust context for plugin requests. */
   hosts: string[];
   ratePerMinute: number;
   signal: AbortSignal;
@@ -64,6 +70,8 @@ export interface CoreNetworkAuthority {
   caller: string;
   /** Core owner policy, evaluated on every logical redirect URL. */
   hosts: (url: URL) => boolean;
+  /** Hosts entered by the user, never hosts learned from fetched content. */
+  trustedHosts: string[];
   ratePerMinute: number;
   signal: AbortSignal;
 }
@@ -82,10 +90,6 @@ export function createLookupNetwork(options: {
 } = {}) {
   const log = options.log ?? scopedLog('lookups');
   const next = new Map<string, number>();
-  options.state?.declare('net.allowPrivateDestinations', {
-    type: 'boolean',
-    default: false,
-  });
   options.state?.declare('net.maxRedirects', {
     type: 'integer',
     default: 5,
@@ -147,6 +151,10 @@ export function createLookupNetwork(options: {
     );
     try {
       let url = new URL(input);
+      const initialHost = url.hostname;
+      const trustedHosts = 'caller' in authority
+        ? authority.trustedHosts
+        : authority.hosts;
       const budget = await settings();
       const maxRedirects = Number(
         await options.state?.getTyped('net.maxRedirects') ?? 5,
@@ -210,12 +218,17 @@ export function createLookupNetwork(options: {
               requestSignal,
             );
             transportFailure = false;
+            // Redirects do not extend the user's trust to a new host. Trust
+            // belongs to the original context, not to an address's DNS answer.
+            const trusted = trustedHosts.some((pattern) =>
+              matchesHost(pattern, host)
+            ) &&
+              (redirects === 0 || host === initialHost);
             if (
               !addresses.length ||
-              addresses.some((address) =>
-                  !publicAddress(address) && !endpoint
-                ) &&
-                !await options.state?.getTyped('net.allowPrivateDestinations')
+              addresses.some(unspecifiedAddress) ||
+              !trusted && !endpoint &&
+                addresses.some((address) => !publicAddress(address))
             ) {
               throw new Error(
                 `Private or non-public destination refused: ${host}`,

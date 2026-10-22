@@ -1,6 +1,6 @@
 import { assert, assertEquals, assertStringIncludes } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
-import { XMLParser } from 'fast-xml-parser';
+import { parse, type XmlElement } from '@std/xml';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { createState } from '../src/state.ts';
@@ -229,12 +229,29 @@ async function setup() {
     const response = await request(op, { ...params, f: 'xml' }, post, user);
     assertEquals(response.status, 200);
     const text = await response.text();
-    const parsed = new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: '',
-    }).parse(text);
-    assertEquals(parsed['subsonic-response'].status, 'ok', text);
-    return { text, value: parsed['subsonic-response'] };
+    // Project XML elements onto the existing wire-assertion shape. Attributes
+    // stay strings and only repeated sibling elements become arrays.
+    // deno-lint-ignore no-explicit-any -- Heterogeneous protocol response tree.
+    const project = (element: XmlElement): any => {
+      const result: Record<string, unknown> = { ...element.attributes };
+      for (const node of element.children) {
+        if (node.type !== 'element') continue;
+        const key = node.name.raw;
+        const entry = project(node);
+        result[key] = key in result
+          ? [
+            ...(Array.isArray(result[key]) ? result[key] : [result[key]]),
+            entry,
+          ]
+          : entry;
+      }
+      return result;
+    };
+    const root = parse(text).root;
+    assertEquals(root.name.raw, 'subsonic-response');
+    const value = project(root);
+    assertEquals(value.status, 'ok', text);
+    return { text, value };
   };
   return {
     dir,

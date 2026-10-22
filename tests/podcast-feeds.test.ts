@@ -89,7 +89,6 @@ async function setup() {
     state,
     fixtures: { 'images.example.test': `http://127.0.0.1:${server.addr.port}` },
   });
-  await state.set('net.allowPrivateDestinations', 'true');
   const podcasts = await createPodcasts({
     store,
     state,
@@ -207,15 +206,14 @@ Deno.test('podcast failures remain visible, preserve prior episodes and recover 
     s.set(rss());
     await s.podcasts.refresh(channel.id);
     assertEquals((await s.podcasts.channels())[0].errorMessage, null);
-    await s.state.set('net.allowPrivateDestinations', 'false');
     const hits = s.hits();
     await s.podcasts.refresh(channel.id);
-    assert(
-      (await s.podcasts.channels())[0].errorMessage?.includes(
-        'destination refused',
-      ),
+    assertEquals((await s.podcasts.channels())[0].errorMessage, null);
+    assertEquals(
+      s.hits(),
+      hits + 1,
+      'user-entered loopback feeds remain trusted',
     );
-    assertEquals(s.hits(), hits);
   } finally {
     await s.close();
   }

@@ -11,11 +11,7 @@ const network = createNetwork({
     declare() {},
     getTyped: (key) =>
       Promise.resolve(
-        key === 'net.allowPrivateDestinations'
-          ? true
-          : key === 'lookups.requestAttempts'
-          ? 1
-          : undefined,
+        key === 'lookups.requestAttempts' ? 1 : undefined,
       ),
   },
 });
@@ -23,6 +19,7 @@ const response = await network.fetch(
   {
     caller: 'core.proxy-test',
     hosts: () => true,
+    trustedHosts: [new URL(input).hostname],
     ratePerMinute: 600000,
     signal: new AbortController().signal,
   },

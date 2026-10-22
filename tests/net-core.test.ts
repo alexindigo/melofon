@@ -8,10 +8,129 @@ import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 const authority = {
   caller: 'core.test',
   hosts: () => true,
+  trustedHosts: [
+    '127.0.0.1',
+    'feed.test',
+    'wrong.test',
+    'does-not-resolve.invalid',
+  ],
   ratePerMinute: 600000,
   signal: new AbortController().signal,
 };
 const limits = { timeoutMs: 2000, maxBytes: 10000 };
+const externalAuthority = { ...authority, trustedHosts: [] };
+
+Deno.test('outbound provenance trusts entered hosts and same-host content, not unrelated private content or cross-host redirects', async () => {
+  const hits: string[] = [];
+  const server = Deno.serve(
+    { hostname: '127.0.0.1', port: 0, onListen() {} },
+    (request): Response => {
+      const path = new URL(request.url).pathname;
+      hits.push(path);
+      if (path === '/redirect') {
+        return Response.redirect(`http://localhost:${server.addr.port}/secret`);
+      }
+      if (path === '/same-redirect') {
+        return Response.redirect(new URL('/image', request.url));
+      }
+      return Response.json({
+        image: '/image',
+        external: `http://localhost:${server.addr.port}/secret`,
+      });
+    },
+  );
+  try {
+    const network = createNetwork({
+      resolve: () => Promise.resolve(['127.0.0.1']),
+    });
+    const url = `http://feed.test:${server.addr.port}`;
+    const context = { ...authority, trustedHosts: ['feed.test'] };
+    const content = await (await network.fetch(context, url, {}, limits))
+      .json();
+    assertEquals(
+      (await network.fetch(
+        context,
+        new URL(content.image, url).href,
+        {},
+        limits,
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await network.fetch(context, `${url}/same-redirect`, {}, limits)).status,
+      200,
+    );
+    for (const input of [content.external, `${url}/redirect`]) {
+      await assertRejects(
+        () => network.fetch(context, input, {}, limits),
+        Error,
+        'destination refused',
+      );
+    }
+    // Even another operator-approved plugin host cannot inherit a redirect's trust.
+    await assertRejects(
+      () =>
+        network.fetch(
+          {
+            plugin: 'approved',
+            hosts: ['feed.test', 'localhost'],
+            ratePerMinute: 600000,
+            signal: authority.signal,
+          },
+          `${url}/redirect`,
+          {},
+          limits,
+        ),
+      Error,
+      'destination refused',
+    );
+    await assertRejects(
+      () => network.fetch(externalAuthority, url, {}, limits),
+      Error,
+      'destination refused',
+    );
+    assertEquals(hits, [
+      '/',
+      '/image',
+      '/same-redirect',
+      '/image',
+      '/redirect',
+      '/redirect',
+    ]);
+  } finally {
+    await server.shutdown();
+  }
+});
+
+Deno.test('unspecified IPv4, IPv6 and mapped bind addresses are refused even in trusted contexts', async () => {
+  for (const host of ['0.0.0.0', '[::]', '[::ffff:0.0.0.0]']) {
+    const url = `http://${host}:9/`;
+    await assertRejects(
+      () =>
+        createNetwork().fetch(
+          { ...authority, trustedHosts: [new URL(url).hostname] },
+          url,
+          {},
+          limits,
+        ),
+      Error,
+      'destination refused',
+    );
+  }
+  for (const address of ['0.0.0.0', '::', '::ffff:0.0.0.0']) {
+    await assertRejects(
+      () =>
+        createNetwork({ resolve: () => Promise.resolve([address]) }).fetch(
+          authority,
+          'http://feed.test:9/',
+          {},
+          limits,
+        ),
+      Error,
+      'destination refused',
+    );
+  }
+});
 
 Deno.test('environment proxies cannot bypass pinned destinations for HTTP or HTTPS', async () => {
   let proxyHits = 0, targetHits = 0;
@@ -163,7 +282,6 @@ Deno.test('pinned HTTPS preserves TLS certificate and logical hostname verificat
       ca: cert,
       resolve: () => Promise.resolve(['127.0.0.1']),
     });
-    await state.set('net.allowPrivateDestinations', 'true');
     await state.set('lookups.requestAttempts', '1');
     const response = await network.fetch(
       authority,
@@ -233,7 +351,6 @@ Deno.test('core buffered/file consumers decode gzip, deflate and br with decoded
   );
   try {
     const network = createNetwork({ state });
-    await state.set('net.allowPrivateDestinations', 'true');
     for (const encoding of ['gzip', 'deflate', 'br']) {
       const url = `http://127.0.0.1:${server.addr.port}/${encoding}`;
       const response = await network.fetch(authority, url, {}, {
@@ -286,7 +403,7 @@ Deno.test('core network defaults refuse private IPv4/IPv6 and unusual numeric UR
     ]
   ) {
     await assertRejects(
-      () => network.fetch(authority, `http://${host}:9/`, {}, limits),
+      () => network.fetch(externalAuthority, `http://${host}:9/`, {}, limits),
       Error,
       'destination refused',
     );
@@ -324,7 +441,7 @@ Deno.test('core network rejects private/mixed DNS answers and checks every redir
     });
     for (const host of ['private.test', 'mixed.test']) {
       await assertRejects(
-        () => network.fetch(authority, `http://${host}/`, {}, limits),
+        () => network.fetch(externalAuthority, `http://${host}/`, {}, limits),
         Error,
         'destination refused',
       );
@@ -391,8 +508,6 @@ Deno.test('core file streaming pins DNS, preserves Host, enforces both byte caps
       state,
       resolve: () => Promise.resolve(['127.0.0.1']),
     });
-    assertEquals(await state.getTyped('net.allowPrivateDestinations'), false);
-    await state.set('net.allowPrivateDestinations', 'true');
     const url = `http://does-not-resolve.invalid:${server.addr.port}`;
     const file = `${dir}/episode.mp3`;
     const result = await network.toFile(authority, `${url}/stream`, file, {
@@ -435,17 +550,16 @@ Deno.test('core file streaming pins DNS, preserves Host, enforces both byte caps
       ),
       [],
     );
-    await state.set('net.allowPrivateDestinations', 'false');
     const count = hosts.length;
     await assertRejects(
-      () => network.toFile(authority, `${url}/stream`, file, limits),
+      () => network.toFile(externalAuthority, `${url}/stream`, file, limits),
       Error,
       'destination refused',
     );
     assertEquals(
       hosts.length,
       count,
-      'the next request observes the live setting',
+      'external content does not inherit another request’s trust',
     );
   } finally {
     await server.shutdown();
@@ -486,7 +600,6 @@ Deno.test('stream-to-file shares timeout retry and caller cancellation without r
   );
   try {
     const network = createNetwork({ state });
-    await state.set('net.allowPrivateDestinations', 'true');
     await state.set('lookups.bodyIdleSeconds', '0.05');
     await state.set('lookups.requestTimeoutSeconds', '1');
     const url = `http://127.0.0.1:${server.addr.port}/`;

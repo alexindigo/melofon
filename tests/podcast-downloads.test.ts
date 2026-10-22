@@ -248,6 +248,77 @@ async function decoded(media: ReturnType<typeof createMedia>, path: string) {
   return count;
 }
 
+Deno.test('user-entered LAN feed downloads same-host episodes and artwork without a private-address setting', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(`${dir}/data`);
+  const state = createState(store);
+  const audio = await Deno.readFile(`${fixture}/01 - First Song.mp3`);
+  const image = await Deno.readFile(`${fixture}/cover.jpg`);
+  const hits: string[] = [];
+  const server = Deno.serve(
+    { hostname: '127.0.0.1', port: 0, onListen() {} },
+    (request) => {
+      const path = new URL(request.url).pathname;
+      hits.push(path);
+      if (path === '/feed') {
+        return new Response(
+          `<rss version="2.0"><channel><title>LAN</title><image><url>/cover.jpg</url></image><item><guid>lan</guid><enclosure url="/episode.mp3" type="audio/mpeg"/></item></channel></rss>`,
+        );
+      }
+      return new Response(path === '/cover.jpg' ? image : audio, {
+        headers: {
+          'content-type': path === '/cover.jpg' ? 'image/jpeg' : 'audio/mpeg',
+        },
+      });
+    },
+  );
+  const podcasts = await createPodcasts({
+    store,
+    state,
+    dataDir: `${dir}/data`,
+  });
+  try {
+    await state.set('podcasts.requestsPerMinute', '600000');
+    const channel = await podcasts.addChannel(
+      `http://127.0.0.1:${server.addr.port}/feed`,
+    );
+    await podcasts.idle();
+    assertEquals(channel.status, 'completed');
+    assert(channel.imagePath);
+    assertEquals(await Deno.readFile(channel.imagePath), image);
+    const [episode] = await podcasts.episodes(channel.id);
+    assertEquals(episode.status, 'completed');
+    const source = await podcasts.fileSource(episode.streamId!);
+    assert(source);
+    assertEquals(await Deno.readFile(source.path), audio);
+    assertEquals(hits, ['/feed', '/cover.jpg', '/episode.mp3']);
+    await podcasts.close();
+    const restarted = await createPodcasts({
+      store,
+      state,
+      dataDir: `${dir}/data`,
+    });
+    try {
+      await restarted.download(episode.id);
+      await restarted.idle();
+      assertEquals((await restarted.episode(episode.id))?.status, 'completed');
+      assertEquals(
+        await Deno.readFile(
+          (await restarted.fileSource(episode.streamId!))!.path,
+        ),
+        audio,
+      );
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    await podcasts.close();
+    await server.shutdown();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('podcast downloads persist probed facts and stream raw, ranges, bitrate, transcode and offsets through the facade without catalog or playback effects', async () => {
   const s = await setup();
   try {

@@ -6,6 +6,43 @@ import {
 } from '../src/lookups/net.ts';
 import type { Log } from '../src/logging.ts';
 
+Deno.test('approved loopback plugin hosts are trusted while response URLs on other private hosts are refused', async () => {
+  const hits: string[] = [];
+  const server = Deno.serve(
+    { hostname: '127.0.0.1', port: 0, onListen() {} },
+    (request): Response => {
+      hits.push(new URL(request.url).pathname);
+      return Response.json({
+        image: `http://localhost:${server.addr.port}/private-image`,
+      });
+    },
+  );
+  const authority = {
+    plugin: 'local',
+    hosts: ['127.0.0.1'],
+    ratePerMinute: 600000,
+    signal: new AbortController().signal,
+  };
+  const limits = { timeoutMs: 2000, maxBytes: 1000 };
+  const network = createLookupNetwork();
+  try {
+    const result = await (await network.fetch(
+      authority,
+      `http://127.0.0.1:${server.addr.port}/plugin`,
+      {},
+      limits,
+    )).json();
+    await assertRejects(
+      () => network.fetch(authority, result.image, {}, limits),
+      Error,
+      'Host not granted',
+    );
+    assertEquals(hits, ['/plugin']);
+  } finally {
+    await server.shutdown();
+  }
+});
+
 Deno.test('network grant intersection never broadens exact hosts or wildcard boundaries', () => {
   assertEquals(intersectHosts(['sub.example.test'], ['*.example.test']), [
     'sub.example.test',

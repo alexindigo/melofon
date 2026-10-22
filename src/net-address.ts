@@ -1,6 +1,14 @@
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
+/** Wildcard bind addresses are never meaningful outbound destinations. */
+export function unspecifiedAddress(address: string): boolean {
+  if (isIP(address) === 4) return address === '0.0.0.0';
+  if (isIP(address) !== 6) return false;
+  const normalized = new URL(`http://[${address}]/`).hostname;
+  return normalized === '[::]' || normalized === '[::ffff:0:0]';
+}
+
 /** Only global unicast destinations. URL parsing canonicalizes unusual IPv4 spellings. */
 export function publicAddress(address: string): boolean {
   if (isIP(address) === 4) {

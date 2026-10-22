@@ -96,10 +96,12 @@ export async function createPodcasts(
     Number(await state.getTyped(`podcasts.${key}`));
   const interval = async () => await numeric('refreshHours') * 3600000;
   const authority = async (
+    feedUrl: string,
     signal = shutdown.signal,
   ): Promise<CoreNetworkAuthority> => ({
     caller: 'core.podcasts',
     hosts: (url) => ['http:', 'https:'].includes(url.protocol),
+    trustedHosts: [new URL(feedUrl).hostname],
     ratePerMinute: await numeric('requestsPerMinute'),
     signal,
   });
@@ -144,6 +146,8 @@ export async function createPodcasts(
         const { row, controller } = job;
         const signal = AbortSignal.any([shutdown.signal, controller.signal]);
         try {
+          const channel = await store.podcasts.channel(row.channelId);
+          if (!channel) throw new Error('Podcast channel no longer exists');
           const temporary = await serial(async () => {
             signal.throwIfAborted();
             const path = await files.path(row.channelId, row.id, 'download');
@@ -151,7 +155,7 @@ export async function createPodcasts(
             return path;
           });
           const downloaded = await network.toFile(
-            await authority(signal),
+            await authority(channel.feedUrl, signal),
             row.enclosureUrl,
             temporary,
             {
@@ -252,7 +256,7 @@ export async function createPodcasts(
     ) return;
     try {
       const response = await network.fetch(
-        await authority(),
+        await authority(row.feedUrl),
         row.imageUrl,
         {},
         { timeoutMs: await timeoutMs(), maxBytes },
@@ -282,7 +286,7 @@ export async function createPodcasts(
     if (!channel) return null;
     try {
       const response = await network.fetch(
-        await authority(),
+        await authority(channel.feedUrl),
         channel.feedUrl,
         {},
         {

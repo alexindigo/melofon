@@ -1,12 +1,19 @@
-import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import { parse, type XmlElement } from '@std/xml';
 import type { PodcastFeed } from './store/podcasts.ts';
 
-const record = (value: unknown): Record<string, unknown> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
+const children = (element: XmlElement | undefined, name: string) =>
+  element?.children.filter((node): node is XmlElement =>
+    node.type === 'element' && node.name.raw === name
+  ) ?? [];
+const child = (element: XmlElement | undefined, name: string) =>
+  children(element, name)[0];
+const value = (element: XmlElement | undefined): string | undefined =>
+  element?.children.filter((node) =>
+    node.type === 'text' || node.type === 'cdata'
+  )
+    .map((node) => node.text).join('');
 const text = (value: unknown): string | null => {
-  const raw = typeof value === 'string' ? value : record(value)['#text'];
+  const raw = value;
   return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
 };
 function plain(value: unknown): string | null {
@@ -57,47 +64,46 @@ export function parsePodcastFeed(xml: string, base: string): PodcastFeed {
   if (/<!\s*(?:DOCTYPE|ENTITY)\b/i.test(xml)) {
     throw new Error('Unsupported feed declaration');
   }
-  const valid = XMLValidator.validate(xml);
-  if (valid !== true) throw new Error(`Bad XML: ${valid.err.msg}`);
-  const parsed = new XMLParser({
-    ignoreAttributes: false,
-    parseTagValue: false,
-    parseAttributeValue: false,
-    isArray: (_name, path) => path === 'rss.channel.item',
-  }).parse(xml);
-  const rss = record(record(parsed).rss);
-  const channel = record(rss.channel);
-  if (rss['@_version'] !== '2.0' || !Object.keys(channel).length) {
+  let rss: XmlElement;
+  try {
+    rss = parse(xml).root;
+  } catch (error) {
+    throw new Error(
+      `Bad XML: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const channel = child(rss, 'channel');
+  if (rss.name.raw !== 'rss' || rss.attributes.version !== '2.0' || !channel) {
     throw new Error('Unsupported feed (RSS 2.0 required)');
   }
   const episodes: PodcastFeed['episodes'] = [];
-  for (const value of Array.isArray(channel.item) ? channel.item : []) {
-    const item = record(value);
-    const enclosure = record(
-      Array.isArray(item.enclosure) ? item.enclosure[0] : item.enclosure,
-    );
-    const enclosureUrl = httpUrl(enclosure['@_url'], base);
+  for (const item of children(channel, 'item')) {
+    const enclosure = child(item, 'enclosure');
+    const enclosureUrl = httpUrl(enclosure?.attributes.url, base);
     if (!enclosureUrl) continue;
-    const date = text(item.pubDate);
+    const date = text(value(child(item, 'pubDate')));
     const ms = date === null ? NaN : Date.parse(date);
     episodes.push({
-      guid: text(item.guid) ?? enclosureUrl,
-      title: plain(item.title),
+      guid: text(value(child(item, 'guid'))) ?? enclosureUrl,
+      title: plain(value(child(item, 'title'))),
       description: plain(
-        item.description ?? item['itunes:summary'] ?? item['content:encoded'],
+        value(
+          child(item, 'description') ?? child(item, 'itunes:summary') ??
+            child(item, 'content:encoded'),
+        ),
       ),
       publishDate: Number.isFinite(ms) ? new Date(ms).toISOString() : null,
       enclosureUrl,
-      contentType: text(enclosure['@_type']),
-      enclosureLength: number(enclosure['@_length']),
-      duration: duration(item['itunes:duration']),
+      contentType: text(enclosure?.attributes.type),
+      enclosureLength: number(enclosure?.attributes.length),
+      duration: duration(value(child(item, 'itunes:duration'))),
     });
   }
   return {
-    title: plain(channel.title),
-    description: plain(channel.description),
-    imageUrl: httpUrl(record(channel['itunes:image'])['@_href'], base) ??
-      httpUrl(record(channel.image).url, base),
+    title: plain(value(child(channel, 'title'))),
+    description: plain(value(child(channel, 'description'))),
+    imageUrl: httpUrl(child(channel, 'itunes:image')?.attributes.href, base) ??
+      httpUrl(value(child(child(channel, 'image'), 'url')), base),
     episodes,
   };
 }
