@@ -15,6 +15,7 @@ import { createFileSource } from '../src/file-source.ts';
 import { createStream } from '../src/stream.ts';
 import { createArtwork } from '../src/artwork.ts';
 import { createPlaylists } from '../src/playlists.ts';
+import { createShares } from '../src/shares.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
 
@@ -131,6 +132,7 @@ async function setup() {
     },
   };
   const library = createLibrary(store);
+  const playlists = createPlaylists(store);
   const app = facade(
     await pathfinder({ roots: ['core/'], app: { store, cfg } }),
     await loadLayers({
@@ -138,7 +140,8 @@ async function setup() {
         cfg,
         state,
         library,
-        playlists: createPlaylists(store),
+        playlists,
+        shares: createShares(store, state, library, playlists),
         libraries: createLibraries(store),
         podcasts: tracked,
         user: createUserService(store, cfg),

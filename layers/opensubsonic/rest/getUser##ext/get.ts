@@ -23,7 +23,7 @@ export default async (_request: HatRequest, context: HatContext) => {
     user: userOf(
       user,
       folders.map((f) => folderWireId(f.id)),
-      await context.app.state.get('sharing.enabled') === 'true',
+      await context.app.shares.enabled(),
     ),
   });
 };

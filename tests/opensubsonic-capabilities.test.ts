@@ -12,6 +12,8 @@ import { createUserService } from '../src/user.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLibrary } from '../src/library.ts';
+import { createShares } from '../src/shares.ts';
+import { createPlaylists } from '../src/playlists.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import {
@@ -228,12 +230,14 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
     await scanLibrary(store);
     const library = createLibrary(store);
     const annotation = createAnnotation(store);
+    const state = createState(store);
     const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
     const app = facade(
       core,
       await loadLayers({
         app: {
-          state: createState(store),
+          state,
+          shares: createShares(store, state, library, createPlaylists(store)),
           cfg,
           libraries,
           library,

@@ -13,6 +13,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { createShares } from '../src/shares.ts';
+import { createPlaylists } from '../src/playlists.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
@@ -169,12 +171,14 @@ Deno.test('two fixture roots via the API: getMusicFolders lists both, musicFolde
     const a = await addViaApi(core, 'A root', ROOT_A);
     await addViaApi(core, 'B root', ROOT_B);
     await scanLibrary(store);
+    const state = createState(store), library = createLibrary(store);
     const bag = {
-      state: createState(store),
+      state,
+      shares: createShares(store, state, library, createPlaylists(store)),
       cfg,
       libraries,
       user: createUserService(store, cfg),
-      library: createLibrary(store),
+      library,
       annotation: createAnnotation(store),
       listens: createListens(store),
     };

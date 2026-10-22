@@ -4,7 +4,7 @@
 //   2. Each layer's mounts: a path that is a mount's prefix or prefix/… is
 //      claimed by that mount and the app sees the path relative to it
 //      (/rest/ping → /ping; /restping is NOT the /rest mount). A path no
-//      prefix matches falls back to a direct lookup in each mount app.
+//      prefix is claimed by any candidate falls back to direct mount lookups.
 //   3. Lookup across candidates: one hit → that app; several → first whose
 //      manifest headers match; none → bare 404 from core.
 // A layer's routes are 100% the layer's responsibility — core never lends,
@@ -26,7 +26,7 @@
 // are always redacted. Compact by default: the full header dump stays
 // behind MELOFON_DEBUG_LOG_HEADERS and rides the accept line.
 import type { PathfinderApp } from '@pathfinder/pathfinder';
-import type { Layer } from './layers.ts';
+import type { Layer, Mount } from './layers.ts';
 import { candidatesForBind } from './binds.ts';
 import { type Log, scopedLog } from './logging.ts';
 
@@ -40,19 +40,23 @@ function headersMatch(request: Request, layer: Layer): boolean {
 // The mount a path belongs to, plus the path relative to it. Prefix claim
 // first (/rest/ping → /ping); a bare remainder no prefix matches falls back
 // to a lookup in each mount app, so /_opensubsonic/ping works too.
+function claims(mount: Mount, path: string): boolean {
+  return mount.prefix !== '' &&
+    (path === mount.prefix || path.startsWith(`${mount.prefix}/`));
+}
+
 function layerDispatch(
   layer: Layer,
   method: string,
   path: string,
+  claimedOnly = false,
 ): { app: PathfinderApp; path: string } | null {
   for (const mount of layer.mounts) {
-    if (
-      mount.prefix !== '' &&
-      (path === mount.prefix || path.startsWith(`${mount.prefix}/`))
-    ) {
+    if (claims(mount, path)) {
       return { app: mount.app, path: path.slice(mount.prefix.length) || '/' };
     }
   }
+  if (claimedOnly) return null;
   for (const mount of layer.mounts) {
     if (mount.app.lookup(method, path).kind === 'match') {
       return { app: mount.app, path };
@@ -199,10 +203,15 @@ export function facade(
       }
     }
 
-    // Lookup across candidates.
+    // A claimed namespace belongs only to its claiming hats, even when an
+    // unrelated mount's positional route could match the original bare path.
+    // Keep bare aliases/root mounts unchanged when no candidate claims it.
+    const claimedOnly = candidates.some((layer) =>
+      layer.mounts.some((mount) => claims(mount, path))
+    );
     const hits: { layer: Layer; app: PathfinderApp; path: string }[] = [];
     for (const layer of candidates) {
-      const dispatch = layerDispatch(layer, request.method, path);
+      const dispatch = layerDispatch(layer, request.method, path, claimedOnly);
       if (dispatch !== null) hits.push({ layer, ...dispatch });
     }
     if (hits.length === 1) {

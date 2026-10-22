@@ -11,7 +11,7 @@ export default async (_request: HatRequest, context: HatContext) => {
   const folders = (await context.app.libraries.list()).map((f) =>
     folderWireId(f.id)
   );
-  const sharing = await context.app.state.get('sharing.enabled') === 'true';
+  const sharing = await context.app.shares.enabled();
   return ok(context, {
     users: { user: users.map((u) => userOf(u, folders, sharing)) },
   });

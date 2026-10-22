@@ -8,6 +8,7 @@ import { createLibraries } from '../../src/libraries.ts';
 import { createLibrary } from '../../src/library.ts';
 import { createState } from '../../src/state.ts';
 import { createPlaylists } from '../../src/playlists.ts';
+import { createShares } from '../../src/shares.ts';
 import { createAnnotation } from '../../src/annotation.ts';
 import { createListens } from '../../src/listens.ts';
 import { createArtwork } from '../../src/artwork.ts';
@@ -58,6 +59,7 @@ export async function h9Facade(store: Store, dir: string) {
       library,
       state,
       playlists,
+      shares: createShares(store, state, library, playlists),
       user: createUserService(store, cfg),
       annotation: createAnnotation(store),
       listens: createListens(store),

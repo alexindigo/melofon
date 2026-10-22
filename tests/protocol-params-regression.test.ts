@@ -22,6 +22,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createPlaylists } from '../src/playlists.ts';
+import { createShares } from '../src/shares.ts';
 import { createBookmarks } from '../src/bookmarks.ts';
 import { createClientQueue } from '../src/clientqueue.ts';
 import { createListens } from '../src/listens.ts';
@@ -262,8 +263,10 @@ async function setup() {
     hls: [] as string[],
   };
   let recordSearchOnly = false;
+  const state = createState(store);
   const bag = {
-    state: createState(store),
+    state,
+    shares: createShares(store, state, library, playlists),
     cfg,
     libraries,
     user: createUserService(store, cfg),

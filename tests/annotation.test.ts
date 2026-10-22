@@ -11,6 +11,8 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
+import { createShares } from '../src/shares.ts';
+import { createPlaylists } from '../src/playlists.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
@@ -41,8 +43,10 @@ async function setup() {
   const library = createLibrary(store);
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
+  const state = createState(store);
   const bag = {
-    state: createState(store),
+    state,
+    shares: createShares(store, state, library, createPlaylists(store)),
     cfg,
     libraries,
     user: createUserService(store, cfg),

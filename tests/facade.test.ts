@@ -12,6 +12,7 @@ import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 import { openStore } from '../src/store/index.ts';
 import { captureLogs, parseLogfmt } from './helpers/logging.ts';
+import type { Layer } from '../src/layers.ts';
 
 async function makeApps() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-facade-' });
@@ -363,6 +364,127 @@ Deno.test('request trace: done logs when info.completed settles', async () => {
     } finally {
       await log.flush();
     }
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('claimed prefixes exclude unrelated bare matches, including missing paths and other methods', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const root = layers.find((l) => l.name === 'layer-a')!;
+    // Real root-mounted /echo route also matches this mounted hat's namespace.
+    const mounted: Layer = {
+      ...root,
+      name: 'mounted',
+      mounts: root.mounts.map((mount) => ({ ...mount, prefix: '/echo' })),
+    };
+    const app = facade(core, [root, mounted]);
+    const missing = await app(new Request('http://x/echo'));
+    assertEquals(missing.status, 404); // mounted remainder '/', never root /echo
+    await missing.body?.cancel();
+    const response = await app(new Request('http://x/echo/echo'));
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), { layer: 'a', route: '/echo' });
+    const post = await app(
+      new Request('http://x/echo/echo', { method: 'POST' }),
+    );
+    assertEquals(post.status, 405);
+    await post.body?.cancel();
+    // The force-prefix grammar still deliberately selects only that hat.
+    const forced = await app(new Request('http://x/_layer-a/echo'));
+    assertEquals(forced.status, 200);
+    assertEquals(await forced.json(), { layer: 'a', route: '/echo' });
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('shared claimed prefix preserves header dispatch on default and replaced/per-layer sockets', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const root = layers.find((l) => l.name === 'layer-a')!;
+    const make = (name: string, header: string, ports: number[]): Layer => ({
+      ...layers.find((l) => l.name === `layer-${name}`)!,
+      name,
+      ports,
+      headers: [{ name: 'x-hat', includes: header }],
+      mounts: layers.find((l) => l.name === `layer-${name}`)!.mounts.map((
+        mount,
+      ) => ({ ...mount, prefix: '/shared' })),
+    });
+    const a = make('p', 'p', []), b = make('q', 'q', []);
+    // Root /echo is a legitimate unrelated bare route, never a shared claimant.
+    const variants: NonNullable<Parameters<typeof facade>[2]>[] = [
+      {},
+      {
+        listenPort: 4000,
+        defaultPort: 4534,
+        env: { MELOFON_LISTEN_REPLACE_3689: '4000' },
+      },
+      {
+        listenPort: 4001,
+        defaultPort: 4534,
+        env: { MELOFON_LISTEN_p: '4001', MELOFON_LISTEN_q: '4001' },
+      },
+    ];
+    for (const opts of variants) {
+      const ported = 'listenPort' in opts;
+      const selected = [a, b].map((layer) => ({
+        ...layer,
+        ports: ported ? [3689] : [],
+      }));
+      const app = facade(core, [root, ...selected], opts);
+      for (const header of ['p', 'q']) {
+        const response = await app(
+          new Request('http://x/shared', { headers: { 'x-hat': header } }),
+        );
+        assertEquals(response.status, 200);
+        assertEquals(await response.json(), {
+          layer: header,
+          route: header === 'p' ? '/alpha' : '/beta',
+        });
+      }
+      const ambiguous = await app(new Request('http://x/shared'));
+      assertEquals(ambiguous.status, 404);
+      await ambiguous.body?.cancel();
+    }
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('unclaimed bare aliases keep previous exclusive-socket and force-prefix behavior', async () => {
+  const { core, layers, close } = await makeApps();
+  try {
+    const root = layers.find((l) => l.name === 'layer-a')!;
+    const mounted: Layer = {
+      ...root,
+      name: 'mounted',
+      ports: [3689],
+      mounts: root.mounts.map((mount) => ({ ...mount, prefix: '/claimed' })),
+    };
+    const app = facade(core, [root, mounted], {
+      listenPort: 3689,
+      defaultPort: 4534,
+    });
+    for (
+      const path of [
+        '/echo',
+        '/claimed/echo',
+        '/_mounted/echo',
+        '/_mounted/claimed/echo',
+      ]
+    ) {
+      const response = await app(new Request(`http://x${path}`));
+      assertEquals(response.status, 200, path);
+      assertEquals(await response.json(), { layer: 'a', route: '/echo' });
+    }
+    const absentClaimant = await facade(core, [mounted])(
+      new Request('http://x/claimed/echo'),
+    );
+    assertEquals(absentClaimant.status, 404);
+    await absentClaimant.body?.cancel();
   } finally {
     await close();
   }

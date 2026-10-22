@@ -60,7 +60,11 @@ export function createShares(
     const albums: AlbumRow[] = [], tracks: SongRow[] = [];
     // Re-read authoritative ownership/resources; a stale snapshot grants nothing.
     const row = await store.shares.get(share.id);
-    if (!row || !await enabled() || !await store.users.profile(row.owner)) {
+    if (
+      !row || !await enabled() ||
+      row.expiresAtMs !== null && row.expiresAtMs <= Date.now() ||
+      !await store.users.profile(row.owner)
+    ) {
       return { albums, tracks };
     }
     for (const id of row.resourceIds) {
@@ -170,6 +174,14 @@ export function createShares(
     },
     async open(id: string): Promise<ShareRow | 'expired' | null> {
       return await enabled() ? store.shares.open(id, Date.now()) : null;
+    },
+    /** Validate public access without recording a page/playlist/download visit. */
+    async resolve(id: string): Promise<ShareRow | 'expired' | null> {
+      if (!await enabled()) return null;
+      const row = await store.shares.get(id);
+      return row && row.expiresAtMs !== null && row.expiresAtMs <= Date.now()
+        ? 'expired'
+        : row;
     },
     contents,
     tracks: async (share: ShareRow) => (await contents(share)).tracks,

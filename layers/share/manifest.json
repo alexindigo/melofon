@@ -1,0 +1,10 @@
+{
+  "pages": "/share",
+  "settings": {
+    "sharing.maxConcurrentStreams": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 4
+    }
+  }
+}
