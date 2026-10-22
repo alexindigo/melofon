@@ -18,6 +18,7 @@ import { createListens } from './listens.ts';
 import { createIdentity } from './identity.ts';
 import { createPlaylists } from './playlists.ts';
 import { createRadio } from './radio.ts';
+import { createShares } from './shares.ts';
 import { createPodcasts } from './podcasts.ts';
 import { createNetwork } from './lookups/net.ts';
 import { createClientQueue } from './clientqueue.ts';
@@ -220,6 +221,7 @@ const bag = {
   listens: createListens(store),
   playlists,
   radio: createRadio(store),
+  shares: createShares(store, state, library, playlists),
   podcasts,
   clientQueue: createClientQueue(store),
   bookmarks: createBookmarks(store),

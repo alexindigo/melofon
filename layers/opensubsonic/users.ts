@@ -1,7 +1,7 @@
 import type { UserProfile } from '#opensubsonic/types.ts';
 
 // Every user can access every library until per-user library access exists.
-export function userOf(user: UserProfile, folder: number[]) {
+export function userOf(user: UserProfile, folder: number[], sharing = false) {
   return {
     username: user.username,
     scrobblingEnabled: true,
@@ -15,7 +15,7 @@ export function userOf(user: UserProfile, folder: number[]) {
     podcastRole: user.role === 'admin',
     streamRole: true,
     jukeboxRole: false,
-    shareRole: false,
+    shareRole: sharing,
     videoConversionRole: false,
     folder,
   };

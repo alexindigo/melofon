@@ -18,6 +18,8 @@ import { facade } from '../src/facade.ts';
 import { createReference } from '../src/reference.ts';
 import { createRadio } from '../src/radio.ts';
 import { createPodcasts } from '../src/podcasts.ts';
+import { createPlaylists } from '../src/playlists.ts';
+import { createShares } from '../src/shares.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
@@ -40,9 +42,12 @@ async function setup() {
   await scan.run();
   const library = createLibrary(store);
   const state = createState(store);
+  const shares = createShares(store, state, library, createPlaylists(store));
+  await state.set('sharing.enabled', 'true');
   const podcasts = await createPodcasts({ store, state, dataDir: dir });
   const bag = {
     state,
+    shares,
     podcasts,
     radio: createRadio(store),
     reference: createReference({

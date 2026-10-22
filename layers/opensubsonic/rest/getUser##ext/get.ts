@@ -20,6 +20,10 @@ export default async (_request: HatRequest, context: HatContext) => {
   if (user === null) return notFound(context);
   const folders = await context.app.libraries.list();
   return ok(context, {
-    user: userOf(user, folders.map((f) => folderWireId(f.id))),
+    user: userOf(
+      user,
+      folders.map((f) => folderWireId(f.id)),
+      await context.app.state.get('sharing.enabled') === 'true',
+    ),
   });
 };

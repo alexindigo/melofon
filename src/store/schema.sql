@@ -368,6 +368,20 @@ CREATE TABLE IF NOT EXISTS candidates (
   details JSON NOT NULL
 );
 CREATE SEQUENCE IF NOT EXISTS lookup_job_seq;
+-- Kept public-link facts, independent of scans. Added on existing installs too.
+CREATE TABLE IF NOT EXISTS shares (
+  id VARCHAR PRIMARY KEY,
+  user_id VARCHAR NOT NULL,
+  description VARCHAR NOT NULL,
+  resource_type VARCHAR NOT NULL CHECK (resource_type IN ('song', 'album', 'artist', 'playlist')),
+  resource_ids VARCHAR[] NOT NULL,
+  downloadable BOOLEAN NOT NULL,
+  expires_ms BIGINT,
+  created_ms BIGINT NOT NULL,
+  updated_ms BIGINT NOT NULL,
+  last_visited_ms BIGINT,
+  visit_count BIGINT NOT NULL
+);
 -- Reference knowledge is kept independently of catalog rebuilds and candidates.
 CREATE TABLE IF NOT EXISTS reference_facts (
   entity_type VARCHAR NOT NULL CHECK (entity_type IN ('artist', 'track')),

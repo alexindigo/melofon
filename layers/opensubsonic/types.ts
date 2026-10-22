@@ -272,6 +272,25 @@ export interface HatContext {
       ): Promise<StationResult | null>;
       delete(id: string): Promise<boolean>;
     };
+    shares: {
+      enabled(): Promise<boolean>;
+      publicUrl(): Promise<string>;
+      create(
+        owner: string,
+        ids: string[],
+        options: ShareOptions,
+      ): Promise<ShareRow | 'disabled' | null | { invalid: string }>;
+      list(caller: string): Promise<ShareRow[]>;
+      update(
+        caller: string,
+        id: string,
+        options: ShareOptions,
+      ): Promise<ShareRow | 'forbidden' | null | { invalid: string }>;
+      delete(caller: string, id: string): Promise<boolean | 'forbidden'>;
+      contents(
+        share: ShareRow,
+      ): Promise<{ albums: AlbumRow[]; tracks: SongRow[] }>;
+    };
     podcasts: {
       channels(): Promise<PodcastChannelRow[]>;
       episodes(channelId: string): Promise<PodcastEpisodeRow[]>;
@@ -388,6 +407,23 @@ export interface HatContext {
 }
 
 // Domain rows, declared structurally (the hat does not import src/).
+export interface ShareOptions {
+  description?: string;
+  expires?: number;
+}
+export interface ShareRow {
+  id: string;
+  owner: string;
+  description: string;
+  resourceType: 'song' | 'album' | 'artist' | 'playlist';
+  resourceIds: string[];
+  downloadable: boolean;
+  expiresAtMs: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+  lastVisitedAtMs: number | null;
+  visitCount: number;
+}
 export type PodcastStatus =
   | 'new'
   | 'downloading'
