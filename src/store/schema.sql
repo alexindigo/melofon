@@ -11,6 +11,20 @@ CREATE TABLE IF NOT EXISTS users (
 );
 -- H9: users.ts migrates only unset roles, then installs the regular-user default.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS name_key VARCHAR;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_access_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS sessions (
+  id VARCHAR PRIMARY KEY,
+  user_id VARCHAR NOT NULL,
+  key_hash VARCHAR UNIQUE NOT NULL,
+  device_name VARCHAR NOT NULL,
+  user_agent VARCHAR NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  last_used_at TIMESTAMPTZ NOT NULL
+);
 -- M3 scan sources: disjoint folders, one OpenSubsonic music folder per row.
 -- Keep-on-rescan: the scan reads this table, never writes it.
 CREATE TABLE IF NOT EXISTS libraries (

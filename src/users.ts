@@ -6,23 +6,99 @@
 import { encodeHex } from '@std/encoding/hex';
 import type { Config } from './config.ts';
 import type { Store } from './store/index.ts';
+import type { PasswordVerifier } from './password-verifier.ts';
+import type { Sessions } from './sessions.ts';
+import type { State } from './state.ts';
+import { UserError } from './user-errors.ts';
 export type { UserProfile } from './store/users.ts';
+export { UserError } from './user-errors.ts';
 
 /** Directory access is core policy, separate from credential verification. */
-export function createUsers(store: Store) {
+export function createUsers(store: Store, options: {
+  cfg: Pick<Config, 'secret'>;
+  verifier: PasswordVerifier;
+  sessions: Sessions;
+  state: State;
+  now?: () => number;
+}) {
+  const { cfg, verifier, sessions, state } = options;
+  const now = options.now ?? Date.now;
+  state.declare('auth.passwordMinLength', {
+    type: 'integer',
+    minimum: 8,
+    default: 8,
+  });
+  state.declare('auth.accessUpdateSeconds', {
+    type: 'integer',
+    minimum: 60,
+    default: 60,
+  });
+  async function encryptNew(password: string) {
+    if (
+      Array.from(password).length <
+        Number(await state.getTyped('auth.passwordMinLength'))
+    ) throw new UserError('password_too_short');
+    if (cfg.secret === undefined) {
+      throw new Error('MELOFON_SECRET is required to store passwords');
+    }
+    return encryptPassword(cfg.secret, password);
+  }
   return {
-    async get(caller: string, username: string) {
-      const user = await store.users.profile(caller);
-      if (user === null || (caller !== username && user.role !== 'admin')) {
-        return 'forbidden' as const;
-      }
-      return await store.users.profile(username);
+    get: store.users.get,
+    list: store.users.list,
+    async create(
+      caller: string,
+      input: {
+        username: string;
+        password: string;
+        role: 'admin' | 'user';
+        displayName?: string;
+        email?: string;
+      },
+    ) {
+      // Fail authorization before processing credentials; store rechecks it at commit.
+      await store.users.list(caller);
+      const { password, ...details } = input;
+      return store.users.create(caller, {
+        ...details,
+        id: crypto.randomUUID(),
+        passwordEnc: await encryptNew(password),
+      });
     },
-    async list(caller: string) {
-      if ((await store.users.profile(caller))?.role !== 'admin') {
-        return 'forbidden' as const;
+    update: store.users.update,
+    setRole(caller: string, target: string, role: 'admin' | 'user') {
+      return store.users.update(caller, target, { role });
+    },
+    async setPassword(
+      caller: string,
+      target: string,
+      input: { current?: string; new: string },
+    ) {
+      await store.users.get(caller, target);
+      let expected: string | undefined;
+      if (caller === target) {
+        const verified = await verifier({ id: target }, {
+          password: input.current ?? '',
+        });
+        if (input.current === undefined || !verified) {
+          throw new UserError('invalid_credentials');
+        }
+        expected = verified.passwordEnc;
       }
-      return await store.users.profiles();
+      const ids = await store.users.setPassword(
+        caller,
+        target,
+        await encryptNew(input.new),
+        expected,
+      );
+      sessions.ended({ userId: target, sessionIds: ids });
+    },
+    async noteAccess(id: string) {
+      await store.users.noteAccess(
+        id,
+        now(),
+        Number(await state.getTyped('auth.accessUpdateSeconds')) * 1000,
+      );
     },
   };
 }

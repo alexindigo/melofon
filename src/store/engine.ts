@@ -220,7 +220,7 @@ export async function openEngine(
     const schema = await Deno.readTextFile(
       new URL('./schema.sql', import.meta.url),
     );
-    await exclusive(async (q) => {
+    const conflicts = await exclusive(async (q) => {
       for (const statement of schema.split(';')) {
         if (statement.trim() !== '') await q.run(statement);
       }
@@ -228,8 +228,11 @@ export async function openEngine(
       await upgradeUsers(q);
       await upgradeClientQueues(q, schema);
       await upgradeNowPlaying(q);
-      await migrate(q);
+      return await migrate(q);
     });
+    for (const userId of conflicts) {
+      (opts.log ?? scopedLog('db')).event('user_name_collision', { userId });
+    }
   } catch (error) {
     await close();
     throw error;

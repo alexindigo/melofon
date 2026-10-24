@@ -219,7 +219,17 @@ export async function findHats(opts: {
 
 /** Startup only. Callers own the per-hat import failure boundary. */
 export async function loadHat(hat: FoundHat, bag: object): Promise<Layer> {
-  const app = { ...bag, log: scopedLog(`hat:${hat.name}`) };
+  const { store: _store, ...services } = bag as Record<string, unknown>;
+  const app = { ...services, log: scopedLog(`hat:${hat.name}`) };
+  // Every import path (registry and isolated loader) crosses this boundary.
+  // Copy all non-secret config values, preserving version/OwnTone acting user.
+  if ('cfg' in app && app.cfg !== null && typeof app.cfg === 'object') {
+    const { password: _password, secret: _secret, ...view } = app.cfg as Record<
+      string,
+      unknown
+    >;
+    app.cfg = Object.freeze(view);
+  }
   const mounts: Mount[] = [];
   for (const mount of hat.mounts) {
     mounts.push({

@@ -12,6 +12,8 @@ export interface Provenance {
 type ErrorFacts = { error: unknown };
 type OutputFacts = { output: string; generation?: number };
 export interface EventFacts {
+  user_name_collision: { userId: string };
+  session_listener_failed: ErrorFacts;
   hat_found: { hat: string };
   hat_loaded: { hat: string };
   hat_failed: { hat: string; phase: string; code: string } & ErrorFacts;
@@ -173,6 +175,18 @@ export const events: Record<EventId, EventDefinition> = {
   hat_found: definition('hats', 'info', 'Hat found', 'hat'),
   hat_loaded: definition('hats', 'info', 'Hat loaded', 'hat'),
   hat_failed: definition('hats', 'error', 'Hat failed', 'hat phase code error'),
+  user_name_collision: definition(
+    'users',
+    'warn',
+    'Legacy username case collision preserved; rename this user to resolve',
+    'userId',
+  ),
+  session_listener_failed: definition(
+    'sessions',
+    'error',
+    'Session listener failed',
+    'error',
+  ),
   hat_activated: definition('hats', 'info', 'Hat activated', 'hat'),
   hat_deactivated: definition(
     'hats',

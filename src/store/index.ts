@@ -18,8 +18,10 @@ import { createLookupsStore } from './lookups.ts';
 import { createReferenceStore } from './reference.ts';
 import { createReferenceMatcherStore } from './reference-matcher.ts';
 import { createHatsStore } from './hats.ts';
+import { createSessionsStore } from './sessions.ts';
 
 export interface Store {
+  sessions: ReturnType<typeof createSessionsStore>;
   hats: ReturnType<typeof createHatsStore>;
   users: ReturnType<typeof createUsersStore>;
   state: ReturnType<typeof createStateStore>;
@@ -48,6 +50,7 @@ export async function openStore(
 ): Promise<Store> {
   const engine = await openEngine(dataDir, opts);
   const store: Store = {
+    sessions: createSessionsStore(engine),
     hats: createHatsStore(engine),
     users: createUsersStore(engine),
     state: createStateStore(engine),

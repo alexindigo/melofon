@@ -9,7 +9,7 @@ import { loadConfig } from './config.ts';
 import { openStore } from './store/index.ts';
 import { seedFirstUser } from './users.ts';
 import { createScan } from './scan.ts';
-import { createUserService } from './user.ts';
+import { createAuthentication } from './authentication.ts';
 import { createLibraries } from './libraries.ts';
 import { createLibrary } from './library.ts';
 import { createLyrics } from './lyrics.ts';
@@ -57,6 +57,7 @@ await seedFirstUser(store, cfg);
 const libraries = createLibraries(store);
 const notify = createNotify();
 const state = createState(store);
+const authentication = createAuthentication(store, cfg, state);
 const media = createMedia(undefined, state);
 const lyrics = createLyrics(store, state);
 const outputs = createOutputs({ notify, persistence, state });
@@ -210,7 +211,7 @@ const bag = {
   libraries,
   scan,
   media,
-  user: createUserService(store, cfg),
+  ...authentication,
   library,
   reference: Object.freeze({
     get: lookups.reference.get,

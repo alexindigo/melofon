@@ -232,7 +232,9 @@ Deno.test('hats: shipped migration runs once; deactivation keeps serving until r
       );
       assertEquals(await second.status('/api/config', extra), 200);
       assertEquals(
-        (await rawSql(store).all('SELECT id FROM migrations')).map((r) => r.id),
+        (await rawSql(store).all(
+          "SELECT id FROM migrations WHERE id = 'hats-001'",
+        )).map((r) => r.id),
         ['hats-001'],
       );
       await second.hats.activate('opensubsonic');
