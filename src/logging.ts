@@ -5,11 +5,13 @@ import {
   type EventFacts,
   type EventId,
   events,
+  type Level,
   nativePresentation,
   nativeProjection,
   priorities,
   severity,
 } from './logging-events.ts';
+import type { State } from './state.ts';
 export type { EventFacts, EventId, Level } from './logging-events.ts';
 export interface Log {
   event<E extends EventId>(event: E, facts: EventFacts[E]): void;
@@ -18,12 +20,31 @@ export interface Logger extends Log {
   scope(source: string): Log;
   registerSecrets(values: readonly (string | undefined)[]): void;
   flush(): Promise<void>;
+  setRingCapacity(capacity: number): void;
+  records(query: LogQuery): { records: LogRecord[]; next: number | null };
+  text(): string;
+  clear(): void;
   stats(): {
     failures: number;
     dropped: number;
     sinkFailures: number;
     normalizationFailures: number;
   };
+}
+export interface LogQuery {
+  after?: number;
+  level?: Level;
+  component?: string;
+  limit: number;
+}
+export interface LogRecord {
+  sequence: number;
+  time: string;
+  level: Level;
+  component: string;
+  event: string;
+  message: string;
+  fields: Record<string, Value>;
 }
 type Sink = (line: string) => void | Promise<void>;
 export interface LoggerOptions {
@@ -298,6 +319,15 @@ export function createLogger(options: LoggerOptions = {}): Logger {
   const journal = options.journal ??
     (options.sinks ? { stdout: false, stderr: false } : journalDescriptors());
   const secrets = new Set<string>();
+  let capacity = 1000, head = 0, size = 0;
+  let ring: { record: LogRecord; line: string }[] = [];
+  const entries = () =>
+    Array.from({ length: size }, (_, i) => ring[(head + i) % capacity]);
+  const retain = (record: LogRecord, line: string) => {
+    ring[(head + size) % capacity] = { record, line };
+    if (size < capacity) size++;
+    else head = (head + 1) % capacity;
+  };
   let sequence = 0, sinkFailures = 0, normalizationFailures = 0, dropped = 0;
   const queues = { stdout: [] as string[], stderr: [] as string[] };
   const busy = { stdout: false, stderr: false };
@@ -634,21 +664,28 @@ export function createLogger(options: LoggerOptions = {}): Logger {
         let part = `${key}=${quote(value)}`;
         if (bytes + encoder.encode(part).length > 11000) {
           recordTruncated.push(key);
-          part = `${key}=${
-            quote(
-              typeof value === 'object' && value !== null
-                ? { truncated: 'record_size_bound' }
-                : '[record size bound]',
-            )
-          }`;
+          fields[key] = typeof value === 'object' && value !== null
+            ? { truncated: 'record_size_bound' }
+            : '[record size bound]';
+          part = `${key}=${quote(fields[key])}`;
         }
         parts.push(part);
         bytes += encoder.encode(part).length + 1;
       }
       if (recordTruncated.length) {
         parts.push(`record_truncated_fields=${quote(recordTruncated)}`);
+        fields.record_truncated_fields = recordTruncated;
       }
       const line = parts.join(' ') + '\n';
+      retain({
+        sequence,
+        time,
+        level,
+        component: schema.component,
+        event: id,
+        message,
+        fields,
+      }, line);
       const destination = level === 'error' || level === 'fatal'
         ? 'stderr'
         : 'stdout';
@@ -665,9 +702,18 @@ export function createLogger(options: LoggerOptions = {}): Logger {
       // Last-resort schema-independent diagnostic. No original object is
       // inspected here, no recursive logger call and no application exception.
       const failedEvent = Object.hasOwn(events, id) ? id : 'unknown';
-      const line = `time=${
-        new Date().toISOString()
-      } level=error component=logging event=normalization_failed message="Event normalization failed" failedEvent=${failedEvent} normalization_failures=1 sequence=${++sequence}\n`;
+      const time = new Date().toISOString();
+      const line =
+        `time=${time} level=error component=logging event=normalization_failed message="Event normalization failed" failedEvent=${failedEvent} normalization_failures=1 sequence=${++sequence}\n`;
+      retain({
+        sequence,
+        time,
+        level: 'error',
+        component: 'logging',
+        event: 'normalization_failed',
+        message: 'Event normalization failed',
+        fields: { failedEvent, normalization_failures: 1, sequence },
+      }, line);
       if (queues.stderr.length >= (options.maxQueued ?? 1024)) {
         dropped++;
         return;
@@ -681,6 +727,35 @@ export function createLogger(options: LoggerOptions = {}): Logger {
   return {
     event: (id, facts) => intake(id, facts),
     scope: (source) => ({ event: (id, facts) => intake(id, facts, source) }),
+    setRingCapacity(value) {
+      if (!Number.isInteger(value) || value < 100 || value > 20000) {
+        throw new RangeError('Log ring capacity must be 100..20000');
+      }
+      ring = entries().slice(-value);
+      capacity = value;
+      head = 0;
+      size = ring.length;
+    },
+    records(query) {
+      const matching = entries().filter(({ record }) =>
+        record.sequence > (query.after ?? 0) &&
+        (!query.level || priorities[record.level] <= priorities[query.level]) &&
+        (query.component === undefined || record.component === query.component)
+      );
+      const page = matching.slice(0, query.limit);
+      return {
+        records: structuredClone(page.map((entry) => entry.record)),
+        next: matching.length > page.length
+          ? page.at(-1)!.record.sequence
+          : null,
+      };
+    },
+    text: () => entries().map((entry) => entry.line).join(''),
+    clear() {
+      ring = [];
+      head = 0;
+      size = 0;
+    },
     registerSecrets(values) {
       for (const value of values) {
         if (value) {
@@ -717,6 +792,23 @@ export function installLogger(logger: Logger): void {
 }
 export function appLogger(): Logger {
   return production;
+}
+/** The logging owner declares and applies its live retention setting. */
+export async function configureLogging(state: State, logger = appLogger()) {
+  state.declare('log.ringRecords', {
+    type: 'integer',
+    default: 1000,
+    minimum: 100,
+    maximum: 20000,
+    title: 'In-memory log records',
+    description:
+      'Recent redacted records retained in memory; the journal is the durable copy.',
+  });
+  const unsubscribe = state.onChange((key, value) => {
+    if (key === 'log.ringRecords') logger.setRingCapacity(Number(value));
+  });
+  logger.setRingCapacity(Number(await state.getTyped('log.ringRecords')));
+  return unsubscribe;
 }
 // Defaults resolve the installed instance at emission time, including late native callbacks.
 export function scopedLog(source: string): Log {

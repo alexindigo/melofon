@@ -1,6 +1,13 @@
 {
   "api": "/api/v1",
   "settings": {
+    "melofon.logPageRecords": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 1000,
+      "description": "Default number of records per log page (protocol maximum 1000)"
+    },
     "melofon.eventsHeartbeatMs": {
       "type": "integer",
       "minimum": 1000,

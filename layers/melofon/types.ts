@@ -33,6 +33,12 @@ export interface Hat {
 }
 export interface HatContext {
   app: {
+    server: {
+      get(caller: string): Promise<unknown>;
+      log(caller: string, query: LogQuery): Promise<unknown>;
+      logText(caller: string): Promise<string>;
+      clearLog(caller: string): Promise<void>;
+    };
     notify: {
       readonly bootId: string;
       subscribe(
@@ -135,6 +141,12 @@ export interface Setting {
   revision: number;
   writeOnly: boolean;
   isSet?: boolean;
+}
+export interface LogQuery {
+  after?: number;
+  level?: 'debug' | 'info' | 'notice' | 'warn' | 'error' | 'fatal';
+  component?: string;
+  limit: number;
 }
 
 export interface Library {

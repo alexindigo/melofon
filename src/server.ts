@@ -44,7 +44,8 @@ import { createHatServices } from './hat-service.ts';
 import { createBinds, createPortMapping } from './binds.ts';
 import { createListenManager } from './listen-manager.ts';
 import { scopedLog } from './logging.ts';
-import { appLogger } from './logging.ts';
+import { appLogger, configureLogging } from './logging.ts';
+import { createServerStatus } from './server-status.ts';
 import { shutdownNativeLogging } from './boots/raop-ffi.ts';
 import { createSetup } from './setup.ts';
 import { createTermination } from './restart.ts';
@@ -59,6 +60,7 @@ export async function startServer(options: {
 
   const env = options.env ?? Deno.env.toObject();
   const cfg = loadConfig((name) => env[name]);
+  const startedAt = new Date().toISOString();
   const store = await openStore(cfg.dataDir, {
     debugLogQueries: cfg.debugLogRequests,
   });
@@ -67,6 +69,7 @@ export async function startServer(options: {
   const setupMode = await store.users.adminCount() === 0;
   const notify = createNotify();
   const state = createState(store, undefined, notify);
+  const stopLoggingSettings = await configureLogging(state);
   const authentication = createAuthentication(
     store,
     cfg,
@@ -239,7 +242,16 @@ export async function startServer(options: {
     settings: createSettings(store, state),
     hats: createHatServices(store, () => hats!),
     cfg,
-    startedAt: new Date().toISOString(),
+    startedAt,
+    server: createServerStatus({
+      store,
+      version: cfg.version!,
+      startedAt,
+      hats: () => hats!,
+      listens: () => listens.list(),
+      scan,
+      logger: appLogger(),
+    }),
     libraries,
     scan,
     media,
@@ -355,6 +367,7 @@ export async function startServer(options: {
         Deno.removeSignalListener(signal, onSignal);
       }
       clearInterval(engineClock);
+      stopLoggingSettings();
       await lookups.close();
       await podcasts.close();
       discovery.close();

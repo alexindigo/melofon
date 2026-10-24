@@ -46,7 +46,7 @@ export async function createHats(opts: {
   app: object;
   layersRoot?: string;
   mapping: PortMapping;
-  listens: ListenManager;
+  listens: Pick<ListenManager, 'ensure'>;
   notify: Notify;
   log?: Log;
   setupMode?: boolean;

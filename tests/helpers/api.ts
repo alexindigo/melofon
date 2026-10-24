@@ -6,10 +6,16 @@ import { authFixture } from './authentication.ts';
 import { createHats, type Hats } from '../../src/hats.ts';
 import { createHatServices } from '../../src/hat-service.ts';
 import { createPortMapping } from '../../src/binds.ts';
-import { createListenManager } from '../../src/listen-manager.ts';
+import {
+  createListenManager,
+  type ListenManager,
+} from '../../src/listen-manager.ts';
 import { createNotify } from '../../src/notify.ts';
 import { createSettings } from '../../src/settings.ts';
-import { scopedLog } from '../../src/logging.ts';
+import { configureLogging, type Logger, scopedLog } from '../../src/logging.ts';
+import { createServerStatus } from '../../src/server-status.ts';
+import { loadConfig } from '../../src/config.ts';
+import type { ScanService } from '../../src/scan.ts';
 
 export async function apiFixture(
   options: {
@@ -20,12 +26,16 @@ export async function apiFixture(
       fixture: Awaited<ReturnType<typeof authFixture>>,
     ) => Promise<Record<string, unknown>>;
     allLayers?: boolean;
+    status?: Logger;
+    traceRequests?: boolean;
   } = {},
 ) {
   const notify = createNotify();
   const f = await authFixture(notify);
   const peers: string[] = [];
   let hats: Hats | undefined;
+  let listens: ListenManager | undefined;
+  let stopLoggingSettings: (() => void) | undefined;
   const notifications: string[][] = [];
   notify.subscribe((names) => notifications.push(names));
   const settingNotifications: Record<string, string[]>[] = [];
@@ -47,6 +57,21 @@ export async function apiFixture(
   };
   try {
     Object.assign(bag, await options.services?.(f));
+    if (options.status) {
+      f.cfg.version = loadConfig().version!;
+      stopLoggingSettings = await configureLogging(f.state, options.status);
+      Object.assign(bag, {
+        server: createServerStatus({
+          store: f.store,
+          version: f.cfg.version,
+          startedAt: new Date().toISOString(),
+          hats: () => hats!,
+          listens: () => listens?.list() ?? [],
+          scan: (bag as unknown as { scan: ScanService }).scan,
+          logger: options.status,
+        }),
+      });
+    }
     const foundHats = await findHats({ app: bag });
     const found = foundHats.find((h) => h.name === 'melofon')!;
     assertEquals(found.errors, []);
@@ -82,12 +107,14 @@ export async function apiFixture(
       port = (socket.addr as Deno.NetAddr).port;
       socket.close();
       const mapping = createPortMapping(options.hats.env);
-      const listens = createListenManager({
+      listens = createListenManager({
         core,
         layers: () => hats?.activeLayers() ?? [],
         mapping,
         defaultPort: port,
         hostname: '0.0.0.0',
+        debugLogRequests: options.traceRequests,
+        debugLogHeaders: options.traceRequests,
       });
       try {
         hats = await createHats({
@@ -103,11 +130,14 @@ export async function apiFixture(
         await listens.shutdown();
         throw error;
       }
-      shutdown = () => listens.shutdown();
+      shutdown = () => listens!.shutdown();
     } else {
       const server = Deno.serve(
         { hostname: '0.0.0.0', port: 0, onListen() {}, ...tls },
-        facade(core, layers),
+        facade(core, layers, {
+          debugLogRequests: options.traceRequests,
+          debugLogHeaders: options.traceRequests,
+        }),
       );
       port = server.addr.port;
       shutdown = () => server.shutdown();
@@ -216,11 +246,13 @@ export async function apiFixture(
       get,
       async close() {
         await shutdown();
+        stopLoggingSettings?.();
         client?.close();
         await f.close();
       },
     };
   } catch (error) {
+    stopLoggingSettings?.();
     await f.close();
     throw error;
   }

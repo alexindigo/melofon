@@ -6,8 +6,15 @@ import { facade } from './facade.ts';
 import { type Log, scopedLog } from './logging.ts';
 
 export interface ListenManager {
+  list(): ListenView[];
   ensure(ports: number[]): Promise<void>;
   shutdown(): Promise<void>;
+}
+export interface ListenView {
+  hostname: string;
+  port: number;
+  kind: 'default' | 'extra';
+  hats: string[];
 }
 
 export function createListenManager(opts: {
@@ -21,7 +28,7 @@ export function createListenManager(opts: {
   log?: Log;
   setupMode?: boolean;
 }): ListenManager {
-  const servers = new Map<number, Deno.HttpServer>();
+  const servers = new Map<number, Deno.HttpServer<Deno.NetAddr>>();
   const log = opts.log ?? scopedLog('server');
   let closed = false;
   let tail: Promise<unknown> = Promise.resolve();
@@ -31,6 +38,17 @@ export function createListenManager(opts: {
     return result;
   }
   return {
+    list: () =>
+      [...servers.entries()].map(([port, server]) => ({
+        hostname: server.addr.hostname,
+        port: server.addr.port,
+        kind: port === opts.defaultPort ? 'default' : 'extra',
+        hats: opts.layers().filter((layer) =>
+          port === opts.defaultPort
+            ? layer.ports.length === 0
+            : opts.mapping.actual(layer).includes(port)
+        ).map((layer) => layer.name),
+      })),
     ensure(ports) {
       return serial(async () => {
         if (closed) throw new Error('Listens are closed');
