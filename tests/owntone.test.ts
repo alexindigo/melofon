@@ -35,7 +35,7 @@ async function setup(env: Record<string, string> = {}) {
     version: '0.0.0-test',
   };
   const libraries = createLibraries(store);
-  await libraries.add('Music', 'tests/fixtures/library');
+  await libraries.add('Music', await Deno.realPath('tests/fixtures/library'));
   await scanLibrary(store);
   const notify = createNotify();
   const outputs = createOutputs({ notify });
@@ -305,6 +305,7 @@ Deno.test('POST /_/outputs registers an AirPlay output that /api/outputs lists',
           host: '192.0.2.10',
         }),
       }),
+      { remoteAddr: { hostname: '127.0.0.1' } },
     );
     assertEquals(res.status, 200);
     const { output } = await res.json();

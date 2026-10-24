@@ -226,7 +226,10 @@ Deno.test('H1 encoded form credentials, scalar precedence and repeated IDs reach
     };
     await seedFirstUser(store, cfg);
     const libraries = createLibraries(store);
-    await libraries.add('Fixture', 'tests/fixtures/library');
+    await libraries.add(
+      'Fixture',
+      await Deno.realPath('tests/fixtures/library'),
+    );
     await scanLibrary(store);
     const library = createLibrary(store);
     const annotation = createAnnotation(store);

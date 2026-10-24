@@ -484,7 +484,7 @@ Deno.test('API settings: write-only values never enter read responses, change re
       assert(!('value' in value));
       assert(!('default' in value));
       assertEquals(await item(f, credential, 'fixture.secret'), value);
-      const config = await (await f.get('/_/config')).json();
+      const config = await (await f.request('/_/config', {}, true)).json();
       assertEquals(config.config['fixture.secret'], { isSet });
       responses.push(settings, value, config);
     };
@@ -502,9 +502,16 @@ Deno.test('API settings: write-only values never enter read responses, change re
       });
     }
     // The legacy writer shares the same secrecy boundary.
-    const legacy = await f.json('/_/config/fixture.secret', 'PUT', {
-      value: secret,
-    });
+    const legacy = await f.json(
+      '/_/config/fixture.secret',
+      'PUT',
+      {
+        value: secret,
+      },
+      undefined,
+      f.origin,
+      true,
+    );
     assertEquals(legacy.status, 200);
     responses.push(await legacy.json());
     await read(true);

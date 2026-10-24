@@ -42,7 +42,7 @@ async function setup(fixture = true) {
   const scan = createScan(store);
   const library = createLibrary(store);
   if (fixture) {
-    await libraries.add('Music', 'tests/fixtures/library');
+    await libraries.add('Music', await Deno.realPath('tests/fixtures/library'));
     await scan.run();
   }
   const bag = {

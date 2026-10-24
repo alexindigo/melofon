@@ -188,7 +188,10 @@ Deno.test('store.catalog scan hands over a plain fixture snapshot without holdin
   const dir = await Deno.makeTempDir({ prefix: 'melofon-catalog-scan-' });
   const store = await openStore(dir);
   try {
-    await createLibraries(store).add('Music', 'tests/fixtures/library');
+    await createLibraries(store).add(
+      'Music',
+      await Deno.realPath('tests/fixtures/library'),
+    );
     const media = createMedia();
     let peakBytes = 0;
     let peakFiles = 0;
@@ -280,17 +283,19 @@ Deno.test('store.catalog identity reads retain absent first-seen, group only pre
   }
 });
 
-Deno.test('store.catalog libraries add atomically, deduplicate concurrent paths and list by name', async () => {
+Deno.test('store.catalog libraries add atomically, reject concurrent duplicate paths and list by name', async () => {
   const t = await domainFixture(createCatalogStore);
   try {
     const row = { id: "lib'", name: "Z'", path: "/music'" };
-    assertEquals(
-      await Promise.all([
-        t.domain.addLibrary(row),
-        t.domain.addLibrary({ ...row, id: 'other', name: 'Other' }),
-      ]),
-      [row, row],
-    );
+    const results = await Promise.allSettled([
+      t.domain.addLibrary(row),
+      t.domain.addLibrary({ ...row, id: 'other', name: 'Other' }),
+    ]);
+    assertEquals(results[0], { status: 'fulfilled', value: row });
+    assertEquals(results[1].status, 'rejected');
+    if (results[1].status === 'rejected') {
+      assertEquals(results[1].reason.code, 'path_duplicate');
+    }
     const first = { id: 'first', name: 'A', path: '/first' };
     t.failCommit();
     await assertRejects(

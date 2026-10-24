@@ -33,6 +33,20 @@ export interface Hat {
 }
 export interface HatContext {
   app: {
+    libraries: {
+      list(): Promise<Library[]>;
+      add(name: string, path: string, source?: Source): Promise<Library>;
+      update(
+        id: string,
+        input: { name?: string; path?: string },
+        source?: Source,
+      ): Promise<Library>;
+      remove(id: string, source?: Source): Promise<boolean>;
+    };
+    scan: {
+      start(): Promise<void>;
+      status(): Promise<ScanStatus>;
+    };
     settings: {
       describe(caller: string, key?: string): Promise<Setting[]>;
       change(caller: string, changes: unknown): Promise<Setting[]>;
@@ -104,4 +118,25 @@ export interface Setting {
   revision: number;
   writeOnly: boolean;
   isSet?: boolean;
+}
+
+export interface Library {
+  id: string;
+  name: string;
+  path: string;
+}
+export interface Source {
+  kind: 'http';
+  peer?: string;
+  userAgent?: string;
+  user?: string;
+  via?: string;
+}
+export interface ScanStatus {
+  scanning: boolean;
+  count: number;
+  folderCount: number;
+  lastScanMs: number | null;
+  lastScanStartedMs: number | null;
+  lastError: string | null;
 }

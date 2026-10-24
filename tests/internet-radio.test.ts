@@ -227,7 +227,7 @@ Deno.test('internet radio HTTP: shared sorted stations, XML escaping, GET/form C
       streamUrl: 'https://new.example/live',
     });
     const libraries = createLibraries(s.store);
-    await libraries.add('Music', 'tests/fixtures/library');
+    await libraries.add('Music', await Deno.realPath('tests/fixtures/library'));
     await createScan(s.store).run();
     assertEquals((await s.list()).length, 2);
     // Stations are not catalog songs and cannot alias their identities.

@@ -30,7 +30,7 @@ type Envelope = Record<string, unknown> & {
 type Item = Record<string, unknown> & { id: string };
 type Params = Record<string, string | string[]>;
 
-const FIXTURE = 'tests/fixtures/library';
+const FIXTURE = await Deno.realPath('tests/fixtures/library');
 // Two explicit, out-of-order scrobble times (the later one is sent first).
 const T_LATE = 1700000002000;
 const T_EARLY = 1700000001000;

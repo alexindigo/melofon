@@ -6,7 +6,7 @@ Greenfield replacement for Navidrome (OpenSubsonic stays so existing apps keep w
 ## Start
 
 ```bash
-export MELOFON_LISTEN=127.0.0.1:8000
+export MELOFON_LISTEN=0.0.0.0:8000
 export MELOFON_DATA=./data
 export MELOFON_USER=admin
 export MELOFON_PASSWORD=change-me
@@ -16,19 +16,30 @@ deno task start
 ```
 
 Scan sources live in the database (not env). Add each music folder once —
-it persists and is scanned on every boot:
+it persists and is scanned on every boot. Sign in as the env-seeded admin
+(replace `melofon.home` with your server's address):
 
 ```bash
-curl -X POST -H 'content-type: application/json' \
+url=http://melofon.home:8000
+curl -c cookies.txt -H 'content-type: application/json' -H "Origin: $url" \
+  -d '{"username":"admin","password":"change-me"}' "$url/api/v1/session"
+curl -b cookies.txt -H 'content-type: application/json' -H "Origin: $url" \
   -d '{"name": "Music", "path": "/path/to/music"}' \
-  http://127.0.0.1:8000/_/libraries
+  "$url/api/v1/admin/libraries"
 ```
 
-`GET /_/libraries` lists sources, `DELETE /_/libraries/<id>` removes one
-(and its catalog rows). `getMusicFolders` on `/rest` is the OpenSubsonic
-view of the same list.
+`GET /api/v1/admin/libraries` lists sources; `PATCH` or `DELETE` its `/<id>`
+edits or removes one. Paths must be absolute, readable, outside the data
+directory and disjoint. Adding or moving a library starts a background scan;
+moving keeps its id and song ids. Removal keeps stars, ratings and listens.
+`POST /api/v1/admin/scans` with `{}` starts a full scan (or returns the running
+one); `GET /api/v1/admin/scans/current` reads its status and last error.
+`getMusicFolders` on `/rest` is the OpenSubsonic view of the same list.
 
 `GET /_/health` returns `{"ok":true}` once the DuckDB index is open.
+All other core `/_/` admin routes (config, libraries, outputs, last-command)
+are loopback-only: call them from inside the server's container or VM.
+Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — the secret and the password live in env only.
 
@@ -235,8 +246,7 @@ durable history. They last only for the process lifetime; restart begins empty
 or records commands actually performed by boot/restore. Internal discovery,
 preparation or restoration can replace the latest output record. Accepted/no-op
 commands may be recorded without changing state. Reading does not record a
-command. The endpoint follows the existing trusted-network native `/_/` binds
-and unauthenticated exposure. OwnTone `/api/player` retains its eight existing
+command. The endpoint is unauthenticated but loopback-only. OwnTone `/api/player` retains its eight existing
 keys and has no `last_command` field. This is a Melofon-specific diagnostic view.
 
 ## AirPlay connection strategies

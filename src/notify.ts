@@ -33,6 +33,8 @@ const KNOWN = new Set([
   'lastfm',
   'hats',
   'settings',
+  'libraries',
+  'scan',
 ]);
 
 export function createNotify(log: Log = scopedLog('notify')): Notify {

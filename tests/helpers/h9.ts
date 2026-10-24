@@ -154,7 +154,10 @@ export async function h9Setup() {
       `INSERT INTO users (id, name, password_enc, created_at) VALUES ('${name}', '${name}', ${password}, now())`,
     );
   }
-  await api.libraries.add('Music', 'tests/fixtures/library');
+  await api.libraries.add(
+    'Music',
+    await Deno.realPath('tests/fixtures/library'),
+  );
   await scanLibrary(store);
   const songs = await rawSql(store).all<{ id: string; duration_ms: number }>(
     'SELECT id, duration_ms FROM files ORDER BY path',

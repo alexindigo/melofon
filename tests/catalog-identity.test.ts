@@ -381,10 +381,12 @@ Deno.test('identity: concurrent run and start share one scan and its completion'
       },
     };
     let completions = 0;
+    let scanTransitions = 0;
     const scan = createScan(t.store, media, {
       notify: {
-        emit() {
-          completions++;
+        emit(names) {
+          if (names.includes('database')) completions++;
+          if (names.includes('scan')) scanTransitions++;
         },
         subscribe() {
           return () => {};
@@ -401,9 +403,11 @@ Deno.test('identity: concurrent run and start share one scan and its completion'
     assertEquals(a, b);
     assertEquals(t.calls(), 1);
     assertEquals(completions, 1);
+    assertEquals(scanTransitions, 2);
     assertEquals((await scan.status()).scanning, false);
     await scan.run();
     assertEquals(completions, 2);
+    assertEquals(scanTransitions, 4);
   } finally {
     await t.close();
   }

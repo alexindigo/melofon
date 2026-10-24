@@ -183,6 +183,14 @@ export function facade(
     // /_/ — the "no layer" prefix: core's own tree.
     if (path === '/_' || path.startsWith('/_/')) {
       const rest = path.slice(2) || '/';
+      const peer = (info as TraceInfo | undefined)?.remoteAddr?.hostname;
+      if (rest !== '/health' && rest !== '/_status' && !isLoopback(peer)) {
+        return respond(
+          Promise.resolve(
+            Response.json({ detail: 'Not Found' }, { status: 404 }),
+          ),
+        );
+      }
       return await respond(coreApp(repath(request, rest), info));
     }
 
@@ -231,4 +239,10 @@ export function facade(
       Promise.resolve(Response.json({ detail: 'Not Found' }, { status: 404 })),
     );
   };
+}
+
+function isLoopback(peer: string | undefined): boolean {
+  if (peer === '::1') return true;
+  if (!peer || !/^127(?:\.\d{1,3}){3}$/.test(peer)) return false;
+  return peer.split('.').every((part) => Number(part) <= 255);
 }

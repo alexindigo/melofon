@@ -56,7 +56,6 @@ const store = await openStore(cfg.dataDir, {
 });
 const persistence = createPersistence(store);
 await seedFirstUser(store, cfg);
-const libraries = createLibraries(store);
 const notify = createNotify();
 const state = createState(store, undefined, notify);
 const authentication = createAuthentication(store, cfg, state);
@@ -65,6 +64,11 @@ const lyrics = createLyrics(store, state);
 const outputs = createOutputs({ notify, persistence, state });
 await outputs.ready();
 const scan = createScan(store, media, { notify, lyrics, state });
+const libraries = createLibraries(store, {
+  dataDir: cfg.dataDir,
+  scan,
+  notify,
+});
 const network = createNetwork({ state });
 const podcasts = await createPodcasts({
   store,

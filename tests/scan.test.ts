@@ -12,7 +12,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createNotify } from '../src/notify.ts';
 
-const FIXTURE_LIBRARY = 'tests/fixtures/library';
+const FIXTURE_LIBRARY = await Deno.realPath('tests/fixtures/library');
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-scan-' });
@@ -38,7 +38,7 @@ Deno.test('a completed scan emits database on app.notify', async () => {
     notify.subscribe((types) => events.push(types));
     const scan = createScan(store, undefined, { notify });
     await scan.run();
-    assertEquals(events, [['database']]);
+    assertEquals(events, [['scan'], ['database'], ['scan']]);
   } finally {
     await close();
   }

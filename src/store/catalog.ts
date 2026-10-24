@@ -4,6 +4,7 @@ import { userIdForName } from './users.ts';
 import { artistAlbumFolderFilter } from './catalog-sql.ts';
 import { isAlbumFolderHint } from '../albums.ts';
 import { dirname } from 'node:path';
+import { LibraryError, LibrarySourcesChanged } from '../library-errors.ts';
 import type { AlbumMetadata, SongMetadata } from '../metadata.ts';
 import type { VideoDetails } from '../video.ts';
 import {
@@ -987,6 +988,7 @@ export interface CatalogEvent {
 }
 
 export interface CatalogSnapshot {
+  sources?: { id: string; path: string }[];
   artists: { id: string; name: string; musicBrainzId?: string | null }[];
   albums: (Album & { metadata?: AlbumMetadata })[];
   albumIdentities: AlbumIdentity[];
@@ -1156,6 +1158,26 @@ async function replaceCatalog(
   }
 }
 
+async function checkLibraryPath(q: Queries, path: string, id?: string) {
+  const libraries = await q.all<LibraryRow>(
+    'SELECT id, name, path FROM libraries',
+  );
+  for (const row of libraries) {
+    if (row.id === id) continue;
+    if (row.path === path) {
+      throw new LibraryError(
+        'path_duplicate',
+        'Library path is already configured',
+      );
+    }
+    const within = (child: string, parent: string) =>
+      child.startsWith(parent === '/' ? '/' : `${parent}/`);
+    if (within(path, row.path) || within(row.path, path)) {
+      throw new LibraryError('path_overlaps', 'Library paths must not overlap');
+    }
+  }
+}
+
 export function createCatalogStore(engine: Engine) {
   return {
     ...createCatalogReadStore(engine),
@@ -1175,7 +1197,20 @@ export function createCatalogStore(engine: Engine) {
       );
     },
     replaceCatalog(snapshot: CatalogSnapshot): Promise<void> {
-      return atomic(engine, (q) => replaceCatalog(q, snapshot));
+      return atomic(engine, async (q) => {
+        if (snapshot.sources) {
+          const current = await q.all<{ id: string; path: string }>(
+            'SELECT id, path FROM libraries ORDER BY id',
+          );
+          const expected = [...snapshot.sources].sort((a, b) =>
+            a.id.localeCompare(b.id)
+          );
+          if (JSON.stringify(current) !== JSON.stringify(expected)) {
+            throw new LibrarySourcesChanged();
+          }
+        }
+        await replaceCatalog(q, snapshot);
+      });
     },
     libraryCount(): Promise<number> {
       return engine.exclusive(async (q) =>
@@ -1268,22 +1303,50 @@ export function createCatalogStore(engine: Engine) {
     },
     addLibrary(row: LibraryRow): Promise<LibraryRow> {
       return atomic(engine, async (q) => {
-        const existing = await q.all<LibraryRow>(
-          `SELECT id, name, path FROM libraries WHERE path = ${esc(row.path)}`,
-        );
-        if (existing[0]) return existing[0];
+        await checkLibraryPath(q, row.path);
+        // A path hash is the preferred initial ID, not a reservation of that
+        // path forever: another library may have kept the ID while moving.
+        // Allocate under the same exclusive transaction as the path check.
+        let added = { ...row };
+        while (
+          (await q.all(`SELECT id FROM libraries WHERE id = ${esc(added.id)}`))
+            .length
+        ) {
+          added = { ...added, id: crypto.randomUUID().replaceAll('-', '') };
+        }
         const stmt = await q.prepare(
           'INSERT INTO libraries (id, name, path) VALUES (?, ?, ?)',
         );
         try {
-          stmt.bindVarchar(1, row.id);
-          stmt.bindVarchar(2, row.name);
-          stmt.bindVarchar(3, row.path);
+          stmt.bindVarchar(1, added.id);
+          stmt.bindVarchar(2, added.name);
+          stmt.bindVarchar(3, added.path);
           await stmt.run();
         } finally {
           stmt.destroySync();
         }
-        return row;
+        return added;
+      });
+    },
+    updateLibrary(
+      id: string,
+      input: { name?: string; path?: string },
+    ): Promise<{ library: LibraryRow; pathChanged: boolean }> {
+      return atomic(engine, async (q) => {
+        const rows = await q.all<LibraryRow>(
+          `SELECT id, name, path FROM libraries WHERE id = ${esc(id)}`,
+        );
+        if (!rows[0]) throw new LibraryError('not_found', 'Library not found');
+        const row = { ...rows[0], ...input };
+        await checkLibraryPath(q, row.path, id);
+        await q.run(
+          `UPDATE libraries SET name = ${esc(row.name)}, path = ${
+            esc(row.path)
+          } WHERE id = ${esc(id)}`,
+        );
+        // Effects must use this transaction's before/after fact, never a
+        // caller snapshot taken before asynchronous filesystem validation.
+        return { library: row, pathChanged: row.path !== rows[0].path };
       });
     },
     removeLibrary(id: string): Promise<boolean> {

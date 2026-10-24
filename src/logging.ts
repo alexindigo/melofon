@@ -557,7 +557,10 @@ export function createLogger(options: LoggerOptions = {}): Logger {
           normalize(sqlFacts(typeof raw.sql === 'string' ? raw.sql : '')),
         );
       }
-      if (id === 'command' || id === 'config_changed') {
+      if (
+        id === 'command' || id === 'config_changed' ||
+        id === 'libraries_changed'
+      ) {
         // Attribution is an explicit contract; user here is not an auth query credential.
         const src = raw.source !== null && typeof raw.source === 'object' &&
             !types.isProxy(raw.source)

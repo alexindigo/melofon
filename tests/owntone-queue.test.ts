@@ -35,7 +35,7 @@ async function setup() {
   };
   await seedFirstUser(store, cfg);
   const libraries = createLibraries(store);
-  await libraries.add('Music', 'tests/fixtures/library');
+  await libraries.add('Music', await Deno.realPath('tests/fixtures/library'));
   await scanLibrary(store);
   const library = createLibrary(store);
   const playlists = createPlaylists(store);

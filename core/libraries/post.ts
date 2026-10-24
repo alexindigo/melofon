@@ -1,12 +1,13 @@
 // POST /_/libraries — add a scan source. JSON body: { "name", "path" }.
-// The path must be a readable directory; the row is idempotent by path
-// (re-adding returns the existing row). 400 on invalid input.
+// Validation and effects belong to the shared core libraries service.
+import { LibraryError } from '../../src/library-errors.ts';
 interface LibrariesApp {
   app: {
     libraries: {
       add(
         name: string,
         path: string,
+        source?: { kind: 'http'; peer?: string; userAgent?: string },
       ): Promise<{ id: string; name: string; path: string }>;
     };
   };
@@ -17,7 +18,11 @@ function badRequest(message: string): Response {
 }
 
 export default async function (
-  request: { body: { json(): Promise<unknown> } },
+  request: {
+    body: { json(): Promise<unknown> };
+    remoteAddr?: { hostname?: string };
+    headers: Headers;
+  },
   context: LibrariesApp,
 ) {
   let body: unknown;
@@ -33,10 +38,17 @@ export default async function (
   if (typeof path !== 'string' || path.trim() === '') {
     return badRequest('path must be a non-empty string');
   }
-  const stat = await Deno.stat(path).catch(() => null);
-  if (stat === null || !stat.isDirectory) {
-    return badRequest(`path is not a readable directory: ${path}`);
+  try {
+    const row = await context.app.libraries.add(name.trim(), path, {
+      kind: 'http',
+      peer: request.remoteAddr?.hostname,
+      userAgent: request.headers.get('user-agent') ?? undefined,
+    });
+    return { library: row };
+  } catch (error) {
+    if (!(error instanceof LibraryError)) throw error;
+    return Response.json({ code: error.code, message: error.message }, {
+      status: 400,
+    });
   }
-  const row = await context.app.libraries.add(name.trim(), path);
-  return { library: row };
 }

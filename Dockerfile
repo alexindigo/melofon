@@ -1,5 +1,5 @@
 # Melofon — LAN run. Scan sources are rows in the database, added once via
-# the core API (POST /_/libraries {"name", "path"}) against the bind-mounted
+# the admin API (POST /api/v1/admin/libraries {"name", "path"}) against the bind-mounted
 # music path inside the container.
 #
 #   docker build -t melofon .
@@ -11,8 +11,14 @@
 #     -v /path/to/music:/music:ro \
 #     -p 8000:8000 \
 #     melofon
-#   curl -X POST -H 'content-type: application/json' \
-#     -d '{"name": "Music", "path": "/music"}' http://127.0.0.1:8000/_/libraries
+#   url=http://melofon.home:8000
+#   curl -c cookies.txt -H 'content-type: application/json' -H "Origin: $url" \
+#     -d '{"username":"admin","password":"change-me"}' "$url/api/v1/session"
+#   curl -b cookies.txt -H 'content-type: application/json' -H "Origin: $url" \
+#     -d '{"name":"Music","path":"/music"}' "$url/api/v1/admin/libraries"
+#
+# /_/health stays public. Other /_/ admin routes are loopback-only: run their
+# requests inside the container or VM, not through Docker's published port.
 #
 # Pick the published port so it does not steal Navidrome's 4533 (dual-run).
 #

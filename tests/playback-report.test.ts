@@ -31,7 +31,10 @@ async function setup() {
     version: 'test',
   };
   await seedFirstUser(store, cfg);
-  await createLibraries(store).add('Music', 'tests/fixtures/library');
+  await createLibraries(store).add(
+    'Music',
+    await Deno.realPath('tests/fixtures/library'),
+  );
   await scanLibrary(store);
   let clock = Date.now();
   let state = createState(store);

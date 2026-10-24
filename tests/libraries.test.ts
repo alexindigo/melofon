@@ -4,7 +4,13 @@
 // are created through the HTTP API (never an env var), getMusicFolders
 // returns both, getUser.folder carries the same ids, and musicFolderId
 // filters the browse ops.
-import { assert, assertEquals, assertNotEquals } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertNotEquals,
+  assertRejects,
+} from '@std/assert';
+import { LibraryError } from '../src/library-errors.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
@@ -22,8 +28,8 @@ import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
-const ROOT_A = 'tests/fixtures/library/Fixture Artist';
-const ROOT_B = 'tests/fixtures/library/Various Artists';
+const ROOT_A = await Deno.realPath('tests/fixtures/library/Fixture Artist');
+const ROOT_B = await Deno.realPath('tests/fixtures/library/Various Artists');
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-libs-' });
@@ -75,13 +81,16 @@ async function addViaApi(
     .library;
 }
 
-Deno.test('app.libraries add is idempotent by path and lists by name', async () => {
+Deno.test('app.libraries rejects duplicate paths and lists by name', async () => {
   const { libraries, close } = await setup();
   try {
     const a = await libraries.add('B root', ROOT_B);
     const b = await libraries.add('A root', ROOT_A);
-    const again = await libraries.add('other name', ROOT_B);
-    assertEquals(again, a);
+    const error = await assertRejects(
+      () => libraries.add('other name', ROOT_B),
+      LibraryError,
+    );
+    assertEquals(error.code, 'path_duplicate');
     const rows = await libraries.list();
     assertEquals(rows.map((r) => r.name), ['A root', 'B root']);
     assertNotEquals(a.id, b.id);

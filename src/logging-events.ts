@@ -52,6 +52,7 @@ export interface EventFacts {
     queueCleared?: boolean;
   };
   config_changed: { key: string; source: Provenance };
+  libraries_changed: { operation: string; library: string; source: Provenance };
   scan_complete: {
     files: number;
     skipped: number;
@@ -239,6 +240,12 @@ export const events: Record<EventId, EventDefinition> = {
     'command facts intent queueCleared',
   ),
   config_changed: definition('config', 'info', 'Configuration changed', 'key'),
+  libraries_changed: definition(
+    'libraries',
+    'info',
+    'Libraries changed',
+    'operation library',
+  ),
   scan_complete: definition(
     'scan',
     'info',

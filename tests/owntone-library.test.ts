@@ -42,7 +42,7 @@ async function setup(
   };
   if (seedUser) await seedFirstUser(store, cfg);
   const libraries = createLibraries(store);
-  await libraries.add('Music', 'tests/fixtures/library');
+  await libraries.add('Music', await Deno.realPath('tests/fixtures/library'));
   const scan = createScan(store);
   await scan.run();
   const library = createLibrary(store);
@@ -361,23 +361,22 @@ Deno.test('search: type substring matching (track ≡ tracks), all result kinds'
 
 Deno.test('files: roots without directory, children by directory, no escape', async () => {
   const { app, close } = await setup();
+  const fixture = await Deno.realPath('tests/fixtures/library');
   try {
     // No directory → the configured source roots.
     const roots = await (await get(app, '/api/library/files')).json();
-    assertEquals(roots.directories, [{ path: 'tests/fixtures/library' }]);
+    assertEquals(roots.directories, [{ path: fixture }]);
     assertEquals(roots.tracks.total, 0);
     assertEquals(roots.playlists.total, 0);
 
     // At a root: immediate subdirectories, no immediate tracks.
     const root = await (await get(
       app,
-      `/api/library/files?directory=${
-        encodeURIComponent('tests/fixtures/library')
-      }`,
+      `/api/library/files?directory=${encodeURIComponent(fixture)}`,
     )).json();
     assertEquals(root.directories, [
-      { path: 'tests/fixtures/library/Fixture Artist' },
-      { path: 'tests/fixtures/library/Various Artists' },
+      { path: `${fixture}/Fixture Artist` },
+      { path: `${fixture}/Various Artists` },
     ]);
     assertEquals(root.tracks.total, 0);
 
@@ -385,17 +384,17 @@ Deno.test('files: roots without directory, children by directory, no escape', as
     const artist = await (await get(
       app,
       `/api/library/files?directory=${
-        encodeURIComponent('tests/fixtures/library/Fixture Artist')
+        encodeURIComponent(`${fixture}/Fixture Artist`)
       }`,
     )).json();
     assertEquals(artist.directories, [
-      { path: 'tests/fixtures/library/Fixture Artist/Fixture Album' },
+      { path: `${fixture}/Fixture Artist/Fixture Album` },
     ]);
     const albumDir = await (await get(
       app,
       `/api/library/files?directory=${
         encodeURIComponent(
-          'tests/fixtures/library/Fixture Artist/Fixture Album',
+          `${fixture}/Fixture Artist/Fixture Album`,
         )
       }`,
     )).json();

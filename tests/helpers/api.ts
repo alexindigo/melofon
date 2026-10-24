@@ -62,7 +62,7 @@ export async function apiFixture(
     );
     const core = await pathfinder({
       roots: ['core/'],
-      app: { store: f.store, state: f.state, log: scopedLog('core') },
+      app: { store: f.store, ...bag, log: scopedLog('core') },
     });
     const tls = options.tls
       ? {
@@ -112,15 +112,24 @@ export async function apiFixture(
       shutdown = () => server.shutdown();
     }
     const origin = `${options.tls ? 'https' : 'http'}://melofon.home:${port}`;
-    const request = async (path: string, init: RequestInit = {}) => {
+    const request = async (
+      path: string,
+      init: RequestInit = {},
+      loopback = false,
+    ) => {
       const headers = new Headers(init.headers);
       // Test callers explicitly control Origin, including absence.
-      const response = await fetch(`${origin}${path}`, {
-        ...init,
-        headers,
-        signal: AbortSignal.timeout(5000),
-        ...(client ? { client } : {}),
-      });
+      const response = await fetch(
+        `${
+          loopback ? origin.replace('melofon.home', '127.0.0.1') : origin
+        }${path}`,
+        {
+          ...init,
+          headers,
+          signal: AbortSignal.timeout(5000),
+          ...(client ? { client } : {}),
+        },
+      );
       for (const [name] of response.headers) {
         assert(
           !name.toLowerCase().startsWith('access-control-'),
@@ -135,6 +144,7 @@ export async function apiFixture(
       body: unknown,
       credential?: string,
       givenOrigin: string | null = origin,
+      loopback = false,
     ) => {
       const headers = new Headers({
         'Content-Type': 'application/json',
@@ -155,7 +165,7 @@ export async function apiFixture(
         method,
         headers,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
+      }, loopback);
     };
     const login = async (
       use: 'cookie' | 'bearer' = 'cookie',

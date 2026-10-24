@@ -26,6 +26,7 @@ export async function authFixture(notify?: Notify) {
     store,
     state,
     auth,
+    notify,
     admin,
     now: () => clock,
     advance: (ms: number) => {

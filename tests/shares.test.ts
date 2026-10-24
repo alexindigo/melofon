@@ -148,7 +148,10 @@ async function setup() {
     ('listener', 'listener', '${password}', now()), ('other', 'other', '${password}', now())`,
   );
   const client = await api(store, dir);
-  await client.libraries.add('Music', 'tests/fixtures/library');
+  await client.libraries.add(
+    'Music',
+    await Deno.realPath('tests/fixtures/library'),
+  );
   await createScan(store).run();
   const songs = (await store.catalog.listSongs({ offset: 0, size: 100 }))
     .filter((s) => s.title);
@@ -582,7 +585,10 @@ Deno.test('shares HTTP: upgrade creates table without resetting state and all fa
     client = await api(store, dir);
     assertEquals(await store.state.get('upgrade-proof'), 'kept');
     await client.state.set('sharing.enabled', 'true');
-    await client.libraries.add('Music', 'tests/fixtures/library');
+    await client.libraries.add(
+      'Music',
+      await Deno.realPath('tests/fixtures/library'),
+    );
     await createScan(store).run();
     const songs = await store.catalog.listSongs({ offset: 0, size: 100 });
     const created = await client.create(

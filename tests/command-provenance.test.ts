@@ -257,7 +257,7 @@ async function setupWire() {
     app: { store, cfg, playback, outputs: bag.outputs },
   });
   const layers = await loadLayers({ app: bag });
-  const onHook = facade(core, layers, {
+  const hook = facade(core, layers, {
     listenPort: 3689,
     defaultPort: 4534,
     env: {},
@@ -267,8 +267,14 @@ async function setupWire() {
     outputs: bag.outputs,
     notify,
     core,
-    onDefault: facade(core, layers, { defaultPort: 4534, env: {} }),
-    onHook,
+    onDefault: (
+      request: Request,
+      info: unknown = { remoteAddr: { hostname: '127.0.0.1' } },
+    ) => facade(core, layers, { defaultPort: 4534, env: {} })(request, info),
+    onHook: (
+      request: Request,
+      info: unknown = { remoteAddr: { hostname: '127.0.0.1' } },
+    ) => hook(request, info),
     logs,
     close: async () => {
       playback.close();
@@ -767,7 +773,7 @@ Deno.test('native last-command: observer GETs preserve records, state and notifi
             cookie: 'observer-cookie',
           },
         }),
-        HA_INFO,
+        { remoteAddr: { hostname: '127.0.0.1' } },
       );
       assertEquals(response.headers.get('cache-control'), 'no-store');
       const body = await response.json();

@@ -30,6 +30,8 @@ import {
 } from './metadata.ts';
 import { createState, type State } from './state.ts';
 import { type VideoDetails, videoDetails } from './video.ts';
+import { LibrarySourcesChanged } from './library-errors.ts';
+import { join, relative } from 'node:path';
 import {
   createTagReader,
   declareTagSettings,
@@ -84,7 +86,7 @@ async function* walkMedia(
   dir: string = root,
 ): AsyncGenerator<{ abs: string; rel: string }> {
   for await (const entry of Deno.readDir(dir)) {
-    const abs = `${dir}/${entry.name}`;
+    const abs = join(dir, entry.name);
     if (entry.isDirectory) {
       if (!entry.name.startsWith('.')) yield* walkMedia(root, abs);
     } else if (
@@ -94,7 +96,7 @@ async function* walkMedia(
     ) {
       // Anchor at the source root, not the recursion dir: same-named files
       // in different subdirectories must not share an identity path.
-      yield { abs, rel: abs.slice(root.length + 1) };
+      yield { abs, rel: relative(root, abs) };
     }
   }
 }
@@ -139,7 +141,7 @@ export async function scanLibrary(
   let skipped = 0;
 
   for (const source of sources) {
-    const root = source.path.replace(/\/+$/, '');
+    const root = source.path.replace(/\/+$/, '') || '/';
     try {
       for await (const { abs, rel } of walkMedia(root)) {
         if (isCoverFile(rel.slice(rel.lastIndexOf('/') + 1))) {
@@ -395,6 +397,7 @@ export async function scanLibrary(
     metadata: file.metadata,
   })));
   await store.catalog.replaceCatalog({
+    sources: sources.map(({ id, path }) => ({ id, path })),
     artists: [...artists.values()].map((artist) => ({
       ...artist,
       musicBrainzId: artistMbids.get(artist.name) ?? null,
@@ -500,13 +503,16 @@ export interface ScanStatus {
   lastScanMs: number | null;
   /** Start time of the latest scan, for conditional catalog reads. */
   lastScanStartedMs: number | null;
+  lastError: string | null;
 }
 export interface ScanService {
   /** Foreground scan. Concurrent callers await the same result. */
   run(): Promise<ScanCounts>;
   status(): Promise<ScanStatus>;
   /** Background entry point, sharing run's single-flight and logging failures. */
-  start(): Promise<void>;
+  start(
+    options?: { afterCurrent?: boolean; ifRunning?: boolean },
+  ): Promise<void>;
 }
 
 export function createScan(
@@ -521,21 +527,38 @@ export function createScan(
   let count = 0;
   let lastScanMs: number | null = null;
   let lastScanStartedMs: number | null = null;
+  let lastError: string | null = null;
+  let rerun = false;
   const run = (): Promise<ScanCounts> => {
     if (pending !== null) return pending;
     lastScanStartedMs = Date.now();
+    lastError = null;
     pending = (async () => {
-      const counts = await scanLibrary(store, media, log, opts?.lyrics, {
-        state,
-      });
-      count = counts.files;
-      lastScanMs = Date.now();
-      // Core emits after successful completion; hats just consume the event.
-      opts?.notify?.emit(['database']);
-      return counts;
-    })().finally(() => {
+      for (;;) {
+        rerun = false;
+        try {
+          const counts = await scanLibrary(store, media, log, opts?.lyrics, {
+            state,
+          });
+          count = counts.files;
+          lastScanMs = Date.now();
+          // Core emits after successful completion; hats just consume the event.
+          opts?.notify?.emit(['database']);
+          if (!rerun) return counts;
+        } catch (error) {
+          // A source changed during I/O: the store refused the stale catalog.
+          // Re-walk the current source list without publishing removed paths.
+          if (!(error instanceof LibrarySourcesChanged) && !rerun) throw error;
+        }
+      }
+    })().catch((error) => {
+      lastError = error instanceof Error ? error.message : String(error);
+      throw error;
+    }).finally(() => {
       pending = null;
+      opts?.notify?.emit(['scan']);
     });
+    opts?.notify?.emit(['scan']);
     return pending;
   };
   return {
@@ -548,9 +571,12 @@ export function createScan(
         folderCount,
         lastScanMs,
         lastScanStartedMs,
+        lastError,
       };
     },
-    async start() {
+    async start(options = {}) {
+      if (options.ifRunning && pending === null) return;
+      if (options.afterCurrent && pending !== null) rerun = true;
       try {
         await run();
       } catch (error) {
