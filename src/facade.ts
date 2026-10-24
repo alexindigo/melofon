@@ -27,7 +27,7 @@
 // behind MELOFON_DEBUG_LOG_HEADERS and rides the accept line.
 import type { PathfinderApp } from '@pathfinder/pathfinder';
 import type { Layer, Mount } from './layers.ts';
-import { candidatesForBind } from './binds.ts';
+import { createPortMapping, type PortMapping } from './binds.ts';
 import { type Log, scopedLog } from './logging.ts';
 
 function headersMatch(request: Request, layer: Layer): boolean {
@@ -83,22 +83,18 @@ interface TraceInfo {
 
 export function facade(
   coreApp: PathfinderApp,
-  layers: Layer[],
+  layers: Layer[] | (() => Layer[]),
   opts: {
     listenPort?: number;
     defaultPort?: number;
     env?: Record<string, string>;
+    mapping?: PortMapping;
     debugLogRequests?: boolean;
     debugLogHeaders?: boolean;
     log?: Log;
   } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
-  const candidates = candidatesForBind(
-    layers,
-    opts.listenPort,
-    opts.defaultPort,
-    opts.env ?? {},
-  );
+  const mapping = opts.mapping ?? createPortMapping(opts.env ?? {});
   // The `/` hello answers on the default listen only; on an extra bind `/`
   // belongs to the bind's hats (the owntone hat serves no Vue → 404).
   const isDefaultListen = opts.listenPort === undefined ||
@@ -107,6 +103,12 @@ export function facade(
   let inflight = 0;
   const log = opts.log ?? scopedLog('facade');
   return async (request: Request, info?: unknown): Promise<Response> => {
+    const current = typeof layers === 'function' ? layers() : layers;
+    const candidates = current.filter((layer) =>
+      isDefaultListen
+        ? layer.ports.length === 0
+        : mapping.actual(layer).includes(opts.listenPort!)
+    );
     const debug = opts.debugLogRequests === true;
     const path = new URL(request.url).pathname;
     let reqId = 0;

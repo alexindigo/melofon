@@ -17,8 +17,10 @@ import { createCandidatesStore } from './candidates.ts';
 import { createLookupsStore } from './lookups.ts';
 import { createReferenceStore } from './reference.ts';
 import { createReferenceMatcherStore } from './reference-matcher.ts';
+import { createHatsStore } from './hats.ts';
 
 export interface Store {
+  hats: ReturnType<typeof createHatsStore>;
   users: ReturnType<typeof createUsersStore>;
   state: ReturnType<typeof createStateStore>;
   bookmarks: ReturnType<typeof createBookmarksStore>;
@@ -46,6 +48,7 @@ export async function openStore(
 ): Promise<Store> {
   const engine = await openEngine(dataDir, opts);
   const store: Store = {
+    hats: createHatsStore(engine),
     users: createUsersStore(engine),
     state: createStateStore(engine),
     bookmarks: createBookmarksStore(engine),

@@ -4,7 +4,7 @@ import { createState, StateRevisionError } from '../src/state.ts';
 import { SettingsValidationError } from '../src/settings-schema.ts';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
-import { loadLayers } from '../src/layers.ts';
+import { findHats, loadLayers } from '../src/layers.ts';
 import { captureLogs } from './helpers/logging.ts';
 
 async function setup() {
@@ -238,9 +238,16 @@ Deno.test('layer settings: manifest declarations are reserved, validated and reg
         settings: { 'fixture.bad': { type: 'string', unknown: true } },
       }),
     );
-    await assertRejects(
-      () => loadLayers({ app: { state: s.state }, layersRoot: root }),
-      SettingsValidationError,
+    const [failed] = await findHats({
+      app: { state: s.state },
+      layersRoot: root,
+    });
+    assertEquals(failed.errors[0].phase, 'manifest');
+    assertEquals(failed.errors[0].code, 'hat_manifest_failed');
+    assertEquals(failed.errors[0].message, 'unknown schema keyword: unknown');
+    assertEquals(
+      await loadLayers({ app: { state: s.state }, layersRoot: root }),
+      [],
     );
   } finally {
     await s.close();

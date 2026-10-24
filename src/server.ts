@@ -39,9 +39,9 @@ import { createAirplayBoot } from './boots/airplay.ts';
 import { createAirplayDiscovery } from './boots/airplay-mdns.ts';
 import { createAirplayDevices } from './boots/airplay-device.ts';
 import { createOutputAdmission } from './output-admission.ts';
-import { loadLayers } from './layers.ts';
-import { actualPorts, createBinds } from './binds.ts';
-import { facade } from './facade.ts';
+import { createHats, type Hats } from './hats.ts';
+import { createBinds, createPortMapping } from './binds.ts';
+import { createListenManager } from './listen-manager.ts';
 import { scopedLog } from './logging.ts';
 import { appLogger } from './logging.ts';
 import { shutdownNativeLogging } from './boots/raop-ffi.ts';
@@ -80,6 +80,7 @@ const lookups = await createLookupRunner({
 const counts = await scan.run();
 log.event('scan_complete', counts);
 const env = Deno.env.toObject();
+const mapping = createPortMapping(env);
 if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
   await state.seedIfUnset(
     'airplay.mdns',
@@ -201,6 +202,7 @@ if (restoreSnapshot !== null) {
   });
 }
 const playlists = createPlaylists(store);
+let hats: Hats | undefined = undefined;
 const bag = {
   log,
   cfg,
@@ -245,9 +247,18 @@ const bag = {
   outputs,
   notify,
   state,
-  binds: createBinds(() => layers, env),
+  binds: createBinds(() => hats?.layers() ?? [], mapping),
 };
-const layers = await loadLayers({ app: bag });
+const listens = createListenManager({
+  core,
+  layers: () => hats?.activeLayers() ?? [],
+  mapping,
+  defaultPort: cfg.listen?.port ?? 8000,
+  hostname: cfg.listen?.hostname,
+  debugLogRequests: cfg.debugLogRequests,
+  debugLogHeaders: cfg.debugLogHeaders,
+});
+hats = await createHats({ store, app: bag, mapping, listens, notify });
 
 // Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
 const airplayBoot = createAirplayBoot({
@@ -294,56 +305,7 @@ if (restoredEngine) {
   notify.emit(['player', 'queue', 'outputs', 'volume', 'options']);
 }
 
-// Extra binds: the distinct actual ports every layer's claims map to after
-// MELOFON_LISTEN_<layer> / MELOFON_LISTEN_REPLACE_<claimed> — minus the
-// default listen port, which is never bound twice. Deno.serve with no port
-// argument binds 8000, so the default port is known even without
-// MELOFON_LISTEN.
-const defaultPort = cfg.listen?.port ?? 8000;
-const extraBinds = new Set<number>();
-for (const layer of layers) {
-  for (const port of actualPorts(layer, env)) {
-    if (port !== defaultPort) extraBinds.add(port);
-  }
-}
-
-const hostname = cfg.listen?.hostname;
-const debug = {
-  debugLogRequests: cfg.debugLogRequests,
-  debugLogHeaders: cfg.debugLogHeaders,
-};
-const servers: Deno.HttpServer[] = [];
-function serve(port: number, kind: 'default' | 'extra') {
-  const server = Deno.serve(
-    {
-      hostname,
-      port,
-      onListen: ({ hostname, port }) =>
-        log.event('listening', { hostname, port, kind }),
-      onError(error) {
-        log.event('server_error', { error });
-        return new Response(new TextEncoder().encode('Internal Server Error'), {
-          status: 500,
-        });
-      },
-    },
-    facade(core, layers, {
-      ...(kind === 'extra' ? { listenPort: port } : {}),
-      defaultPort,
-      env,
-      ...debug,
-    }),
-  );
-  void server.finished.then(
-    () => log.event('server_finished', { port }),
-    (error) => log.event('server_failed', { port, error }),
-  );
-  servers.push(server);
-}
-serve(defaultPort, 'default');
-for (const port of extraBinds) {
-  serve(port, 'extra');
-}
+await listens.ensure([cfg.listen?.port ?? 8000]);
 
 let shuttingDown = false;
 async function shutdown(): Promise<void> {
@@ -354,7 +316,7 @@ async function shutdown(): Promise<void> {
   await podcasts.close();
   discovery.close();
   airplay.close();
-  await Promise.all(servers.map((server) => server.shutdown()));
+  await listens.shutdown();
   await airplayBoot.close();
   shutdownNativeLogging();
   playback.close();

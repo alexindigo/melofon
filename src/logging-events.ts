@@ -12,6 +12,12 @@ export interface Provenance {
 type ErrorFacts = { error: unknown };
 type OutputFacts = { output: string; generation?: number };
 export interface EventFacts {
+  hat_found: { hat: string };
+  hat_loaded: { hat: string };
+  hat_failed: { hat: string; phase: string; code: string } & ErrorFacts;
+  hat_activated: { hat: string };
+  hat_deactivated: { hat: string };
+  hat_activation_failed: { hat: string; code: string } & ErrorFacts;
   http_accept: {
     request: Request;
     req: number;
@@ -164,6 +170,22 @@ const definition = (
   fields: fields ? fields.split(' ') : [],
 });
 export const events: Record<EventId, EventDefinition> = {
+  hat_found: definition('hats', 'info', 'Hat found', 'hat'),
+  hat_loaded: definition('hats', 'info', 'Hat loaded', 'hat'),
+  hat_failed: definition('hats', 'error', 'Hat failed', 'hat phase code error'),
+  hat_activated: definition('hats', 'info', 'Hat activated', 'hat'),
+  hat_deactivated: definition(
+    'hats',
+    'info',
+    'Hat deactivated for next start',
+    'hat',
+  ),
+  hat_activation_failed: definition(
+    'hats',
+    'error',
+    'Hat activation failed',
+    'hat code error',
+  ),
   stream_empty: definition(
     'stream',
     'warn',

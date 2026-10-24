@@ -1,23 +1,10 @@
-// src/layers.ts — glob layers/*/, read the optional manifest.json, boot one
-// pathfinder app per declared mount. The layer name is the folder name; core
-// never imports a layer by name. Layers get the injected service bag
-// (app.user, app.library, …, cfg) — never a DuckDB handle.
-//
-// manifest.json: `port`, `headers` and `settings` are reserved; every other
-// key declares a mount — folder (under the layer dir) → URL prefix:
-//
-//   { "rest": "/rest" }   →   layers/<name>/rest/ answered at /rest/…
-//
-// `port` is a number or a list of numbers — the layer's CLAIMED default
-// ports (hooks, never binds; src/binds.ts maps claims to actual sockets).
-// Omitted or [] means unported: a candidate on the default listen only.
-//
-// A layer with no mount keys keeps the old shape: the whole layer dir is the
-// pathfinder root (prefix '').
+// Discovery reads data only. Importing is a separate startup-only operation;
+// src/hats.ts owns lifecycle and activation, never the injected hat bag.
 import { pathfinder } from '@pathfinder/pathfinder';
 import type { PathfinderApp } from '@pathfinder/pathfinder';
 import { scopedLog } from './logging.ts';
 import type { State } from './state.ts';
+import { parseSettingsSchema } from './settings-schema.ts';
 
 export interface HeaderMatch {
   name: string;
@@ -41,7 +28,77 @@ export interface Layer {
   dir: string;
 }
 
-const RESERVED = new Set(['port', 'headers', 'settings']);
+const RESERVED = new Set(['port', 'headers', 'settings', 'setup']);
+
+export interface HatError {
+  phase: 'manifest' | 'import' | 'activate';
+  code: string;
+  message: string;
+  file?: string;
+}
+
+export interface FoundHat {
+  name: string;
+  dir: string;
+  mounts: { folder: string; prefix: string }[];
+  ports: number[];
+  headers: HeaderMatch[];
+  settings: string[];
+  setup: boolean;
+  hash: string;
+  errors: HatError[];
+}
+
+export function hatError(
+  phase: HatError['phase'],
+  code: string,
+  error: unknown,
+  file?: string,
+): HatError {
+  return {
+    phase,
+    code,
+    message: error instanceof Error ? error.message : String(error),
+    ...(file === undefined ? {} : { file }),
+  };
+}
+
+// Include names as well as bytes: additions/removals/renames are changes too.
+async function contentHash(dir: string): Promise<string> {
+  const files: [string, string][] = [];
+  const hex = (bytes: ArrayBuffer) =>
+    Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  async function walk(folder: string, relative: string) {
+    for await (const entry of Deno.readDir(folder)) {
+      const name = `${relative}${entry.name}`;
+      if (entry.isDirectory) await walk(`${folder}/${entry.name}`, `${name}/`);
+      else if (entry.isFile) {
+        files.push([
+          name,
+          hex(
+            await crypto.subtle.digest(
+              'SHA-256',
+              await Deno.readFile(`${folder}/${entry.name}`),
+            ),
+          ),
+        ]);
+      } else {
+        throw new Error(
+          `${folder}/${entry.name}: hat files must be regular files or directories`,
+        );
+      }
+    }
+  }
+  await walk(dir, '');
+  files.sort(([a], [b]) => a.localeCompare(b));
+  return hex(
+    await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(JSON.stringify(files)),
+    ),
+  );
+}
 
 // Manifest `port`: number | number[] | undefined → number[]. Anything else
 // (non-int, 0, >65535, mixed junk) is a load-time error naming the file.
@@ -60,79 +117,142 @@ function parsePortClaim(dir: string, raw: unknown): number[] {
   return list;
 }
 
-export async function loadLayers(opts: {
+/** Discover all folders, isolating manifest/settings/mount failures per hat. */
+export async function findHats(opts: {
   app: object;
   layersRoot?: string;
-}): Promise<Layer[]> {
+}): Promise<FoundHat[]> {
   const root = opts.layersRoot ?? './layers';
-  const layers: Layer[] = [];
+  const hats: FoundHat[] = [];
   const entries: Deno.DirEntry[] = [];
   for await (const entry of Deno.readDir(root)) entries.push(entry);
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     if (!entry.isDirectory) continue;
     const dir = `${root}/${entry.name}`;
-    const app = { ...opts.app, log: scopedLog(`hat:${entry.name}`) };
-    let manifest:
-      & { port?: number | number[]; headers?: HeaderMatch[] }
-      & Record<
-        string,
-        unknown
-      > = {};
+    const file = `${dir}/manifest.json`;
+    const hat: FoundHat = {
+      name: entry.name,
+      dir,
+      mounts: [],
+      ports: [],
+      headers: [],
+      settings: [],
+      setup: false,
+      hash: '',
+      errors: [],
+    };
     try {
-      manifest = JSON.parse(await Deno.readTextFile(`${dir}/manifest.json`));
-    } catch (err) {
-      if (!(err instanceof Deno.errors.NotFound)) throw err;
-    }
-    if (manifest.settings !== undefined) {
+      hat.hash = await contentHash(dir);
+      let manifest: Record<string, unknown> = {};
+      try {
+        manifest = JSON.parse(await Deno.readTextFile(file));
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
       if (
-        manifest.settings === null || typeof manifest.settings !== 'object' ||
-        Array.isArray(manifest.settings)
-      ) {
-        throw new Error(
-          `${dir}/manifest.json — settings must map keys to schemas`,
-        );
+        manifest === null || typeof manifest !== 'object' ||
+        Array.isArray(manifest)
+      ) throw new Error('manifest must be an object');
+      if (manifest.setup !== undefined && typeof manifest.setup !== 'boolean') {
+        throw new Error('setup must be a boolean');
       }
-      const state = (opts.app as { state?: Pick<State, 'declare'> }).state;
-      if (!state) {
-        throw new Error(`${dir}/manifest.json — settings service is required`);
+      hat.setup = manifest.setup === true;
+      hat.ports = parsePortClaim(dir, manifest.port);
+      if (manifest.headers !== undefined) {
+        if (
+          !Array.isArray(manifest.headers) ||
+          !manifest.headers.every((h) =>
+            h !== null && typeof h === 'object' && typeof h.name === 'string' &&
+            h.name.length > 0 && typeof h.includes === 'string'
+          )
+        ) throw new Error('headers must be a list of {name, includes}');
+        hat.headers = manifest.headers;
       }
-      for (const [key, schema] of Object.entries(manifest.settings)) {
-        state.declare(key, schema);
+      if (manifest.settings !== undefined) {
+        if (
+          manifest.settings === null || typeof manifest.settings !== 'object' ||
+          Array.isArray(manifest.settings)
+        ) {
+          throw new Error('settings must map keys to schemas');
+        }
+        const state = (opts.app as { state?: Pick<State, 'declare'> }).state;
+        if (!state) throw new Error('settings service is required');
+        // Validate all schemas before publishing any declaration from this manifest.
+        const settings = Object.entries(manifest.settings).map((
+          [key, schema],
+        ) => [key, parseSettingsSchema(schema)] as const);
+        for (const [key, schema] of settings) state.declare(key, schema);
+        hat.settings = settings.map(([key]) => key);
       }
-    }
-    const mountKeys = Object.keys(manifest).filter((k) => !RESERVED.has(k))
-      .sort();
-    const mounts: Mount[] = [];
-    if (mountKeys.length === 0) {
-      mounts.push({
-        folder: dir,
-        prefix: '',
-        app: await pathfinder({ roots: [dir], app }),
-      });
-    } else {
+      const mountKeys = Object.keys(manifest).filter((k) => !RESERVED.has(k))
+        .sort();
+      const rootPath = await Deno.realPath(dir);
       for (const key of mountKeys) {
         const prefix = manifest[key];
-        if (typeof prefix !== 'string') {
+        if (
+          typeof prefix !== 'string' ||
+          (prefix !== '' && (!prefix.startsWith('/') || prefix.endsWith('/')))
+        ) {
           throw new Error(
-            `${dir}/manifest.json — mount "${key}" must map to a URL prefix string`,
+            `mount "${key}" must map to a URL prefix string (no trailing slash)`,
           );
         }
         const folder = `${dir}/${key}`;
-        mounts.push({
-          folder,
-          prefix,
-          app: await pathfinder({ roots: [folder], app }),
-        });
+        const resolved = await Deno.realPath(folder);
+        if (
+          !resolved.startsWith(`${rootPath}/`) ||
+          !(await Deno.stat(folder)).isDirectory
+        ) {
+          throw new Error(`mount "${key}" must be a directory inside the hat`);
+        }
+        hat.mounts.push({ folder, prefix });
       }
+      if (mountKeys.length === 0) hat.mounts.push({ folder: dir, prefix: '' });
+    } catch (error) {
+      hat.errors.push(hatError('manifest', 'hat_manifest_failed', error, file));
     }
-    layers.push({
-      name: entry.name,
-      mounts,
-      ports: parsePortClaim(dir, manifest.port),
-      headers: manifest.headers ?? [],
-      dir,
+    hats.push(hat);
+  }
+  return hats;
+}
+
+/** Startup only. Callers own the per-hat import failure boundary. */
+export async function loadHat(hat: FoundHat, bag: object): Promise<Layer> {
+  const app = { ...bag, log: scopedLog(`hat:${hat.name}`) };
+  const mounts: Mount[] = [];
+  for (const mount of hat.mounts) {
+    mounts.push({
+      ...mount,
+      app: await pathfinder({ roots: [mount.folder], app }),
     });
+  }
+  return {
+    name: hat.name,
+    dir: hat.dir,
+    ports: hat.ports,
+    headers: hat.headers,
+    mounts,
+  };
+}
+
+/** Low-level startup loader for isolated protocol consumers. No activation policy. */
+export async function loadLayers(
+  opts: { app: object; layersRoot?: string },
+): Promise<Layer[]> {
+  const layers: Layer[] = [];
+  for (const hat of await findHats(opts)) {
+    if (hat.errors.length || hat.setup) continue;
+    try {
+      layers.push(await loadHat(hat, opts.app));
+    } catch (error) {
+      scopedLog('hats').event('hat_failed', {
+        hat: hat.name,
+        phase: 'import',
+        code: 'hat_import_failed',
+        error,
+      });
+    }
   }
   return layers;
 }

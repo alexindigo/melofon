@@ -111,18 +111,72 @@ export interface Binds {
   actual(layerName: string, claimed: number): number;
 }
 
+export interface PortMapping {
+  actual(layer: Pick<Layer, 'name' | 'ports'>): number[];
+}
+
+/** Parse once; malformed per-hat mappings fail only hats which use them. */
+export function createPortMapping(env: Record<string, string>): PortMapping {
+  const values = new Map<string, number[] | Error>();
+  for (const [key, raw] of Object.entries(env)) {
+    if (!key.startsWith('MELOFON_LISTEN_')) continue;
+    try {
+      values.set(key, parsePortList(key, raw));
+    } catch (error) {
+      values.set(
+        key,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
+  function read(key: string): number[] | undefined {
+    const value = values.get(key);
+    if (value instanceof Error) throw value;
+    return value;
+  }
+  return {
+    actual(layer) {
+      if (layer.ports.length === 0) return [];
+      const perLayer = read(`MELOFON_LISTEN_${layer.name}`);
+      if (perLayer !== undefined) {
+        if (perLayer.length !== layer.ports.length) {
+          throw new Error(
+            `MELOFON_LISTEN_${layer.name} must list ${layer.ports.length} port(s) — one per claimed ${
+              JSON.stringify(layer.ports)
+            } — got ${JSON.stringify(perLayer)}`,
+          );
+        }
+        return [...perLayer];
+      }
+      return layer.ports.map((claimed) => {
+        const replacement = read(`MELOFON_LISTEN_REPLACE_${claimed}`);
+        if (replacement === undefined) return claimed;
+        if (replacement.length !== 1) {
+          throw new Error(
+            `MELOFON_LISTEN_REPLACE_${claimed} must be a single port`,
+          );
+        }
+        return replacement[0];
+      });
+    },
+  };
+}
+
 // getLayers is lazy: the bag is built before loadLayers runs.
 export function createBinds(
   getLayers: () => Layer[],
-  env: Record<string, string>,
+  env: Record<string, string> | PortMapping,
 ): Binds {
+  const mapping = 'actual' in env && typeof env.actual === 'function'
+    ? env as PortMapping
+    : createPortMapping(env as Record<string, string>);
   return {
     actual(layerName, claimed) {
       const layer = getLayers().find((l) => l.name === layerName);
       if (layer === undefined) return claimed;
       const idx = layer.ports.indexOf(claimed);
       if (idx === -1) return claimed;
-      return actualPorts(layer, env)[idx];
+      return mapping.actual(layer)[idx];
     },
   };
 }

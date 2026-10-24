@@ -28,6 +28,7 @@ const KNOWN = new Set([
   'pairing',
   'spotify',
   'lastfm',
+  'hats',
 ]);
 
 export function createNotify(log: Log = scopedLog('notify')): Notify {

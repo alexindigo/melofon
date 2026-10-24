@@ -410,3 +410,12 @@ CREATE TABLE IF NOT EXISTS lookup_jobs (
   finished_at TIMESTAMPTZ,
   not_before TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS hats (
+  name VARCHAR PRIMARY KEY,
+  active BOOLEAN NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS migrations (
+  id VARCHAR PRIMARY KEY,
+  applied_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
