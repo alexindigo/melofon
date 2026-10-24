@@ -1,0 +1,18 @@
+{
+  "api": "/api/v1",
+  "settings": {
+    "melofon.jsonMaxBytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65536,
+      "default": 65536,
+      "description": "Maximum JSON request body size in bytes"
+    },
+    "melofon.cookieMaxAgeSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 34560000,
+      "description": "Browser session cookie lifetime (400 days); server sessions have no expiry by default"
+    }
+  }
+}

@@ -183,6 +183,7 @@ Deno.test('hats: shipped migration runs once; deactivation keeps serving until r
     const first = await boot(store, undefined, env);
     try {
       assertEquals(first.hats.list().map((h) => [h.name, h.state, h.active]), [
+        ['melofon', 'active', true],
         ['opensubsonic', 'active', true],
         ['owntone', 'active', true],
         ['share', 'active', true],
@@ -565,6 +566,7 @@ Deno.test('hats: pre-ledger database receives shipped flags once on upgrade', as
     await store.close();
     store = await openStore(dir);
     assertEquals(await store.hats.list(), [
+      { name: 'melofon', active: true },
       { name: 'opensubsonic', active: true },
       { name: 'owntone', active: true },
       { name: 'share', active: true },

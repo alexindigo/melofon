@@ -8,6 +8,13 @@ export async function seedShippedHats(q: Queries): Promise<void> {
   }
 }
 
+/** Release activation, once only; later admin choices are never overwritten. */
+export async function seedMelofonHat(q: Queries): Promise<void> {
+  await q.run(
+    "INSERT INTO hats (name, active) VALUES ('melofon', true) ON CONFLICT (name) DO NOTHING",
+  );
+}
+
 export function createHatsStore(engine: Engine) {
   return {
     list: (): Promise<{ name: string; active: boolean }[]> =>
