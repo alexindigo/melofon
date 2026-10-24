@@ -1,4 +1,5 @@
 import type { Store } from '../store/index.ts';
+import { dirname, resolve } from 'node:path';
 import type { LookupInput, LookupJob } from '../store/lookups.ts';
 import type { CandidateInput } from '../store/candidates.ts';
 import type { State } from '../state.ts';
@@ -143,7 +144,13 @@ export async function createLookupRunner(options: {
     options.builtin ?? 'lookups',
     options.dataDir,
   );
-  const hosts = plugins.map((p) => new LookupHost(p, network, { log }));
+  const hosts = plugins.map((p) =>
+    new LookupHost(p, network, {
+      log,
+      onStateChange: () =>
+        options.notify?.emit(['plugins'], { plugins: [p.id] }),
+    })
+  );
   for (const plugin of plugins) {
     const prefix = `lookups.plugin.${plugin.id}`;
     state.declare(
@@ -602,6 +609,45 @@ export async function createLookupRunner(options: {
   }, 86400000);
   return {
     hosts,
+    /** A projection of the existing hosts, not a second lifecycle registry. */
+    async list() {
+      await configuration;
+      return hosts.map((host) => {
+        const { id, dir, manifest } = host.plugin;
+        const prefix = `lookups.plugin.${id}`;
+        return {
+          id,
+          name: manifest?.name ?? id,
+          ...(manifest ? { version: manifest.version } : {}),
+          origin: dirname(dir) === resolve(options.dataDir, 'plugins/lookups')
+            ? 'override' as const
+            : 'builtin' as const,
+          state: host.state,
+          ...(host.error === undefined ? {} : { error: host.error }),
+          capabilities: structuredClone(manifest?.capabilities ?? []),
+          network: {
+            requestedHosts: (manifest?.network.hosts ?? []).map((host) => ({
+              host,
+              ...(manifest?.network.reason === undefined
+                ? {}
+                : { reason: manifest.network.reason }),
+              ...(manifest
+                ? { ratePerMinute: manifest.network.ratePerMinute }
+                : {}),
+            })),
+            approvedHosts: host.approvedHosts,
+          },
+          settingKeys: [
+            `${prefix}.enabled`,
+            `${prefix}.hosts`,
+            ...Object.keys(manifest?.settings ?? {}).map((key) =>
+              `${prefix}.settings.${key}`
+            ),
+          ],
+          discovery: 'startup' as const,
+        };
+      });
+    },
     reference: {
       get: reference.get,
       refresh: reference.refresh,

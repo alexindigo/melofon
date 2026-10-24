@@ -3,7 +3,14 @@ import { sessionKey } from '#melofon/auth.ts';
 import { checkOrigin } from '#melofon/origin.ts';
 import { fail } from '#melofon/errors.ts';
 
-const ADMIN = new Set(['hats', 'settings', 'libraries', 'scan', 'users']);
+const ADMIN = new Set([
+  'hats',
+  'settings',
+  'libraries',
+  'scan',
+  'users',
+  'plugins',
+]);
 const PRIVATE = new Set(['me', 'sessions', 'preferences']);
 type Ids = string[] | '*';
 

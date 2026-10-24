@@ -42,6 +42,7 @@ const KNOWN = new Set([
   'me',
   'sessions',
   'preferences',
+  'plugins',
 ]);
 
 export function createNotify(

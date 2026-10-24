@@ -137,6 +137,7 @@ export class LookupHost {
       livenessMs?: number;
       startupMs?: number;
       stopMs?: number;
+      onStateChange?: () => void;
     } = {},
   ) {
     this.state = plugin.error ? 'failed' : 'discovered';
@@ -146,6 +147,9 @@ export class LookupHost {
   get generation(): string | undefined {
     return this.slot?.generation;
   }
+  get approvedHosts(): string[] {
+    return [...this.hosts];
+  }
   get authority(): NetworkAuthority {
     if (this.state !== 'ready' || !this.slot) {
       throw new Error('Plugin is not ready');
@@ -153,6 +157,7 @@ export class LookupHost {
     return this.slot.authority;
   }
   private transition(state: PluginState, error?: string) {
+    const changed = this.state !== state || this.error !== error;
     this.state = state;
     this.error = error;
     this.log.event('lookup_lifecycle', {
@@ -161,6 +166,7 @@ export class LookupHost {
       generation: this.generation,
       error,
     });
+    if (changed) this.options.onStateChange?.();
   }
   /** Synchronous authority retirement. No queued message can outlive its grant. */
   revoke(reason = 'Lookup authority revoked', interrupted = true): void {

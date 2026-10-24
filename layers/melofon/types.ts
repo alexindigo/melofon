@@ -33,6 +33,11 @@ export interface Hat {
 }
 export interface HatContext {
   app: {
+    plugins: {
+      list(caller: string): Promise<{ plugins: Plugin[] }>;
+      get(caller: string, id: string): Promise<PluginDetail>;
+      change(caller: string, id: string, input: unknown): Promise<PluginDetail>;
+    };
     preferences: {
       get(userId: string): Promise<Preferences>;
       change(
@@ -149,6 +154,44 @@ export interface Setting {
   revision: number;
   writeOnly: boolean;
   isSet?: boolean;
+}
+export interface Plugin {
+  id: string;
+  name: string;
+  version?: string;
+  origin: 'builtin' | 'override';
+  state:
+    | 'discovered'
+    | 'disabled'
+    | 'starting'
+    | 'ready'
+    | 'failed'
+    | 'stopping';
+  error?: string;
+  capabilities: {
+    id: string;
+    accepts: string;
+    provides: string[];
+    requires: string[];
+  }[];
+  network: {
+    requestedHosts: { host: string; reason?: string; ratePerMinute?: number }[];
+    approvedHosts: string[];
+  };
+  settingKeys: string[];
+  discovery: 'startup';
+}
+export interface PluginDetail extends Plugin {
+  enabled: boolean;
+  hosts: string[];
+  settings: {
+    schema: {
+      type: 'object';
+      properties: Record<string, Record<string, unknown>>;
+    };
+    values: Record<string, unknown>;
+    revisions: Record<string, number>;
+  };
 }
 export interface Preferences {
   preferences: Record<string, unknown>;
