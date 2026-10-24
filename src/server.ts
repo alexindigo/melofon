@@ -58,7 +58,13 @@ const persistence = createPersistence(store);
 await seedFirstUser(store, cfg);
 const notify = createNotify();
 const state = createState(store, undefined, notify);
-const authentication = createAuthentication(store, cfg, state);
+const authentication = createAuthentication(
+  store,
+  cfg,
+  state,
+  Date.now,
+  notify,
+);
 const media = createMedia(undefined, state);
 const lyrics = createLyrics(store, state);
 const outputs = createOutputs({ notify, persistence, state });

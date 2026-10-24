@@ -84,6 +84,7 @@ export function createSessionsStore(engine: Engine) {
       now: number,
       idleMs: number,
       intervalMs: number,
+      touch = true,
     ) {
       return atomic(engine, async (q) => {
         const row = (await q.all<StoredSession>(
@@ -98,7 +99,7 @@ export function createSessionsStore(engine: Engine) {
             ended: { userId: row.userId, sessionIds: [row.id] },
           };
         }
-        if (now - row.lastUsedAt >= intervalMs) {
+        if (touch && now - row.lastUsedAt >= intervalMs) {
           await q.run(
             `UPDATE sessions SET last_used_at = epoch_ms(${now}) WHERE id = ${
               esc(row.id)

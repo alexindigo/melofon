@@ -6,6 +6,7 @@ import { createSessions } from './sessions.ts';
 import { createUsers, UserError } from './users.ts';
 import { createUserService } from './user.ts';
 import { createSignInLimiter } from './signin-limiter.ts';
+import type { Notify } from './notify.ts';
 
 export class SignInError extends Error {
   constructor(
@@ -27,10 +28,18 @@ export function createAuthentication(
   cfg: Config,
   state: State,
   now: () => number = Date.now,
+  notify?: Notify,
 ) {
   const verifier = createPasswordVerifier(store, cfg);
-  const sessions = createSessions(store, state, now);
-  const users = createUsers(store, { cfg, verifier, sessions, state, now });
+  const sessions = createSessions(store, state, now, notify);
+  const users = createUsers(store, {
+    cfg,
+    verifier,
+    sessions,
+    state,
+    now,
+    notify,
+  });
   const limiter = createSignInLimiter(state, now);
   // Same-key attempts are serialized through verification and outcome, so a
   // concurrent batch cannot all pass the lockout check before failure #10.

@@ -34,6 +34,7 @@ export async function apiFixture(
   });
   const bag = {
     ...f.auth,
+    notify,
     state: f.state,
     cfg: f.cfg,
     settings: createSettings(f.store, f.state),
@@ -204,6 +205,7 @@ export async function apiFixture(
     };
     return {
       ...f,
+      notify,
       origin,
       peers,
       notifications,

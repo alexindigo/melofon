@@ -3,6 +3,7 @@ import { encodeBase64Url } from '@std/encoding/base64url';
 import type { Store } from './store/index.ts';
 import type { State } from './state.ts';
 import { scopedLog } from './logging.ts';
+import type { Notify } from './notify.ts';
 
 export interface SessionsEnded {
   userId: string;
@@ -13,6 +14,7 @@ export function createSessions(
   store: Store,
   state: State,
   now: () => number = Date.now,
+  notify?: Notify,
 ) {
   state.declare('auth.sessionIdleDays', {
     type: 'number',
@@ -36,6 +38,9 @@ export function createSessions(
         log.event('session_listener_failed', { error });
       }
     }
+    notify?.emit(['sessions'], { sessions: event.sessionIds }, {
+      userId: event.userId,
+    });
   }
   async function create(
     userId: string,
@@ -54,11 +59,12 @@ export function createSessions(
       userAgent: meta.userAgent,
       now: now(),
     }, passwordEnc);
+    notify?.emit(['sessions'], { sessions: [id] }, { userId });
     return { id, key, session };
   }
   return {
     create,
-    async authenticate(key: string) {
+    async authenticate(key: string, options: { touch?: boolean } = {}) {
       const idleMs = Number(await state.getTyped('auth.sessionIdleDays')) *
         86400000;
       const intervalMs =
@@ -68,6 +74,7 @@ export function createSessions(
         now(),
         idleMs,
         intervalMs,
+        options.touch !== false,
       );
       if (result.ended) ended(result.ended);
       return result.auth;

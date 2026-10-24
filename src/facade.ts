@@ -65,15 +65,21 @@ function layerDispatch(
   return null;
 }
 
-// Re-path the request, keeping the query string (credentials ride it).
-// Path unchanged → the ORIGINAL request, not a clone: Deno binds a WebSocket
-// upgrade to the original Request object — a clone's 101 completes (headers,
-// subprotocol) but the socket never delivers data.
+// A routing view, never a new Request: cloning loses the incoming transport's
+// upgrade association. Forward all other properties/methods to the original
+// receiver, preserving body, signal and WebSocket transport for EVERY mount.
+// The facade still owns the original URL (including for completion tracing).
 function repath(request: Request, path: string): Request {
   const url = new URL(request.url);
   if (url.pathname === path) return request;
   url.pathname = path;
-  return new Request(url, request);
+  return new Proxy(request, {
+    get(target, property) {
+      if (property === 'url') return url.href;
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
 }
 
 interface TraceInfo {

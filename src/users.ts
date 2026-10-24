@@ -10,6 +10,7 @@ import type { PasswordVerifier } from './password-verifier.ts';
 import type { Sessions } from './sessions.ts';
 import type { State } from './state.ts';
 import { UserError } from './user-errors.ts';
+import type { Notify } from './notify.ts';
 export type { UserProfile } from './store/users.ts';
 export { UserError } from './user-errors.ts';
 
@@ -20,9 +21,14 @@ export function createUsers(store: Store, options: {
   sessions: Sessions;
   state: State;
   now?: () => number;
+  notify?: Notify;
 }) {
   const { cfg, verifier, sessions, state } = options;
   const now = options.now ?? Date.now;
+  const changed = (id: string) => {
+    options.notify?.emit(['users'], { users: [id] });
+    options.notify?.emit(['me'], { me: [id] }, { userId: id });
+  };
   state.declare('auth.passwordMinLength', {
     type: 'integer',
     minimum: 8,
@@ -59,15 +65,27 @@ export function createUsers(store: Store, options: {
       // Fail authorization before processing credentials; store rechecks it at commit.
       await store.users.list(caller);
       const { password, ...details } = input;
-      return store.users.create(caller, {
+      const user = await store.users.create(caller, {
         ...details,
         id: crypto.randomUUID(),
         passwordEnc: await encryptNew(password),
       });
+      changed(user.id);
+      return user;
     },
-    update: store.users.update,
-    setRole(caller: string, target: string, role: 'admin' | 'user') {
-      return store.users.update(caller, target, { role });
+    async update(
+      caller: string,
+      target: string,
+      input: Parameters<Store['users']['update']>[2],
+    ) {
+      const user = await store.users.update(caller, target, input);
+      changed(user.id);
+      return user;
+    },
+    async setRole(caller: string, target: string, role: 'admin' | 'user') {
+      const user = await store.users.update(caller, target, { role });
+      changed(user.id);
+      return user;
     },
     async setPassword(
       caller: string,
@@ -92,6 +110,7 @@ export function createUsers(store: Store, options: {
         expected,
       );
       sessions.ended({ userId: target, sessionIds: ids });
+      changed(target);
     },
     async noteAccess(id: string) {
       await store.users.noteAccess(

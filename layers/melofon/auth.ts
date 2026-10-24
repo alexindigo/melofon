@@ -6,7 +6,7 @@ export function bearer(request: HatRequest): string | null {
     ?.[1] ?? null;
 }
 
-export default async function auth(request: HatRequest, context: HatContext) {
+export function sessionKey(request: HatRequest): string | null {
   // An explicit Authorization header takes precedence; never fall back to a
   // cookie when the caller supplied an invalid/unsupported credential.
   let key = bearer(request);
@@ -17,6 +17,11 @@ export default async function auth(request: HatRequest, context: HatContext) {
       )
       ?.slice('melofon_session='.length) ?? null;
   }
+  return key;
+}
+
+export default async function auth(request: HatRequest, context: HatContext) {
+  const key = sessionKey(request);
   const authenticated = key
     ? await core(() => context.app.sessions.authenticate(key))
     : null;

@@ -18,7 +18,7 @@ export async function authFixture(notify?: Notify) {
   await seedFirstUser(store, cfg);
   const state = createState(store, undefined, notify);
   let clock = 1800000000000;
-  const auth = createAuthentication(store, cfg, state, () => clock);
+  const auth = createAuthentication(store, cfg, state, () => clock, notify);
   const admin = (await store.users.credentials({ username: 'admin' }))!.user;
   return {
     dir,

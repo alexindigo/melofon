@@ -33,6 +33,16 @@ export interface Hat {
 }
 export interface HatContext {
   app: {
+    notify: {
+      readonly bootId: string;
+      subscribe(
+        fn: (
+          names: string[],
+          ids?: Record<string, string[]>,
+          audience?: { userId: string },
+        ) => void,
+      ): () => void;
+    };
     libraries: {
       list(): Promise<Library[]>;
       add(name: string, path: string, source?: Source): Promise<Library>;
@@ -70,7 +80,14 @@ export interface HatContext {
     sessions: {
       authenticate(
         key: string,
+        options?: { touch?: boolean },
       ): Promise<{ user: User; sessionId: string } | null>;
+      onSessionsEnded(
+        fn: (event: {
+          userId: string;
+          sessionIds: string[];
+        }) => void,
+      ): () => void;
       list(caller: string, target?: string): Promise<Session[]>;
       revoke(caller: string, id: string): Promise<void>;
       revokeAll(caller: string, target?: string): Promise<void>;

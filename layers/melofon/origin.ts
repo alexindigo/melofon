@@ -4,6 +4,10 @@ import { fail } from './errors.ts';
 
 export default function origin(request: HatRequest) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return;
+  checkOrigin(request);
+}
+
+export function checkOrigin(request: HatRequest) {
   const value = request.headers.get('origin');
   if (
     value === null
