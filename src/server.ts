@@ -34,6 +34,7 @@ import { createPlayback } from './playback.ts';
 import { createNotify } from './notify.ts';
 import { createState } from './state.ts';
 import { createSettings } from './settings.ts';
+import { createPreferences } from './preferences.ts';
 import { createLookupRunner } from './lookups/runner.ts';
 import { createAirplayBoot } from './boots/airplay.ts';
 import { createAirplayDiscovery } from './boots/airplay-mdns.ts';
@@ -240,6 +241,7 @@ export async function startServer(options: {
       }
       : {}),
     settings: createSettings(store, state),
+    preferences: createPreferences(store, state, notify),
     hats: createHatServices(store, () => hats!),
     cfg,
     startedAt,

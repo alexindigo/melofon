@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   last_used_at TIMESTAMPTZ NOT NULL
 );
 -- M3 scan sources: disjoint folders, one OpenSubsonic music folder per row.
+-- Preferences survive rescans and upgrades. NULL is a reset revision tombstone.
+CREATE TABLE IF NOT EXISTS user_preferences (
+  user_id VARCHAR NOT NULL,
+  key VARCHAR NOT NULL,
+  value VARCHAR,
+  revision BIGINT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, key)
+);
 -- Keep-on-rescan: the scan reads this table, never writes it.
 CREATE TABLE IF NOT EXISTS libraries (
   id VARCHAR PRIMARY KEY,

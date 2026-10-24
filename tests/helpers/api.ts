@@ -12,6 +12,7 @@ import {
 } from '../../src/listen-manager.ts';
 import { createNotify } from '../../src/notify.ts';
 import { createSettings } from '../../src/settings.ts';
+import { createPreferences } from '../../src/preferences.ts';
 import { configureLogging, type Logger, scopedLog } from '../../src/logging.ts';
 import { createServerStatus } from '../../src/server-status.ts';
 import { loadConfig } from '../../src/config.ts';
@@ -48,6 +49,7 @@ export async function apiFixture(
     state: f.state,
     cfg: f.cfg,
     settings: createSettings(f.store, f.state),
+    preferences: createPreferences(f.store, f.state, notify),
     hats: createHatServices(f.store, () => hats!),
     signIn(input: Parameters<typeof f.auth.signIn>[0]) {
       peers.push(input.clientAddress);

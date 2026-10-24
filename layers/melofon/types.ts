@@ -33,6 +33,14 @@ export interface Hat {
 }
 export interface HatContext {
   app: {
+    preferences: {
+      get(userId: string): Promise<Preferences>;
+      change(
+        userId: string,
+        preferences: unknown,
+        revisions?: unknown,
+      ): Promise<Preferences>;
+    };
     server: {
       get(caller: string): Promise<unknown>;
       log(caller: string, query: LogQuery): Promise<unknown>;
@@ -141,6 +149,11 @@ export interface Setting {
   revision: number;
   writeOnly: boolean;
   isSet?: boolean;
+}
+export interface Preferences {
+  preferences: Record<string, unknown>;
+  revisions: Record<string, number>;
+  defaults: Record<string, unknown>;
 }
 export interface LogQuery {
   after?: number;

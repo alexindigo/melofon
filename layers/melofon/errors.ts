@@ -14,7 +14,7 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
     if (error.name === 'LibraryError') {
       fail(code === 'not_found' ? 404 : 400, String(code), error.message);
     }
-    if (error.name === 'SettingsError') {
+    if (error.name === 'SettingsError' || error.name === 'PreferenceError') {
       const status = code === 'revision_conflict' ? 409 : 400;
       throw new HttpError(status, {
         code,
