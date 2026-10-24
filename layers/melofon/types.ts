@@ -20,8 +20,27 @@ export interface Session {
   createdAt: string;
   lastUsedAt: string;
 }
+export interface Hat {
+  name: string;
+  state: 'found' | 'loaded' | 'active' | 'failed';
+  active: boolean;
+  pendingRestart: boolean;
+  setup: boolean;
+  errors: { phase: string; code: string; message: string; file?: string }[];
+  mounts: { folder: string; prefix: string }[];
+  ports: { claimed: number[]; actual: number[] };
+  settings: string[];
+}
 export interface HatContext {
   app: {
+    hats: {
+      list(caller: string): Promise<{ hats: Hat[]; restartRequired: boolean }>;
+      rescan(
+        caller: string,
+      ): Promise<{ hats: Hat[]; restartRequired: boolean }>;
+      activate(caller: string, name: string): Promise<Hat>;
+      deactivate(caller: string, name: string): Promise<Hat>;
+    };
     state: { getTyped(key: string): Promise<unknown> };
     signIn(input: {
       username: string;

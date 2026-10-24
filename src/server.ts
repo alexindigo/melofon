@@ -40,6 +40,7 @@ import { createAirplayDiscovery } from './boots/airplay-mdns.ts';
 import { createAirplayDevices } from './boots/airplay-device.ts';
 import { createOutputAdmission } from './output-admission.ts';
 import { createHats, type Hats } from './hats.ts';
+import { createHatServices } from './hat-service.ts';
 import { createBinds, createPortMapping } from './binds.ts';
 import { createListenManager } from './listen-manager.ts';
 import { scopedLog } from './logging.ts';
@@ -206,6 +207,7 @@ const playlists = createPlaylists(store);
 let hats: Hats | undefined = undefined;
 const bag = {
   log,
+  hats: createHatServices(store, () => hats!),
   cfg,
   startedAt: new Date().toISOString(),
   libraries,

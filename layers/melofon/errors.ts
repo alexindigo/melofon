@@ -19,7 +19,10 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
         'Retry-After': String(seconds),
       });
     }
-    if (error.name !== 'UserError' && error.name !== 'SignInError') throw error;
+    if (
+      error.name !== 'UserError' && error.name !== 'SignInError' &&
+      error.name !== 'HatServiceError'
+    ) throw error;
     switch (code) {
       case 'invalid_credentials':
         fail(401, code, 'Wrong username or password');
@@ -32,6 +35,12 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
         break;
       case 'name_taken':
         fail(409, code, 'Username is already taken');
+        break;
+      case 'hat_failed':
+      case 'hat_reserved':
+      case 'hat_self':
+      case 'activation_failed':
+        fail(409, code, error.message);
         break;
       case 'last_admin':
         fail(409, code, 'The last admin cannot be demoted');

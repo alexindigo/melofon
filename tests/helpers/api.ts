@@ -3,15 +3,29 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../../src/facade.ts';
 import { findHats, loadHat } from '../../src/layers.ts';
 import { authFixture } from './authentication.ts';
+import { createHats, type Hats } from '../../src/hats.ts';
+import { createHatServices } from '../../src/hat-service.ts';
+import { createPortMapping } from '../../src/binds.ts';
+import { createListenManager } from '../../src/listen-manager.ts';
+import { createNotify } from '../../src/notify.ts';
 
 export async function apiFixture(
-  options: { failSignIn?: boolean; tls?: boolean } = {},
+  options: {
+    failSignIn?: boolean;
+    tls?: boolean;
+    hats?: { layersRoot: string; env: Record<string, string> };
+  } = {},
 ) {
   const f = await authFixture();
   const peers: string[] = [];
+  let hats: Hats | undefined;
+  const notify = createNotify();
+  const notifications: string[][] = [];
+  notify.subscribe((names) => notifications.push(names));
   const bag = {
     ...f.auth,
     state: f.state,
+    hats: createHatServices(f.store, () => hats!),
     signIn(input: Parameters<typeof f.auth.signIn>[0]) {
       peers.push(input.clientAddress);
       if (options.failSignIn) throw new Error('private fixture failure');
@@ -40,13 +54,45 @@ export async function apiFixture(
     const client = options.tls
       ? Deno.createHttpClient({ caCerts: [tls.cert!] })
       : undefined;
-    const server = Deno.serve(
-      { hostname: '0.0.0.0', port: 0, onListen() {}, ...tls },
-      facade(core, [layer]),
-    );
-    const origin = `${
-      options.tls ? 'https' : 'http'
-    }://melofon.home:${server.addr.port}`;
+    let port: number;
+    let shutdown: () => Promise<void>;
+    if (options.hats) {
+      assert(!options.tls, 'lifecycle fixture uses plain HTTP');
+      const socket = Deno.listen({ hostname: '0.0.0.0', port: 0 });
+      port = (socket.addr as Deno.NetAddr).port;
+      socket.close();
+      const mapping = createPortMapping(options.hats.env);
+      const listens = createListenManager({
+        core,
+        layers: () => hats?.activeLayers() ?? [],
+        mapping,
+        defaultPort: port,
+        hostname: '0.0.0.0',
+      });
+      try {
+        hats = await createHats({
+          store: f.store,
+          app: bag,
+          layersRoot: options.hats.layersRoot,
+          mapping,
+          listens,
+          notify,
+        });
+        await listens.ensure([port]);
+      } catch (error) {
+        await listens.shutdown();
+        throw error;
+      }
+      shutdown = () => listens.shutdown();
+    } else {
+      const server = Deno.serve(
+        { hostname: '0.0.0.0', port: 0, onListen() {}, ...tls },
+        facade(core, [layer]),
+      );
+      port = server.addr.port;
+      shutdown = () => server.shutdown();
+    }
+    const origin = `${options.tls ? 'https' : 'http'}://melofon.home:${port}`;
     const request = async (path: string, init: RequestInit = {}) => {
       const headers = new Headers(init.headers);
       // Test callers explicitly control Origin, including absence.
@@ -131,12 +177,13 @@ export async function apiFixture(
       ...f,
       origin,
       peers,
+      notifications,
       request,
       json,
       login,
       get,
       async close() {
-        await server.shutdown();
+        await shutdown();
         client?.close();
         await f.close();
       },

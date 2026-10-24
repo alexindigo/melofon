@@ -5,6 +5,7 @@ import type { PathfinderApp } from '@pathfinder/pathfinder';
 import { scopedLog } from './logging.ts';
 import type { State } from './state.ts';
 import { parseSettingsSchema } from './settings-schema.ts';
+import type { HatServices } from './hat-service.ts';
 
 export interface HeaderMatch {
   name: string;
@@ -219,8 +220,14 @@ export async function findHats(opts: {
 
 /** Startup only. Callers own the per-hat import failure boundary. */
 export async function loadHat(hat: FoundHat, bag: object): Promise<Layer> {
-  const { store: _store, ...services } = bag as Record<string, unknown>;
-  const app = { ...services, log: scopedLog(`hat:${hat.name}`) };
+  const { store: _store, hats, ...services } = bag as
+    & Record<string, unknown>
+    & { hats?: HatServices };
+  const app = {
+    ...services,
+    log: scopedLog(`hat:${hat.name}`),
+    ...(hats ? { hats: hats(hat.name) } : {}),
+  };
   // Every import path (registry and isolated loader) crosses this boundary.
   // Copy all non-secret config values, preserving version/OwnTone acting user.
   if ('cfg' in app && app.cfg !== null && typeof app.cfg === 'object') {
