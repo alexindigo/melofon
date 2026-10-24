@@ -33,6 +33,10 @@ export interface Hat {
 }
 export interface HatContext {
   app: {
+    settings: {
+      describe(caller: string, key?: string): Promise<Setting[]>;
+      change(caller: string, changes: unknown): Promise<Setting[]>;
+    };
     hats: {
       list(caller: string): Promise<{ hats: Hat[]; restartRequired: boolean }>;
       rescan(
@@ -87,4 +91,17 @@ export interface HatContext {
     json: Record<string, unknown>;
   };
   miss?: unknown;
+}
+
+export interface Setting {
+  key: string;
+  owner: string;
+  category: string;
+  schema: Record<string, unknown>;
+  default?: unknown;
+  value?: unknown;
+  source: 'stored' | 'default';
+  revision: number;
+  writeOnly: boolean;
+  isSet?: boolean;
 }

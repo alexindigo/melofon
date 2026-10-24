@@ -183,7 +183,9 @@ export async function findHats(opts: {
         const settings = Object.entries(manifest.settings).map((
           [key, schema],
         ) => [key, parseSettingsSchema(schema)] as const);
-        for (const [key, schema] of settings) state.declare(key, schema);
+        for (const [key, schema] of settings) {
+          state.declare(key, schema, `hat:${entry.name}`);
+        }
         hat.settings = settings.map(([key]) => key);
       }
       const mountKeys = Object.keys(manifest).filter((k) => !RESERVED.has(k))

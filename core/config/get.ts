@@ -3,7 +3,9 @@
 export default async function (
   _request: unknown,
   context: {
-    app: { state: { list(): Promise<Record<string, string>> } };
+    app: {
+      state: { list(): Promise<Record<string, string | { isSet: boolean }>> };
+    };
   },
 ) {
   return { config: await context.app.state.list() };

@@ -34,6 +34,7 @@ import { createPersistence } from './persistence.ts';
 import { createPlayback } from './playback.ts';
 import { createNotify } from './notify.ts';
 import { createState } from './state.ts';
+import { createSettings } from './settings.ts';
 import { createLookupRunner } from './lookups/runner.ts';
 import { createAirplayBoot } from './boots/airplay.ts';
 import { createAirplayDiscovery } from './boots/airplay-mdns.ts';
@@ -57,7 +58,7 @@ const persistence = createPersistence(store);
 await seedFirstUser(store, cfg);
 const libraries = createLibraries(store);
 const notify = createNotify();
-const state = createState(store);
+const state = createState(store, undefined, notify);
 const authentication = createAuthentication(store, cfg, state);
 const media = createMedia(undefined, state);
 const lyrics = createLyrics(store, state);
@@ -207,6 +208,7 @@ const playlists = createPlaylists(store);
 let hats: Hats | undefined = undefined;
 const bag = {
   log,
+  settings: createSettings(store, state),
   hats: createHatServices(store, () => hats!),
   cfg,
   startedAt: new Date().toISOString(),

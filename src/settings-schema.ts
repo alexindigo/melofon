@@ -13,6 +13,7 @@ export interface SettingsSchema {
   default?: SettingValue;
   title?: string;
   description?: string;
+  writeOnly?: boolean;
 }
 
 export class SettingsValidationError extends Error {
@@ -37,6 +38,7 @@ const KEYWORDS = new Set([
   'default',
   'title',
   'description',
+  'writeOnly',
 ]);
 const TYPES = new Set(['string', 'integer', 'number', 'boolean', 'array']);
 const equal = (a: unknown, b: unknown) =>
@@ -100,6 +102,9 @@ export function parseSettingsSchema(raw: unknown): SettingsSchema {
     invalid('schema must declare a supported type');
   }
   const numeric = input.type === 'number' || input.type === 'integer';
+  if ('writeOnly' in input && typeof input.writeOnly !== 'boolean') {
+    invalid('writeOnly must be a boolean');
+  }
   for (const key of ['minimum', 'maximum']) {
     if (!(key in input)) continue;
     if (
@@ -179,4 +184,16 @@ export function parseSetting(
   }
   validate(schema, value);
   return value;
+}
+
+/** Typed JSON enters the existing string encoding only after schema validation. */
+export function encodeSetting(schema: SettingsSchema, value: unknown): string {
+  validate(schema, value);
+  const raw = Array.isArray(value) ? value.join(',') : String(value);
+  // The legacy comma-separated encoding cannot represent commas or trimmed
+  // whitespace inside string items. Refuse loss rather than silently changing data.
+  if (!equal(parseSetting(schema, raw), value)) {
+    invalid('array items cannot contain commas or surrounding whitespace');
+  }
+  return raw;
 }

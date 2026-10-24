@@ -11,6 +11,19 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
   } catch (error) {
     if (!(error instanceof Error) || !('code' in error)) throw error;
     const code = error.code;
+    if (error.name === 'SettingsError') {
+      const status = code === 'revision_conflict' ? 409 : 400;
+      throw new HttpError(status, {
+        code,
+        message: error.message,
+        ...('key' in error && error.key !== undefined
+          ? { key: error.key }
+          : {}),
+        ...('revisions' in error && error.revisions !== undefined
+          ? { revisions: error.revisions }
+          : {}),
+      });
+    }
     if (error.name === 'SignInError' && code === 'too_many_attempts') {
       const seconds = 'retryAfterSeconds' in error
         ? error.retryAfterSeconds

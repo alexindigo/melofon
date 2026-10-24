@@ -6,13 +6,16 @@
 // quiet until something emits them. Sync emit, no DuckDB, no persistence.
 
 import { type Log, scopedLog } from './logging.ts';
-export type NotifyFn = (types: string[]) => void;
+export type NotifyFn = (
+  types: string[],
+  keys?: Record<string, string[]>,
+) => void;
 
 export interface Notify {
   /** Adds a listener; returns the unsubscribe (sockets drop on close/error). */
   subscribe(fn: NotifyFn): () => void;
   /** Synchronously notifies every listener of the (known) types. */
-  emit(types: string[]): void;
+  emit(types: string[], keys?: Record<string, string[]>): void;
 }
 
 // OwnTone's event vocabulary (docs/json-api.md §Push notifications + the
@@ -29,6 +32,7 @@ const KNOWN = new Set([
   'spotify',
   'lastfm',
   'hats',
+  'settings',
 ]);
 
 export function createNotify(log: Log = scopedLog('notify')): Notify {
@@ -40,12 +44,12 @@ export function createNotify(log: Log = scopedLog('notify')): Notify {
         subscribers.delete(fn);
       };
     },
-    emit(types) {
+    emit(types, keys) {
       const known = types.filter((t) => KNOWN.has(t));
       if (known.length === 0) return;
       for (const fn of [...subscribers]) {
         try {
-          fn(known);
+          fn(known, keys);
         } catch (err) {
           // A broken listener (closing socket, …) must not break the emitter
           // or starve the other listeners.

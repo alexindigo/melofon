@@ -2,8 +2,9 @@ import { createAuthentication } from '../../src/authentication.ts';
 import { openStore } from '../../src/store/index.ts';
 import { createState } from '../../src/state.ts';
 import { seedFirstUser } from '../../src/users.ts';
+import type { Notify } from '../../src/notify.ts';
 
-export async function authFixture() {
+export async function authFixture(notify?: Notify) {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-auth-' });
   const cfg = {
     listen: undefined,
@@ -15,7 +16,7 @@ export async function authFixture() {
   };
   const store = await openStore(dir);
   await seedFirstUser(store, cfg);
-  const state = createState(store);
+  const state = createState(store, undefined, notify);
   let clock = 1800000000000;
   const auth = createAuthentication(store, cfg, state, () => clock);
   const admin = (await store.users.credentials({ username: 'admin' }))!.user;

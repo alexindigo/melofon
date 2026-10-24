@@ -146,7 +146,11 @@ export async function createLookupRunner(options: {
   const hosts = plugins.map((p) => new LookupHost(p, network, { log }));
   for (const plugin of plugins) {
     const prefix = `lookups.plugin.${plugin.id}`;
-    state.declare(`${prefix}.enabled`, { type: 'boolean', default: true });
+    state.declare(
+      `${prefix}.enabled`,
+      { type: 'boolean', default: true },
+      `plugin:${plugin.id}`,
+    );
     state.declare(`${prefix}.hosts`, {
       type: 'array',
       items: {
@@ -154,10 +158,10 @@ export async function createLookupRunner(options: {
         pattern: HOST_PATTERN,
       },
       default: [],
-    });
+    }, `plugin:${plugin.id}`);
     for (
       const [key, schema] of Object.entries(plugin.manifest?.settings ?? {})
-    ) state.declare(`${prefix}.settings.${key}`, schema);
+    ) state.declare(`${prefix}.settings.${key}`, schema, `plugin:${plugin.id}`);
   }
   let closed = false;
   const shutdown = new AbortController();

@@ -8,23 +8,35 @@ import { createHatServices } from '../../src/hat-service.ts';
 import { createPortMapping } from '../../src/binds.ts';
 import { createListenManager } from '../../src/listen-manager.ts';
 import { createNotify } from '../../src/notify.ts';
+import { createSettings } from '../../src/settings.ts';
+import { scopedLog } from '../../src/logging.ts';
 
 export async function apiFixture(
   options: {
     failSignIn?: boolean;
     tls?: boolean;
     hats?: { layersRoot: string; env: Record<string, string> };
+    services?: (
+      fixture: Awaited<ReturnType<typeof authFixture>>,
+    ) => Promise<Record<string, unknown>>;
+    allLayers?: boolean;
   } = {},
 ) {
-  const f = await authFixture();
+  const notify = createNotify();
+  const f = await authFixture(notify);
   const peers: string[] = [];
   let hats: Hats | undefined;
-  const notify = createNotify();
   const notifications: string[][] = [];
   notify.subscribe((names) => notifications.push(names));
+  const settingNotifications: Record<string, string[]>[] = [];
+  notify.subscribe((names, keys) => {
+    if (names.includes('settings') && keys) settingNotifications.push(keys);
+  });
   const bag = {
     ...f.auth,
     state: f.state,
+    cfg: f.cfg,
+    settings: createSettings(f.store, f.state),
     hats: createHatServices(f.store, () => hats!),
     signIn(input: Parameters<typeof f.auth.signIn>[0]) {
       peers.push(input.clientAddress);
@@ -33,17 +45,24 @@ export async function apiFixture(
     },
   };
   try {
-    const found = (await findHats({ app: bag })).find((h) =>
-      h.name === 'melofon'
-    )!;
+    Object.assign(bag, await options.services?.(f));
+    const foundHats = await findHats({ app: bag });
+    const found = foundHats.find((h) => h.name === 'melofon')!;
     assertEquals(found.errors, []);
     const layer = await loadHat(found, bag);
+    const layers = options.allLayers
+      ? await Promise.all(
+        foundHats.filter((h) => !h.setup && h.errors.length === 0).map((h) =>
+          loadHat(h, bag)
+        ),
+      )
+      : [layer];
     assert(
       (await f.store.hats.list()).some((h) => h.name === 'melofon' && h.active),
     );
     const core = await pathfinder({
       roots: ['core/'],
-      app: { store: f.store },
+      app: { store: f.store, state: f.state, log: scopedLog('core') },
     });
     const tls = options.tls
       ? {
@@ -87,7 +106,7 @@ export async function apiFixture(
     } else {
       const server = Deno.serve(
         { hostname: '0.0.0.0', port: 0, onListen() {}, ...tls },
-        facade(core, [layer]),
+        facade(core, layers),
       );
       port = server.addr.port;
       shutdown = () => server.shutdown();
@@ -178,6 +197,7 @@ export async function apiFixture(
       origin,
       peers,
       notifications,
+      settingNotifications,
       request,
       json,
       login,
