@@ -21,7 +21,7 @@ import {
 } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest, SongRow } from '#owntone/types.ts';
 
-const ALL = Number.MAX_SAFE_INTEGER;
+const ALL = 9007199254740991; // Largest exactly representable safe integer.
 
 async function songsForUri(
   context: HatContext,

@@ -28,6 +28,9 @@
     "taglib-wasm": "npm:taglib-wasm@2.4.0"
   },
   "nodeModulesDir": "auto",
+  "lint": {
+    "plugins": ["./lint/hat-definitions.ts"]
+  },
   "fmt": {
     "singleQuote": true,
     "proseWrap": "preserve"

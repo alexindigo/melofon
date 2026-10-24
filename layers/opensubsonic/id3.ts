@@ -34,19 +34,24 @@ import type {
 } from '#opensubsonic/types.ts';
 
 export const IGNORED_ARTICLES = 'The El La Los Las Le Les Os As O A';
-const ARTICLES = IGNORED_ARTICLES.split(' ');
+const ARTICLES = [
+  'The',
+  'El',
+  'La',
+  'Los',
+  'Las',
+  'Le',
+  'Les',
+  'Os',
+  'As',
+  'O',
+  'A',
+];
 
-const placeholderId = async (kind: string) => {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(`melofon-placeholder-artist\n${kind}`),
-  );
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0'))
-    .join('').slice(0, 32);
-};
+// SHA-256(`melofon-placeholder-artist\n${kind}`), first 32 hex characters.
 const PLACEHOLDER_IDS = {
-  various: await placeholderId('various'),
-  unknown: await placeholderId('unknown'),
+  various: '5db4f9f82609e01429419e6affafb434',
+  unknown: '627a8a0ebe2d3b3284f1d4ece383dd59',
 };
 const PLACEHOLDER_KINDS = ['various', 'unknown'] as const;
 type PlaceholderKind = typeof PLACEHOLDER_KINDS[number];

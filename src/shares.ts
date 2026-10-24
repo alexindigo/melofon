@@ -29,6 +29,13 @@ export function createShares(
     type: 'boolean',
     default: false,
   });
+  state.declare('sharing.maxConcurrentStreams', {
+    type: 'integer',
+    minimum: 1,
+    default: 4,
+  });
+  // Live admission belongs to this service instance, never hat module state.
+  const streams = new Map<string, number>();
   state.declare('server.publicUrl', {
     type: 'string',
     default: '',
@@ -100,6 +107,22 @@ export function createShares(
   }
   return {
     enabled,
+    async admitStream(id: string): Promise<(() => void) | null> {
+      const limit = Number(
+        await state.getTyped('sharing.maxConcurrentStreams'),
+      );
+      const count = streams.get(id) ?? 0;
+      if (count >= limit) return null;
+      streams.set(id, count + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const remaining = (streams.get(id) ?? 1) - 1;
+        if (remaining) streams.set(id, remaining);
+        else streams.delete(id);
+      };
+    },
     async publicUrl(): Promise<string> {
       const value = await state.getTyped('server.publicUrl') as string;
       if (!value) return '';

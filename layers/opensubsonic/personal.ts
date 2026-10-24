@@ -56,11 +56,13 @@ function factsOf(row: PersonalFactsRow | undefined, play: PlayRow): Facts {
   };
 }
 
-const EMPTY: Personal = {
-  song: () => factsOf(undefined, NO_PLAYS),
-  album: () => factsOf(undefined, NO_PLAYS),
-  artist: () => factsOf(undefined, NO_PLAYS),
-};
+function emptyPersonal(): Personal {
+  return {
+    song: () => factsOf(undefined, NO_PLAYS),
+    album: () => factsOf(undefined, NO_PLAYS),
+    artist: () => factsOf(undefined, NO_PLAYS),
+  };
+}
 
 /** Loads every id's facts for the current user in one batch per service.
  * Ids that were not requested or are unknown get empty facts. */
@@ -73,7 +75,7 @@ export async function loadPersonal(
   const albums = ids.albums ?? [];
   const artists = ids.artists ?? [];
   const all = [...songs, ...albums, ...artists];
-  if (user === undefined || all.length === 0) return EMPTY;
+  if (user === undefined || all.length === 0) return emptyPersonal();
   const annotations = await context.app.annotation.facts(user.username, [
     ...new Set(all),
   ]);

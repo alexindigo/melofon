@@ -25,6 +25,7 @@ export interface ShareContext {
     state: { getTyped(key: string): Promise<unknown> };
     shares: {
       enabled(): Promise<boolean>;
+      admitStream(id: string): Promise<(() => void) | null>;
       resolve(id: string): Promise<Share | 'expired' | null>;
       open(id: string): Promise<Share | 'expired' | null>;
       tracks(share: Share): Promise<Track[]>;

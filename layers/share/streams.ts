@@ -1,27 +1,8 @@
 import type { ShareContext } from './types.ts';
 
-// Admission belongs to this public protocol, not to every core stream consumer.
-const owners = new WeakMap<
-  ShareContext['app']['shares'],
-  Map<string, number>
->();
-export async function admit(context: ShareContext, id: string) {
-  const limit = Number(
-    await context.app.state.getTyped('sharing.maxConcurrentStreams'),
-  );
-  let counts = owners.get(context.app.shares);
-  if (!counts) owners.set(context.app.shares, counts = new Map());
-  const count = counts.get(id) ?? 0;
-  if (count >= limit) return null;
-  counts.set(id, count + 1);
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    const remaining = (counts.get(id) ?? 1) - 1;
-    if (remaining) counts.set(id, remaining);
-    else counts.delete(id);
-  };
+// Core owns live per-share admission; the hat retains only the response lease.
+export function admit(context: ShareContext, id: string) {
+  return context.app.shares.admitStream(id);
 }
 
 /** Retain admission until the consumer finishes, cancels or disconnects. */
