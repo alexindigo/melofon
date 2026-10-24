@@ -49,6 +49,7 @@ export async function createHats(opts: {
   listens: ListenManager;
   notify: Notify;
   log?: Log;
+  setupMode?: boolean;
 }): Promise<Hats> {
   const entries = new Map<string, Entry>();
   const flags = new Map(
@@ -114,12 +115,14 @@ export async function createHats(opts: {
     if (entry.view.state === 'failed') {
       throw new Error(`Hat failed: ${entry.view.name}`);
     }
-    if (entry.found.setup) {
+    if (
+      (entry.found.setup && !startup) || (opts.setupMode && !entry.found.setup)
+    ) {
       throw new Error(`Setup hat is reserved: ${entry.view.name}`);
     }
     if (entry.view.state === 'loaded') {
       try {
-        await opts.listens.ensure(entry.view.ports.actual);
+        if (!opts.setupMode) await opts.listens.ensure(entry.view.ports.actual);
       } catch (error) {
         const failure = hatError('activate', 'hat_activation_failed', error);
         entry.view.errors = [
@@ -144,8 +147,10 @@ export async function createHats(opts: {
     } else if (!startup) {
       await opts.store.hats.set(entry.view.name, true);
     }
-    entry.view.active = true;
-    pending(entry);
+    if (!opts.setupMode) {
+      entry.view.active = true;
+      pending(entry);
+    }
     log.event('hat_activated', { hat: entry.view.name });
     emit();
     return copy(entry);
@@ -220,9 +225,12 @@ export async function createHats(opts: {
   };
   for (const hat of await findHats(opts)) {
     const entry = found(hat);
-    if (entry.view.state === 'failed' || hat.setup) continue;
+    if (
+      entry.view.state === 'failed' || hat.setup !== (opts.setupMode === true)
+    ) continue;
     try {
       entry.layer = await loadHat(hat, opts.app);
+      if (opts.setupMode) entry.layer.ports = [];
       entry.view.state = 'loaded';
       log.event('hat_loaded', { hat: hat.name });
       emit();
@@ -243,7 +251,9 @@ export async function createHats(opts: {
   // The composition's live registry callback can now resolve this service before
   // activation; no request is routed until createHats returns.
   for (const entry of entries.values()) {
-    if (entry.view.state === 'loaded' && entry.view.active) {
+    if (
+      entry.view.state === 'loaded' && (opts.setupMode || entry.view.active)
+    ) {
       await activate(entry, true);
     }
   }

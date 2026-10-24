@@ -52,6 +52,20 @@ export function createUsers(store: Store, options: {
   return {
     get: store.users.get,
     list: store.users.list,
+    async createFirstAdmin(input: {
+      username: string;
+      password: string;
+      displayName?: string;
+    }) {
+      const { password, ...details } = input;
+      const user = await store.users.createFirstAdmin({
+        ...details,
+        id: crypto.randomUUID(),
+        passwordEnc: await encryptNew(password),
+      });
+      changed(user.id);
+      return user;
+    },
     async create(
       caller: string,
       input: {

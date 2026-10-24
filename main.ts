@@ -8,7 +8,8 @@ log.registerSecrets(
 );
 try {
   installDependencyLogging(log);
-  await import('./src/server.ts');
+  const { startServer } = await import('./src/server.ts');
+  await startServer();
 } catch (error) {
   log.event('startup_failed', { error });
   await log.flush();

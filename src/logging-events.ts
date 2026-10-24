@@ -12,6 +12,8 @@ export interface Provenance {
 type ErrorFacts = { error: unknown };
 type OutputFacts = { output: string; generation?: number };
 export interface EventFacts {
+  setup_code: { code: string };
+  restart_requested: { reason: string };
   user_name_collision: { userId: string };
   session_listener_failed: ErrorFacts;
   hat_found: { hat: string };
@@ -173,6 +175,18 @@ const definition = (
   fields: fields ? fields.split(' ') : [],
 });
 export const events: Record<EventId, EventDefinition> = {
+  setup_code: definition(
+    'setup',
+    'notice',
+    'Open /setup and POST the one-time code to create the first admin',
+    'code',
+  ),
+  restart_requested: definition(
+    'server',
+    'notice',
+    'Restart requested',
+    'reason',
+  ),
   hat_found: definition('hats', 'info', 'Hat found', 'hat'),
   hat_loaded: definition('hats', 'info', 'Hat loaded', 'hat'),
   hat_failed: definition('hats', 'error', 'Hat failed', 'hat phase code error'),

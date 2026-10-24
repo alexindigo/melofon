@@ -15,6 +15,24 @@ mkdir -p "$MELOFON_DATA"
 deno task start
 ```
 
+For interactive first setup, omit `MELOFON_USER` and `MELOFON_PASSWORD`
+(keep `MELOFON_SECRET`). With no admin, only setup and health are public.
+Read the one-time code in the startup log and open `/setup`, then create the
+admin with a matching Origin:
+
+```bash
+url=http://melofon.home:8000
+curl -H 'content-type: application/json' -H "Origin: $url" \
+  -d '{"code":"CODE-FROM-LOG","username":"admin","password":"your-password"}' \
+  "$url/setup"
+```
+
+Melofon sends 201, shuts down and exits with code 75 after setup. Configure
+systemd with `Restart=on-failure` (or `Restart=always`), or Docker Compose
+with `restart: unless-stopped` (`docker run --restart unless-stopped`).
+When started by hand, start it again. The next start serves the normal hats;
+sign in with the admin you just created.
+
 Scan sources live in the database (not env). Add each music folder once —
 it persists and is scanned on every boot. Sign in as the env-seeded admin
 (replace `melofon.home` with your server's address):
@@ -41,7 +59,7 @@ All other core `/_/` admin routes (config, libraries, outputs, last-command)
 are loopback-only: call them from inside the server's container or VM.
 Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
-or anything under `data/` — the secret and the password live in env only.
+or anything under `data/` — keep deployment secrets out of source control.
 
 ## Catalog identity
 

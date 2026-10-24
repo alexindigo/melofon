@@ -2,8 +2,7 @@
 // sources into the catalog, boot the core tree + glob layers, serve the facade
 // on the process default listen plus one Deno.serve per distinct actual extra
 // port the layers' claims map to (src/binds.ts). Layers get the injected
-// service bag (app.user, app.library, app.libraries, cfg) — never a DuckDB
-// handle.
+// service bag — never a DuckDB handle or deployment credentials.
 import { pathfinder } from '@pathfinder/pathfinder';
 import { loadConfig } from './config.ts';
 import { openStore } from './store/index.ts';
@@ -47,305 +46,337 @@ import { createListenManager } from './listen-manager.ts';
 import { scopedLog } from './logging.ts';
 import { appLogger } from './logging.ts';
 import { shutdownNativeLogging } from './boots/raop-ffi.ts';
+import { createSetup } from './setup.ts';
+import { createTermination } from './restart.ts';
+import type { Log } from './logging.ts';
 
-const log = scopedLog('server');
+export async function startServer(options: {
+  env?: Record<string, string>;
+  exit?: (code: number) => void;
+  setupLog?: Log;
+} = {}) {
+  const log = scopedLog('server');
 
-const cfg = loadConfig();
-const store = await openStore(cfg.dataDir, {
-  debugLogQueries: cfg.debugLogRequests,
-});
-const persistence = createPersistence(store);
-await seedFirstUser(store, cfg);
-const notify = createNotify();
-const state = createState(store, undefined, notify);
-const authentication = createAuthentication(
-  store,
-  cfg,
-  state,
-  Date.now,
-  notify,
-);
-const media = createMedia(undefined, state);
-const lyrics = createLyrics(store, state);
-const outputs = createOutputs({ notify, persistence, state });
-await outputs.ready();
-const scan = createScan(store, media, { notify, lyrics, state });
-const libraries = createLibraries(store, {
-  dataDir: cfg.dataDir,
-  scan,
-  notify,
-});
-const network = createNetwork({ state });
-const podcasts = await createPodcasts({
-  store,
-  state,
-  network,
-  media,
-  dataDir: cfg.dataDir,
-});
-const lookups = await createLookupRunner({
-  store,
-  state,
-  dataDir: cfg.dataDir,
-  notify,
-  network,
-});
-const counts = await scan.run();
-log.event('scan_complete', counts);
-const env = Deno.env.toObject();
-const mapping = createPortMapping(env);
-if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
-  await state.seedIfUnset(
-    'airplay.mdns',
-    env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
-  );
-}
-// Load persisted remotes BEFORE discovery starts (plan atv3-session-recycle):
-// this populates the savedOutput cache discovery consults synchronously, and
-// the rows are the restore snapshot below — model identity included.
-const savedOutputs = await persistence.loadOutputs();
-const outputAdmission = createOutputAdmission({
-  endpoint(id) {
-    const row = outputs.get(id);
-    return row?.host
-      ? {
-        id,
-        protocol: row.type,
-        address: row.host,
-        ...(row.port === undefined ? {} : { port: row.port }),
-      }
-      : null;
-  },
-  changed: () => notify.emit(['outputs']),
-});
-const airplay = createAirplayDevices({ outputs, admission: outputAdmission });
-const discovery = createAirplayDiscovery({
-  outputs,
-  state,
-  devices: airplay,
-  savedOutput: (id) => persistence.savedOutput(id),
-});
-const library = createLibrary(store, lyrics, { dataDir: cfg.dataDir, media });
-const player = createPlayer();
-const nowPlaying = createNowPlaying(store, { state });
-const playback = createPlayback({
-  player,
-  nowPlaying,
-  library,
-  cfg,
-  notify,
-  persistence,
-});
-const app = {
-  store,
-  cfg,
-  libraries,
-  outputs,
-  playback,
-  state,
-  airplay,
-  outputAdmission,
-  identity: createIdentity(store),
-  reference: lookups.reference,
-  log: scopedLog('core'),
-};
-const core = await pathfinder({ roots: ['core/'], app });
-
-// Restart transparency (plan restart-transparency): restore the engine —
-// the persisted queue rehydrated via the library (missing tracks drop with
-// a warn), then the snapshot. Auto-resume PLAY only inside the freshness
-// window with the environment still matching; anything else pauses at the
-// saved place, so a stale save can't surprise the household (3am speaker).
-// First re-register persisted remotes (hand-added and last-seen mDNS
-// alike) so a saved selection is present for the resume decision.
-for (const row of savedOutputs) {
-  const existing = outputs.get(row.id);
-  if (existing !== null) {
-    // Discovery beat the restore: keep its fresh record, apply user state.
-    outputs.update(row.id, {
-      selected: row.selected,
-      volume: row.volume,
-      connectionStrategy: row.connectionStrategy,
-    }, {
-      kind: 'internal',
-      via: 'restore',
-    });
-    // Identity merge (plan atv3-session-recycle): discovery's fresh record
-    // keeps its address/TXT; only when it carries no model of its own does
-    // the saved identity fill in. A fresh explicit `am` always wins.
-    if (existing.model === undefined && row.model !== undefined) {
-      const fresh = outputs.get(row.id);
-      if (fresh !== null) {
-        airplay.register({ ...fresh, model: row.model }, {
-          kind: 'internal',
-          via: 'restore',
-        });
-      }
-    }
-  } else if (row.host !== undefined) {
-    airplay.register({
-      id: row.id,
-      name: row.name,
-      type: row.type,
-      selected: row.selected,
-      volume: row.volume,
-      connectionStrategy: row.connectionStrategy,
-      host: row.host,
-      ...(row.port === undefined ? {} : { port: row.port }),
-      ...(row.model === undefined ? {} : { model: row.model }),
-    }, { kind: 'internal', via: 'restore' });
-  }
-}
-const restoreSnapshot = await planRestore({
-  queueIds: await persistence.loadQueue(),
-  saved: await persistence.loadPlayerState(),
-  getSong: (id) => library.getSong(id),
-  nowMs: Date.now(),
-  maxAgeMs: (cfg.resumeMaxAgeSec ?? 300) * 1000,
-  selectedOutputPresent: outputs.list().some((o) => o.selected),
-});
-const restoredEngine = restoreSnapshot !== null;
-if (restoreSnapshot !== null) {
-  playback.restore(restoreSnapshot);
-  log.event('restore_complete', {
-    queued: restoreSnapshot.queue.length,
-    state: restoreSnapshot.state,
-    currentIndex: restoreSnapshot.currentIndex,
-    positionMs: restoreSnapshot.positionMs,
+  const env = options.env ?? Deno.env.toObject();
+  const cfg = loadConfig((name) => env[name]);
+  const store = await openStore(cfg.dataDir, {
+    debugLogQueries: cfg.debugLogRequests,
   });
-}
-const playlists = createPlaylists(store);
-let hats: Hats | undefined = undefined;
-const bag = {
-  log,
-  settings: createSettings(store, state),
-  hats: createHatServices(store, () => hats!),
-  cfg,
-  startedAt: new Date().toISOString(),
-  libraries,
-  scan,
-  media,
-  ...authentication,
-  library,
-  reference: Object.freeze({
-    get: lookups.reference.get,
-    artistByName: lookups.reference.artistByName,
-    topTracks: lookups.reference.topTracks,
-    similarArtists: lookups.reference.similarArtists,
-    radio: lookups.reference.radio,
-  }),
-  annotation: createAnnotation(store),
-  listens: createListens(store),
-  playlists,
-  radio: createRadio(store),
-  shares: createShares(store, state, library, playlists),
-  podcasts,
-  clientQueue: createClientQueue(store),
-  bookmarks: createBookmarks(store),
-  nowPlaying,
-  playback,
-  stream: createStream(
-    media,
-    playback,
+  const persistence = createPersistence(store);
+  await seedFirstUser(store, cfg);
+  const setupMode = await store.users.adminCount() === 0;
+  const notify = createNotify();
+  const state = createState(store, undefined, notify);
+  const authentication = createAuthentication(
+    store,
     cfg,
-    undefined,
-    createFileSource(library, podcasts),
-  ),
-  zip: createZip(),
-  artwork: createArtwork(library, {
+    state,
+    Date.now,
+    notify,
+  );
+  const media = createMedia(undefined, state);
+  const lyrics = createLyrics(store, state);
+  const outputs = createOutputs({ notify, persistence, state });
+  await outputs.ready();
+  const scan = createScan(store, media, { notify, lyrics, state });
+  const libraries = createLibraries(store, {
+    dataDir: cfg.dataDir,
+    scan,
+    notify,
+  });
+  const network = createNetwork({ state });
+  const podcasts = await createPodcasts({
+    store,
+    state,
+    network,
+    media,
+    dataDir: cfg.dataDir,
+  });
+  const lookups = await createLookupRunner({
+    store,
     state,
     dataDir: cfg.dataDir,
-    playlists,
-    podcasts,
-  }),
-  player,
-  outputs,
-  notify,
-  state,
-  binds: createBinds(() => hats?.layers() ?? [], mapping),
-};
-const listens = createListenManager({
-  core,
-  layers: () => hats?.activeLayers() ?? [],
-  mapping,
-  defaultPort: cfg.listen?.port ?? 8000,
-  hostname: cfg.listen?.hostname,
-  debugLogRequests: cfg.debugLogRequests,
-  debugLogHeaders: cfg.debugLogHeaders,
-});
-hats = await createHats({ store, app: bag, mapping, listens, notify });
-
-// Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
-const airplayBoot = createAirplayBoot({
-  outputs,
-  playback,
-  media,
-  notify,
-  state,
-  devices: airplay,
-});
-addEventListener('unload', () => {
-  discovery.close();
-  airplay.close();
-});
-
-// The engine's clock: wall-clock progress reaching an item's length ends it
-// (advance/replay/drop/stop per repeat/consume). Without this the engine sat
-// at track-end in 'play' forever and HA extrapolated ("57 min of a 3 min
-// track").
-const engineClock = setInterval(() => playback.advanceEnded(), 500);
-
-// MELOFON_AIRPLAY_HOST=<ip>[:port] — unicast-resolve TXT at that host, then
-// register. The CRUD twin is POST /_/outputs. Bare IP if resolve times out.
-const airplayHost = env.MELOFON_AIRPLAY_HOST?.trim();
-if (airplayHost) {
-  const match = airplayHost.match(/^(.+?)(?::(\d+))?$/);
-  const host = match?.[1] ?? airplayHost;
-  const port = match?.[2] === undefined ? undefined : Number(match[2]);
-  const row = await airplay.registerAddress({
-    name: outputs.list().find((o) => o.host === host)?.name ?? host,
-    host,
-    ...(port === undefined ? {} : { port }),
-  }, { kind: 'internal', via: 'airplay-host-env' });
-  log.event('address_registered', {
-    host,
-    preparation: row ? outputAdmission.describe(row.id).state : 'failed',
+    notify,
+    network,
   });
-}
+  const counts = await scan.run();
+  log.event('scan_complete', counts);
+  const mapping = createPortMapping(env);
+  if (env.MELOFON_AIRPLAY_MDNS !== undefined) {
+    await state.seedIfUnset(
+      'airplay.mdns',
+      env.MELOFON_AIRPLAY_MDNS === 'off' ? 'off' : 'on',
+    );
+  }
+  // Load persisted remotes BEFORE discovery starts (plan atv3-session-recycle):
+  // this populates the savedOutput cache discovery consults synchronously, and
+  // the rows are the restore snapshot below — model identity included.
+  const savedOutputs = await persistence.loadOutputs();
+  const outputAdmission = createOutputAdmission({
+    endpoint(id) {
+      const row = outputs.get(id);
+      return row?.host
+        ? {
+          id,
+          protocol: row.type,
+          address: row.host,
+          ...(row.port === undefined ? {} : { port: row.port }),
+        }
+        : null;
+    },
+    changed: () => notify.emit(['outputs']),
+  });
+  const airplay = createAirplayDevices({ outputs, admission: outputAdmission });
+  const discovery = createAirplayDiscovery({
+    outputs,
+    state,
+    devices: airplay,
+    savedOutput: (id) => persistence.savedOutput(id),
+  });
+  const library = createLibrary(store, lyrics, { dataDir: cfg.dataDir, media });
+  const player = createPlayer();
+  const nowPlaying = createNowPlaying(store, { state });
+  const playback = createPlayback({
+    player,
+    nowPlaying,
+    library,
+    cfg,
+    notify,
+    persistence,
+  });
+  const app = {
+    store,
+    cfg,
+    libraries,
+    outputs,
+    playback,
+    state,
+    airplay,
+    outputAdmission,
+    identity: createIdentity(store),
+    reference: lookups.reference,
+    log: scopedLog('core'),
+  };
+  const core = await pathfinder({ roots: ['core/'], app });
 
-// A restored engine announces itself once the boots exist: the AirPlay boot
-// reconciles (a resumed play spawns its session — audible without a client
-// action) and any connected hats pick up the restored state.
-if (restoredEngine) {
-  notify.emit(['player', 'queue', 'outputs', 'volume', 'options']);
-}
+  // Restart transparency (plan restart-transparency): restore the engine —
+  // the persisted queue rehydrated via the library (missing tracks drop with
+  // a warn), then the snapshot. Auto-resume PLAY only inside the freshness
+  // window with the environment still matching; anything else pauses at the
+  // saved place, so a stale save can't surprise the household (3am speaker).
+  // First re-register persisted remotes (hand-added and last-seen mDNS
+  // alike) so a saved selection is present for the resume decision.
+  for (const row of savedOutputs) {
+    const existing = outputs.get(row.id);
+    if (existing !== null) {
+      // Discovery beat the restore: keep its fresh record, apply user state.
+      outputs.update(row.id, {
+        selected: row.selected,
+        volume: row.volume,
+        connectionStrategy: row.connectionStrategy,
+      }, {
+        kind: 'internal',
+        via: 'restore',
+      });
+      // Identity merge (plan atv3-session-recycle): discovery's fresh record
+      // keeps its address/TXT; only when it carries no model of its own does
+      // the saved identity fill in. A fresh explicit `am` always wins.
+      if (existing.model === undefined && row.model !== undefined) {
+        const fresh = outputs.get(row.id);
+        if (fresh !== null) {
+          airplay.register({ ...fresh, model: row.model }, {
+            kind: 'internal',
+            via: 'restore',
+          });
+        }
+      }
+    } else if (row.host !== undefined) {
+      airplay.register({
+        id: row.id,
+        name: row.name,
+        type: row.type,
+        selected: row.selected,
+        volume: row.volume,
+        connectionStrategy: row.connectionStrategy,
+        host: row.host,
+        ...(row.port === undefined ? {} : { port: row.port }),
+        ...(row.model === undefined ? {} : { model: row.model }),
+      }, { kind: 'internal', via: 'restore' });
+    }
+  }
+  const restoreSnapshot = await planRestore({
+    queueIds: await persistence.loadQueue(),
+    saved: await persistence.loadPlayerState(),
+    getSong: (id) => library.getSong(id),
+    nowMs: Date.now(),
+    maxAgeMs: (cfg.resumeMaxAgeSec ?? 300) * 1000,
+    selectedOutputPresent: outputs.list().some((o) => o.selected),
+  });
+  const restoredEngine = restoreSnapshot !== null;
+  if (restoreSnapshot !== null) {
+    playback.restore(restoreSnapshot);
+    log.event('restore_complete', {
+      queued: restoreSnapshot.queue.length,
+      state: restoreSnapshot.state,
+      currentIndex: restoreSnapshot.currentIndex,
+      positionMs: restoreSnapshot.positionMs,
+    });
+  }
+  const playlists = createPlaylists(store);
+  let hats: Hats | undefined = undefined;
+  const bag = {
+    log,
+    ...(setupMode
+      ? {
+        setup: createSetup({
+          users: authentication.users,
+          state,
+          restartAfter: (completed) => termination.restartAfter(completed),
+          log: options.setupLog,
+        }),
+      }
+      : {}),
+    settings: createSettings(store, state),
+    hats: createHatServices(store, () => hats!),
+    cfg,
+    startedAt: new Date().toISOString(),
+    libraries,
+    scan,
+    media,
+    ...authentication,
+    library,
+    reference: Object.freeze({
+      get: lookups.reference.get,
+      artistByName: lookups.reference.artistByName,
+      topTracks: lookups.reference.topTracks,
+      similarArtists: lookups.reference.similarArtists,
+      radio: lookups.reference.radio,
+    }),
+    annotation: createAnnotation(store),
+    listens: createListens(store),
+    playlists,
+    radio: createRadio(store),
+    shares: createShares(store, state, library, playlists),
+    podcasts,
+    clientQueue: createClientQueue(store),
+    bookmarks: createBookmarks(store),
+    nowPlaying,
+    playback,
+    stream: createStream(
+      media,
+      playback,
+      cfg,
+      undefined,
+      createFileSource(library, podcasts),
+    ),
+    zip: createZip(),
+    artwork: createArtwork(library, {
+      state,
+      dataDir: cfg.dataDir,
+      playlists,
+      podcasts,
+    }),
+    player,
+    outputs,
+    notify,
+    state,
+    binds: createBinds(() => hats?.layers() ?? [], mapping),
+  };
+  const listens = createListenManager({
+    core,
+    layers: () => hats?.activeLayers() ?? [],
+    mapping,
+    defaultPort: cfg.listen?.port ?? 8000,
+    hostname: cfg.listen?.hostname,
+    debugLogRequests: cfg.debugLogRequests,
+    debugLogHeaders: cfg.debugLogHeaders,
+    setupMode,
+  });
+  hats = await createHats({
+    store,
+    app: bag,
+    mapping,
+    listens,
+    notify,
+    setupMode,
+  });
 
-await listens.ensure([cfg.listen?.port ?? 8000]);
+  // Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
+  const airplayBoot = createAirplayBoot({
+    outputs,
+    playback,
+    media,
+    notify,
+    state,
+    devices: airplay,
+  });
+  const onUnload = () => {
+    discovery.close();
+    airplay.close();
+  };
+  addEventListener('unload', onUnload);
 
-let shuttingDown = false;
-async function shutdown(): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  clearInterval(engineClock);
-  await lookups.close();
-  await podcasts.close();
-  discovery.close();
-  airplay.close();
-  await listens.shutdown();
-  await airplayBoot.close();
-  shutdownNativeLogging();
-  playback.close();
-  await persistence.drain();
-  await store.close();
-  await appLogger().flush();
-  Deno.exit(0);
-}
-for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-  Deno.addSignalListener(signal, () => {
-    void shutdown().catch(async (error) => {
+  // The engine's clock: wall-clock progress reaching an item's length ends it
+  // (advance/replay/drop/stop per repeat/consume). Without this the engine sat
+  // at track-end in 'play' forever and HA extrapolated ("57 min of a 3 min
+  // track").
+  const engineClock = setInterval(() => playback.advanceEnded(), 500);
+
+  // MELOFON_AIRPLAY_HOST=<ip>[:port] — unicast-resolve TXT at that host, then
+  // register. The CRUD twin is POST /_/outputs. Bare IP if resolve times out.
+  const airplayHost = env.MELOFON_AIRPLAY_HOST?.trim();
+  if (airplayHost) {
+    const match = airplayHost.match(/^(.+?)(?::(\d+))?$/);
+    const host = match?.[1] ?? airplayHost;
+    const port = match?.[2] === undefined ? undefined : Number(match[2]);
+    const row = await airplay.registerAddress({
+      name: outputs.list().find((o) => o.host === host)?.name ?? host,
+      host,
+      ...(port === undefined ? {} : { port }),
+    }, { kind: 'internal', via: 'airplay-host-env' });
+    log.event('address_registered', {
+      host,
+      preparation: row ? outputAdmission.describe(row.id).state : 'failed',
+    });
+  }
+
+  // A restored engine announces itself once the boots exist: the AirPlay boot
+  // reconciles (a resumed play spawns its session — audible without a client
+  // action) and any connected hats pick up the restored state.
+  if (restoredEngine) {
+    notify.emit(['player', 'queue', 'outputs', 'volume', 'options']);
+  }
+
+  const termination = createTermination({
+    exit: options.exit,
+    close: async () => {
+      removeEventListener('unload', onUnload);
+      for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+        Deno.removeSignalListener(signal, onSignal);
+      }
+      clearInterval(engineClock);
+      await lookups.close();
+      await podcasts.close();
+      discovery.close();
+      airplay.close();
+      await listens.shutdown();
+      await airplayBoot.close();
+      shutdownNativeLogging();
+      playback.close();
+      await persistence.drain();
+      await store.close();
+    },
+  });
+  const onSignal = () => {
+    void termination.shutdown().catch(async (error) => {
       log.event('server_error', { error });
       await appLogger().flush();
-      Deno.exit(1);
+      (options.exit ?? Deno.exit)(1);
     });
-  });
+  };
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    Deno.addSignalListener(signal, onSignal);
+  }
+  await listens.ensure([cfg.listen?.port ?? 8000]);
+  return { shutdown: termination.shutdown, setupMode, hats };
 }

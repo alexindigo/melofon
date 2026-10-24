@@ -24,6 +24,29 @@ type StoredUser =
     lastLoginAt: number | null;
     lastAccessAt: number | null;
   };
+
+type NewUser = {
+  id: string;
+  username: string;
+  passwordEnc: string;
+  role: UserProfile['role'];
+  displayName?: string;
+  email?: string;
+};
+
+async function insertUser(q: Queries, input: NewUser) {
+  await checkName(q, input.username);
+  await q.run(
+    `INSERT INTO users (id, name, name_key, password_enc, role, display_name, email, created_at)
+    VALUES (${esc(input.id)}, ${esc(input.username)}, ${
+      esc(input.username.toLowerCase())
+    },
+    ${esc(input.passwordEnc)}, ${esc(input.role)},
+    ${input.displayName ? esc(input.displayName) : 'NULL'},
+    ${input.email ? esc(input.email) : 'NULL'}, now())`,
+  );
+  return (await readUser(q, input.id))!;
+}
 const fields =
   `id, name AS username, role, coalesce(display_name, name) AS displayName,
   email, epoch_ms(created_at)::DOUBLE AS createdAt, epoch_ms(last_login_at)::DOUBLE AS lastLoginAt, epoch_ms(last_access_at)::DOUBLE AS lastAccessAt`;
@@ -169,6 +192,24 @@ export function createUsersStore(engine: Engine) {
         return Number(rows[0]?.n ?? 0);
       });
     },
+    adminCount(): Promise<number> {
+      return engine.exclusive(async (q) =>
+        Number(
+          (await q.all<{ n: number }>(
+            "SELECT count(*) AS n FROM users WHERE role = 'admin'",
+          ))[0].n,
+        )
+      );
+    },
+    createFirstAdmin(input: Omit<NewUser, 'role' | 'email'>) {
+      return atomic(engine, async (q) => {
+        const rows = await q.all<{ n: number }>(
+          "SELECT count(*) AS n FROM users WHERE role = 'admin'",
+        );
+        if (Number(rows[0].n) !== 0) throw new UserError('forbidden');
+        return insertUser(q, { ...input, role: 'admin' });
+      });
+    },
     byId(id: string) {
       return engine.exclusive((q) => readUser(q, id));
     },
@@ -201,17 +242,7 @@ export function createUsersStore(engine: Engine) {
     ) {
       return atomic(engine, async (q) => {
         await requireCaller(q, caller);
-        await checkName(q, input.username);
-        await q.run(
-          `INSERT INTO users (id, name, name_key, password_enc, role, display_name, email, created_at)
-          VALUES (${esc(input.id)}, ${esc(input.username)}, ${
-            esc(input.username.toLowerCase())
-          }, ${esc(input.passwordEnc)},
-          ${esc(input.role)}, ${
-            input.displayName ? esc(input.displayName) : 'NULL'
-          }, ${input.email ? esc(input.email) : 'NULL'}, now())`,
-        );
-        return (await readUser(q, input.id))!;
+        return insertUser(q, input);
       });
     },
     update(

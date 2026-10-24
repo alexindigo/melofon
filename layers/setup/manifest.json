@@ -1,0 +1,12 @@
+{
+  "setup": true,
+  "api": "/setup",
+  "settings": {
+    "setup.jsonMaxBytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65536,
+      "default": 65536
+    }
+  }
+}

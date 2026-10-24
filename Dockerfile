@@ -3,7 +3,7 @@
 # music path inside the container.
 #
 #   docker build -t melofon .
-#   docker run -d --name melofon \
+#   docker run -d --restart unless-stopped --name melofon \
 #     -e MELOFON_LISTEN=0.0.0.0:8000 \
 #     -e MELOFON_USER=admin -e MELOFON_PASSWORD=change-me \
 #     -e MELOFON_SECRET=another-secret \
@@ -11,6 +11,11 @@
 #     -v /path/to/music:/music:ro \
 #     -p 8000:8000 \
 #     melofon
+# Omit MELOFON_USER/MELOFON_PASSWORD for setup: read the code in the startup
+# log, open /setup, then POST /setup {"code","username","password"} with a
+# matching Origin. Melofon sends 201 and exits 75; a restart policy is required.
+# systemd: Restart=on-failure (or always). Docker Compose: restart: unless-stopped.
+# Started by hand, start it again after setup; sign in with the new admin below.
 #   url=http://melofon.home:8000
 #   curl -c cookies.txt -H 'content-type: application/json' -H "Origin: $url" \
 #     -d '{"username":"admin","password":"change-me"}' "$url/api/v1/session"

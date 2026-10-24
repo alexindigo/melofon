@@ -19,6 +19,7 @@ export function createListenManager(opts: {
   debugLogRequests?: boolean;
   debugLogHeaders?: boolean;
   log?: Log;
+  setupMode?: boolean;
 }): ListenManager {
   const servers = new Map<number, Deno.HttpServer>();
   const log = opts.log ?? scopedLog('server');
@@ -55,6 +56,7 @@ export function createListenManager(opts: {
                 mapping: opts.mapping,
                 debugLogRequests: opts.debugLogRequests,
                 debugLogHeaders: opts.debugLogHeaders,
+                setupMode: opts.setupMode,
               }),
             );
             servers.set(port, server);

@@ -186,6 +186,7 @@ Deno.test('hats: shipped migration runs once; deactivation keeps serving until r
         ['melofon', 'active', true],
         ['opensubsonic', 'active', true],
         ['owntone', 'active', true],
+        ['setup', 'found', false],
         ['share', 'active', true],
       ]);
       const discovery = await first.request(
@@ -575,7 +576,11 @@ Deno.test('hats: pre-ledger database receives shipped flags once on upgrade', as
       MELOFON_LISTEN_owntone: `${freePort()},${freePort()}`,
     });
     try {
-      assert(upgraded.hats.list().every((h) => h.state === 'active'));
+      assert(
+        upgraded.hats.list().every((h) =>
+          h.setup ? h.state === 'found' : h.state === 'active'
+        ),
+      );
       assertEquals(
         await upgraded.status('/rest/getOpenSubsonicExtensions?f=json'),
         200,

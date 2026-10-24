@@ -98,6 +98,7 @@ export function facade(
     debugLogRequests?: boolean;
     debugLogHeaders?: boolean;
     log?: Log;
+    setupMode?: boolean;
   } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
   const mapping = opts.mapping ?? createPortMapping(opts.env ?? {});
@@ -177,6 +178,13 @@ export function facade(
     // replaces this stub on branch `owntone`; master keeps the plain-text
     // hello). Extra binds leave `/` to their hats.
     if (isDefaultListen && path === '/') {
+      if (opts.setupMode) {
+        return respond(
+          Promise.resolve(
+            Response.json({ detail: 'Not Found' }, { status: 404 }),
+          ),
+        );
+      }
       return respond(
         Promise.resolve(
           new Response('Hello World!\n', {
