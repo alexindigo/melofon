@@ -41,6 +41,19 @@ CREATE TABLE IF NOT EXISTS libraries (
   name VARCHAR NOT NULL,
   path VARCHAR UNIQUE NOT NULL
 );
+-- Scan owns availability and the latest completed run's problems per library.
+CREATE TABLE IF NOT EXISTS scan_libraries (
+  library_id VARCHAR PRIMARY KEY,
+  run_id VARCHAR NOT NULL,
+  available BOOLEAN NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scan_problems (
+  run_id VARCHAR NOT NULL,
+  library_id VARCHAR NOT NULL,
+  path VARCHAR NOT NULL,
+  kind VARCHAR NOT NULL,
+  message VARCHAR NOT NULL
+);
 -- Shared stations are kept on rescan. CREATE also upgrades existing installs.
 CREATE TABLE IF NOT EXISTS radio_stations (
   id VARCHAR PRIMARY KEY,
@@ -123,6 +136,9 @@ ALTER TABLE files ADD COLUMN IF NOT EXISTS is_video BOOLEAN;
 ALTER TABLE files ADD COLUMN IF NOT EXISTS video_details JSON;
 -- H8: the first embedded picture, hashed by the scanner for local conflicts.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS picture_hash VARCHAR;
+-- Original album grouping facts, before album-level inference. Old installs
+-- acquire them on their next scan. Retained files need no filesystem reads.
+ALTER TABLE files ADD COLUMN IF NOT EXISTS album_input JSON;
 
 -- H7: scan-owned facts. Old catalog rows acquire them on their next scan.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS bit_rate DOUBLE;

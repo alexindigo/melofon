@@ -6,6 +6,7 @@ export type LibraryErrorCode =
   | 'path_overlaps'
   | 'path_duplicate'
   | 'path_in_data_dir'
+  | 'path_outside_library'
   | 'invalid_field'
   | 'not_found';
 

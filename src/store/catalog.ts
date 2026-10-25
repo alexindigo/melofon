@@ -7,6 +7,9 @@ import { dirname } from 'node:path';
 import { LibraryError, LibrarySourcesChanged } from '../library-errors.ts';
 import type { AlbumMetadata, SongMetadata } from '../metadata.ts';
 import type { VideoDetails } from '../video.ts';
+import type { AlbumInput } from '../albums.ts';
+import { covered, type ScanCoverage } from '../scan-scope.ts';
+import { type ScanResult, writeScanResult } from './scan.ts';
 import {
   albumMetadataColumns,
   metadataSelect,
@@ -921,6 +924,7 @@ export interface LibraryRow {
   id: string;
   name: string;
   path: string;
+  available: boolean;
 }
 
 export interface DuplicateGroup {
@@ -958,6 +962,7 @@ export interface CatalogIdentity extends CatalogFileStat {
 }
 
 export interface CatalogFile {
+  albumInput?: Omit<AlbumInput, 'songId'>;
   video?: VideoDetails;
   pictureHash?: string | null;
   metadata?: SongMetadata;
@@ -988,6 +993,10 @@ export interface CatalogEvent {
 }
 
 export interface CatalogSnapshot {
+  coverage?: ScanCoverage;
+  scanResult?: ScanResult;
+  /** Retained rows participate in album grouping but are never re-indexed. */
+  preserved?: { id: string; albumId: string | null }[];
   sources?: { id: string; path: string }[];
   artists: { id: string; name: string; musicBrainzId?: string | null }[];
   albums: (Album & { metadata?: AlbumMetadata })[];
@@ -1008,7 +1017,25 @@ async function replaceCatalog(
 ): Promise<void> {
   const { artists, albums, files, events } = snapshot;
   const byId = new Set(snapshot.retainedIds);
-  await q.run('UPDATE file_identity SET present = false');
+  const affected = snapshot.coverage
+    ? (await q.all<{ id: string; library_id: string; rel_path: string }>(
+      `SELECT id, library_id, rel_path FROM file_identity
+       UNION ALL
+       SELECT f.id, f.library_id, substring(f.path, length(rtrim(l.path, '/')) + 2) AS rel_path
+       FROM files f JOIN libraries l ON l.id = f.library_id
+       WHERE NOT EXISTS (SELECT 1 FROM file_identity fi WHERE fi.id = f.id)`,
+    ))
+      .filter((r) => covered(snapshot.coverage!, r.library_id, r.rel_path)).map(
+        (r) => r.id,
+      )
+    : null;
+  const ids = (values: string[]) =>
+    values.length ? values.map(esc).join(', ') : "''";
+  await q.run(
+    `UPDATE file_identity SET present = false${
+      affected ? ` WHERE id IN (${ids(affected)})` : ''
+    }`,
+  );
   for (const file of files) {
     const values = `${esc(file.libraryId)}, ${esc(file.rel)}, true, now(), ${
       file.stat.size ?? 'NULL'
@@ -1052,7 +1079,12 @@ async function replaceCatalog(
   }
 
   // Rebuild catalog tables as before, using the resolved song ids.
-  await q.run('UPDATE album_identity SET present = false');
+  // Grouping includes retained songs, so only absent albums lose presence.
+  await q.run(
+    `UPDATE album_identity SET present = false WHERE id NOT IN (${
+      ids(snapshot.albumIdentities.map((a) => a.id))
+    })`,
+  );
   for (const identity of snapshot.albumIdentities) {
     await q.run(`INSERT INTO album_identity (id, library_id, root_dir, present)
       VALUES (${esc(identity.id)}, ${esc(identity.libraryId)}, ${
@@ -1069,12 +1101,15 @@ async function replaceCatalog(
         ${nullable(event.to?.libraryId)}, ${nullable(event.to?.rootDir)},
         [${(event.candidates ?? []).map(esc).join(', ')}]::VARCHAR[])`);
   }
-  await q.run('DELETE FROM files');
-  await q.run('DELETE FROM albums');
-  await q.run('DELETE FROM artists');
+  await q.run(
+    `DELETE FROM files${affected ? ` WHERE id IN (${ids(affected)})` : ''}`,
+  );
+  await q.run(
+    `DELETE FROM albums WHERE id NOT IN (${ids(albums.map((a) => a.id))})`,
+  );
 
   const artistStmt = await q.prepare(
-    'INSERT INTO artists (id, name, musicbrainz_id) VALUES (?, ?, ?)',
+    'INSERT INTO artists (id, name, musicbrainz_id) VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, musicbrainz_id = excluded.musicbrainz_id',
   );
   try {
     for (const artist of artists) {
@@ -1089,7 +1124,7 @@ async function replaceCatalog(
   }
 
   const albumStmt = await q.prepare(
-    'INSERT INTO albums (id, name, album_artist_id, artist_kind, library_id, root_dir, folder_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO albums (id, name, album_artist_id, artist_kind, library_id, root_dir, folder_name) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, album_artist_id = excluded.album_artist_id, artist_kind = excluded.artist_kind, library_id = excluded.library_id, root_dir = excluded.root_dir, folder_name = excluded.folder_name',
   );
   try {
     for (const album of albums) {
@@ -1145,6 +1180,13 @@ async function replaceCatalog(
       else fileStmt.bindVarchar(16, file.pictureHash);
       await fileStmt.run();
       await writeMetadata(q, 'files', file.id, file.metadata);
+      if (file.albumInput) {
+        await q.run(
+          `UPDATE files SET album_input = ${
+            esc(JSON.stringify(file.albumInput))
+          }::JSON WHERE id = ${esc(file.id)}`,
+        );
+      }
       if (file.video) {
         await q.run(
           `UPDATE files SET video_details = ${
@@ -1156,6 +1198,24 @@ async function replaceCatalog(
   } finally {
     fileStmt.destroySync();
   }
+  for (const file of snapshot.preserved ?? []) {
+    await q.run(
+      `UPDATE files SET album_id = ${nullable(file.albumId)} WHERE id = ${
+        esc(file.id)
+      } AND album_id IS DISTINCT FROM ${nullable(file.albumId)}`,
+    );
+    await q.run(
+      `UPDATE file_identity SET album_id = ${
+        nullable(file.albumId)
+      } WHERE id = ${esc(file.id)} AND album_id IS DISTINCT FROM ${
+        nullable(file.albumId)
+      }`,
+    );
+  }
+  await q.run(
+    `DELETE FROM artists WHERE id NOT IN (SELECT artist_id FROM files WHERE artist_id IS NOT NULL)
+    AND id NOT IN (SELECT album_artist_id FROM albums WHERE album_artist_id IS NOT NULL)`,
+  );
 }
 
 async function checkLibraryPath(q: Queries, path: string, id?: string) {
@@ -1181,6 +1241,73 @@ async function checkLibraryPath(q: Queries, path: string, id?: string) {
 export function createCatalogStore(engine: Engine) {
   return {
     ...createCatalogReadStore(engine),
+    scanFilesSnapshot(): Promise<CatalogFile[]> {
+      return engine.exclusive(async (q) => {
+        const rows = await q.all<
+          SongSqlRow & {
+            rel_path: string;
+            fingerprint: string | null;
+            pcm_md5: string | null;
+            mtime: number | null;
+            dev: number | null;
+            ino: number | null;
+            album_input: string | null;
+            artist_kind: ArtistKind;
+            album_artist_name: string | null;
+            has_lyrics: boolean;
+          }
+        >(`${
+          SONG_SELECT.replace(
+            'SELECT f.id,',
+            `SELECT fi.rel_path, fi.fingerprint, fi.pcm_md5, f.mtime, fi.dev, fi.ino,
+          f.album_input::VARCHAR AS album_input, f.has_lyrics, al.artist_kind,
+          (SELECT name FROM artists WHERE id = al.album_artist_id) AS album_artist_name, f.id,`,
+          )
+        }`);
+        return rows.map((row) => {
+          const song = songOf(row);
+          const libraryId = row.library_id!;
+          const rel = row.rel_path ??
+            row.path.slice((row.library_path?.length ?? 0) + 1);
+          return {
+            id: row.id,
+            path: row.path,
+            rel,
+            libraryId,
+            stat: {
+              size: num(row.size),
+              mtime_ms: num(row.mtime),
+              dev: num(row.dev),
+              ino: num(row.ino),
+            },
+            fingerprint: row.fingerprint,
+            pcmMd5: row.pcm_md5,
+            title: row.title,
+            albumId: row.album_id,
+            artistId: row.artist_id,
+            track: num(row.track),
+            disc: num(row.disc),
+            durationMs: num(row.duration_ms),
+            genre: row.genre,
+            year: num(row.year),
+            isVideo: row.is_video ?? false,
+            hasLyrics: row.has_lyrics,
+            metadata: song.metadata,
+            pictureHash: row.picture_hash,
+            albumInput: row.album_input ? JSON.parse(row.album_input) : {
+              libraryId,
+              rel,
+              albumName: row.album_name,
+              albumArtistTag: row.artist_kind === 'tagged'
+                ? row.album_artist_name
+                : null,
+              trackArtist: row.artist_name,
+              disc: num(row.disc),
+            },
+          };
+        });
+      });
+    },
     identitySnapshot(): Promise<CatalogIdentity[]> {
       return engine.exclusive((q) =>
         q.all<CatalogIdentity>(`
@@ -1196,7 +1323,7 @@ export function createCatalogStore(engine: Engine) {
         FROM album_identity ORDER BY id`)
       );
     },
-    replaceCatalog(snapshot: CatalogSnapshot): Promise<void> {
+    replaceCatalog(snapshot: CatalogSnapshot): Promise<string[]> {
       return atomic(engine, async (q) => {
         if (snapshot.sources) {
           const current = await q.all<{ id: string; path: string }>(
@@ -1210,6 +1337,9 @@ export function createCatalogStore(engine: Engine) {
           }
         }
         await replaceCatalog(q, snapshot);
+        return snapshot.scanResult
+          ? writeScanResult(q, snapshot.scanResult)
+          : [];
       });
     },
     libraryCount(): Promise<number> {
@@ -1297,17 +1427,17 @@ export function createCatalogStore(engine: Engine) {
     listLibraries(): Promise<LibraryRow[]> {
       return engine.exclusive((q) =>
         q.all<LibraryRow>(
-          'SELECT id, name, path FROM libraries ORDER BY name',
+          'SELECT l.id, l.name, l.path, COALESCE(s.available, true) AS available FROM libraries l LEFT JOIN scan_libraries s ON s.library_id = l.id ORDER BY l.name',
         )
       );
     },
-    addLibrary(row: LibraryRow): Promise<LibraryRow> {
+    addLibrary(row: Omit<LibraryRow, 'available'>): Promise<LibraryRow> {
       return atomic(engine, async (q) => {
         await checkLibraryPath(q, row.path);
         // A path hash is the preferred initial ID, not a reservation of that
         // path forever: another library may have kept the ID while moving.
         // Allocate under the same exclusive transaction as the path check.
-        let added = { ...row };
+        let added = { ...row, available: true };
         while (
           (await q.all(`SELECT id FROM libraries WHERE id = ${esc(added.id)}`))
             .length
@@ -1334,7 +1464,9 @@ export function createCatalogStore(engine: Engine) {
     ): Promise<{ library: LibraryRow; pathChanged: boolean }> {
       return atomic(engine, async (q) => {
         const rows = await q.all<LibraryRow>(
-          `SELECT id, name, path FROM libraries WHERE id = ${esc(id)}`,
+          `SELECT l.id, l.name, l.path, COALESCE(s.available, true) AS available FROM libraries l LEFT JOIN scan_libraries s ON s.library_id = l.id WHERE l.id = ${
+            esc(id)
+          }`,
         );
         if (!rows[0]) throw new LibraryError('not_found', 'Library not found');
         const row = { ...rows[0], ...input };

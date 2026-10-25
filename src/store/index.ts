@@ -20,8 +20,10 @@ import { createReferenceMatcherStore } from './reference-matcher.ts';
 import { createHatsStore } from './hats.ts';
 import { createSessionsStore } from './sessions.ts';
 import { createPreferencesStore } from './preferences.ts';
+import { createScanStore } from './scan.ts';
 
 export interface Store {
+  scan: ReturnType<typeof createScanStore>;
   preferences: ReturnType<typeof createPreferencesStore>;
   sessions: ReturnType<typeof createSessionsStore>;
   hats: ReturnType<typeof createHatsStore>;
@@ -52,6 +54,7 @@ export async function openStore(
 ): Promise<Store> {
   const engine = await openEngine(dataDir, opts);
   const store: Store = {
+    scan: createScanStore(engine),
     preferences: createPreferencesStore(engine),
     sessions: createSessionsStore(engine),
     hats: createHatsStore(engine),

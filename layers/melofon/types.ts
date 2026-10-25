@@ -74,6 +74,13 @@ export interface HatContext {
     };
     scan: {
       start(): Promise<void>;
+      request(
+        scope?: {
+          libraries?: string[];
+          folder?: { library: string; path: string };
+        },
+      ): Promise<void>;
+      problems(libraryId?: string): Promise<unknown>;
       status(): Promise<ScanStatus>;
     };
     settings: {
@@ -209,6 +216,7 @@ export interface Library {
   id: string;
   name: string;
   path: string;
+  available: boolean;
 }
 export interface Source {
   kind: 'http';

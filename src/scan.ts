@@ -33,6 +33,14 @@ import { type VideoDetails, videoDetails } from './video.ts';
 import { LibrarySourcesChanged } from './library-errors.ts';
 import { join, relative } from 'node:path';
 import {
+  covered,
+  type ScanCoverage,
+  type ScanScope,
+  validateScanScope,
+} from './scan-scope.ts';
+import type { ScanProblem, ScanProblemKind } from './store/scan.ts';
+import { LibraryError } from './library-errors.ts';
+import {
   createTagReader,
   declareTagSettings,
   type TagReader,
@@ -58,6 +66,7 @@ const VIDEO_EXTENSIONS = new Set([
 export interface ScanCounts {
   files: number;
   skipped: number;
+  skippedByKind: Record<ScanProblemKind, number>;
   artists: number;
   albums: number;
 }
@@ -83,12 +92,22 @@ function extOf(name: string): string {
 
 async function* walkMedia(
   root: string,
+  unreadable: (path: string, error: unknown) => void,
   dir: string = root,
 ): AsyncGenerator<{ abs: string; rel: string }> {
-  for await (const entry of Deno.readDir(dir)) {
+  // Catch only directory acquisition, never a consumer's file processing.
+  // Buffer before yielding so partial reads cannot invalidate emitted coverage.
+  const entries: Deno.DirEntry[] = [];
+  try {
+    for await (const entry of Deno.readDir(dir)) entries.push(entry);
+  } catch (error) {
+    unreadable(relative(root, dir), error);
+    return;
+  }
+  for (const entry of entries) {
     const abs = join(dir, entry.name);
     if (entry.isDirectory) {
-      if (!entry.name.startsWith('.')) yield* walkMedia(root, abs);
+      if (!entry.name.startsWith('.')) yield* walkMedia(root, unreadable, abs);
     } else if (
       entry.isFile &&
       (AUDIO_EXTENSIONS.has(extOf(entry.name)) ||
@@ -106,13 +125,55 @@ export async function scanLibrary(
   media?: Media,
   log: Log = scopedLog('scan'),
   lyrics: Lyrics = createLyrics(store),
-  options: { state?: State; tagReader?: TagReader } = {},
+  options: {
+    state?: State;
+    tagReader?: TagReader;
+    scope?: ScanScope;
+    notify?: Notify;
+  } = {},
 ): Promise<ScanCounts> {
   using tagReader = options.tagReader ??
     createTagReader(options.state ?? createState(store));
   let media_: Media | undefined = media;
   const fallbackMedia = () => (media_ ??= createMedia());
   const sources = await store.catalog.listLibraries();
+  const scope = await validateScanScope(options.scope ?? {}, sources);
+  const coverage: ScanCoverage = {
+    libraries: scope.folder
+      ? [scope.folder.library]
+      : scope.libraries ?? sources.map((s) => s.id),
+    ...(scope.folder ? { folder: scope.folder } : {}),
+    excluded: [],
+  };
+  const oldFiles = await store.catalog.scanFilesSnapshot();
+  const runId = crypto.randomUUID();
+  const problems: ScanProblem[] = [];
+  const availability: { id: string; available: boolean }[] = [];
+  const skippedByKind: Record<ScanProblemKind, number> = {
+    folder_unreadable: 0,
+    root_unavailable: 0,
+    tags_unreadable: 0,
+    no_streams: 0,
+    fingerprint_failed: 0,
+  };
+  const problem = (
+    libraryId: string,
+    path: string,
+    kind: ScanProblemKind,
+    error: unknown,
+  ) => {
+    problems.push({
+      runId,
+      libraryId,
+      path,
+      kind,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    skippedByKind[kind]++;
+    if (kind !== 'fingerprint_failed') {
+      coverage.excluded.push({ library: libraryId, path });
+    }
+  };
   // Read-only preparation: previous rows remain unchanged until the transaction.
   const retained = await store.catalog.identitySnapshot();
   const retainedAlbums = await store.catalog.albumIdentitySnapshot();
@@ -141,9 +202,33 @@ export async function scanLibrary(
   let skipped = 0;
 
   for (const source of sources) {
+    if (!coverage.libraries.includes(source.id)) continue;
     const root = source.path.replace(/\/+$/, '') || '/';
-    try {
-      for await (const { abs, rel } of walkMedia(root)) {
+    let available = true;
+    const unreadable = (path: string, error: unknown) => {
+      if (path === '') available = false;
+      problem(
+        source.id,
+        path,
+        path === '' ? 'root_unavailable' : 'folder_unreadable',
+        error,
+      );
+      log.event('scan_skipped', { path: join(root, path), error });
+    };
+    // Even a folder scan reports root availability, independently of its target.
+    if (scope.folder) {
+      try {
+        for await (const _entry of Deno.readDir(root)) { /* exhaust */ }
+      } catch (error) {
+        unreadable('', error);
+      }
+    }
+    for await (
+      const { abs, rel } of available
+        ? walkMedia(root, unreadable, join(root, scope.folder?.path ?? ''))
+        : []
+    ) {
+      try {
         if (isCoverFile(rel.slice(rel.lastIndexOf('/') + 1))) {
           try {
             coverPictures.set(abs, {
@@ -169,6 +254,21 @@ export async function scanLibrary(
         };
         const cacheKey = statKey(stat);
         const previous = byPath.get(pathKey(source.id, rel));
+        if (!info) {
+          problem(source.id, rel, 'tags_unreadable', 'File could not be read');
+          skipped++;
+          continue;
+        }
+        // A streamless video container has no tags to parse. Classify it before
+        // tag parsing so the failure has one useful owner and kind.
+        const probe = VIDEO_EXTENSIONS.has(extOf(abs))
+          ? await fallbackMedia().probe(abs)
+          : undefined;
+        if (probe && !probe.hasVideo && !probe.hasAudio) {
+          problem(source.id, rel, 'no_streams', 'No audio or video streams');
+          skipped++;
+          continue;
+        }
         const cached = cacheKey === null
           ? undefined
           : previous && statKey(previous) === cacheKey
@@ -183,6 +283,7 @@ export async function scanLibrary(
           } catch (error) {
             audio = { fingerprint: null, pcmMd5: null };
             log.event('scan_fingerprint_failed', { path: abs, error });
+            problem(source.id, rel, 'fingerprint_failed', error);
           }
         }
 
@@ -231,17 +332,13 @@ export async function scanLibrary(
           );
         } catch (error) {
           log.event('scan_tags_failed', { path: abs, error });
+          problem(source.id, rel, 'tags_unreadable', error);
           skipped++;
           continue; // unreadable tags — skip the file, keep scanning
         }
-        if (VIDEO_EXTENSIONS.has(extOf(abs))) {
+        if (probe) {
           // Probe decides video-ness and backfills missing duration. An
           // audio-only .mp4 stays a song, and a streamless file is skipped.
-          const probe = await fallbackMedia().probe(abs);
-          if (!probe.hasVideo && !probe.hasAudio) {
-            skipped++;
-            continue;
-          }
           isVideo = probe.hasVideo;
           if (isVideo) {
             video = await videoDetails(
@@ -267,7 +364,6 @@ export async function scanLibrary(
         let artistId: string | null = null;
         if (trackArtist !== undefined) {
           artistId = await stableId('artist', trackArtist);
-          artists.set(trackArtist, { id: artistId, name: trackArtist });
         }
         const file: FileIn = {
           id: '',
@@ -289,7 +385,6 @@ export async function scanLibrary(
           metadata,
           pictureHash: pictures[0]?.imageHash ?? null,
         };
-        files.push(file);
         const localLyrics = await lyrics.sources(abs);
         file.hasLyrics = localLyrics.length > 0;
         songLyrics.set(file, localLyrics);
@@ -302,18 +397,30 @@ export async function scanLibrary(
           trackArtist: trackArtist ?? null,
           disc: discNo,
         });
+        file.albumInput = albumInputs.get(file)!;
+        files.push(file);
+      } catch (error) {
+        // Permission/mount races can happen after tags, while acquiring audio,
+        // captions or lyrics too. Exclude the file at this one I/O boundary;
+        // programming/service failures still fail the run atomically.
+        if (
+          !(error instanceof Deno.errors.PermissionDenied ||
+            error instanceof Deno.errors.NotFound ||
+            error instanceof Deno.errors.NotADirectory ||
+            ['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EIO', 'ESTALE'].includes(
+              (error as { code?: string }).code ?? '',
+            ))
+        ) throw error;
+        problem(source.id, rel, 'tags_unreadable', error);
+        skipped++;
       }
-    } catch (err) {
-      if (
-        err instanceof Deno.errors.NotFound ||
-        err instanceof Deno.errors.PermissionDenied
-      ) {
-        log.event('scan_skipped', { path: root, error: err });
-        continue;
-      }
-      throw err;
     }
+    availability.push({ id: source.id, available });
   }
+
+  const preserved = oldFiles.filter((f) =>
+    !covered(coverage, f.libraryId, f.rel)
+  );
 
   // Resolve the whole walk together: linking during the walk would make an
   // ambiguous group depend on filesystem traversal order.
@@ -345,7 +452,12 @@ export async function scanLibrary(
   for (const [fp, rows] of byFingerprint) {
     candidates.set(
       fp,
-      rows.filter((row) => !seen.has(row.id)),
+      rows.filter((row) =>
+        !seen.has(row.id) &&
+        (covered(coverage, row.library_id, row.rel_path) ||
+          (!scope.libraries && !scope.folder &&
+            !sources.some((s) => s.id === row.library_id)))
+      ),
     );
   }
   const reservedIds = new Set(byId.keys());
@@ -377,13 +489,21 @@ export async function scanLibrary(
     seen.add(file.id);
   }
 
+  const allFiles = [...files, ...preserved];
+  for (const file of allFiles) {
+    albumInputs.set(file, file.albumInput!);
+    const name = file.albumInput!.trackArtist;
+    if (name !== null && file.artistId !== null) {
+      artists.set(name, { id: file.artistId, name });
+    }
+  }
   const grouped = await groupAlbums(
-    files.map((f) => ({ ...albumInputs.get(f)!, songId: f.id })),
+    allFiles.map((f) => ({ ...albumInputs.get(f)!, songId: f.id })),
     sources,
     new Map(retained.map((r) => [r.id, r.album_id])),
     retainedAlbums,
   );
-  for (const file of files) file.albumId = grouped.fileAlbums.get(file.id)!;
+  for (const file of allFiles) file.albumId = grouped.fileAlbums.get(file.id)!;
   for (const album of grouped.albums) {
     if (album.artistName !== null) {
       artists.set(album.artistName, {
@@ -392,11 +512,14 @@ export async function scanLibrary(
       });
     }
   }
-  const artistMbids = artistMusicBrainzIds(files.map((file) => ({
+  const artistMbids = artistMusicBrainzIds(allFiles.map((file) => ({
     ...albumInputs.get(file)!,
     metadata: file.metadata,
   })));
-  await store.catalog.replaceCatalog({
+  const changedLibraries = await store.catalog.replaceCatalog({
+    coverage,
+    preserved,
+    scanResult: { runId, libraries: availability, problems },
     sources: sources.map(({ id, path }) => ({ id, path })),
     artists: [...artists.values()].map((artist) => ({
       ...artist,
@@ -405,7 +528,7 @@ export async function scanLibrary(
     albums: grouped.albums.map((album) => ({
       ...album,
       metadata: albumMetadata(
-        files.filter((file) => file.albumId === album.id),
+        allFiles.filter((file) => file.albumId === album.id),
       ),
     })),
     albumIdentities: grouped.identities,
@@ -414,6 +537,9 @@ export async function scanLibrary(
     events,
     retainedIds: [...byId.keys()],
   });
+  if (changedLibraries.length) {
+    options.notify?.emit(['libraries'], { libraries: changedLibraries });
+  }
   // Catalog owns album/root eligibility. Hashes are already prepared outside its
   // exclusive slot; candidates own the separate atomic reconciliation.
   const picturesByAlbum = new Map<string, Map<string, LocalVersion>>();
@@ -429,7 +555,10 @@ export async function scanLibrary(
   }
   const writable = new Map<string, boolean>();
   for (const album of grouped.albums) {
-    const versions = picturesByAlbum.get(album.id)!;
+    const versions = picturesByAlbum.get(album.id);
+    // Local candidates are acquired only for completely observed albums.
+    // An excluded track's picture/lyrics facts are not an empty observation.
+    if (!versions || preserved.some((f) => f.albumId === album.id)) continue;
     const dirs = new Set(await store.catalog.albumCoverDirectories(album.id));
     for (const [path, picture] of coverPictures) {
       if (
@@ -462,6 +591,14 @@ export async function scanLibrary(
     );
   }
   for (const artist of artists.values()) {
+    if (
+      preserved.some((f) =>
+        f.artistId === artist.id ||
+        grouped.albums.some((a) =>
+          a.id === f.albumId && a.albumArtistId === artist.id
+        )
+      )
+    ) continue;
     const folder = await store.catalog.artistFolder(artist.id);
     const versions = new Map<string, LocalVersion>();
     if (folder) {
@@ -486,8 +623,9 @@ export async function scanLibrary(
     );
   }
   return {
-    files: files.length,
+    files: allFiles.length,
     skipped,
+    skippedByKind,
     artists: artists.size,
     albums: grouped.albums.length,
   };
@@ -507,7 +645,11 @@ export interface ScanStatus {
 }
 export interface ScanService {
   /** Foreground scan. Concurrent callers await the same result. */
-  run(): Promise<ScanCounts>;
+  run(scope?: ScanScope): Promise<ScanCounts>;
+  request(scope?: ScanScope): Promise<void>;
+  problems(
+    libraryId?: string,
+  ): Promise<{ problems: ScanProblem[]; truncated: boolean }>;
   status(): Promise<ScanStatus>;
   /** Background entry point, sharing run's single-flight and logging failures. */
   start(
@@ -523,13 +665,19 @@ export function createScan(
   const log = opts?.log ?? scopedLog('scan');
   const state = opts?.state ?? createState(store);
   declareTagSettings(state);
+  state.declare('scan.problemListLimit', {
+    type: 'integer',
+    default: 1000,
+    minimum: 1,
+    maximum: 1000,
+  });
   let pending: Promise<ScanCounts> | null = null;
   let count = 0;
   let lastScanMs: number | null = null;
   let lastScanStartedMs: number | null = null;
   let lastError: string | null = null;
   let rerun = false;
-  const run = (): Promise<ScanCounts> => {
+  const run = (scope: ScanScope = {}): Promise<ScanCounts> => {
     if (pending !== null) return pending;
     lastScanStartedMs = Date.now();
     lastError = null;
@@ -539,16 +687,20 @@ export function createScan(
         try {
           const counts = await scanLibrary(store, media, log, opts?.lyrics, {
             state,
+            scope,
+            notify: opts?.notify,
           });
           count = counts.files;
           lastScanMs = Date.now();
           // Core emits after successful completion; hats just consume the event.
           opts?.notify?.emit(['database']);
           if (!rerun) return counts;
+          scope = {};
         } catch (error) {
           // A source changed during I/O: the store refused the stale catalog.
           // Re-walk the current source list without publishing removed paths.
           if (!(error instanceof LibrarySourcesChanged) && !rerun) throw error;
+          scope = {};
         }
       }
     })().catch((error) => {
@@ -563,6 +715,25 @@ export function createScan(
   };
   return {
     run,
+    async request(scope = {}) {
+      const validated = await validateScanScope(
+        scope,
+        await store.catalog.listLibraries(),
+      );
+      void run(validated).catch((error) => log.event('scan_failed', { error }));
+    },
+    async problems(libraryId) {
+      if (
+        libraryId !== undefined &&
+        !(await store.catalog.listLibraries()).some((l) => l.id === libraryId)
+      ) {
+        throw new LibraryError('not_found', 'Library not found');
+      }
+      return store.scan.problems(
+        libraryId,
+        await state.getTyped('scan.problemListLimit') as number,
+      );
+    },
     async status() {
       const folderCount = await store.catalog.libraryCount();
       return {

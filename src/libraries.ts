@@ -141,6 +141,7 @@ export function createLibraries(store: Store, options: {
         id: await stableId(normalized),
         name: nameOf(name),
         path: normalized,
+        available: true,
       };
       const added = await store.catalog.addLibrary(row);
       changed('add', added.id, source);

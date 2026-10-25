@@ -153,12 +153,18 @@ Deno.test('core /_/libraries CRUD validates input and round-trips rows', async (
     const list = await core(new Request('http://x/libraries'));
     assertEquals(list.status, 200);
     const listed = (await list.json()) as {
-      libraries: { id: string; name: string; path: string }[];
+      libraries: {
+        id: string;
+        name: string;
+        path: string;
+        available: boolean;
+      }[];
     };
     assertEquals(listed.libraries, [{
       id: row.id,
       name: 'A root',
       path: ROOT_A,
+      available: true,
     }]);
 
     const gone = await core(

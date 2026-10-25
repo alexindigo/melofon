@@ -207,7 +207,7 @@ Deno.test('store.catalog scan hands over a plain fixture snapshot without holdin
             new TextEncoder().encode(serialized).length,
           );
           peakFiles = Math.max(peakFiles, data.files.length);
-          await store.catalog.replaceCatalog(JSON.parse(serialized));
+          return await store.catalog.replaceCatalog(JSON.parse(serialized));
         },
       },
     };
@@ -219,7 +219,19 @@ Deno.test('store.catalog scan hands over a plain fixture snapshot without holdin
         return await media.fingerprint(path);
       },
     });
-    assertEquals(counts, { files: 4, skipped: 1, artists: 3, albums: 2 });
+    assertEquals(counts, {
+      files: 4,
+      skipped: 1,
+      artists: 3,
+      albums: 2,
+      skippedByKind: {
+        folder_unreadable: 0,
+        root_unavailable: 0,
+        tags_unreadable: 1,
+        no_streams: 0,
+        fingerprint_failed: 1,
+      },
+    });
     assert(fingerprintCalls > 0);
     assertEquals(peakFiles, 4);
     assert(peakBytes > 0);
@@ -291,7 +303,10 @@ Deno.test('store.catalog libraries add atomically, reject concurrent duplicate p
       t.domain.addLibrary(row),
       t.domain.addLibrary({ ...row, id: 'other', name: 'Other' }),
     ]);
-    assertEquals(results[0], { status: 'fulfilled', value: row });
+    assertEquals(results[0], {
+      status: 'fulfilled',
+      value: { ...row, available: true },
+    });
     assertEquals(results[1].status, 'rejected');
     if (results[1].status === 'rejected') {
       assertEquals(results[1].reason.code, 'path_duplicate');
@@ -303,9 +318,12 @@ Deno.test('store.catalog libraries add atomically, reject concurrent duplicate p
       Error,
       'injected commit failure',
     );
-    assertEquals(await t.domain.listLibraries(), [row]);
+    assertEquals(await t.domain.listLibraries(), [{ ...row, available: true }]);
     await t.domain.addLibrary(first);
-    assertEquals(await t.domain.listLibraries(), [first, row]);
+    assertEquals(
+      await t.domain.listLibraries(),
+      [first, row].map((r) => ({ ...r, available: true })),
+    );
   } finally {
     await t.close();
   }

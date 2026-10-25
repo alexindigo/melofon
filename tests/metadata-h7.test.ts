@@ -655,6 +655,8 @@ Deno.test('H7 parser timeout terminates synchronous work, skips that file and co
     await mp3(`${root}/fast.mp3`);
   });
   try {
+    const before = await s.songs();
+    const retained = before.find((song) => song.path.endsWith('/slow.mp3'))!;
     const state = createState(s.store());
     const workerPath = `${s.dir}/slow-worker.ts`;
     const production =
@@ -686,17 +688,20 @@ Deno.test('H7 parser timeout terminates synchronous work, skips that file and co
     );
     assertEquals(
       [counts.files, counts.skipped],
-      [1, 1],
+      [2, 1],
       JSON.stringify(events),
     );
+    assertEquals(counts.skippedByKind.tags_unreadable, 1);
     assert(
       events.some((event) =>
         event.kind === 'scan_tags_failed' &&
         event.error.includes('exceeded 0.5 seconds')
       ),
     );
-    const [song] = await s.songs();
-    assert(song.path.endsWith('/fast.mp3'));
+    const songs = await s.songs();
+    assertEquals(songs.find((song) => song.id === retained.id), retained);
+    const song = songs.find((song) => song.path.endsWith('/fast.mp3'))!;
+    assert(song);
     assertEquals(
       (await s.get('getSong', { id: song.id })).song.musicBrainzId,
       recording,
@@ -712,6 +717,8 @@ Deno.test('H7 byte budget rejects oversized tags before payload read and continu
     await tagged(`${root}/small.mp3`, { TIT2: 'Small' });
   });
   try {
+    const before = await s.songs();
+    const retained = before.find((song) => song.path.endsWith('/large.mp3'))!;
     const state = createState(s.store());
     using reader = createTagReader(state);
     await state.set('scan.tagParseMaxBytes', '8192');
@@ -722,8 +729,12 @@ Deno.test('H7 byte budget rejects oversized tags before payload read and continu
       undefined,
       { state, tagReader: reader },
     );
-    assertEquals([counts.files, counts.skipped], [1, 1]);
-    const [song] = await s.songs();
+    assertEquals([counts.files, counts.skipped], [2, 1]);
+    assertEquals(counts.skippedByKind.tags_unreadable, 1);
+    const songs = await s.songs();
+    assertEquals(songs.find((song) => song.id === retained.id), retained);
+    const song = songs.find((song) => song.path.endsWith('/small.mp3'))!;
+    assert(song);
     assertEquals((await s.get('getSong', { id: song.id })).song.title, 'Small');
   } finally {
     await s.close();

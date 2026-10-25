@@ -7,7 +7,7 @@ import type { Logger, LogQuery } from './logging.ts';
 import { UserError } from './user-errors.ts';
 
 export function createServerStatus(opts: {
-  store: Pick<Store, 'users'>;
+  store: Pick<Store, 'users' | 'catalog'>;
   version: string;
   startedAt: string;
   hats: () => Hats;
@@ -47,6 +47,14 @@ export function createServerStatus(opts: {
         warnings.push({ code, message });
       if (!scan.folderCount) {
         warn('no_library', 'No music libraries are configured.');
+      }
+      for (const library of await opts.store.catalog.listLibraries()) {
+        if (library.available === false) {
+          warn(
+            'library_unavailable',
+            `Library ${library.name} is unavailable.`,
+          );
+        }
       }
       if (scan.scanning) {
         warn('scanning', 'The music library is being scanned.');

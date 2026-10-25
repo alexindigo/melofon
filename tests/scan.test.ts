@@ -48,7 +48,19 @@ Deno.test('scanLibrary reads tags, honors TPE2, skips corrupt files', async () =
   const { db, store, close } = await setup();
   try {
     const counts = await scanLibrary(store);
-    assertEquals(counts, { files: 4, skipped: 1, artists: 3, albums: 2 });
+    assertEquals(counts, {
+      files: 4,
+      skipped: 1,
+      artists: 3,
+      albums: 2,
+      skippedByKind: {
+        folder_unreadable: 0,
+        root_unavailable: 0,
+        tags_unreadable: 1,
+        no_streams: 0,
+        fingerprint_failed: 1,
+      },
+    });
 
     const songs = await rawSql(db).all(
       'SELECT title, track, duration_ms, is_video FROM files ORDER BY album_id, track',
