@@ -26,6 +26,7 @@ export interface HatView {
 }
 interface Entry {
   found: FoundHat;
+  discoveryErrors: HatError[];
   view: HatView;
   layer?: Layer;
   changed: boolean;
@@ -76,6 +77,7 @@ export async function createHats(opts: {
   function found(hat: FoundHat): Entry {
     const entry: Entry = {
       found: hat,
+      discoveryErrors: hat.errors,
       changed: false,
       view: {
         name: hat.name,
@@ -177,12 +179,15 @@ export async function createHats(opts: {
             continue;
           }
           if (
-            previous.found.hash !== hat.hash ||
+            previous.changed || previous.found.hash !== hat.hash ||
             JSON.stringify(previous.found.errors) !== JSON.stringify(hat.errors)
           ) {
             previous.changed = true;
             previous.view.errors = [
-              ...previous.view.errors.filter((e) => e.code !== 'hat_changed'),
+              ...previous.view.errors.filter((e) =>
+                !previous.discoveryErrors.includes(e) &&
+                e.code !== 'hat_changed' && e.code !== 'hat_removed'
+              ),
               ...hat.errors,
               hatError(
                 'manifest',
@@ -190,6 +195,8 @@ export async function createHats(opts: {
                 'Hat files changed; restart required',
               ),
             ];
+            // Keep discovery's replaceable snapshot separate from runtime failures.
+            previous.discoveryErrors = hat.errors;
             pending(previous);
             emit();
           }

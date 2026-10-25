@@ -393,6 +393,72 @@ Deno.test('API settings: events drain interval rejects timer overflow and accept
   }
 });
 
+Deno.test('API settings: invalid stored values fall back without breaking the settings inventory', async () => {
+  const f = await apiFixture({
+    services: async (f) => {
+      // Values valid under the old schema survive when a new declaration tightens it.
+      await f.state.set('melofon.eventsDrainMs', '2147483648');
+      await f.state.set('fixture.noDefault', '21');
+      f.state.declare('fixture.noDefault', { type: 'integer', maximum: 20 });
+      return {};
+    },
+  });
+  try {
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await f.login(mode);
+      const response = await f.get(base, credential, { Origin: f.origin });
+      assertEquals(response.status, 200, await response.clone().text());
+      const settings = (await response.json()).settings as Setting[];
+      for (
+        const [key, fallback, raw] of [
+          ['melofon.eventsDrainMs', 25, '2147483648'],
+          ['fixture.noDefault', null, '21'],
+        ] as const
+      ) {
+        const setting = settings.find((s) => s.key === key)!;
+        assertEquals([
+          setting.value,
+          setting.default,
+          setting.source,
+          setting.invalid,
+          setting.revision,
+        ], [fallback, fallback, 'stored', true, 1]);
+        assertEquals(await item(f, credential, key), setting);
+        assertEquals(
+          await f.state.get(key),
+          raw,
+          'listing never rewrites the stored value',
+        );
+      }
+      assertEquals(
+        settings.find((s) => s.key === 'auth.signInFailures')!.value,
+        10,
+      );
+      assertEquals(
+        settings.find((s) => s.key === 'auth.signInFailures')!.invalid,
+        undefined,
+      );
+    }
+    const { credential } = await f.login('bearer');
+    const response = await change(f, credential, [{
+      key: 'melofon.eventsDrainMs',
+      value: 2000,
+      revision: 1,
+    }]);
+    assertEquals(response.status, 200);
+    const repaired = (await response.json()).settings[0];
+    assertEquals([
+      repaired.value,
+      repaired.source,
+      repaired.invalid,
+      repaired.revision,
+    ], [2000, 'stored', undefined, 2]);
+    assertEquals(await item(f, credential, repaired.key), repaired);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('API settings: concurrent admins conflict atomically; reset retains rising revisions and current default', async () => {
   const f = await apiFixture();
   try {

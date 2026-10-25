@@ -353,6 +353,83 @@ Deno.test('API hats: rescan imports no code; found activation waits; failed/rese
   }
 });
 
+Deno.test('API hats: repeated rescans replace discovery errors and retain load and activation errors', async () => {
+  const f = await fixture();
+  const held = Deno.listen({ hostname: '0.0.0.0', port: f.actual });
+  try {
+    const { credential } = await f.login('bearer');
+    await error(
+      await f.json(`${base}/extra/active`, 'PUT', { active: true }, credential),
+      409,
+      'activation_failed',
+    );
+    const names = ['extra', 'bad-json', 'bad-import'];
+    const before = (await f.list(credential)).hats;
+    const originals = new Map<string, string>();
+    for (const name of names) {
+      const file = `${f.root}/${name}/manifest.json`;
+      originals.set(name, await Deno.readTextFile(file));
+      await Deno.writeTextFile(file, JSON.stringify({ port: 0 }));
+    }
+    const rescan = async () => {
+      const response = await f.json(`${base}/rescan`, 'POST', {}, credential);
+      assertEquals(response.status, 200);
+      const body = await response.json() as {
+        hats: Hat[];
+        restartRequired: boolean;
+      };
+      assertEquals(body.restartRequired, true);
+      assertEquals(await f.list(credential), body);
+      return body.hats.filter((h) => names.includes(h.name));
+    };
+    const first = await rescan();
+    for (const hat of first) {
+      const retained = before.find((h) => h.name === hat.name)!.errors.filter((
+        e,
+      ) => e.phase === 'import' || e.phase === 'activate');
+      assertEquals(hat.errors.slice(0, retained.length), retained);
+      assertEquals(hat.errors.map((e) => e.code), [
+        ...retained.map((e) => e.code),
+        'hat_manifest_failed',
+        'hat_changed',
+      ]);
+      assert(hat.errors[retained.length].message.includes('port'));
+      assertEquals(hat.pendingRestart, true);
+    }
+    assertEquals(await rescan(), first);
+    assertEquals(await rescan(), first);
+    // A different discovery failure replaces the previous one too.
+    for (const name of names) {
+      await Deno.writeTextFile(`${f.root}/${name}/manifest.json`, '[]');
+    }
+    for (const hat of await rescan()) {
+      assertEquals(
+        hat.errors.filter((e) => e.code === 'hat_manifest_failed').map((e) =>
+          e.message
+        ),
+        ['manifest must be an object'],
+      );
+    }
+    // Restoring bytes does not reload startup code or clear the restart marker.
+    for (const [name, contents] of originals) {
+      await Deno.writeTextFile(`${f.root}/${name}/manifest.json`, contents);
+    }
+    const restored = await rescan();
+    for (const hat of restored) {
+      assertEquals(
+        hat.errors.slice(0, -1),
+        before.find((h) => h.name === hat.name)!.errors,
+      );
+      assertEquals(hat.errors.at(-1)?.code, 'hat_changed');
+      assertEquals(hat.pendingRestart, true);
+    }
+    assertEquals(await rescan(), restored);
+  } finally {
+    held.close();
+    await f.close();
+  }
+});
+
 Deno.test('API hats: active input and inherited JSON/Origin boundaries apply before mutations', async () => {
   const f = await fixture();
   try {

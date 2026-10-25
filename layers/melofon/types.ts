@@ -163,6 +163,7 @@ export interface Setting {
   revision: number;
   writeOnly: boolean;
   isSet?: boolean;
+  invalid?: true;
 }
 export interface Plugin {
   id: string;

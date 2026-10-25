@@ -32,6 +32,7 @@ export interface SettingDescription {
   revision: number;
   writeOnly: boolean;
   isSet?: boolean;
+  invalid?: true;
 }
 
 export interface State {
@@ -119,6 +120,16 @@ export function createState(
       declared,
     );
     const writeOnly = secret === true || row.writeOnly;
+    let value = fallback ?? null;
+    let invalid = false;
+    if (!writeOnly && row.value !== null) {
+      try {
+        value = parseSetting(declared, row.value);
+      } catch (error) {
+        if (!(error instanceof SettingsValidationError)) throw error;
+        invalid = true;
+      }
+    }
     return {
       key: row.key,
       owner,
@@ -131,9 +142,8 @@ export function createState(
         ? { isSet: row.value !== null || fallback !== undefined }
         : {
           default: fallback ?? null,
-          value: row.value === null
-            ? fallback ?? null
-            : parseSetting(declared, row.value),
+          value,
+          ...(invalid ? { invalid: true as const } : {}),
         }),
     };
   }
