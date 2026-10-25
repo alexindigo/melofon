@@ -25,6 +25,7 @@
     "melofon.eventsDrainMs": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 2147483647,
       "default": 25,
       "description": "Retry interval while an events socket has buffered output"
     },

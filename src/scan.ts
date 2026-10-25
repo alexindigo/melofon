@@ -808,7 +808,7 @@ export function createScan(
   };
   const launch = (initial: QueuedScan): Promise<ScanCounts> => {
     if (pending !== null) return pending;
-    pending = Promise.resolve().then(async () => {
+    const launched = Promise.resolve().then(async () => {
       let request = initial;
       let counts: ScanCounts | undefined;
       for (;;) {
@@ -866,6 +866,7 @@ export function createScan(
           opts?.notify?.emit(['update']);
         }
         if (queued === null) {
+          pending = null;
           if (failure) throw failure;
           return counts!;
         }
@@ -874,9 +875,10 @@ export function createScan(
         queued = null;
       }
     }).finally(() => {
-      pending = null;
+      if (pending === launched) pending = null;
     });
-    return pending;
+    pending = launched;
+    return launched;
   };
   const run = (input: ScanRequest = {}): Promise<ScanCounts> => {
     if (pending !== null) return pending;

@@ -160,16 +160,33 @@ Deno.test('core lockdown: IPv6 loopback is admitted and unknown/non-loopback pee
     // Supplemental peer-parser boundary cases; the LAN tests above exercise
     // real peer forwarding end-to-end rather than only this supplied info.
     for (
-      const hostname of [undefined, '192.168.1.20', '127.0.0.999', 'localhost']
+      const hostname of [
+        undefined,
+        '192.168.1.20',
+        '127.0.0.999',
+        'localhost',
+        '::ffff:192.168.1.5',
+        '::ffff:127.0.0.999',
+      ]
     ) {
       const denied = await route(
-        new Request('http://melofon.home/_/config'),
+        new Request('http://melofon.home/_/config', {
+          headers: { 'X-Forwarded-For': '::ffff:127.0.0.1' },
+        }),
         hostname ? { remoteAddr: { hostname } } : undefined,
       );
       assertEquals(denied.status, 404);
       assertEquals(await denied.json(), { detail: 'Not Found' });
     }
-    for (const hostname of ['127.0.0.1', '127.23.45.67', '::1']) {
+    for (
+      const hostname of [
+        '127.0.0.1',
+        '127.23.45.67',
+        '::1',
+        '::ffff:127.0.0.1',
+        '::FFFF:127.23.45.67',
+      ]
+    ) {
       const allowed = await route(new Request('http://melofon.home/_/config'), {
         remoteAddr: { hostname },
       });

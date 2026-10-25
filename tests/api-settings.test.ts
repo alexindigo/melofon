@@ -366,6 +366,33 @@ Deno.test('API settings: typed batches validate completely before writing or ann
   }
 });
 
+Deno.test('API settings: events drain interval rejects timer overflow and accepts the maximum', async () => {
+  const f = await apiFixture();
+  try {
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await f.login(mode);
+      const key = 'melofon.eventsDrainMs';
+      const before = await item(f, credential, key);
+      await settingError(
+        await change(f, credential, [{ key, value: 2147483648 }]),
+        400,
+        'invalid_value',
+        key,
+      );
+      assertEquals(await item(f, credential, key), before);
+      const accepted = await change(f, credential, [{
+        key,
+        value: 2147483647,
+      }]);
+      assertEquals(accepted.status, 200);
+      await accepted.json();
+      assertEquals((await item(f, credential, key)).value, 2147483647);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('API settings: concurrent admins conflict atomically; reset retains rising revisions and current default', async () => {
   const f = await apiFixture();
   try {

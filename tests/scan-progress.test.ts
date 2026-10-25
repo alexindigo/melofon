@@ -1,5 +1,10 @@
 import { assert, assertEquals } from '@std/assert';
 import { scanFixture } from './helpers/scans.ts';
+import { authFixture } from './helpers/authentication.ts';
+import { createLibraries } from '../src/libraries.ts';
+import { createScan, type ScanCounts } from '../src/scan.ts';
+import { createNotify } from '../src/notify.ts';
+import { tagged } from './helpers/tagged.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(condition: () => boolean) {
@@ -13,6 +18,86 @@ function barrier() {
   const entered = Promise.withResolvers<void>();
   const released = Promise.withResolvers<void>();
   return { entered, released };
+}
+
+for (const entry of ['run', 'request'] as const) {
+  Deno.test(`scan finish: late ${entry} runs its own scope and old cleanup preserves the new launch`, async () => {
+    const f = await authFixture();
+    const hold = barrier();
+    let next: Promise<ScanCounts> | undefined;
+    let late: Promise<void> | undefined;
+    try {
+      const libraries = createLibraries(f.store);
+      for (const name of ['A', 'B']) await Deno.mkdir(`${f.dir}/${name}`);
+      const a = await libraries.add('A', `${f.dir}/A`);
+      const b = await libraries.add('B', `${f.dir}/B`);
+      for (const path of ['A/one.mp3', 'B/two.mp3', 'B/three.mp3']) {
+        await tagged(`${f.dir}/${path}`, {
+          TIT2: path,
+          TALB: 'Album',
+          TPE1: 'Artist',
+        });
+      }
+      const sources = await f.store.catalog.listLibraries();
+      // A resolved store fake makes request validation use only microtasks.
+      const store = {
+        ...f.store,
+        catalog: {
+          ...f.store.catalog,
+          listLibraries: () => Promise.resolve(sources),
+        },
+      };
+      let starts = 0;
+      const notify = createNotify();
+      const scan = createScan(store, undefined, {
+        notify,
+        state: {
+          ...f.state,
+          async getTyped(key) {
+            if (key === 'scan.progressIntervalMs' && ++starts === 2) {
+              hold.entered.resolve();
+              await hold.released.promise;
+            }
+            return f.state.getTyped(key);
+          },
+        },
+      });
+      let updates = 0;
+      notify.subscribe((names) => {
+        if (!names.includes('update') || ++updates !== 2) return;
+        // This callback precedes the final queue check. A foreground call's
+        // microtask, or request's two validation awaits, crosses that check
+        // but runs before the old launch's finally.
+        if (entry === 'run') {
+          late = Promise.resolve().then(() => {
+            next = scan.run({ libraries: [b.id] });
+          });
+        } else {
+          late = scan.request({ libraries: [b.id], mode: 'full' });
+        }
+      });
+      const first = scan.run({ libraries: [a.id] });
+      assertEquals((await first).files, 1);
+      await late;
+      // No sleeps: drain the bounded promise chain to the controlled barrier.
+      for (let n = 0; n < 8; n++) await Promise.resolve();
+      assertEquals(starts, 2, 'the late call must start a separate scan');
+      await hold.entered.promise;
+      next ??= scan.run();
+      assert(next !== first, 'the late caller must not receive the old result');
+      assert(scan.run() === next, 'old finally must not clear a new launch');
+      hold.released.resolve();
+      assertEquals((await next).files, 3);
+      const status = await scan.status();
+      assertEquals(status.scope, { libraries: [b.id] });
+      assertEquals(status.queued, null);
+      assertEquals(status.scanning, false);
+    } finally {
+      hold.released.resolve();
+      await next;
+      await f.close();
+    }
+  });
 }
 
 Deno.test('scan progress: live HTTP fields, throttled socket events, OwnTone updating and end', async () => {

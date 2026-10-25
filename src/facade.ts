@@ -257,6 +257,7 @@ export function facade(
 
 function isLoopback(peer: string | undefined): boolean {
   if (peer === '::1') return true;
+  peer = peer?.replace(/^::ffff:/i, '');
   if (!peer || !/^127(?:\.\d{1,3}){3}$/.test(peer)) return false;
   return peer.split('.').every((part) => Number(part) <= 255);
 }
