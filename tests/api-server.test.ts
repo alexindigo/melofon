@@ -1,7 +1,8 @@
 import { assert, assertEquals } from '@std/assert';
 import { cp } from 'node:fs/promises';
 import { error, iso } from './helpers/api.ts';
-import { freePort, statusFixture } from './helpers/api-status.ts';
+import { statusFixture } from './helpers/api-status.ts';
+import { reservePorts } from './helpers/ports.ts';
 import { startServer } from '../src/server.ts';
 
 const base = '/api/v1/server';
@@ -95,9 +96,11 @@ Deno.test('API server: signed-in projection, actual remapped listens and live ha
 
 Deno.test('API server: production composition exposes deno.json version and startup logging through the real facade', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-production-status-' });
-  const port = freePort();
+  using reserved = reservePorts(3);
+  const [port, own, ws] = reserved.ports;
   const origin = `http://melofon.home:${port}`;
   const exits: number[] = [];
+  reserved.release();
   const server = await startServer({
     exit: (code) => {
       exits.push(code);
@@ -108,7 +111,7 @@ Deno.test('API server: production composition exposes deno.json version and star
       MELOFON_USER: 'admin',
       MELOFON_PASSWORD: 'production-status-password',
       MELOFON_LISTEN: `0.0.0.0:${port}`,
-      MELOFON_LISTEN_owntone: `${freePort()},${freePort()}`,
+      MELOFON_LISTEN_owntone: `${own},${ws}`,
       MELOFON_AIRPLAY_MDNS: 'off',
     },
   });

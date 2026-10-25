@@ -5,12 +5,6 @@ import type { Hat } from '../layers/melofon/types.ts';
 
 const base = '/api/v1/admin/hats';
 
-function freePort() {
-  const socket = Deno.listen({ hostname: '0.0.0.0', port: 0 });
-  const port = (socket.addr as Deno.NetAddr).port;
-  socket.close();
-  return port;
-}
 async function fixtureHat(
   root: string,
   name: string,
@@ -34,7 +28,6 @@ async function fixtureHat(
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-api-hats-' });
   const root = `${dir}/layers`;
-  const actual = freePort();
   try {
     await cp('layers', root, { recursive: true });
     await fixtureHat(root, 'extra', {
@@ -79,16 +72,17 @@ export default async (request, context) => {
     const f = await apiFixture({
       hats: {
         layersRoot: root,
-        env: {
-          MELOFON_LISTEN_owntone: `${freePort()},${freePort()}`,
+        extraPorts: 3,
+        env: ([own, ws, actual]) => ({
+          MELOFON_LISTEN_owntone: `${own},${ws}`,
           MELOFON_LISTEN_extra: String(actual),
-        },
+        }),
       },
     });
     return {
       ...f,
       root,
-      actual,
+      actual: f.extraPorts[2],
       async list(credential: string) {
         const response = await f.get(base, credential);
         assertEquals(response.status, 200);

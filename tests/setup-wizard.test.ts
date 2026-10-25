@@ -6,16 +6,11 @@ import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { createAuthentication } from '../src/authentication.ts';
 import { createState } from '../src/state.ts';
-
-function freePort() {
-  const listener = Deno.listen({ hostname: '0.0.0.0', port: 0 });
-  const port = (listener.addr as Deno.NetAddr).port;
-  listener.close();
-  return port;
-}
+import { reservePorts } from './helpers/ports.ts';
 
 async function boot(dataDir: string, extra: Record<string, string> = {}) {
-  const port = freePort(), own = freePort(), ws = freePort();
+  using reserved = reservePorts(3);
+  const [port, own, ws] = reserved.ports;
   const env = {
     MELOFON_DATA: dataDir,
     MELOFON_SECRET: 'setup-test-secret',
@@ -40,6 +35,7 @@ async function boot(dataDir: string, extra: Record<string, string> = {}) {
   const exited = new Promise<number>((resolve) => {
     resolveExit = resolve;
   });
+  reserved.release();
   const server = await startServer({
     env,
     setupLog: log,

@@ -17,12 +17,17 @@ import { configureLogging, type Logger, scopedLog } from '../../src/logging.ts';
 import { createServerStatus } from '../../src/server-status.ts';
 import { loadConfig } from '../../src/config.ts';
 import type { ScanService } from '../../src/scan.ts';
+import { reservePorts } from './ports.ts';
 
 export async function apiFixture(
   options: {
     failSignIn?: boolean;
     tls?: boolean;
-    hats?: { layersRoot: string; env: Record<string, string> };
+    hats?: {
+      layersRoot: string;
+      extraPorts: number;
+      env: (ports: number[]) => Record<string, string>;
+    };
     services?: (
       fixture: Awaited<ReturnType<typeof authFixture>>,
     ) => Promise<Record<string, unknown>>;
@@ -102,14 +107,12 @@ export async function apiFixture(
     const client = options.tls
       ? Deno.createHttpClient({ caCerts: [tls.cert!] })
       : undefined;
-    let port: number;
+    using reserved = reservePorts(1 + (options.hats?.extraPorts ?? 0));
+    const [port, ...extraPorts] = reserved.ports;
     let shutdown: () => Promise<void>;
     if (options.hats) {
       assert(!options.tls, 'lifecycle fixture uses plain HTTP');
-      const socket = Deno.listen({ hostname: '0.0.0.0', port: 0 });
-      port = (socket.addr as Deno.NetAddr).port;
-      socket.close();
-      const mapping = createPortMapping(options.hats.env);
+      const mapping = createPortMapping(options.hats.env(extraPorts));
       listens = createListenManager({
         core,
         layers: () => hats?.activeLayers() ?? [],
@@ -120,6 +123,7 @@ export async function apiFixture(
         debugLogHeaders: options.traceRequests,
       });
       try {
+        reserved.release();
         hats = await createHats({
           store: f.store,
           app: bag,
@@ -135,14 +139,14 @@ export async function apiFixture(
       }
       shutdown = () => listens!.shutdown();
     } else {
+      reserved.release();
       const server = Deno.serve(
-        { hostname: '0.0.0.0', port: 0, onListen() {}, ...tls },
+        { hostname: '0.0.0.0', port, onListen() {}, ...tls },
         facade(core, layers, {
           debugLogRequests: options.traceRequests,
           debugLogHeaders: options.traceRequests,
         }),
       );
-      port = server.addr.port;
       shutdown = () => server.shutdown();
     }
     const origin = `${options.tls ? 'https' : 'http'}://melofon.home:${port}`;
@@ -240,6 +244,7 @@ export async function apiFixture(
       ...f,
       notify,
       origin,
+      extraPorts,
       peers,
       notifications,
       settingNotifications,

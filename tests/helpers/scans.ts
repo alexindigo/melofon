@@ -7,7 +7,6 @@ import { createLibrary } from '../../src/library.ts';
 import { createAnnotation } from '../../src/annotation.ts';
 import { createListens } from '../../src/listens.ts';
 import { createLogger } from '../../src/logging.ts';
-import { freePort } from './api-status.ts';
 import { createMedia } from '../../src/media.ts';
 import { createTagReader } from '../../src/scan-tags.ts';
 
@@ -25,7 +24,8 @@ export async function scanFixture(
     allLayers: true,
     hats: {
       layersRoot: 'layers',
-      env: { MELOFON_LISTEN_owntone: `${freePort()},${freePort()}` },
+      extraPorts: 2,
+      env: (ports) => ({ MELOFON_LISTEN_owntone: ports.join(',') }),
     },
     status: logger,
     storeDir: options.storeDir,

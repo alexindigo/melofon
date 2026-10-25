@@ -5,12 +5,6 @@ import { createScan } from '../../src/scan.ts';
 import { createLibraries } from '../../src/libraries.ts';
 import { createMedia } from '../../src/media.ts';
 
-export function freePort() {
-  const socket = Deno.listen({ hostname: '0.0.0.0', port: 0 });
-  const port = (socket.addr as Deno.NetAddr).port;
-  socket.close();
-  return port;
-}
 export async function statusFixture(lifecycle = false, traceRequests = false) {
   const previous = appLogger();
   const lines: string[] = [];
@@ -23,7 +17,6 @@ export async function statusFixture(lifecycle = false, traceRequests = false) {
   installLogger(logger);
   const dir = await Deno.makeTempDir({ prefix: 'melofon-status-' });
   const root = `${dir}/layers`;
-  const ownPorts = [freePort(), freePort()];
   let release = () => {};
   let held: Promise<void> | undefined;
   let failMedia = false;
@@ -41,7 +34,10 @@ export async function statusFixture(lifecycle = false, traceRequests = false) {
         ? {
           hats: {
             layersRoot: root,
-            env: { MELOFON_LISTEN_owntone: ownPorts.join(',') },
+            extraPorts: 2,
+            env: (ports: number[]) => ({
+              MELOFON_LISTEN_owntone: ports.join(','),
+            }),
           },
         }
         : {}),
@@ -69,7 +65,7 @@ export async function statusFixture(lifecycle = false, traceRequests = false) {
       ...f,
       root,
       dir,
-      ownPorts,
+      ownPorts: f.extraPorts,
       logger,
       lines,
       scan,

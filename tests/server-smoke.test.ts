@@ -3,6 +3,7 @@
 // restart restore of an AirPlay output.
 import { assert, assertEquals } from '@std/assert';
 import { startFakeRaop } from './helpers/fake-raop.ts';
+import { reservePorts } from './helpers/ports.ts';
 
 const USER = 'admin';
 const PASSWORD = 'smoke-password';
@@ -11,13 +12,8 @@ const AUTH_QUERY = new URLSearchParams(AUTH).toString();
 const INHERITED = ['HOME', 'PATH', 'DENO_DIR', 'TMPDIR', 'MELOFON_RAOP_LIB'];
 
 async function boot(dataDir: string, extra: Record<string, string> = {}) {
-  const freePort = () => {
-    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    const { port } = listener.addr as Deno.NetAddr;
-    listener.close();
-    return port;
-  };
-  const port = freePort();
+  using reserved = reservePorts(3);
+  const [port, own, ws] = reserved.ports;
   const env: Record<string, string> = {};
   for (const name of INHERITED) {
     const value = Deno.env.get(name);
@@ -29,10 +25,11 @@ async function boot(dataDir: string, extra: Record<string, string> = {}) {
     MELOFON_PASSWORD: PASSWORD,
     MELOFON_SECRET: 'smoke-secret',
     MELOFON_LISTEN: `127.0.0.1:${port}`,
-    MELOFON_LISTEN_owntone: `${freePort()},${freePort()}`,
+    MELOFON_LISTEN_owntone: `${own},${ws}`,
     MELOFON_AIRPLAY_MDNS: 'off',
     ...extra,
   });
+  reserved.release();
   const child = new Deno.Command(Deno.execPath(), {
     args: [
       'run',

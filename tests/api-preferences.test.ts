@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { apiFixture, error } from './helpers/api.ts';
+import { reservePorts } from './helpers/ports.ts';
 import type { Preferences } from '../layers/melofon/types.ts';
 
 const base = '/api/v1/me/preferences';
@@ -539,12 +540,8 @@ Deno.test('API preferences: real cookie/Bearer device sockets refetch private ch
 // This case starts the real production composition twice, not a reopened mock
 // service. Existing server-smoke provides the child lifecycle precedent.
 async function boot(dataDir: string) {
-  const freePort = () => {
-    const l = Deno.listen({ hostname: '0.0.0.0', port: 0 });
-    const port = (l.addr as Deno.NetAddr).port;
-    l.close();
-    return port;
-  };
+  using reserved = reservePorts(3);
+  const [port, own, ws] = reserved.ports;
   const env: Record<string, string> = {};
   for (
     const key of ['HOME', 'PATH', 'DENO_DIR', 'TMPDIR', 'MELOFON_RAOP_LIB']
@@ -552,16 +549,17 @@ async function boot(dataDir: string) {
     const value = Deno.env.get(key);
     if (value !== undefined) env[key] = value;
   }
-  const origin = `http://melofon.home:${freePort()}`;
+  const origin = `http://melofon.home:${port}`;
   Object.assign(env, {
     MELOFON_DATA: dataDir,
     MELOFON_USER: 'admin',
     MELOFON_PASSWORD: 'password-admin',
     MELOFON_SECRET: 'preferences-restart-secret',
-    MELOFON_LISTEN: `0.0.0.0:${new URL(origin).port}`,
-    MELOFON_LISTEN_owntone: `${freePort()},${freePort()}`,
+    MELOFON_LISTEN: `0.0.0.0:${port}`,
+    MELOFON_LISTEN_owntone: `${own},${ws}`,
     MELOFON_AIRPLAY_MDNS: 'off',
   });
+  reserved.release();
   const child = new Deno.Command(Deno.execPath(), {
     args: [
       'run',

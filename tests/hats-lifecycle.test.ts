@@ -9,13 +9,7 @@ import { createState } from '../src/state.ts';
 import { openStore, type Store } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { captureLogs } from './helpers/logging.ts';
-
-function freePort(): number {
-  const socket = Deno.listen({ hostname: '0.0.0.0', port: 0 });
-  const port = (socket.addr as Deno.NetAddr).port;
-  socket.close();
-  return port;
-}
+import { reservePorts } from './helpers/ports.ts';
 
 async function fixture(
   root: string,
@@ -39,8 +33,10 @@ async function boot(
   store: Store,
   layersRoot?: string,
   env: Record<string, string> = {},
+  reservation = reservePorts(1),
 ) {
-  const port = freePort();
+  using reserved = reservation;
+  const [port] = reserved.ports;
   const mapping = createPortMapping(env);
   const state = createState(store);
   const notify = createNotify();
@@ -59,6 +55,7 @@ async function boot(
   });
   const binds = createBinds(() => hats?.layers() ?? [], mapping);
   try {
+    reserved.release();
     hats = await createHats({
       store,
       app: { state, binds, cfg: { version: 'lifecycle-test' } },
@@ -177,10 +174,11 @@ Deno.test('hats: broken manifests, settings, mounts, ports and imports cannot ab
 Deno.test('hats: shipped migration runs once; deactivation keeps serving until restart', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-hats-' });
   let store = await openStore(dir);
-  const extra = freePort(), ws = freePort();
+  using reserved = reservePorts(3);
+  const [, extra, ws] = reserved.ports;
   const env = { MELOFON_LISTEN_owntone: `${extra},${ws}` };
   try {
-    const first = await boot(store, undefined, env);
+    const first = await boot(store, undefined, env, reserved);
     try {
       assertEquals(first.hats.list().map((h) => [h.name, h.state, h.active]), [
         ['melofon', 'active', true],
@@ -214,7 +212,7 @@ Deno.test('hats: shipped migration runs once; deactivation keeps serving until r
     }
     await store.close();
     store = await openStore(dir);
-    const second = await boot(store, undefined, env);
+    const second = await boot(store, undefined, env, reserved);
     try {
       const hat = second.hats.list().find((h) => h.name === 'opensubsonic')!;
       assertEquals([hat.state, hat.active, hat.pendingRestart], [
@@ -257,7 +255,9 @@ Deno.test('hats: shipped migration runs once; deactivation keeps serving until r
 
 Deno.test('hats: loaded inactive settings and routes activate over a new remapped listen', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-hats-' });
-  const root = `${dir}/layers`, actual = freePort();
+  const root = `${dir}/layers`;
+  using reserved = reservePorts(2);
+  const [, actual] = reserved.ports;
   const store = await openStore(`${dir}/db`);
   try {
     await fixture(
@@ -271,7 +271,7 @@ Deno.test('hats: loaded inactive settings and routes activate over a new remappe
     );
     const server = await boot(store, root, {
       MELOFON_LISTEN_REPLACE_12345: String(actual),
-    });
+    }, reserved);
     try {
       assertEquals(server.hats.list()[0].state, 'loaded');
       assertEquals(server.hats.list()[0].settings, ['fixture.message']);
@@ -314,14 +314,16 @@ Deno.test('hats: loaded inactive settings and routes activate over a new remappe
 
 Deno.test('hats: failed multi-port activation rolls back new sockets and leaves flag off; retry works', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-hats-' });
-  const root = `${dir}/layers`, first = freePort();
+  const root = `${dir}/layers`;
   const held = Deno.listen({ hostname: '0.0.0.0', port: 0 });
   const blocked = (held.addr as Deno.NetAddr).port;
+  using reserved = reservePorts(2);
+  const [, first] = reserved.ports;
   const store = await openStore(`${dir}/db`);
   let heldOpen = true;
   try {
     await fixture(root, 'extra', { port: [first, blocked] });
-    const server = await boot(store, root);
+    const server = await boot(store, root, {}, reserved);
     try {
       await assertRejects(
         () => server.hats.activate('extra'),
@@ -392,16 +394,18 @@ Deno.test('hats: startup port conflict is isolated and retains the desired flag'
 
 Deno.test('hats: live shared listen excludes inactive forced routes and survives another activation failing', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-hats-' });
-  const root = `${dir}/layers`, shared = freePort();
+  const root = `${dir}/layers`;
   const held = Deno.listen({ hostname: '0.0.0.0', port: 0 });
   const blocked = (held.addr as Deno.NetAddr).port;
+  using reserved = reservePorts(2);
+  const [, shared] = reserved.ports;
   const store = await openStore(`${dir}/db`);
   try {
     await fixture(root, 'opensubsonic', { port: 12345 });
     await fixture(root, 'extra', { port: 12345 });
     await fixture(root, 'conflict', { port: [12345, blocked] });
     const env = { MELOFON_LISTEN_REPLACE_12345: String(shared) };
-    const server = await boot(store, root, env);
+    const server = await boot(store, root, env, reserved);
     try {
       // Mutating the caller's environment cannot change the parsed mapping.
       env.MELOFON_LISTEN_REPLACE_12345 = String(blocked);
@@ -572,9 +576,11 @@ Deno.test('hats: pre-ledger database receives shipped flags once on upgrade', as
       { name: 'owntone', active: true },
       { name: 'share', active: true },
     ]);
+    using reserved = reservePorts(3);
+    const [, own, ws] = reserved.ports;
     const upgraded = await boot(store, undefined, {
-      MELOFON_LISTEN_owntone: `${freePort()},${freePort()}`,
-    });
+      MELOFON_LISTEN_owntone: `${own},${ws}`,
+    }, reserved);
     try {
       assert(
         upgraded.hats.list().every((h) =>
