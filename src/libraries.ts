@@ -16,6 +16,7 @@ import type { Provenance } from './logging-events.ts';
 export type { LibraryRow } from './store/catalog.ts';
 
 export interface Libraries {
+  stats(id: string): ReturnType<Store['scan']['stats']>;
   /** All configured sources, by name. */
   list(): Promise<LibraryRow[]>;
   /** Add a validated, disjoint source and queue a background scan. */
@@ -134,6 +135,7 @@ export function createLibraries(store: Store, options: {
   };
   return {
     list: store.catalog.listLibraries,
+    stats: store.scan.stats,
 
     async add(name, path, source = { kind: 'internal' }) {
       const normalized = await pathOf(path);

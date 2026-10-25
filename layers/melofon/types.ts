@@ -63,6 +63,7 @@ export interface HatContext {
       ): () => void;
     };
     libraries: {
+      stats(id: string): Promise<unknown>;
       list(): Promise<Library[]>;
       add(name: string, path: string, source?: Source): Promise<Library>;
       update(
@@ -78,6 +79,7 @@ export interface HatContext {
         scope?: {
           libraries?: string[];
           folder?: { library: string; path: string };
+          mode?: 'quick' | 'full';
         },
       ): Promise<void>;
       problems(libraryId?: string): Promise<unknown>;

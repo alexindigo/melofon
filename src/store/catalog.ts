@@ -7,6 +7,8 @@ import { dirname } from 'node:path';
 import { LibraryError, LibrarySourcesChanged } from '../library-errors.ts';
 import type { AlbumMetadata, SongMetadata } from '../metadata.ts';
 import type { VideoDetails } from '../video.ts';
+import type { LyricsSource } from '../lyrics.ts';
+import type { LocalVersion } from './candidates.ts';
 import type { AlbumInput } from '../albums.ts';
 import { covered, type ScanCoverage } from '../scan-scope.ts';
 import { type ScanResult, writeScanResult } from './scan.ts';
@@ -962,6 +964,11 @@ export interface CatalogIdentity extends CatalogFileStat {
 }
 
 export interface CatalogFile {
+  /** Complete file-owned acquisition cache. Absent on pre-cache installs. */
+  scanFacts?: {
+    pictures: Omit<LocalVersion, 'origin'>[];
+    embeddedLyrics: LyricsSource[];
+  };
   albumInput?: Omit<AlbumInput, 'songId'>;
   video?: VideoDetails;
   pictureHash?: string | null;
@@ -1187,6 +1194,13 @@ async function replaceCatalog(
           }::JSON WHERE id = ${esc(file.id)}`,
         );
       }
+      if (file.scanFacts) {
+        await q.run(
+          `UPDATE files SET scan_facts = ${
+            esc(JSON.stringify(file.scanFacts))
+          }::JSON WHERE id = ${esc(file.id)}`,
+        );
+      }
       if (file.video) {
         await q.run(
           `UPDATE files SET video_details = ${
@@ -1252,6 +1266,8 @@ export function createCatalogStore(engine: Engine) {
             dev: number | null;
             ino: number | null;
             album_input: string | null;
+            scan_facts: string | null;
+            video_details: string | null;
             artist_kind: ArtistKind;
             album_artist_name: string | null;
             has_lyrics: boolean;
@@ -1260,7 +1276,8 @@ export function createCatalogStore(engine: Engine) {
           SONG_SELECT.replace(
             'SELECT f.id,',
             `SELECT fi.rel_path, fi.fingerprint, fi.pcm_md5, f.mtime, fi.dev, fi.ino,
-          f.album_input::VARCHAR AS album_input, f.has_lyrics, al.artist_kind,
+          f.album_input::VARCHAR AS album_input, f.scan_facts::VARCHAR AS scan_facts,
+          f.video_details::VARCHAR AS video_details, f.has_lyrics, al.artist_kind,
           (SELECT name FROM artists WHERE id = al.album_artist_id) AS album_artist_name, f.id,`,
           )
         }`);
@@ -1291,6 +1308,12 @@ export function createCatalogStore(engine: Engine) {
             genre: row.genre,
             year: num(row.year),
             isVideo: row.is_video ?? false,
+            ...(row.scan_facts
+              ? { scanFacts: JSON.parse(row.scan_facts) }
+              : {}),
+            ...(row.video_details
+              ? { video: JSON.parse(row.video_details) }
+              : {}),
             hasLyrics: row.has_lyrics,
             metadata: song.metadata,
             pictureHash: row.picture_hash,

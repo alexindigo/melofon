@@ -5,9 +5,53 @@ export interface ScanScope {
   libraries?: string[];
   folder?: { library: string; path: string };
 }
+/** A union is needed when queued folder requests are disjoint. Never widen it. */
+export type ScanSelection = ScanScope & { scopes?: ScanScope[] };
+
+export function mergeScanScopes(
+  a: ScanSelection,
+  b: ScanSelection,
+): ScanSelection {
+  const scopes = [...(a.scopes ?? [a]), ...(b.scopes ?? [b])];
+  if (scopes.some((s) => !s.libraries && !s.folder)) return {};
+  const libraries = [...new Set(scopes.flatMap((s) => s.libraries ?? []))]
+    .sort();
+  const folders = scopes.flatMap((s) => s.folder ? [s.folder] : [])
+    .filter((f, i, all) =>
+      !libraries.includes(f.library) &&
+      !all.some((p, j) =>
+        p.library === f.library && withinScanPath(f.path, p.path) &&
+        (p.path !== f.path || j < i)
+      )
+    ).sort((x, y) =>
+      x.library.localeCompare(y.library) || x.path.localeCompare(y.path)
+    );
+  const union: ScanScope[] = [
+    ...(libraries.length ? [{ libraries }] : []),
+    ...folders.map((folder) => ({ folder })),
+  ];
+  return union.length === 1 ? union[0] : { scopes: union };
+}
+
+export function scanTargets(scope: ScanSelection, sources: { id: string }[]) {
+  const scopes = scope.scopes ?? [scope];
+  return sources.flatMap((source) => {
+    if (
+      scopes.some((s) =>
+        !s.folder && (!s.libraries || s.libraries.includes(source.id))
+      )
+    ) {
+      return [{ library: source.id, path: '' }];
+    }
+    return scopes.flatMap((s) =>
+      s.folder?.library === source.id ? [s.folder] : []
+    );
+  });
+}
 export interface ScanCoverage {
   libraries: string[];
   folder?: { library: string; path: string };
+  targets?: { library: string; path: string }[];
   excluded: { library: string; path: string }[];
 }
 export const withinScanPath = (path: string, parent: string) =>
@@ -16,6 +60,10 @@ export const withinScanPath = (path: string, parent: string) =>
 /** The same effective coverage governs deletion, retention and move eligibility. */
 export function covered(coverage: ScanCoverage, library: string, path: string) {
   return coverage.libraries.includes(library) &&
+    (!coverage.targets ||
+      coverage.targets.some((t) =>
+        t.library === library && withinScanPath(path, t.path)
+      )) &&
     (!coverage.folder || (coverage.folder.library === library &&
       withinScanPath(path, coverage.folder.path))) &&
     !coverage.excluded.some((e) =>

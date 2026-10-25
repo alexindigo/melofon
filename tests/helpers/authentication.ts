@@ -4,8 +4,8 @@ import { createState } from '../../src/state.ts';
 import { seedFirstUser } from '../../src/users.ts';
 import type { Notify } from '../../src/notify.ts';
 
-export async function authFixture(notify?: Notify) {
-  const dir = await Deno.makeTempDir({ prefix: 'melofon-auth-' });
+export async function authFixture(notify?: Notify, storeDir?: string) {
+  const dir = storeDir ?? await Deno.makeTempDir({ prefix: 'melofon-auth-' });
   const cfg = {
     listen: undefined,
     dataDir: dir,
@@ -46,7 +46,7 @@ export async function authFixture(notify?: Notify) {
       }),
     async close() {
       await store.close();
-      await Deno.remove(dir, { recursive: true });
+      if (storeDir === undefined) await Deno.remove(dir, { recursive: true });
     },
   };
 }

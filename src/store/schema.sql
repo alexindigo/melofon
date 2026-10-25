@@ -54,6 +54,12 @@ CREATE TABLE IF NOT EXISTS scan_problems (
   kind VARCHAR NOT NULL,
   message VARCHAR NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scan_runs (
+  run_id VARCHAR NOT NULL,
+  library_id VARCHAR NOT NULL,
+  stats JSON NOT NULL,
+  PRIMARY KEY (run_id, library_id)
+);
 -- Shared stations are kept on rescan. CREATE also upgrades existing installs.
 CREATE TABLE IF NOT EXISTS radio_stations (
   id VARCHAR PRIMARY KEY,
@@ -139,6 +145,7 @@ ALTER TABLE files ADD COLUMN IF NOT EXISTS picture_hash VARCHAR;
 -- Original album grouping facts, before album-level inference. Old installs
 -- acquire them on their next scan. Retained files need no filesystem reads.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS album_input JSON;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS scan_facts JSON;
 
 -- H7: scan-owned facts. Old catalog rows acquire them on their next scan.
 ALTER TABLE files ADD COLUMN IF NOT EXISTS bit_rate DOUBLE;

@@ -34,11 +34,14 @@ import { LibrarySourcesChanged } from './library-errors.ts';
 import { join, relative } from 'node:path';
 import {
   covered,
+  mergeScanScopes,
   type ScanCoverage,
   type ScanScope,
+  type ScanSelection,
+  scanTargets,
   validateScanScope,
 } from './scan-scope.ts';
-import type { ScanProblem, ScanProblemKind } from './store/scan.ts';
+import type { ScanMode, ScanProblem, ScanProblemKind } from './store/scan.ts';
 import { LibraryError } from './library-errors.ts';
 import {
   createTagReader,
@@ -129,6 +132,10 @@ export async function scanLibrary(
     state?: State;
     tagReader?: TagReader;
     scope?: ScanScope;
+    selection?: ScanSelection;
+    mode?: ScanMode;
+    startedAt?: string;
+    progress?: (progress: ScanProgress) => void;
     notify?: Notify;
   } = {},
 ): Promise<ScanCounts> {
@@ -137,15 +144,44 @@ export async function scanLibrary(
   let media_: Media | undefined = media;
   const fallbackMedia = () => (media_ ??= createMedia());
   const sources = await store.catalog.listLibraries();
-  const scope = await validateScanScope(options.scope ?? {}, sources);
+  const selected: ScanSelection = options.selection ?? options.scope ?? {};
+  const scope: ScanSelection = selected.scopes
+    ? {
+      scopes: await Promise.all(
+        selected.scopes.map((s) => validateScanScope(s, sources)),
+      ),
+    }
+    : await validateScanScope(selected, sources);
+  const mode = options.mode ?? 'full';
+  const startedAt = options.startedAt ?? new Date().toISOString();
+  const targets = scanTargets(scope, sources);
   const coverage: ScanCoverage = {
-    libraries: scope.folder
-      ? [scope.folder.library]
-      : scope.libraries ?? sources.map((s) => s.id),
-    ...(scope.folder ? { folder: scope.folder } : {}),
+    libraries: [...new Set(targets.map((t) => t.library))],
+    targets,
     excluded: [],
   };
+  const progress: ScanProgress = {
+    phase: 'walking',
+    mode,
+    scope,
+    librariesDone: 0,
+    librariesTotal: coverage.libraries.length,
+    filesSeen: 0,
+    filesRead: 0,
+    problems: 0,
+    startedAt,
+    elapsedMs: 0,
+  };
+  const report = (phase = progress.phase) => {
+    progress.phase = phase;
+    progress.elapsedMs = Date.now() - Date.parse(startedAt);
+    options.progress?.({ ...progress });
+  };
+  report();
   const oldFiles = await store.catalog.scanFilesSnapshot();
+  const oldByPath = new Map(
+    oldFiles.map((f) => [pathKey(f.libraryId, f.rel), f]),
+  );
   const runId = crypto.randomUUID();
   const problems: ScanProblem[] = [];
   const availability: { id: string; available: boolean }[] = [];
@@ -170,6 +206,8 @@ export async function scanLibrary(
       message: error instanceof Error ? error.message : String(error),
     });
     skippedByKind[kind]++;
+    progress.problems++;
+    report();
     if (kind !== 'fingerprint_failed') {
       coverage.excluded.push({ library: libraryId, path });
     }
@@ -203,6 +241,7 @@ export async function scanLibrary(
 
   for (const source of sources) {
     if (!coverage.libraries.includes(source.id)) continue;
+    report('walking');
     const root = source.path.replace(/\/+$/, '') || '/';
     let available = true;
     const unreadable = (path: string, error: unknown) => {
@@ -216,206 +255,251 @@ export async function scanLibrary(
       log.event('scan_skipped', { path: join(root, path), error });
     };
     // Even a folder scan reports root availability, independently of its target.
-    if (scope.folder) {
+    if (targets.some((t) => t.library === source.id && t.path !== '')) {
       try {
         for await (const _entry of Deno.readDir(root)) { /* exhaust */ }
       } catch (error) {
         unreadable('', error);
       }
     }
-    for await (
-      const { abs, rel } of available
-        ? walkMedia(root, unreadable, join(root, scope.folder?.path ?? ''))
-        : []
-    ) {
-      try {
-        if (isCoverFile(rel.slice(rel.lastIndexOf('/') + 1))) {
-          try {
-            coverPictures.set(abs, {
-              imageHash: await imageHash(await Deno.readFile(abs)),
-              imageExt: imageExtension(extOf(abs).slice(1)),
-              libraryId: source.id,
-              origin: rel,
-            });
-          } catch (error) {
-            if (
-              !(error instanceof Deno.errors.NotFound ||
-                error instanceof Deno.errors.PermissionDenied)
-            ) throw error;
-          }
-          continue;
-        }
-        const info = await Deno.stat(abs).catch(() => null);
-        const stat: FileStat = {
-          size: info?.size ?? null,
-          mtime_ms: info?.mtime?.getTime() ?? null,
-          dev: info?.dev ?? null,
-          ino: info?.ino ?? null,
-        };
-        const cacheKey = statKey(stat);
-        const previous = byPath.get(pathKey(source.id, rel));
-        if (!info) {
-          problem(source.id, rel, 'tags_unreadable', 'File could not be read');
-          skipped++;
-          continue;
-        }
-        // A streamless video container has no tags to parse. Classify it before
-        // tag parsing so the failure has one useful owner and kind.
-        const probe = VIDEO_EXTENSIONS.has(extOf(abs))
-          ? await fallbackMedia().probe(abs)
-          : undefined;
-        if (probe && !probe.hasVideo && !probe.hasAudio) {
-          problem(source.id, rel, 'no_streams', 'No audio or video streams');
-          skipped++;
-          continue;
-        }
-        const cached = cacheKey === null
-          ? undefined
-          : previous && statKey(previous) === cacheKey
-          ? previous
-          : byStat.get(cacheKey);
-        let audio: AudioFingerprint;
-        if (cached !== undefined) {
-          audio = { fingerprint: cached.fingerprint, pcmMd5: cached.pcm_md5 };
-        } else {
-          try {
-            audio = await fallbackMedia().fingerprint(abs);
-          } catch (error) {
-            audio = { fingerprint: null, pcmMd5: null };
-            log.event('scan_fingerprint_failed', { path: abs, error });
-            problem(source.id, rel, 'fingerprint_failed', error);
-          }
-        }
-
-        let title: string | undefined;
-        let trackArtist: string | undefined;
-        let albumName: string | undefined;
-        let albumArtist: string | undefined;
-        let trackNo: number | null = null;
-        let discNo: number | null = null;
-        let durationMs: number | null = null;
-        let genre: string | null = null;
-        let year: number | null = null;
-        let isVideo = false;
-        let video: VideoDetails | undefined;
-        let metadata: SongMetadata;
-        let pictures: Omit<LocalVersion, 'origin'>[] = [];
+    for (const target of targets.filter((t) => t.library === source.id)) {
+      for await (
+        const { abs, rel } of available
+          ? walkMedia(root, unreadable, join(root, target.path))
+          : []
+      ) {
         try {
-          const meta = await tagReader.read(abs);
-          metadata = metadataFromTags(meta);
-          // Garbage bytes can resolve with an empty format rather than throw.
+          if (isCoverFile(rel.slice(rel.lastIndexOf('/') + 1))) {
+            try {
+              coverPictures.set(abs, {
+                imageHash: await imageHash(await Deno.readFile(abs)),
+                imageExt: imageExtension(extOf(abs).slice(1)),
+                libraryId: source.id,
+                origin: rel,
+              });
+            } catch (error) {
+              if (
+                !(error instanceof Deno.errors.NotFound ||
+                  error instanceof Deno.errors.PermissionDenied)
+              ) throw error;
+            }
+            continue;
+          }
+          const info = await Deno.stat(abs).catch(() => null);
+          progress.filesSeen++;
+          report('reading');
+          const stat: FileStat = {
+            size: info?.size ?? null,
+            mtime_ms: info?.mtime?.getTime() ?? null,
+            dev: info?.dev ?? null,
+            ino: info?.ino ?? null,
+          };
+          const cacheKey = statKey(stat);
+          const previous = byPath.get(pathKey(source.id, rel));
+          if (!info) {
+            problem(
+              source.id,
+              rel,
+              'tags_unreadable',
+              'File could not be read',
+            );
+            skipped++;
+            continue;
+          }
+          const old = oldByPath.get(pathKey(source.id, rel));
           if (
-            meta.format.container === undefined &&
-            meta.format.codec === undefined
+            mode === 'quick' && cacheKey !== null && old?.scanFacts &&
+            statKey(old.stat) === cacheKey
           ) {
-            throw new Error('unrecognized audio format');
+            using _readable = await Deno.open(abs, { read: true });
+            const file: FileIn = { ...old, path: abs, stat };
+            if (old.video) {
+              file.video = await videoDetails(
+                abs,
+                old.video.audio,
+                old.video.subtitles,
+              );
+            }
+            // File tags/probes are cached; sidecars and directory pictures are
+            // independent filesystem inputs and must still be observed.
+            const localLyrics = await lyrics.sources(
+              abs,
+              old.scanFacts.embeddedLyrics,
+            );
+            file.hasLyrics = localLyrics.length > 0;
+            songLyrics.set(file, localLyrics);
+            embeddedPictures.set(file, old.scanFacts.pictures);
+            albumInputs.set(file, file.albumInput!);
+            files.push(file);
+            continue;
           }
-          title = meta.common.title?.trim() || undefined;
-          trackArtist = meta.common.artist?.trim() || undefined;
-          albumName = meta.common.album?.trim() || undefined;
-          // Preserve the tagged fact. Album-level inference owns the fallback.
-          albumArtist = meta.common.albumartist?.trim() || undefined;
-          trackNo = meta.common.track.no;
-          discNo = meta.common.disk.no;
-          if (meta.format.duration && meta.format.duration > 0) {
-            durationMs = Math.round(meta.format.duration * 1000);
+          progress.filesRead++;
+          report();
+          // A streamless video container has no tags to parse. Classify it before
+          // tag parsing so the failure has one useful owner and kind.
+          const probe = VIDEO_EXTENSIONS.has(extOf(abs))
+            ? await fallbackMedia().probe(abs)
+            : undefined;
+          if (probe && !probe.hasVideo && !probe.hasAudio) {
+            problem(source.id, rel, 'no_streams', 'No audio or video streams');
+            skipped++;
+            continue;
           }
-          // TCON is multi-valued; keep its first value, as before.
-          genre = metadata.genres[0] ?? null;
-          year = meta.common.year ?? null;
-          pictures = await Promise.all(
-            picturesFromMetadata(meta).map(async (picture) => ({
-              imageHash: await imageHash(picture.data),
-              imageExt: imageExtension(picture.format),
-              libraryId: source.id,
-            })),
-          );
+          const cached = cacheKey === null
+            ? undefined
+            : previous && statKey(previous) === cacheKey
+            ? previous
+            : byStat.get(cacheKey);
+          let audio: AudioFingerprint;
+          if (cached !== undefined) {
+            audio = { fingerprint: cached.fingerprint, pcmMd5: cached.pcm_md5 };
+          } else {
+            try {
+              audio = await fallbackMedia().fingerprint(abs);
+            } catch (error) {
+              audio = { fingerprint: null, pcmMd5: null };
+              log.event('scan_fingerprint_failed', { path: abs, error });
+              problem(source.id, rel, 'fingerprint_failed', error);
+            }
+          }
+
+          let title: string | undefined;
+          let trackArtist: string | undefined;
+          let albumName: string | undefined;
+          let albumArtist: string | undefined;
+          let trackNo: number | null = null;
+          let discNo: number | null = null;
+          let durationMs: number | null = null;
+          let genre: string | null = null;
+          let year: number | null = null;
+          let isVideo = false;
+          let video: VideoDetails | undefined;
+          let metadata: SongMetadata;
+          let pictures: Omit<LocalVersion, 'origin'>[] = [];
+          try {
+            const meta = await tagReader.read(abs);
+            metadata = metadataFromTags(meta);
+            // Garbage bytes can resolve with an empty format rather than throw.
+            if (
+              meta.format.container === undefined &&
+              meta.format.codec === undefined
+            ) {
+              throw new Error('unrecognized audio format');
+            }
+            title = meta.common.title?.trim() || undefined;
+            trackArtist = meta.common.artist?.trim() || undefined;
+            albumName = meta.common.album?.trim() || undefined;
+            // Preserve the tagged fact. Album-level inference owns the fallback.
+            albumArtist = meta.common.albumartist?.trim() || undefined;
+            trackNo = meta.common.track.no;
+            discNo = meta.common.disk.no;
+            if (meta.format.duration && meta.format.duration > 0) {
+              durationMs = Math.round(meta.format.duration * 1000);
+            }
+            // TCON is multi-valued; keep its first value, as before.
+            genre = metadata.genres[0] ?? null;
+            year = meta.common.year ?? null;
+            pictures = await Promise.all(
+              picturesFromMetadata(meta).map(async (picture) => ({
+                imageHash: await imageHash(picture.data),
+                imageExt: imageExtension(picture.format),
+                libraryId: source.id,
+              })),
+            );
+          } catch (error) {
+            log.event('scan_tags_failed', { path: abs, error });
+            problem(source.id, rel, 'tags_unreadable', error);
+            skipped++;
+            continue; // unreadable tags — skip the file, keep scanning
+          }
+          if (probe) {
+            // Probe decides video-ness and backfills missing duration. An
+            // audio-only .mp4 stays a song, and a streamless file is skipped.
+            isVideo = probe.hasVideo;
+            if (isVideo) {
+              video = await videoDetails(
+                abs,
+                probe.audioStreams ?? [],
+                probe.subtitleStreams ?? [],
+              );
+            }
+            durationMs ??= probe.durationMs;
+          } else if (durationMs === null) {
+            durationMs = (await fallbackMedia().probe(abs)).durationMs;
+          }
+          // Same selected stream as the decoder/transcoder (Demuxer.audio()).
+          // Container averages and the tag parser's first stream are not audio facts.
+          const details = await fallbackMedia().describeAudio(abs);
+          metadata.bitRate = details?.audioBitrate === undefined
+            ? null
+            : details.audioBitrate / 1000;
+          metadata.bitDepth = details?.audioBitdepth ?? null;
+          metadata.sampleRate = details?.audioSamplerate ?? null;
+          metadata.channels = details?.audioChannels ?? null;
+
+          let artistId: string | null = null;
+          if (trackArtist !== undefined) {
+            artistId = await stableId('artist', trackArtist);
+          }
+          const file: FileIn = {
+            id: '',
+            path: abs,
+            rel,
+            libraryId: source.id,
+            stat,
+            ...audio,
+            title: title ?? null,
+            albumId: null,
+            artistId,
+            track: trackNo,
+            disc: discNo,
+            durationMs,
+            genre,
+            year,
+            isVideo,
+            video,
+            metadata,
+            pictureHash: pictures[0]?.imageHash ?? null,
+          };
+          const localLyrics = await lyrics.sources(abs);
+          file.scanFacts = {
+            pictures,
+            embeddedLyrics: localLyrics.filter((s) => s.origin === 'embedded'),
+          };
+          file.hasLyrics = localLyrics.length > 0;
+          songLyrics.set(file, localLyrics);
+          embeddedPictures.set(file, pictures);
+          albumInputs.set(file, {
+            libraryId: source.id,
+            rel,
+            albumName: albumName ?? null,
+            albumArtistTag: albumArtist ?? null,
+            trackArtist: trackArtist ?? null,
+            disc: discNo,
+          });
+          file.albumInput = albumInputs.get(file)!;
+          files.push(file);
         } catch (error) {
-          log.event('scan_tags_failed', { path: abs, error });
+          // Permission/mount races can happen after tags, while acquiring audio,
+          // captions or lyrics too. Exclude the file at this one I/O boundary;
+          // programming/service failures still fail the run atomically.
+          if (
+            !(error instanceof Deno.errors.PermissionDenied ||
+              error instanceof Deno.errors.NotFound ||
+              error instanceof Deno.errors.NotADirectory ||
+              ['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EIO', 'ESTALE']
+                .includes(
+                  (error as { code?: string }).code ?? '',
+                ))
+          ) throw error;
           problem(source.id, rel, 'tags_unreadable', error);
           skipped++;
-          continue; // unreadable tags — skip the file, keep scanning
         }
-        if (probe) {
-          // Probe decides video-ness and backfills missing duration. An
-          // audio-only .mp4 stays a song, and a streamless file is skipped.
-          isVideo = probe.hasVideo;
-          if (isVideo) {
-            video = await videoDetails(
-              abs,
-              probe.audioStreams ?? [],
-              probe.subtitleStreams ?? [],
-            );
-          }
-          durationMs ??= probe.durationMs;
-        } else if (durationMs === null) {
-          durationMs = (await fallbackMedia().probe(abs)).durationMs;
-        }
-        // Same selected stream as the decoder/transcoder (Demuxer.audio()).
-        // Container averages and the tag parser's first stream are not audio facts.
-        const details = await fallbackMedia().describeAudio(abs);
-        metadata.bitRate = details?.audioBitrate === undefined
-          ? null
-          : details.audioBitrate / 1000;
-        metadata.bitDepth = details?.audioBitdepth ?? null;
-        metadata.sampleRate = details?.audioSamplerate ?? null;
-        metadata.channels = details?.audioChannels ?? null;
-
-        let artistId: string | null = null;
-        if (trackArtist !== undefined) {
-          artistId = await stableId('artist', trackArtist);
-        }
-        const file: FileIn = {
-          id: '',
-          path: abs,
-          rel,
-          libraryId: source.id,
-          stat,
-          ...audio,
-          title: title ?? null,
-          albumId: null,
-          artistId,
-          track: trackNo,
-          disc: discNo,
-          durationMs,
-          genre,
-          year,
-          isVideo,
-          video,
-          metadata,
-          pictureHash: pictures[0]?.imageHash ?? null,
-        };
-        const localLyrics = await lyrics.sources(abs);
-        file.hasLyrics = localLyrics.length > 0;
-        songLyrics.set(file, localLyrics);
-        embeddedPictures.set(file, pictures);
-        albumInputs.set(file, {
-          libraryId: source.id,
-          rel,
-          albumName: albumName ?? null,
-          albumArtistTag: albumArtist ?? null,
-          trackArtist: trackArtist ?? null,
-          disc: discNo,
-        });
-        file.albumInput = albumInputs.get(file)!;
-        files.push(file);
-      } catch (error) {
-        // Permission/mount races can happen after tags, while acquiring audio,
-        // captions or lyrics too. Exclude the file at this one I/O boundary;
-        // programming/service failures still fail the run atomically.
-        if (
-          !(error instanceof Deno.errors.PermissionDenied ||
-            error instanceof Deno.errors.NotFound ||
-            error instanceof Deno.errors.NotADirectory ||
-            ['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EIO', 'ESTALE'].includes(
-              (error as { code?: string }).code ?? '',
-            ))
-        ) throw error;
-        problem(source.id, rel, 'tags_unreadable', error);
-        skipped++;
       }
     }
     availability.push({ id: source.id, available });
+    progress.librariesDone++;
+    report('walking');
   }
 
   const preserved = oldFiles.filter((f) =>
@@ -455,7 +539,7 @@ export async function scanLibrary(
       rows.filter((row) =>
         !seen.has(row.id) &&
         (covered(coverage, row.library_id, row.rel_path) ||
-          (!scope.libraries && !scope.folder &&
+          (!scope.libraries && !scope.folder && !scope.scopes &&
             !sources.some((s) => s.id === row.library_id)))
       ),
     );
@@ -516,10 +600,11 @@ export async function scanLibrary(
     ...albumInputs.get(file)!,
     metadata: file.metadata,
   })));
+  report('publishing');
   const changedLibraries = await store.catalog.replaceCatalog({
     coverage,
     preserved,
-    scanResult: { runId, libraries: availability, problems },
+    scanResult: { runId, startedAt, mode, libraries: availability, problems },
     sources: sources.map(({ id, path }) => ({ id, path })),
     artists: [...artists.values()].map((artist) => ({
       ...artist,
@@ -631,7 +716,26 @@ export async function scanLibrary(
   };
 }
 
-export interface ScanStatus {
+export interface ScanProgress {
+  phase: 'walking' | 'reading' | 'publishing';
+  mode: ScanMode;
+  scope: ScanSelection;
+  librariesDone: number;
+  librariesTotal: number;
+  filesSeen: number;
+  filesRead: number;
+  problems: number;
+  startedAt: string;
+  elapsedMs: number;
+}
+export interface ScanRequest extends ScanScope {
+  mode?: ScanMode;
+}
+export interface QueuedScan {
+  mode: ScanMode;
+  scope: ScanSelection;
+}
+export interface ScanStatus extends Partial<ScanProgress> {
   scanning: boolean;
   /** Files indexed by the last completed scan (0 before the first). */
   count: number;
@@ -642,11 +746,12 @@ export interface ScanStatus {
   /** Start time of the latest scan, for conditional catalog reads. */
   lastScanStartedMs: number | null;
   lastError: string | null;
+  queued: QueuedScan | null;
 }
 export interface ScanService {
   /** Foreground scan. Concurrent callers await the same result. */
-  run(scope?: ScanScope): Promise<ScanCounts>;
-  request(scope?: ScanScope): Promise<void>;
+  run(scope?: ScanRequest): Promise<ScanCounts>;
+  request(scope?: ScanRequest): Promise<void>;
   problems(
     libraryId?: string,
   ): Promise<{ problems: ScanProblem[]; truncated: boolean }>;
@@ -660,7 +765,13 @@ export interface ScanService {
 export function createScan(
   store: Store,
   media?: Media,
-  opts?: { notify?: Notify; log?: Log; lyrics?: Lyrics; state?: State },
+  opts?: {
+    notify?: Notify;
+    log?: Log;
+    lyrics?: Lyrics;
+    state?: State;
+    tagReader?: () => TagReader;
+  },
 ): ScanService {
   const log = opts?.log ?? scopedLog('scan');
   const state = opts?.state ?? createState(store);
@@ -671,56 +782,124 @@ export function createScan(
     minimum: 1,
     maximum: 1000,
   });
+  state.declare('scan.progressIntervalMs', {
+    type: 'integer',
+    default: 1000,
+    minimum: 1000,
+    maximum: 2147483647,
+  });
   let pending: Promise<ScanCounts> | null = null;
   let count = 0;
   let lastScanMs: number | null = null;
   let lastScanStartedMs: number | null = null;
   let lastError: string | null = null;
-  let rerun = false;
-  const run = (scope: ScanScope = {}): Promise<ScanCounts> => {
+  let queued: QueuedScan | null = null;
+  let progress: ScanProgress | null = null;
+  let active = false;
+  const enqueue = (request: QueuedScan) => {
+    queued = queued
+      ? {
+        mode: queued.mode === 'full' || request.mode === 'full'
+          ? 'full'
+          : 'quick',
+        scope: mergeScanScopes(queued.scope, request.scope),
+      }
+      : request;
+  };
+  const launch = (initial: QueuedScan): Promise<ScanCounts> => {
     if (pending !== null) return pending;
-    lastScanStartedMs = Date.now();
-    lastError = null;
-    pending = (async () => {
+    pending = Promise.resolve().then(async () => {
+      let request = initial;
+      let counts: ScanCounts | undefined;
       for (;;) {
-        rerun = false;
+        lastScanStartedMs = Date.now();
+        lastError = null;
+        active = true;
+        progress = {
+          phase: 'walking',
+          ...request,
+          librariesDone: 0,
+          librariesTotal: 0,
+          filesSeen: 0,
+          filesRead: 0,
+          problems: 0,
+          startedAt: new Date(lastScanStartedMs).toISOString(),
+          elapsedMs: 0,
+        };
+        opts?.notify?.emit(['scan']);
+        opts?.notify?.emit(['update']);
+        let timer: ReturnType<typeof setInterval> | undefined;
+        let failure: unknown;
         try {
-          const counts = await scanLibrary(store, media, log, opts?.lyrics, {
+          const interval = await state.getTyped(
+            'scan.progressIntervalMs',
+          ) as number;
+          timer = setInterval(() => opts?.notify?.emit(['scan']), interval);
+          counts = await scanLibrary(store, media, log, opts?.lyrics, {
             state,
-            scope,
+            tagReader: opts?.tagReader?.(),
+            selection: request.scope,
+            mode: request.mode,
+            startedAt: progress.startedAt,
+            progress: (value) => {
+              progress = value;
+            },
             notify: opts?.notify,
           });
           count = counts.files;
           lastScanMs = Date.now();
           // Core emits after successful completion; hats just consume the event.
           opts?.notify?.emit(['database']);
-          if (!rerun) return counts;
-          scope = {};
         } catch (error) {
           // A source changed during I/O: the store refused the stale catalog.
-          // Re-walk the current source list without publishing removed paths.
-          if (!(error instanceof LibrarySourcesChanged) && !rerun) throw error;
-          scope = {};
+          if (error instanceof LibrarySourcesChanged) {
+            enqueue({ mode: request.mode, scope: {} });
+          } else {
+            lastError = error instanceof Error ? error.message : String(error);
+            failure = error;
+          }
+        } finally {
+          clearInterval(timer);
+          active = false;
+          if (progress) progress.elapsedMs = Date.now() - lastScanStartedMs!;
+          opts?.notify?.emit(['scan']);
+          opts?.notify?.emit(['update']);
         }
+        if (queued === null) {
+          if (failure) throw failure;
+          return counts!;
+        }
+        if (failure) log.event('scan_failed', { error: failure });
+        request = queued;
+        queued = null;
       }
-    })().catch((error) => {
-      lastError = error instanceof Error ? error.message : String(error);
-      throw error;
     }).finally(() => {
       pending = null;
-      opts?.notify?.emit(['scan']);
     });
-    opts?.notify?.emit(['scan']);
     return pending;
+  };
+  const run = (input: ScanRequest = {}): Promise<ScanCounts> => {
+    if (pending !== null) return pending;
+    const { mode = 'full', ...scope } = input;
+    // Foreground callers retain their single-flight/full default contract.
+    return launch({ scope, mode });
   };
   return {
     run,
-    async request(scope = {}) {
+    async request(input = {}) {
+      const { mode = 'quick', ...scope } = input;
+      if (mode !== 'quick' && mode !== 'full') {
+        throw new LibraryError('invalid_field', 'Invalid scan mode');
+      }
       const validated = await validateScanScope(
         scope,
         await store.catalog.listLibraries(),
       );
-      void run(validated).catch((error) => log.event('scan_failed', { error }));
+      const request = { scope: validated, mode };
+      if (pending !== null) enqueue(request);
+      else {void launch(request).catch((error) =>
+          log.event('scan_failed', { error })
+        );}
     },
     async problems(libraryId) {
       if (
@@ -737,17 +916,24 @@ export function createScan(
     async status() {
       const folderCount = await store.catalog.libraryCount();
       return {
-        scanning: pending !== null,
+        ...structuredClone(progress ?? {}),
+        ...(active && progress
+          ? { elapsedMs: Date.now() - Date.parse(progress.startedAt) }
+          : {}),
+        scanning: active,
         count,
         folderCount,
         lastScanMs,
         lastScanStartedMs,
         lastError,
+        queued: structuredClone(queued),
       };
     },
     async start(options = {}) {
       if (options.ifRunning && pending === null) return;
-      if (options.afterCurrent && pending !== null) rerun = true;
+      if (options.afterCurrent && pending !== null) {
+        enqueue({ mode: 'full', scope: {} });
+      }
       try {
         await run();
       } catch (error) {

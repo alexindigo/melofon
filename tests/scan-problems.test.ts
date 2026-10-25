@@ -263,7 +263,7 @@ Deno.test('file read failures after tags preserve the old song and continue inde
     await f.rest('star', { id: song.id });
     await f.write('A', 'one/b.mp3', 'Sibling');
     fail = true;
-    await f.scan();
+    await f.scan({ mode: 'full' });
     assertEquals(
       (await f.songs()).map((s: { title: string }) => s.title).sort(),
       ['Kept', 'Sibling'],

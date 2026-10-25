@@ -29,10 +29,11 @@ export async function apiFixture(
     allLayers?: boolean;
     status?: Logger;
     traceRequests?: boolean;
+    storeDir?: string;
   } = {},
 ) {
   const notify = createNotify();
-  const f = await authFixture(notify);
+  const f = await authFixture(notify, options.storeDir);
   const peers: string[] = [];
   let hats: Hats | undefined;
   let listens: ListenManager | undefined;

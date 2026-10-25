@@ -207,11 +207,12 @@ Deno.test('API libraries: canonical paths, every validation code and atomic disj
         code,
       );
     }
-    assertEquals(
+    const { stats, ...unchanged } =
       (await (await f.get(`${base}/libraries/${a.id}`, f.credential)).json())
-        .library,
-      a,
-    );
+        .library;
+    assertEquals(unchanged, a);
+    assertEquals(stats.songs, 0);
+    assertEquals(stats.lastScanMode, 'full');
     await Deno.symlink(a.path, `${f.root}/alias`);
     for (
       const [path, code] of [
@@ -535,6 +536,7 @@ Deno.test('API scans: status preserves fields, failures end with lastError and a
       lastScanMs: null,
       lastScanStartedMs: null,
       lastError: null,
+      queued: null,
     });
     await cp('tests/fixtures/library', `${f.root}/music`, { recursive: true });
     f.fail(true);

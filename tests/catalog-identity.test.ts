@@ -403,11 +403,12 @@ Deno.test('identity: concurrent run and start share one scan and its completion'
     assertEquals(a, b);
     assertEquals(t.calls(), 1);
     assertEquals(completions, 1);
-    assertEquals(scanTransitions, 2);
+    assert(scanTransitions >= 2); // Start/end plus any throttled progress.
     assertEquals((await scan.status()).scanning, false);
+    const previousTransitions = scanTransitions;
     await scan.run();
     assertEquals(completions, 2);
-    assertEquals(scanTransitions, 4);
+    assert(scanTransitions >= previousTransitions + 2);
   } finally {
     await t.close();
   }

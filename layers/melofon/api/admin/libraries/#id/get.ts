@@ -5,5 +5,10 @@ export default async function (request: HatRequest, context: HatContext) {
     row.id === request.params.id
   );
   if (!library) fail(404, 'not_found', 'Library not found');
-  return { library };
+  return {
+    library: {
+      ...library,
+      stats: await context.app.libraries.stats(library.id),
+    },
+  };
 }

@@ -9,9 +9,15 @@ import { createListens } from '../../src/listens.ts';
 import { createLogger } from '../../src/logging.ts';
 import { freePort } from './api-status.ts';
 import { createMedia } from '../../src/media.ts';
+import { createTagReader } from '../../src/scan-tags.ts';
 
 export async function scanFixture(
-  options: { beforeDescribe?: (path: string) => Promise<void> } = {},
+  options: {
+    beforeDescribe?: (path: string) => Promise<void>;
+    onTags?: (path: string) => void;
+    beforeTags?: (path: string) => Promise<void>;
+    storeDir?: string;
+  } = {},
 ) {
   const root = await Deno.makeTempDir({ prefix: 'melofon-scopes-' });
   const logger = createLogger({ sinks: { stdout() {}, stderr() {} } });
@@ -22,6 +28,7 @@ export async function scanFixture(
       env: { MELOFON_LISTEN_owntone: `${freePort()},${freePort()}` },
     },
     status: logger,
+    storeDir: options.storeDir,
     services(f) {
       const media = createMedia();
       return Promise.resolve({
@@ -34,6 +41,19 @@ export async function scanFixture(
         }, {
           state: f.state,
           notify: f.notify,
+          tagReader: () => {
+            const reader = createTagReader(f.state);
+            return {
+              async read(path) {
+                options.onTags?.(path);
+                await options.beforeTags?.(path);
+                return reader.read(path);
+              },
+              [Symbol.dispose]() {
+                reader[Symbol.dispose]();
+              },
+            };
+          },
         }),
         libraries: createLibraries(f.store, { notify: f.notify }),
         library: createLibrary(f.store),

@@ -318,11 +318,16 @@ export function createLyrics(
     default: 10,
   });
   const maxBytes = async () => Number(await state.getTyped('lyrics.maxBytes'));
-  const sources = async (path: string): Promise<LyricsSource[]> => {
+  const sources = async (
+    path: string,
+    cachedEmbedded?: LyricsSource[],
+  ): Promise<LyricsSource[]> => {
     const limit = await maxBytes();
-    let embedded: LyricsSource[] = [];
+    let embedded: LyricsSource[] = cachedEmbedded ?? [];
     try {
-      embedded = embeddedLyrics(await lyricsMetadata(path, limit));
+      if (cachedEmbedded === undefined) {
+        embedded = embeddedLyrics(await lyricsMetadata(path, limit));
+      }
     } catch { /* Unreadable/oversized tag is missing. */ }
     const sides: LyricsSource[] = [];
     for (const sidecar of await lyricsSidecars(path).catch(() => [])) {
