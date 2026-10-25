@@ -19,38 +19,50 @@ export function createSignInLimiter(
     minimum: 1,
     default: 3600,
   });
-  const entries = new Map<
-    string,
-    {
-      failures: number;
-      wait: number;
-      until: number;
-      lastFailure: number;
-      windowSeconds: number;
-    }
-  >();
+  type Entry = {
+    failures: number;
+    wait: number;
+    until: number;
+    lastFailure: number;
+    windowSeconds: number;
+  };
+  const entries = new Map<string, Entry>();
+  let nextSweep = -Infinity;
   const keyOf = (username: string, address: string) =>
     JSON.stringify([username.toLowerCase(), address]);
+  function expired(entry: Entry, time: number) {
+    // Keep history for one idle window after the last failure or lockout end,
+    // whichever is later. The window records the current wait (initial before
+    // the first lockout), so attempts just after a lockout retain their backoff.
+    return entry.until <= time &&
+      Math.max(entry.lastFailure, entry.until) + entry.windowSeconds * 1000 <=
+        time;
+  }
   function sweep(time: number) {
+    if (time < nextSweep) return;
+    // Lazy housekeeping at most once a second, independent of attempt volume.
+    nextSweep = time + 1000;
     for (const [key, entry] of entries) {
-      // Keep history for one idle window after the last failure or lockout end,
-      // whichever is later. The window records the current wait (initial before
-      // the first lockout), so attempts just after a lockout retain their backoff.
-      if (
-        entry.until <= time &&
-        Math.max(entry.lastFailure, entry.until) + entry.windowSeconds * 1000 <=
-          time
-      ) entries.delete(key);
+      if (expired(entry, time)) entries.delete(key);
     }
+  }
+  function getEntry(key: string, time: number) {
+    sweep(time);
+    const entry = entries.get(key);
+    if (entry && expired(entry, time)) {
+      entries.delete(key);
+      return undefined;
+    }
+    return entry;
   }
   return {
     remaining(username: string, address: string) {
       const time = now();
-      sweep(time);
       return Math.max(
         0,
         Math.ceil(
-          ((entries.get(keyOf(username, address))?.until ?? 0) - time) / 1000,
+          ((getEntry(keyOf(username, address), time)?.until ?? 0) - time) /
+            1000,
         ),
       );
     },
@@ -59,9 +71,8 @@ export function createSignInLimiter(
       const initial = Number(await state.getTyped('auth.signInWaitSeconds'));
       const max = Number(await state.getTyped('auth.signInWaitMaxSeconds'));
       const time = now();
-      sweep(time);
       const key = keyOf(username, address);
-      const entry = entries.get(key) ?? {
+      const entry = getEntry(key, time) ?? {
         failures: 0,
         wait: 0,
         until: 0,
