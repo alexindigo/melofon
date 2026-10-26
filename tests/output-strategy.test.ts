@@ -123,7 +123,8 @@ Deno.test('strategies: native API, new-ID default, saved-cache gap and reopen pr
       }),
     );
   try {
-    assertEquals(await s.state.get(KEY), 'melofon');
+    assertEquals(await s.state.get(KEY), null);
+    assertEquals(await s.state.getTyped(KEY), 'melofon');
     s.outputs.register(registration('1'), source);
     let result = await jsonPut('http://x/outputs/1', {
       connectionStrategy: 'audiostation',
@@ -238,9 +239,9 @@ Deno.test('strategies: late initial default read cannot undo a newer live write'
   let reading = false;
   const state = {
     declare() {},
-    getTyped: () => Promise.resolve(undefined),
+    get: () => Promise.resolve(null),
     getWithRevision: () => Promise.resolve({ value: null, revision: 0 }),
-    get: () => {
+    getTyped: () => {
       reading = true;
       return new Promise<string>((resolve) => release = resolve);
     },
@@ -272,9 +273,9 @@ Deno.test('strategies: failed or invalid initial read never assigns an irreversi
   for (const value of ['corrupt', null]) {
     const state = {
       declare() {},
-      getTyped: () => Promise.resolve(undefined),
+      get: () => Promise.resolve(null),
       getWithRevision: () => Promise.resolve({ value: null, revision: 0 }),
-      get: () =>
+      getTyped: () =>
         value === null
           ? Promise.reject(new Error('read failed'))
           : Promise.resolve(value),

@@ -635,12 +635,8 @@ export function createOutputs(
       const before = defaultRevision;
       let readRevision: number | undefined;
       try {
-        await state.seedIfUnset(
-          CONNECTION_STRATEGY_DEFAULT_KEY,
-          DEFAULT_CONNECTION_STRATEGY,
-        );
         readRevision = defaultRevision;
-        const value = await state.get(CONNECTION_STRATEGY_DEFAULT_KEY);
+        const value = await state.getTyped(CONNECTION_STRATEGY_DEFAULT_KEY);
         if (defaultRevision === readRevision) {defaultStrategy =
             requireConnectionStrategy(value);}
         initialized = true;
