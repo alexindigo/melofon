@@ -93,11 +93,6 @@ export default async (request: HatRequest, context: HatContext) => {
   if (playbackFromPosition === null) return badRequest();
   const shuffleParam = request.query.get('shuffle');
 
-  const base = context.app.playback.queueView().items.length;
-  const startPos = Math.min(
-    position ?? (boolParam(request.query.get('clear')) ? 0 : base),
-    base,
-  );
   const added = context.app.playback.queueAdd(songs, {
     position,
     playbackFromPosition,
@@ -106,15 +101,19 @@ export default async (request: HatRequest, context: HatContext) => {
     shuffle: shuffleParam === null ? undefined : boolParam(shuffleParam),
   }, sourceFrom(request));
 
+  const queue = context.app.playback.queueView();
+  const positions = new Map(
+    queue.items.map((entry, position) => [entry.id, position]),
+  );
   const albumArtist = albumArtistResolver(context.app);
   return {
-    version: context.app.playback.queueView().version,
+    version: queue.version,
     count: added.length,
     items: await Promise.all(
-      added.map(async (entry, i) =>
+      added.map(async (entry) =>
         queueItemPayload(
           entry,
-          startPos + i,
+          positions.get(entry.id)!,
           await albumArtist(entry.song.albumId),
         )
       ),

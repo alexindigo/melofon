@@ -87,6 +87,76 @@ const get = (app: (r: Request) => Promise<Response>, path: string) =>
 const post = (app: (r: Request) => Promise<Response>, path: string) =>
   app(new Request(`http://x${path}`, { method: 'POST' }));
 
+for (const position of [undefined, 3, 10, 25]) {
+  Deno.test(`add reply matches queue entries at position ${position ?? 'omitted'} with clear/shuffle/playback`, async () => {
+    const { app, close } = await setup();
+    const server = Deno.serve(
+      { hostname: '0.0.0.0', port: 0, onListen() {} },
+      app,
+    );
+    const base = `http://melofon.home:${server.addr.port}`;
+    const json = async (path: string, method = 'GET') => {
+      const response = await fetch(`${base}${path}`, { method });
+      assertEquals(response.status, 200);
+      return await response.json();
+    };
+    try {
+      const library = await json('/api/library/albums');
+      const tracks = await json(
+        `/api/library/albums/${library.items[0].id}/tracks`,
+      );
+      const uri = `library:track:${tracks.items[0].id}`;
+      // Repeated songs require matching queue entry ids, not library track ids.
+      const seed = Array(10).fill(uri).join(',');
+      for (const clear of [false, true]) {
+        for (const shuffle of [undefined, false, true]) {
+          for (const play of [false, true]) {
+            await json(`/api/queue/items/add?uris=${seed}&clear=true`, 'POST');
+            const before = await json('/api/queue');
+            assertEquals(before.count, 10);
+            const query = new URLSearchParams({
+              uris: `${uri},${uri}`,
+              clear: String(clear),
+            });
+            if (position !== undefined) query.set('position', String(position));
+            if (shuffle !== undefined) query.set('shuffle', String(shuffle));
+            if (play) query.set('playback', 'start');
+            const added = await json(`/api/queue/items/add?${query}`, 'POST');
+            const queue = await json('/api/queue');
+            assertEquals(added.version, queue.version);
+            assertEquals(added.version, before.version + (clear ? 2 : 1));
+            assertEquals(added.count, 2);
+            assertEquals(queue.count, clear ? 2 : 12);
+            const start = clear ? 0 : Math.min(position ?? 10, 10);
+            assertEquals(
+              added.items.map((item: { position: number }) => item.position),
+              [start, start + 1],
+            );
+            assertEquals(
+              new Set(added.items.map((item: { id: number }) => item.id)).size,
+              2,
+            );
+            for (const item of added.items) {
+              const index = queue.items.findIndex((entry: { id: number }) =>
+                entry.id === item.id
+              );
+              assert(index >= 0);
+              assertEquals(item.position, index);
+              assertEquals(item, queue.items[index]);
+            }
+            if (play) {
+              assertEquals((await json('/api/player')).state, 'play');
+            }
+          }
+        }
+      }
+    } finally {
+      await server.shutdown();
+      await close();
+    }
+  });
+}
+
 async function albums(app: (r: Request) => Promise<Response>) {
   return await (await get(app, '/api/library/albums')).json();
 }
