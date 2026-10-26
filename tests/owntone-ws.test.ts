@@ -21,7 +21,7 @@ import { createState } from '../src/state.ts';
 const HOOK = 3689;
 const DEFAULT_PORT = 4534;
 
-async function setup(env: Record<string, string> = {}) {
+async function setup(env: Record<string, string> = {}, hostname = '127.0.0.1') {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-otws-' });
   const store = await openStore(dir);
   const db = store;
@@ -59,11 +59,12 @@ async function setup(env: Record<string, string> = {}) {
     env,
   });
   const server = Deno.serve(
-    { port: 0, hostname: '127.0.0.1' },
+    { port: 0, hostname },
     (req, info) => app(req, info),
   );
   const port = server.addr.port;
   return {
+    notify,
     base: `http://127.0.0.1:${port}`,
     wsBase: `ws://127.0.0.1:${port}`,
     close: async () => {
@@ -139,6 +140,58 @@ Deno.test('config websocket_port follows the 3688 claim and its REPLACE_ remap',
     assertEquals((await res.json()).websocket_port, 4001);
   } finally {
     await remapped.close();
+  }
+});
+
+Deno.test('notify websocket: requested admin/private audiences never reach the unauthenticated client', async () => {
+  const f = await setup({}, '0.0.0.0');
+  const { notify, close } = f;
+  const base = f.base.replace('127.0.0.1', 'melofon.home');
+  const wsBase = f.wsBase.replace('127.0.0.1', 'melofon.home');
+  const ws = new WebSocket(`${wsBase}/`, ['notify']);
+  const frames: string[][] = [];
+  try {
+    ws.onmessage = (event) =>
+      frames.push(JSON.parse(String(event.data)).notify);
+    await waitFor(() => ws.readyState === WebSocket.OPEN);
+    ws.send(
+      JSON.stringify({
+        notify: [
+          'player',
+          'users',
+          'settings',
+          'me',
+          'sessions',
+          'preferences',
+        ],
+      }),
+    );
+    // Establish that the filter has landed with a real playback command.
+    for (let i = 0; frames.length === 0; i++) {
+      assert(i < 30, 'subscription did not land');
+      const response = await fetch(`${base}/api/player/pause`, {
+        method: 'PUT',
+      });
+      assertEquals(response.status, 204);
+      await response.body?.cancel();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    frames.length = 0;
+    notify.emit(['users', 'settings', 'player'], undefined, 'admins');
+    notify.emit(['me', 'sessions', 'preferences', 'player'], undefined, {
+      userId: 'alice',
+    });
+    const response = await fetch(`${base}/api/player/play`, { method: 'PUT' });
+    assertEquals(response.status, 204);
+    await response.body?.cancel();
+    await waitFor(() => frames.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assertEquals(frames, [['player']]);
+  } finally {
+    ws.close();
+    await waitFor(() => ws.readyState === WebSocket.CLOSED);
+    await close();
   }
 });
 

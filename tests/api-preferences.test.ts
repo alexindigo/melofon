@@ -503,6 +503,7 @@ Deno.test('API preferences: real cookie/Bearer device sockets refetch private ch
       type: 'changed',
       events: { preferences: ['viewMode'] },
     });
+    // @ts-expect-error The required audience is also enforced at type-check time.
     f.notify.emit(['preferences'], { preferences: ['unscoped-must-not-leak'] });
     await failure(
       await change(f, a.credential, { theme: 'light' }, { theme: 0 }),

@@ -1,5 +1,11 @@
 import { assert, assertEquals } from '@std/assert';
 import { apiFixture, error } from './helpers/api.ts';
+import { createLibraries } from '../src/libraries.ts';
+import { scanLibrary } from '../src/scan.ts';
+import { createLibrary } from '../src/library.ts';
+import { createNowPlaying } from '../src/nowplaying.ts';
+import { createOutputs, createPlayer, type Outputs } from '../src/player.ts';
+import { createPlayback, type Playback } from '../src/playback.ts';
 
 type Fixture = Awaited<ReturnType<typeof apiFixture>>;
 interface Frame {
@@ -108,7 +114,11 @@ Deno.test('events: cookie/Bearer hello, forced mount, no replay and stable proce
       const socket = connect(f, credential, path, origin);
       sockets.push(socket);
       assertEquals((await socket.hello()).bootId, f.notify!.bootId);
-      f.notify!.emit(['settings'], { settings: ['only-key-no-value'] });
+      f.notify!.emit(
+        ['settings'],
+        { settings: ['only-key-no-value'] },
+        'admins',
+      );
       await waitFor(() => socket.frames.length > 0);
       assertEquals(socket.frames.shift(), {
         type: 'changed',
@@ -116,7 +126,7 @@ Deno.test('events: cookie/Bearer hello, forced mount, no replay and stable proce
       });
       await socket.close();
     }
-    f.notify!.emit(['settings'], { settings: ['not-replayed'] });
+    f.notify!.emit(['settings'], { settings: ['not-replayed'] }, 'admins');
     const reconnect = connect(f, cookie.credential);
     sockets.push(reconnect);
     await reconnect.hello();
@@ -184,7 +194,7 @@ Deno.test('events: authentication and Origin reject before 101; plain authentica
   }
 });
 
-Deno.test('events: current admin role, per-user profile/session audience and no player vocabulary', async () => {
+Deno.test('events: current admin role, per-user profile/session audience and household events', async () => {
   const f = await apiFixture();
   const sockets: ReturnType<typeof connect>[] = [];
   try {
@@ -238,28 +248,211 @@ Deno.test('events: current admin role, per-user profile/session audience and no 
     );
     await f.auth.users.setRole(f.admin.id, otherAdmin.id, 'user');
     await sleep(80);
-    sd.frames.length = 0;
+    assertEquals(sb.frames, []); // Neither Alice's private ids nor admin changes.
+    assertEquals(sa.frames, []); // No other user's profile/session ids.
+    for (const socket of [sc, sd]) {
+      assert(
+        !socket.frames.some((frame) =>
+          frame.events?.me?.includes(a.id) ||
+          frame.events?.sessions?.includes(device.body.session.id)
+        ),
+      );
+    }
+    for (const socket of sockets) socket.frames.length = 0;
     f.notify!.emit(['hats', 'settings', 'libraries', 'scan', 'users'], {
       users: ['admin-only'],
-    });
-    f.notify!.emit(['player', 'queue', 'outputs']);
+    }, 'admins');
+    f.notify!.emit(['player', 'queue', 'outputs'], undefined, 'all');
     // Unscoped private events must fail closed, even for admins.
+    // @ts-expect-error A producer cannot omit the required audience.
     f.notify!.emit(['me', 'sessions'], {
       me: ['private'],
       sessions: ['private'],
     });
     await sleep(120);
-    assertEquals(sb.frames, []);
-    assertEquals(sd.frames, []);
-    assertEquals(sa.frames, []);
-    assert(
-      !sc.frames.some((frame) =>
-        Object.keys(frame.events ?? {}).some((name) =>
-          ['me', 'sessions', 'player', 'queue', 'outputs'].includes(name)
-        )
-      ),
-    );
+    for (const socket of [sa, sb, sd]) {
+      assertEquals(socket.frames, [{
+        type: 'changed',
+        events: { player: [], queue: [], outputs: [] },
+      }]);
+    }
+    assertEquals(sc.frames, [{
+      type: 'changed',
+      events: {
+        player: [],
+        queue: [],
+        outputs: [],
+        hats: [],
+        settings: [],
+        libraries: [],
+        scan: [],
+        users: ['admin-only'],
+      },
+    }]);
   } finally {
+    for (const socket of sockets) await socket.close();
+    await f.close();
+  }
+});
+
+Deno.test('events: household queue, player and speaker changes reach cookie/Bearer members and admins', async () => {
+  let playback!: Playback;
+  let outputs!: Outputs;
+  const f = await apiFixture({
+    services: async (f) => {
+      const libraries = createLibraries(f.store);
+      await libraries.add(
+        'Music',
+        await Deno.realPath('tests/fixtures/library'),
+      );
+      await scanLibrary(f.store);
+      const library = createLibrary(f.store);
+      playback = createPlayback({
+        player: createPlayer(),
+        nowPlaying: createNowPlaying(f.store),
+        library,
+        cfg: f.cfg,
+        notify: f.notify,
+      });
+      outputs = createOutputs({ notify: f.notify });
+      return { libraries, library, playback, outputs };
+    },
+  });
+  const sockets: ReturnType<typeof connect>[] = [];
+  try {
+    const admin = await f.login('bearer');
+    const a = await member(f, 'listener');
+    const cookie = await f.login('cookie', 'listener', 'password-member');
+    for (
+      const credential of [admin.credential, a.credential, cookie.credential]
+    ) {
+      const socket = connect(f, credential);
+      sockets.push(socket);
+      await socket.hello();
+    }
+    const songs = await createLibrary(f.store).listSongs({
+      size: 1,
+      offset: 0,
+    });
+    assertEquals(songs.length, 1);
+    playback.queueAdd(songs, { play: true });
+    assertEquals(playback.queueView().items[0].song.id, songs[0].id);
+    assertEquals(playback.playerView().state, 'play');
+    for (const socket of sockets) {
+      await waitFor(() => socket.frames.some((frame) => frame.events?.queue));
+      assertEquals(socket.frames.shift(), {
+        type: 'changed',
+        events: { queue: [], player: [] },
+      });
+    }
+    outputs.register({
+      id: 'speaker',
+      name: 'Household',
+      type: 'AirPlay',
+      selected: true,
+      volume: 100,
+    });
+    outputs.update('speaker', { volume: 42 });
+    assertEquals(outputs.get('speaker')?.volume, 42);
+    for (const socket of sockets) {
+      await waitFor(() => socket.frames.some((frame) => frame.events?.outputs));
+      assertEquals(socket.frames.shift(), {
+        type: 'changed',
+        events: { outputs: [], volume: [] },
+      });
+    }
+  } finally {
+    for (const socket of sockets) await socket.close();
+    playback?.close();
+    await f.close();
+  }
+});
+
+Deno.test('events: core audience overrides names and same-name ids stay separate during send-time demotion', async () => {
+  let hold: Promise<void> | undefined;
+  let waiting = 0;
+  const f = await apiFixture({
+    services: (f) =>
+      Promise.resolve({
+        sessions: {
+          ...f.auth.sessions,
+          async authenticate(
+            ...args: Parameters<typeof f.auth.sessions.authenticate>
+          ) {
+            if (args[1]?.touch === false && hold) {
+              waiting++;
+              await hold;
+            }
+            return f.auth.sessions.authenticate(...args);
+          },
+        },
+      }),
+  });
+  const sockets: ReturnType<typeof connect>[] = [];
+  let release = () => {};
+  try {
+    const admin = await f.login('bearer');
+    const a = await member(f, 'demoted-listener', 'admin');
+    const b = await member(f, 'ordinary-listener');
+    const sa = connect(f, a.credential), sb = connect(f, b.credential);
+    sockets.push(sa, sb);
+    for (const socket of sockets) await socket.hello();
+    hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    f.notify.emit(['player'], { player: ['admin-only'] }, 'admins');
+    await waitFor(() => waiting === 2);
+    f.notify.emit(['player'], { player: ['public'] }, 'all');
+    f.notify.emit(['database'], { database: ['private-a'] }, { userId: a.id });
+    f.notify.emit(['database'], { database: ['private-b'] }, { userId: b.id });
+    // The name cannot add a restriction that core did not mark.
+    f.notify.emit(['settings'], { settings: ['public-setting'] }, 'all');
+    const demoted = await f.json(`/api/v1/admin/users/${a.id}`, 'PATCH', {
+      role: 'user',
+    }, admin.credential);
+    assertEquals(demoted.status, 200);
+    await demoted.body?.cancel();
+    hold = undefined;
+    release();
+    for (const socket of sockets) await waitFor(() => socket.frames.length > 0);
+    assertEquals(sa.frames.shift(), {
+      type: 'changed',
+      events: {
+        player: ['public'],
+        database: ['private-a'],
+        settings: ['public-setting'],
+        me: [a.id],
+      },
+    });
+    assertEquals(sb.frames.shift(), {
+      type: 'changed',
+      events: {
+        player: ['public'],
+        database: ['private-b'],
+        settings: ['public-setting'],
+      },
+    });
+    // With an admin still signed in, the two authorized buckets merge ids.
+    const sc = connect(f, admin.credential);
+    sockets.push(sc);
+    await sc.hello();
+    f.notify.emit(['queue'], { queue: ['public', 'duplicate'] }, 'all');
+    f.notify.emit(['queue'], { queue: ['restricted', 'duplicate'] }, 'admins');
+    await waitFor(() => sc.frames.length > 0);
+    assertEquals(sc.frames.shift(), {
+      type: 'changed',
+      events: { queue: ['public', 'duplicate', 'restricted'] },
+    });
+    for (const socket of [sa, sb]) {
+      await waitFor(() => socket.frames.length > 0);
+      assertEquals(socket.frames.shift(), {
+        type: 'changed',
+        events: { queue: ['public', 'duplicate'] },
+      });
+    }
+  } finally {
+    hold = undefined;
+    release();
     for (const socket of sockets) await socket.close();
     await f.close();
   }
@@ -272,7 +465,11 @@ Deno.test('events: ten synchronous changes merge, duplicate ids deduplicate, >10
   try {
     await socket.hello();
     for (let i = 0; i < 10; i++) {
-      f.notify!.emit(['settings'], { settings: [`key-${i}`, 'duplicate'] });
+      f.notify!.emit(
+        ['settings'],
+        { settings: [`key-${i}`, 'duplicate'] },
+        'admins',
+      );
     }
     await waitFor(() => socket.frames.length > 0);
     await sleep(80);
@@ -288,11 +485,11 @@ Deno.test('events: ten synchronous changes merge, duplicate ids deduplicate, >10
     }]);
     socket.frames.length = 0;
     for (let i = 0; i < 101; i++) {
-      f.notify!.emit(['users'], { users: [`id-${i}`] });
+      f.notify!.emit(['users'], { users: [`id-${i}`] }, 'admins');
     }
-    f.notify!.emit(['libraries'], { libraries: ['narrow'] });
-    f.notify!.emit(['libraries']);
-    f.notify!.emit(['libraries'], { libraries: ['later'] });
+    f.notify!.emit(['libraries'], { libraries: ['narrow'] }, 'admins');
+    f.notify!.emit(['libraries'], undefined, 'admins');
+    f.notify!.emit(['libraries'], { libraries: ['later'] }, 'admins');
     await waitFor(() => socket.frames.length > 0);
     assertEquals(socket.frames.shift(), {
       type: 'changed',
@@ -422,10 +619,10 @@ Deno.test('events: one in-flight validation merges changes, rechecks a demotion 
     hold = new Promise<void>((resolve) => {
       release = resolve;
     });
-    f.notify.emit(['settings'], { settings: ['first'] });
+    f.notify.emit(['settings'], { settings: ['first'] }, 'admins');
     await waitFor(() => waiting > 0);
     for (let i = 0; i < 1000; i++) {
-      f.notify.emit(['settings'], { settings: [`key-${i}`] });
+      f.notify.emit(['settings'], { settings: [`key-${i}`] }, 'admins');
     }
     await f.auth.users.setRole(f.admin.id, other.id, 'user');
     assertEquals(waiting, 1);
@@ -529,7 +726,7 @@ Deno.test('events: closing the real socket unsubscribes both core listeners', as
     assertEquals([changes, endings], [1, 1]);
     await socket.close();
     await waitFor(() => changes === 0 && endings === 0);
-    f.notify.emit(['settings'], { settings: ['after-close'] });
+    f.notify.emit(['settings'], { settings: ['after-close'] }, 'admins');
     await f.auth.sessions.revoke(f.admin.id, login.body.session.id);
     assertEquals(socket.frames, []);
   } finally {

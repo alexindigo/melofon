@@ -1,8 +1,12 @@
 // tests/notify.test.ts — app.notify hub semantics and the player/outputs
 // emit map (OwnTone event names). No HTTP: the hub is in-process pub/sub;
 // the WS transport is the hat's (tests/owntone-ws.test.ts).
-import { assertEquals } from '@std/assert';
-import { createNotify, type Notify } from '../src/notify.ts';
+import { assertEquals, assertStrictEquals } from '@std/assert';
+import {
+  createNotify,
+  type Notify,
+  type NotifyAudience,
+} from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import type { SongRow } from '../src/library.ts';
@@ -57,19 +61,19 @@ Deno.test('hub: subscribe/emit, unsubscribe, unknown names dropped', () => {
   const unsubA = notify.subscribe((types) => a.push(types));
   notify.subscribe((types) => b.push(types));
 
-  notify.emit(['player', 'queue']);
+  notify.emit(['player', 'queue'], undefined, 'all');
   assertEquals(a, [['player', 'queue']]);
   assertEquals(b, [['player', 'queue']]);
 
   unsubA();
-  notify.emit(['volume']);
+  notify.emit(['volume'], undefined, 'all');
   assertEquals(a.length, 1);
   assertEquals(b, [['player', 'queue'], ['volume']]);
 
   // Unknown names are dropped at emit; nothing known → no call at all.
-  notify.emit(['bogus', 'queue']);
+  notify.emit(['bogus', 'queue'], undefined, 'all');
   assertEquals(b, [['player', 'queue'], ['volume'], ['queue']]);
-  notify.emit(['nonsense']);
+  notify.emit(['nonsense'], undefined, 'all');
   assertEquals(b.length, 3);
 });
 
@@ -80,8 +84,30 @@ Deno.test('hub: a throwing listener breaks neither the emitter nor others', () =
     throw new Error('closing socket');
   });
   notify.subscribe((types) => seen.push(types));
-  notify.emit(['player']);
+  notify.emit(['player'], undefined, 'all');
   assertEquals(seen, [['player']]);
+});
+
+Deno.test('hub: audiences and keys reach subscribers unchanged after a listener throws', () => {
+  const notify = createNotify();
+  const keys = { player: ['changed-id'] };
+  const audiences: NotifyAudience[] = ['all', 'admins', { userId: 'alice' }];
+  const seen: {
+    keys: Record<string, string[]> | undefined;
+    audience: NotifyAudience;
+  }[] = [];
+  notify.subscribe(() => {
+    throw new Error('broken listener');
+  });
+  notify.subscribe((_names, keys, audience) => seen.push({ keys, audience }));
+  for (const audience of audiences) notify.emit(['player'], keys, audience);
+  assertEquals(seen.length, audiences.length);
+  for (const [index, event] of seen.entries()) {
+    assertStrictEquals(event.keys, keys);
+    assertStrictEquals(event.audience, audiences[index]);
+  }
+  notify.emit(['queue'], undefined, 'all');
+  assertEquals(seen.at(-1), { keys: undefined, audience: 'all' });
 });
 
 Deno.test('playback commands emit: engine → player/options/volume/queue', () => {

@@ -605,7 +605,7 @@ export function createOutputs(
     default: DEFAULT_CONNECTION_STRATEGY,
     description: 'Connection strategy assigned to new AirPlay outputs',
   });
-  const emit = (types: string[]) => notify?.emit(types);
+  const emit = (types: string[]) => notify?.emit(types, undefined, 'all');
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;

@@ -148,7 +148,7 @@ export async function createLookupRunner(options: {
     new LookupHost(p, network, {
       log,
       onStateChange: () =>
-        options.notify?.emit(['plugins'], { plugins: [p.id] }),
+        options.notify?.emit(['plugins'], { plugins: [p.id] }, 'admins'),
     })
   );
   for (const plugin of plugins) {

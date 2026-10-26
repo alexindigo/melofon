@@ -57,8 +57,8 @@ export interface HatContext {
       subscribe(
         fn: (
           names: string[],
-          ids?: Record<string, string[]>,
-          audience?: { userId: string },
+          ids: Record<string, string[]> | undefined,
+          audience: 'all' | 'admins' | { userId: string },
         ) => void,
       ): () => void;
     };

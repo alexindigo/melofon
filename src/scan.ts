@@ -623,7 +623,11 @@ export async function scanLibrary(
     retainedIds: [...byId.keys()],
   });
   if (changedLibraries.length) {
-    options.notify?.emit(['libraries'], { libraries: changedLibraries });
+    options.notify?.emit(
+      ['libraries'],
+      { libraries: changedLibraries },
+      'admins',
+    );
   }
   // Catalog owns album/root eligibility. Hashes are already prepared outside its
   // exclusive slot; candidates own the separate atomic reconciliation.
@@ -826,15 +830,18 @@ export function createScan(
           startedAt: new Date(lastScanStartedMs).toISOString(),
           elapsedMs: 0,
         };
-        opts?.notify?.emit(['scan']);
-        opts?.notify?.emit(['update']);
+        opts?.notify?.emit(['scan'], undefined, 'admins');
+        opts?.notify?.emit(['update'], undefined, 'all');
         let timer: ReturnType<typeof setInterval> | undefined;
         let failure: unknown;
         try {
           const interval = await state.getTyped(
             'scan.progressIntervalMs',
           ) as number;
-          timer = setInterval(() => opts?.notify?.emit(['scan']), interval);
+          timer = setInterval(
+            () => opts?.notify?.emit(['scan'], undefined, 'admins'),
+            interval,
+          );
           counts = await scanLibrary(store, media, log, opts?.lyrics, {
             state,
             tagReader: opts?.tagReader?.(),
@@ -849,7 +856,7 @@ export function createScan(
           count = counts.files;
           lastScanMs = Date.now();
           // Core emits after successful completion; hats just consume the event.
-          opts?.notify?.emit(['database']);
+          opts?.notify?.emit(['database'], undefined, 'all');
         } catch (error) {
           // A source changed during I/O: the store refused the stale catalog.
           if (error instanceof LibrarySourcesChanged) {
@@ -862,8 +869,8 @@ export function createScan(
           clearInterval(timer);
           active = false;
           if (progress) progress.elapsedMs = Date.now() - lastScanStartedMs!;
-          opts?.notify?.emit(['scan']);
-          opts?.notify?.emit(['update']);
+          opts?.notify?.emit(['scan'], undefined, 'admins');
+          opts?.notify?.emit(['update'], undefined, 'all');
         }
         if (queued === null) {
           pending = null;

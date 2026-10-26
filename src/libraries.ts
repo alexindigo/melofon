@@ -131,7 +131,7 @@ export function createLibraries(store: Store, options: {
   };
   const changed = (operation: string, id: string, source: Provenance) => {
     log.event('libraries_changed', { operation, library: id, source });
-    options.notify?.emit(['libraries'], { libraries: [id] });
+    options.notify?.emit(['libraries'], { libraries: [id] }, 'admins');
   };
   return {
     list: store.catalog.listLibraries,

@@ -26,7 +26,7 @@ export function createUsers(store: Store, options: {
   const { cfg, verifier, sessions, state } = options;
   const now = options.now ?? Date.now;
   const changed = (id: string) => {
-    options.notify?.emit(['users'], { users: [id] });
+    options.notify?.emit(['users'], { users: [id] }, 'admins');
     options.notify?.emit(['me'], { me: [id] }, { userId: id });
   };
   state.declare('auth.passwordMinLength', {

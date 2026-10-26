@@ -57,7 +57,7 @@ export async function createHats(opts: {
     (await opts.store.hats.list()).map((row) => [row.name, row.active]),
   );
   const log = opts.log ?? scopedLog('hats');
-  const emit = () => opts.notify.emit(['hats']);
+  const emit = () => opts.notify.emit(['hats'], undefined, 'admins');
   let tail: Promise<unknown> = Promise.resolve();
   function serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = tail.then(fn);

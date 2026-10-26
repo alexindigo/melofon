@@ -129,7 +129,7 @@ export async function startServer(options: {
         }
         : null;
     },
-    changed: () => notify.emit(['outputs']),
+    changed: () => notify.emit(['outputs'], undefined, 'all'),
   });
   const airplay = createAirplayDevices({ outputs, admission: outputAdmission });
   const discovery = createAirplayDiscovery({
@@ -361,7 +361,11 @@ export async function startServer(options: {
   // reconciles (a resumed play spawns its session — audible without a client
   // action) and any connected hats pick up the restored state.
   if (restoredEngine) {
-    notify.emit(['player', 'queue', 'outputs', 'volume', 'options']);
+    notify.emit(
+      ['player', 'queue', 'outputs', 'volume', 'options'],
+      undefined,
+      'all',
+    );
   }
 
   const termination = createTermination({

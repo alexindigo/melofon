@@ -155,7 +155,11 @@ export function createState(
       emit(change.key, rows[index].writeOnly ? '' : value);
     }
     if (changes.length) {
-      notify?.emit(['settings'], { settings: changes.map((c) => c.key) });
+      notify?.emit(
+        ['settings'],
+        { settings: changes.map((c) => c.key) },
+        'admins',
+      );
     }
   };
 
@@ -309,7 +313,7 @@ export function createState(
         writeOnly: secret,
       });
       emit(key, secret ? '' : value);
-      notify?.emit(['settings'], { settings: [key] });
+      notify?.emit(['settings'], { settings: [key] }, 'admins');
     },
 
     async seedIfUnset(key, value) {
@@ -330,7 +334,7 @@ export function createState(
         )
       ) return false;
       emit(key, secret ? '' : value);
-      notify?.emit(['settings'], { settings: [key] });
+      notify?.emit(['settings'], { settings: [key] }, 'admins');
       return true;
     },
 

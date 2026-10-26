@@ -127,7 +127,7 @@ export function createPlayback(deps: {
 }): Playback {
   const { player, nowPlaying, library, cfg, notify, persistence } = deps;
   const log = deps.log ?? scopedLog('playback');
-  const emit = (types: string[]) => notify?.emit(types);
+  const emit = (types: string[]) => notify?.emit(types, undefined, 'all');
 
   // Provenance (plan command-provenance): every mutation is recorded and
   // logged with its source. Unsourced callers are internal drivers.

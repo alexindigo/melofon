@@ -7,7 +7,7 @@
 // Session: the client sends `{ "notify": ["player", …] }` to set its filter
 // (invalid JSON is ignored, like OwnTone's process_notify_request returning
 // -1 — logged there, dropped here, socket stays); each app.notify event
-// whose types intersect the filter goes out as `{ "notify": […] }`.
+// for everyone whose types intersect the filter goes out as `{ "notify": […] }`.
 import type { HatContext, HatRequest } from '#owntone/types.ts';
 
 export default (request: HatRequest, context: HatContext) => {
@@ -22,12 +22,15 @@ export default (request: HatRequest, context: HatContext) => {
   const upgrade = request.upgrade({ protocol: 'notify' });
   let filter: string[] = [];
   void upgrade.socket.then((ws) => {
-    const unsubscribe = context.app.notify.subscribe((types) => {
-      const overlap = types.filter((t) => filter.includes(t));
-      if (overlap.length > 0 && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ notify: overlap }));
-      }
-    });
+    const unsubscribe = context.app.notify.subscribe(
+      (types, _keys, audience) => {
+        if (audience !== 'all') return; // This socket has no signed-in user.
+        const overlap = types.filter((t) => filter.includes(t));
+        if (overlap.length > 0 && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ notify: overlap }));
+        }
+      },
+    );
     ws.onmessage = (ev) => {
       try {
         const data: unknown = JSON.parse(String(ev.data));

@@ -59,7 +59,13 @@ export interface HatContext {
     startedAt?: string;
     notify: {
       /** Listen for core change events (OwnTone names); returns unsubscribe. */
-      subscribe(fn: (types: string[]) => void): () => void;
+      subscribe(
+        fn: (
+          types: string[],
+          keys: Record<string, string[]> | undefined,
+          audience: 'all' | 'admins' | { userId: string },
+        ) => void,
+      ): () => void;
     };
     binds: {
       /** The actual bind of one of this hat's claimed ports (after env

@@ -3,15 +3,6 @@ import { sessionKey } from '#melofon/auth.ts';
 import { checkOrigin } from '#melofon/origin.ts';
 import { fail } from '#melofon/errors.ts';
 
-const ADMIN = new Set([
-  'hats',
-  'settings',
-  'libraries',
-  'scan',
-  'users',
-  'plugins',
-]);
-const PRIVATE = new Set(['me', 'sessions', 'preferences']);
 type Ids = string[] | '*';
 
 export default async function (request: HatRequest, context: HatContext) {
@@ -33,11 +24,16 @@ export default async function (request: HatRequest, context: HatContext) {
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let retry: ReturnType<typeof setTimeout> | undefined;
   const pending = new Map<string, Ids>();
+  // Keep restricted ids separate until the fresh send-time role check. A
+  // public and admin emit of the same name must not change each other's access.
+  const adminPending = new Map<string, Ids>();
+  const hasPending = () => pending.size > 0 || adminPending.size > 0;
   let unsubscribe = () => {};
   let unend = () => {};
   function cleanup() {
     closed = true;
     pending.clear();
+    adminPending.clear();
     clearInterval(heartbeat);
     clearTimeout(retry);
     unsubscribe();
@@ -72,8 +68,18 @@ export default async function (request: HatRequest, context: HatContext) {
       schedule();
     }, drainMs);
   }
+  function merge(target: Map<string, Ids>, name: string, incoming: Ids) {
+    const previous = target.get(name);
+    // [] invalidates the entire collection and dominates narrower changes.
+    if (previous === '*' || previous?.length === 0) return;
+    if (incoming === '*' || !incoming.length) target.set(name, incoming);
+    else {
+      const merged = [...new Set([...(previous ?? []), ...incoming])];
+      target.set(name, merged.length > maxIds ? '*' : merged);
+    }
+  }
   async function flush() {
-    if (closed || !socket || pending.size === 0) return;
+    if (closed || !socket || !hasPending()) return;
     // One bounded accumulator, not a queue of frames/promises. Keep merging
     // while output drains or the single fresh-auth read is in flight.
     if (socket.bufferedAmount > 0) {
@@ -84,11 +90,12 @@ export default async function (request: HatRequest, context: HatContext) {
     try {
       const auth = await current();
       if (!auth || socket.readyState !== WebSocket.OPEN) return;
-      const events: Record<string, Ids> = {};
-      for (const [name, ids] of pending) {
-        if (!ADMIN.has(name) || auth.user.role === 'admin') events[name] = ids;
+      if (auth.user.role === 'admin') {
+        for (const [name, ids] of adminPending) merge(pending, name, ids);
       }
+      const events = Object.fromEntries(pending);
       pending.clear();
+      adminPending.clear();
       if (Object.keys(events).length) {
         socket.send(JSON.stringify({ type: 'changed', events }));
       }
@@ -96,26 +103,20 @@ export default async function (request: HatRequest, context: HatContext) {
       signedOut();
     } finally {
       sending = false;
-      if (pending.size) schedule();
+      if (hasPending()) schedule();
     }
   }
   unsubscribe = notify.subscribe((names, ids, audience) => {
     if (closed) return;
+    if (
+      audience !== 'all' && audience !== 'admins' &&
+      audience?.userId !== user.id
+    ) return;
+    const target = audience === 'admins' ? adminPending : pending;
     for (const name of names) {
-      if (!ADMIN.has(name) && !PRIVATE.has(name)) continue;
-      if (PRIVATE.has(name) && audience?.userId !== user.id) continue;
-      if (audience && audience.userId !== user.id) continue;
-      const incoming = ids?.[name] ?? [];
-      const previous = pending.get(name);
-      // [] invalidates the entire collection and dominates narrower changes.
-      if (previous === '*' || previous?.length === 0) continue;
-      if (!incoming.length) pending.set(name, []);
-      else {
-        const merged = [...new Set([...(previous ?? []), ...incoming])];
-        pending.set(name, merged.length > maxIds ? '*' : merged);
-      }
+      merge(target, name, ids?.[name] ?? []);
     }
-    if (pending.size) schedule();
+    if (hasPending()) schedule();
   });
   unend = sessions.onSessionsEnded((event) => {
     if (event.sessionIds.includes(sessionId)) signedOut();

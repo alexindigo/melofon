@@ -86,7 +86,7 @@ Deno.test('OwnTone transport: native and forced paths on the 3688 facade carry s
         // exists in OwnTone's unchanged wire protocol.
         const deadline = Date.now() + 3000;
         while (!frames.length && Date.now() < deadline) {
-          notify.emit(['player']);
+          notify.emit(['player'], undefined, 'all');
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
         assertEquals(frames[0], { notify: ['player'] });

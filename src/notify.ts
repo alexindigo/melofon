@@ -1,21 +1,22 @@
-// Core change-event hub. Legacy OwnTone names remain compatible; native
-// names carry ids and, for private changes, an explicit user audience.
+// Core change-event hub. Every producer declares its audience; hats enforce
+// that marking without deriving access from event names.
 
 import { type Log, scopedLog } from './logging.ts';
+export type NotifyAudience = 'all' | 'admins' | { userId: string };
 export type NotifyFn = (
   types: string[],
-  keys?: Record<string, string[]>,
-  audience?: { userId: string },
+  keys: Record<string, string[]> | undefined,
+  audience: NotifyAudience,
 ) => void;
 
 export interface Notify {
   /** Adds a listener; returns the unsubscribe (sockets drop on close/error). */
   subscribe(fn: NotifyFn): () => void;
-  /** Synchronously notifies every listener of the (known) types. */
+  /** Synchronously notifies every listener of the (known) types and audience. */
   emit(
     types: string[],
-    keys?: Record<string, string[]>,
-    audience?: { userId: string },
+    keys: Record<string, string[]> | undefined,
+    audience: NotifyAudience,
   ): void;
 }
 
