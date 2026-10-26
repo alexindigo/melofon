@@ -36,6 +36,12 @@
       "default": 65536,
       "description": "Maximum JSON request body size in bytes"
     },
+    "melofon.queueJsonMaxBytes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 2097152,
+      "description": "Maximum saved-queue JSON request body size in bytes; the 2 MiB default fits 20,000 song ids"
+    },
     "melofon.cookieMaxAgeSeconds": {
       "type": "integer",
       "minimum": 1,

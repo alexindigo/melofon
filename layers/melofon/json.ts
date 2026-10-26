@@ -7,7 +7,11 @@ export default async function json(request: HatRequest, context: HatContext) {
     context.miss !== undefined ||
     !['POST', 'PUT', 'PATCH'].includes(request.method)
   ) return;
-  const max = Number(await context.app.state.getTyped('melofon.jsonMaxBytes'));
+  const max = Number(
+    await context.app.state.getTyped(
+      context.meta.jsonMaxBytesSetting ?? 'melofon.jsonMaxBytes',
+    ),
+  );
   const length = request.headers.get('content-length');
   if (length !== null && Number(length) > max) {
     fail(413, 'too_large', 'Request body is too large');

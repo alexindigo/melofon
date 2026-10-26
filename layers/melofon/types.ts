@@ -32,7 +32,17 @@ export interface Hat {
   settings: string[];
 }
 export interface HatContext {
+  meta: { jsonMaxBytesSetting?: string };
   app: {
+    clientQueue: {
+      get(username: string): Promise<SavedQueue | null>;
+      save(username: string, queue: {
+        trackIds: string[];
+        currentIndex?: number;
+        positionMs?: number;
+        changedBy?: string;
+      }): Promise<void>;
+    };
     plugins: {
       list(caller: string): Promise<{ plugins: Plugin[] }>;
       get(caller: string, id: string): Promise<PluginDetail>;
@@ -150,6 +160,14 @@ export interface HatContext {
     json: Record<string, unknown>;
   };
   miss?: unknown;
+}
+
+export interface SavedQueue {
+  trackIds: string[];
+  currentIndex: number;
+  positionMs: number;
+  changedAtMs: number;
+  changedBy: string | null;
 }
 
 export interface Setting {
