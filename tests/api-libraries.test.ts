@@ -317,6 +317,7 @@ Deno.test('API libraries: concurrent path edits scan the path changed by each co
   const hold = f.holdNextUpdate();
   let restoring: Promise<Response> | undefined;
   try {
+    await f.state.set('scan.progressIntervalMs', '60000');
     await Deno.mkdir(`${f.root}/original`);
     await Deno.mkdir(`${f.root}/other`);
     await Deno.copyFile(
@@ -529,6 +530,7 @@ Deno.test('API libraries: add indexes songs, path edit keeps ids, removal and re
 Deno.test('API scans: status preserves fields, failures end with lastError and a successful scan clears it', async () => {
   const f = await fixture();
   try {
+    await f.state.set('scan.progressIntervalMs', '60000');
     assertEquals(await f.status(), {
       scanning: false,
       count: 0,
