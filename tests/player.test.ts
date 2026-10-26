@@ -138,6 +138,38 @@ Deno.test('next/previous move and start playback; next past the end stops', () =
   assertEquals(player.status().state, 'stop');
 });
 
+Deno.test('repeat single: next moves to the following queue entry', () => {
+  const player = createPlayer();
+  const entries = player.queueAdd([song(), song()]);
+  player.setRepeat('single');
+  player.play();
+  assertEquals(player.status().current, entries[0]);
+
+  player.next();
+  const status = player.status();
+  assertEquals(status.state, 'play');
+  assertEquals(status.repeat, 'single');
+  assertEquals(status.current, entries[1]);
+  assertEquals(player.queue().items, entries);
+});
+
+Deno.test('repeat single: natural end replays even with a following queue entry', async () => {
+  const player = createPlayer();
+  const entries = player.queueAdd([song(1000), song()]);
+  player.setRepeat('single');
+  player.play();
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  assertEquals(player.status().itemProgressMs, 1000);
+
+  assertEquals(player.advanceEnded(), 'player');
+  const status = player.status();
+  assertEquals(status.state, 'play');
+  assertEquals(status.repeat, 'single');
+  assertEquals(status.current, entries[0]);
+  assert(status.itemProgressMs < 1000, 'replay resets the playback clock');
+  assertEquals(player.queue().items, entries);
+});
+
 Deno.test('seek: absolute and relative, clamped, starts playback; false with no current', () => {
   const player = createPlayer();
   assertEquals(player.seek({ positionMs: 100 }), false); // empty queue

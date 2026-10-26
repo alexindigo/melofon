@@ -472,6 +472,47 @@ Deno.test('player flow: add a whole album uri; next/previous walk it', async () 
   }
 });
 
+Deno.test('player flow over HTTP: next moves on while repeat is single', async () => {
+  const { onHook, close } = await setup();
+  const server = Deno.serve({ hostname: '0.0.0.0', port: 0 }, onHook);
+  const origin = `http://melofon.home:${server.addr.port}`;
+  const request = (path: string, method = 'GET') =>
+    fetch(`${origin}${path}`, { method, headers: { Origin: origin } });
+  try {
+    const albums = await request('/api/library/albums');
+    assertEquals(albums.status, 200);
+    const album = (await albums.json()).items[0];
+    const added = await request(
+      `/api/queue/items/add?uris=library:album:${album.id}&playback=start`,
+      'POST',
+    );
+    assertEquals(added.status, 200);
+    const entries = (await added.json()).items;
+    assertEquals(entries.length, 3);
+
+    assertEquals(
+      (await request('/api/player/repeat?state=single', 'PUT')).status,
+      204,
+    );
+    const before = await request('/api/player');
+    assertEquals(before.status, 200);
+    const initial = await before.json();
+    assertEquals(initial.repeat, 'single');
+    assertEquals(initial.item_id, entries[0].id);
+
+    assertEquals((await request('/api/player/next', 'PUT')).status, 204);
+    const after = await request('/api/player');
+    assertEquals(after.status, 200);
+    const status = await after.json();
+    assertEquals(status.state, 'play');
+    assertEquals(status.repeat, 'single');
+    assertEquals(status.item_id, entries[1].id);
+  } finally {
+    await server.shutdown();
+    await close();
+  }
+});
+
 Deno.test('player knobs: volume (master + output), seek, shuffle/repeat/consume', async () => {
   const { onHook, outputs, close } = await setup();
   try {
