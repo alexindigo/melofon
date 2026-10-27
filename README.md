@@ -56,7 +56,8 @@ one); `GET /api/v1/admin/scans/current` reads its status and last error.
 
 `GET /_/health` returns `{"ok":true}` once the DuckDB index is open.
 All other core `/_/` admin routes (config, libraries, outputs, last-command)
-are loopback-only: call them from inside the server's container or VM.
+are loopback-only: call them from inside the server's container or VM. Requests
+carrying a forwarded header never count as loopback.
 Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — keep deployment secrets out of source control.
@@ -79,6 +80,23 @@ own listens keep their root paths (`/api/...`). For the curl examples above,
 append `/music` to the request URL, while keeping `Origin` as just the scheme,
 host and port.
 
+A reverse proxy **must set or append at least one** of `X-Forwarded-For`,
+`X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP` or `Forwarded` on every
+request it forwards. Melofon treats a loopback peer without one as local
+administration. This applies to any same-host proxy, with or without a prefix.
+Most proxies add a forwarded header; nginx needs the `X-Forwarded-For` line below
+(replace `<port>` with Melofon's listen port):
+
+```nginx
+location /music/ {
+    proxy_pass http://127.0.0.1:<port>;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+```
+
 Generated artist-image and share addresses include the serving prefix. A full
 `server.baseUrl` supplies their public origin; a path-only setting uses the
 request's own origin. `server.publicUrl`, when set, remains the separate share
@@ -87,7 +105,8 @@ address override and receives no base-URL prefix.
 Change requests and WebSockets accept either the request's own Origin or the
 configured full base URL's Origin. Cookies carry `Secure` on HTTPS requests,
 or when the configured base URL is HTTPS and its host (including port) matches
-the request's host. Forwarded headers never supply an origin or scheme.
+the request's host. Forwarded headers never supply an origin, scheme or client
+address.
 
 ## Catalog identity
 
