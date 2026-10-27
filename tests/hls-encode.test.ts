@@ -104,11 +104,11 @@ Deno.test('HLS HTTP consumers receive encoded rungs, selected audio, actual timi
   ) {
     let duration = 0, videoBytes = 0, decodedFrames = 0;
     const urls = text.split('\n').filter((line) =>
-      line.startsWith('/rest/hls/')
+      line.length > 0 && !line.startsWith('#')
     );
     assert(urls.length >= minimumSegments);
     for (const url of urls) {
-      const response = await fetch(`${origin}${url}`);
+      const response = await fetch(new URL(url, `${origin}/rest/hls.m3u8`));
       assertEquals(response.status, 200);
       assertEquals(response.headers.get('content-type'), 'video/MP2T');
       const bytes = new Uint8Array(await response.arrayBuffer());
@@ -142,7 +142,7 @@ Deno.test('HLS HTTP consumers receive encoded rungs, selected audio, actual timi
         frame.free();
       }
       duration += parseFloat(
-        new URL(`${origin}${url}`).searchParams.get('duration')!,
+        new URL(url, `${origin}/rest/hls.m3u8`).searchParams.get('duration')!,
       );
     }
     assert(Math.abs(duration - 2) <= 0.12, `muxed duration ${duration}`);
@@ -200,10 +200,12 @@ Deno.test('HLS HTTP consumers receive encoded rungs, selected audio, actual timi
           ),
         );
         for (
-          const url of lines.filter((l) => l.startsWith('/rest/hls.m3u8?'))
+          const url of lines.filter((l) => l.length > 0 && !l.startsWith('#'))
         ) {
           assertEquals(
-            new URL(`${origin}${url}`).searchParams.get('audioTrack'),
+            new URL(url, `${origin}/rest/hls.m3u8`).searchParams.get(
+              'audioTrack',
+            ),
             '2',
           );
         }
@@ -237,10 +239,10 @@ Deno.test('HLS HTTP consumers receive encoded rungs, selected audio, actual timi
         assert(copied.includes('#EXT-X-ENDLIST'));
         for (
           const url of copied.split('\n').filter((l) =>
-            l.startsWith('/rest/hls/')
+            l.length > 0 && !l.startsWith('#')
           )
         ) {
-          const response = await fetch(`${origin}${url}`);
+          const response = await fetch(new URL(url, `${origin}/rest/hls.m3u8`));
           assertEquals(response.status, 200);
           await response.arrayBuffer();
         }
@@ -311,8 +313,12 @@ Deno.test('HLS HTTP consumers receive encoded rungs, selected audio, actual timi
         await state.set('media.hlsCacheMegabytes', '2048');
         // Keep the cache lease open until consumer EOF/cancel. Use the production
         // facade Response directly so network buffering cannot drain it for us.
-        const url = text.split('\n').find((l) => l.startsWith('/rest/hls/'))!;
-        const held = await app(new Request(`${origin}${url}`));
+        const url = text.split('\n').find((l) =>
+          l.length > 0 && !l.startsWith('#')
+        )!;
+        const held = await app(
+          new Request(new URL(url, `${origin}/rest/hls.m3u8`)),
+        );
         assertEquals(held.status, 200);
         await state.set('media.hlsCacheMegabytes', '0');
         const other = await media.hls(`${dir}/music/copy.mp4`, `${dir}/hls`);

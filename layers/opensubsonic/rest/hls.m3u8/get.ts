@@ -32,7 +32,9 @@ export default async (_request: HatRequest, context: HatContext) => {
         lines.push(
           `#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=${view.bandwidth},RESOLUTION=${view.width}x${view.height}`,
         );
-        lines.push(`/rest/hls.m3u8?${query}`);
+        // RFC 8216 §4.1: links resolve against this playlist, not the server
+        // root. A forced hat mount or proxy prefix belongs to the client URL.
+        lines.push(`hls.m3u8?${query}`);
       } else {
         lines.push(
           `#EXT-X-TARGETDURATION:${
@@ -44,7 +46,7 @@ export default async (_request: HatRequest, context: HatContext) => {
         for (const [index, segment] of view.segments.entries()) {
           lines.push(`#EXTINF:${segment.duration},`);
           lines.push(
-            `/rest/hls/segment.ts?${query}&segmentIndex=${index}&duration=${segment.duration}`,
+            `hls/segment.ts?${query}&segmentIndex=${index}&duration=${segment.duration}`,
           );
         }
         if (view.complete) lines.push('#EXT-X-ENDLIST');
