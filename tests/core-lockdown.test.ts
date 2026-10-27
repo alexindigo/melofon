@@ -7,6 +7,127 @@ import { PreparationError } from '../src/output-admission.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { facade } from '../src/facade.ts';
 import { authFixture } from './helpers/authentication.ts';
+import { loadLayers } from '../src/layers.ts';
+
+const forwardedHeaders = [
+  'X-Forwarded-For',
+  'X-Forwarded-Host',
+  'X-Forwarded-Proto',
+  'X-Real-IP',
+  'Forwarded',
+];
+
+// All forms dispatch to Pathfinder's inherited Layer 0 status tree.
+const statusPaths = [
+  '/_/_status',
+  '/_/_status/',
+  '/_/_status/health',
+  '/api/v1/_status',
+  '/_melofon/api/v1/_status',
+  '/_melofon/_status',
+  '/_status',
+];
+
+for (const header of forwardedHeaders) {
+  Deno.test(`core lockdown: loopback with ${header} is never local, even when empty`, async () => {
+    const f = await apiFixture();
+    try {
+      for (const value of ['', '127.0.0.1', 'untrusted proxy data']) {
+        const headers = { [header]: value };
+        for (const path of ['/_/config', ...statusPaths]) {
+          const response = await f.request(path, { headers }, true);
+          assertEquals(response.status, 404, `${header} ${path}`);
+          assertEquals(await response.json(), { detail: 'Not Found' });
+        }
+        for (const loopback of [true, false]) {
+          const health = await f.request('/_/health', { headers }, loopback);
+          assertEquals(health.status, 200);
+          assertEquals(await health.json(), { ok: true });
+        }
+      }
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('core lockdown: direct loopback config and inherited status aliases remain available', async () => {
+  const f = await apiFixture();
+  try {
+    for (const path of ['/_/config', '/_/health', ...statusPaths]) {
+      const response = await f.request(path, {}, true);
+      assertEquals(response.status, 200, path);
+      await response.json();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('core lockdown: inherited status descendants share the guard across header-selected mounts and extra binds', async () => {
+  const f = await authFixture();
+  const app = { store: f.store, state: f.state };
+  const core = await pathfinder({ roots: ['core/'], app });
+  const layers = (await loadLayers({
+    app,
+    layersRoot: 'tests/fixtures/layers',
+  })).filter((layer) => ['layer-p', 'layer-q'].includes(layer.name)).map((
+    layer,
+  ) => ({
+    ...layer,
+    headers: [{ name: 'x-hat', includes: layer.name }],
+    mounts: layer.mounts.map((mount) => ({ ...mount, prefix: '/shared' })),
+  }));
+  try {
+    for (const extra of [false, true]) {
+      const server = Deno.serve(
+        { hostname: '0.0.0.0', port: 0, onListen() {} },
+        facade(
+          core,
+          layers.map((layer) => ({ ...layer, ports: extra ? [3689] : [] })),
+          extra ? { listenPort: 3689, defaultPort: 4534 } : {},
+        ),
+      );
+      try {
+        for (const layer of layers) {
+          for (
+            const prefix of [
+              '/shared',
+              `/_${layer.name}`,
+              `/_${layer.name}/shared`,
+            ]
+          ) {
+            for (const suffix of ['/_status', '/_status/', '/_status/health']) {
+              for (const header of [undefined, ...forwardedHeaders]) {
+                const response = await fetch(
+                  `http://127.0.0.1:${server.addr.port}${prefix}${suffix}`,
+                  {
+                    headers: {
+                      'x-hat': layer.name,
+                      ...(header ? { [header]: '' } : {}),
+                    },
+                    signal: AbortSignal.timeout(5000),
+                  },
+                );
+                assertEquals(
+                  response.status,
+                  header ? 404 : 200,
+                  `${extra} ${prefix}${suffix} ${header}`,
+                );
+                const body = await response.json();
+                if (header) assertEquals(body, { detail: 'Not Found' });
+              }
+            }
+          }
+        }
+      } finally {
+        await server.shutdown();
+      }
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('core lockdown: LAN and spoofed forwarding get bare 404s on every admin route; health stays public', async () => {
   const f = await apiFixture();
@@ -192,6 +313,39 @@ Deno.test('core lockdown: IPv6 loopback is admitted and unknown/non-loopback pee
       });
       assertEquals(allowed.status, 200);
       await allowed.json();
+    }
+  } finally {
+    await server.shutdown();
+    await f.close();
+  }
+});
+
+Deno.test('core lockdown: forwarded IPv6 loopback requests lose local privilege while health stays public', async () => {
+  const f = await authFixture();
+  const core = await pathfinder({
+    roots: ['core/'],
+    app: { store: f.store, state: f.state },
+  });
+  const server = Deno.serve(
+    { hostname: '::1', port: 0, onListen() {} },
+    facade(core, []),
+  );
+  try {
+    for (const header of forwardedHeaders) {
+      for (const path of ['/_/config', '/_/_status', '/_/health']) {
+        const response = await fetch(
+          `http://[::1]:${server.addr.port}${path}`,
+          {
+            headers: { [header]: '' },
+            signal: AbortSignal.timeout(5000),
+          },
+        );
+        assertEquals(response.status, path === '/_/health' ? 200 : 404);
+        assertEquals(
+          await response.json(),
+          path === '/_/health' ? { ok: true } : { detail: 'Not Found' },
+        );
+      }
     }
   } finally {
     await server.shutdown();

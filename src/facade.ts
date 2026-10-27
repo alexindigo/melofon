@@ -87,6 +87,17 @@ interface TraceInfo {
   completed?: Promise<void>;
 }
 
+// Presence only: forwarding metadata can remove local privilege, never grant it.
+function hasForwardedHeaders(request: Request): boolean {
+  return [
+    'x-forwarded-for',
+    'x-forwarded-host',
+    'x-forwarded-proto',
+    'x-real-ip',
+    'forwarded',
+  ].some((name) => request.headers.has(name));
+}
+
 export function facade(
   coreApp: PathfinderApp,
   layers: Layer[] | (() => Layer[]),
@@ -173,6 +184,21 @@ export function facade(
       });
     };
 
+    // Every core/hat dispatch crosses this boundary AFTER mount/alias stripping.
+    // Pathfinder's inherited Layer 0 status tree also grants loopback privilege;
+    // extend its fail-closed disqualifier without changing the transport info.
+    const dispatch = (app: PathfinderApp, path: string): Promise<Response> => {
+      if (
+        (path === '/_status' || path.startsWith('/_status/')) &&
+        hasForwardedHeaders(request)
+      ) {
+        return Promise.resolve(
+          Response.json({ detail: 'Not Found' }, { status: 404 }),
+        );
+      }
+      return app(repath(request, path), info);
+    };
+
     // Amperfy-style reachability probes GET the server root before login and
     // abort on any >= 400 — answer 200 on the default listen (the M5 UI
     // replaces this stub on branch `owntone`; master keeps the plain-text
@@ -198,14 +224,17 @@ export function facade(
     if (path === '/_' || path.startsWith('/_/')) {
       const rest = path.slice(2) || '/';
       const peer = (info as TraceInfo | undefined)?.remoteAddr?.hostname;
-      if (rest !== '/health' && rest !== '/_status' && !isLoopback(peer)) {
+      if (
+        rest !== '/health' && rest !== '/_status' &&
+        (!isLoopback(peer) || hasForwardedHeaders(request))
+      ) {
         return respond(
           Promise.resolve(
             Response.json({ detail: 'Not Found' }, { status: 404 }),
           ),
         );
       }
-      return await respond(coreApp(repath(request, rest), info));
+      return await respond(dispatch(coreApp, rest));
     }
 
     // Force prefix: /_<name> strip → that layer, then mount rules.
@@ -213,10 +242,10 @@ export function facade(
       const prefix = `/_${layer.name}`;
       if (path === prefix || path.startsWith(`${prefix}/`)) {
         const rest = path.slice(prefix.length) || '/';
-        const dispatch = layerDispatch(layer, request.method, rest);
-        if (dispatch !== null) {
+        const target = layerDispatch(layer, request.method, rest);
+        if (target !== null) {
           return await respond(
-            dispatch.app(repath(request, dispatch.path), info),
+            dispatch(target.app, target.path),
           );
         }
         return respond(
@@ -235,18 +264,18 @@ export function facade(
     );
     const hits: { layer: Layer; app: PathfinderApp; path: string }[] = [];
     for (const layer of candidates) {
-      const dispatch = layerDispatch(layer, request.method, path, claimedOnly);
-      if (dispatch !== null) hits.push({ layer, ...dispatch });
+      const target = layerDispatch(layer, request.method, path, claimedOnly);
+      if (target !== null) hits.push({ layer, ...target });
     }
     if (hits.length === 1) {
       return await respond(
-        hits[0].app(repath(request, hits[0].path), info),
+        dispatch(hits[0].app, hits[0].path),
       );
     }
     if (hits.length > 1) {
       const match = hits.find((h) => headersMatch(request, h.layer));
       if (match) {
-        return await respond(match.app(repath(request, match.path), info));
+        return await respond(dispatch(match.app, match.path));
       }
     }
     return respond(
