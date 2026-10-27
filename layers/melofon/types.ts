@@ -34,7 +34,11 @@ export interface Hat {
 export interface HatContext {
   meta: { jsonMaxBytesSetting?: string };
   app: {
-    publicAddress: { prefix(): Promise<string> };
+    publicAddress: {
+      prefix(): Promise<string>;
+      acceptsOrigin(request: Request, origin: string): Promise<boolean>;
+      secure(request: Request): Promise<boolean>;
+    };
     clientQueue: {
       get(username: string): Promise<SavedQueue | null>;
       save(username: string, queue: {

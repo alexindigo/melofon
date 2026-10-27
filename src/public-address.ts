@@ -1,11 +1,15 @@
 // Public deployment address: core owns the setting; hats receive this read port.
 // Navidrome conf/configuration.go:464-474 separates BaseURL's serving path
-// from its origin. The full-address operation can extend this same service.
+// from its origin. No forwarded header participates in this service.
 import type { State } from './state.ts';
 
 export interface PublicAddress {
   /** Current default-listen prefix, empty at the root, never trailing '/'. */
   prefix(): Promise<string>;
+  /** Full default-listen resource address (path starts with '/'). */
+  full(request: Request, path: string): Promise<string>;
+  acceptsOrigin(request: Request, origin: string): Promise<boolean>;
+  secure(request: Request): Promise<boolean>;
 }
 
 export function createPublicAddress(state: State): PublicAddress {
@@ -52,14 +56,35 @@ export function createPublicAddress(state: State): PublicAddress {
       `^(?:|${scheme}${authority}/?|(?:${scheme}${authority})?${path})$(?![\\s\\S])`,
     description: 'Public HTTP(S) URL or serving path, for example /music',
   });
+  async function current() {
+    const value = String(await state.getTyped('server.baseUrl'));
+    const url = value ? new URL(value, 'http://melofon.invalid') : null;
+    return {
+      prefix: url?.pathname.replace(/\/+$/, '') ?? '',
+      configured: value && !value.startsWith('/') ? url : null,
+    };
+  }
   return Object.freeze({
     async prefix() {
-      const value = String(await state.getTyped('server.baseUrl'));
-      if (!value) return '';
-      return new URL(value, 'http://melofon.invalid').pathname.replace(
-        /\/+$/,
-        '',
-      );
+      return (await current()).prefix;
+    },
+    async full(request: Request, path: string) {
+      const { prefix, configured } = await current();
+      // Concatenation keeps the serving prefix even for a root-relative path.
+      return `${
+        configured?.origin ?? new URL(request.url).origin
+      }${prefix}${path}`;
+    },
+    async acceptsOrigin(request: Request, origin: string) {
+      const { configured } = await current();
+      return origin === new URL(request.url).origin ||
+        origin === configured?.origin;
+    },
+    async secure(request: Request) {
+      const own = new URL(request.url);
+      const { configured } = await current();
+      return own.protocol === 'https:' ||
+        (configured?.protocol === 'https:' && own.host === configured.host);
     },
   });
 }

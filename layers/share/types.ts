@@ -22,6 +22,7 @@ export interface ShareRequest {
 }
 export interface ShareContext {
   app: {
+    publicAddress: { full(request: Request, path: string): Promise<string> };
     state: { getTyped(key: string): Promise<unknown> };
     shares: {
       enabled(): Promise<boolean>;

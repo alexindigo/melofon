@@ -1,18 +1,18 @@
-import type { HatRequest } from './types.ts';
+import type { HatContext, HatRequest } from './types.ts';
 import { bearer } from './auth.ts';
 import { fail } from './errors.ts';
 
-export default function origin(request: HatRequest) {
+export default async function origin(request: HatRequest, context: HatContext) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return;
-  checkOrigin(request);
+  await checkOrigin(request, context);
 }
 
-export function checkOrigin(request: HatRequest) {
+export async function checkOrigin(request: HatRequest, context: HatContext) {
   const value = request.headers.get('origin');
   if (
     value === null
       ? bearer(request) !== null
-      : value === new URL(request._raw.url).origin
+      : await context.app.publicAddress.acceptsOrigin(request._raw, value)
   ) return;
   fail(403, 'origin', 'Origin not allowed');
 }

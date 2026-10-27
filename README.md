@@ -79,6 +79,16 @@ own listens keep their root paths (`/api/...`). For the curl examples above,
 append `/music` to the request URL, while keeping `Origin` as just the scheme,
 host and port.
 
+Generated artist-image and share addresses include the serving prefix. A full
+`server.baseUrl` supplies their public origin; a path-only setting uses the
+request's own origin. `server.publicUrl`, when set, remains the separate share
+address override and receives no base-URL prefix.
+
+Change requests and WebSockets accept either the request's own Origin or the
+configured full base URL's Origin. Cookies carry `Secure` on HTTPS requests,
+or when the configured base URL is HTTPS and its host (including port) matches
+the request's host. Forwarded headers never supply an origin or scheme.
+
 ## Catalog identity
 
 Scanning records an `afp/1` audio fingerprint from compressed audio packets,

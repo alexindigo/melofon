@@ -48,6 +48,7 @@ export interface HatRequest {
 
 export interface HatContext {
   app: {
+    publicAddress: { full(request: Request, path: string): Promise<string> };
     cfg: {
       version?: string;
       /** Data dir root — the HLS segment cache lives under it. */

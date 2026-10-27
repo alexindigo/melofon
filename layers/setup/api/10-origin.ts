@@ -1,9 +1,13 @@
-import type { SetupRequest } from '../types.ts';
+import type { SetupContext, SetupRequest } from '../types.ts';
 import { fail } from '../errors.ts';
 
-export default function (request: SetupRequest) {
+export default async function (request: SetupRequest, context: SetupContext) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return;
-  if (request.headers.get('origin') !== new URL(request._raw.url).origin) {
+  const value = request.headers.get('origin');
+  if (
+    value === null ||
+    !await context.app.publicAddress.acceptsOrigin(request._raw, value)
+  ) {
     fail(403, 'origin', 'Origin not allowed');
   }
 }

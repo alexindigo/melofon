@@ -2,6 +2,7 @@ import { assert, assertEquals, assertStringIncludes } from '@std/assert';
 import { startServer } from '../src/server.ts';
 import { createLogger } from '../src/logging.ts';
 import { reservePorts } from './helpers/ports.ts';
+import { apiFixture } from './helpers/api.ts';
 
 const settings = '/api/v1/admin/settings';
 const auth = new URLSearchParams({
@@ -122,6 +123,353 @@ async function missing(response: Response) {
   assertEquals(response.status, 404);
   assertEquals(await response.json(), { detail: 'Not Found' });
 }
+
+async function fixtureLibrary(
+  f: Awaited<ReturnType<typeof boot>>,
+  dir: string,
+) {
+  const root = `${dir}/library`;
+  const artist = `${root}/Fixture Artist`;
+  const album = `${artist}/Fixture Album`;
+  await Deno.mkdir(album, { recursive: true });
+  const source = 'tests/fixtures/library/Fixture Artist/Fixture Album';
+  for (
+    const name of ['01 - First Song.mp3', '02 - Second Song.mp3', 'cover.jpg']
+  ) {
+    await Deno.copyFile(`${source}/${name}`, `${album}/${name}`);
+  }
+  await Deno.copyFile(`${source}/cover.jpg`, `${artist}/artist.jpg`);
+  const signed = await f.login('/music');
+  const added = await f.json('/music/api/v1/admin/libraries', 'POST', {
+    name: 'Public addresses',
+    path: root,
+  }, signed.cookie);
+  assertEquals(added.status, 201);
+  await added.json();
+  const until = Date.now() + 30000;
+  while (true) {
+    const songs = (await f.rest('/music', 'getRandomSongs')).randomSongs.song;
+    if (songs?.length === 2) return { signed, song: songs[0] };
+    assert(Date.now() < until, 'photo library scan timed out');
+    await sleep(50);
+  }
+}
+
+Deno.test('base URL full addresses: artistInfo photos include live prefix/origin and all image sizes load', () =>
+  temp(async (dir) => {
+    const f = await boot(`${dir}/data`, { MELOFON_BASE_URL: '/music' });
+    try {
+      const { signed, song } = await fixtureLibrary(f, dir);
+      const forwarded = await f.request(
+        `/music/rest/getArtistInfo?${auth}&id=${song.artistId}`,
+        {
+          headers: {
+            'X-Forwarded-Host': 'evil.example',
+            'X-Forwarded-Proto': 'https',
+            Forwarded: 'host=evil.example;proto=https',
+          },
+        },
+      );
+      assertEquals(forwarded.status, 200);
+      const forwardedInfo =
+        (await forwarded.json())['subsonic-response'].artistInfo;
+      assertEquals(new URL(forwardedInfo.smallImageUrl).origin, f.origin);
+      for (const configured of ['/music', 'https://myhome.example/music', '']) {
+        await f.change('/music', signed.cookie, configured);
+        const prefix = configured ? '/music' : '';
+        for (const op of ['getArtistInfo', 'getArtistInfo2']) {
+          const body = await f.rest(prefix, op, { id: song.artistId });
+          const info =
+            body[op === 'getArtistInfo' ? 'artistInfo' : 'artistInfo2'];
+          for (
+            const [field, size] of [['smallImageUrl', 300], [
+              'mediumImageUrl',
+              600,
+            ], ['largeImageUrl', 1200]] as const
+          ) {
+            const url = new URL(info[field]);
+            assertEquals(
+              url.origin,
+              configured.startsWith('https:')
+                ? 'https://myhome.example'
+                : f.origin,
+            );
+            assertEquals(url.pathname, `${prefix}/rest/getCoverArt`);
+            assertEquals(url.searchParams.get('size'), String(size));
+            assertEquals(url.searchParams.get('id'), song.artistId);
+            // The configured public host isn't a test server: exercise its exact
+            // generated resource path at the running transport instead.
+            const image = url.origin === f.origin
+              ? await fetch(url, { signal: AbortSignal.timeout(5000) })
+              : await f.request(`${url.pathname}${url.search}`);
+            assertEquals(image.status, 200);
+            assertStringIncludes(image.headers.get('content-type')!, 'image/');
+            assert((await image.arrayBuffer()).byteLength > 0);
+          }
+        }
+      }
+    } finally {
+      await f.close();
+    }
+  }));
+
+Deno.test('base URL full addresses: share wire/page/m3u follow base URL unless publicUrl overrides it', () =>
+  temp(async (dir) => {
+    const f = await boot(`${dir}/data`, { MELOFON_BASE_URL: '/music' });
+    try {
+      const { signed, song } = await fixtureLibrary(f, dir);
+      const enabled = await f.json(`/music${settings}`, 'PATCH', {
+        changes: [{ key: 'sharing.enabled', value: true }],
+      }, signed.cookie);
+      assertEquals(enabled.status, 200);
+      await enabled.json();
+      const share =
+        (await f.rest('/music', 'createShare', { id: song.id })).shares
+          .share[0];
+      assertEquals(share.url, `${f.origin}/music/share/${share.id}`);
+      for (
+        const [configured, override, expected] of [
+          ['/music', '', `${f.origin}/music`],
+          ['https://myhome.example/music', '', 'https://myhome.example/music'],
+          [
+            'https://myhome.example/music',
+            'https://shares.example/listen',
+            'https://shares.example/listen',
+          ],
+          [
+            '/music',
+            'https://shares.example/listen',
+            'https://shares.example/listen',
+          ],
+        ]
+      ) {
+        await f.change('/music', signed.cookie, configured);
+        const changed = await f.json(`/music${settings}`, 'PATCH', {
+          changes: [{ key: 'server.publicUrl', value: override }],
+        }, signed.cookie);
+        assertEquals(changed.status, 200);
+        await changed.json();
+        const listed = (await f.rest('/music', 'getShares')).shares.share[0];
+        const base = `${expected}/share/${share.id}`;
+        assertEquals(listed.url, base);
+        const page = await f.request(`/music/share/${share.id}`);
+        assertEquals(page.status, 200);
+        const html = await page.text();
+        for (const path of ['/0', '/cover', '/m3u']) {
+          assertStringIncludes(html, `${base}${path}`);
+        }
+        const playlist = await f.request(`/music/share/${share.id}/m3u`);
+        assertEquals(playlist.status, 200);
+        assertStringIncludes(await playlist.text(), `${base}/0`);
+      }
+      const stream = await f.request(`/music/share/${share.id}/0`);
+      assertEquals(stream.status, 200);
+      assert((await stream.arrayBuffer()).byteLength > 0);
+    } finally {
+      await f.close();
+    }
+  }));
+
+Deno.test('base URL Origin: sign-in and WebSocket accept own/configured origin live, never forwarded origins', () =>
+  temp(async (dir) => {
+    const f = await boot(dir, { MELOFON_BASE_URL: '/music' });
+    try {
+      const signed = await f.login('/music');
+      for (
+        const [value, accepted] of [['/music', false], [
+          'https://myhome.example/music',
+          true,
+        ], ['/music', false]] as const
+      ) {
+        await f.change('/music', signed.cookie, value);
+        for (
+          const origin of [
+            f.origin,
+            'https://myhome.example',
+            'https://evil.example',
+            'null',
+          ]
+        ) {
+          const allow = origin === f.origin ||
+            (accepted && origin === 'https://myhome.example');
+          const response = await f.request('/music/api/v1/session', {
+            method: 'POST',
+            headers: {
+              Origin: origin,
+              'content-type': 'application/json',
+              'X-Forwarded-Host': 'myhome.example',
+              'X-Forwarded-Proto': 'https',
+            },
+            body: JSON.stringify({
+              username: 'admin',
+              password: 'prefix-password',
+              use: 'cookie',
+            }),
+          });
+          assertEquals(response.status, allow ? 200 : 403);
+          await response.json();
+          // A real Upgrade request observes the HTTP rejection, without hiding
+          // it behind a WebSocket constructor's generic connection error.
+          if (!allow) {
+            const denied = await f.request('/music/api/v1/events', {
+              headers: {
+                Origin: origin,
+                Cookie: signed.cookie,
+                Upgrade: 'websocket',
+                Connection: 'Upgrade',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                'Sec-WebSocket-Version': '13',
+              },
+            });
+            assertEquals(denied.status, 403);
+            await denied.json();
+          } else {
+            const ws = new WebSocket(
+              `${f.origin.replace('http:', 'ws:')}/music/api/v1/events`,
+              {
+                headers: { Origin: origin, Cookie: signed.cookie },
+              },
+            );
+            const hello = await new Promise<string>((resolve, reject) => {
+              const timer = setTimeout(
+                () => reject(new Error('hello timeout')),
+                5000,
+              );
+              ws.onmessage = (e) => {
+                clearTimeout(timer);
+                resolve(String(e.data));
+              };
+              ws.onerror = () => {
+                clearTimeout(timer);
+                reject(new Error('WS error'));
+              };
+            });
+            assertEquals(JSON.parse(hello).type, 'hello');
+            await new Promise<void>((resolve) => {
+              ws.onclose = () => resolve();
+              ws.close();
+            });
+          }
+        }
+      }
+    } finally {
+      await f.close();
+    }
+  }));
+
+Deno.test('base URL Secure: request HTTPS or configured HTTPS with exact host/port; forwarded proto has no effect', async () => {
+  for (const tls of [false, true]) {
+    const f = await apiFixture({ tls });
+    try {
+      const own = new URL(f.origin);
+      for (
+        const [base, secure] of [
+          ['', tls],
+          ['/music', tls],
+          [`https://${own.host}/music`, true],
+          [`http://${own.host}/music`, tls],
+          ['https://myhome.example/music', tls],
+          ['https://melofon.home/music', tls],
+        ] as const
+      ) {
+        await f.state.set('server.baseUrl', base);
+        const prefix = base ? '/music' : '';
+        for (const forwarded of ['https', 'http']) {
+          const response = await f.request(`${prefix}/api/v1/session`, {
+            method: 'POST',
+            headers: {
+              Origin: f.origin,
+              'content-type': 'application/json',
+              'X-Forwarded-Proto': forwarded,
+            },
+            body: JSON.stringify({
+              username: 'admin',
+              password: 'password-admin',
+              use: 'cookie',
+            }),
+          });
+          assertEquals(response.status, 200);
+          await response.json();
+          const cookie = response.headers.get('set-cookie')!;
+          assertEquals(
+            cookie.includes('; Secure'),
+            secure,
+            `${tls} ${base} ${forwarded}`,
+          );
+          assertStringIncludes(cookie, `; Path=${prefix || '/'};`);
+          const logout = await f.json(
+            `${prefix}/api/v1/session`,
+            'DELETE',
+            undefined,
+            cookie.split(';')[0],
+          );
+          assertEquals(logout.status, 200);
+          await logout.json();
+          assertEquals(
+            logout.headers.get('set-cookie')!.includes('; Secure'),
+            secure,
+          );
+        }
+      }
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test('base URL setup Origin: configured full origin accepted, path-only and forwarded origins rejected', () =>
+  temp(async (dir) => {
+    for (const full of [false, true]) {
+      const f = await boot(`${dir}/${full}`, {
+        MELOFON_USER: '',
+        MELOFON_PASSWORD: '',
+        MELOFON_BASE_URL: full ? 'https://myhome.example/music' : '/music',
+      });
+      try {
+        const code = f.lines.find((line) => line.includes('event=setup_code '))
+          ?.match(/\bcode=([A-Z2-9-]+)/)?.[1];
+        assert(code);
+        for (
+          const origin of [
+            'https://evil.example',
+            'null',
+            'https://myhome.example',
+          ]
+        ) {
+          const response = await f.request('/music/setup', {
+            method: 'POST',
+            headers: {
+              Origin: origin,
+              'content-type': 'application/json',
+              'X-Forwarded-Host': 'myhome.example',
+              'X-Forwarded-Proto': 'https',
+            },
+            body: JSON.stringify({
+              code,
+              username: 'admin',
+              password: 'prefix-password',
+            }),
+          });
+          assertEquals(
+            response.status,
+            full && origin === 'https://myhome.example' ? 201 : 403,
+          );
+          await response.json();
+        }
+        if (!full) {
+          const own = await f.json('/music/setup', 'POST', {
+            code,
+            username: 'admin',
+            password: 'prefix-password',
+          });
+          assertEquals(own.status, 201);
+          await own.json();
+        }
+      } finally {
+        await f.close();
+      }
+    }
+  }));
 
 Deno.test('base URL: real default listen strips once before mounts, aliases, core and hello; own ports stay at root', () =>
   temp(async (dir) => {

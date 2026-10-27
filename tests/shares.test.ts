@@ -15,6 +15,7 @@ import { createLibrary } from '../src/library.ts';
 import { createState } from '../src/state.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createShares } from '../src/shares.ts';
+import { createPublicAddress } from '../src/public-address.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { loadLayers } from '../src/layers.ts';
@@ -56,6 +57,7 @@ async function api(store: Store, dir: string) {
         library,
         playlists,
         shares,
+        publicAddress: createPublicAddress(state),
         libraries,
         user: createUserService(store, cfg),
         annotation: createAnnotation(store),

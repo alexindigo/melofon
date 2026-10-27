@@ -51,13 +51,16 @@ export async function topSongs(context: HatContext) {
 }
 
 // Keep only authentication/protocol arguments, including merged POST credentials.
-function imageUrl(
+async function imageUrl(
   request: HatRequest,
   context: HatContext,
   id: string,
   size: number,
 ) {
-  const url = new URL('/rest/getCoverArt', request._raw.url);
+  // Navidrome core/publicurl/publicurl.go:61-85; artistInfo URLs stay full.
+  const url = new URL(
+    await context.app.publicAddress.full(request._raw, '/rest/getCoverArt'),
+  );
   for (const key of ['u', 'p', 't', 's', 'v', 'c']) {
     const value = context.state.params!.get(key);
     if (value !== null) url.searchParams.set(key, value);
@@ -128,9 +131,9 @@ export async function artistInfo(
       lastFmUrl: values['artist.url']?.url,
       ...(hasPhoto
         ? {
-          smallImageUrl: imageUrl(request, context, artistId, 300),
-          mediumImageUrl: imageUrl(request, context, artistId, 600),
-          largeImageUrl: imageUrl(request, context, artistId, 1200),
+          smallImageUrl: await imageUrl(request, context, artistId, 300),
+          mediumImageUrl: await imageUrl(request, context, artistId, 600),
+          largeImageUrl: await imageUrl(request, context, artistId, 1200),
         }
         : {}),
       ...(similar.length && count

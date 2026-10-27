@@ -10,6 +10,7 @@ import { createLibrary } from '../src/library.ts';
 import { createState } from '../src/state.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createShares } from '../src/shares.ts';
+import { createPublicAddress } from '../src/public-address.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { createStream } from '../src/stream.ts';
@@ -73,6 +74,7 @@ async function setup() {
         library,
         playlists,
         shares,
+        publicAddress: createPublicAddress(state),
         annotation: createAnnotation(store),
         listens: createListens(store),
         libraries,

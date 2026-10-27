@@ -55,7 +55,9 @@ export const cleanName = (name: string) =>
   name.replace(/[\p{Cc}/\\:"<>|?*,]/gu, '_').replace(/^\.+$/, '_') ||
   'share';
 export async function baseUrl(request: ShareRequest, context: ShareContext) {
-  return `${
-    await context.app.shares.publicUrl() || new URL(request._raw.url).origin
-  }/share/${encodeURIComponent(request.params.id)}`;
+  const base = await context.app.shares.publicUrl();
+  const path = `/share/${encodeURIComponent(request.params.id)}`;
+  return base
+    ? `${base}${path}`
+    : context.app.publicAddress.full(request._raw, path);
 }

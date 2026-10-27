@@ -5,6 +5,9 @@ export interface SetupContext {
   miss?: unknown;
   state: { json: Record<string, unknown> };
   app: {
+    publicAddress: {
+      acceptsOrigin(request: Request, origin: string): Promise<boolean>;
+    };
     state: { getTyped(key: string): Promise<unknown> };
     setup: {
       create(

@@ -3,6 +3,7 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import { Buffer } from 'node:buffer';
 import { Decoder, Demuxer } from 'node-av';
 import { createReference, type Reference } from '../src/reference.ts';
+import { createPublicAddress } from '../src/public-address.ts';
 import { createLibrary } from '../src/library.ts';
 import { createArtwork } from '../src/artwork.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -40,6 +41,7 @@ async function consumer(f: Fixture, reference: Reference) {
         cfg,
         library,
         reference,
+        publicAddress: createPublicAddress(f.state),
         state: f.state,
         libraries: createLibraries(f.store),
         artwork: createArtwork(library, {

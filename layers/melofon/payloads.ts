@@ -31,8 +31,7 @@ export async function cookie(
   const maxAge = key
     ? Number(await context.app.state.getTyped('melofon.cookieMaxAgeSeconds'))
     : 0;
-  // No trusted-proxy setting exists: only the request URL controls Secure.
-  const secure = new URL(request._raw.url).protocol === 'https:'
+  const secure = await context.app.publicAddress.secure(request._raw)
     ? '; Secure'
     : '';
   const path = await context.app.publicAddress.prefix() || '/';

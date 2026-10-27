@@ -41,11 +41,13 @@ export async function shareOf(
     albums: albums.map((a) => a.id),
     songs: tracks.map((s) => s.id),
   });
-  const base = await context.app.shares.publicUrl() ||
-    new URL(request._raw.url).origin;
+  const base = await context.app.shares.publicUrl();
+  const path = `/share/${share.id}`;
   return {
     id: share.id,
-    url: `${base}/share/${share.id}`,
+    url: base
+      ? `${base}${path}`
+      : await context.app.publicAddress.full(request._raw, path),
     description: share.description,
     username: share.owner,
     created: new Date(share.createdAtMs).toISOString(),

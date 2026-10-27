@@ -9,7 +9,7 @@ export default async function (request: HatRequest, context: HatContext) {
   if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
     fail(400, 'upgrade_required', 'WebSocket upgrade required');
   }
-  checkOrigin(request);
+  await checkOrigin(request, context);
   const { sessions, notify, state } = context.app;
   const key = sessionKey(request)!;
   const { sessionId, user } = context.state;
