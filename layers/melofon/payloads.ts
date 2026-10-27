@@ -35,7 +35,8 @@ export async function cookie(
   const secure = new URL(request._raw.url).protocol === 'https:'
     ? '; Secure'
     : '';
-  return `melofon_session=${key}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure}`;
+  const path = await context.app.publicAddress.prefix() || '/';
+  return `melofon_session=${key}; HttpOnly; SameSite=Strict; Path=${path}; Max-Age=${maxAge}${secure}`;
 }
 export function sessionList(sessions: Session[], currentId: string) {
   return {

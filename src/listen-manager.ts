@@ -4,6 +4,7 @@ import type { Layer } from './layers.ts';
 import type { PortMapping } from './binds.ts';
 import { facade } from './facade.ts';
 import { type Log, scopedLog } from './logging.ts';
+import type { PublicAddress } from './public-address.ts';
 
 export interface ListenManager {
   list(): ListenView[];
@@ -27,6 +28,7 @@ export function createListenManager(opts: {
   debugLogHeaders?: boolean;
   log?: Log;
   setupMode?: boolean;
+  publicAddress?: PublicAddress;
 }): ListenManager {
   const servers = new Map<number, Deno.HttpServer<Deno.NetAddr>>();
   const log = opts.log ?? scopedLog('server');
@@ -75,6 +77,7 @@ export function createListenManager(opts: {
                 debugLogRequests: opts.debugLogRequests,
                 debugLogHeaders: opts.debugLogHeaders,
                 setupMode: opts.setupMode,
+                publicAddress: opts.publicAddress,
               }),
             );
             servers.set(port, server);

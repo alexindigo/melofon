@@ -12,6 +12,7 @@ import {
 } from '../../src/listen-manager.ts';
 import { createNotify } from '../../src/notify.ts';
 import { createSettings } from '../../src/settings.ts';
+import { createPublicAddress } from '../../src/public-address.ts';
 import { createPreferences } from '../../src/preferences.ts';
 import { configureLogging, type Logger, scopedLog } from '../../src/logging.ts';
 import { createServerStatus } from '../../src/server-status.ts';
@@ -53,6 +54,7 @@ export async function apiFixture(
     ...f.auth,
     notify,
     state: f.state,
+    publicAddress: createPublicAddress(f.state),
     cfg: f.cfg,
     settings: createSettings(f.store, f.state),
     preferences: createPreferences(f.store, f.state, notify),
@@ -121,6 +123,7 @@ export async function apiFixture(
         hostname: '0.0.0.0',
         debugLogRequests: options.traceRequests,
         debugLogHeaders: options.traceRequests,
+        publicAddress: bag.publicAddress,
       });
       try {
         reserved.release();
@@ -145,6 +148,7 @@ export async function apiFixture(
         facade(core, layers, {
           debugLogRequests: options.traceRequests,
           debugLogHeaders: options.traceRequests,
+          publicAddress: bag.publicAddress,
         }),
       );
       shutdown = () => server.shutdown();
@@ -211,12 +215,16 @@ export async function apiFixture(
       password = 'password-admin',
       deviceName = 'Device',
     ) => {
-      const response = await json('/api/v1/session', 'POST', {
-        username,
-        password,
-        use,
-        deviceName,
-      });
+      const response = await json(
+        `${await bag.publicAddress.prefix()}/api/v1/session`,
+        'POST',
+        {
+          username,
+          password,
+          use,
+          deviceName,
+        },
+      );
       assertEquals(response.status, 200, await response.clone().text());
       const body = await response.json();
       const credential: string = use === 'cookie'

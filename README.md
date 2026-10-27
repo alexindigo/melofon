@@ -61,6 +61,24 @@ Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — keep deployment secrets out of source control.
 
+### Serving in a sub-folder
+
+The core setting `server.baseUrl` is empty by default. Set it through the
+admin settings API to a path such as `/music` or an HTTP(S) URL such as
+`https://myhome.example/music`. Its path becomes the default listen's serving
+prefix immediately; a trailing slash is normalized away. Paths must start
+with one `/`, cannot be `/` alone or start with `/_`, and cannot contain a
+query, fragment or dot segments. `MELOFON_BASE_URL` seeds this setting on
+first boot only; it never replaces a stored choice.
+
+With `/music`, use `/music/setup`, `/music/rest/...` and `/music/api/v1/...`.
+Configure a reverse proxy to pass that prefix through. `GET /` redirects to
+`/music/`; health answers at both `/music/_/health` and `/_/health`. Other
+unprefixed paths return 404. Session cookies use `Path=/music`. OwnTone's
+own listens keep their root paths (`/api/...`). For the curl examples above,
+append `/music` to the request URL, while keeping `Origin` as just the scheme,
+host and port.
+
 ## Catalog identity
 
 Scanning records an `afp/1` audio fingerprint from compressed audio packets,

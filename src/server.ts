@@ -33,6 +33,7 @@ import { createPersistence } from './persistence.ts';
 import { createPlayback } from './playback.ts';
 import { createNotify } from './notify.ts';
 import { createState } from './state.ts';
+import { createPublicAddress } from './public-address.ts';
 import { createSettings } from './settings.ts';
 import { createPreferences } from './preferences.ts';
 import { createPlugins } from './plugins.ts';
@@ -71,6 +72,10 @@ export async function startServer(options: {
   const setupMode = await store.users.adminCount() === 0;
   const notify = createNotify();
   const state = createState(store, undefined, notify);
+  const publicAddress = createPublicAddress(state);
+  if (env.MELOFON_BASE_URL !== undefined) {
+    await state.seedIfUnset('server.baseUrl', env.MELOFON_BASE_URL);
+  }
   const stopLoggingSettings = await configureLogging(state);
   const authentication = createAuthentication(
     store,
@@ -232,6 +237,7 @@ export async function startServer(options: {
   let hats: Hats | undefined = undefined;
   const bag = {
     log,
+    publicAddress,
     ...(setupMode
       ? {
         setup: createSetup({
@@ -308,6 +314,7 @@ export async function startServer(options: {
     debugLogRequests: cfg.debugLogRequests,
     debugLogHeaders: cfg.debugLogHeaders,
     setupMode,
+    publicAddress,
   });
   hats = await createHats({
     store,

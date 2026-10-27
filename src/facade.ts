@@ -29,6 +29,7 @@ import type { PathfinderApp } from '@pathfinder/pathfinder';
 import type { Layer, Mount } from './layers.ts';
 import { createPortMapping, type PortMapping } from './binds.ts';
 import { type Log, scopedLog } from './logging.ts';
+import type { PublicAddress } from './public-address.ts';
 
 function headersMatch(request: Request, layer: Layer): boolean {
   return layer.headers.length > 0 &&
@@ -110,6 +111,7 @@ export function facade(
     debugLogHeaders?: boolean;
     log?: Log;
     setupMode?: boolean;
+    publicAddress?: PublicAddress;
   } = {},
 ): (request: Request, info?: unknown) => Promise<Response> {
   const mapping = opts.mapping ?? createPortMapping(opts.env ?? {});
@@ -128,7 +130,7 @@ export function facade(
         : mapping.actual(layer).includes(opts.listenPort!)
     );
     const debug = opts.debugLogRequests === true;
-    const path = new URL(request.url).pathname;
+    let path = new URL(request.url).pathname;
     let reqId = 0;
     const started = performance.now();
     if (debug) {
@@ -183,6 +185,30 @@ export function facade(
         return response;
       });
     };
+
+    // Only the default listen moves. Like Navidrome's BasePath mounts and
+    // root redirect (server/server.go:50-55,224-232), every downstream router
+    // sees its usual namespace. Keep root health, like Navidrome's /ping
+    // (server/server.go:177). Match a segment boundary and strip exactly once.
+    const prefix = isDefaultListen
+      ? await opts.publicAddress?.prefix() ?? ''
+      : '';
+    if (prefix) {
+      if (path === prefix || path.startsWith(`${prefix}/`)) {
+        path = path.slice(prefix.length) || '/';
+      } else if (path === '/' && request.method === 'GET') {
+        return respond(Promise.resolve(
+          new Response(null, {
+            status: 302,
+            headers: { Location: `${prefix}/` },
+          }),
+        ));
+      } else if (path !== '/_/health') {
+        return respond(Promise.resolve(
+          Response.json({ detail: 'Not Found' }, { status: 404 }),
+        ));
+      }
+    }
 
     // Every core/hat dispatch crosses this boundary AFTER mount/alias stripping.
     // Pathfinder's inherited Layer 0 status tree also grants loopback privilege;
