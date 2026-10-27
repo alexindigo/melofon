@@ -90,12 +90,17 @@ Most proxies add a forwarded header; nginx needs the `X-Forwarded-For` line belo
 ```nginx
 location /music/ {
     proxy_pass http://127.0.0.1:<port>;
+    proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
 }
 ```
+
+The proxy must pass the public `Host` (including port) for Melofon's generated
+addresses and `Origin` checks; if it cannot, configure a full `server.baseUrl`
+for those instead.
 
 Generated artist-image and share addresses include the serving prefix. A full
 `server.baseUrl` supplies their public origin; a path-only setting uses the
