@@ -21,6 +21,8 @@ export const songMetadataColumns: Record<keyof SongMetadata, string> = {
   moods: 'moods',
   comment: 'comment',
   sortTitle: 'sort_title',
+  artistSortName: 'artist_sort_name',
+  albumArtistSortName: 'album_artist_sort_name',
   bpm: 'bpm',
   explicit: 'explicit',
   discSubtitle: 'disc_subtitle',

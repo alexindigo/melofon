@@ -29,8 +29,10 @@ export interface ArtistRow {
   id: string;
   name: string;
   musicBrainzId: string | null;
+  /** Present when files carry an artist sort tag. */
+  sortName?: string;
   albumCount: number;
-  /** Present on article-aware lists; the exact key used for ordering/grouping. */
+  /** Present on article-aware or sort-tag lists; the exact ordering/grouping key. */
   sortKey?: string;
 }
 
@@ -107,11 +109,17 @@ export interface RandomSongOptions {
   toYear?: number;
 }
 
+export interface NameSortOptions {
+  ignoredArticles?: string[];
+  /** Prefer tagged sort names; off unless explicitly requested by the caller. */
+  sortTags?: boolean;
+}
+
 export interface CatalogReads {
   /** Album artists (artists with at least one album), alphabetically. */
   listArtists(
     folderId?: string,
-    opts?: { ignoredArticles?: string[] },
+    opts?: NameSortOptions,
   ): Promise<ArtistRow[]>;
   /** One album artist by ID (null when unknown or has no albums). */
   getArtist(id: string): Promise<ArtistRow | null>;
@@ -120,36 +128,37 @@ export interface CatalogReads {
   /** Every present artist, including track-only performers, scoped to a library. */
   artistIds(folderId?: string): Promise<string[]>;
   /** Albums of one album artist, alphabetically. */
-  albumsByArtist(artistId: string): Promise<AlbumRow[]>;
+  albumsByArtist(artistId: string, opts?: NameSortOptions): Promise<AlbumRow[]>;
   albumsWithoutArtist(
     kind: 'various' | 'unknown',
-    opts?: { folderId?: string },
+    opts?: NameSortOptions & { folderId?: string },
   ): Promise<AlbumRow[]>;
   /** Album lists for getAlbumList/getAlbumList2-shaped hats. The user-scoped
    * sorts (highest / frequent / recent) need `username`; `genre` sort needs
    * `genre`. Favourites are not a sort here: hats derive their order from
    * app.annotation's star history and resolve rows with albumsById. */
-  listAlbums(opts: {
-    sort:
-      | 'name'
-      | 'artist'
-      | 'random'
-      | 'newest'
-      | 'highest'
-      | 'frequent'
-      | 'recent'
-      | 'genre'
-      | 'year';
-    size: number;
-    offset: number;
-    folderId?: string;
-    genre?: string;
-    username?: string;
-    ignoredArticles?: string[];
-    /** `year` sort: range bounds (either order; from > to is newest-first). */
-    fromYear?: number;
-    toYear?: number;
-  }): Promise<AlbumRow[]>;
+  listAlbums(
+    opts: NameSortOptions & {
+      sort:
+        | 'name'
+        | 'artist'
+        | 'random'
+        | 'newest'
+        | 'highest'
+        | 'frequent'
+        | 'recent'
+        | 'genre'
+        | 'year';
+      size: number;
+      offset: number;
+      folderId?: string;
+      genre?: string;
+      username?: string;
+      /** `year` sort: range bounds (either order; from > to is newest-first). */
+      fromYear?: number;
+      toYear?: number;
+    },
+  ): Promise<AlbumRow[]>;
   /** The given albums (unknown ids skipped), by id. With `folderId`, only
    * albums with a file in that source, counted and timed within it exactly
    * as listAlbums scopes them. */
@@ -158,7 +167,7 @@ export interface CatalogReads {
   getSong(id: string): Promise<SongRow | null>;
   search3(
     query: string,
-    opts: {
+    opts: NameSortOptions & {
       artistCount: number;
       artistOffset: number;
       albumCount: number;
@@ -184,7 +193,7 @@ export interface CatalogReads {
   /** Songs of one genre (getSongsByGenre). */
   songsByGenre(
     genre: string,
-    opts: { size: number; offset: number; folderId?: string },
+    opts: NameSortOptions & { size: number; offset: number; folderId?: string },
   ): Promise<SongRow[]>;
   songsForLyrics(
     query: { artist?: string; title?: string },
@@ -229,7 +238,14 @@ function num(value: unknown): number | null {
 // Generic sorting policy: the hat supplies articles, core owns the computed
 // key. Strip a single case-sensitive leading article after accent folding,
 // before lowercasing (Navidrome); unoptioned callers retain their old order.
-function sortKeySql(column: string, articles?: string[]): string {
+function sortKeySql(column: string, articles?: string[], tag?: string): string {
+  if (tag !== undefined) {
+    // A sort tag is already in sort form: fold like the fallback, but never
+    // strip an article from it. Empty tags have the same fallback as absent tags.
+    return `CASE WHEN nullif(trim(${tag}), '') IS NOT NULL THEN ${
+      sortKeySql(tag, articles === undefined ? undefined : [])
+    } ELSE ${sortKeySql(column, articles)} END`;
+  }
   if (articles === undefined) return column;
   const folded = `trim(strip_accents(${column}))`;
   const branches = articles.map((article) =>
@@ -432,7 +448,7 @@ function catalogReads(q: Queries): CatalogReads {
     all: boolean,
   ): Promise<ArtistRow | null> {
     const res = await q.all(
-      `SELECT ar.id, ar.name, ar.musicbrainz_id, COUNT(al.id) AS album_count
+      `SELECT ar.id, ar.name, ar.musicbrainz_id, first(ar.sort_name) AS sort_name, COUNT(al.id) AS album_count
        FROM artists ar
        ${all ? 'LEFT JOIN' : 'JOIN'} albums al ON al.album_artist_id = ar.id
        WHERE ar.id = ${esc(id)}
@@ -442,6 +458,7 @@ function catalogReads(q: Queries): CatalogReads {
       id: string;
       name: string;
       musicbrainz_id: string | null;
+      sort_name: string | null;
       album_count: number | bigint;
     }[])[0];
     return row
@@ -449,15 +466,20 @@ function catalogReads(q: Queries): CatalogReads {
         id: row.id,
         name: row.name,
         musicBrainzId: row.musicbrainz_id,
+        ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
         albumCount: Number(row.album_count),
       }
       : null;
   }
   return {
     async listArtists(folderId, opts = {}): Promise<ArtistRow[]> {
-      const key = sortKeySql('ar.name', opts.ignoredArticles);
+      const key = sortKeySql(
+        'ar.name',
+        opts.ignoredArticles,
+        opts.sortTags ? 'first(ar.sort_name)' : undefined,
+      );
       const res = await q.all(
-        `SELECT ar.id, ar.name, ar.musicbrainz_id, COUNT(al.id) AS album_count, ${key} AS sort_key
+        `SELECT ar.id, ar.name, ar.musicbrainz_id, first(ar.sort_name) AS sort_name, COUNT(al.id) AS album_count, ${key} AS sort_key
          FROM artists ar
          JOIN albums al ON al.album_artist_id = ar.id
          WHERE 1 = 1 ${artistAlbumFolderFilter(folderId)}
@@ -468,14 +490,16 @@ function catalogReads(q: Queries): CatalogReads {
         id: string;
         name: string;
         musicbrainz_id: string | null;
+        sort_name: string | null;
         album_count: number | bigint;
         sort_key: string;
       }[]).map((row) => ({
         id: row.id,
         name: row.name,
         musicBrainzId: row.musicbrainz_id,
+        ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
         albumCount: Number(row.album_count),
-        ...(opts.ignoredArticles === undefined
+        ...(opts.ignoredArticles === undefined && !opts.sortTags
           ? {}
           : { sortKey: row.sort_key }),
       }));
@@ -497,10 +521,16 @@ function catalogReads(q: Queries): CatalogReads {
       }) ORDER BY ar.id`)).map((row) => row.id);
     },
 
-    async albumsByArtist(artistId) {
+    async albumsByArtist(artistId, opts = {}) {
       const res = await q.all(
         `${albumSelect()} HAVING al.album_artist_id = ${esc(artistId)}
-         ORDER BY COALESCE(al.name, al.folder_name), al.id`,
+         ORDER BY ${
+          sortKeySql(
+            'COALESCE(al.name, al.folder_name)',
+            opts.ignoredArticles,
+            opts.sortTags ? 'first(al.sort_name)' : undefined,
+          )
+        }, al.id`,
       );
       return (res as unknown as AlbumSqlRow[]).map(albumOf);
     },
@@ -508,12 +538,28 @@ function catalogReads(q: Queries): CatalogReads {
     async albumsWithoutArtist(kind, opts = {}) {
       const res = await q.all(`${albumSelect({ folderId: opts.folderId })}
         HAVING al.album_artist_id IS NULL AND al.artist_kind = ${esc(kind)}
-        ORDER BY COALESCE(al.name, al.folder_name), al.id`);
+        ORDER BY ${
+        sortKeySql(
+          'COALESCE(al.name, al.folder_name)',
+          opts.ignoredArticles,
+          opts.sortTags ? 'first(al.sort_name)' : undefined,
+        )
+      }, al.id`);
       return (res as unknown as AlbumSqlRow[]).map(albumOf);
     },
 
     async listAlbums(opts) {
       const query: AlbumQuery = { folderId: opts.folderId };
+      const albumKey = sortKeySql(
+        'COALESCE(al.name, al.folder_name)',
+        opts.ignoredArticles,
+        opts.sortTags ? 'first(al.sort_name)' : undefined,
+      );
+      // These modes historically used a raw name as their secondary key, even
+      // when callers supplied articles. Keep that contract with sort tags off.
+      const secondaryKey = opts.sortTags
+        ? albumKey
+        : 'COALESCE(al.name, al.folder_name)';
       let order: string;
       switch (opts.sort) {
         case 'random':
@@ -523,12 +569,13 @@ function catalogReads(q: Queries): CatalogReads {
           order = 'ORDER BY created_ms DESC NULLS LAST';
           break;
         case 'artist':
-          order = `ORDER BY ${sortKeySql('ar.name', opts.ignoredArticles)}, ${
+          order = `ORDER BY ${
             sortKeySql(
-              'COALESCE(al.name, al.folder_name)',
+              'ar.name',
               opts.ignoredArticles,
+              opts.sortTags ? 'first(ar.sort_name)' : undefined,
             )
-          }`;
+          }, ${albumKey}`;
           break;
         case 'highest':
         case 'frequent':
@@ -538,20 +585,19 @@ function catalogReads(q: Queries): CatalogReads {
           if (userId === null) return [];
           if (opts.sort === 'highest') {
             query.ratedBy = userId;
-            order =
-              'ORDER BY MAX(r.rating) DESC, COALESCE(al.name, al.folder_name)';
+            order = `ORDER BY MAX(r.rating) DESC, ${secondaryKey}`;
           } else {
             query.listenAgg = userId;
             order = opts.sort === 'frequent'
-              ? 'ORDER BY MAX(agg.play_count) DESC NULLS LAST, COALESCE(al.name, al.folder_name)'
-              : 'ORDER BY MAX(agg.last_played) DESC NULLS LAST, COALESCE(al.name, al.folder_name)';
+              ? `ORDER BY MAX(agg.play_count) DESC NULLS LAST, ${secondaryKey}`
+              : `ORDER BY MAX(agg.last_played) DESC NULLS LAST, ${secondaryKey}`;
           }
           break;
         }
         case 'genre':
           if (opts.genre === undefined) return [];
           query.genre = opts.genre;
-          order = 'ORDER BY COALESCE(al.name, al.folder_name)';
+          order = `ORDER BY ${secondaryKey}`;
           break;
         case 'year': {
           if (opts.fromYear === undefined || opts.toYear === undefined) {
@@ -561,17 +607,12 @@ function catalogReads(q: Queries): CatalogReads {
           query.yearTo = Math.max(opts.fromYear, opts.toYear);
           // Subsonic: fromYear > toYear is a reverse chronological list.
           order = opts.fromYear > opts.toYear
-            ? 'ORDER BY MAX(f.year) DESC, COALESCE(al.name, al.folder_name)'
-            : 'ORDER BY MAX(f.year), COALESCE(al.name, al.folder_name)';
+            ? `ORDER BY MAX(f.year) DESC, ${secondaryKey}`
+            : `ORDER BY MAX(f.year), ${secondaryKey}`;
           break;
         }
         default:
-          order = `ORDER BY ${
-            sortKeySql(
-              'COALESCE(al.name, al.folder_name)',
-              opts.ignoredArticles,
-            )
-          }`;
+          order = `ORDER BY ${albumKey}`;
       }
       const res = await q.all(
         `${albumSelect(query)} ${order}${
@@ -619,25 +660,43 @@ function catalogReads(q: Queries): CatalogReads {
     async search3(query, opts) {
       const like = `'%' || ${esc(query)} || '%'`;
       const artistRes = await q.all(
-        `SELECT ar.id, ar.name, ar.musicbrainz_id, COUNT(al.id) AS album_count
+        `SELECT ar.id, ar.name, ar.musicbrainz_id, first(ar.sort_name) AS sort_name, COUNT(al.id) AS album_count
            FROM artists ar
            JOIN albums al ON al.album_artist_id = ar.id
            WHERE ar.name ILIKE ${like} ${artistAlbumFolderFilter(opts.folderId)}
            GROUP BY ar.id, ar.name, ar.musicbrainz_id
-            ORDER BY ar.name, ar.id
+             ORDER BY ${
+          sortKeySql(
+            'ar.name',
+            opts.ignoredArticles,
+            opts.sortTags ? 'first(ar.sort_name)' : undefined,
+          )
+        }, ar.id
            LIMIT ${opts.artistCount} OFFSET ${opts.artistOffset}`,
       );
       const albumRes = await q.all(
         `${albumSelect({ folderId: opts.folderId })}
             HAVING COALESCE(al.name, al.folder_name) ILIKE ${like}
-             ORDER BY COALESCE(al.name, al.folder_name), al.id
+              ORDER BY ${
+          sortKeySql(
+            'COALESCE(al.name, al.folder_name)',
+            opts.ignoredArticles,
+            opts.sortTags ? 'first(al.sort_name)' : undefined,
+          )
+        }, al.id
            LIMIT ${opts.albumCount} OFFSET ${opts.albumOffset}`,
       );
       const songRes = await q.all(
         `${SONG_SELECT} WHERE ${
           [`${SONG_TITLE} ILIKE ${like}`, ...songPredicates(opts)].join(' AND ')
         }
-            ORDER BY ${SONG_TITLE}, f.id
+             ORDER BY ${
+          sortKeySql(
+            SONG_TITLE,
+            opts.ignoredArticles,
+            opts.sortTags ? 'f.sort_title' : undefined,
+          )
+        }, f.id
            LIMIT ${opts.songCount} OFFSET ${opts.songOffset}`,
       );
       return {
@@ -645,11 +704,13 @@ function catalogReads(q: Queries): CatalogReads {
           id: string;
           name: string;
           musicbrainz_id: string | null;
+          sort_name: string | null;
           album_count: number | bigint;
         }[]).map((row) => ({
           id: row.id,
           name: row.name,
           musicBrainzId: row.musicbrainz_id,
+          ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
           albumCount: Number(row.album_count),
         })),
         albums: (albumRes as unknown as AlbumSqlRow[]).map(
@@ -731,7 +792,13 @@ function catalogReads(q: Queries): CatalogReads {
       const res = await q.all(
         `${SONG_SELECT}
          WHERE ${songPredicates({ ...opts, genre }).join(' AND ')}
-         ORDER BY ${SONG_TITLE}, f.id
+          ORDER BY ${
+          sortKeySql(
+            SONG_TITLE,
+            opts.ignoredArticles,
+            opts.sortTags ? 'f.sort_title' : undefined,
+          )
+        }, f.id
          LIMIT ${opts.size} OFFSET ${opts.offset}`,
       );
       return (res as unknown as SongSqlRow[]).map(songOf);
@@ -879,8 +946,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
     artistById: (id) => engine.exclusive((q) => catalogReads(q).artistById(id)),
     artistIds: (folderId) =>
       engine.exclusive((q) => catalogReads(q).artistIds(folderId)),
-    albumsByArtist: (id) =>
-      engine.exclusive((q) => catalogReads(q).albumsByArtist(id)),
+    albumsByArtist: (...args) =>
+      engine.exclusive((q) => catalogReads(q).albumsByArtist(...args)),
     albumsWithoutArtist: (...args) =>
       engine.exclusive((q) => catalogReads(q).albumsWithoutArtist(...args)),
     listAlbums: (opts) =>
@@ -1005,7 +1072,12 @@ export interface CatalogSnapshot {
   /** Retained rows participate in album grouping but are never re-indexed. */
   preserved?: { id: string; albumId: string | null }[];
   sources?: { id: string; path: string }[];
-  artists: { id: string; name: string; musicBrainzId?: string | null }[];
+  artists: {
+    id: string;
+    name: string;
+    musicBrainzId?: string | null;
+    sortName?: string | null;
+  }[];
   albums: (Album & { metadata?: AlbumMetadata })[];
   albumIdentities: AlbumIdentity[];
   albumEvents: AlbumEvent[];
@@ -1116,7 +1188,7 @@ async function replaceCatalog(
   );
 
   const artistStmt = await q.prepare(
-    'INSERT INTO artists (id, name, musicbrainz_id) VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, musicbrainz_id = excluded.musicbrainz_id',
+    'INSERT INTO artists (id, name, musicbrainz_id, sort_name) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, musicbrainz_id = excluded.musicbrainz_id, sort_name = excluded.sort_name',
   );
   try {
     for (const artist of artists) {
@@ -1124,6 +1196,8 @@ async function replaceCatalog(
       artistStmt.bindVarchar(2, artist.name);
       if (artist.musicBrainzId == null) artistStmt.bindNull(3);
       else artistStmt.bindVarchar(3, artist.musicBrainzId);
+      if (artist.sortName == null) artistStmt.bindNull(4);
+      else artistStmt.bindVarchar(4, artist.sortName);
       await artistStmt.run();
     }
   } finally {

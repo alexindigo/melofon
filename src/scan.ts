@@ -25,6 +25,7 @@ import { createLyrics, type Lyrics, type LyricsSource } from './lyrics.ts';
 import {
   albumMetadata,
   artistMusicBrainzIds,
+  artistSortNames,
   metadataFromTags,
   type SongMetadata,
 } from './metadata.ts';
@@ -600,6 +601,10 @@ export async function scanLibrary(
     ...albumInputs.get(file)!,
     metadata: file.metadata,
   })));
+  const sortNames = artistSortNames(allFiles.map((file) => ({
+    ...albumInputs.get(file)!,
+    metadata: file.metadata,
+  })));
   report('publishing');
   const changedLibraries = await store.catalog.replaceCatalog({
     coverage,
@@ -609,6 +614,7 @@ export async function scanLibrary(
     artists: [...artists.values()].map((artist) => ({
       ...artist,
       musicBrainzId: artistMbids.get(artist.name) ?? null,
+      sortName: sortNames.get(artist.name) ?? null,
     })),
     albums: grouped.albums.map((album) => ({
       ...album,

@@ -19,6 +19,8 @@ export interface SongMetadata {
   moods: string[];
   comment: string | null;
   sortTitle: string | null;
+  artistSortName: string | null;
+  albumArtistSortName: string | null;
   bpm: number | null;
   explicit: 'explicit' | 'clean' | null;
   discSubtitle: string | null;
@@ -109,6 +111,8 @@ export function metadataFromTags(meta: IAudioMetadata): SongMetadata {
     ),
     comment: text(common.comment?.[0]?.text) ?? text(native('DESCRIPTION')[0]),
     sortTitle: text(common.titlesort),
+    artistSortName: text(common.artistsort),
+    albumArtistSortName: text(common.albumartistsort),
     bpm: common.bpm !== undefined && common.bpm > 0
       ? Math.round(common.bpm)
       : null,
@@ -151,20 +155,25 @@ export function metadataFromTags(meta: IAudioMetadata): SongMetadata {
   };
 }
 
-// Count files, not credits: the same id in both roles on one file is one vote.
-// Only actual tag names own an id, never an inferred album-artist fallback.
-export function artistMusicBrainzIds(
-  files: {
-    trackArtist: string | null;
-    albumArtistTag: string | null;
-    metadata?: SongMetadata;
-  }[],
+interface ArtistFile {
+  trackArtist: string | null;
+  albumArtistTag: string | null;
+  metadata?: SongMetadata;
+}
+
+// Count files, not credits: the same value in both roles is one vote per file.
+// Only actual tag names own a value, never an inferred album-artist fallback.
+// Most frequent non-empty value wins, with lexical ties independent of traversal.
+function artistTagValues(
+  files: ArtistFile[],
+  trackKey: 'artistMbid' | 'artistSortName',
+  albumKey: 'albumArtistMbid' | 'albumArtistSortName',
 ): Map<string, string> {
   const counts = new Map<string, Map<string, number>>();
   for (const file of files) {
     const credits = [
-      [file.trackArtist, file.metadata?.artistMbid],
-      [file.albumArtistTag, file.metadata?.albumArtistMbid],
+      [file.trackArtist, file.metadata?.[trackKey]],
+      [file.albumArtistTag, file.metadata?.[albumKey]],
     ] as const;
     const seen = new Set<string>();
     for (const [name, id] of credits) {
@@ -183,6 +192,14 @@ export function artistMusicBrainzIds(
     )[0];
     return [name, id];
   }));
+}
+
+export function artistMusicBrainzIds(files: ArtistFile[]): Map<string, string> {
+  return artistTagValues(files, 'artistMbid', 'albumArtistMbid');
+}
+
+export function artistSortNames(files: ArtistFile[]): Map<string, string> {
+  return artistTagValues(files, 'artistSortName', 'albumArtistSortName');
 }
 
 export function albumMetadata(
