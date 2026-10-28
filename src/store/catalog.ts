@@ -90,6 +90,27 @@ export interface GenreRow {
   albumCount: number;
 }
 
+export interface GenrePageOptions {
+  folderId?: string;
+  offset: number;
+  limit: number;
+}
+
+/** Live indexed media, not the last scan's acquisition counts. */
+export interface CatalogStatistics {
+  /** All indexed media, including music videos (the song ID namespace). */
+  songCount: number;
+  /** Subset of songCount, never added to it. */
+  videoCount: number;
+  /** Sum over all songs/videos; unknown durations contribute zero. */
+  durationMs: number;
+  albumCount: number;
+  /** Distinct real track and album credits, excluding synthetic groups. */
+  artistCount: number;
+  /** Album-artist root population, including present various/unknown groups. */
+  browseArtistCount: number;
+}
+
 export interface LyricsRow {
   artist: string | null;
   title: string | null;
@@ -264,6 +285,15 @@ export interface CatalogReads {
   listSongs(opts: { offset: number; size: number }): Promise<SongRow[]>;
   /** All genres with song/album counts (getGenres). */
   listGenres(): Promise<GenreRow[]>;
+  genresPage(opts: GenrePageOptions): Promise<{
+    rows: GenreRow[];
+    total: number;
+    revision: string;
+  }>;
+  statistics(folderId?: string): Promise<{
+    statistics: CatalogStatistics;
+    revision: string;
+  }>;
   /** Songs of one genre (getSongsByGenre). */
   songsByGenre(
     genre: string,
@@ -574,6 +604,30 @@ function artistGroupPredicate(ref: ArtistGroupRef): string {
   return ref.kind === 'artist'
     ? `kind = 'artist' AND id = ${esc(ref.id)}`
     : `kind = ${esc(ref.kind)}`;
+}
+
+interface GenreSqlRow {
+  genre: string;
+  song_count: number | bigint;
+  album_count: number | bigint;
+}
+
+function genreOf(row: GenreSqlRow): GenreRow {
+  return {
+    name: row.genre,
+    songCount: Number(row.song_count),
+    albumCount: Number(row.album_count),
+  };
+}
+
+// Match the same primary-genre eligibility used by song/album browse filters.
+function genreSelect(folderId?: string): string {
+  return `SELECT f.genre, COUNT(*) AS song_count,
+    COUNT(DISTINCT f.album_id) AS album_count FROM files f
+    WHERE ${
+    ['f.genre IS NOT NULL', ...songPredicates({ folderId })].join(' AND ')
+  }
+    GROUP BY f.genre`;
 }
 
 // Internal helpers share the current slot, never another public operation.
@@ -1083,23 +1137,68 @@ function catalogReads(q: Queries): CatalogReads {
     },
 
     async listGenres(): Promise<GenreRow[]> {
-      const res = await q.all(
-        `SELECT genre, COUNT(*) AS song_count,
-                COUNT(DISTINCT album_id) AS album_count
-         FROM files
-         WHERE genre IS NOT NULL
-         GROUP BY genre
-         ORDER BY genre`,
+      const rows = await q.all<GenreSqlRow>(
+        `${genreSelect()} ORDER BY f.genre`,
       );
-      return (res as {
-        genre: string;
-        song_count: number | bigint;
-        album_count: number | bigint;
-      }[]).map((row) => ({
-        name: row.genre,
-        songCount: Number(row.song_count),
-        albumCount: Number(row.album_count),
-      }));
+      return rows.map(genreOf);
+    },
+
+    async genresPage(opts) {
+      await requireLibrary(opts.folderId);
+      const select = genreSelect(opts.folderId);
+      const count = await q.all<{ total: bigint }>(
+        `SELECT COUNT(*) AS total FROM (${select}) genres`,
+      );
+      const rows = await q.all<GenreSqlRow>(
+        `${select} ORDER BY f.genre LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+      );
+      return {
+        rows: rows.map(genreOf),
+        total: Number(count[0].total),
+        revision: await catalogRevision(q),
+      };
+    },
+
+    async statistics(folderId) {
+      await requireLibrary(folderId);
+      const predicates = songPredicates({ folderId });
+      const rows = await q.all<{
+        song_count: bigint;
+        video_count: bigint;
+        duration_ms: bigint;
+        album_count: bigint;
+        artist_count: bigint;
+        browse_artist_count: bigint;
+      }>(`WITH eligible_files AS (
+        SELECT f.* FROM files f
+        ${predicates.length ? `WHERE ${predicates.join(' AND ')}` : ''}
+      ), credits AS (
+        SELECT artist_id AS id FROM eligible_files
+        UNION
+        SELECT al.album_artist_id AS id FROM albums al
+          JOIN eligible_files f ON f.album_id = al.id
+      )
+      SELECT COUNT(*) AS song_count,
+        COUNT(*) FILTER (WHERE is_video) AS video_count,
+        COALESCE(SUM(duration_ms), 0) AS duration_ms,
+        COUNT(DISTINCT album_id) AS album_count,
+        (SELECT COUNT(id) FROM credits) AS artist_count,
+        (SELECT COUNT(*) FROM (${
+        artistGroups(folderId)
+      }) groups) AS browse_artist_count
+      FROM eligible_files`);
+      const row = rows[0];
+      return {
+        statistics: {
+          songCount: Number(row.song_count),
+          videoCount: Number(row.video_count),
+          durationMs: Number(row.duration_ms),
+          albumCount: Number(row.album_count),
+          artistCount: Number(row.artist_count),
+          browseArtistCount: Number(row.browse_artist_count),
+        },
+        revision: await catalogRevision(q),
+      };
     },
 
     async songsByGenre(genre, opts) {
@@ -1300,6 +1399,10 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
     listSongs: (opts) =>
       engine.exclusive((q) => catalogReads(q).listSongs(opts)),
     listGenres: () => engine.exclusive((q) => catalogReads(q).listGenres()),
+    genresPage: (opts) =>
+      engine.exclusive((q) => catalogReads(q).genresPage(opts)),
+    statistics: (folderId) =>
+      engine.exclusive((q) => catalogReads(q).statistics(folderId)),
     songsByGenre: (...args) =>
       engine.exclusive((q) => catalogReads(q).songsByGenre(...args)),
     songsForLyrics: (query, limit) =>

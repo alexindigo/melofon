@@ -488,6 +488,117 @@ Deno.test('store.catalog artist groups, detail counts and memberships keep one s
   }
 });
 
+Deno.test('store.catalog genre pages and live statistics keep facts, totals and revision atomic across removal', async () => {
+  let pause: ((sql: string) => Promise<void>) | undefined;
+  const t = await domainFixture((engine) =>
+    createCatalogStore({
+      ...engine,
+      exclusive: (fn) =>
+        engine.exclusive((q) =>
+          fn({
+            ...q,
+            async all<T>(sql: string): Promise<T[]> {
+              const rows = await q.all<T>(sql);
+              await pause?.(sql);
+              return rows;
+            },
+          })
+        ),
+    })
+  );
+  try {
+    for (const operation of ['genres', 'statistics'] as const) {
+      await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+      await t.domain.replaceCatalog({ ...snapshot(), retainedIds: ['song'] });
+      const read = () =>
+        operation === 'genres'
+          ? t.domain.genresPage({ folderId: 'lib', offset: 0, limit: 1 })
+          : t.domain.statistics('lib');
+      const before = await read();
+      if ('statistics' in before) {
+        assertEquals(before.statistics, {
+          songCount: 1,
+          videoCount: 0,
+          durationMs: 2500,
+          albumCount: 1,
+          artistCount: 1,
+          browseArtistCount: 1,
+        });
+      } else {
+        assertEquals(before.rows, [{
+          name: 'Jazz',
+          songCount: 1,
+          albumCount: 1,
+        }]);
+        assertEquals(before.total, 1);
+      }
+      let entered!: () => void;
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      pause = async (sql) => {
+        if (
+          operation === 'genres'
+            ? sql.includes('AS total FROM (SELECT f.genre')
+            : sql.includes('WITH eligible_files AS')
+        ) {
+          entered();
+          await held;
+        }
+      };
+      const pending = read();
+      try {
+        await waiting;
+        const write = t.domain.removeLibrary('lib');
+        pause = undefined;
+        release();
+        assertEquals(await pending, before);
+        assertEquals(await write, true);
+        const after = operation === 'genres'
+          ? await t.domain.genresPage({ offset: 0, limit: 1 })
+          : await t.domain.statistics();
+        assertNotEquals(after.revision, before.revision);
+        if ('statistics' in after) {
+          assertEquals(after.statistics, {
+            songCount: 0,
+            videoCount: 0,
+            durationMs: 0,
+            albumCount: 0,
+            artistCount: 0,
+            browseArtistCount: 0,
+          });
+        } else {
+          assertEquals(after.rows, []);
+          assertEquals(after.total, 0);
+        }
+      } finally {
+        pause = undefined;
+        release();
+        await pending;
+      }
+    }
+    // Unknown duration contributes zero, a video remains in the song population.
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    const input = snapshot();
+    input.files[0] = { ...input.files[0], isVideo: true, durationMs: null };
+    await t.domain.replaceCatalog({ ...input, retainedIds: ['song'] });
+    assertEquals((await t.domain.statistics('lib')).statistics, {
+      songCount: 1,
+      videoCount: 1,
+      durationMs: 0,
+      albumCount: 1,
+      artistCount: 1,
+      browseArtistCount: 1,
+    });
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('store.catalog replaceCatalog round-trips plain identity snapshots and retains absent first-seen', async () => {
   const t = await domainFixture(createCatalogStore);
   try {

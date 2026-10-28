@@ -123,6 +123,15 @@ export interface HatContext {
         total: number;
         revision: string;
       }>;
+      genresPage(opts: GenrePageOptions): Promise<{
+        rows: GenreRow[];
+        total: number;
+        revision: string;
+      }>;
+      statistics(folderId?: string): Promise<{
+        statistics: CatalogStatistics;
+        revision: string;
+      }>;
     };
     scan: {
       start(): Promise<void>;
@@ -338,6 +347,20 @@ export interface ArtistPageOptions {
   folderId?: string;
   offset: number;
   limit: number;
+}
+export type GenrePageOptions = ArtistPageOptions;
+export interface GenreRow {
+  name: string;
+  songCount: number;
+  albumCount: number;
+}
+export interface CatalogStatistics {
+  songCount: number;
+  videoCount: number;
+  durationMs: number;
+  albumCount: number;
+  artistCount: number;
+  browseArtistCount: number;
 }
 export interface AlbumRow {
   id: string;

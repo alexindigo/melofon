@@ -57,7 +57,7 @@ async function browsePaging(params: URLSearchParams, context: HatContext) {
   };
 }
 
-export async function artistPageQuery(
+export async function namePageQuery(
   request: HatRequest,
   context: HatContext,
 ): Promise<ArtistPageOptions> {
