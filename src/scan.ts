@@ -628,6 +628,9 @@ export async function scanLibrary(
     events,
     retainedIds: [...byId.keys()],
   });
+  // This invalidates only committed catalog facts, even if later candidate
+  // acquisition fails. Progress and legacy database/update events stay separate.
+  options.notify?.emit(['library'], undefined, 'all');
   if (changedLibraries.length) {
     options.notify?.emit(
       ['libraries'],

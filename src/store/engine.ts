@@ -7,6 +7,7 @@ import { upgradeUsers } from './users.ts';
 import { upgradeClientQueues } from './clientqueue.ts';
 import { upgradeNowPlaying } from './nowplaying.ts';
 import { migrate } from './migrations.ts';
+import { initializeCatalogRevision } from './catalog-revision.ts';
 
 // Debug spans behind MELOFON_DEBUG_LOG_REQUEST (plans/diag-request-trace):
 // [db] begin/end for run + runAndReadAll — sql truncated to the verb plus
@@ -228,6 +229,7 @@ export async function openEngine(
       await upgradeUsers(q);
       await upgradeClientQueues(q, schema);
       await upgradeNowPlaying(q);
+      await initializeCatalogRevision(q);
       return await migrate(q);
     });
     for (const userId of conflicts) {

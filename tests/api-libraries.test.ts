@@ -439,7 +439,7 @@ Deno.test('API libraries: add indexes songs, path edit keeps ids, removal and re
       (await f.status()).lastScanStartedMs,
       initial.lastScanStartedMs,
     );
-    assertEquals(f.notifications.slice(before), [['libraries']]);
+    assertEquals(f.notifications.slice(before), [['libraries'], ['library']]);
     await Deno.rename(`${f.root}/music`, `${f.root}/moved`);
     const moved = await f.json(`${base}/libraries/${added.id}`, 'PATCH', {
       path: `${f.root}/moved`,

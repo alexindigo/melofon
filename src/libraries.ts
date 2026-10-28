@@ -19,6 +19,7 @@ export interface Libraries {
   stats(id: string): ReturnType<Store['scan']['stats']>;
   /** All configured sources, by name. */
   list(): Promise<LibraryRow[]>;
+  snapshot(): Promise<{ libraries: LibraryRow[]; revision: string }>;
   /** Add a validated, disjoint source and queue a background scan. */
   add(name: string, path: string, source?: Provenance): Promise<LibraryRow>;
   update(
@@ -132,9 +133,11 @@ export function createLibraries(store: Store, options: {
   const changed = (operation: string, id: string, source: Provenance) => {
     log.event('libraries_changed', { operation, library: id, source });
     options.notify?.emit(['libraries'], { libraries: [id] }, 'admins');
+    options.notify?.emit(['library'], undefined, 'all');
   };
   return {
     list: store.catalog.listLibraries,
+    snapshot: store.catalog.librariesSnapshot,
     stats: store.scan.stats,
 
     async add(name, path, source = { kind: 'internal' }) {

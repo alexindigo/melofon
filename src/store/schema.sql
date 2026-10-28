@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS libraries (
   name VARCHAR NOT NULL,
   path VARCHAR UNIQUE NOT NULL
 );
+-- Internal cache identity, initialized by its owner on fresh and existing DBs.
+-- Not settings: the epoch and transactional counter survive scans and restarts.
+CREATE TABLE IF NOT EXISTS catalog_revision (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  epoch VARCHAR NOT NULL,
+  revision BIGINT NOT NULL
+);
 -- Scan owns availability and the latest completed run's problems per library.
 CREATE TABLE IF NOT EXISTS scan_libraries (
   library_id VARCHAR PRIMARY KEY,

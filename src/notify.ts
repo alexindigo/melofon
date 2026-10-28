@@ -38,6 +38,7 @@ const KNOWN = new Set([
   'hats',
   'settings',
   'libraries',
+  'library',
   'scan',
   'users',
   'me',

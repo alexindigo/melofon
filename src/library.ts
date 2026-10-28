@@ -140,6 +140,7 @@ export function createLibrary(
     albumsById: catalog.albumsById,
     getAlbum: catalog.getAlbum,
     getSong: catalog.getSong,
+    getSongSnapshot: catalog.getSongSnapshot,
     search3: catalog.search3,
     songPath: catalog.songPath,
     videos: catalog.videos,

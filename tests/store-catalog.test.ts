@@ -1,4 +1,9 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertNotEquals,
+  assertRejects,
+} from '@std/assert';
 import {
   type CatalogFile,
   type CatalogSnapshot,
@@ -10,6 +15,7 @@ import { createLibrary } from '../src/library.ts';
 import { createScan, scanLibrary } from '../src/scan.ts';
 import { createMedia } from '../src/media.ts';
 import { domainFixture } from './helpers/store.ts';
+import { rawSql } from '../src/store/testing.ts';
 
 function snapshot(): CatalogSnapshot {
   const file: CatalogFile = {
@@ -49,6 +55,175 @@ function snapshot(): CatalogSnapshot {
     retainedIds: [],
   };
 }
+
+Deno.test('store.catalog revision upgrades existing catalogs, persists across reopen and differs between databases', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-revision-upgrade-' });
+  const otherDir = await Deno.makeTempDir({
+    prefix: 'melofon-revision-other-',
+  });
+  let store = await openStore(dir);
+  try {
+    await store.catalog.addLibrary({
+      id: 'lib',
+      name: 'Music',
+      path: '/music',
+    });
+    await store.catalog.replaceCatalog(snapshot());
+    const song = await store.catalog.getSong('song');
+    // Simulate an installed pre-revision schema while retaining its real catalog.
+    await rawSql(store).run('DROP TABLE catalog_revision');
+    await store.close();
+    store = await openStore(dir);
+    const upgraded = await store.catalog.getSongSnapshot('song');
+    assertEquals(upgraded.song, song);
+    assert(/^[0-9a-f-]{36}:0$/.test(upgraded.revision));
+    assertEquals(
+      (await store.catalog.librariesSnapshot()).revision,
+      upgraded.revision,
+    );
+    await store.close();
+    store = await openStore(dir);
+    assertEquals(await store.catalog.getSongSnapshot('song'), upgraded);
+    const other = await openStore(otherDir);
+    try {
+      assertNotEquals(
+        (await other.catalog.librariesSnapshot()).revision,
+        upgraded.revision,
+      );
+    } finally {
+      await other.close();
+    }
+    await store.catalog.replaceCatalog({
+      ...snapshot(),
+      retainedIds: ['song'],
+    });
+    const advanced = await store.catalog.getSongSnapshot('song');
+    assertEquals(advanced.revision, upgraded.revision.replace(/:0$/, ':1'));
+    await store.close();
+    store = await openStore(dir);
+    assertEquals(await store.catalog.getSongSnapshot('song'), advanced);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+    await Deno.remove(otherDir, { recursive: true });
+  }
+});
+
+Deno.test('store.catalog revision advances only on committed publications and source mutations', async () => {
+  const t = await domainFixture(createCatalogStore);
+  try {
+    const before = await t.domain.getSongSnapshot('song');
+    const initial = await t.domain.librariesSnapshot();
+    for (
+      const operation of [
+        () =>
+          t.domain.addLibrary({ id: 'extra', name: 'Extra', path: '/extra' }),
+        () => t.domain.replaceCatalog(snapshot()),
+      ]
+    ) {
+      t.failCommit();
+      await assertRejects(operation, Error, 'injected commit failure');
+      assertEquals(await t.domain.getSongSnapshot('song'), before);
+      assertEquals(await t.domain.librariesSnapshot(), initial);
+    }
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    let prior = await t.domain.librariesSnapshot();
+    assertNotEquals(prior.revision, initial.revision);
+    for (
+      const operation of [
+        () => t.domain.updateLibrary('lib', { name: 'Changed' }),
+        () => t.domain.removeLibrary('lib'),
+      ]
+    ) {
+      t.failCommit();
+      await assertRejects(operation, Error, 'injected commit failure');
+      assertEquals(await t.domain.librariesSnapshot(), prior);
+    }
+    for (
+      const operation of [
+        () => t.domain.updateLibrary('lib', { name: 'Changed' }),
+        () => t.domain.replaceCatalog(snapshot()),
+        () => t.domain.removeLibrary('lib'),
+      ]
+    ) {
+      await operation();
+      const next = await t.domain.librariesSnapshot();
+      const [epoch, count] = prior.revision.split(':');
+      assertEquals(next.revision, `${epoch}:${Number(count) + 1}`);
+      prior = next;
+    }
+    assertEquals(await t.domain.removeLibrary('missing'), false);
+    await assertRejects(() =>
+      t.domain.updateLibrary('missing', { name: 'Missing' })
+    );
+    assertEquals(await t.domain.librariesSnapshot(), prior);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('store.catalog song and source snapshots cannot pair old facts with a queued mutation revision', async () => {
+  let pause: ((sql: string) => Promise<void>) | undefined;
+  const t = await domainFixture((engine) =>
+    createCatalogStore({
+      ...engine,
+      exclusive: (fn) =>
+        engine.exclusive((q) =>
+          fn({
+            ...q,
+            async all<T>(sql: string): Promise<T[]> {
+              const rows = await q.all<T>(sql);
+              await pause?.(sql);
+              return rows;
+            },
+          })
+        ),
+    })
+  );
+  try {
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    for (const kind of ['song', 'sources'] as const) {
+      const read = () =>
+        kind === 'song'
+          ? t.domain.getSongSnapshot('song')
+          : t.domain.librariesSnapshot();
+      const before = await read();
+      let entered!: () => void;
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      pause = async (sql) => {
+        if (
+          (kind === 'song' && sql.includes('WHERE f.id')) ||
+          (kind === 'sources' && sql.includes('SELECT l.id'))
+        ) {
+          entered();
+          await held;
+        }
+      };
+      const pending = read();
+      try {
+        await waiting;
+        const write = t.domain.updateLibrary('lib', { name: kind });
+        pause = undefined;
+        release();
+        assertEquals(await pending, before);
+        await write;
+        assertNotEquals((await read()).revision, before.revision);
+      } finally {
+        pause = undefined;
+        release();
+        await pending;
+      }
+    }
+  } finally {
+    await t.close();
+  }
+});
 
 Deno.test('store.catalog replaceCatalog round-trips plain identity snapshots and retains absent first-seen', async () => {
   const t = await domainFixture(createCatalogStore);

@@ -80,6 +80,7 @@ export interface HatContext {
     libraries: {
       stats(id: string): Promise<unknown>;
       list(): Promise<Library[]>;
+      snapshot(): Promise<{ libraries: Library[]; revision: string }>;
       add(name: string, path: string, source?: Source): Promise<Library>;
       update(
         id: string,
@@ -90,6 +91,9 @@ export interface HatContext {
     };
     library: {
       getSong(id: string): Promise<SongRow | null>;
+      getSongSnapshot(
+        id: string,
+      ): Promise<{ song: SongRow | null; revision: string }>;
     };
     scan: {
       start(): Promise<void>;

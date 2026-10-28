@@ -38,9 +38,10 @@ Deno.test('a completed scan emits database on app.notify', async () => {
     notify.subscribe((types) => events.push(types));
     const scan = createScan(store, undefined, { notify });
     await scan.run();
-    assertEquals(events.filter((e) => !e.includes('scan')), [['update'], [
-      'database',
-    ], ['update']]);
+    assertEquals(
+      events.filter((e) => !e.includes('scan')),
+      [['update'], ['library'], ['database'], ['update']],
+    );
     assertEquals(events[0], ['scan']);
     assertEquals(events.at(-2), ['scan']);
   } finally {

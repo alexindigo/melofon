@@ -12,6 +12,7 @@ import type { LocalVersion } from './candidates.ts';
 import type { AlbumInput } from '../albums.ts';
 import { covered, type ScanCoverage } from '../scan-scope.ts';
 import { type ScanResult, writeScanResult } from './scan.ts';
+import { advanceCatalogRevision, catalogRevision } from './catalog-revision.ts';
 import {
   albumMetadataColumns,
   metadataSelect,
@@ -165,6 +166,10 @@ export interface CatalogReads {
   albumsById(ids: string[], opts: { folderId?: string }): Promise<AlbumRow[]>;
   getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
   getSong(id: string): Promise<SongRow | null>;
+  /** Facts and their persistent revision, read under one exclusive slot. */
+  getSongSnapshot(
+    id: string,
+  ): Promise<{ song: SongRow | null; revision: string }>;
   search3(
     query: string,
     opts: NameSortOptions & {
@@ -657,6 +662,13 @@ function catalogReads(q: Queries): CatalogReads {
       return row ? songOf(row) : null;
     },
 
+    async getSongSnapshot(id) {
+      return {
+        song: await catalogReads(q).getSong(id),
+        revision: await catalogRevision(q),
+      };
+    },
+
     async search3(query, opts) {
       const like = `'%' || ${esc(query)} || '%'`;
       const artistRes = await q.all(
@@ -956,6 +968,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).albumsById(...args)),
     getAlbum: (id) => engine.exclusive((q) => catalogReads(q).getAlbum(id)),
     getSong: (id) => engine.exclusive((q) => catalogReads(q).getSong(id)),
+    getSongSnapshot: (id) =>
+      engine.exclusive((q) => catalogReads(q).getSongSnapshot(id)),
     search3: (...args) =>
       engine.exclusive((q) => catalogReads(q).search3(...args)),
     songPath: (id) => engine.exclusive((q) => catalogReads(q).songPath(id)),
@@ -1326,6 +1340,12 @@ async function checkLibraryPath(q: Queries, path: string, id?: string) {
   }
 }
 
+function libraries(q: Queries): Promise<LibraryRow[]> {
+  return q.all<LibraryRow>(
+    'SELECT l.id, l.name, l.path, COALESCE(s.available, true) AS available FROM libraries l LEFT JOIN scan_libraries s ON s.library_id = l.id ORDER BY l.name, l.id',
+  );
+}
+
 export function createCatalogStore(engine: Engine) {
   return {
     ...createCatalogReadStore(engine),
@@ -1434,9 +1454,11 @@ export function createCatalogStore(engine: Engine) {
           }
         }
         await replaceCatalog(q, snapshot);
-        return snapshot.scanResult
-          ? writeScanResult(q, snapshot.scanResult)
+        const changed = snapshot.scanResult
+          ? await writeScanResult(q, snapshot.scanResult)
           : [];
+        await advanceCatalogRevision(q);
+        return changed;
       });
     },
     libraryCount(): Promise<number> {
@@ -1522,11 +1544,15 @@ export function createCatalogStore(engine: Engine) {
       });
     },
     listLibraries(): Promise<LibraryRow[]> {
-      return engine.exclusive((q) =>
-        q.all<LibraryRow>(
-          'SELECT l.id, l.name, l.path, COALESCE(s.available, true) AS available FROM libraries l LEFT JOIN scan_libraries s ON s.library_id = l.id ORDER BY l.name',
-        )
-      );
+      return engine.exclusive(libraries);
+    },
+    librariesSnapshot(): Promise<
+      { libraries: LibraryRow[]; revision: string }
+    > {
+      return engine.exclusive(async (q) => ({
+        libraries: await libraries(q),
+        revision: await catalogRevision(q),
+      }));
     },
     addLibrary(row: Omit<LibraryRow, 'available'>): Promise<LibraryRow> {
       return atomic(engine, async (q) => {
@@ -1552,6 +1578,7 @@ export function createCatalogStore(engine: Engine) {
         } finally {
           stmt.destroySync();
         }
+        await advanceCatalogRevision(q);
         return added;
       });
     },
@@ -1575,6 +1602,7 @@ export function createCatalogStore(engine: Engine) {
         );
         // Effects must use this transaction's before/after fact, never a
         // caller snapshot taken before asynchronous filesystem validation.
+        await advanceCatalogRevision(q);
         return { library: row, pathChanged: row.path !== rows[0].path };
       });
     },
@@ -1598,6 +1626,7 @@ export function createCatalogStore(engine: Engine) {
              (SELECT DISTINCT artist_id FROM files
                WHERE artist_id IS NOT NULL)`,
         );
+        await advanceCatalogRevision(q);
         return true;
       });
     },

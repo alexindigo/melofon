@@ -6,6 +6,9 @@ import { createLibrary } from '../src/library.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createOutputs, createPlayer, type Outputs } from '../src/player.ts';
 import { createPlayback, type Playback } from '../src/playback.ts';
+import { browseFixture } from './helpers/browse.ts';
+import { createScan } from '../src/scan.ts';
+import { tagged } from './helpers/tagged.ts';
 
 type Fixture = Awaited<ReturnType<typeof apiFixture>>;
 interface Frame {
@@ -132,6 +135,94 @@ Deno.test('events: cookie/Bearer hello, forced mount, no replay and stable proce
     await reconnect.hello();
     await sleep(80);
     assertEquals(reconnect.frames, []);
+  } finally {
+    for (const socket of sockets) await socket.close();
+    await f.close();
+  }
+});
+
+Deno.test('events: regular cookie/Bearer clients receive committed library invalidation then refetch native changes', async () => {
+  const f = await browseFixture();
+  const sockets: ReturnType<typeof connect>[] = [];
+  try {
+    const song = f.songs.find((s) => s.title === 'Tagged Song')!;
+    const path = `/api/v1/songs/${song.id}`;
+    const clients = [];
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await f.login(
+        mode,
+        'listener',
+        'password-listener',
+      );
+      const socket = connect(f, credential);
+      sockets.push(socket);
+      await socket.hello();
+      const response = await f.get(path, credential);
+      assertEquals(response.status, 200);
+      const etag = response.headers.get('etag')!;
+      await response.body?.cancel();
+      clients.push({ credential, socket, etag });
+    }
+    const scan = createScan(f.store, undefined, {
+      notify: f.notify,
+      state: f.state,
+    });
+    await tagged(song.path, {
+      TIT2: 'Published title',
+      TALB: 'Album',
+      TPE1: 'Shared Artist',
+      TPOS: '1/2',
+    });
+    await scan.run({ mode: 'full' });
+    for (const client of clients) {
+      await waitFor(() =>
+        client.socket.frames.some((frame) => frame.events?.library)
+      );
+      assert(
+        !client.socket.frames.some((frame) =>
+          frame.events?.scan || frame.events?.libraries
+        ),
+      );
+      const response = await f.get(path, client.credential, {
+        'If-None-Match': client.etag,
+      });
+      assertEquals(response.status, 200);
+      assert(response.headers.get('etag') !== client.etag);
+      assertEquals((await response.json()).song.title, 'Published title');
+      // Publication invalidates before candidate acquisition finishes. Each
+      // event is delivered asynchronously; receipt of one is no drain barrier.
+      await waitFor(() =>
+        client.socket.frames.some((frame) => frame.events?.database) &&
+        client.socket.frames.some((frame) => frame.events?.update)
+      );
+      client.socket.frames.length = 0;
+    }
+    const libraries = createLibraries(f.store, { notify: f.notify });
+    const library = (await libraries.list()).find((l) => l.name === 'Music')!;
+    await libraries.update(library.id, { name: 'Public source rename' });
+    for (const client of clients) {
+      await waitFor(() =>
+        client.socket.frames.some((frame) => frame.events?.library)
+      );
+      assertEquals(
+        client.socket.frames.find((frame) => frame.events?.library)?.events
+          ?.library,
+        [],
+      );
+      assert(
+        !client.socket.frames.some((frame) =>
+          frame.events?.scan || frame.events?.libraries
+        ),
+      );
+      const response = await f.get('/api/v1/libraries', client.credential);
+      assertEquals(response.status, 200);
+      assertEquals(
+        (await response.json()).libraries.find((l: { id: string }) =>
+          l.id === library.id
+        ).name,
+        'Public source rename',
+      );
+    }
   } finally {
     for (const socket of sockets) await socket.close();
     await f.close();
