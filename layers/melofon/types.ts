@@ -103,6 +103,11 @@ export interface HatContext {
       getSongSnapshot(
         id: string,
       ): Promise<{ song: SongRow | null; revision: string }>;
+      songsPage(opts: SongPageOptions): Promise<{
+        rows: SongRow[];
+        total: number;
+        revision: string;
+      }>;
     };
     scan: {
       start(): Promise<void>;
@@ -292,7 +297,7 @@ export interface SongMetadata {
   version: string | null;
   albumSortName: string | null;
 }
-export interface AlbumPageOptions {
+export interface BrowsePageOptions {
   sort: 'name' | 'artist' | 'year' | 'newest' | 'genre';
   offset: number;
   limit: number;
@@ -301,6 +306,8 @@ export interface AlbumPageOptions {
   fromYear?: number;
   toYear?: number;
 }
+export type AlbumPageOptions = BrowsePageOptions;
+export type SongPageOptions = BrowsePageOptions;
 export interface AlbumRow {
   id: string;
   name: string | null;

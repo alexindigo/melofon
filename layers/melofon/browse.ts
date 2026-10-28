@@ -1,5 +1,5 @@
 import type {
-  AlbumPageOptions,
+  BrowsePageOptions,
   HatContext,
   HatRequest,
   SongRow,
@@ -42,10 +42,10 @@ export function browseLibrary(params: URLSearchParams): string | undefined {
   return library ?? undefined;
 }
 
-export async function albumPageQuery(
+export async function browsePageQuery(
   request: HatRequest,
   context: HatContext,
-): Promise<AlbumPageOptions> {
+): Promise<BrowsePageOptions> {
   const params = browseQuery(request, [
     'library',
     'offset',
@@ -79,7 +79,7 @@ export async function albumPageQuery(
     await context.app.state.getTyped('melofon.browsePageRecords'),
   );
   return {
-    sort: sort as AlbumPageOptions['sort'],
+    sort: sort as BrowsePageOptions['sort'],
     folderId: browseLibrary(params),
     offset: browseInteger(params, 'offset', 0, 0),
     limit: browseInteger(params, 'limit', Math.min(defaultLimit, max), 1, max),

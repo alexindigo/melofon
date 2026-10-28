@@ -310,6 +310,84 @@ Deno.test('store.catalog album page counts/rows and detail children share their 
   }
 });
 
+Deno.test('store.catalog song page count, rows and revision remain atomic across queued publication', async () => {
+  let pause: ((sql: string) => Promise<void>) | undefined;
+  const t = await domainFixture((engine) =>
+    createCatalogStore({
+      ...engine,
+      exclusive: (fn) =>
+        engine.exclusive((q) =>
+          fn({
+            ...q,
+            async all<T>(sql: string): Promise<T[]> {
+              const rows = await q.all<T>(sql);
+              await pause?.(sql);
+              return rows;
+            },
+          })
+        ),
+    })
+  );
+  try {
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    await t.domain.replaceCatalog(snapshot());
+    const read = () =>
+      t.domain.songsPage({
+        sort: 'newest',
+        folderId: 'lib',
+        genre: 'Jazz',
+        fromYear: 2001,
+        toYear: 2001,
+        limit: 1,
+        offset: 0,
+      });
+    const before = await read();
+    assertEquals(before.total, 1);
+    assertEquals(before.rows[0].id, 'song');
+    let entered!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    pause = async (sql) => {
+      if (sql.includes('SELECT COUNT(*) AS total FROM files')) {
+        entered();
+        await held;
+      }
+    };
+    const pending = read();
+    try {
+      await waiting;
+      const write = t.domain.replaceCatalog({
+        artists: [],
+        albums: [],
+        files: [],
+        albumIdentities: [],
+        albumEvents: [],
+        events: [],
+        retainedIds: [],
+      });
+      pause = undefined;
+      release();
+      assertEquals(await pending, before);
+      await write;
+      const after = await read();
+      assertNotEquals(after.revision, before.revision);
+      assertEquals(after.rows, []);
+      assertEquals(after.total, 0);
+    } finally {
+      pause = undefined;
+      release();
+      await pending;
+    }
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('store.catalog replaceCatalog round-trips plain identity snapshots and retains absent first-seen', async () => {
   const t = await domainFixture(createCatalogStore);
   try {

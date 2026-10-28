@@ -21,6 +21,7 @@ export type {
   LyricsRow,
   RandomSongOptions,
   Search3Result,
+  SongPageOptions,
   SongRow,
 } from './store/catalog.ts';
 
@@ -144,6 +145,7 @@ export function createLibrary(
     getAlbumSnapshot: catalog.getAlbumSnapshot,
     getSong: catalog.getSong,
     getSongSnapshot: catalog.getSongSnapshot,
+    songsPage: catalog.songsPage,
     search3: catalog.search3,
     songPath: catalog.songPath,
     videos: catalog.videos,
