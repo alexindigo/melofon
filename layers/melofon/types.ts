@@ -322,6 +322,7 @@ export interface SongMetadata {
   albumSortName: string | null;
 }
 export interface BrowsePageOptions {
+  ignoredArticles?: string[];
   sort: 'name' | 'artist' | 'year' | 'newest' | 'genre';
   offset: number;
   limit: number;
@@ -344,6 +345,7 @@ export interface ArtistGroupRow {
   albumCount: number;
 }
 export interface ArtistPageOptions {
+  ignoredArticles?: string[];
   folderId?: string;
   offset: number;
   limit: number;

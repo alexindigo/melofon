@@ -91,6 +91,7 @@ export interface GenreRow {
 }
 
 export interface GenrePageOptions {
+  ignoredArticles?: string[];
   folderId?: string;
   offset: number;
   limit: number;
@@ -1150,7 +1151,9 @@ function catalogReads(q: Queries): CatalogReads {
         `SELECT COUNT(*) AS total FROM (${select}) genres`,
       );
       const rows = await q.all<GenreSqlRow>(
-        `${select} ORDER BY f.genre LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+        `${select} ORDER BY ${
+          sortKeySql('f.genre', opts.ignoredArticles)
+        }, f.genre LIMIT ${opts.limit} OFFSET ${opts.offset}`,
       );
       return {
         rows: rows.map(genreOf),

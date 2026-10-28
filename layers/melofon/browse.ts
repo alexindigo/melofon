@@ -51,6 +51,8 @@ async function browsePaging(params: URLSearchParams, context: HatContext) {
     await context.app.state.getTyped('melofon.browsePageRecords'),
   );
   return {
+    // a20 replaces [] with the shared core article setting; fold without stripping.
+    ignoredArticles: [],
     folderId: browseLibrary(params),
     offset: browseInteger(params, 'offset', 0, 0),
     limit: browseInteger(params, 'limit', Math.min(defaultLimit, max), 1, max),

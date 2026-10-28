@@ -105,8 +105,8 @@ Deno.test('API songs: bounded pages partition stable title/ID order and match sa
     const expected = [
       f.songs.find((s) => s.title === 'Alpha')!,
       f.songs.find((s) => s.title === 'Later')!,
-      ...f.songs.filter((s) => s.title === 'Same').sort(byId),
       f.songs.find((s) => s.title === null)!,
+      ...f.songs.filter((s) => s.title === 'Same').sort(byId),
     ];
     let common;
     for (const use of ['cookie', 'bearer'] as const) {
