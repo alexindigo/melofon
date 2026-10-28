@@ -116,6 +116,16 @@ export interface NameSortOptions {
   sortTags?: boolean;
 }
 
+export interface AlbumPageOptions extends NameSortOptions {
+  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre';
+  offset: number;
+  limit: number;
+  folderId?: string;
+  genre?: string;
+  fromYear?: number;
+  toYear?: number;
+}
+
 export interface CatalogReads {
   /** Album artists (artists with at least one album), alphabetically. */
   listArtists(
@@ -165,6 +175,16 @@ export interface CatalogReads {
    * as listAlbums scopes them. */
   albumsById(ids: string[], opts: { folderId?: string }): Promise<AlbumRow[]>;
   getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
+  /** Bounded common catalog facts, exact pre-page total and revision in one slot. */
+  albumsPage(opts: AlbumPageOptions): Promise<{
+    rows: AlbumRow[];
+    total: number;
+    revision: string;
+  }>;
+  getAlbumSnapshot(id: string, folderId?: string): Promise<{
+    detail: { album: AlbumRow; songs: SongRow[] } | null;
+    revision: string;
+  }>;
   getSong(id: string): Promise<SongRow | null>;
   /** Facts and their persistent revision, read under one exclusive slot. */
   getSongSnapshot(
@@ -412,9 +432,15 @@ function albumSelect(q: AlbumQuery = {}): string {
       })`,
     );
   }
-  if (q.yearFrom !== undefined && q.yearTo !== undefined) {
+  if (q.yearFrom !== undefined || q.yearTo !== undefined) {
+    const years = [
+      ...(q.yearFrom === undefined ? [] : [`fy.year >= ${q.yearFrom}`]),
+      ...(q.yearTo === undefined ? [] : [`fy.year <= ${q.yearTo}`]),
+    ];
     wheres.push(
-      `EXISTS (SELECT 1 FROM files fy WHERE fy.album_id = al.id AND fy.year BETWEEN ${q.yearFrom} AND ${q.yearTo})`,
+      `EXISTS (SELECT 1 FROM files fy WHERE fy.album_id = al.id AND ${
+        years.join(' AND ')
+      })`,
     );
   }
   return `
@@ -448,6 +474,33 @@ function songPredicates(opts: Omit<RandomSongOptions, 'size'>): string[] {
 
 // Internal helpers share the current slot, never another public operation.
 function catalogReads(q: Queries): CatalogReads {
+  async function requireLibrary(folderId?: string) {
+    if (folderId === undefined) return;
+    const rows = await q.all(
+      `SELECT id FROM libraries WHERE id = ${esc(folderId)}`,
+    );
+    if (rows.length === 0) {
+      throw new LibraryError('not_found', 'Library not found');
+    }
+  }
+
+  async function albumDetail(id: string, folderId?: string) {
+    const albumRes = await q.all(
+      `${albumSelect({ folderId })} HAVING al.id = ${esc(id)}`,
+    );
+    const albumRow = (albumRes as unknown as AlbumSqlRow[])[0];
+    if (!albumRow) return null;
+    const songRes = await q.all(
+      `${SONG_SELECT} WHERE f.album_id = ${esc(id)}${
+        folderId === undefined ? '' : ` AND f.library_id = ${esc(folderId)}`
+      } ORDER BY f.disc, f.track, f.path, f.id`,
+    );
+    return {
+      album: albumOf(albumRow),
+      songs: (songRes as unknown as SongSqlRow[]).map(songOf),
+    };
+  }
+
   async function resolveArtist(
     id: string,
     all: boolean,
@@ -638,19 +691,59 @@ function catalogReads(q: Queries): CatalogReads {
       return (res as unknown as AlbumSqlRow[]).map(albumOf);
     },
 
-    async getAlbum(id) {
-      const albumRes = await q.all(
-        `${albumSelect()} HAVING al.id = ${esc(id)}`,
+    getAlbum: (id) => albumDetail(id),
+
+    async albumsPage(opts) {
+      await requireLibrary(opts.folderId);
+      const select = albumSelect({
+        folderId: opts.folderId,
+        genre: opts.genre,
+        yearFrom: opts.fromYear,
+        yearTo: opts.toYear,
+      });
+      const name = sortKeySql(
+        'COALESCE(al.name, al.folder_name)',
+        opts.ignoredArticles,
+        opts.sortTags ? 'first(al.sort_name)' : undefined,
       );
-      const albumRow = (albumRes as unknown as AlbumSqlRow[])[0];
-      if (!albumRow) return null;
-      const songRes = await q.all(
-        `${SONG_SELECT} WHERE f.album_id = ${esc(id)}
-         ORDER BY f.disc, f.track, f.path, f.id`,
+      let order: string;
+      switch (opts.sort) {
+        case 'newest':
+          order = 'created_ms DESC NULLS LAST';
+          break;
+        case 'year':
+          order = `MAX(f.year) NULLS LAST, ${name}`;
+          break;
+        case 'artist':
+          order = `${
+            sortKeySql(
+              'ar.name',
+              opts.ignoredArticles,
+              opts.sortTags ? 'first(ar.sort_name)' : undefined,
+            )
+          } NULLS LAST, ${name}`;
+          break;
+        default:
+          order = name;
+      }
+      const count = await q.all<{ total: bigint }>(
+        `SELECT COUNT(*) AS total FROM (${select}) eligible`,
+      );
+      const rows = await q.all<AlbumSqlRow>(
+        `${select} ORDER BY ${order}, al.id LIMIT ${opts.limit} OFFSET ${opts.offset}`,
       );
       return {
-        album: albumOf(albumRow),
-        songs: (songRes as unknown as SongSqlRow[]).map(songOf),
+        rows: rows.map(albumOf),
+        total: Number(count[0].total),
+        revision: await catalogRevision(q),
+      };
+    },
+
+    async getAlbumSnapshot(id, folderId) {
+      await requireLibrary(folderId);
+      return {
+        detail: await albumDetail(id, folderId),
+        revision: await catalogRevision(q),
       };
     },
 
@@ -967,6 +1060,10 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
     albumsById: (...args) =>
       engine.exclusive((q) => catalogReads(q).albumsById(...args)),
     getAlbum: (id) => engine.exclusive((q) => catalogReads(q).getAlbum(id)),
+    albumsPage: (opts) =>
+      engine.exclusive((q) => catalogReads(q).albumsPage(opts)),
+    getAlbumSnapshot: (...args) =>
+      engine.exclusive((q) => catalogReads(q).getAlbumSnapshot(...args)),
     getSong: (id) => engine.exclusive((q) => catalogReads(q).getSong(id)),
     getSongSnapshot: (id) =>
       engine.exclusive((q) => catalogReads(q).getSongSnapshot(id)),

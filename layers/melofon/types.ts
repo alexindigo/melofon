@@ -90,6 +90,15 @@ export interface HatContext {
       remove(id: string, source?: Source): Promise<boolean>;
     };
     library: {
+      albumsPage(opts: AlbumPageOptions): Promise<{
+        rows: AlbumRow[];
+        total: number;
+        revision: string;
+      }>;
+      getAlbumSnapshot(id: string, folderId?: string): Promise<{
+        detail: { album: AlbumRow; songs: SongRow[] } | null;
+        revision: string;
+      }>;
       getSong(id: string): Promise<SongRow | null>;
       getSongSnapshot(
         id: string,
@@ -282,6 +291,41 @@ export interface SongMetadata {
   compilation: boolean;
   version: string | null;
   albumSortName: string | null;
+}
+export interface AlbumPageOptions {
+  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre';
+  offset: number;
+  limit: number;
+  folderId?: string;
+  genre?: string;
+  fromYear?: number;
+  toYear?: number;
+}
+export interface AlbumRow {
+  id: string;
+  name: string | null;
+  artistId: string | null;
+  artistName: string | null;
+  artistKind: 'tagged' | 'shared' | 'various' | 'unknown';
+  folderName: string;
+  songCount: number;
+  durationMs: number;
+  year: number | null;
+  createdAtMs: number | null;
+  metadata?: {
+    musicBrainzId: string | null;
+    recordLabels: string[];
+    releaseTypes: string[];
+    genres: string[];
+    moods: string[];
+    releaseDate: string | null;
+    originalReleaseDate: string | null;
+    compilation: boolean;
+    version: string | null;
+    sortName: string | null;
+    explicit: 'explicit' | 'clean' | null;
+    discTitles: { disc: number; title: string }[];
+  };
 }
 export interface SongRow {
   id: string;

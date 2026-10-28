@@ -14,6 +14,7 @@ import {
   readImage,
 } from './images.ts';
 export type {
+  AlbumPageOptions,
   AlbumRow,
   ArtistRow,
   GenreRow,
@@ -139,6 +140,8 @@ export function createLibrary(
     listAlbums: catalog.listAlbums,
     albumsById: catalog.albumsById,
     getAlbum: catalog.getAlbum,
+    albumsPage: catalog.albumsPage,
+    getAlbumSnapshot: catalog.getAlbumSnapshot,
     getSong: catalog.getSong,
     getSongSnapshot: catalog.getSongSnapshot,
     search3: catalog.search3,

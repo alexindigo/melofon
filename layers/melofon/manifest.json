@@ -1,6 +1,18 @@
 {
   "api": "/api/v1",
   "settings": {
+    "melofon.browsePageRecords": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 50,
+      "description": "Default number of records per native catalog page, capped by browseMaxPageRecords"
+    },
+    "melofon.browseMaxPageRecords": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 500,
+      "description": "Maximum number of records per native catalog page"
+    },
     "melofon.logPageRecords": {
       "type": "integer",
       "minimum": 1,

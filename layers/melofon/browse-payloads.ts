@@ -1,8 +1,46 @@
 import { posix } from 'node:path';
-import type { Library, SongMetadata, SongRow } from './types.ts';
+import type { AlbumRow, Library, SongMetadata, SongRow } from './types.ts';
 
 export function librarySummary(library: Library) {
   return { id: library.id, name: library.name, available: library.available };
+}
+
+export function albumSummary(album: AlbumRow) {
+  const metadata = album.metadata;
+  return {
+    id: album.id,
+    name: album.name,
+    label: album.name ?? `[${album.folderName}]`,
+    folderName: album.folderName,
+    artistId: album.artistId,
+    artistName: album.artistName,
+    artistKind: album.artistKind,
+    artistLabel: album.artistName ??
+      (album.artistKind === 'various'
+        ? '[Various Artists]'
+        : '[Unknown Artist]'),
+    songCount: album.songCount,
+    durationMs: album.durationMs,
+    year: album.year,
+    createdAtMs: album.createdAtMs,
+    metadata: metadata === undefined ? null : {
+      musicBrainzId: metadata.musicBrainzId,
+      recordLabels: metadata.recordLabels,
+      releaseTypes: metadata.releaseTypes,
+      genres: metadata.genres,
+      moods: metadata.moods,
+      releaseDate: metadata.releaseDate,
+      originalReleaseDate: metadata.originalReleaseDate,
+      compilation: metadata.compilation,
+      version: metadata.version,
+      sortName: metadata.sortName,
+      explicit: metadata.explicit,
+      discTitles: metadata.discTitles.map(({ disc, title }) => ({
+        disc,
+        title,
+      })),
+    },
+  };
 }
 
 /** No absolute fallback, including unresolved or mismatched source roots. */

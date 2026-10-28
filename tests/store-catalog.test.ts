@@ -225,6 +225,91 @@ Deno.test('store.catalog song and source snapshots cannot pair old facts with a 
   }
 });
 
+Deno.test('store.catalog album page counts/rows and detail children share their revision snapshot', async () => {
+  let pause: ((sql: string) => Promise<void>) | undefined;
+  const t = await domainFixture((engine) =>
+    createCatalogStore({
+      ...engine,
+      exclusive: (fn) =>
+        engine.exclusive((q) =>
+          fn({
+            ...q,
+            async all<T>(sql: string): Promise<T[]> {
+              const rows = await q.all<T>(sql);
+              await pause?.(sql);
+              return rows;
+            },
+          })
+        ),
+    })
+  );
+  try {
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    for (const kind of ['page', 'detail'] as const) {
+      await t.domain.replaceCatalog({
+        ...snapshot(),
+        retainedIds: kind === 'page' ? [] : ['song'],
+      });
+      const read = () =>
+        kind === 'page'
+          ? t.domain.albumsPage({
+            sort: 'name',
+            limit: 1,
+            offset: 0,
+            folderId: 'lib',
+          })
+          : t.domain.getAlbumSnapshot('album', 'lib');
+      const before = await read();
+      let entered!: () => void;
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      pause = async (sql) => {
+        if (
+          (kind === 'page' && sql.includes('SELECT COUNT(*) AS total')) ||
+          (kind === 'detail' && sql.includes('HAVING al.id'))
+        ) {
+          entered();
+          await held;
+        }
+      };
+      const pending = read();
+      try {
+        await waiting;
+        const write = t.domain.replaceCatalog({
+          artists: [],
+          albums: [],
+          files: [],
+          albumIdentities: [],
+          albumEvents: [],
+          events: [],
+          retainedIds: [],
+        });
+        pause = undefined;
+        release();
+        assertEquals(await pending, before);
+        await write;
+        const after = await read();
+        assertNotEquals(after.revision, before.revision);
+        if ('rows' in after) {
+          assertEquals(after.rows, []);
+          assertEquals(after.total, 0);
+        } else assertEquals(after.detail, null);
+      } finally {
+        pause = undefined;
+        release();
+        await pending;
+      }
+    }
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('store.catalog replaceCatalog round-trips plain identity snapshots and retains absent first-seen', async () => {
   const t = await domainFixture(createCatalogStore);
   try {
