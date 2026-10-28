@@ -88,6 +88,9 @@ export interface HatContext {
       ): Promise<Library>;
       remove(id: string, source?: Source): Promise<boolean>;
     };
+    library: {
+      getSong(id: string): Promise<SongRow | null>;
+    };
     scan: {
       start(): Promise<void>;
       request(
@@ -243,6 +246,62 @@ export interface Library {
   name: string;
   path: string;
   available: boolean;
+}
+export interface SongMetadata {
+  bitRate: number | null;
+  bitDepth: number | null;
+  sampleRate: number | null;
+  channels: number | null;
+  trackGain: number | null;
+  trackPeak: number | null;
+  albumGain: number | null;
+  albumPeak: number | null;
+  baseGain: number | null;
+  recordingMbid: string | null;
+  artistMbid: string | null;
+  albumArtistMbid: string | null;
+  isrc: string[];
+  genres: string[];
+  moods: string[];
+  comment: string | null;
+  sortTitle: string | null;
+  artistSortName: string | null;
+  albumArtistSortName: string | null;
+  bpm: number | null;
+  explicit: 'explicit' | 'clean' | null;
+  discSubtitle: string | null;
+  albumMbid: string | null;
+  recordLabels: string[];
+  releaseTypes: string[];
+  releaseDate: string | null;
+  originalReleaseDate: string | null;
+  compilation: boolean;
+  version: string | null;
+  albumSortName: string | null;
+}
+export interface SongRow {
+  id: string;
+  path: string;
+  libraryId: string | null;
+  libraryPath: string | null;
+  title: string | null;
+  fileName: string;
+  albumId: string | null;
+  albumName: string | null;
+  albumFolderName: string | null;
+  artistId: string | null;
+  artistName: string | null;
+  track: number | null;
+  disc: number | null;
+  durationMs: number | null;
+  size: number | null;
+  genre: string | null;
+  year: number | null;
+  firstSeenMs: number | null;
+  isVideo: boolean;
+  suffix: string;
+  contentType: string;
+  metadata?: SongMetadata;
 }
 export interface Source {
   kind: 'http';
