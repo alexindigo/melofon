@@ -16,6 +16,9 @@ import {
 export type {
   AlbumPageOptions,
   AlbumRow,
+  ArtistGroupRef,
+  ArtistGroupRow,
+  ArtistPageOptions,
   ArtistRow,
   GenreRow,
   LyricsRow,
@@ -133,6 +136,9 @@ export function createLibrary(
         : null;
     },
     listArtists: catalog.listArtists,
+    artistsPage: catalog.artistsPage,
+    getArtistSnapshot: catalog.getArtistSnapshot,
+    artistAlbumsPage: catalog.artistAlbumsPage,
     getArtist: catalog.getArtist,
     artistById: catalog.artistById,
     artistIds: catalog.artistIds,

@@ -136,7 +136,40 @@ export interface SongPageOptions extends NameSortOptions {
   toYear?: number;
 }
 
+/** Factual groups only: hats own placeholder IDs and labels. */
+export type ArtistGroupRef =
+  | { kind: 'artist'; id: string }
+  | { kind: 'various' | 'unknown' };
+export interface ArtistGroupRow {
+  kind: 'artist' | 'various' | 'unknown';
+  id: string | null;
+  name: string | null;
+  musicBrainzId: string | null;
+  sortName: string | null;
+  albumCount: number;
+}
+export interface ArtistPageOptions extends NameSortOptions {
+  folderId?: string;
+  offset: number;
+  limit: number;
+}
+
 export interface CatalogReads {
+  artistsPage(opts: ArtistPageOptions): Promise<{
+    rows: ArtistGroupRow[];
+    total: number;
+    revision: string;
+  }>;
+  getArtistSnapshot(ref: ArtistGroupRef, folderId?: string): Promise<{
+    artist: ArtistGroupRow | null;
+    revision: string;
+  }>;
+  artistAlbumsPage(ref: ArtistGroupRef, opts: ArtistPageOptions): Promise<{
+    artist: ArtistGroupRow | null;
+    rows: AlbumRow[];
+    total: number;
+    revision: string;
+  }>;
   /** Album artists (artists with at least one album), alphabetically. */
   listArtists(
     folderId?: string,
@@ -488,6 +521,61 @@ function songPredicates(opts: Omit<RandomSongOptions, 'size'>): string[] {
   return predicates;
 }
 
+interface ArtistGroupSqlRow {
+  kind: ArtistGroupRow['kind'];
+  id: string | null;
+  name: string | null;
+  musicbrainz_id: string | null;
+  sort_name: string | null;
+  album_count: bigint;
+}
+
+function artistGroupOf(row: ArtistGroupSqlRow): ArtistGroupRow {
+  return {
+    kind: row.kind,
+    id: row.id,
+    name: row.name,
+    musicBrainzId: row.musicbrainz_id,
+    sortName: row.sort_name,
+    albumCount: Number(row.album_count),
+  };
+}
+
+// Both root groups and details use the same scoped album population. Details
+// additionally admit a performer present only on tracks, with zero memberships.
+function artistGroups(folderId?: string, trackOnly = false): string {
+  const scope = folderId === undefined
+    ? ''
+    : `AND f.library_id = ${esc(folderId)}`;
+  return `WITH eligible_albums AS (
+    SELECT al.* FROM albums al WHERE EXISTS (
+      SELECT 1 FROM files f WHERE f.album_id = al.id ${scope})
+  )
+  SELECT 'artist' AS kind, ar.id, ar.name, ar.musicbrainz_id,
+    first(ar.sort_name) AS sort_name, COUNT(al.id) AS album_count
+  FROM artists ar ${trackOnly ? 'LEFT JOIN' : 'JOIN'} eligible_albums al
+    ON al.album_artist_id = ar.id
+  ${
+    trackOnly
+      ? `WHERE EXISTS (
+    SELECT 1 FROM files f LEFT JOIN albums a ON a.id = f.album_id
+    WHERE (f.artist_id = ar.id OR a.album_artist_id = ar.id) ${scope})`
+      : ''
+  }
+  GROUP BY ar.id, ar.name, ar.musicbrainz_id
+  UNION ALL
+  SELECT artist_kind AS kind, NULL AS id, NULL AS name,
+    NULL AS musicbrainz_id, NULL AS sort_name, COUNT(*) AS album_count
+  FROM eligible_albums WHERE album_artist_id IS NULL
+    AND artist_kind IN ('various', 'unknown') GROUP BY artist_kind`;
+}
+
+function artistGroupPredicate(ref: ArtistGroupRef): string {
+  return ref.kind === 'artist'
+    ? `kind = 'artist' AND id = ${esc(ref.id)}`
+    : `kind = ${esc(ref.kind)}`;
+}
+
 // Internal helpers share the current slot, never another public operation.
 function catalogReads(q: Queries): CatalogReads {
   async function requireLibrary(folderId?: string) {
@@ -515,6 +603,14 @@ function catalogReads(q: Queries): CatalogReads {
       album: albumOf(albumRow),
       songs: (songRes as unknown as SongSqlRow[]).map(songOf),
     };
+  }
+
+  async function artistGroup(ref: ArtistGroupRef, folderId?: string) {
+    const rows = await q.all<ArtistGroupSqlRow>(
+      `SELECT * FROM (${artistGroups(folderId, true)}) groups
+        WHERE ${artistGroupPredicate(ref)}`,
+    );
+    return rows[0] ? artistGroupOf(rows[0]) : null;
   }
 
   async function resolveArtist(
@@ -546,6 +642,59 @@ function catalogReads(q: Queries): CatalogReads {
       : null;
   }
   return {
+    async artistsPage(opts) {
+      await requireLibrary(opts.folderId);
+      const select = artistGroups(opts.folderId);
+      const count = await q.all<{ total: bigint }>(
+        `SELECT COUNT(*) AS total FROM (${select}) groups`,
+      );
+      const key = sortKeySql(
+        'name',
+        opts.ignoredArticles,
+        opts.sortTags ? 'sort_name' : undefined,
+      );
+      const rows = await q.all<ArtistGroupSqlRow>(
+        `SELECT * FROM (${select}) groups ORDER BY ${key} NULLS LAST,
+          kind, id LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+      );
+      return {
+        rows: rows.map(artistGroupOf),
+        total: Number(count[0].total),
+        revision: await catalogRevision(q),
+      };
+    },
+
+    async getArtistSnapshot(ref, folderId) {
+      await requireLibrary(folderId);
+      return {
+        artist: await artistGroup(ref, folderId),
+        revision: await catalogRevision(q),
+      };
+    },
+
+    async artistAlbumsPage(ref, opts) {
+      await requireLibrary(opts.folderId);
+      const artist = await artistGroup(ref, opts.folderId);
+      const membership = ref.kind === 'artist'
+        ? `al.album_artist_id = ${esc(ref.id)}`
+        : `al.album_artist_id IS NULL AND al.artist_kind = ${esc(ref.kind)}`;
+      const key = sortKeySql(
+        'COALESCE(al.name, al.folder_name)',
+        opts.ignoredArticles,
+        opts.sortTags ? 'first(al.sort_name)' : undefined,
+      );
+      const rows = artist === null ? [] : await q.all<AlbumSqlRow>(
+        `${albumSelect({ folderId: opts.folderId })} HAVING ${membership}
+          ORDER BY ${key}, al.id LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+      );
+      return {
+        artist,
+        rows: rows.map(albumOf),
+        total: artist?.albumCount ?? 0,
+        revision: await catalogRevision(q),
+      };
+    },
+
     async listArtists(folderId, opts = {}): Promise<ArtistRow[]> {
       const key = sortKeySql(
         'ar.name',
@@ -1105,6 +1254,12 @@ function catalogReads(q: Queries): CatalogReads {
 
 function createCatalogReadStore(engine: Engine): CatalogReads {
   return {
+    artistsPage: (opts) =>
+      engine.exclusive((q) => catalogReads(q).artistsPage(opts)),
+    getArtistSnapshot: (...args) =>
+      engine.exclusive((q) => catalogReads(q).getArtistSnapshot(...args)),
+    artistAlbumsPage: (...args) =>
+      engine.exclusive((q) => catalogReads(q).artistAlbumsPage(...args)),
     listArtists: (...args) =>
       engine.exclusive((q) => catalogReads(q).listArtists(...args)),
     getArtist: (id) => engine.exclusive((q) => catalogReads(q).getArtist(id)),

@@ -388,6 +388,106 @@ Deno.test('store.catalog song page count, rows and revision remain atomic across
   }
 });
 
+Deno.test('store.catalog artist groups, detail counts and memberships keep one snapshot across queued publication', async () => {
+  let pause: ((sql: string) => Promise<void>) | undefined;
+  const t = await domainFixture((engine) =>
+    createCatalogStore({
+      ...engine,
+      exclusive: (fn) =>
+        engine.exclusive((q) =>
+          fn({
+            ...q,
+            async all<T>(sql: string): Promise<T[]> {
+              const rows = await q.all<T>(sql);
+              await pause?.(sql);
+              return rows;
+            },
+          })
+        ),
+    })
+  );
+  try {
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    let first = true;
+    for (const kind of ['artist', 'various', 'unknown'] as const) {
+      for (const operation of ['root', 'detail', 'memberships'] as const) {
+        const input = snapshot();
+        if (kind !== 'artist') {
+          input.albums[0] = {
+            ...input.albums[0],
+            albumArtistId: null,
+            artistName: null,
+            artistKind: kind,
+          };
+        }
+        await t.domain.replaceCatalog({
+          ...input,
+          retainedIds: first ? [] : ['song'],
+        });
+        first = false;
+        const ref = kind === 'artist' ? { kind, id: 'artist' } : { kind };
+        const read = () =>
+          operation === 'root'
+            ? t.domain.artistsPage({ folderId: 'lib', limit: 1, offset: 0 })
+            : operation === 'detail'
+            ? t.domain.getArtistSnapshot(ref, 'lib')
+            : t.domain.artistAlbumsPage(ref, {
+              folderId: 'lib',
+              limit: 1,
+              offset: 0,
+            });
+        const before = await read();
+        if ('total' in before) assertEquals(before.total, 1);
+        if ('artist' in before) assertEquals(before.artist?.albumCount, 1);
+        let entered!: () => void;
+        let release!: () => void;
+        const waiting = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        pause = async (sql) => {
+          if (sql.includes('FROM (WITH eligible_albums')) {
+            entered();
+            await held;
+          }
+        };
+        const pending = read();
+        try {
+          await waiting;
+          const write = t.domain.replaceCatalog({
+            artists: [],
+            albums: [],
+            files: [],
+            albumIdentities: [],
+            albumEvents: [],
+            events: [],
+            retainedIds: [],
+          });
+          pause = undefined;
+          release();
+          assertEquals(await pending, before);
+          await write;
+          const after = await read();
+          assertNotEquals(after.revision, before.revision);
+          if ('rows' in after) {
+            assertEquals(after.rows, []);
+            assertEquals(after.total, 0);
+          }
+          if ('artist' in after) assertEquals(after.artist, null);
+        } finally {
+          pause = undefined;
+          release();
+          await pending;
+        }
+      }
+    }
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('store.catalog replaceCatalog round-trips plain identity snapshots and retains absent first-seen', async () => {
   const t = await domainFixture(createCatalogStore);
   try {

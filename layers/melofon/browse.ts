@@ -1,4 +1,5 @@
 import type {
+  ArtistPageOptions,
   BrowsePageOptions,
   HatContext,
   HatRequest,
@@ -42,6 +43,31 @@ export function browseLibrary(params: URLSearchParams): string | undefined {
   return library ?? undefined;
 }
 
+async function browsePaging(params: URLSearchParams, context: HatContext) {
+  const max = Number(
+    await context.app.state.getTyped('melofon.browseMaxPageRecords'),
+  );
+  const defaultLimit = Number(
+    await context.app.state.getTyped('melofon.browsePageRecords'),
+  );
+  return {
+    folderId: browseLibrary(params),
+    offset: browseInteger(params, 'offset', 0, 0),
+    limit: browseInteger(params, 'limit', Math.min(defaultLimit, max), 1, max),
+  };
+}
+
+export async function artistPageQuery(
+  request: HatRequest,
+  context: HatContext,
+): Promise<ArtistPageOptions> {
+  const params = browseQuery(request, ['library', 'offset', 'limit', 'sort']);
+  if ((params.get('sort') ?? 'name') !== 'name') {
+    fail(400, 'invalid_field', 'Invalid sort');
+  }
+  return await browsePaging(params, context);
+}
+
 export async function browsePageQuery(
   request: HatRequest,
   context: HatContext,
@@ -72,17 +98,9 @@ export async function browsePageQuery(
   if (fromYear !== undefined && toYear !== undefined && fromYear > toYear) {
     fail(400, 'invalid_field', 'Invalid year range');
   }
-  const max = Number(
-    await context.app.state.getTyped('melofon.browseMaxPageRecords'),
-  );
-  const defaultLimit = Number(
-    await context.app.state.getTyped('melofon.browsePageRecords'),
-  );
   return {
     sort: sort as BrowsePageOptions['sort'],
-    folderId: browseLibrary(params),
-    offset: browseInteger(params, 'offset', 0, 0),
-    limit: browseInteger(params, 'limit', Math.min(defaultLimit, max), 1, max),
+    ...await browsePaging(params, context),
     genre,
     fromYear,
     toYear,

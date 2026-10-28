@@ -90,6 +90,21 @@ export interface HatContext {
       remove(id: string, source?: Source): Promise<boolean>;
     };
     library: {
+      artistsPage(opts: ArtistPageOptions): Promise<{
+        rows: ArtistGroupRow[];
+        total: number;
+        revision: string;
+      }>;
+      getArtistSnapshot(ref: ArtistGroupRef, folderId?: string): Promise<{
+        artist: ArtistGroupRow | null;
+        revision: string;
+      }>;
+      artistAlbumsPage(ref: ArtistGroupRef, opts: ArtistPageOptions): Promise<{
+        artist: ArtistGroupRow | null;
+        rows: AlbumRow[];
+        total: number;
+        revision: string;
+      }>;
       albumsPage(opts: AlbumPageOptions): Promise<{
         rows: AlbumRow[];
         total: number;
@@ -308,6 +323,22 @@ export interface BrowsePageOptions {
 }
 export type AlbumPageOptions = BrowsePageOptions;
 export type SongPageOptions = BrowsePageOptions;
+export type ArtistGroupRef =
+  | { kind: 'artist'; id: string }
+  | { kind: 'various' | 'unknown' };
+export interface ArtistGroupRow {
+  kind: 'artist' | 'various' | 'unknown';
+  id: string | null;
+  name: string | null;
+  musicBrainzId: string | null;
+  sortName: string | null;
+  albumCount: number;
+}
+export interface ArtistPageOptions {
+  folderId?: string;
+  offset: number;
+  limit: number;
+}
 export interface AlbumRow {
   id: string;
   name: string | null;

@@ -1,5 +1,32 @@
 import { posix } from 'node:path';
-import type { AlbumRow, Library, SongMetadata, SongRow } from './types.ts';
+import type {
+  AlbumRow,
+  ArtistGroupRef,
+  ArtistGroupRow,
+  Library,
+  SongMetadata,
+  SongRow,
+} from './types.ts';
+
+// Reserved native IDs cannot collide with the catalog's hashed artist IDs.
+export function artistReference(id: string): ArtistGroupRef {
+  return id === 'various' || id === 'unknown'
+    ? { kind: id }
+    : { kind: 'artist', id };
+}
+
+export function artistSummary(artist: ArtistGroupRow) {
+  return {
+    id: artist.kind === 'artist' ? artist.id! : artist.kind,
+    kind: artist.kind,
+    name: artist.name,
+    label: artist.name ??
+      (artist.kind === 'various' ? '[Various Artists]' : '[Unknown Artist]'),
+    musicBrainzId: artist.musicBrainzId,
+    sortName: artist.sortName,
+    albumCount: artist.albumCount,
+  };
+}
 
 export function librarySummary(library: Library) {
   return { id: library.id, name: library.name, available: library.available };
