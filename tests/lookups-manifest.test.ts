@@ -1,6 +1,48 @@
 import { assertEquals, assertMatch, assertThrows } from '@std/assert';
-import { discoverLookups, parseManifest } from '../src/lookups/manifest.ts';
+import {
+  discoverLookups,
+  isReference,
+  parseManifest,
+} from '../src/lookups/manifest.ts';
 import { lookupManifest, lookupPlugin } from './helpers/lookup.ts';
+
+Deno.test('lyrics capabilities are track candidates, separate from reference and image outputs', () => {
+  const lyrics = {
+    id: 'lyrics',
+    accepts: 'track',
+    provides: ['track.lyrics'],
+    requires: ['track.title', 'track.artist', 'track.id.mbid'],
+  };
+  const image = lookupManifest().capabilities[0];
+  const reference = {
+    id: 'similar',
+    accepts: 'track',
+    provides: ['track.similar'],
+  };
+  const capabilities = parseManifest(
+    lookupManifest({
+      capabilities: [lyrics, image, reference],
+    }),
+    'fixture',
+  ).capabilities;
+  assertEquals(capabilities[0], lyrics);
+  assertEquals(capabilities.map(isReference), [false, false, true]);
+  for (
+    const capability of [
+      { ...lyrics, accepts: 'song' },
+      { ...lyrics, accepts: 'album' },
+      { ...lyrics, accepts: 'artist' },
+      { ...lyrics, provides: ['track.lyrics', 'track.similar'] },
+      { ...lyrics, provides: ['track.lyrics', 'album.image.front'] },
+      { ...lyrics, provides: ['track.lyrics', 'track.lyrics'] },
+      { ...lyrics, provides: ['song.lyrics'] },
+    ]
+  ) {
+    assertThrows(() =>
+      parseManifest(lookupManifest({ capabilities: [capability] }), 'fixture')
+    );
+  }
+});
 
 Deno.test('reference capabilities use typed vocabulary without candidates or photos', () => {
   const artist = {

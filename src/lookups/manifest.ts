@@ -22,6 +22,11 @@ export type CandidateCapability = {
   accepts: 'artist';
   provides: ['artist.image.primary'];
   requires: string[];
+} | {
+  id: string;
+  accepts: 'track';
+  provides: ['track.lyrics'];
+  requires: string[];
 };
 export interface ReferenceCapability {
   id: string;
@@ -34,7 +39,8 @@ export function isReference(
   capability: Capability,
 ): capability is ReferenceCapability {
   return capability.accepts !== 'album' &&
-    capability.provides[0] !== 'artist.image.primary';
+    capability.provides[0] !== 'artist.image.primary' &&
+    capability.provides[0] !== 'track.lyrics';
 }
 export interface Manifest {
   contract: 1;
@@ -155,6 +161,9 @@ export function parseManifest(raw: unknown, id: string): Manifest {
         : c.accepts === 'artist' && provides.length === 1 &&
             provides[0] === 'artist.image.primary'
         ? false
+        : c.accepts === 'track' && provides.length === 1 &&
+            provides[0] === 'track.lyrics'
+        ? false
         : !provides.every((name) =>
           referenceNames(c.accepts as ReferenceType).includes(
             name as ReferenceName,
@@ -176,6 +185,8 @@ export function parseManifest(raw: unknown, id: string): Manifest {
         provides: ['artist.image.primary'],
         requires,
       }
+      : c.accepts === 'track' && provides[0] === 'track.lyrics'
+      ? { id: cid, accepts: 'track', provides: ['track.lyrics'], requires }
       : {
         id: cid,
         accepts: c.accepts,

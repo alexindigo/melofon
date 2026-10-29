@@ -15,6 +15,7 @@ import {
 } from './net.ts';
 import type { ReferenceValues } from '../reference-types.ts';
 import { parseReferenceValues } from './reference-values.ts';
+import { type LookupLyricsValue, parseLyricsValue } from './lyrics-values.ts';
 
 export type PluginState =
   | 'discovered'
@@ -25,11 +26,13 @@ export type PluginState =
   | 'stopping';
 export class LookupRevoked extends Error {}
 export interface LookupCandidate {
-  target: { type: 'album' | 'artist'; id: string };
+  target: { type: 'album' | 'artist' | 'track'; id: string };
   confidence: 'strong' | 'medium' | 'low';
-  values: Partial<
-    Record<'album.image.front' | 'artist.image.primary', { url: string }>
-  >;
+  values:
+    & Partial<
+      Record<'album.image.front' | 'artist.image.primary', { url: string }>
+    >
+    & { 'track.lyrics'?: LookupLyricsValue };
   ids?: Record<string, string>;
   evidence?: Record<string, unknown>;
 }
@@ -42,7 +45,22 @@ export type LookupResult = { candidates: LookupCandidate[] } | {
 export function parseResult(
   raw: unknown,
   capability: Capability,
+  context?: { targetId: string; maxBytes: number },
 ): LookupResult {
+  const lyrics = !isReference(capability) && capability.accepts === 'track';
+  if (lyrics) {
+    // Bound the complete outcome, including variants, cues and evidence. The
+    // caller supplies the owner's live byte budget; no second fixed cap here.
+    if (
+      !context?.targetId || !Number.isSafeInteger(context.maxBytes) ||
+      context.maxBytes < 1
+    ) throw new Error('Lyrics result requires a target and byte budget');
+    if (
+      new TextEncoder().encode(JSON.stringify(raw)).length > context.maxBytes
+    ) {
+      throw new Error('Lyrics result exceeds byte budget');
+    }
+  }
   const r = object(
     raw,
     isReference(capability)
@@ -65,7 +83,7 @@ export function parseResult(
     throw new Error('Invalid lookup outcome');
   }
   return {
-    candidates: r.candidates.map((raw): LookupCandidate => {
+    candidates: Array.from(r.candidates, (raw): LookupCandidate => {
       const c = object(raw, [
         'target',
         'confidence',
@@ -76,17 +94,23 @@ export function parseResult(
       const target = object(c.target, ['type', 'id']);
       if (
         target.type !== capability.accepts || typeof target.id !== 'string' ||
-        !target.id
+        !target.id || (lyrics && target.id !== context!.targetId)
       ) throw new Error('Invalid candidate target');
       if (
-        !['strong', 'medium', 'low'].includes(String(c.confidence))
+        typeof c.confidence !== 'string' ||
+        !['strong', 'medium', 'low'].includes(c.confidence)
       ) throw new Error('Invalid candidate confidence');
       const values = object(c.values, capability.provides);
-      const image = object(values[capability.provides[0]], ['url']);
-      if (
-        typeof image.url !== 'string' ||
-        !['http:', 'https:'].includes(new URL(image.url).protocol)
-      ) throw new Error('Invalid image URL');
+      const parsedValues = lyrics
+        ? { 'track.lyrics': parseLyricsValue(values['track.lyrics']) }
+        : values;
+      if (!lyrics) {
+        const image = object(values[capability.provides[0]], ['url']);
+        if (
+          typeof image.url !== 'string' ||
+          !['http:', 'https:'].includes(new URL(image.url).protocol)
+        ) throw new Error('Invalid image URL');
+      }
       if (
         c.ids !== undefined &&
         (!c.ids || typeof c.ids !== 'object' || Array.isArray(c.ids) ||
@@ -97,7 +121,10 @@ export function parseResult(
         (!c.evidence || typeof c.evidence !== 'object' ||
           Array.isArray(c.evidence))
       ) throw new Error('Invalid evidence');
-      return structuredClone(c) as unknown as LookupCandidate;
+      return structuredClone({
+        ...c,
+        values: parsedValues,
+      }) as unknown as LookupCandidate;
     }),
   };
 }
@@ -367,6 +394,11 @@ export class LookupHost {
     limits: { timeoutMs: number; maxBytes: number },
     outer?: AbortSignal,
   ): Promise<LookupResult> {
+    // Bind result admission to the submitted identity before asynchronous work.
+    const targetId = item && typeof item === 'object' && 'id' in item &&
+        typeof item.id === 'string'
+      ? item.id
+      : '';
     await this.start();
     const slot = this.slot!;
     if (slot.call) throw new Error('Lookup intake is full');
@@ -415,7 +447,11 @@ export class LookupHost {
         item,
         settings: this.settings,
       });
-      return parseResult(await result.promise, capability);
+      const raw = await result.promise;
+      return parseResult(raw, capability, {
+        targetId,
+        maxBytes: limits.maxBytes,
+      });
     } finally {
       clearTimeout(timer);
       signal.removeEventListener('abort', abort);
