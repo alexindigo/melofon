@@ -1,4 +1,5 @@
 import type {
+  AlbumPageOptions,
   ArtistPageOptions,
   BrowsePageOptions,
   HatContext,
@@ -116,10 +117,24 @@ export async function namePageQuery(
   return await browsePaging(params, context);
 }
 
+export function personalAlbumSort(sort: string): boolean {
+  return ['starred', 'highest', 'frequent', 'recent'].includes(sort);
+}
+
+export function browsePageQuery(
+  request: HatRequest,
+  context: HatContext,
+  collection: 'albums',
+): Promise<AlbumPageOptions>;
+export function browsePageQuery(
+  request: HatRequest,
+  context: HatContext,
+): Promise<BrowsePageOptions>;
 export async function browsePageQuery(
   request: HatRequest,
   context: HatContext,
-): Promise<BrowsePageOptions> {
+  collection?: 'albums',
+): Promise<AlbumPageOptions> {
   const params = browseQuery(request, [
     'library',
     'offset',
@@ -131,7 +146,11 @@ export async function browsePageQuery(
     'toYear',
   ]);
   const sort = params.get('sort') ?? 'name';
-  if (!['name', 'artist', 'year', 'newest', 'genre', 'random'].includes(sort)) {
+  const personal = collection === 'albums' && personalAlbumSort(sort);
+  if (
+    !personal &&
+    !['name', 'artist', 'year', 'newest', 'genre', 'random'].includes(sort)
+  ) {
     fail(400, 'invalid_field', 'Invalid sort');
   }
   const seed = params.get('seed') ?? undefined;
@@ -154,7 +173,8 @@ export async function browsePageQuery(
     fail(400, 'invalid_field', 'Invalid year range');
   }
   return {
-    sort: sort as BrowsePageOptions['sort'],
+    sort: sort as AlbumPageOptions['sort'],
+    ...(personal ? { username: context.state.user.username } : {}),
     seed,
     ...await browsePaging(params, context),
     genre,

@@ -338,7 +338,15 @@ export interface BrowsePageOptions {
   fromYear?: number;
   toYear?: number;
 }
-export type AlbumPageOptions = BrowsePageOptions;
+export interface AlbumPageOptions extends Omit<BrowsePageOptions, 'sort'> {
+  sort:
+    | BrowsePageOptions['sort']
+    | 'starred'
+    | 'highest'
+    | 'frequent'
+    | 'recent';
+  username?: string;
+}
 export type SongPageOptions = BrowsePageOptions;
 export type ArtistGroupRef =
   | { kind: 'artist'; id: string }

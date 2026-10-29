@@ -124,6 +124,7 @@ export interface HatContext {
           | 'artist'
           | 'random'
           | 'newest'
+          | 'starred'
           | 'highest'
           | 'frequent'
           | 'recent'

@@ -430,14 +430,14 @@ export async function scanStatusOf(
 
 // getAlbumList/getAlbumList2 share the type table. Every documented type is
 // implemented; unknown types get the same clean "not implemented" envelope.
-// `starred` is not a core sort: the plugin orders the user's favourite
-// albums by their most recent like (see albumListAlbums).
+// Core owns eligibility, order and paging for personal selections too.
 const ALBUM_LIST_SORTS: Record<
   string,
   | 'name'
   | 'artist'
   | 'random'
   | 'newest'
+  | 'starred'
   | 'highest'
   | 'frequent'
   | 'recent'
@@ -448,6 +448,7 @@ const ALBUM_LIST_SORTS: Record<
   alphabeticalByArtist: 'artist',
   random: 'random',
   newest: 'newest',
+  starred: 'starred',
   highest: 'highest',
   frequent: 'frequent',
   recent: 'recent',
@@ -461,23 +462,6 @@ export async function albumListAlbums(
   const params = context.state.params!;
   const type = requiredParam(context, 'type');
   if (type instanceof Response) return type;
-  if (type === 'starred') {
-    const user = context.state.user;
-    if (user === undefined) return [];
-    const folderId = await folderIdParam(context);
-    const items = (await context.app.annotation.starred(user.username, {
-      folderId,
-    })).filter((item) => item.targetType === 'album');
-    const albums = byLatestLike(
-      await context.app.library.albumsById(
-        items.map((item) => item.targetId),
-        { folderId },
-      ),
-      items,
-    );
-    const offset = safeIntParam(params, 'offset', 0);
-    return albums.slice(offset, offset + boundedCountParam(params, 'size'));
-  }
   const sort = ALBUM_LIST_SORTS[type];
   if (sort === undefined) {
     return fail(context, 0, `album list type not implemented: ${type}`);

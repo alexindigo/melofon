@@ -491,7 +491,7 @@ Deno.test('API albums: strict query validation, missing resources and explicit a
           '?limit=',
           '?sort=',
           '?sort=random',
-          '?sort=highest',
+          '?sort=unsupported',
           '?sort=name%20DESC',
           '?genre=',
           '?sort=genre',

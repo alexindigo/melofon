@@ -139,7 +139,15 @@ export interface NameSortOptions {
 }
 
 export interface AlbumPageOptions extends NameSortOptions {
-  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
+  sort:
+    | 'name'
+    | 'artist'
+    | 'year'
+    | 'newest'
+    | 'genre'
+    | 'random'
+    | PersonalAlbumSort;
+  username?: string;
   /** Required for random pages; independent of connection/process RNG state. */
   seed?: string;
   offset: number;
@@ -227,10 +235,8 @@ export interface CatalogReads {
     kind: 'various' | 'unknown',
     opts?: NameSortOptions & { folderId?: string },
   ): Promise<AlbumRow[]>;
-  /** Album lists for getAlbumList/getAlbumList2-shaped hats. The user-scoped
-   * sorts (highest / frequent / recent) need `username`; `genre` sort needs
-   * `genre`. Favourites are not a sort here: hats derive their order from
-   * app.annotation's star history and resolve rows with albumsById. */
+  /** Album lists for getAlbumList/getAlbumList2-shaped hats. Personal sorts
+   * need `username`; `genre` sort needs `genre`. */
   listAlbums(
     opts: NameSortOptions & {
       sort:
@@ -238,6 +244,7 @@ export interface CatalogReads {
         | 'artist'
         | 'random'
         | 'newest'
+        | 'starred'
         | 'highest'
         | 'frequent'
         | 'recent'
@@ -258,7 +265,8 @@ export interface CatalogReads {
    * as listAlbums scopes them. */
   albumsById(ids: string[], opts: { folderId?: string }): Promise<AlbumRow[]>;
   getAlbum(id: string): Promise<{ album: AlbumRow; songs: SongRow[] } | null>;
-  /** Bounded common catalog facts, exact pre-page total and revision in one slot. */
+  /** Bounded album facts and exact pre-page total in one slot. The revision
+   * covers catalog facts only, never personal selection dependencies. */
   albumsPage(opts: AlbumPageOptions): Promise<{
     rows: AlbumRow[];
     total: number;
@@ -507,10 +515,58 @@ interface AlbumQuery {
   yearTo?: number;
   ratedBy?: string; // users.id
   listenAgg?: string; // users.id
+  starredBy?: string; // users.id
+}
+
+export type PersonalAlbumSort = 'starred' | 'highest' | 'frequent' | 'recent';
+
+/** Both legacy and paged reads share personal eligibility and primary order.
+ * The caller supplies its established secondary name policy. */
+async function personalAlbums(
+  q: Queries,
+  sort: PersonalAlbumSort,
+  username: string | undefined,
+  name: string,
+): Promise<{ query: AlbumQuery; order: string } | null> {
+  if (username === undefined) return null;
+  const userId = await userIdForName(q, username);
+  if (userId === null) return null;
+  switch (sort) {
+    case 'starred':
+      return {
+        query: { starredBy: userId },
+        order: 'MAX(st.last_starred) DESC',
+      };
+    case 'highest':
+      return {
+        query: { ratedBy: userId },
+        order: `MAX(r.rating) DESC, ${name}`,
+      };
+    default:
+      return {
+        query: { listenAgg: userId },
+        order: sort === 'frequent'
+          ? `MAX(agg.play_count) DESC NULLS LAST, ${name}`
+          : `MAX(agg.last_played) DESC NULLS LAST, ${name}`,
+      };
+  }
 }
 
 function albumSelect(q: AlbumQuery = {}): string {
   const joins: string[] = [];
+  if (q.starredBy !== undefined) {
+    // Membership follows sequence, but legacy starred dates/order use the
+    // maximum like timestamp in milliseconds, even for out-of-time-order history.
+    joins.push(
+      `JOIN (
+         SELECT target_id,
+                MAX(CASE WHEN action = 'star' THEN epoch_ms(occurred_at) END) AS last_starred
+         FROM star_events WHERE user_id = ${esc(q.starredBy)}
+         GROUP BY target_id
+         HAVING arg_max(action, seq) = 'star' AND arg_max(target_type, seq) = 'album'
+       ) st ON st.target_id = al.id`,
+    );
+  }
   if (q.ratedBy !== undefined) {
     joins.push(
       `JOIN ratings r ON r.target_id = al.id AND r.user_id = ${esc(q.ratedBy)}`,
@@ -894,21 +950,19 @@ function catalogReads(q: Queries): CatalogReads {
             )
           }, ${albumKey}`;
           break;
+        case 'starred':
         case 'highest':
         case 'frequent':
         case 'recent': {
-          if (opts.username === undefined) return [];
-          const userId = await userIdForName(q, opts.username);
-          if (userId === null) return [];
-          if (opts.sort === 'highest') {
-            query.ratedBy = userId;
-            order = `ORDER BY MAX(r.rating) DESC, ${secondaryKey}`;
-          } else {
-            query.listenAgg = userId;
-            order = opts.sort === 'frequent'
-              ? `ORDER BY MAX(agg.play_count) DESC NULLS LAST, ${secondaryKey}`
-              : `ORDER BY MAX(agg.last_played) DESC NULLS LAST, ${secondaryKey}`;
-          }
+          const personal = await personalAlbums(
+            q,
+            opts.sort,
+            opts.username,
+            secondaryKey,
+          );
+          if (personal === null) return [];
+          Object.assign(query, personal.query);
+          order = `ORDER BY ${personal.order}`;
           break;
         }
         case 'genre':
@@ -954,12 +1008,12 @@ function catalogReads(q: Queries): CatalogReads {
 
     async albumsPage(opts) {
       await requireLibrary(opts.folderId);
-      const select = albumSelect({
+      const query: AlbumQuery = {
         folderId: opts.folderId,
         genre: opts.genre,
         yearFrom: opts.fromYear,
         yearTo: opts.toYear,
-      });
+      };
       const name = sortKeySql(
         'COALESCE(al.name, al.folder_name)',
         opts.ignoredArticles,
@@ -967,6 +1021,23 @@ function catalogReads(q: Queries): CatalogReads {
       );
       let order: string;
       switch (opts.sort) {
+        case 'starred':
+        case 'highest':
+        case 'frequent':
+        case 'recent': {
+          const personal = await personalAlbums(
+            q,
+            opts.sort,
+            opts.username,
+            name,
+          );
+          if (personal === null) {
+            return { rows: [], total: 0, revision: await catalogRevision(q) };
+          }
+          Object.assign(query, personal.query);
+          order = personal.order;
+          break;
+        }
         case 'random':
           order = seededRankSql('al.id', opts.seed);
           break;
@@ -988,6 +1059,7 @@ function catalogReads(q: Queries): CatalogReads {
         default:
           order = name;
       }
+      const select = albumSelect(query);
       const count = await q.all<{ total: bigint }>(
         `SELECT COUNT(*) AS total FROM (${select}) eligible`,
       );
