@@ -126,12 +126,19 @@ export async function browsePageQuery(
     'limit',
     'sort',
     'genre',
+    'seed',
     'fromYear',
     'toYear',
   ]);
   const sort = params.get('sort') ?? 'name';
-  if (!['name', 'artist', 'year', 'newest', 'genre'].includes(sort)) {
+  if (!['name', 'artist', 'year', 'newest', 'genre', 'random'].includes(sort)) {
     fail(400, 'invalid_field', 'Invalid sort');
+  }
+  const seed = params.get('seed') ?? undefined;
+  if (
+    sort === 'random' ? seed === undefined || seed === '' : seed !== undefined
+  ) {
+    fail(400, 'invalid_field', 'Seed is required only for random sort');
   }
   const genre = params.get('genre') ?? undefined;
   if (genre === '' || (sort === 'genre' && genre === undefined)) {
@@ -148,6 +155,7 @@ export async function browsePageQuery(
   }
   return {
     sort: sort as BrowsePageOptions['sort'],
+    seed,
     ...await browsePaging(params, context),
     genre,
     fromYear,

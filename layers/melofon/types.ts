@@ -329,7 +329,8 @@ export interface SongMetadata {
 }
 export interface BrowsePageOptions {
   ignoredArticles?: string[];
-  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre';
+  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
+  seed?: string;
   offset: number;
   limit: number;
   folderId?: string;

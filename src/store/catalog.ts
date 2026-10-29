@@ -139,7 +139,9 @@ export interface NameSortOptions {
 }
 
 export interface AlbumPageOptions extends NameSortOptions {
-  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre';
+  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
+  /** Required for random pages; independent of connection/process RNG state. */
+  seed?: string;
   offset: number;
   limit: number;
   folderId?: string;
@@ -149,7 +151,9 @@ export interface AlbumPageOptions extends NameSortOptions {
 }
 
 export interface SongPageOptions extends NameSortOptions {
-  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre';
+  sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
+  /** Required for random pages; independent of connection/process RNG state. */
+  seed?: string;
   offset: number;
   limit: number;
   folderId?: string;
@@ -377,6 +381,14 @@ function sortKeySql(column: string, articles?: string[], tag?: string): string {
     ? folded
     : `CASE ${branches.join(' ')} ELSE ${folded} END`;
   return `lower(trim(${stripped}))`;
+}
+
+/** Fixed digest algorithm, unlike a connection RNG or version-dependent hash(). */
+function seededRankSql(id: string, seed?: string): string {
+  if (seed === undefined || seed === '') {
+    throw new TypeError('Random pages require a nonempty seed');
+  }
+  return `md5(${esc(seed)} || ':' || ${id})`;
 }
 
 interface SongSqlRow {
@@ -955,6 +967,9 @@ function catalogReads(q: Queries): CatalogReads {
       );
       let order: string;
       switch (opts.sort) {
+        case 'random':
+          order = seededRankSql('al.id', opts.seed);
+          break;
         case 'newest':
           order = 'created_ms DESC NULLS LAST';
           break;
@@ -1022,6 +1037,9 @@ function catalogReads(q: Queries): CatalogReads {
       );
       let order: string;
       switch (opts.sort) {
+        case 'random':
+          order = seededRankSql('f.id', opts.seed);
+          break;
         case 'newest':
           order = 'fi.first_seen_at DESC NULLS LAST';
           break;
