@@ -130,6 +130,7 @@ export interface HatContext {
         revision: string;
       }>;
       getSong(id: string): Promise<SongRow | null>;
+      lyricsBySongId(id: string): Promise<LyricsEntry[]>;
       getSongSnapshot(
         id: string,
       ): Promise<{ song: SongRow | null; revision: string }>;
@@ -494,6 +495,21 @@ export interface MediaTrack {
   language: string | null;
   title: string | null;
   channels?: number;
+}
+export interface LyricsCue {
+  start: number;
+  end?: number;
+  text: string;
+  byteStart: number;
+  byteEnd: number;
+}
+export interface LyricsEntry {
+  language: string;
+  synced: boolean;
+  offset?: number;
+  artist?: string;
+  title?: string;
+  lines: { start?: number; text: string; cues?: LyricsCue[] }[];
 }
 export interface VideoDetails {
   audio: MediaTrack[];
