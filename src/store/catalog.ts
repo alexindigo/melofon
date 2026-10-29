@@ -1,7 +1,7 @@
 // Catalog data access. Every public operation owns one exclusive engine slot.
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { userIdForName } from './users.ts';
-import { artistAlbumFolderFilter } from './catalog-sql.ts';
+import { artistAlbumFolderFilter, sortKeySql } from './catalog-sql.ts';
 import { isAlbumFolderHint } from '../albums.ts';
 import { dirname } from 'node:path';
 import { LibraryError, LibrarySourcesChanged } from '../library-errors.ts';
@@ -367,30 +367,6 @@ function num(value: unknown): number | null {
   return Number(value);
 }
 
-// Generic sorting policy: the hat supplies articles, core owns the computed
-// key. Strip a single case-sensitive leading article after accent folding,
-// before lowercasing (Navidrome); unoptioned callers retain their old order.
-function sortKeySql(column: string, articles?: string[], tag?: string): string {
-  if (tag !== undefined) {
-    // A sort tag is already in sort form: fold like the fallback, but never
-    // strip an article from it. Empty tags have the same fallback as absent tags.
-    return `CASE WHEN nullif(trim(${tag}), '') IS NOT NULL THEN ${
-      sortKeySql(tag, articles === undefined ? undefined : [])
-    } ELSE ${sortKeySql(column, articles)} END`;
-  }
-  if (articles === undefined) return column;
-  const folded = `trim(strip_accents(${column}))`;
-  const branches = articles.map((article) =>
-    `WHEN starts_with(${folded}, ${
-      esc(article + ' ')
-    }) THEN substring(${folded}, length(${esc(article)}) + 2)`
-  );
-  const stripped = branches.length === 0
-    ? folded
-    : `CASE ${branches.join(' ')} ELSE ${folded} END`;
-  return `lower(trim(${stripped}))`;
-}
-
 /** Fixed digest algorithm, unlike a connection RNG or version-dependent hash(). */
 function seededRankSql(id: string, seed?: string): string {
   if (seed === undefined || seed === '') {
@@ -468,6 +444,15 @@ const SONG_SELECT = `
   LEFT JOIN artists ar ON ar.id = f.artist_id
   LEFT JOIN libraries l ON l.id = f.library_id
   LEFT JOIN file_identity fi ON fi.id = f.id`;
+
+/** Store-internal projection shared by bounded catalog and folder reads.
+ * Call only with Queries from the current exclusive slot and store-built SQL. */
+export async function catalogSongRows(
+  q: Queries,
+  tail: string,
+): Promise<SongRow[]> {
+  return (await q.all<SongSqlRow>(`${SONG_SELECT} ${tail}`)).map(songOf);
+}
 
 interface AlbumSqlRow {
   metadata_json: string | null;

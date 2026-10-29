@@ -106,6 +106,33 @@ export async function searchPageQuery(
   };
 }
 
+export async function folderPageQuery(
+  request: HatRequest,
+  context: HatContext,
+) {
+  const params = browseQuery(request, [
+    'library',
+    'path',
+    'folderOffset',
+    'folderLimit',
+    'songOffset',
+    'songLimit',
+  ]);
+  const { folderId, ignoredArticles, offset, limit } = await browsePaging(
+    params,
+    context,
+    'folder',
+  );
+  const songPage = await browsePaging(params, context, 'song');
+  return {
+    libraryId: folderId,
+    path: params.get('path') ?? '',
+    ignoredArticles,
+    folders: { offset, limit },
+    songs: { offset: songPage.offset, limit: songPage.limit },
+  };
+}
+
 export async function namePageQuery(
   request: HatRequest,
   context: HatContext,

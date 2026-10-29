@@ -1,5 +1,30 @@
 import { esc } from './engine.ts';
 
+// Generic sorting policy: the caller supplies articles, core owns the key.
+// Unoptioned callers retain binary ordering; [] folds without stripping.
+export function sortKeySql(
+  column: string,
+  articles?: string[],
+  tag?: string,
+): string {
+  if (tag !== undefined) {
+    return `CASE WHEN nullif(trim(${tag}), '') IS NOT NULL THEN ${
+      sortKeySql(tag, articles === undefined ? undefined : [])
+    } ELSE ${sortKeySql(column, articles)} END`;
+  }
+  if (articles === undefined) return column;
+  const folded = `trim(strip_accents(${column}))`;
+  const branches = articles.map((article) =>
+    `WHEN starts_with(${folded}, ${
+      esc(article + ' ')
+    }) THEN substring(${folded}, length(${esc(article)}) + 2)`
+  );
+  const stripped = branches.length === 0
+    ? folded
+    : `CASE ${branches.join(' ')} ELSE ${folded} END`;
+  return `lower(trim(${stripped}))`;
+}
+
 // Source membership (musicFolderId) of a catalog id, one owner for every
 // folder-scoped read: a song's file is in the source, an album has a file in
 // it, an artist has an album with a file in it. `idSql` is the SQL

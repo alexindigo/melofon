@@ -89,6 +89,14 @@ export interface HatContext {
       ): Promise<Library>;
       remove(id: string, source?: Source): Promise<boolean>;
     };
+    folders: {
+      browse(options: FolderPageOptions): Promise<{
+        folder: FolderRow | null;
+        folders: { rows: FolderRow[]; total: number };
+        songs: { rows: SongRow[]; total: number };
+        revision: string;
+      }>;
+    };
     library: {
       artistsPage(opts: ArtistPageOptions): Promise<{
         rows: ArtistGroupRow[];
@@ -337,6 +345,18 @@ export interface BrowsePageOptions {
   genre?: string;
   fromYear?: number;
   toYear?: number;
+}
+export interface FolderRow {
+  libraryId: string;
+  path: string;
+  name: string;
+}
+export interface FolderPageOptions {
+  libraryId?: string;
+  path?: string;
+  ignoredArticles?: string[];
+  folders: { offset: number; limit: number };
+  songs: { offset: number; limit: number };
 }
 export interface AlbumPageOptions extends Omit<BrowsePageOptions, 'sort'> {
   sort:

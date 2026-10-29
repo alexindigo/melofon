@@ -11,6 +11,7 @@ import { createScan } from './scan.ts';
 import { createAuthentication } from './authentication.ts';
 import { createLibraries } from './libraries.ts';
 import { createLibrary } from './library.ts';
+import { createFolders } from './folders.ts';
 import { createLyrics } from './lyrics.ts';
 import { createAnnotation } from './annotation.ts';
 import { createListens } from './listens.ts';
@@ -268,6 +269,7 @@ export async function startServer(options: {
     media,
     ...authentication,
     library,
+    folders: createFolders(store),
     reference: Object.freeze({
       get: lookups.reference.get,
       artistByName: lookups.reference.artistByName,
