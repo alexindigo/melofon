@@ -97,6 +97,13 @@ export interface HatContext {
         revision: string;
       }>;
     };
+    playlists: {
+      containingSong(
+        username: string,
+        songId: string,
+        options: PlaylistPageOptions,
+      ): Promise<{ rows: PlaylistRow[]; total: number } | null>;
+    };
     library: {
       artistsPage(opts: ArtistPageOptions): Promise<{
         rows: ArtistGroupRow[];
@@ -350,6 +357,22 @@ export interface FolderRow {
   libraryId: string;
   path: string;
   name: string;
+}
+export interface PlaylistPageOptions {
+  ignoredArticles?: string[];
+  offset: number;
+  limit: number;
+}
+export interface PlaylistRow {
+  id: string;
+  name: string;
+  comment: string | null;
+  owner: string;
+  public: boolean;
+  createdAtMs: number;
+  changedAtMs: number;
+  songCount: number;
+  durationMs: number;
 }
 export interface FolderPageOptions {
   libraryId?: string;

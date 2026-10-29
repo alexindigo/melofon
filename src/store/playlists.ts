@@ -1,5 +1,17 @@
 import { type Engine, esc, type Queries } from './engine.ts';
 import { requireUserId } from './users.ts';
+import { sortKeySql } from './catalog-sql.ts';
+
+export interface PlaylistPageOptions {
+  offset: number;
+  limit: number;
+  ignoredArticles?: string[];
+}
+
+export interface PlaylistPage {
+  rows: PlaylistRow[];
+  total: number;
+}
 
 export interface PlaylistRow {
   id: string;
@@ -109,6 +121,44 @@ async function bumpChanged(q: Queries, playlistId: string): Promise<void> {
 
 export function createPlaylistsStore(engine: Engine) {
   return {
+    containingSong(
+      songId: string,
+      opts: PlaylistPageOptions,
+      username?: string,
+      includePublic = false,
+    ): Promise<PlaylistPage | null> {
+      return engine.exclusive(async (q) => {
+        if (
+          !(await q.all(`SELECT id FROM files WHERE id = ${esc(songId)}`))
+            .length
+        ) {
+          return null;
+        }
+        const userId_ = username === undefined
+          ? null
+          : await requireUserId(q, username);
+        const eligible = `EXISTS (
+          SELECT 1 FROM playlist_tracks member
+          WHERE member.playlist_id = p.id AND member.track_id = ${esc(songId)}
+        ) AND ${
+          userId_ === null
+            ? 'true'
+            : `(p.user_id = ${esc(userId_)}${
+              includePublic ? ' OR p.public' : ''
+            })`
+        }`;
+        const [{ total }] = await q.all<{ total: number }>(
+          `SELECT COUNT(*) AS total FROM playlists p WHERE ${eligible}`,
+        );
+        const rows = await q.all<PlaylistSqlRow>(`${PLAYLIST_SELECT}
+          WHERE ${eligible}
+          GROUP BY p.id, p.name, p.comment, u.name, p.public, p.created_at, p.changed_at
+          ORDER BY ${sortKeySql('p.name', opts.ignoredArticles)}, p.id
+          LIMIT ${Math.max(0, Math.trunc(opts.limit))}
+          OFFSET ${Math.max(0, Math.trunc(opts.offset))}`);
+        return { rows: rows.map(playlistOf), total: Number(total) };
+      });
+    },
     list(username?: string, includePublic = false): Promise<PlaylistRow[]> {
       return engine.exclusive(async (q) => {
         const userId_ = username === undefined

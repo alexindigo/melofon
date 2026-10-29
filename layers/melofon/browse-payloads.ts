@@ -4,6 +4,7 @@ import type {
   ArtistGroupRef,
   ArtistGroupRow,
   Library,
+  PlaylistRow,
   SongMetadata,
   SongRow,
 } from './types.ts';
@@ -30,6 +31,20 @@ export function artistSummary(artist: ArtistGroupRow) {
 
 export function librarySummary(library: Library) {
   return { id: library.id, name: library.name, available: library.available };
+}
+
+export function playlistSummary(playlist: PlaylistRow) {
+  return {
+    id: playlist.id,
+    name: playlist.name,
+    comment: playlist.comment,
+    owner: playlist.owner,
+    public: playlist.public,
+    createdAtMs: playlist.createdAtMs,
+    changedAtMs: playlist.changedAtMs,
+    songCount: playlist.songCount,
+    durationMs: playlist.durationMs,
+  };
 }
 
 export function albumSummary(album: AlbumRow) {

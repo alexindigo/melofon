@@ -4,6 +4,7 @@ import type {
   BrowsePageOptions,
   HatContext,
   HatRequest,
+  PlaylistPageOptions,
   SongRow,
 } from './types.ts';
 import { fail } from './errors.ts';
@@ -142,6 +143,21 @@ export async function namePageQuery(
     fail(400, 'invalid_field', 'Invalid sort');
   }
   return await browsePaging(params, context);
+}
+
+export async function playlistPageQuery(
+  request: HatRequest,
+  context: HatContext,
+): Promise<PlaylistPageOptions> {
+  const params = browseQuery(request, ['offset', 'limit', 'sort']);
+  if ((params.get('sort') ?? 'name') !== 'name') {
+    fail(400, 'invalid_field', 'Invalid sort');
+  }
+  const { offset, limit, ignoredArticles } = await browsePaging(
+    params,
+    context,
+  );
+  return { offset, limit, ignoredArticles };
 }
 
 export function personalAlbumSort(sort: string): boolean {

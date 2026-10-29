@@ -2,6 +2,8 @@
 // The store keeps occurrences and resolves visible indices atomically.
 import type { Store } from './store/index.ts';
 import type {
+  PlaylistPage,
+  PlaylistPageOptions,
   PlaylistRow,
   PlaylistUpdate,
   PlaylistWithTracks,
@@ -9,6 +11,12 @@ import type {
 export type { PlaylistRow, PlaylistWithTracks } from './store/playlists.ts';
 
 export interface Playlists {
+  /** Current own/public visibility (admins see all), paged before returning. */
+  containingSong(
+    username: string,
+    songId: string,
+    opts: PlaylistPageOptions,
+  ): Promise<PlaylistPage | null>;
   /** Own-only view used by OwnTone, even when the seeded user is admin. */
   list(username: string): Promise<PlaylistRow[]>;
   visible(
@@ -57,6 +65,16 @@ export function createPlaylists(store: Store): Playlists {
       : 'forbidden' as const;
   }
   return {
+    async containingSong(username, songId, opts) {
+      const user = await store.users.profile(username);
+      if (user === null) return null;
+      return await store.playlists.containingSong(
+        songId,
+        opts,
+        user.role === 'admin' ? undefined : username,
+        true,
+      );
+    },
     list: (username) => store.playlists.list(username),
     async visible(username, forUsername) {
       const user = await store.users.profile(username);
