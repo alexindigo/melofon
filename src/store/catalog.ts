@@ -176,6 +176,20 @@ export interface ArtistPageOptions extends NameSortOptions {
   limit: number;
 }
 
+export interface SearchPageOptions extends NameSortOptions {
+  folderId?: string;
+  artists: { offset: number; limit: number };
+  albums: { offset: number; limit: number };
+  songs: { offset: number; limit: number };
+}
+
+export interface SearchPages {
+  artists: { rows: ArtistGroupRow[]; total: number };
+  albums: { rows: AlbumRow[]; total: number };
+  songs: { rows: SongRow[]; total: number };
+  revision: string;
+}
+
 export interface CatalogReads {
   artistsPage(opts: ArtistPageOptions): Promise<{
     rows: ArtistGroupRow[];
@@ -273,6 +287,7 @@ export interface CatalogReads {
       folderId?: string;
     },
   ): Promise<Search3Result>;
+  searchPages(query: string, opts: SearchPageOptions): Promise<SearchPages>;
   /** Absolute path of a song's audio file, for app.stream. */
   songPath(id: string): Promise<string | null>;
   /** All music videos in the catalog (getVideos). */
@@ -629,6 +644,18 @@ function genreSelect(folderId?: string): string {
     ['f.genre IS NOT NULL', ...songPredicates({ folderId })].join(' AND ')
   }
     GROUP BY f.genre`;
+}
+
+// Keep native totals/pages and legacy search on one matching contract. ILIKE
+// intentionally retains the existing search3 pattern semantics (not FTS).
+function searchPredicates(query: string, folderId?: string) {
+  const like = `'%' || ${esc(query)} || '%'`;
+  return {
+    artist: `ar.name ILIKE ${like}`,
+    album: `COALESCE(al.name, al.folder_name) ILIKE ${like}`,
+    song: [`${SONG_TITLE} ILIKE ${like}`, ...songPredicates({ folderId })]
+      .join(' AND '),
+  };
 }
 
 // Internal helpers share the current slot, never another public operation.
@@ -1026,13 +1053,77 @@ function catalogReads(q: Queries): CatalogReads {
       };
     },
 
+    async searchPages(query, opts) {
+      await requireLibrary(opts.folderId);
+      const match = searchPredicates(query, opts.folderId);
+      // Search real album artists, as search3 does; protocol placeholder labels
+      // are not catalog names and cannot participate in name matching.
+      const artists = `SELECT ar.* FROM (${artistGroups(opts.folderId)}) ar
+        WHERE ${match.artist}`;
+      const albums = `${albumSelect({ folderId: opts.folderId })}
+        HAVING ${match.album}`;
+      const songs = `${SONG_SELECT} WHERE ${match.song}`;
+      async function page<T>(
+        select: string,
+        order: string,
+        paging: { offset: number; limit: number },
+      ) {
+        const count = await q.all<{ total: bigint }>(
+          `SELECT COUNT(*) AS total FROM (${select}) matches`,
+        );
+        const rows = await q.all<T>(
+          `${select} ORDER BY ${order} LIMIT ${paging.limit} OFFSET ${paging.offset}`,
+        );
+        return { rows, total: Number(count[0].total) };
+      }
+      const artistPage = await page<ArtistGroupSqlRow>(
+        artists,
+        `${
+          sortKeySql(
+            'ar.name',
+            opts.ignoredArticles,
+            opts.sortTags ? 'ar.sort_name' : undefined,
+          )
+        }, ar.id`,
+        opts.artists,
+      );
+      const albumPage = await page<AlbumSqlRow>(
+        albums,
+        `${
+          sortKeySql(
+            'COALESCE(al.name, al.folder_name)',
+            opts.ignoredArticles,
+            opts.sortTags ? 'first(al.sort_name)' : undefined,
+          )
+        }, al.id`,
+        opts.albums,
+      );
+      const songPage = await page<SongSqlRow>(
+        songs,
+        `${
+          sortKeySql(
+            SONG_TITLE,
+            opts.ignoredArticles,
+            opts.sortTags ? 'f.sort_title' : undefined,
+          )
+        }, f.id`,
+        opts.songs,
+      );
+      return {
+        artists: { ...artistPage, rows: artistPage.rows.map(artistGroupOf) },
+        albums: { ...albumPage, rows: albumPage.rows.map(albumOf) },
+        songs: { ...songPage, rows: songPage.rows.map(songOf) },
+        revision: await catalogRevision(q),
+      };
+    },
+
     async search3(query, opts) {
-      const like = `'%' || ${esc(query)} || '%'`;
+      const match = searchPredicates(query, opts.folderId);
       const artistRes = await q.all(
         `SELECT ar.id, ar.name, ar.musicbrainz_id, first(ar.sort_name) AS sort_name, COUNT(al.id) AS album_count
            FROM artists ar
            JOIN albums al ON al.album_artist_id = ar.id
-           WHERE ar.name ILIKE ${like} ${artistAlbumFolderFilter(opts.folderId)}
+            WHERE ${match.artist} ${artistAlbumFolderFilter(opts.folderId)}
            GROUP BY ar.id, ar.name, ar.musicbrainz_id
              ORDER BY ${
           sortKeySql(
@@ -1045,7 +1136,7 @@ function catalogReads(q: Queries): CatalogReads {
       );
       const albumRes = await q.all(
         `${albumSelect({ folderId: opts.folderId })}
-            HAVING COALESCE(al.name, al.folder_name) ILIKE ${like}
+             HAVING ${match.album}
               ORDER BY ${
           sortKeySql(
             'COALESCE(al.name, al.folder_name)',
@@ -1056,9 +1147,7 @@ function catalogReads(q: Queries): CatalogReads {
            LIMIT ${opts.albumCount} OFFSET ${opts.albumOffset}`,
       );
       const songRes = await q.all(
-        `${SONG_SELECT} WHERE ${
-          [`${SONG_TITLE} ILIKE ${like}`, ...songPredicates(opts)].join(' AND ')
-        }
+        `${SONG_SELECT} WHERE ${match.song}
              ORDER BY ${
           sortKeySql(
             SONG_TITLE,
@@ -1388,6 +1477,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).songsPage(opts)),
     search3: (...args) =>
       engine.exclusive((q) => catalogReads(q).search3(...args)),
+    searchPages: (...args) =>
+      engine.exclusive((q) => catalogReads(q).searchPages(...args)),
     songPath: (id) => engine.exclusive((q) => catalogReads(q).songPath(id)),
     videos: (folderId) =>
       engine.exclusive((q) => catalogReads(q).videos(folderId)),

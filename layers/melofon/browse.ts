@@ -43,7 +43,11 @@ export function browseLibrary(params: URLSearchParams): string | undefined {
   return library ?? undefined;
 }
 
-async function browsePaging(params: URLSearchParams, context: HatContext) {
+async function browsePaging(
+  params: URLSearchParams,
+  context: HatContext,
+  category = '',
+) {
   const max = Number(
     await context.app.state.getTyped('melofon.browseMaxPageRecords'),
   );
@@ -54,8 +58,50 @@ async function browsePaging(params: URLSearchParams, context: HatContext) {
     // a20 replaces [] with the shared core article setting; fold without stripping.
     ignoredArticles: [],
     folderId: browseLibrary(params),
-    offset: browseInteger(params, 'offset', 0, 0),
-    limit: browseInteger(params, 'limit', Math.min(defaultLimit, max), 1, max),
+    offset: browseInteger(
+      params,
+      category ? `${category}Offset` : 'offset',
+      0,
+      0,
+    ),
+    limit: browseInteger(
+      params,
+      category ? `${category}Limit` : 'limit',
+      Math.min(defaultLimit, max),
+      1,
+      max,
+    ),
+  };
+}
+
+export async function searchPageQuery(
+  request: HatRequest,
+  context: HatContext,
+) {
+  const params = browseQuery(request, [
+    'query',
+    'library',
+    'artistOffset',
+    'artistLimit',
+    'albumOffset',
+    'albumLimit',
+    'songOffset',
+    'songLimit',
+  ]);
+  const { folderId, ignoredArticles, ...artists } = await browsePaging(
+    params,
+    context,
+    'artist',
+  );
+  const albumPage = await browsePaging(params, context, 'album');
+  const songPage = await browsePaging(params, context, 'song');
+  return {
+    query: params.get('query') ?? '',
+    folderId,
+    ignoredArticles,
+    artists,
+    albums: { offset: albumPage.offset, limit: albumPage.limit },
+    songs: { offset: songPage.offset, limit: songPage.limit },
   };
 }
 

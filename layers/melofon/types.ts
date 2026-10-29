@@ -123,6 +123,12 @@ export interface HatContext {
         total: number;
         revision: string;
       }>;
+      searchPages(query: string, opts: SearchPageOptions): Promise<{
+        artists: { rows: ArtistGroupRow[]; total: number };
+        albums: { rows: AlbumRow[]; total: number };
+        songs: { rows: SongRow[]; total: number };
+        revision: string;
+      }>;
       genresPage(opts: GenrePageOptions): Promise<{
         rows: GenreRow[];
         total: number;
@@ -351,6 +357,13 @@ export interface ArtistPageOptions {
   limit: number;
 }
 export type GenrePageOptions = ArtistPageOptions;
+export interface SearchPageOptions {
+  ignoredArticles?: string[];
+  folderId?: string;
+  artists: { offset: number; limit: number };
+  albums: { offset: number; limit: number };
+  songs: { offset: number; limit: number };
+}
 export interface GenreRow {
   name: string;
   songCount: number;
