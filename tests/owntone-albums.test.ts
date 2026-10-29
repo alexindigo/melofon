@@ -6,6 +6,7 @@ import { seedFirstUser } from '../src/users.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibrary } from '../src/library.ts';
+import { createFolders } from '../src/folders.ts';
 import { createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
@@ -109,6 +110,7 @@ async function setup(fn: (s: Setup) => Promise<void>) {
           cfg,
           library,
           libraries,
+          folders: createFolders(store),
           scan,
           playlists,
           playback: createPlayback({

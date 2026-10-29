@@ -79,6 +79,17 @@ export interface HatContext {
       /** The configured scan sources (files roots live here, not in the hat). */
       list(): Promise<{ id: string; name: string; path: string }[]>;
     };
+    folders: {
+      browse(options: {
+        libraryId: string;
+        path: string;
+        folders: { offset: number; limit: number };
+        songs: { offset: number; limit: number };
+      }): Promise<{
+        folders: { rows: { path: string }[]; total: number };
+        songs: { rows: SongRow[]; total: number };
+      }>;
+    };
     playback: {
       /** THE playback core: every player/queue mutation and the engine
        * views. The hat parses into one command and encodes views back out —
@@ -143,6 +154,14 @@ export interface HatContext {
       ): OutputRow | null;
     };
     library: {
+      statistics(): Promise<{
+        statistics: {
+          songCount: number;
+          durationMs: number;
+          albumCount: number;
+          browseArtistCount: number;
+        };
+      }>;
       listAlbums(opts: {
         sort: 'name' | 'genre';
         size: number;

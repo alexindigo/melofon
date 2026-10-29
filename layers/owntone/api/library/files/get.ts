@@ -11,55 +11,77 @@ import {
   pagingParams,
   trackPayload,
 } from '#owntone/payloads.ts';
-import type { HatContext, HatRequest, SongRow } from '#owntone/types.ts';
+import type { HatContext, HatRequest } from '#owntone/types.ts';
 
 const ALL = 9007199254740991; // Largest exactly representable safe integer.
 
 export default async (request: HatRequest, context: HatContext) => {
-  const roots = (await context.app.libraries.list()).map((l) =>
-    l.path.replace(/\/+$/, '')
-  );
+  const roots = (await context.app.libraries.list()).map((l) => ({
+    id: l.id,
+    path: l.path.replace(/\/+$/, ''),
+  }));
   const paging = pagingParams(request.query);
   if (paging instanceof Response) return paging;
 
   const dir = request.query.get('directory');
   if (dir === null) {
     return {
-      directories: roots.map((path) => ({ path })),
+      directories: roots.map(({ path }) => ({ path })),
       tracks: paged([], paging.offset, paging.limit),
       playlists: paged([], paging.offset, paging.limit),
     };
   }
   const target = dir.replace(/\/+$/, '');
-  if (!roots.some((r) => target === r || target.startsWith(`${r}/`))) {
-    return notFound();
-  }
-
-  const prefix = `${target}/`;
-  const subdirs = new Set<string>();
-  const tracks: SongRow[] = [];
-  for (
-    const song of await context.app.library.listSongs({
-      offset: 0,
-      size: ALL,
-    })
-  ) {
-    if (!song.path.startsWith(prefix)) continue;
-    const rest = song.path.slice(prefix.length);
-    const slash = rest.indexOf('/');
-    if (slash === -1) tracks.push(song);
-    else subdirs.add(`${target}/${rest.slice(0, slash)}`);
+  const root = roots.find((r) =>
+    target === r.path || target.startsWith(`${r.path}/`)
+  );
+  if (!root) return notFound();
+  let page;
+  try {
+    page = await context.app.folders.browse({
+      libraryId: root.id,
+      path: target === root.path ? '' : target.slice(root.path.length + 1),
+      // Directories are an unpaged array in OwnTone. Only immediate tracks
+      // carry paging; keep legacy zero/all/unsafe integer wire values while
+      // passing canonical safe pages to core.
+      folders: { offset: 0, limit: ALL },
+      songs: {
+        offset: Math.min(paging.offset, ALL),
+        limit: paging.limit === -1
+          ? ALL
+          : Math.max(1, Math.min(paging.limit, ALL)),
+      },
+    });
+  } catch (error) {
+    // Historically any absent/noncanonical in-root directory returned empty
+    // pages, not a native folder error. Never normalize it into another path.
+    if (
+      !(error instanceof Error) || error.name !== 'LibraryError' ||
+      !('code' in error) ||
+      (error.code !== 'not_found' && error.code !== 'invalid_field')
+    ) throw error;
+    return {
+      directories: [],
+      tracks: paged([], paging.offset, paging.limit),
+      playlists: paged([], paging.offset, paging.limit),
+    };
   }
   const albumArtist = albumArtistResolver(context.app);
   return {
-    directories: [...subdirs].sort().map((path) => ({ path })),
-    tracks: paged(
-      await Promise.all(
-        tracks.map(async (s) => trackPayload(s, await albumArtist(s.albumId))),
+    // This array is unpaged; retain the hat's UTF-16 path order even where
+    // core's binary text order differs (astral versus high-BMP names).
+    directories: page.folders.rows.map((f) => `${root.path}/${f.path}`).sort()
+      .map((path) => ({ path })),
+    tracks: {
+      items: await Promise.all(
+        (paging.limit === 0 ? [] : page.songs.rows).map(async (s) =>
+          trackPayload(s, await albumArtist(s.albumId))
+        ),
       ),
-      paging.offset,
-      paging.limit,
-    ),
+      total: page.songs.total,
+      offset: paging.offset,
+      limit: paging.limit,
+    },
     playlists: paged([], paging.offset, paging.limit),
   };
 };

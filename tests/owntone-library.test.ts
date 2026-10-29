@@ -10,6 +10,7 @@ import { seedFirstUser } from '../src/users.ts';
 import { createScan } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
+import { createFolders } from '../src/folders.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createArtwork } from '../src/artwork.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
@@ -20,6 +21,8 @@ import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
+import { apiFixture } from './helpers/api.ts';
+import { tagged } from './helpers/tagged.ts';
 
 const HOOK = 3689;
 const DEFAULT_PORT = 4534;
@@ -65,6 +68,7 @@ async function setup(
     startedAt: STARTED_AT,
     libraries,
     library,
+    folders: createFolders(store),
     scan,
     playlists,
     artwork: createArtwork(library),
@@ -94,6 +98,343 @@ async function setup(
 
 const get = (app: (r: Request) => Promise<Response>, path: string) =>
   app(new Request(`http://x${path}`));
+
+/** Both real protocol listens share the same core owners. Reject the former
+ * hat-side catalog reconstruction so an HTTP success proves adoption too. */
+async function coreBrowseFixture(empty = false) {
+  const root = await Deno.makeTempDir({ prefix: 'melofon-own-core-' });
+  const folderCalls: Parameters<
+    ReturnType<typeof createFolders>['browse']
+  >[0][] = [];
+  try {
+    const f = await apiFixture({
+      allLayers: true,
+      hats: {
+        layersRoot: 'layers',
+        extraPorts: 2,
+        env: (ports) => ({ MELOFON_LISTEN_owntone: ports.join(',') }),
+      },
+      services: async (f) => {
+        const libraries = createLibraries(f.store, { notify: f.notify });
+        const scan = createScan(f.store);
+        if (!empty) {
+          for (const name of ['Music', 'Second', 'Empty']) {
+            await Deno.mkdir(`${root}/${name}`);
+            await libraries.add(name, `${root}/${name}`);
+          }
+          const files = [
+            ['Music/z_root.mp3', {}],
+            ['Music/a_root.mp3', { TALB: 'Root', TPE1: 'A' }],
+            ['Music/Shared/a.mp3', { TALB: 'Compilation', TPE1: 'A' }],
+            ['Music/Shared/z.mp3', { TALB: 'Compilation', TPE1: 'B' }],
+            ['Music/Shared/deep/file.mp3', { TALB: 'Deep', TPE1: 'A' }],
+            ['Second/Shared/file.mp3', {
+              TALB: 'Other',
+              TPE2: 'A',
+              TPE1: 'Other',
+            }],
+            ['Music/Tagged/file.mp3', {
+              TALB: 'Tagged',
+              TPE2: 'Various Artists',
+              TPE1: 'Guest',
+            }],
+          ] as const;
+          for (const [i, [path, tags]] of files.entries()) {
+            await Deno.mkdir(
+              `${root}/${path.slice(0, path.lastIndexOf('/'))}`,
+              {
+                recursive: true,
+              },
+            );
+            await tagged(`${root}/${path}`, {
+              ...tags,
+              TIT2: `Title ${20 - i}`,
+            });
+          }
+          await Deno.mkdir(`${root}/Music/No media`);
+          await scan.run();
+        }
+        const library = createLibrary(f.store);
+        const folders = createFolders(f.store);
+        const noWalk = () => {
+          throw new Error('OwnTone must use core browse/statistics');
+        };
+        return {
+          libraries,
+          scan,
+          startedAt: STARTED_AT,
+          library: {
+            ...library,
+            listSongs: noWalk,
+            listAlbums: noWalk,
+            listArtists: noWalk,
+            albumsWithoutArtist: noWalk,
+          },
+          folders: {
+            browse: (options: Parameters<typeof folders.browse>[0]) => {
+              folderCalls.push(options);
+              return folders.browse(options);
+            },
+          },
+        };
+      },
+    });
+    await f.auth.users.create(f.admin.id, {
+      username: 'listener',
+      password: 'password-listener',
+      role: 'user',
+    });
+    const own = async (path: string) => {
+      const response = await fetch(
+        `http://melofon.home:${f.extraPorts[0]}${path}`,
+        {
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      assertEquals(response.status, 200, await response.clone().text());
+      return response.json();
+    };
+    return {
+      ...f,
+      root,
+      own,
+      folderCalls,
+      async close() {
+        await f.close();
+        await Deno.remove(root, { recursive: true });
+      },
+    };
+  } catch (error) {
+    await Deno.remove(root, { recursive: true });
+    throw error;
+  }
+}
+
+Deno.test('OwnTone core folders: absolute paths, independent directories, bounded track pages and native parity over HTTP', async () => {
+  const f = await coreBrowseFixture();
+  try {
+    for (const name of ['🚀', '\uE000']) {
+      await Deno.mkdir(`${f.root}/Music/${name}`);
+      await tagged(`${f.root}/Music/${name}/file.mp3`, {});
+    }
+    await createScan(f.store).run();
+    const libraries = await f.store.catalog.listLibraries();
+    const music = libraries.find((l) => l.name === 'Music')!;
+    const files = (directory?: string, page: Record<string, string> = {}) =>
+      f.own(
+        `/api/library/files?${new URLSearchParams({
+          ...(directory === undefined ? {} : { directory }),
+          ...page,
+        })}`,
+      );
+    assertEquals(
+      (await files()).directories,
+      libraries.map((l) => ({ path: l.path })),
+    );
+    const root = await files(music.path);
+    assertEquals(root.directories, [
+      { path: `${music.path}/Shared` },
+      { path: `${music.path}/Tagged` },
+      { path: `${music.path}/🚀` },
+      { path: `${music.path}/\uE000` },
+    ]);
+    assertEquals(root.tracks.items.map((s: { title: string }) => s.title), [
+      'Title 19',
+      'Title 20',
+    ]);
+    assertEquals([root.tracks.total, root.tracks.offset, root.tracks.limit], [
+      2,
+      0,
+      -1,
+    ]);
+    assertEquals(root.playlists, { items: [], total: 0, offset: 0, limit: -1 });
+    const nested = await files(`${music.path}/Shared///`);
+    assertEquals(nested.directories, [{ path: `${music.path}/Shared/deep` }]);
+    assertEquals(nested.tracks.items.map((s: { title: string }) => s.title), [
+      'Title 18',
+      'Title 17',
+    ]);
+    for (
+      const [offset, limit, expected] of [
+        ['0', '1', [nested.tracks.items[0]]],
+        ['1', '1', [nested.tracks.items[1]]],
+        ['2', '1', []],
+        ['0', '0', []],
+        ['1', '-1', [nested.tracks.items[1]]],
+        ['9007199254740993', '-1', []],
+        ['0', '9007199254740993', nested.tracks.items],
+      ] as const
+    ) {
+      const page = await files(`${music.path}/Shared`, { offset, limit });
+      assertEquals(page.directories, nested.directories);
+      assertEquals(page.tracks, {
+        items: expected,
+        total: 2,
+        offset: Number(offset),
+        limit: Number(limit),
+      });
+      assertEquals(page.playlists, {
+        items: [],
+        total: 0,
+        offset: Number(offset),
+        limit: Number(limit),
+      });
+    }
+    assert(
+      f.folderCalls.some((c) => c.songs.limit === 1 && c.songs.offset === 1),
+    );
+    for (
+      const path of [
+        'missing',
+        'No media',
+        '../Second',
+        'Shared/../Tagged',
+        'Shared//deep',
+      ]
+    ) {
+      assertEquals(await files(`${music.path}/${path}`), {
+        directories: [],
+        tracks: { items: [], total: 0, offset: 0, limit: -1 },
+        playlists: { items: [], total: 0, offset: 0, limit: -1 },
+      });
+    }
+    assertEquals((await files(`${f.root}/Empty`)).tracks.total, 0);
+    assertEquals(
+      (await files(`${f.root}/Second/Shared`)).tracks.items[0].title,
+      'Title 15',
+    );
+    const outside = await fetch(
+      `http://melofon.home:${
+        f.extraPorts[0]
+      }/api/library/files?${new URLSearchParams({
+        directory: `${music.path}ish`,
+      })}`,
+    );
+    assertEquals(outside.status, 404);
+    await outside.body?.cancel();
+    for (const use of ['cookie', 'bearer'] as const) {
+      const { credential } = await f.login(
+        use,
+        'listener',
+        'password-listener',
+      );
+      const response = await f.get(
+        `/api/v1/folders?${new URLSearchParams({
+          library: music.id,
+          path: 'Shared',
+          songLimit: '1',
+          songOffset: '1',
+        })}`,
+        credential,
+        { Origin: 'http://foreign.invalid' },
+      );
+      assertEquals(response.status, 200);
+      const native = await response.json();
+      assertEquals(native.folders.folders, [{
+        libraryId: music.id,
+        path: 'Shared/deep',
+        name: 'deep',
+      }]);
+      assertEquals(native.songs.total, 2);
+      assertEquals(native.songs.songs.map((s: { path: string }) => s.path), [
+        'Shared/z.mp3',
+      ]);
+      assertEquals(native.songs.songs[0].title, nested.tracks.items[1].title);
+      assert(!JSON.stringify(native).includes(music.path));
+      assertEquals(native.tracks, undefined);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('OwnTone core statistics: placeholder population and live removal agree with native HTTP without catalog walks', async () => {
+  const f = await coreBrowseFixture();
+  try {
+    const credentials = await Promise.all(
+      (['cookie', 'bearer'] as const).map(async (use) =>
+        (await f.login(use, 'listener', 'password-listener')).credential
+      ),
+    );
+    const compare = async (count: number, artists: number) => {
+      const summary = await f.own('/api/library');
+      const counts = await f.own('/api/library/count');
+      assertEquals(counts, {
+        tracks: count,
+        artists,
+        albums: summary.albums,
+        db_playtime: summary.db_playtime,
+      });
+      assertEquals(summary.songs, count);
+      assertEquals(summary.artists, artists);
+      assertEquals(summary.started_at, STARTED_AT);
+      assertEquals(summary.updating, false);
+      assert(typeof summary.updated_at === 'string');
+      for (const credential of credentials) {
+        const response = await f.get('/api/v1/statistics', credential);
+        assertEquals(response.status, 200);
+        const native = await response.json();
+        const stats = native.statistics;
+        assertEquals(summary.songs, stats.songCount);
+        assertEquals(summary.artists, stats.browseArtistCount);
+        assertEquals(summary.albums, stats.albumCount);
+        assertEquals(summary.db_playtime, Math.trunc(stats.durationMs / 1000));
+        assertEquals(native.tracks, undefined);
+        if (count === 7) assertEquals(stats.artistCount, 5);
+      }
+      return summary;
+    };
+    const before = await compare(7, 4);
+    const admin = (await f.login('cookie')).credential;
+    const music = (await f.store.catalog.listLibraries()).find((l) =>
+      l.name === 'Music'
+    )!;
+    const removed = await f.json(
+      `/api/v1/admin/libraries/${music.id}`,
+      'DELETE',
+      undefined,
+      admin,
+    );
+    assertEquals(removed.status, 204);
+    const after = await compare(1, 1);
+    assertEquals(after.updated_at, before.updated_at);
+    assertEquals(after.albums, 1);
+    assert(after.db_playtime < before.db_playtime);
+    assertEquals(
+      await f.own('/api/library/count?expression=DATA_KIND+IS+PIPE'),
+      { tracks: 0, artists: 0, albums: 0, db_playtime: 0 },
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('OwnTone core statistics: empty unscanned catalog keeps zero wire shapes and omits updated_at', async () => {
+  const f = await coreBrowseFixture(true);
+  try {
+    assertEquals(await f.own('/api/library'), {
+      songs: 0,
+      db_playtime: 0,
+      artists: 0,
+      albums: 0,
+      started_at: STARTED_AT,
+      updating: false,
+    });
+    assertEquals(await f.own('/api/library/count'), {
+      tracks: 0,
+      artists: 0,
+      albums: 0,
+      db_playtime: 0,
+    });
+    assertEquals(await f.own('/api/library/files'), {
+      directories: [],
+      tracks: { items: [], total: 0, offset: 0, limit: -1 },
+      playlists: { items: [], total: 0, offset: 0, limit: -1 },
+    });
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('GET /api/library: stats with db_playtime in SECONDS', async () => {
   const { app, close } = await setup();

@@ -20,6 +20,7 @@ import { seedFirstUser } from '../src/users.ts';
 import { createUserService } from '../src/user.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
+import { createFolders } from '../src/folders.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createShares } from '../src/shares.ts';
@@ -271,6 +272,7 @@ async function setup() {
     publicAddress: createPublicAddress(state),
     cfg,
     libraries,
+    folders: createFolders(store),
     user: createUserService(store, cfg),
     library: {
       ...library,
