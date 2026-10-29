@@ -138,6 +138,15 @@ export interface HatContext {
         total: number;
         revision: string;
       }>;
+      videosPage(opts: ArtistPageOptions): Promise<{
+        rows: SongRow[];
+        total: number;
+        revision: string;
+      }>;
+      getVideoSnapshot(id: string, folderId?: string): Promise<{
+        detail: { song: SongRow; details: VideoDetails | null } | null;
+        revision: string;
+      }>;
       searchPages(query: string, opts: SearchPageOptions): Promise<{
         artists: { rows: ArtistGroupRow[]; total: number };
         albums: { rows: AlbumRow[]; total: number };
@@ -478,6 +487,23 @@ export interface SongRow {
   suffix: string;
   contentType: string;
   metadata?: SongMetadata;
+}
+export interface MediaTrack {
+  index: number;
+  codec: string | null;
+  language: string | null;
+  title: string | null;
+  channels?: number;
+}
+export interface VideoDetails {
+  audio: MediaTrack[];
+  subtitles: MediaTrack[];
+  captions: {
+    key: string;
+    name: string;
+    format: 'srt' | 'vtt';
+    stream?: number;
+  }[];
 }
 export interface Source {
   kind: 'http';

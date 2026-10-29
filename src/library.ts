@@ -160,6 +160,8 @@ export function createLibrary(
     searchPages: catalog.searchPages,
     songPath: catalog.songPath,
     videos: catalog.videos,
+    videosPage: catalog.videosPage,
+    getVideoSnapshot: catalog.getVideoSnapshot,
     randomSongs: catalog.randomSongs,
     listSongs: catalog.listSongs,
     listGenres: catalog.listGenres,

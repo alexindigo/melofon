@@ -4,9 +4,11 @@ import type {
   ArtistGroupRef,
   ArtistGroupRow,
   Library,
+  MediaTrack,
   PlaylistRow,
   SongMetadata,
   SongRow,
+  VideoDetails,
 } from './types.ts';
 
 // Reserved native IDs cannot collide with the catalog's hashed artist IDs.
@@ -163,5 +165,32 @@ export function songDetail(song: SongRow) {
     metadata: song.metadata === undefined
       ? null
       : indexedMetadata(song.metadata),
+  };
+}
+
+function mediaTrack(track: MediaTrack) {
+  return {
+    index: track.index,
+    codec: track.codec,
+    language: track.language,
+    title: track.title,
+    ...(track.channels === undefined ? {} : { channels: track.channels }),
+  };
+}
+
+export function videoDetail(song: SongRow, details: VideoDetails | null) {
+  return {
+    ...songDetail(song),
+    details: details === null ? null : {
+      audio: details.audio.map(mediaTrack),
+      subtitles: details.subtitles.map(mediaTrack),
+      // Caption paths are internal resolution facts, never native payloads.
+      captions: details.captions.map((caption) => ({
+        key: caption.key,
+        name: caption.name,
+        format: caption.format,
+        ...(caption.stream === undefined ? {} : { stream: caption.stream }),
+      })),
+    },
   };
 }

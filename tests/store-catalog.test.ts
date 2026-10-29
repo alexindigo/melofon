@@ -310,6 +310,111 @@ Deno.test('store.catalog album page counts/rows and detail children share their 
   }
 });
 
+Deno.test('store.catalog video pages and stream details stay atomic across queued publication', async () => {
+  let pause: ((sql: string) => Promise<void>) | undefined;
+  const t = await domainFixture((engine) =>
+    createCatalogStore({
+      ...engine,
+      exclusive: (fn) =>
+        engine.exclusive((q) =>
+          fn({
+            ...q,
+            async all<T>(sql: string): Promise<T[]> {
+              const rows = await q.all<T>(sql);
+              await pause?.(sql);
+              return rows;
+            },
+          })
+        ),
+    })
+  );
+  try {
+    await t.domain.addLibrary({ id: 'lib', name: 'Music', path: '/music' });
+    const initial = snapshot();
+    initial.files[0].isVideo = true;
+    initial.files[0].video = {
+      audio: [{
+        index: 1,
+        codec: 'aac',
+        title: 'Original',
+        language: 'eng',
+        channels: 2,
+      }],
+      subtitles: [],
+      captions: [{
+        key: 'sidecar:song.en.srt',
+        name: 'en',
+        format: 'srt',
+        file: '/music/song.en.srt',
+      }],
+    };
+    // Retained identity input is required when publishing the same file again.
+    initial.retainedIds = ['song'];
+    for (const mode of ['page', 'detail'] as const) {
+      await t.domain.replaceCatalog(initial);
+      const read = () =>
+        mode === 'page'
+          ? t.domain.videosPage({
+            folderId: 'lib',
+            offset: 0,
+            limit: 1,
+            ignoredArticles: [],
+          })
+          : t.domain.getVideoSnapshot('song', 'lib');
+      const before = await read();
+      if ('total' in before) assertEquals(before.total, 1);
+      else assertEquals(before.detail?.details, initial.files[0].video);
+      let entered!: () => void;
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      pause = async (sql) => {
+        if (
+          sql.includes(
+            mode === 'page'
+              ? 'SELECT COUNT(*) AS total FROM files f'
+              : 'WHERE f.id =',
+          )
+        ) {
+          entered();
+          await held;
+        }
+      };
+      const pending = read();
+      try {
+        await waiting;
+        const write = t.domain.replaceCatalog({
+          artists: [],
+          albums: [],
+          files: [],
+          albumIdentities: [],
+          albumEvents: [],
+          events: [],
+          retainedIds: [],
+        });
+        pause = undefined;
+        release();
+        assertEquals(await pending, before);
+        await write;
+        const after = await read();
+        assertNotEquals(after.revision, before.revision);
+        if ('total' in after) assertEquals([after.total, after.rows], [0, []]);
+        else assertEquals(after.detail, null);
+      } finally {
+        pause = undefined;
+        release();
+        await pending;
+      }
+    }
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('store.catalog search categories, counts and revision stay atomic across queued publication', async () => {
   let pause: ((sql: string) => Promise<void>) | undefined;
   const t = await domainFixture((engine) =>

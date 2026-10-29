@@ -304,6 +304,15 @@ export interface CatalogReads {
   songPath(id: string): Promise<string | null>;
   /** All music videos in the catalog (getVideos). */
   videos(folderId?: string): Promise<SongRow[]>;
+  videosPage(opts: ArtistPageOptions): Promise<{
+    rows: SongRow[];
+    total: number;
+    revision: string;
+  }>;
+  getVideoSnapshot(id: string, folderId?: string): Promise<{
+    detail: { song: SongRow; details: VideoDetails | null } | null;
+    revision: string;
+  }>;
   videoDetails(id: string): Promise<VideoDetails | null>;
   /** Random songs from the catalog (getRandomSongs pull-forward). */
   randomSongs(opts: RandomSongOptions): Promise<SongRow[]>;
@@ -748,6 +757,54 @@ function catalogReads(q: Queries): CatalogReads {
     return rows[0] ? artistGroupOf(rows[0]) : null;
   }
 
+  async function songPage(opts: SongPageOptions, videosOnly = false) {
+    await requireLibrary(opts.folderId);
+    const predicates = songPredicates(opts);
+    if (videosOnly) predicates.push('f.is_video');
+    const where = predicates.length === 0
+      ? ''
+      : ` WHERE ${predicates.join(' AND ')}`;
+    const name = sortKeySql(
+      SONG_TITLE,
+      opts.ignoredArticles,
+      opts.sortTags ? 'f.sort_title' : undefined,
+    );
+    let order: string;
+    switch (opts.sort) {
+      case 'random':
+        order = seededRankSql('f.id', opts.seed);
+        break;
+      case 'newest':
+        order = 'fi.first_seen_at DESC NULLS LAST';
+        break;
+      case 'year':
+        order = `f.year NULLS LAST, ${name}`;
+        break;
+      case 'artist':
+        order = `${
+          sortKeySql(
+            'ar.name',
+            opts.ignoredArticles,
+            opts.sortTags ? 'f.artist_sort_name' : undefined,
+          )
+        } NULLS LAST, ${name}`;
+        break;
+      default:
+        order = name;
+    }
+    const count = await q.all<{ total: bigint }>(
+      `SELECT COUNT(*) AS total FROM files f${where}`,
+    );
+    const rows = await q.all<SongSqlRow>(
+      `${SONG_SELECT}${where} ORDER BY ${order}, f.id LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+    );
+    return {
+      rows: rows.map(songOf),
+      total: Number(count[0].total),
+      revision: await catalogRevision(q),
+    };
+  }
+
   async function resolveArtist(
     id: string,
     all: boolean,
@@ -1081,49 +1138,23 @@ function catalogReads(q: Queries): CatalogReads {
       };
     },
 
-    async songsPage(opts) {
-      await requireLibrary(opts.folderId);
-      const predicates = songPredicates(opts);
-      const where = predicates.length === 0
-        ? ''
-        : ` WHERE ${predicates.join(' AND ')}`;
-      const name = sortKeySql(
-        SONG_TITLE,
-        opts.ignoredArticles,
-        opts.sortTags ? 'f.sort_title' : undefined,
-      );
-      let order: string;
-      switch (opts.sort) {
-        case 'random':
-          order = seededRankSql('f.id', opts.seed);
-          break;
-        case 'newest':
-          order = 'fi.first_seen_at DESC NULLS LAST';
-          break;
-        case 'year':
-          order = `f.year NULLS LAST, ${name}`;
-          break;
-        case 'artist':
-          order = `${
-            sortKeySql(
-              'ar.name',
-              opts.ignoredArticles,
-              opts.sortTags ? 'f.artist_sort_name' : undefined,
-            )
-          } NULLS LAST, ${name}`;
-          break;
-        default:
-          order = name;
-      }
-      const count = await q.all<{ total: bigint }>(
-        `SELECT COUNT(*) AS total FROM files f${where}`,
-      );
+    songsPage: (opts) => songPage(opts),
+    videosPage: (opts) => songPage({ ...opts, sort: 'name' }, true),
+
+    async getVideoSnapshot(id, folderId) {
+      await requireLibrary(folderId);
       const rows = await q.all<SongSqlRow>(
-        `${SONG_SELECT}${where} ORDER BY ${order}, f.id LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+        `${SONG_SELECT} WHERE f.id = ${esc(id)} AND f.is_video${
+          folderId === undefined ? '' : ` AND f.library_id = ${esc(folderId)}`
+        }`,
       );
       return {
-        rows: rows.map(songOf),
-        total: Number(count[0].total),
+        detail: rows[0]
+          ? {
+            song: songOf(rows[0]),
+            details: await catalogReads(q).videoDetails(id),
+          }
+          : null,
         revision: await catalogRevision(q),
       };
     },
@@ -1550,6 +1581,10 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).getSongSnapshot(id)),
     songsPage: (opts) =>
       engine.exclusive((q) => catalogReads(q).songsPage(opts)),
+    videosPage: (opts) =>
+      engine.exclusive((q) => catalogReads(q).videosPage(opts)),
+    getVideoSnapshot: (id, folderId) =>
+      engine.exclusive((q) => catalogReads(q).getVideoSnapshot(id, folderId)),
     search3: (...args) =>
       engine.exclusive((q) => catalogReads(q).search3(...args)),
     searchPages: (...args) =>
