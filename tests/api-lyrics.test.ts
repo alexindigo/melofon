@@ -5,6 +5,9 @@ import { createLibraries } from '../src/libraries.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createLyrics } from '../src/lyrics.ts';
 import { scanLibrary } from '../src/scan.ts';
+import { createLookupRunner } from '../src/lookups/runner.ts';
+import { eventually } from './helpers/lookup.ts';
+import { lookupLyrics, lyricsLookupPlugin } from './helpers/lyrics-lookup.ts';
 
 async function lyricsFixture(prepare: (root: string) => Promise<unknown>) {
   const root = await Deno.makeTempDir({ prefix: 'melofon-api-lyrics-' });
@@ -383,6 +386,67 @@ Deno.test('API lyrics: known empty, unknown song, auth precedence, strict querie
       'unauthenticated',
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('API lyrics: acquired plugin candidates persist while embedded and sidecar lyrics retain precedence', async () => {
+  const f = await lyricsFixture(async (root) => {
+    await lyricMp3(`${root}/embedded.mp3`, [{
+      lang: 'eng',
+      text: 'Embedded wins',
+    }]);
+    await lyricMp3(`${root}/sidecar.mp3`);
+    await Deno.writeTextFile(
+      `${root}/sidecar.lrc`,
+      '[lang:rus]\n[00:01.00]Sidecar wins',
+    );
+  });
+  let runner: Awaited<ReturnType<typeof createLookupRunner>> | undefined;
+  try {
+    const builtin = `${f.root}/test-plugins`;
+    await lyricsLookupPlugin(builtin);
+    runner = await createLookupRunner({
+      store: f.store,
+      state: f.state,
+      dataDir: f.cfg.dataDir,
+      builtin,
+    });
+    const before = await Promise.all(f.songs.map((s) => Deno.readFile(s.path)));
+    for (const song of f.songs) {
+      await runner.request({ type: 'song', id: song.id }, 'all');
+    }
+    await eventually(async () =>
+      (await f.store.lookups.stats('lyrics-fixture')).done === 2
+    );
+    for (const [i, song] of f.songs.entries()) {
+      const [candidate] = await f.store.candidates.candidatesFor(
+        'song',
+        song.id,
+      );
+      assertEquals(candidate.source, 'lyrics-fixture');
+      assertEquals(candidate.kind, 'lyrics');
+      assertEquals(candidate.details.lyrics, {
+        origin: 'https://provenance.invalid/song',
+        entries: lookupLyrics,
+      });
+      const expected = song.fileName === 'embedded'
+        ? { language: 'eng', synced: false, lines: [{ text: 'Embedded wins' }] }
+        : {
+          language: 'rus',
+          synced: true,
+          lines: [{ start: 1000, text: 'Sidecar wins' }],
+        };
+      for (const credential of await credentials(f)) {
+        assertEquals(await read(f, credential, song.id), {
+          lyrics: [expected],
+        });
+      }
+      assertEquals(await Deno.readFile(song.path), before[i]);
+    }
+    assert(f.peers.every((peer) => peer !== '127.0.0.1' && peer !== '::1'));
+  } finally {
+    await runner?.close();
     await f.close();
   }
 });

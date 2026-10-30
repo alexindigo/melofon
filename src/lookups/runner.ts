@@ -30,6 +30,7 @@ import { createReference, type ReferenceProvider } from '../reference.ts';
 import type { ReferenceType } from '../reference-types.ts';
 import { imageHeader } from '../image-header.ts';
 import { LookupHost, LookupRevoked } from './host.ts';
+import { createLyrics } from '../lyrics.ts';
 import {
   createLookupNetwork,
   intersectHosts,
@@ -111,6 +112,7 @@ export async function createLookupRunner(options: {
 }) {
   const { store, state } = options;
   declareImageDownload(state);
+  const lyrics = createLyrics(store, state);
   const log = options.log ?? scopedLog('lookups');
   const library = options.library ??
     createLibrary(store, undefined, { dataDir: options.dataDir });
@@ -219,8 +221,10 @@ export async function createLookupRunner(options: {
       // Retire existing network authority synchronously at the settings boundary.
       if (key === `${prefix}hosts`) host.revoke('Lookup grant changed');
       if (key === `${prefix}enabled` && value === 'false') {
-        void host.configure(false, [], {});
+        host.revoke('Lookup disabled');
       }
+      // Only the configuration queue may perform asynchronous stop/configure:
+      // an out-of-band disable must not finish after a newer re-enable.
       scheduleConfiguration(host);
     }
   });
@@ -234,14 +238,14 @@ export async function createLookupRunner(options: {
   ) {
     if (closed) return;
     await configuration;
-    const accepts = (type: 'album' | 'artist') =>
+    const accepts = (type: 'album' | 'artist' | 'track') =>
       hosts.some((host) =>
         host.state !== 'disabled' &&
         host.plugin.manifest?.capabilities.some((c) =>
           !isReference(c) && c.accepts === type
         )
       );
-    if (!accepts('album') && !accepts('artist')) return;
+    if (!accepts('album') && !accepts('artist') && !accepts('track')) return;
     let ids: string[];
     if (!accepts('album') || target?.type === 'artist') ids = [];
     else if (target?.type === 'album') ids = [target.id];
@@ -342,6 +346,59 @@ export async function createLookupRunner(options: {
         }
       }
     }
+    // Explicit requests acquire whole lyrics candidates even when local lyrics
+    // exist. Automatic missing-lyrics intake belongs to the lyrics reader policy.
+    if (mode === 'all' && accepts('track') && target?.type !== 'artist') {
+      const tracks = async function* () {
+        if (target?.type === 'song') {
+          yield target.id;
+        } else if (target?.type === 'album') {
+          for (const song of (await library.getAlbum(target.id))?.songs ?? []) {
+            yield song.id;
+          }
+        } else {
+          for (let offset = 0;; offset += 100) {
+            const page = await library.songsPage({
+              sort: 'name',
+              offset,
+              limit: 100,
+              ...(target ? { folderId: target.id } : {}),
+            });
+            for (const song of page.rows) yield song.id;
+            if (page.rows.length < 100) break;
+          }
+        }
+      };
+      for await (const id of tracks()) {
+        if (closed) return;
+        const facts = await referenceFacts(store, 'track', id);
+        if (!facts || facts.type !== 'track') continue;
+        for (const host of hosts) {
+          if (!host.plugin.manifest || host.state === 'disabled') continue;
+          for (const capability of host.plugin.manifest.capabilities) {
+            if (isReference(capability) || capability.accepts !== 'track') {
+              continue;
+            }
+            if (
+              !capability.requires.every((name) =>
+                name.startsWith('track.id.')
+                  ? Boolean(facts.ids[name.slice('track.id.'.length)])
+                  : name.startsWith('artist.id.') &&
+                    Boolean(facts.artistIds[name.slice('artist.id.'.length)])
+              )
+            ) continue;
+            jobs.push({
+              plugin: host.plugin.id,
+              entityType: 'song',
+              entityId: id,
+              factsHash: await factsHash(capability, facts),
+              mode,
+            });
+          }
+        }
+        if (jobs.length >= 100) await store.lookups.enqueue(jobs.splice(0));
+      }
+    }
     if (!closed && jobs.length) await store.lookups.enqueue(jobs);
     pump();
   }
@@ -393,6 +450,9 @@ export async function createLookupRunner(options: {
         await store.lookups.finish(job.id, { state: 'done' });
         return;
       }
+      if (!isReference(capability) && capability.accepts === 'track') {
+        budget.maxBytes = await lyrics.maxBytes();
+      }
       if (closed) throw new LookupRevoked('Runner closed');
       await host.start();
       const authority = host.authority;
@@ -424,6 +484,32 @@ export async function createLookupRunner(options: {
       if (!('candidates' in result)) throw new Error('Expected candidates');
       const candidates: CandidateInput[] = [];
       for (const candidate of result.candidates) {
+        if (capability.accepts === 'track') {
+          const value = candidate.values['track.lyrics']!;
+          const song = await store.catalog.getSong(candidate.target.id);
+          if (!song) throw new Error('Candidate target not in catalog');
+          candidates.push({
+            entityType: 'song',
+            entityId: song.id,
+            kind: 'lyrics',
+            source: host.plugin.id,
+            confidence: candidate.confidence,
+            // Unlike local text-conflict identity, an online proposal owns all
+            // variants and timing. Changing any part creates a new proposal.
+            imageHash: await imageHash(
+              new TextEncoder().encode(JSON.stringify(value.entries)),
+            ),
+            imageExt: 'lyrics',
+            libraryId: song.libraryId,
+            origin: value.url,
+            details: {
+              ...candidate.evidence,
+              ...(candidate.ids ? { ids: candidate.ids } : {}),
+              lyrics: { origin: value.url, entries: value.entries },
+            },
+          });
+          continue;
+        }
         const artist = candidate.target.type === 'artist';
         const target = artist
           ? await referenceFacts(store, 'artist', candidate.target.id)
