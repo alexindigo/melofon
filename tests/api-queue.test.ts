@@ -6,6 +6,8 @@ import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
 import { scanLibrary } from '../src/scan.ts';
+import { authFixture } from './helpers/authentication.ts';
+import { restored } from './helpers/prepared.ts';
 
 const path = '/api/v1/me/queue';
 interface Queue {
@@ -17,16 +19,25 @@ interface Queue {
 }
 
 async function fixture() {
-  let songIds: string[] = [];
-  const f = await apiFixture({
-    allLayers: true,
-    services: async (f) => {
+  const dir = await restored('api-queue', async (dir) => {
+    const f = await authFixture(undefined, dir);
+    try {
       const libraries = createLibraries(f.store);
       await libraries.add(
         'Music',
         await Deno.realPath('tests/fixtures/library'),
       );
       await scanLibrary(f.store);
+    } finally {
+      await f.close();
+    }
+  }, 'melofon-api-queue-');
+  let songIds: string[] = [];
+  const f = await apiFixture({
+    storeDir: dir,
+    allLayers: true,
+    services: async (f) => {
+      const libraries = createLibraries(f.store);
       const library = createLibrary(f.store);
       songIds = (await library.listSongs({ offset: 0, size: 100 }))
         .filter((song) => song.title !== null).map((song) => song.id);
@@ -65,7 +76,17 @@ async function fixture() {
     assertEquals(body.status, 'ok', JSON.stringify(body));
     return body;
   }
-  return { ...f, songIds, read, save, rest };
+  return {
+    ...f,
+    songIds,
+    read,
+    save,
+    rest,
+    async close() {
+      await f.close();
+      await Deno.remove(dir, { recursive: true });
+    },
+  };
 }
 
 Deno.test('API saved queue: cookie and Bearer devices round-trip core values and clear without events', async () => {

@@ -21,14 +21,12 @@ import { createPlayback } from '../src/playback.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
+import { restored } from './helpers/prepared.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
 
-async function setup() {
-  const dir = await Deno.makeTempDir({ prefix: 'melofon-ann-' });
-  const store = await openStore(dir);
-  const db = store;
-  const cfg = {
+function config(dir: string) {
+  return {
     listen: undefined,
     dataDir: dir,
     user: 'admin',
@@ -36,10 +34,27 @@ async function setup() {
     secret: 's3cret',
     version: '0.0.0-test',
   };
-  await seedFirstUser(store, cfg);
+}
+
+async function setup() {
+  const dir = await restored('annotation', async (dir) => {
+    const store = await openStore(dir);
+    try {
+      await seedFirstUser(store, config(dir));
+      const libraries = createLibraries(store);
+      await libraries.add(
+        'Music',
+        await Deno.realPath('tests/fixtures/library'),
+      );
+      await scanLibrary(store);
+    } finally {
+      await store.close();
+    }
+  }, 'melofon-ann-');
+  const store = await openStore(dir);
+  const db = store;
+  const cfg = config(dir);
   const libraries = createLibraries(store);
-  await libraries.add('Music', await Deno.realPath('tests/fixtures/library'));
-  await scanLibrary(store);
   const library = createLibrary(store);
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);

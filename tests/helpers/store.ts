@@ -1,8 +1,28 @@
 import { type Engine, openEngine } from '../../src/store/engine.ts';
+import { restored } from './prepared.ts';
+
+async function build(dir: string) {
+  const engine = await openEngine(dir);
+  const run = (sql: string) => engine.exclusive((q) => q.run(sql));
+  try {
+    await run(
+      "INSERT INTO users (id, name, password_enc, created_at) VALUES ('u', 'alice', 'encrypted', now()), ('v', 'bob', 'other', now())",
+    );
+    await run("INSERT INTO artists (id, name) VALUES ('artist', 'Artist')");
+    await run(
+      "INSERT INTO albums (id, name, album_artist_id, artist_kind, folder_name) VALUES ('album', 'Album', 'artist', 'tagged', 'Music')",
+    );
+    await run(
+      "INSERT INTO files (id, path, album_id, artist_id) VALUES ('song', '/song', 'album', 'artist')",
+    );
+  } finally {
+    await engine.close();
+  }
+}
 
 /** Real engine with a one-shot commit fault, to observe rollback at consumers. */
 export async function domainFixture<T>(factory: (engine: Engine) => T) {
-  const dir = await Deno.makeTempDir({ prefix: 'melofon-store-' });
+  const dir = await restored('domain', build, 'melofon-store-');
   const engine = await openEngine(dir);
   let failCommit = false;
   const observed: Engine = {
@@ -24,16 +44,6 @@ export async function domainFixture<T>(factory: (engine: Engine) => T) {
   const all = <R = Record<string, unknown>>(sql: string) =>
     engine.exclusive((q) => q.all<R>(sql));
   const run = (sql: string) => engine.exclusive((q) => q.run(sql));
-  await run(
-    "INSERT INTO users (id, name, password_enc, created_at) VALUES ('u', 'alice', 'encrypted', now()), ('v', 'bob', 'other', now())",
-  );
-  await run("INSERT INTO artists (id, name) VALUES ('artist', 'Artist')");
-  await run(
-    "INSERT INTO albums (id, name, album_artist_id, artist_kind, folder_name) VALUES ('album', 'Album', 'artist', 'tagged', 'Music')",
-  );
-  await run(
-    "INSERT INTO files (id, path, album_id, artist_id) VALUES ('song', '/song', 'album', 'artist')",
-  );
   return {
     domain: factory(observed),
     all,

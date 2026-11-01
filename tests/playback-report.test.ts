@@ -18,11 +18,10 @@ import { createFileSource } from '../src/file-source.ts';
 import { createMedia } from '../src/media.ts';
 import { loadLayers } from '../src/layers.ts';
 import { facade } from '../src/facade.ts';
+import { restored } from './helpers/prepared.ts';
 
-async function setup() {
-  const dir = await Deno.makeTempDir({ prefix: 'melofon-playback-report-' });
-  let store = await openStore(dir);
-  const cfg = {
+function config(dir: string) {
+  return {
     listen: undefined,
     dataDir: dir,
     user: 'admin',
@@ -30,12 +29,24 @@ async function setup() {
     secret: 'g2-secret',
     version: 'test',
   };
-  await seedFirstUser(store, cfg);
-  await createLibraries(store).add(
-    'Music',
-    await Deno.realPath('tests/fixtures/library'),
-  );
-  await scanLibrary(store);
+}
+
+async function setup() {
+  const dir = await restored('playback-report', async (dir) => {
+    const store = await openStore(dir);
+    try {
+      await seedFirstUser(store, config(dir));
+      await createLibraries(store).add(
+        'Music',
+        await Deno.realPath('tests/fixtures/library'),
+      );
+      await scanLibrary(store);
+    } finally {
+      await store.close();
+    }
+  }, 'melofon-playback-report-');
+  let store = await openStore(dir);
+  const cfg = config(dir);
   let clock = Date.now();
   let state = createState(store);
   let player = createPlayer();

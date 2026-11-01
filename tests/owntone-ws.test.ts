@@ -17,12 +17,25 @@ import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
+import { restored } from './helpers/prepared.ts';
 
 const HOOK = 3689;
 const DEFAULT_PORT = 4534;
 
 async function setup(env: Record<string, string> = {}, hostname = '127.0.0.1') {
-  const dir = await Deno.makeTempDir({ prefix: 'melofon-otws-' });
+  const dir = await restored('owntone-ws', async (dir) => {
+    const store = await openStore(dir);
+    try {
+      const libraries = createLibraries(store);
+      await libraries.add(
+        'Music',
+        await Deno.realPath('tests/fixtures/library'),
+      );
+      await scanLibrary(store);
+    } finally {
+      await store.close();
+    }
+  }, 'melofon-otws-');
   const store = await openStore(dir);
   const db = store;
   const cfg = {
@@ -34,8 +47,6 @@ async function setup(env: Record<string, string> = {}, hostname = '127.0.0.1') {
     version: '0.0.0-test',
   };
   const libraries = createLibraries(store);
-  await libraries.add('Music', await Deno.realPath('tests/fixtures/library'));
-  await scanLibrary(store);
   const notify = createNotify();
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store);

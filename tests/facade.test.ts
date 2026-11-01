@@ -13,9 +13,13 @@ import { loadLayers } from '../src/layers.ts';
 import { openStore } from '../src/store/index.ts';
 import { captureLogs, parseLogfmt } from './helpers/logging.ts';
 import type { Layer } from '../src/layers.ts';
+import { restored } from './helpers/prepared.ts';
 
 async function makeApps() {
-  const dir = await Deno.makeTempDir({ prefix: 'melofon-facade-' });
+  const dir = await restored('facade', async (dir) => {
+    const store = await openStore(dir);
+    await store.close();
+  }, 'melofon-facade-');
   const store = await openStore(dir);
   const db = store;
   const app = { store, cfg: {} };

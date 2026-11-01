@@ -16,6 +16,7 @@ import { createArtwork } from '../../src/artwork.ts';
 import { scanLibrary } from '../../src/scan.ts';
 import { facade } from '../../src/facade.ts';
 import { loadLayers } from '../../src/layers.ts';
+import { restored } from './prepared.ts';
 
 export const quote = (s: string) => `'${s.replaceAll("'", "''")}'`;
 export type Params = Record<string, string | string[]>;
@@ -146,21 +147,28 @@ export async function h9Facade(store: Store, dir: string) {
 }
 
 export async function h9Setup() {
-  const dir = await Deno.makeTempDir({ prefix: 'melofon-h9-' });
+  const dir = await restored('h9', async (dir) => {
+    const store = await openStore(dir);
+    try {
+      const api = await h9Facade(store, dir);
+      await seedFirstUser(store, api.cfg);
+      const password = quote(await encryptPassword(api.cfg.secret, 'test'));
+      for (const name of ['alice', 'bob']) {
+        await rawSql(store).run(
+          `INSERT INTO users (id, name, password_enc, created_at) VALUES ('${name}', '${name}', ${password}, now())`,
+        );
+      }
+      await api.libraries.add(
+        'Music',
+        await Deno.realPath('tests/fixtures/library'),
+      );
+      await scanLibrary(store);
+    } finally {
+      await store.close();
+    }
+  }, 'melofon-h9-');
   const store = await openStore(dir);
   const api = await h9Facade(store, dir);
-  await seedFirstUser(store, api.cfg);
-  const password = quote(await encryptPassword(api.cfg.secret, 'test'));
-  for (const name of ['alice', 'bob']) {
-    await rawSql(store).run(
-      `INSERT INTO users (id, name, password_enc, created_at) VALUES ('${name}', '${name}', ${password}, now())`,
-    );
-  }
-  await api.libraries.add(
-    'Music',
-    await Deno.realPath('tests/fixtures/library'),
-  );
-  await scanLibrary(store);
   const songs = await rawSql(store).all<{ id: string; duration_ms: number }>(
     'SELECT id, duration_ms FROM files ORDER BY path',
   );
