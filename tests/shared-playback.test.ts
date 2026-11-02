@@ -83,7 +83,6 @@ async function setup() {
     playback,
     stream: createStream(
       createMedia(),
-      playback,
       undefined,
       undefined,
       createFileSource(library),
@@ -164,7 +163,7 @@ Deno.test('client report: getNowPlaying has it; OwnTone player stays engine; not
   }
 });
 
-Deno.test('a stream open reports the play (no listens; player stays engine)', async () => {
+Deno.test('a stream open does not report playback or listens; player stays engine', async () => {
   const { db, onDefault, onHook, songs, close } = await setup();
   try {
     const res = await get(
@@ -174,10 +173,9 @@ Deno.test('a stream open reports the play (no listens; player stays engine)', as
     assertEquals(res.status, 200);
     await res.body?.cancel();
 
-    // The session shows on getNowPlaying…
+    // Media delivery is independent of explicit client playback reports.
     const entries = await npEntry(onDefault);
-    assertEquals(entries.length, 1);
-    assertEquals(entries[0].title, songs[0].title);
+    assertEquals(entries, []);
 
     // …but stream is not a scrobble: no listens row.
     const listens = (await rawSql(db).all(

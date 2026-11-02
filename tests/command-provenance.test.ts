@@ -244,7 +244,6 @@ async function setupWire() {
     playback,
     stream: createStream(
       createMedia(),
-      playback,
       undefined,
       undefined,
       createFileSource(library),

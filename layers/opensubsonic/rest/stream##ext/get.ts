@@ -1,10 +1,8 @@
 // layers/opensubsonic/rest/stream/get.ts — GET /rest/stream.
 // app.stream prepares DirectPlay or a live audio transcode; unrequested
 // music-video containers become audio-only. HEAD shares headers, never encoding.
-// Every open reports the play to core (playback.reportPlaying, one id per
-// open; completion/disconnect reports the stop — an older Range completing
-// never clears a newer stream). Never a listens row — stream is not a
-// scrobble. The hat only parses, calls, encodes.
+// Reads do not report playback. Clients use scrobble/reportPlayback explicitly
+// (OpenSubsonic stream.md; Navidrome 18205366 server/subsonic/stream.go:20-54).
 import { fail, notFound } from '#opensubsonic/envelope.ts';
 import { mediaReadRequest } from '#opensubsonic/media-request.ts';
 import { intParam, requiredParam } from '#opensubsonic/params.ts';
@@ -23,14 +21,6 @@ export default async (request: HatRequest, context: HatContext) => {
     mediaReadRequest(request),
     source,
     context.state.params!.get('format') ?? undefined,
-    source.trackId
-      ? {
-        username: context.state.user!.username,
-        client: context.state.params!.get('c') ?? 'opensubsonic',
-        trackId: source.trackId,
-        streamId: crypto.randomUUID(),
-      }
-      : undefined,
     maxBitRateKbps,
     {
       timeOffset: intParam(context.state.params!, 'timeOffset', 0),

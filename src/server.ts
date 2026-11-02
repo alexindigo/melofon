@@ -294,7 +294,6 @@ export async function startServer(options: {
     playback,
     stream: createStream(
       media,
-      playback,
       cfg,
       undefined,
       createFileSource(library, podcasts),

@@ -1,11 +1,11 @@
 // Core owns stream decisions and their execution. Hats parse wire arguments;
 // one prepared decision governs GET/HEAD, legacy streaming and negotiation.
+// Media delivery has no playback-state capability: apps report separately.
 import { serveFile } from '@std/http/file-server';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { extname } from 'node:path';
 import type { Media } from './media.ts';
-import type { Playback } from './playback.ts';
 import type { FileSource } from './file-source.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
@@ -17,12 +17,6 @@ import {
 export interface StreamFile {
   path: string;
   isVideo: boolean;
-}
-export interface StreamIdentity {
-  username: string;
-  client: string;
-  trackId: string;
-  streamId: string;
 }
 export interface StreamOptions {
   timeOffset?: number;
@@ -42,13 +36,11 @@ export interface StreamService {
   file(
     request: Request,
     path: string,
-    identity?: StreamIdentity,
   ): Promise<Response>;
   play(
     request: Request,
     file: StreamFile,
     format?: string,
-    identity?: StreamIdentity,
     maxBitRateKbps?: number,
     options?: StreamOptions,
   ): Promise<Response | null>;
@@ -61,7 +53,7 @@ export interface StreamService {
     request: Request,
     file: StreamFile,
     token: string,
-    identity: StreamIdentity,
+    username: string,
     offset?: number,
   ): Promise<Response>;
 }
@@ -74,7 +66,6 @@ const offsetSeconds = (value?: number) =>
 
 export function createStream(
   media: Media,
-  playback?: Playback,
   cfg?: { absentToMp3?: boolean; secret?: string },
   log: Log = scopedLog('stream'),
   source: FileSource = () => Promise.resolve(null),
@@ -88,19 +79,9 @@ export function createStream(
     const stat = await Deno.stat(path);
     return `${stat.size}:${stat.mtime?.getTime()}:${stat.ino}`;
   };
-  const hook = (request: Request, identity?: StreamIdentity) => {
-    if (!playback || !identity || request.method === 'HEAD') return;
-    void playback.reportPlaying(identity);
-    request.signal.addEventListener(
-      'abort',
-      () => void playback.reportStopped({ streamId: identity.streamId }),
-      { once: true },
-    );
-  };
   const fixed = async (
     request: Request,
     path: string,
-    identity?: StreamIdentity,
   ) => {
     const response = await serveFile(request, path);
     const probe = await media.probe(path);
@@ -110,17 +91,15 @@ export function createStream(
         String(probe.durationMs / 1000),
       );
     }
-    hook(request, identity);
     return response;
   };
   const serve = async (
     request: Request,
     file: StreamFile,
     decision: StreamDecision,
-    identity?: StreamIdentity,
     options: StreamOptions = {},
   ): Promise<Response | null> => {
-    if (decision.kind === 'direct') return fixed(request, file.path, identity);
+    if (decision.kind === 'direct') return fixed(request, file.path);
     const profile = (await media.audioProfiles()).find((p) =>
       p.format === decision.format
     );
@@ -166,28 +145,27 @@ export function createStream(
       signal: request.signal,
     });
     if (!audio) return null;
-    hook(request, identity);
     return new Response(audio.stream, { headers });
   };
   return {
     source,
     file: fixed,
-    async play(request, file, format, identity, maxBitRateKbps, options) {
-      if (format === 'raw') return fixed(request, file.path, identity);
+    async play(request, file, format, maxBitRateKbps, options) {
+      if (format === 'raw') return fixed(request, file.path);
       const ceiling = limit(maxBitRateKbps);
       const probe = await media.probe(file.path);
       const profiles = await media.audioProfiles();
       const over = probe.bitrateKbps !== null && probe.bitrateKbps > ceiling;
       const container = extname(file.path).slice(1).toLowerCase();
       if (file.isVideo && format === container && !over) {
-        return fixed(request, file.path, identity);
+        return fixed(request, file.path);
       }
       let target = format;
       if (!file.isVideo && format === undefined && !cfg?.absentToMp3 && !over) {
-        return fixed(request, file.path, identity);
+        return fixed(request, file.path);
       }
       if (!file.isVideo && format === probe.audioCodec && !over) {
-        return fixed(request, file.path, identity);
+        return fixed(request, file.path);
       }
       if (target === undefined && over && !file.isVideo) {
         target = probe.audioCodec ?? undefined;
@@ -198,7 +176,7 @@ export function createStream(
       if (
         !file.isVideo && format !== undefined &&
         profile.format === probe.audioCodec && !over
-      ) return fixed(request, file.path, identity);
+      ) return fixed(request, file.path);
       return serve(
         request,
         file,
@@ -207,7 +185,6 @@ export function createStream(
           format: profile.format,
           bitRateKbps: Math.min(profile.bitRateKbps, ceiling),
         },
-        identity,
         options,
       );
     },
@@ -233,7 +210,7 @@ export function createStream(
       }
       return { ...result, transcodeParams: token };
     },
-    async negotiated(request, file, token, identity, offset) {
+    async negotiated(request, file, token, username, offset) {
       let decision: StreamDecision;
       try {
         const [payload, mac, extra] = token.split('.');
@@ -246,7 +223,7 @@ export function createStream(
         const claims = JSON.parse(Buffer.from(payload, 'base64url').toString());
         if (
           claims.file !== fileKey(file.path) ||
-          claims.username !== identity.username ||
+          claims.username !== username ||
           claims.stamp !== await stamp(file.path)
         ) throw new Error('Stale token');
         decision = claims.decision;
@@ -255,7 +232,7 @@ export function createStream(
           status: 410,
         });
       }
-      return await serve(request, file, decision, identity, {
+      return await serve(request, file, decision, {
         timeOffset: offset,
       }) ?? new Response('Cannot create media stream', { status: 500 });
     },

@@ -50,11 +50,6 @@ async function setup() {
   let clock = Date.now();
   let state = createState(store);
   let player = createPlayer();
-  let lookupBarrier: Promise<void> | undefined;
-  let releaseLookup: (() => void) | undefined;
-  let pendingLookup:
-    | ReturnType<ReturnType<typeof createLibrary>['getSong']>
-    | undefined;
   const router = async () => {
     const library = createLibrary(store);
     const listens = createListens(store);
@@ -65,16 +60,7 @@ async function setup() {
     });
     const playback = createPlayback({
       player,
-      library: {
-        ...library,
-        getSong(id) {
-          pendingLookup = (async () => {
-            await lookupBarrier;
-            return library.getSong(id);
-          })();
-          return pendingLookup;
-        },
-      },
+      library,
       nowPlaying,
       cfg,
     });
@@ -91,7 +77,6 @@ async function setup() {
           playback,
           stream: createStream(
             createMedia(),
-            playback,
             cfg,
             undefined,
             createFileSource(library),
@@ -149,17 +134,6 @@ async function setup() {
     },
     advance(ms: number) {
       clock += ms;
-    },
-    holdPlaybackLookup() {
-      lookupBarrier = new Promise<void>((resolve) => {
-        releaseLookup = resolve;
-      });
-      pendingLookup = undefined;
-    },
-    async releasePlaybackLookup() {
-      releaseLookup?.();
-      await pendingLookup;
-      lookupBarrier = undefined;
     },
     async report(
       playState: string,
@@ -472,7 +446,7 @@ Deno.test('G2 HTTP parameter errors preserve session and discovery advertises pl
   }
 });
 
-Deno.test('G2 scrobble notification and stream-style open/abort share expiring sessions without listens', async () => {
+Deno.test('G2 scrobble reports expire; stream opens and aborts never change explicit sessions', async () => {
   const t = await setup();
   try {
     await t.call('scrobble', {
@@ -491,27 +465,22 @@ Deno.test('G2 scrobble notification and stream-style open/abort share expiring s
     assertEquals(await t.count(), 1);
     assertEquals(await t.entries(), []);
     const firstStream = await t.stream();
-    const playerId = (await t.entries())[0].playerId;
+    assertEquals(await t.entries(), []);
+    await t.report('paused', 12);
+    const before = await t.entries();
     const newerStream = await t.stream();
     firstStream.abort();
-    assertEquals((await t.entries())[0].playerId, playerId);
+    assertEquals(await t.entries(), before);
     newerStream.abort();
-    assertEquals(await t.entries(), []);
-    // An abort must not overtake a fire-and-forget stream-open report while
-    // unrelated catalog work is delayed. No waits: hold/release the dependency.
-    t.holdPlaybackLookup();
-    const abortedStream = await t.stream();
-    abortedStream.abort();
-    await t.releasePlaybackLookup();
-    assertEquals(await t.entries(), []);
+    assertEquals(await t.entries(), before);
     await t.stream();
-    assertEquals((await t.entries()).length, 1);
+    assertEquals(await t.entries(), before);
     t.advance(t.song.durationMs! + 30 * 60000);
     assertEquals(await t.entries(), []);
     assertEquals(
       await t.count(),
       1,
-      'stream expiry/abort never creates a listen',
+      'media reads and explicit-session expiry never create a listen',
     );
   } finally {
     await t.close();

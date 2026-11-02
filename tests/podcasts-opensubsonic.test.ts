@@ -147,7 +147,6 @@ async function setup() {
         user: createUserService(store, cfg),
         stream: createStream(
           media,
-          undefined,
           cfg,
           undefined,
           createFileSource(library, podcasts),

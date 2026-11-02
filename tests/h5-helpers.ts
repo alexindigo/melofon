@@ -101,7 +101,7 @@ export async function setupH5() {
     libraries,
     user: createUserService(store, cfg),
     library,
-    stream: createStream(media, undefined, cfg, {
+    stream: createStream(media, cfg, {
       event(id) {
         events.push(id);
       },

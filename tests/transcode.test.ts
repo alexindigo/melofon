@@ -25,11 +25,10 @@ const play = (
     maxBitRateKbps?: number;
   },
 ) =>
-  createStream(createMedia(), undefined, cfg).play(
+  createStream(createMedia(), cfg).play(
     new Request('http://x/rest/stream'),
     { path: opts.path, isVideo: opts.isVideo ?? false },
     opts.format,
-    undefined,
     opts.maxBitRateKbps,
   );
 

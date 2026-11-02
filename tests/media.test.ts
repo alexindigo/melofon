@@ -59,7 +59,6 @@ async function setup() {
       createMedia(),
       undefined,
       undefined,
-      undefined,
       createFileSource(library),
     ),
     zip: createZip(),

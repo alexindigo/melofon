@@ -14,10 +14,11 @@ export default async (request: HatRequest, context: HatContext) => {
   }
   const song = await context.app.library.getSong(id);
   if (!song) return new Response('Media not found', { status: 404 });
-  return context.app.stream.negotiated(mediaReadRequest(request), song, token, {
-    username: context.state.user!.username,
-    client: params.get('c') ?? 'opensubsonic',
-    trackId: id,
-    streamId: crypto.randomUUID(),
-  }, intParam(params, 'offset', 0));
+  return context.app.stream.negotiated(
+    mediaReadRequest(request),
+    song,
+    token,
+    context.state.user!.username,
+    intParam(params, 'offset', 0),
+  );
 };

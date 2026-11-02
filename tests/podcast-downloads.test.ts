@@ -114,7 +114,6 @@ async function setup(auto: number | null = 0) {
   const playback = createPlayback({ player, nowPlaying, library, cfg });
   const stream = createStream(
     media,
-    playback,
     cfg,
     undefined,
     createFileSource(library, { fileSource: (id) => podcasts.fileSource(id) }),
@@ -218,7 +217,6 @@ async function setup(auto: number | null = 0) {
         library: nextLibrary,
         stream: createStream(
           media,
-          undefined,
           cfg,
           undefined,
           createFileSource(nextLibrary, podcasts),

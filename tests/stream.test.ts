@@ -60,7 +60,6 @@ async function setup() {
       createMedia(),
       undefined,
       undefined,
-      undefined,
       createFileSource(library),
     ),
     artwork: createArtwork(library),
