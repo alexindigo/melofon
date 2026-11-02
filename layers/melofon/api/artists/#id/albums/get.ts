@@ -1,11 +1,11 @@
 import type { HatContext, HatRequest } from '#melofon/types.ts';
-import { namePageQuery } from '#melofon/browse.ts';
+import { indexPayload, namePageQuery } from '#melofon/browse.ts';
 import { albumSummary, artistReference } from '#melofon/browse-payloads.ts';
 import { catalogResponse } from '#melofon/cache.ts';
 import { core, fail } from '#melofon/errors.ts';
 
 export default async function (request: HatRequest, context: HatContext) {
-  const query = await namePageQuery(request, context);
+  const query = await namePageQuery(request, context, true);
   const page = await core(() =>
     context.app.library.artistAlbumsPage(
       artistReference(request.params.id),
@@ -23,5 +23,6 @@ export default async function (request: HatRequest, context: HatContext) {
     total: page.total,
     offset: query.offset,
     limit: query.limit,
+    ...indexPayload(page.index, query.ignoredArticles),
   });
 }

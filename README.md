@@ -139,6 +139,31 @@ insignificant; equal keys use the entity id (the literal name for genres).
 Punctuation and non-ASCII digits are ordinary text, not signs or decimals.
 Other hats keep their existing defaults.
 
+Native artists, albums, songs, artist-album memberships and search accept
+`sortTags=true|false`, default **off**. A nonblank tagged sort name/title wins;
+otherwise the normal article and filesystem-fallback key applies. Tagged sort
+values are folded but are not article-stripped. Core still defaults off; each
+hat chooses its own policy.
+
+On artists and artist-album memberships, `sort=-name` reverses name order.
+Album/song collections also accept `-artist`, `-year`, `-newest` and `-genre`
+(genre still requires its filter). A minus reverses the existing mode, so
+`-newest` is oldest-first. Missing values stay last; final ID ties stay ascending.
+Random and personal selection modes keep their existing sort names.
+
+Those name-ordered pages additionally accept `index=true` (default off), for
+example `/api/v1/artists?sort=-name&natural=true&sortTags=true&index=true`.
+The response adds the effective `ignoredArticles` list and
+`index: [{key,label,offset,count}, ...]`: contiguous runs in
+the **whole eligible sequence**, not just the current page. A–Z keys follow the
+same resolved article/tag key as paging; other scripts and numeric initials
+are retained, with `#` for an empty key. Numeric initials can recur under
+natural ordering, so separate runs are not merged. Present Unknown/Various
+artist groups have their own native keys/labels and remain last. Offsets/counts
+are scoped and computed in the same catalog snapshot as rows and total.
+Index metadata requires name order; it is not offered for other sort modes.
+All options are strict booleans/allow-listed sorts and participate in validators.
+
 ### Stable identities
 
 Scanning records an `afp/1` audio fingerprint from compressed audio packets,

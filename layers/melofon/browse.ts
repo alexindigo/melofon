@@ -2,6 +2,7 @@ import type {
   AlbumPageOptions,
   ArtistPageOptions,
   BrowsePageOptions,
+  CatalogIndexEntry,
   HatContext,
   HatRequest,
   PlaylistPageOptions,
@@ -45,13 +46,58 @@ export function browseLibrary(params: URLSearchParams): string | undefined {
   return library ?? undefined;
 }
 
-function naturalOption(params: URLSearchParams): { natural?: boolean } {
-  const raw = params.get('natural');
+function booleanOption(params: URLSearchParams, key: string) {
+  const raw = params.get(key);
   if (raw === null) return {};
   if (raw !== 'true' && raw !== 'false') {
-    fail(400, 'invalid_field', 'Invalid natural');
+    fail(400, 'invalid_field', `Invalid ${key}`);
   }
-  return { natural: raw === 'true' };
+  return { [key]: raw === 'true' };
+}
+
+function nameOptions(params: URLSearchParams) {
+  return {
+    ...booleanOption(params, 'natural'),
+    ...booleanOption(params, 'sortTags'),
+  };
+}
+
+function pageOptions(params: URLSearchParams, sort: string) {
+  const index = booleanOption(params, 'index');
+  if (index.index && sort !== 'name') {
+    fail(400, 'invalid_field', 'Index requires name sort');
+  }
+  return {
+    ...nameOptions(params),
+    ...index,
+    ...(params.get('sort')?.startsWith('-') ? { descending: true } : {}),
+  };
+}
+
+/** The store supplies facts/ranks; native labels and index spelling live here. */
+export function indexPayload(
+  index: CatalogIndexEntry[] | undefined,
+  ignoredArticles: string[] = [],
+) {
+  if (index === undefined) return {};
+  return {
+    ignoredArticles,
+    index: index.map((entry) => {
+      const key = entry.kind === 'text'
+        ? entry.initial?.toUpperCase() || '#'
+        : entry.kind;
+      return {
+        key,
+        label: entry.kind === 'unknown'
+          ? '[Unknown Artist]'
+          : entry.kind === 'various'
+          ? '[Various Artists]'
+          : key,
+        offset: entry.offset,
+        count: entry.count,
+      };
+    }),
+  };
 }
 
 async function browsePaging(
@@ -100,6 +146,7 @@ export async function searchPageQuery(
     'songOffset',
     'songLimit',
     'natural',
+    'sortTags',
   ]);
   const { folderId, ignoredArticles, articleRevision, ...artists } =
     await browsePaging(
@@ -114,7 +161,7 @@ export async function searchPageQuery(
     folderId,
     ignoredArticles,
     articleRevision,
-    ...naturalOption(params),
+    ...nameOptions(params),
     artists,
     albums: { offset: albumPage.offset, limit: albumPage.limit },
     songs: { offset: songPage.offset, limit: songPage.limit },
@@ -153,6 +200,7 @@ export async function folderPageQuery(
 export async function namePageQuery(
   request: HatRequest,
   context: HatContext,
+  extended = false,
 ): Promise<ArtistPageOptions> {
   const params = browseQuery(request, [
     'library',
@@ -160,11 +208,18 @@ export async function namePageQuery(
     'limit',
     'sort',
     'natural',
+    ...(extended ? ['sortTags', 'index'] : []),
   ]);
-  if ((params.get('sort') ?? 'name') !== 'name') {
+  const sort = params.get('sort') ?? 'name';
+  if (sort !== 'name' && !(extended && sort === '-name')) {
     fail(400, 'invalid_field', 'Invalid sort');
   }
-  return { ...await browsePaging(params, context), ...naturalOption(params) };
+  return {
+    ...await browsePaging(params, context),
+    ...(extended
+      ? pageOptions(params, 'name')
+      : booleanOption(params, 'natural')),
+  };
 }
 
 export async function playlistPageQuery(
@@ -211,12 +266,18 @@ export async function browsePageQuery(
     'fromYear',
     'toYear',
     'natural',
+    'sortTags',
+    'index',
   ]);
-  const sort = params.get('sort') ?? 'name';
+  const rawSort = params.get('sort') ?? 'name';
+  const sort = rawSort.startsWith('-') ? rawSort.slice(1) : rawSort;
   const personal = collection === 'albums' && personalAlbumSort(sort);
   if (
-    !personal &&
-    !['name', 'artist', 'year', 'newest', 'genre', 'random'].includes(sort)
+    (!personal &&
+      !['name', 'artist', 'year', 'newest', 'genre', 'random'].includes(
+        sort,
+      )) ||
+    (rawSort.startsWith('-') && (personal || sort === 'random'))
   ) {
     fail(400, 'invalid_field', 'Invalid sort');
   }
@@ -244,7 +305,7 @@ export async function browsePageQuery(
     ...(personal ? { username: context.state.user.username } : {}),
     seed,
     ...await browsePaging(params, context),
-    ...naturalOption(params),
+    ...pageOptions(params, sort),
     genre,
     fromYear,
     toYear,

@@ -145,7 +145,22 @@ export interface NameSortOptions {
   sortTags?: boolean;
 }
 
-export interface AlbumPageOptions extends NameSortOptions {
+/** Optional page-only controls; legacy list defaults are unaffected. */
+export interface NamePageOptions extends NameSortOptions {
+  descending?: boolean;
+  /** Full-sequence index runs are defined only for name-ordered pages. */
+  index?: boolean;
+}
+
+/** Contiguous runs of resolved text initials; labels belong to the hat. */
+export interface CatalogIndexEntry {
+  initial: string | null;
+  kind: 'text' | 'unknown' | 'various';
+  offset: number;
+  count: number;
+}
+
+export interface AlbumPageOptions extends NamePageOptions {
   sort:
     | 'name'
     | 'artist'
@@ -165,7 +180,7 @@ export interface AlbumPageOptions extends NameSortOptions {
   toYear?: number;
 }
 
-export interface SongPageOptions extends NameSortOptions {
+export interface SongPageOptions extends NamePageOptions {
   sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
   /** Required for random pages; independent of connection/process RNG state. */
   seed?: string;
@@ -189,7 +204,7 @@ export interface ArtistGroupRow {
   sortName: string | null;
   albumCount: number;
 }
-export interface ArtistPageOptions extends NameSortOptions {
+export interface ArtistPageOptions extends NamePageOptions {
   folderId?: string;
   offset: number;
   limit: number;
@@ -211,6 +226,7 @@ export interface SearchPages {
 
 export interface CatalogReads {
   artistsPage(opts: ArtistPageOptions): Promise<{
+    index?: CatalogIndexEntry[];
     rows: ArtistGroupRow[];
     total: number;
     revision: string;
@@ -220,6 +236,7 @@ export interface CatalogReads {
     revision: string;
   }>;
   artistAlbumsPage(ref: ArtistGroupRef, opts: ArtistPageOptions): Promise<{
+    index?: CatalogIndexEntry[];
     artist: ArtistGroupRow | null;
     rows: AlbumRow[];
     total: number;
@@ -275,6 +292,7 @@ export interface CatalogReads {
   /** Bounded album facts and exact pre-page total in one slot. The revision
    * covers catalog facts only, never personal selection dependencies. */
   albumsPage(opts: AlbumPageOptions): Promise<{
+    index?: CatalogIndexEntry[];
     rows: AlbumRow[];
     total: number;
     revision: string;
@@ -290,6 +308,7 @@ export interface CatalogReads {
   ): Promise<{ song: SongRow | null; revision: string }>;
   /** Bounded eligible songs, exact pre-page total and revision in one slot. */
   songsPage(opts: SongPageOptions): Promise<{
+    index?: CatalogIndexEntry[];
     rows: SongRow[];
     total: number;
     revision: string;
@@ -553,7 +572,7 @@ async function personalAlbums(
   }
 }
 
-function albumSelect(q: AlbumQuery = {}): string {
+function albumSelect(q: AlbumQuery = {}, extra = ''): string {
   const joins: string[] = [];
   if (q.starredBy !== undefined) {
     // Membership follows sequence, but legacy starred dates/order use the
@@ -608,7 +627,7 @@ function albumSelect(q: AlbumQuery = {}): string {
     );
   }
   return `
-  SELECT al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name AS artist_name,
+  SELECT ${extra} al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
           MAX(f.year) AS year, epoch_ms(MIN(fi.first_seen_at)) AS created_ms,
           ${metadataSelect(albumMetadataColumns, 'al', true)}
@@ -727,6 +746,48 @@ function searchPredicates(query: string, folderId?: string) {
   };
 }
 
+/** A single SQL rank contract feeds both bounded pages and full index runs. */
+function namePageKey(column: string, opts: NamePageOptions, tag?: string) {
+  const text = sortKeySql(
+    column,
+    opts.ignoredArticles ?? (opts.natural ? [] : undefined),
+    opts.sortTags ? tag : undefined,
+  );
+  const key = opts.natural ? naturalKeySql(text) : text;
+  return {
+    text,
+    order: `${key} ${opts.descending ? 'DESC' : 'ASC'} NULLS LAST`,
+  };
+}
+
+async function indexRuns(
+  q: Queries,
+  ranked: string,
+): Promise<CatalogIndexEntry[]> {
+  const rows = await q.all<{
+    initial: string | null;
+    kind: CatalogIndexEntry['kind'];
+    start_position: bigint;
+    count: bigint;
+  }>(`WITH ranked AS (${ranked}), initials AS (
+      SELECT substring(index_text, 1, 1) AS initial, index_kind AS kind, index_position FROM ranked
+    ), boundaries AS (
+      SELECT *, CASE WHEN row_number() OVER (ORDER BY index_position) = 1
+        OR initial IS DISTINCT FROM lag(initial) OVER (ORDER BY index_position)
+        OR kind IS DISTINCT FROM lag(kind) OVER (ORDER BY index_position)
+        THEN 1 ELSE 0 END AS boundary FROM initials
+    ), runs AS (
+      SELECT *, sum(boundary) OVER (ORDER BY index_position) AS run FROM boundaries
+    ) SELECT first(initial) AS initial, first(kind) AS kind,
+      min(index_position) AS start_position, count(*) AS count FROM runs GROUP BY run ORDER BY start_position`);
+  return rows.map((row) => ({
+    initial: row.initial,
+    kind: row.kind,
+    offset: Number(row.start_position),
+    count: Number(row.count),
+  }));
+}
+
 // Internal helpers share the current slot, never another public operation.
 function catalogReads(q: Queries): CatalogReads {
   async function requireLibrary(folderId?: string) {
@@ -765,38 +826,43 @@ function catalogReads(q: Queries): CatalogReads {
   }
 
   async function songPage(opts: SongPageOptions, videosOnly = false) {
+    if (opts.index && opts.sort !== 'name') {
+      throw new LibraryError('invalid_field', 'Index requires name sort');
+    }
     await requireLibrary(opts.folderId);
     const predicates = songPredicates(opts);
     if (videosOnly) predicates.push('f.is_video');
     const where = predicates.length === 0
       ? ''
       : ` WHERE ${predicates.join(' AND ')}`;
-    const name = sortKeySql(
+    const nameKey = namePageKey(
       SONG_TITLE,
-      opts.ignoredArticles,
-      opts.sortTags ? 'f.sort_title' : undefined,
-      opts.natural,
+      opts,
+      'f.sort_title',
     );
+    const name = nameKey.order;
+    const direction = opts.descending ? 'DESC' : 'ASC';
     let order: string;
     switch (opts.sort) {
       case 'random':
         order = seededRankSql('f.id', opts.seed);
         break;
       case 'newest':
-        order = 'fi.first_seen_at DESC NULLS LAST';
+        order = `fi.first_seen_at ${
+          opts.descending ? 'ASC' : 'DESC'
+        } NULLS LAST`;
         break;
       case 'year':
-        order = `f.year NULLS LAST, ${name}`;
+        order = `f.year ${direction} NULLS LAST, ${name}`;
         break;
       case 'artist':
         order = `${
-          sortKeySql(
+          namePageKey(
             'ar.name',
-            opts.ignoredArticles,
-            opts.sortTags ? 'f.artist_sort_name' : undefined,
-            opts.natural,
-          )
-        } NULLS LAST, ${name}`;
+            opts,
+            'f.artist_sort_name',
+          ).order
+        }, ${name}`;
         break;
       default:
         order = name;
@@ -810,6 +876,16 @@ function catalogReads(q: Queries): CatalogReads {
     return {
       rows: rows.map(songOf),
       total: Number(count[0].total),
+      ...(opts.index
+        ? {
+          index: await indexRuns(
+            q,
+            `SELECT ${nameKey.text} AS index_text,
+        'text' AS index_kind, row_number() OVER (ORDER BY ${order}, f.id) - 1 AS index_position
+        FROM files f LEFT JOIN file_identity fi ON fi.id = f.id${where}`,
+          ),
+        }
+        : {}),
       revision: await catalogRevision(q),
     };
   }
@@ -849,19 +925,28 @@ function catalogReads(q: Queries): CatalogReads {
       const count = await q.all<{ total: bigint }>(
         `SELECT COUNT(*) AS total FROM (${select}) groups`,
       );
-      const key = sortKeySql(
+      const key = namePageKey(
         'name',
-        opts.ignoredArticles,
-        opts.sortTags ? 'sort_name' : undefined,
-        opts.natural,
+        opts,
+        'sort_name',
       );
+      const order = `${key.order}, kind, id`;
       const rows = await q.all<ArtistGroupSqlRow>(
-        `SELECT * FROM (${select}) groups ORDER BY ${key} NULLS LAST,
-          kind, id LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+        `SELECT * FROM (${select}) groups ORDER BY ${order} LIMIT ${opts.limit} OFFSET ${opts.offset}`,
       );
       return {
         rows: rows.map(artistGroupOf),
         total: Number(count[0].total),
+        ...(opts.index
+          ? {
+            index: await indexRuns(
+              q,
+              `SELECT ${key.text} AS index_text,
+          CASE WHEN kind = 'artist' THEN 'text' ELSE kind END AS index_kind,
+          row_number() OVER (ORDER BY ${order}) - 1 AS index_position FROM (${select}) groups`,
+            ),
+          }
+          : {}),
         revision: await catalogRevision(q),
       };
     },
@@ -880,20 +965,35 @@ function catalogReads(q: Queries): CatalogReads {
       const membership = ref.kind === 'artist'
         ? `al.album_artist_id = ${esc(ref.id)}`
         : `al.album_artist_id IS NULL AND al.artist_kind = ${esc(ref.kind)}`;
-      const key = sortKeySql(
+      const key = namePageKey(
         'COALESCE(al.name, al.folder_name)',
-        opts.ignoredArticles,
-        opts.sortTags ? 'first(al.sort_name)' : undefined,
-        opts.natural,
+        opts,
+        'first(al.sort_name)',
       );
+      const order = `${key.order}, al.id`;
       const rows = artist === null ? [] : await q.all<AlbumSqlRow>(
         `${albumSelect({ folderId: opts.folderId })} HAVING ${membership}
-          ORDER BY ${key}, al.id LIMIT ${opts.limit} OFFSET ${opts.offset}`,
+          ORDER BY ${order} LIMIT ${opts.limit} OFFSET ${opts.offset}`,
       );
       return {
         artist,
         rows: rows.map(albumOf),
         total: artist?.albumCount ?? 0,
+        ...(opts.index
+          ? {
+            index: artist === null ? [] : await indexRuns(
+              q,
+              `${
+                albumSelect(
+                  { folderId: opts.folderId },
+                  `${key.text} AS index_text,
+            'text' AS index_kind, row_number() OVER (ORDER BY ${order}) - 1 AS index_position,`,
+                )
+              }
+            HAVING ${membership}`,
+            ),
+          }
+          : {}),
         revision: await catalogRevision(q),
       };
     },
@@ -1068,6 +1168,9 @@ function catalogReads(q: Queries): CatalogReads {
     getAlbum: (id) => albumDetail(id),
 
     async albumsPage(opts) {
+      if (opts.index && opts.sort !== 'name') {
+        throw new LibraryError('invalid_field', 'Index requires name sort');
+      }
       await requireLibrary(opts.folderId);
       const query: AlbumQuery = {
         folderId: opts.folderId,
@@ -1075,12 +1178,13 @@ function catalogReads(q: Queries): CatalogReads {
         yearFrom: opts.fromYear,
         yearTo: opts.toYear,
       };
-      const name = sortKeySql(
+      const nameKey = namePageKey(
         'COALESCE(al.name, al.folder_name)',
-        opts.ignoredArticles,
-        opts.sortTags ? 'first(al.sort_name)' : undefined,
-        opts.natural,
+        opts,
+        'first(al.sort_name)',
       );
+      const name = nameKey.order;
+      const direction = opts.descending ? 'DESC' : 'ASC';
       let order: string;
       switch (opts.sort) {
         case 'starred':
@@ -1104,20 +1208,19 @@ function catalogReads(q: Queries): CatalogReads {
           order = seededRankSql('al.id', opts.seed);
           break;
         case 'newest':
-          order = 'created_ms DESC NULLS LAST';
+          order = `created_ms ${opts.descending ? 'ASC' : 'DESC'} NULLS LAST`;
           break;
         case 'year':
-          order = `MAX(f.year) NULLS LAST, ${name}`;
+          order = `MAX(f.year) ${direction} NULLS LAST, ${name}`;
           break;
         case 'artist':
           order = `${
-            sortKeySql(
+            namePageKey(
               'ar.name',
-              opts.ignoredArticles,
-              opts.sortTags ? 'first(ar.sort_name)' : undefined,
-              opts.natural,
-            )
-          } NULLS LAST, ${name}`;
+              opts,
+              'first(ar.sort_name)',
+            ).order
+          }, ${name}`;
           break;
         default:
           order = name;
@@ -1132,6 +1235,18 @@ function catalogReads(q: Queries): CatalogReads {
       return {
         rows: rows.map(albumOf),
         total: Number(count[0].total),
+        ...(opts.index
+          ? {
+            index: await indexRuns(
+              q,
+              albumSelect(
+                query,
+                `${nameKey.text} AS index_text, 'text' AS index_kind,
+          row_number() OVER (ORDER BY ${order}, al.id) - 1 AS index_position,`,
+              ),
+            ),
+          }
+          : {}),
         revision: await catalogRevision(q),
       };
     },

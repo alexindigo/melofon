@@ -142,6 +142,7 @@ export interface HatContext {
     };
     library: {
       artistsPage(opts: ArtistPageOptions): Promise<{
+        index?: CatalogIndexEntry[];
         rows: ArtistGroupRow[];
         total: number;
         revision: string;
@@ -152,12 +153,14 @@ export interface HatContext {
         revision: string;
       }>;
       artistAlbumsPage(ref: ArtistGroupRef, opts: ArtistPageOptions): Promise<{
+        index?: CatalogIndexEntry[];
         artist: ArtistGroupRow | null;
         rows: AlbumRow[];
         total: number;
         revision: string;
       }>;
       albumsPage(opts: AlbumPageOptions): Promise<{
+        index?: CatalogIndexEntry[];
         rows: AlbumRow[];
         total: number;
         revision: string;
@@ -172,6 +175,7 @@ export interface HatContext {
         id: string,
       ): Promise<{ song: SongRow | null; revision: string }>;
       songsPage(opts: SongPageOptions): Promise<{
+        index?: CatalogIndexEntry[];
         rows: SongRow[];
         total: number;
         revision: string;
@@ -393,6 +397,9 @@ export interface BrowsePageOptions {
   articleRevision?: number;
   ignoredArticles?: string[];
   natural?: boolean;
+  sortTags?: boolean;
+  descending?: boolean;
+  index?: boolean;
   sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
   seed?: string;
   offset: number;
@@ -457,6 +464,9 @@ export interface ArtistPageOptions {
   articleRevision?: number;
   ignoredArticles?: string[];
   natural?: boolean;
+  sortTags?: boolean;
+  descending?: boolean;
+  index?: boolean;
   folderId?: string;
   offset: number;
   limit: number;
@@ -466,10 +476,17 @@ export interface SearchPageOptions {
   articleRevision?: number;
   ignoredArticles?: string[];
   natural?: boolean;
+  sortTags?: boolean;
   folderId?: string;
   artists: { offset: number; limit: number };
   albums: { offset: number; limit: number };
   songs: { offset: number; limit: number };
+}
+export interface CatalogIndexEntry {
+  initial: string | null;
+  kind: 'text' | 'unknown' | 'various';
+  offset: number;
+  count: number;
 }
 export interface GenreRow {
   name: string;
