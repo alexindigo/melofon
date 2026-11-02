@@ -194,14 +194,26 @@ export function createReference(options: {
       artistId: string,
       count: number,
       user: string,
+      folderId?: string,
     ): Promise<string[]> {
       validCount(count);
       const values = await service.get('artist', artistId, [
         'artist.topTracks',
       ]);
       return values['artist.topTracks']?.length
-        ? matcher.tracks(values['artist.topTracks'], count, user)
-        : store.referenceMatcher.localTopTracks(artistId, count, user);
+        ? matcher.tracks(
+          values['artist.topTracks'],
+          count,
+          user,
+          undefined,
+          folderId,
+        )
+        : store.referenceMatcher.localTopTracks(
+          artistId,
+          count,
+          user,
+          folderId,
+        );
     },
     artistByName: store.referenceMatcher.artistByName,
     /** Unknown seed is distinct from a known seed with an empty local mix. */
@@ -237,12 +249,20 @@ export function createReference(options: {
       const artist = await store.catalog.artistById(seedId);
       return artist ? count ? artistMix(seedId, count, user) : [] : null;
     },
-    async similarArtists(artistId: string, count: number, presentOnly = false) {
+    async similarArtists(
+      artistId: string,
+      count: number,
+      presentOnly = false,
+      folderId?: string,
+    ) {
       if (!Number.isSafeInteger(count) || count < 0) {
         throw new RangeError('Invalid reference count');
       }
       const values = await service.get('artist', artistId, ['artist.similar']);
-      const artists = await matcher.artists(values['artist.similar'] ?? []);
+      const artists = await matcher.artists(
+        values['artist.similar'] ?? [],
+        folderId,
+      );
       return (presentOnly ? artists.filter((a) => a.present) : artists).slice(
         0,
         count,

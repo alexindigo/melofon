@@ -104,6 +104,36 @@ export interface HatContext {
         options: PlaylistPageOptions,
       ): Promise<{ rows: PlaylistRow[]; total: number } | null>;
     };
+    reference: {
+      get(
+        type: 'artist',
+        id: string,
+        names:
+          readonly ('artist.biography' | 'artist.url' | 'artist.id.mbid')[],
+      ): Promise<{
+        'artist.biography'?: { text: string; language?: string };
+        'artist.url'?: { url: string };
+        'artist.id.mbid'?: string;
+      }>;
+      topTracks(
+        id: string,
+        count: number,
+        username: string,
+        folderId?: string,
+      ): Promise<string[]>;
+      similarArtists(
+        id: string,
+        count: number,
+        presentOnly?: boolean,
+        folderId?: string,
+      ): Promise<(
+        { present: true; id: string } | {
+          present: false;
+          name: string;
+          mbid?: string;
+        }
+      )[]>;
+    };
     library: {
       artistsPage(opts: ArtistPageOptions): Promise<{
         rows: ArtistGroupRow[];

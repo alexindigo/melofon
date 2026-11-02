@@ -30,6 +30,7 @@ export function createReferenceMatcherStore(engine: Engine) {
       artistId: string,
       count: number,
       username: string,
+      folderId?: string,
     ): Promise<string[]> {
       if (!Number.isSafeInteger(count) || count < 0) {
         return Promise.reject(new RangeError('Invalid reference count'));
@@ -49,20 +50,24 @@ export function createReferenceMatcherStore(engine: Engine) {
         JOIN album_plays ap ON ap.album_id = f.album_id
         LEFT JOIN song_plays sp ON sp.track_id = f.id
         WHERE ${present} AND f.artist_id = ${esc(artistId)}
+          ${folderId === undefined ? '' : `AND f.library_id = ${esc(folderId)}`}
         ORDER BY (sp.n IS NOT NULL) DESC, sp.n DESC NULLS LAST,
           sp.latest DESC NULLS LAST, ap.n DESC, f.album_id,
           coalesce(f.disc, 1), coalesce(f.track, 0), f.id LIMIT ${count}`))
           .map((row) => row.id);
       });
     },
-    artists(): Promise<MatchArtist[]> {
+    artists(folderId?: string): Promise<MatchArtist[]> {
       return engine.exclusive((q) =>
         q.all<MatchArtist>(`
         SELECT ar.id, ar.name, ar.musicbrainz_id AS mbid FROM artists ar
         WHERE EXISTS (SELECT 1 FROM files f
           LEFT JOIN file_identity fi ON fi.id = f.id
           LEFT JOIN albums al ON al.id = f.album_id
-          WHERE ${present} AND (f.artist_id = ar.id OR al.album_artist_id = ar.id))
+           WHERE ${present} AND (f.artist_id = ar.id OR al.album_artist_id = ar.id)
+             ${
+          folderId === undefined ? '' : `AND f.library_id = ${esc(folderId)}`
+        })
         ORDER BY ar.id`)
       );
     },
@@ -70,6 +75,7 @@ export function createReferenceMatcherStore(engine: Engine) {
       recordingMbid?: string;
       isrc?: string;
       artistIds?: string[];
+      folderId?: string;
     }): Promise<MatchTrack[]> {
       const conditions: string[] = [];
       if (query.recordingMbid) {
@@ -91,7 +97,13 @@ export function createReferenceMatcherStore(engine: Engine) {
         SELECT f.id, f.title, al.name AS album, f.duration_ms AS "durationMs"
         FROM files f LEFT JOIN albums al ON al.id = f.album_id
         LEFT JOIN file_identity fi ON fi.id = f.id
-        WHERE ${present} AND (${conditions.join(' OR ')}) ORDER BY f.id`)
+        WHERE ${present} AND (${conditions.join(' OR ')})
+          ${
+          query.folderId === undefined
+            ? ''
+            : `AND f.library_id = ${esc(query.folderId)}`
+        }
+        ORDER BY f.id`)
       );
     },
     genreTracks(seedId: string, count: number): Promise<string[]> {

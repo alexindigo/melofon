@@ -68,8 +68,8 @@ export function createReferenceMatcher(store: Store, state: State) {
       'A',
     ],
   });
-  const resolver = async () => {
-    const artists = await store.referenceMatcher.artists();
+  const resolver = async (folderId?: string) => {
+    const artists = await store.referenceMatcher.artists(folderId);
     const articles =
       (await state.getTyped('reference.ignoredArticles') as string[]).map(
         normalize,
@@ -91,8 +91,11 @@ export function createReferenceMatcher(store: Store, state: State) {
     };
   };
   return {
-    async artists(input: ExternalArtist[]): Promise<MatchedArtist[]> {
-      const resolve = await resolver();
+    async artists(
+      input: ExternalArtist[],
+      folderId?: string,
+    ): Promise<MatchedArtist[]> {
+      const resolve = await resolver(folderId);
       return input.map((artist) => {
         const local = resolve(artist)[0];
         return local
@@ -105,12 +108,13 @@ export function createReferenceMatcher(store: Store, state: State) {
       count: number,
       user: string,
       exclude?: string,
+      folderId?: string,
     ): Promise<string[]> {
       if (!Number.isSafeInteger(count) || count < 0) {
         throw new RangeError('Invalid reference count');
       }
       if (!count || !input.length) return [];
-      const resolve = await resolver();
+      const resolve = await resolver(folderId);
       const threshold = await state.getTyped(
         'reference.matchThreshold',
       ) as number;
@@ -120,11 +124,13 @@ export function createReferenceMatcher(store: Store, state: State) {
         if (external.mbid) {
           candidates = await store.referenceMatcher.tracks({
             recordingMbid: external.mbid,
+            folderId,
           });
         }
         if (!candidates.length && external.isrc) {
           candidates = await store.referenceMatcher.tracks({
             isrc: external.isrc,
+            folderId,
           });
         }
         const exact = candidates.length > 0;
@@ -135,6 +141,7 @@ export function createReferenceMatcher(store: Store, state: State) {
           });
           candidates = await store.referenceMatcher.tracks({
             artistIds: artists.map((a) => a.id),
+            folderId,
           });
           candidates = candidates.filter((c) =>
             c.title !== null &&
