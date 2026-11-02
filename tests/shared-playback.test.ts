@@ -27,6 +27,7 @@ import { facade } from '../src/facade.ts';
 import { loadLayers } from '../src/layers.ts';
 import { createState } from '../src/state.ts';
 import { restored } from './helpers/prepared.ts';
+import { reservePorts } from './helpers/ports.ts';
 
 const HOOK = 3689;
 const DEFAULT_PORT = 4534;
@@ -43,7 +44,7 @@ function config(dir: string) {
   };
 }
 
-async function setup() {
+async function setup(player = createPlayer()) {
   const dir = await restored('shared-playback', async (dir) => {
     const store = await openStore(dir);
     try {
@@ -65,10 +66,17 @@ async function setup() {
   const events: string[][] = [];
   const notify = createNotify();
   notify.subscribe((types) => events.push(types));
-  const player = createPlayer();
   const nowPlaying = createNowPlaying(store);
   const library = createLibrary(store);
-  const playback = createPlayback({ player, nowPlaying, library, cfg, notify });
+  const outputs = createOutputs({ notify });
+  const playback = createPlayback({
+    player,
+    outputs,
+    nowPlaying,
+    library,
+    cfg,
+    notify,
+  });
   const bag = {
     state: createState(store),
     cfg,
@@ -79,7 +87,7 @@ async function setup() {
     listens: createListens(store),
     nowPlaying,
     player,
-    outputs: createOutputs({ notify }),
+    outputs,
     playback,
     stream: createStream(
       createMedia(),
@@ -106,6 +114,7 @@ async function setup() {
     onDefault,
     onHook,
     playback,
+    outputs,
     events,
     songs,
     close: async () => {
@@ -264,5 +273,201 @@ Deno.test('engine: play shows on /rest; HA album select yields a real queue item
     );
   } finally {
     await close();
+  }
+});
+
+Deno.test('OwnTone HTTP play/pause/stop projects a server label, never the env user', async () => {
+  const s = await setup();
+  using ports = reservePorts(2);
+  const [restPort, ownPort] = ports.ports;
+  ports.release();
+  const rest = Deno.serve({
+    hostname: '0.0.0.0',
+    port: restPort,
+    onListen() {},
+  }, s.onDefault);
+  const own = Deno.serve(
+    { hostname: '0.0.0.0', port: ownPort, onListen() {} },
+    s.onHook,
+  );
+  const request = (port: number, path: string, method = 'GET') =>
+    fetch(
+      `http://melofon.home:${port}${path}`,
+      { method, signal: AbortSignal.timeout(5000) },
+    );
+  const entries = async () =>
+    (await (await request(
+      restPort,
+      `/rest/getNowPlaying?${NARJO}&f=json`,
+    )).json())['subsonic-response'].nowPlaying.entry;
+  try {
+    const addresses = await Deno.resolveDns('melofon.home', 'A');
+    assert(
+      addresses.length > 0 && addresses.every((ip) => !ip.startsWith('127.')),
+    );
+    assertEquals(await entries(), []);
+    const albums = await (await request(ownPort, '/api/library/albums')).json();
+    const add = await request(
+      ownPort,
+      `/api/queue/items/add?uris=library:album:${
+        albums.items[0].id
+      }&playback=start&clear=true`,
+      'POST',
+    );
+    assertEquals(add.status, 200);
+    await add.body?.cancel();
+    const playing = await entries();
+    assertEquals(playing.length, 1);
+    assertEquals(playing[0].username, 'melofon');
+    assertEquals(playing[0].playerId, 0);
+    assertEquals(playing[0].playerName, 'melofon');
+    assertEquals(playing[0].state, 'playing');
+    const serverRow = (await s.playback.nowPlayingView())[0];
+    assertEquals(serverRow.kind, 'server');
+    assert(serverRow.kind === 'server');
+    assertEquals(serverRow.commander, null);
+    const pause = await request(ownPort, '/api/player/pause', 'PUT');
+    assertEquals(pause.status, 204);
+    await pause.body?.cancel();
+    const paused = await entries();
+    assertEquals(paused[0].state, 'paused');
+    assertEquals(paused[0].username, 'melofon');
+    assertEquals(await entries(), paused);
+    const play = await request(ownPort, '/api/player/play', 'PUT');
+    assertEquals(play.status, 204);
+    await play.body?.cancel();
+    const resumed = await entries();
+    assertEquals(resumed[0].state, 'playing');
+    assertEquals(resumed[0].username, 'melofon');
+    const stop = await request(ownPort, '/api/player/stop', 'PUT');
+    assertEquals(stop.status, 204);
+    await stop.body?.cancel();
+    assertEquals(await entries(), []);
+  } finally {
+    await Promise.all([rest.shutdown(), own.shutdown()]);
+    await s.close();
+  }
+});
+
+Deno.test('core server row retains truthful clocks, selected speakers and external commander independently', async () => {
+  let time = 100_000;
+  let monotonic = 0;
+  const s = await setup(
+    createPlayer({ now: () => time, monotonicNow: () => monotonic }),
+  );
+  const server = async () => {
+    const row = (await s.playback.nowPlayingView()).find((r) =>
+      r.kind === 'server'
+    );
+    assert(row?.kind === 'server');
+    return row;
+  };
+  try {
+    const song = await createLibrary(s.db).getSong(s.songs[0].id);
+    assert(song);
+    s.outputs.register({
+      id: 'living',
+      name: 'Living room',
+      type: 'AirPlay',
+      selected: true,
+      volume: 40,
+      host: '192.0.2.1',
+    });
+    s.outputs.register({
+      id: 'study',
+      name: 'Study',
+      type: 'AirPlay',
+      selected: false,
+      volume: 60,
+    });
+    s.playback.queueAdd([song, song], { play: true }, {
+      kind: 'http',
+      user: 'alice',
+      peer: '192.0.2.2',
+      userAgent: 'private diagnostics',
+    });
+    const first = await server();
+    assertEquals(first.label, 'melofon');
+    assertEquals(first.commander, 'alice');
+    assertEquals(first.speakers, [{ id: 'living', name: 'Living room' }]);
+    assertEquals(first.startedAtMs, time);
+    assertEquals(first.reportedAtMs, time);
+    assertEquals('username' in first, false);
+    assertEquals('playerId' in first, false);
+    assertEquals('source' in first, false);
+
+    time += 500;
+    monotonic += 500;
+    const later = await server();
+    assertEquals(later.startedAtMs, first.startedAtMs);
+    assertEquals(later.reportedAtMs, first.reportedAtMs);
+    assertEquals(later.positionMs, 500);
+    s.playback.pause({ kind: 'internal', via: 'airplay-boot' });
+    const paused = await server();
+    assertEquals(paused.reportedAtMs, time);
+    time += 100;
+    monotonic += 100;
+    assertEquals(await server(), paused);
+    assertEquals(s.playback.lastCommand()?.source.kind, 'internal');
+    assertEquals(paused.commander, 'alice');
+    s.playback.play();
+    assertEquals((await server()).startedAtMs, first.startedAtMs);
+    s.playback.seek({ positionMs: song.durationMs! });
+    time += 100;
+    monotonic += 100;
+    s.playback.advanceEnded();
+    const next = await server();
+    assertEquals(next.commander, 'alice');
+    assertEquals(next.startedAtMs, time);
+    assertEquals(next.reportedAtMs, time);
+    s.outputs.setEnabled(['study']);
+    assertEquals((await server()).speakers, [{ id: 'study', name: 'Study' }]);
+    s.outputs.unregister('study');
+    assertEquals((await server()).speakers, []);
+
+    // Returned facts are snapshots, not handles to the retained state.
+    next.commander = 'forged';
+    next.speakers.push({ id: 'fake', name: 'fake' });
+    assertEquals((await server()).commander, 'alice');
+    s.playback.pause({ kind: 'http' });
+    assertEquals((await server()).commander, null);
+    s.playback.play();
+    assertEquals((await server()).commander, null);
+
+    await s.playback.reportPlaying({
+      username: 'admin',
+      client: 'phone',
+      trackId: song.id,
+      streamId: 'app-run',
+    });
+    const app = (await s.playback.nowPlayingView()).find((row) =>
+      row.kind === 'app'
+    );
+    assert(app?.kind === 'app');
+    assertEquals(app.username, 'admin');
+    assertEquals(app.client, 'phone');
+    assert(app.appPlayerId > 0);
+    assertEquals('commander' in app, false);
+    s.playback.stop();
+    assertEquals((await s.playback.nowPlayingView()).map((row) => row.kind), [
+      'app',
+    ]);
+    s.playback.restore({
+      queue: [song],
+      state: 'pause',
+      currentIndex: 0,
+      positionMs: 250,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+    });
+    const restored = await server();
+    assertEquals(restored.startedAtMs, null);
+    assertEquals(restored.reportedAtMs, time);
+    assertEquals(restored.positionMs, 250);
+    assertEquals(restored.commander, null);
+  } finally {
+    s.playback.close();
+    await s.close();
   }
 });

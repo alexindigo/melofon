@@ -670,14 +670,23 @@ export interface LyricsRow {
 
 /** app.playback.nowPlayingView() row: a now-playing entry with the song
  * already resolved by core (client rows plus the engine's current). */
-export interface NowPlayingViewRow {
-  username: string;
-  client: string;
+interface NowPlayingFacts {
   song: SongRow;
   positionMs: number | null;
-  startedAtMs: number;
+  startedAtMs: number | null;
   reportedAtMs: number;
   state: 'starting' | 'playing' | 'paused';
   playbackRate: number;
-  playerId: number;
 }
+
+export type NowPlayingViewRow =
+  & NowPlayingFacts
+  & (
+    | { kind: 'app'; username: string; client: string; appPlayerId: number }
+    | {
+      kind: 'server';
+      label: string;
+      commander: string | null;
+      speakers: { id: string; name: string }[];
+    }
+  );

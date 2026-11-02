@@ -16,13 +16,14 @@ export default async (_request: HatRequest, context: HatContext) => {
   });
   const entries = rows.map((row) => ({
     ...childOf(row.song, p),
-    username: row.username,
+    // Subsonic requires a string; a server label is not a core user identity.
+    username: row.kind === 'server' ? row.label : row.username,
     minutesAgo: Math.max(
       0,
       Math.floor((Date.now() - row.reportedAtMs) / 60000),
     ),
-    playerId: row.playerId,
-    playerName: row.client,
+    playerId: row.kind === 'server' ? 0 : row.appPlayerId,
+    playerName: row.kind === 'server' ? row.label : row.client,
     state: row.state,
     positionMs: row.positionMs,
     playbackRate: row.playbackRate,

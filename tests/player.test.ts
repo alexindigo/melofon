@@ -269,3 +269,94 @@ Deno.test('outputs: register, get/update/toggle/setEnabled, unregister', () => {
   assertEquals(outputs.list(), []);
   assertEquals(outputs.unregister('0'), false);
 });
+
+Deno.test('engine clock facts follow every activation path, not status reads or wall-clock progress', () => {
+  let wall = 1000;
+  let mono = 0;
+  const player = createPlayer({ now: () => wall, monotonicNow: () => mono });
+  const songs = [song(100), song(100)];
+  const at = (start: number | null, report = wall) =>
+    assertEquals(player.status().clock, {
+      startedAtMs: start,
+      reportedAtMs: report,
+    });
+  assertEquals(player.status().clock, null);
+  player.queueAdd(songs);
+  player.play();
+  at(1000);
+  wall = 2000;
+  mono = 10;
+  at(1000, 1000);
+  assertEquals(player.status().itemProgressMs, 10);
+  player.play(); // no-op must not reset the anchor
+  at(1000, 1000);
+  player.pause();
+  at(1000);
+  wall = 3000;
+  mono = 20;
+  player.pause(); // no-op
+  at(1000, 2000);
+  player.toggle();
+  at(1000);
+  wall = 4000;
+  player.seek({ positionMs: 50 });
+  at(1000);
+  player.setVolume({ volume: 10 });
+  player.queueAdd([song(100)], 0); // insertion preserves the active run
+  at(1000);
+  wall = 5000;
+  player.next();
+  at(5000);
+  wall = 6000;
+  player.previous();
+  at(6000);
+  wall = 7000;
+  player.play(1); // explicit activation, even the same entry
+  at(7000);
+  player.setRepeat('single');
+  mono += 100;
+  wall = 8000;
+  player.advanceEnded();
+  at(8000);
+  player.setRepeat('all');
+  mono += 100;
+  wall = 9000;
+  player.advanceEnded();
+  at(9000);
+  player.setRepeat('off');
+  player.setConsume(true);
+  player.play(0);
+  mono += 100;
+  wall = 10_000;
+  player.advanceEnded();
+  at(10_000);
+  player.queueClear();
+  assertEquals(player.status().clock, null);
+  player.queueAdd(songs);
+  wall = 11_000;
+  player.seek({ positionMs: 20 }); // stopped seek starts a new run
+  at(11_000);
+  const clock = player.status().clock!;
+  clock.startedAtMs = -1;
+  at(11_000);
+  wall = 12_000;
+  player.restore({
+    queue: songs,
+    state: 'pause',
+    currentIndex: 0,
+    positionMs: 20,
+    repeat: 'off',
+    shuffle: false,
+    consume: false,
+  });
+  at(null);
+  wall = 13_000;
+  player.play();
+  at(null); // resume cannot recover an unrecorded historical start
+  wall = -1000; // wall-clock correction must not alter monotonic progress
+  mono += 10;
+  assertEquals(player.status().itemProgressMs, 30);
+  at(null, 13_000);
+  player.stop();
+  assertEquals(player.status().clock, null);
+});

@@ -21,6 +21,7 @@ import { type Log, scopedLog } from './logging.ts';
 import type {
   CommandSource,
   LastCommand,
+  Outputs,
   Player,
   PlayerPersistence,
   PlayerStatus,
@@ -40,17 +41,35 @@ export interface ReportPlaying {
   positionMs?: number;
 }
 
-export interface NowPlayingViewRow {
-  username: string;
-  client: string;
+interface NowPlayingFacts {
   song: SongRow;
   positionMs: number | null;
-  startedAtMs: number;
+  startedAtMs: number | null;
   reportedAtMs: number;
   state: 'starting' | 'playing' | 'paused';
   playbackRate: number;
-  playerId: number;
 }
+
+export type NowPlayingViewRow =
+  & NowPlayingFacts
+  & (
+    | {
+      kind: 'app';
+      username: string;
+      client: string;
+      appPlayerId: number;
+    }
+    | {
+      kind: 'server';
+      label: string;
+      /** Last external commander's known username, not the seeded account.
+       * An anonymous external command replaces it with null; internal commands
+       * and natural transitions preserve it. No request diagnostics escape. */
+      commander: string | null;
+      /** Selected targets, not evidence of audible output. */
+      speakers: { id: string; name: string }[];
+    }
+  );
 
 export interface Playback {
   reportPlaying(report: ReportPlaying): Promise<void>;
@@ -118,6 +137,7 @@ export function createPlayback(deps: {
   nowPlaying: NowPlaying;
   library: Library;
   cfg: { user?: string };
+  outputs?: Pick<Outputs, 'list'>;
   notify?: Notify;
   /** Restart transparency (plan restart-transparency): when present, every
    * state change flushes the engine snapshot and queue, and a 1 Hz tick
@@ -125,13 +145,14 @@ export function createPlayback(deps: {
   persistence?: PlayerPersistence;
   log?: Log;
 }): Playback {
-  const { player, nowPlaying, library, cfg, notify, persistence } = deps;
+  const { player, nowPlaying, library, outputs, notify, persistence } = deps;
   const log = deps.log ?? scopedLog('playback');
   const emit = (types: string[]) => notify?.emit(types, undefined, 'all');
 
   // Provenance (plan command-provenance): every mutation is recorded and
   // logged with its source. Unsourced callers are internal drivers.
   let last: LastCommand | null = null;
+  let commander: string | null = null;
   const record = (
     kind: string,
     detail: string | undefined,
@@ -141,6 +162,7 @@ export function createPlayback(deps: {
     facts?: Record<string, unknown>,
   ): void => {
     const src = source ?? { kind: 'internal' as const };
+    if (src.kind === 'http') commander = src.user ?? null;
     last = {
       kind,
       ...(detail !== undefined ? { detail } : {}),
@@ -380,23 +402,27 @@ export function createPlayback(deps: {
     async nowPlayingView() {
       const out: NowPlayingViewRow[] = [];
       const status = player.status();
-      if (status.current !== null) {
+      if (status.current !== null && status.clock !== null) {
         out.push({
-          username: cfg.user ?? 'melofon',
-          client: 'melofon',
+          kind: 'server',
+          label: 'melofon',
+          commander,
+          speakers: (outputs?.list() ?? []).filter((o) => o.selected).map(
+            ({ id, name }) => ({ id, name }),
+          ),
           song: status.current.song,
           positionMs: status.itemProgressMs,
-          startedAtMs: Date.now(),
-          reportedAtMs: Date.now(),
+          startedAtMs: status.clock.startedAtMs,
+          reportedAtMs: status.clock.reportedAtMs,
           state: status.state === 'play' ? 'playing' : 'paused',
           playbackRate: 1,
-          playerId: 0,
         });
       }
       for (const row of await nowPlaying.list()) {
         const song = await library.getSong(row.trackId);
         if (song === null) continue; // track vanished since the report
         out.push({
+          kind: 'app',
           username: row.username,
           client: row.client,
           song,
@@ -405,7 +431,7 @@ export function createPlayback(deps: {
           reportedAtMs: row.reportedAtMs,
           state: row.state,
           playbackRate: row.playbackRate,
-          playerId: row.playerId,
+          appPlayerId: row.playerId,
         });
       }
       return out;

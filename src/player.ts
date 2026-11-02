@@ -96,6 +96,10 @@ export interface PlayerStatus {
   current: QueueEntry | null;
   itemLengthMs: number;
   itemProgressMs: number;
+  /** Retained engine clock facts, absent when stopped. A restored run's
+   * historical start is unknown; reportedAtMs is the observed transition,
+   * never the time of a status read. Progress still uses a monotonic clock. */
+  clock: { startedAtMs: number | null; reportedAtMs: number } | null;
 }
 
 /** The persisted engine snapshot (player_state row, minus updated_at). */
@@ -346,7 +350,12 @@ function clampVolume(n: number): number {
   return Math.min(100, Math.max(0, Math.trunc(n)));
 }
 
-export function createPlayer(): Player {
+export function createPlayer(options: {
+  now?: () => number;
+  monotonicNow?: () => number;
+} = {}): Player {
+  const now = options.now ?? Date.now;
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
   let items: QueueEntry[] = [];
   let version = 0;
   let nextId = 1;
@@ -360,6 +369,14 @@ export function createPlayer(): Player {
   // is base + (now - startedAt).
   let baseProgressMs = 0;
   let startedAt = 0;
+  let clock: PlayerStatus['clock'] = null;
+  const anchor = (restart = false) => {
+    const at = now();
+    clock = {
+      startedAtMs: restart ? at : clock?.startedAtMs ?? null,
+      reportedAtMs: at,
+    };
+  };
 
   const currentEntry = (): QueueEntry | null =>
     currentIndex === null ? null : items[currentIndex] ?? null;
@@ -369,7 +386,7 @@ export function createPlayer(): Player {
     if (entry === null) return 0;
     const length = entry.song.durationMs ?? 0;
     const elapsed = state === 'play'
-      ? baseProgressMs + (performance.now() - startedAt)
+      ? baseProgressMs + (monotonicNow() - startedAt)
       : baseProgressMs;
     return Math.min(Math.max(0, Math.round(elapsed)), length);
   };
@@ -378,8 +395,9 @@ export function createPlayer(): Player {
   const startAt = (index: number) => {
     currentIndex = index;
     baseProgressMs = 0;
-    startedAt = performance.now();
+    startedAt = monotonicNow();
     state = 'play';
+    anchor(true);
   };
 
   const doPlay = (fromPosition?: number) => {
@@ -395,8 +413,9 @@ export function createPlayer(): Player {
     if (state === 'pause') {
       // Resume from the frozen position.
       baseProgressMs = progressMs();
-      startedAt = performance.now();
+      startedAt = monotonicNow();
       state = 'play';
+      anchor();
       return;
     }
     if (state === 'stop') startAt(currentIndex ?? 0);
@@ -406,12 +425,14 @@ export function createPlayer(): Player {
     if (state !== 'play') return;
     baseProgressMs = progressMs();
     state = 'pause';
+    anchor();
   };
 
   const doStop = () => {
     state = 'stop';
     currentIndex = null;
     baseProgressMs = 0;
+    clock = null;
   };
 
   return {
@@ -429,6 +450,7 @@ export function createPlayer(): Player {
         current: entry,
         itemLengthMs: entry?.song.durationMs ?? 0,
         itemProgressMs: state === 'stop' ? 0 : progressMs(),
+        clock: clock === null ? null : { ...clock },
       };
     },
 
@@ -493,10 +515,12 @@ export function createPlayer(): Player {
       const target = opts.positionMs !== undefined
         ? opts.positionMs
         : progressMs() + (opts.seekMs ?? 0);
+      const restart = state === 'stop';
       currentIndex = index;
       baseProgressMs = Math.min(Math.max(0, Math.round(target)), length);
-      startedAt = performance.now();
+      startedAt = monotonicNow();
       state = 'play'; // OwnTone starts playback after a seek
+      anchor(restart);
       return true;
     },
 
@@ -577,6 +601,7 @@ export function createPlayer(): Player {
         state = 'stop';
         currentIndex = null;
         baseProgressMs = 0;
+        clock = null;
         return;
       }
       currentIndex = Math.min(Math.max(0, index), items.length - 1);
@@ -585,8 +610,10 @@ export function createPlayer(): Player {
         Math.max(0, Math.round(snapshot.positionMs)),
         length,
       );
-      startedAt = performance.now();
+      startedAt = monotonicNow();
       state = snapshot.state;
+      // The snapshot stores position/state, not the original start time.
+      clock = { startedAtMs: null, reportedAtMs: now() };
     },
   };
 }

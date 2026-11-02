@@ -154,6 +154,7 @@ export async function startServer(options: {
   const nowPlaying = createNowPlaying(store, { state });
   const playback = createPlayback({
     player,
+    outputs,
     nowPlaying,
     library,
     cfg,
