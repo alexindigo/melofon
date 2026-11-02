@@ -1,5 +1,6 @@
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { requireUserId } from './users.ts';
+import { appendListen, type ListenAppend } from './listens.ts';
 
 export interface NowPlayingRow {
   username: string;
@@ -149,12 +150,13 @@ export function createNowPlayingStore(engine: Engine) {
         return true;
       });
     },
-    /** Claim a matching live session once; late/duplicate/expired stops cannot count. */
-    take(
+    /** Claim and optionally append in one transaction; a failed finish stays retryable. */
+    finish(
       username: string,
       client: string,
       trackId: string,
       expiry: SessionExpiry,
+      listen?: ListenAppend,
     ): Promise<NowPlayingRow | null> {
       return atomic(engine, async (q) => {
         const row = (await rows(q, expiry)).find((r) =>
@@ -168,6 +170,9 @@ export function createNowPlayingStore(engine: Engine) {
           }
           AND client = ${esc(client)} AND track_id = ${esc(trackId)}`,
         );
+        if (listen && !(await appendListen(q, username, trackId, listen))) {
+          throw new Error('Unknown track for reported finish');
+        }
         return row;
       });
     },

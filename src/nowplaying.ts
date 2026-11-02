@@ -2,10 +2,11 @@
 import type { Store } from './store/index.ts';
 import type { NowPlayingRow } from './store/nowplaying.ts';
 import { createState, type State } from './state.ts';
-import { createListens, type Listens } from './listens.ts';
 export type { NowPlayingRow } from './store/nowplaying.ts';
 
 export interface PlaybackReport {
+  /** Supplied by the reporting facade, never copied from a wire parameter. */
+  source: 'opensubsonic' | 'melofon';
   username: string;
   client: string;
   trackId: string;
@@ -33,11 +34,9 @@ export interface NowPlaying {
 
 export function createNowPlaying(store: Store, options: {
   state?: State;
-  listens?: Listens;
   now?: () => number;
 } = {}): NowPlaying {
   const state = options.state ?? createState(store);
-  const listens = options.listens ?? createListens(store);
   const now = options.now ?? Date.now;
   for (
     const key of [
@@ -71,25 +70,27 @@ export function createNowPlaying(store: Store, options: {
       );
     },
     async report(report, durationMs) {
+      if (report.source !== 'opensubsonic' && report.source !== 'melofon') {
+        throw new Error('Invalid playback report source');
+      }
       const at = now();
       if (report.state === 'stopped') {
-        const session = await store.nowPlaying.take(
+        const eligible = !report.ignoreScrobble && durationMs !== null &&
+          durationMs > 0 &&
+          report.positionMs >= Math.min(durationMs / 2, 240000);
+        await store.nowPlaying.finish(
           report.username,
           report.client,
           report.trackId,
           await expiry(at),
+          eligible
+            ? {
+              source: report.source,
+              durationMs: durationMs!,
+              playedAtMs: at,
+            }
+            : undefined,
         );
-        if (
-          session && !report.ignoreScrobble && durationMs !== null &&
-          durationMs > 0 &&
-          report.positionMs >= Math.min(durationMs / 2, 240000)
-        ) {
-          await listens.record(report.username, report.trackId, {
-            source: 'opensubsonic',
-            durationMs,
-            playedAtMs: at,
-          });
-        }
         return;
       }
       await store.nowPlaying.set(

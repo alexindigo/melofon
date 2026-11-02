@@ -355,6 +355,7 @@ export interface HatContext {
       }): Promise<void>;
       reportStopped(opts: { streamId: string }): Promise<void>;
       reportPlayback(report: {
+        source: 'opensubsonic';
         username: string;
         client: string;
         trackId: string;

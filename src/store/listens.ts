@@ -26,33 +26,45 @@ async function plays(
   return out;
 }
 
+export interface ListenAppend {
+  source: string;
+  playedAtMs?: number;
+  durationMs?: number;
+}
+
+/** Store-local writer: the caller owns the exclusive transaction, never nests it. */
+export async function appendListen(
+  q: Queries,
+  username: string,
+  trackId: string,
+  opts: ListenAppend,
+): Promise<boolean> {
+  const userId = await requireUserId(q, username);
+  const known = await q.all(`SELECT 1 FROM files WHERE id = ${esc(trackId)}`);
+  if (known.length === 0) return false;
+  const playedAt = opts.playedAtMs === undefined
+    ? 'now()'
+    : `to_timestamp(${Math.trunc(opts.playedAtMs) / 1000})`;
+  const duration = opts.durationMs === undefined
+    ? 'NULL'
+    : String(Math.trunc(opts.durationMs));
+  await q.run(
+    `INSERT INTO listens (user_id, track_id, played_at, duration_ms, source)
+     VALUES (${esc(userId)}, ${esc(trackId)}, ${playedAt}, ${duration}, ${
+      esc(opts.source)
+    })`,
+  );
+  return true;
+}
+
 export function createListensStore(engine: Engine) {
   return {
     record(
       username: string,
       trackId: string,
-      opts: { source: string; playedAtMs?: number; durationMs?: number },
+      opts: ListenAppend,
     ): Promise<boolean> {
-      return atomic(engine, async (q) => {
-        const userId_ = await requireUserId(q, username);
-        const known = await q.all(
-          `SELECT 1 FROM files WHERE id = ${esc(trackId)}`,
-        );
-        if (known.length === 0) return false;
-        const playedAt = opts.playedAtMs === undefined
-          ? 'now()'
-          : `to_timestamp(${Math.trunc(opts.playedAtMs) / 1000})`;
-        const duration = opts.durationMs === undefined
-          ? 'NULL'
-          : String(Math.trunc(opts.durationMs));
-        await q.run(
-          `INSERT INTO listens (user_id, track_id, played_at, duration_ms, source)
-         VALUES (${esc(userId_)}, ${esc(trackId)}, ${playedAt}, ${duration}, ${
-            esc(opts.source)
-          })`,
-        );
-        return true;
-      });
+      return atomic(engine, (q) => appendListen(q, username, trackId, opts));
     },
     facts(
       username: string,

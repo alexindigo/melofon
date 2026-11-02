@@ -27,6 +27,7 @@ export default async (_request: HatRequest, context: HatContext) => {
   if (!submission) {
     const rawPosition = Number(params.get('position') ?? '0');
     await context.app.playback.reportPlayback({
+      source: 'opensubsonic',
       username: context.state.user!.username,
       client: params.get('c')!,
       trackId: ids[0],

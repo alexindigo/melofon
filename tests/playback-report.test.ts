@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
@@ -56,7 +56,6 @@ async function setup() {
     const listens = createListens(store);
     const nowPlaying = createNowPlaying(store, {
       state,
-      listens,
       now: () => clock,
     });
     playback = createPlayback({
@@ -241,6 +240,135 @@ Deno.test('G2 HTTP lifecycle advances only playing, caps duration and counts one
       'SELECT source, duration_ms FROM listens',
     );
     assertEquals(listens, [{ source: 'opensubsonic', duration_ms: duration }]);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('reported finish rolls back a failed listen append and remains retryable', async () => {
+  const t = await setup();
+  try {
+    await t.report('playing');
+    const before = await t.store.nowPlaying.list();
+    const sql = rawSql(t.store);
+    // A real DuckDB append failure, after the finish has claimed the live row.
+    await sql.run('DROP TABLE listens');
+    await sql.run(`CREATE TABLE listens (
+      user_id VARCHAR NOT NULL, track_id VARCHAR NOT NULL,
+      played_at TIMESTAMPTZ NOT NULL, duration_ms INTEGER,
+      source VARCHAR NOT NULL CHECK (source <> 'opensubsonic'))`);
+    const nowPlaying = createNowPlaying(t.store, {
+      state: t.state,
+      now: () => t.clock,
+    });
+    const stop = {
+      username: 'admin',
+      client: 'g2-phone',
+      trackId: t.song.id,
+      state: 'stopped' as const,
+      positionMs: t.song.durationMs!,
+      playbackRate: 1,
+      ignoreScrobble: false,
+      source: 'opensubsonic' as const,
+    };
+    await assertRejects(() => nowPlaying.report(stop, t.song.durationMs));
+    assertEquals(
+      await t.store.nowPlaying.list(),
+      before,
+      'finish must be retryable',
+    );
+    assertEquals(await sql.all('SELECT * FROM listens'), []);
+    await sql.run('DROP TABLE listens');
+    await sql.run(`CREATE TABLE listens (
+      user_id VARCHAR NOT NULL, track_id VARCHAR NOT NULL,
+      played_at TIMESTAMPTZ NOT NULL, duration_ms INTEGER, source VARCHAR NOT NULL)`);
+    await nowPlaying.report(stop, t.song.durationMs);
+    await nowPlaying.report(stop, t.song.durationMs);
+    assertEquals(await t.entries(), []);
+    assertEquals(await t.count(), 1);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('reported listens validate facade provenance and preserve position eligibility in shared core', async () => {
+  const t = await setup();
+  try {
+    const nowPlaying = createNowPlaying(t.store, {
+      state: t.state,
+      now: () => t.clock,
+    });
+    const report = {
+      source: 'melofon' as const,
+      username: 'admin',
+      client: 'native-core',
+      trackId: t.song.id,
+      positionMs: 0,
+      playbackRate: 1,
+      ignoreScrobble: false,
+    };
+    await nowPlaying.report({ ...report, state: 'playing' }, 600000);
+    const before = await t.store.nowPlaying.list();
+    for (const state of ['starting', 'playing', 'paused', 'stopped'] as const) {
+      await assertRejects(
+        () =>
+          nowPlaying.report({
+            ...report,
+            state,
+            source: 'spoofed' as 'melofon',
+            positionMs: 600000,
+          }, 600000),
+        Error,
+        'Invalid playback report source',
+      );
+      assertEquals(await t.store.nowPlaying.list(), before);
+    }
+    for (
+      const [duration, positionMs, ignoreScrobble] of [
+        [600000, 239999, false],
+        [600000, 240000, true],
+        [null, 600000, false],
+        [0, 600000, false],
+        [1000, 499, false],
+      ] as [number | null, number, boolean][]
+    ) {
+      await nowPlaying.report({ ...report, state: 'playing' }, duration);
+      await nowPlaying.report({
+        ...report,
+        state: 'stopped',
+        positionMs,
+        ignoreScrobble,
+      }, duration);
+      assertEquals(await t.store.nowPlaying.list(), []);
+      assertEquals(await t.count(), 0);
+    }
+    for (const [duration, positionMs] of [[600000, 240000], [1000, 500]]) {
+      await nowPlaying.report({ ...report, state: 'starting' }, duration);
+      await Promise.all([1, 2].map(() =>
+        nowPlaying.report({
+          ...report,
+          state: 'stopped',
+          positionMs,
+        }, duration)
+      ));
+    }
+    assertEquals(await t.count(), 2);
+    assertEquals(
+      await rawSql(t.store).all(
+        'SELECT source, duration_ms FROM listens ORDER BY duration_ms',
+      ),
+      [
+        { source: 'melofon', duration_ms: 1000 },
+        { source: 'melofon', duration_ms: 600000 },
+      ],
+    );
+    await nowPlaying.report({ ...report, state: 'paused' }, 1000);
+    t.advance(30 * 60000);
+    await nowPlaying.report(
+      { ...report, state: 'stopped', positionMs: 1000 },
+      1000,
+    );
+    assertEquals(await t.count(), 2, 'expired eligible stops never append');
   } finally {
     await t.close();
   }

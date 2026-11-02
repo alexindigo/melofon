@@ -40,6 +40,7 @@ export default async (_request: HatRequest, context: HatContext) => {
   }
   if (mediaType !== 'song') return fail(context, 70, 'Media not found');
   const found = await context.app.playback.reportPlayback({
+    source: 'opensubsonic',
     username: context.state.user!.username,
     client: params.get('c')!,
     trackId: mediaId,

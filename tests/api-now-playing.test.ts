@@ -8,6 +8,7 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibrary } from '../src/library.ts';
 import { createUserService } from '../src/user.ts';
 import { createAnnotation } from '../src/annotation.ts';
+import { createListens } from '../src/listens.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPlayback, type Playback } from '../src/playback.ts';
 import { createOutputs, createPlayer, type Outputs } from '../src/player.ts';
@@ -88,6 +89,7 @@ async function setup(now?: () => number) {
         libraries: createLibraries(f.store),
         user: createUserService(f.store, f.cfg),
         annotation: createAnnotation(f.store),
+        listens: createListens(f.store),
         outputs,
         playback,
       });
@@ -118,6 +120,7 @@ async function setup(now?: () => number) {
     assertEquals(response.status, 200);
     const body = (await response.json())['subsonic-response'];
     assertEquals(body.status, 'ok');
+    return body;
   };
   const songs = await createLibrary(f.store).listSongs({ size: 2, offset: 0 });
   const observers: (Awaited<ReturnType<typeof f.login>> & {
@@ -503,6 +506,104 @@ Deno.test('household now-playing: OwnTone commands, selected speakers and comman
     for (const observer of t.observers) {
       assertEquals((await t.read(observer)).nowPlaying, []);
     }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('household now-playing: legacy scrobbles and competing reported stops keep count and provenance over HTTP', async () => {
+  let clock = Date.now();
+  const t = await setup(() => clock);
+  try {
+    const ips = await Deno.resolveDns('melofon.home', 'A');
+    assert(ips.length > 0 && ips.every((ip) => !ip.startsWith('127.')));
+    const song = t.songs[0];
+    const duration = song.durationMs!;
+    await t.own(
+      `/api/queue/items/add?uris=library:track:${
+        wireInt(song.id)
+      }&playback=start&clear=true`,
+      'POST',
+    );
+    await t.own('/api/player/pause');
+    await t.changed();
+    const server = (await t.read()).nowPlaying[0];
+    t.clear();
+    await t.rest('scrobble', {
+      id: song.id,
+      source: 'melofon',
+      time: String(clock),
+    });
+    assertEquals((await t.rest('getSong', { id: song.id })).song.playCount, 1);
+    assertEquals(
+      (await t.read()).nowPlaying,
+      [server],
+      'submission never reports playback',
+    );
+    await t.rest('scrobble', {
+      id: song.id,
+      submission: 'false',
+      source: 'melofon',
+    });
+    await t.changed();
+    assertEquals((await t.read()).nowPlaying.length, 2);
+    t.clear();
+    const stop = {
+      mediaId: song.id,
+      mediaType: 'song',
+      state: 'stopped',
+      positionMs: String(duration),
+      source: 'melofon',
+    };
+    await Promise.all([
+      t.rest('reportPlayback', stop),
+      t.rest('reportPlayback', stop),
+    ]);
+    await t.changed();
+    for (const o of t.observers) {
+      assertEquals((await t.read(o)).nowPlaying, [server]);
+    }
+    assertEquals((await t.rest('getSong', { id: song.id })).song.playCount, 2);
+    const expected = [
+      { source: 'opensubsonic', duration_ms: null },
+      { source: 'opensubsonic', duration_ms: duration },
+    ];
+    assertEquals(
+      await rawSql(t.f.store).all(
+        'SELECT source, duration_ms FROM listens ORDER BY duration_ms NULLS FIRST',
+      ),
+      expected,
+    );
+    for (
+      const extra of [
+        { positionMs: String(Math.ceil(duration / 2) - 1) },
+        { ignoreScrobble: 'true' },
+        { mediaId: t.songs[1].id },
+      ] as Record<string, string>[]
+    ) {
+      await t.rest('reportPlayback', {
+        ...stop,
+        state: 'playing',
+        positionMs: '0',
+      });
+      await t.rest('reportPlayback', { ...stop, ...extra });
+    }
+    await t.rest('reportPlayback', { ...stop, state: 'paused' });
+    clock += 30 * 60000;
+    await t.rest('reportPlayback', stop);
+    await t.rest('reportPlayback', stop);
+    assertEquals((await t.rest('getSong', { id: song.id })).song.playCount, 2);
+    assertEquals(
+      await rawSql(t.f.store).all(
+        'SELECT source, duration_ms FROM listens ORDER BY duration_ms NULLS FIRST',
+      ),
+      expected,
+    );
+    assertEquals(
+      (await t.read()).nowPlaying,
+      [server],
+      'engine stays independent',
+    );
   } finally {
     await t.close();
   }

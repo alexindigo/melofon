@@ -57,7 +57,7 @@ async function setup() {
         player: createPlayer(),
         cfg: f.cfg,
         notify: f.notify,
-        nowPlaying: createNowPlaying(f.store, { state: f.state, listens }),
+        nowPlaying: createNowPlaying(f.store, { state: f.state }),
       });
       return Promise.resolve({
         library,

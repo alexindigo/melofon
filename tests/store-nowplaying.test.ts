@@ -76,7 +76,7 @@ Deno.test('store.nowPlaying reads and expired stop claims never silently remove 
     const expiry = { plannedBeforeMs: 1000, pausedBeforeMs: 1000 };
     assertEquals(await t.domain.list(expiry), []);
     assertEquals(await t.domain.list(), before, 'a projection must not delete');
-    assertEquals(await t.domain.take('alice', 'phone', 'song', expiry), null);
+    assertEquals(await t.domain.finish('alice', 'phone', 'song', expiry), null);
     assertEquals(await t.domain.list(), before, 'an expired stop cannot claim');
   } finally {
     await t.close();
@@ -177,6 +177,105 @@ Deno.test('store.nowPlaying a refreshed report supersedes expiry without a silen
       await t.domain.expire({ plannedBeforeMs: 2000, pausedBeforeMs: 2000 }),
       0,
     );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('store.nowPlaying finish rolls back claim and append together and serializes competing stops', async () => {
+  const t = await domainFixture(createNowPlayingStore);
+  try {
+    await t.domain.set('alice', 'phone', 'song', 'run', 500, {
+      state: 'paused',
+      playbackRate: 1,
+      reportedAtMs: 1000,
+      durationMs: 1000,
+      restart: true,
+    });
+    const before = await t.domain.list();
+    const expiry = { plannedBeforeMs: 0, pausedBeforeMs: 0 };
+    const listen = { source: 'melofon', playedAtMs: 2000, durationMs: 1000 };
+    t.failCommit();
+    await assertRejects(
+      () => t.domain.finish('alice', 'phone', 'song', expiry, listen),
+      Error,
+      'injected',
+    );
+    assertEquals(await t.domain.list(), before);
+    assertEquals(
+      await t.all('SELECT * FROM listens'),
+      [],
+      'append must roll back too',
+    );
+    const result = await Promise.all([
+      t.domain.finish('alice', 'phone', 'song', expiry, listen),
+      t.domain.finish('alice', 'phone', 'song', expiry, listen),
+    ]);
+    assertEquals(result, [before[0], null]);
+    assertEquals(await t.domain.list(), []);
+    assertEquals(
+      await t.all(`SELECT user_id, track_id, source, duration_ms,
+      epoch_ms(played_at) AS at FROM listens`),
+      [{
+        user_id: 'u',
+        track_id: 'song',
+        source: 'melofon',
+        duration_ms: 1000,
+        at: 2000,
+      }],
+    );
+    await t.domain.set('alice', 'phone', 'song', 'next');
+    assertEquals((await t.domain.list())[0].playerId, before[0].playerId);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('store.nowPlaying finish never counts stale or expired claims and missing catalog cannot consume a retry', async () => {
+  const t = await domainFixture(createNowPlayingStore);
+  try {
+    const update = {
+      state: 'paused' as const,
+      playbackRate: 1,
+      reportedAtMs: 1000,
+      durationMs: 1000,
+      restart: true,
+    };
+    await t.domain.set('alice', 'phone', 'song', 'run', 0, update);
+    const before = await t.domain.list();
+    const expiry = { plannedBeforeMs: 0, pausedBeforeMs: 0 };
+    const listen = { source: 'opensubsonic', durationMs: 1000 };
+    assertEquals(
+      await t.domain.finish('alice', 'phone', 'other', expiry, listen),
+      null,
+    );
+    assertEquals(
+      await t.domain.finish('bob', 'phone', 'song', expiry, listen),
+      null,
+    );
+    assertEquals(
+      await t.domain.finish('alice', 'phone', 'song', {
+        ...expiry,
+        pausedBeforeMs: 1000,
+      }, listen),
+      null,
+    );
+    assertEquals(await t.domain.list(), before);
+    await t.run("DELETE FROM files WHERE id = 'song'");
+    await assertRejects(
+      () => t.domain.finish('alice', 'phone', 'song', expiry, listen),
+      Error,
+      'Unknown track',
+    );
+    assertEquals(await t.domain.list(), before);
+    assertEquals(await t.all('SELECT * FROM listens'), []);
+    // Non-counting stops can still remove their matching live row.
+    assertEquals(
+      await t.domain.finish('alice', 'phone', 'song', expiry),
+      before[0],
+    );
+    assertEquals(await t.domain.list(), []);
+    assertEquals(await t.all('SELECT * FROM listens'), []);
   } finally {
     await t.close();
   }
