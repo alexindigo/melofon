@@ -79,6 +79,7 @@ export interface HatContext {
     };
     playback: {
       nowPlayingView(): Promise<NowPlayingViewRow[]>;
+      reportSessionPlayback(report: SessionPlaybackReport): Promise<boolean>;
     };
     libraries: {
       stats(id: string): Promise<unknown>;
@@ -285,6 +286,20 @@ export interface HatContext {
     json: Record<string, unknown>;
   };
   miss?: unknown;
+}
+
+export interface SessionPlaybackReport {
+  userId: string;
+  sessionId: string;
+  trackId: string;
+  /** Positive increasing counter per login, including repeats of a song. */
+  run: number;
+  /** Nonnegative increasing counter within the run; reuse on retry. */
+  sequence: number;
+  state: 'starting' | 'playing' | 'paused' | 'stopped';
+  positionMs: number;
+  playbackRate: number;
+  ignoreScrobble: boolean;
 }
 
 export interface SavedQueue {
