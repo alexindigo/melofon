@@ -30,6 +30,7 @@ export default async (request: HatRequest, context: HatContext) => {
     song,
     info,
     context.state.user!.username,
+    'audio',
   );
   if (!result) return fail(context, 0, 'Cannot inspect media stream');
   // Only the wire fields cross back out of core (selection is core-private).

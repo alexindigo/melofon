@@ -385,6 +385,7 @@ export interface HatContext {
         file: { path: string; isVideo: boolean },
         capabilities: import('./transcoding.ts').ClientInfo,
         username: string,
+        intent?: 'audio' | 'video',
       ): Promise<import('./transcoding.ts').TranscodeDecision | null>;
       negotiated(
         request: Request,

@@ -7,9 +7,11 @@ import { Buffer } from 'node:buffer';
 import { extname } from 'node:path';
 import type { Media } from './media.ts';
 import type { FileSource } from './file-source.ts';
+import type { Sessions } from './sessions.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   type ClientCapabilities,
+  type MediaIntent,
   negotiate,
   type Negotiation,
 } from './stream-negotiation.ts';
@@ -23,7 +25,7 @@ export interface StreamOptions {
   estimateContentLength?: boolean;
 }
 export type StreamDecision =
-  | { kind: 'direct' }
+  | { kind: 'direct'; intent: MediaIntent }
   | {
     kind: 'transcode';
     format: string;
@@ -31,6 +33,15 @@ export type StreamDecision =
     sampleRate?: number;
     channels?: number;
   };
+export class StreamError extends Error {
+  constructor(
+    public readonly code: 'incompatible_media' | 'cannot_stream_media',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'StreamError';
+  }
+}
 export interface StreamService {
   source: FileSource;
   file(
@@ -48,7 +59,15 @@ export interface StreamService {
     file: StreamFile,
     capabilities: ClientCapabilities,
     username: string,
+    intent?: MediaIntent,
   ): Promise<(Negotiation & { transcodeParams: string }) | null>;
+  session(
+    request: Request,
+    file: StreamFile,
+    caller: string,
+    sessionId: string,
+    options?: StreamOptions,
+  ): Promise<Response>;
   negotiated(
     request: Request,
     file: StreamFile,
@@ -69,6 +88,7 @@ export function createStream(
   cfg?: { absentToMp3?: boolean; secret?: string },
   log: Log = scopedLog('stream'),
   source: FileSource = () => Promise.resolve(null),
+  sessions?: Pick<Sessions, 'playbackCapabilities'>,
 ): StreamService {
   const secret = cfg?.secret ?? crypto.randomUUID();
   const signature = (payload: string) =>
@@ -99,7 +119,16 @@ export function createStream(
     decision: StreamDecision,
     options: StreamOptions = {},
   ): Promise<Response | null> => {
-    if (decision.kind === 'direct') return fixed(request, file.path);
+    if (decision.kind === 'direct') {
+      // Enforce the prepared contract at execution too, including signed
+      // decisions made before this contract existed (which lack an intent).
+      if (!['audio', 'video'].includes(decision.intent)) return null;
+      if (
+        decision.intent === 'audio' &&
+        (file.isVideo || (await media.probe(file.path)).hasVideo)
+      ) return null;
+      return fixed(request, file.path);
+    }
     const profile = (await media.audioProfiles()).find((p) =>
       p.format === decision.format
     );
@@ -147,6 +176,19 @@ export function createStream(
     if (!audio) return null;
     return new Response(audio.stream, { headers });
   };
+  const prepare = async (
+    file: StreamFile,
+    capabilities: ClientCapabilities,
+    intent: MediaIntent,
+  ) => {
+    const source = await media.describeAudio(file.path);
+    if (!source) return null;
+    const probe = await media.probe(file.path);
+    return negotiate(source, capabilities, await media.audioProfiles(), {
+      intent,
+      hasVideo: file.isVideo || probe.hasVideo,
+    });
+  };
   return {
     source,
     file: fixed,
@@ -188,14 +230,9 @@ export function createStream(
         options,
       );
     },
-    async decision(file, capabilities, username) {
-      const source = await media.describeAudio(file.path);
-      if (!source) return null;
-      const result = negotiate(
-        source,
-        capabilities,
-        await media.audioProfiles(),
-      );
+    async decision(file, capabilities, username, intent = 'audio') {
+      const result = await prepare(file, capabilities, intent);
+      if (!result) return null;
       let token = '';
       if (result.selection) {
         const payload = Buffer.from(
@@ -209,6 +246,45 @@ export function createStream(
         token = `${payload}.${signature(payload).toString('base64url')}`;
       }
       return { ...result, transcodeParams: token };
+    },
+    async session(request, file, caller, sessionId, options) {
+      if (!sessions) throw new Error('Session streaming is not configured');
+      // Resolve for every read: declaration replacement, revocation, live
+      // encoder settings and source facts must not be cached in a token.
+      const capabilities = await sessions.playbackCapabilities(
+        caller,
+        sessionId,
+      );
+      const result = await prepare(
+        file,
+        capabilities ?? {
+          name: 'Default audio',
+          platform: 'http',
+          transcodingProfiles: [{
+            container: 'mp3',
+            audioCodec: 'mp3',
+            protocol: 'http',
+          }],
+        },
+        'audio',
+      );
+      if (!result) {
+        throw new StreamError(
+          'cannot_stream_media',
+          'Cannot inspect media stream',
+        );
+      }
+      if (!result.selection) {
+        throw new StreamError('incompatible_media', result.errorReason);
+      }
+      const response = await serve(request, file, result.selection, options);
+      if (!response) {
+        throw new StreamError(
+          'cannot_stream_media',
+          'Cannot create media stream',
+        );
+      }
+      return response;
     },
     async negotiated(request, file, token, username, offset) {
       let decision: StreamDecision;
@@ -224,7 +300,9 @@ export function createStream(
         if (
           claims.file !== fileKey(file.path) ||
           claims.username !== username ||
-          claims.stamp !== await stamp(file.path)
+          claims.stamp !== await stamp(file.path) ||
+          (claims.decision.kind === 'direct' &&
+            !['audio', 'video'].includes(claims.decision.intent))
         ) throw new Error('Stale token');
         decision = claims.decision;
       } catch {

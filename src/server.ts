@@ -299,6 +299,7 @@ export async function startServer(options: {
       cfg,
       undefined,
       createFileSource(library, podcasts),
+      authentication.sessions,
     ),
     zip: createZip(),
     artwork: createArtwork(library, {

@@ -37,6 +37,7 @@ export interface Negotiation {
   transcodeStream?: AudioDetails;
   selection?: StreamDecision;
 }
+export type MediaIntent = 'audio' | 'video';
 const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 const codec = (s: string) =>
   s.toLowerCase() === 'ogg' ? 'vorbis' : s.toLowerCase();
@@ -72,6 +73,7 @@ export function negotiate(
   source: AudioDetails,
   info: ClientCapabilities,
   profiles: AudioProfile[],
+  media: { intent: MediaIntent; hasVideo: boolean },
 ): Negotiation {
   const result: Negotiation = {
     canDirectPlay: false,
@@ -80,8 +82,13 @@ export function negotiate(
     errorReason: '',
     sourceStream: source,
   };
+  if (media.intent === 'video' && !media.hasVideo) {
+    return { ...result, errorReason: 'source has no video' };
+  }
   for (const profile of info.directPlayProfiles ?? []) {
-    const reason = !matches('http', profile.protocols)
+    const reason = media.intent === 'audio' && media.hasVideo
+      ? 'audio-only delivery required'
+      : !matches('http', profile.protocols)
       ? 'protocol not supported'
       : !matches(source.container, profile.containers)
       ? 'container not supported'
@@ -103,11 +110,19 @@ export function negotiate(
       return {
         ...result,
         canDirectPlay: true,
-        selection: { kind: 'direct' },
+        selection: { kind: 'direct', intent: media.intent },
         transcodeReason: [],
       };
     }
     result.transcodeReason.push(reason);
+  }
+  // The available profiles encode audio only. Never satisfy video intent by
+  // silently discarding video; explicit original video can still play direct.
+  if (media.intent === 'video') {
+    return {
+      ...result,
+      errorReason: 'no compatible video playback profile found',
+    };
   }
   for (const requested of info.transcodingProfiles ?? []) {
     if (!same(requested.protocol, 'http')) continue;

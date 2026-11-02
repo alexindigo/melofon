@@ -68,6 +68,116 @@ Deno.test('H5 transcoding: direct play decision and original fixed-byte stream',
   }
 });
 
+Deno.test('H5 transcoding: HTTP audio negotiation of a video never returns video bytes', async () => {
+  const s = await setupH5();
+  const server = Deno.serve(
+    { hostname: '0.0.0.0', port: 0, onListen() {} },
+    s.app,
+  );
+  const origin = `http://melofon.home:${server.addr.port}`;
+  const request = (
+    op: string,
+    args: Record<string, string>,
+    init?: RequestInit,
+  ) => fetch(`${origin}/rest/${op}?${AUTH}&${new URLSearchParams(args)}`, init);
+  try {
+    const ips = await Deno.resolveDns('melofon.home', 'A');
+    assert(ips.length > 0 && ips.every((ip) => !ip.startsWith('127.')));
+    const capabilities = info({
+      directPlayProfiles: [{
+        containers: ['mp4'],
+        audioCodecs: ['aac'],
+        protocols: ['http'],
+      }],
+      codecProfiles: [{
+        type: 'AudioCodec',
+        name: 'mp3',
+        limitations: [
+          {
+            name: 'audioChannels',
+            comparison: 'Equals',
+            values: ['1'],
+            required: true,
+          },
+          {
+            name: 'audioSamplerate',
+            comparison: 'Equals',
+            values: ['22050'],
+            required: true,
+          },
+          {
+            name: 'audioBitrate',
+            comparison: 'Equals',
+            values: ['64000'],
+            required: true,
+          },
+        ],
+      }],
+    });
+    const response = await request('getTranscodeDecision', {
+      mediaId: s.videoId,
+      mediaType: 'song',
+    }, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(capabilities),
+    });
+    const result = (await response.json())['subsonic-response'];
+    assertEquals(result.status, 'ok');
+    const d = result.transcodeDecision;
+    assertEquals([d.canDirectPlay, d.canTranscode], [false, true]);
+    assertEquals(
+      d.sourceStream.hasVideo,
+      undefined,
+      'core media facts stay private',
+    );
+    const output = await request('getTranscodeStream', {
+      mediaId: s.videoId,
+      mediaType: 'song',
+      transcodeParams: d.transcodeParams,
+    });
+    const { probe } = await decoded(s, output, 'mp3');
+    assertEquals(probe.hasVideo, false);
+    const actual = await s.media.describeAudio(`${s.dir}/returned-audio`);
+    assertEquals([
+      actual!.audioChannels,
+      actual!.audioSamplerate,
+      actual!.audioBitrate,
+    ], [1, 22050, 64000]);
+    const videoBytes = await Deno.readFile(`${s.dir}/library/clip.mp4`);
+    for (const format of ['raw', 'mp4']) {
+      const original = await request('stream', { id: s.videoId, format });
+      assertEquals(new Uint8Array(await original.arrayBuffer()), videoBytes);
+    }
+    const directResponse = await request('getTranscodeDecision', {
+      mediaId: s.id,
+      mediaType: 'song',
+    }, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(info({
+        directPlayProfiles: [{
+          containers: ['wav'],
+          audioCodecs: ['pcm_s16le'],
+          protocols: ['http'],
+        }],
+      })),
+    });
+    const direct =
+      (await directResponse.json())['subsonic-response'].transcodeDecision;
+    assertEquals(direct.canDirectPlay, true);
+    const original = await request('getTranscodeStream', {
+      mediaId: s.id,
+      mediaType: 'song',
+      transcodeParams: direct.transcodeParams,
+    });
+    assertEquals(new Uint8Array(await original.arrayBuffer()), s.wav);
+  } finally {
+    await server.shutdown();
+    await s.close();
+  }
+});
+
 for (
   const [container, codec, token] of [
     ['mp3', 'mp3', 'mp3'],
