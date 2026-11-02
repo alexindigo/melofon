@@ -50,6 +50,7 @@ async function setup() {
   let clock = Date.now();
   let state = createState(store);
   let player = createPlayer();
+  let playback: ReturnType<typeof createPlayback>;
   const router = async () => {
     const library = createLibrary(store);
     const listens = createListens(store);
@@ -58,12 +59,14 @@ async function setup() {
       listens,
       now: () => clock,
     });
-    const playback = createPlayback({
+    playback = createPlayback({
       player,
       library,
       nowPlaying,
       cfg,
     });
+    // Production runs the lifecycle sweep before accepting HTTP reads on boot.
+    await playback.expireReports();
     const core = await pathfinder({ roots: ['core/'], app: { store, cfg } });
     return facade(
       core,
@@ -169,6 +172,7 @@ async function setup() {
       return count;
     },
     async reopen() {
+      await playback.close();
       await store.close();
       store = await openStore(dir);
       state = createState(store);
@@ -196,6 +200,7 @@ async function setup() {
       return controller;
     },
     async close() {
+      await playback.close();
       await store.close();
       await Deno.remove(dir, { recursive: true });
     },

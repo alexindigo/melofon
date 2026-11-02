@@ -1,7 +1,7 @@
 // tests/notify.test.ts — app.notify hub semantics and the player/outputs
 // emit map (OwnTone event names). No HTTP: the hub is in-process pub/sub;
 // the WS transport is the hat's (tests/owntone-ws.test.ts).
-import { assertEquals, assertStrictEquals } from '@std/assert';
+import { assertEquals, assertRejects, assertStrictEquals } from '@std/assert';
 import {
   createNotify,
   type Notify,
@@ -120,6 +120,7 @@ Deno.test('playback commands emit: engine → player/options/volume/queue', () =
       report: () => Promise.resolve(),
       clearByStreamId: () => Promise.resolve(true),
       list: () => Promise.resolve([]),
+      expire: () => Promise.resolve(false),
     },
     library: {} as never, // views under test here don't touch the library
     cfg: {},
@@ -208,6 +209,7 @@ Deno.test('household invalidations follow selected speaker facts and commander i
       report: () => Promise.resolve(),
       clearByStreamId: () => Promise.resolve(false),
       list: () => Promise.resolve([]),
+      expire: () => Promise.resolve(false),
     },
     library: {} as never,
     cfg: {},
@@ -263,6 +265,52 @@ Deno.test('household invalidations follow selected speaker facts and commander i
   } finally {
     playback.close();
   }
+});
+
+Deno.test('playback expiry emits only after success, shares in-flight work and close drains it', async () => {
+  const { notify, events } = recorder();
+  let calls = 0;
+  let release!: (changed: boolean) => void;
+  const playback = createPlayback({
+    player: createPlayer(),
+    library: {} as never,
+    cfg: {},
+    notify,
+    nowPlaying: {
+      set: () => Promise.resolve(),
+      report: () => Promise.resolve(),
+      clearByStreamId: () => Promise.resolve(false),
+      list: () => Promise.resolve([]),
+      expire: () => {
+        calls++;
+        if (calls === 1) {
+          return Promise.reject(new Error('injected expiry failure'));
+        }
+        return new Promise<boolean>((resolve) => {
+          release = resolve;
+        });
+      },
+    },
+  });
+  await assertRejects(() => playback.expireReports(), Error, 'injected');
+  assertEquals(events, []);
+  const first = playback.expireReports();
+  const second = playback.expireReports();
+  assertStrictEquals(first, second);
+  assertEquals(calls, 2);
+  assertEquals(events, []);
+  let closed = false;
+  const close = playback.close().then(() => {
+    closed = true;
+  });
+  await Promise.resolve();
+  assertEquals(closed, false);
+  release(true);
+  assertEquals(await first, true);
+  await close;
+  assertEquals(events, [['nowPlaying']]);
+  assertEquals(await playback.expireReports(), false);
+  assertEquals(calls, 2, 'no work starts after close');
 });
 
 Deno.test('player/outputs without a hub: mutations work, nothing throws', () => {

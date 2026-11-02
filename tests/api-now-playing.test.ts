@@ -12,6 +12,7 @@ import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPlayback, type Playback } from '../src/playback.ts';
 import { createOutputs, createPlayer, type Outputs } from '../src/player.ts';
 import { wireInt } from '../layers/owntone/payloads.ts';
+import { rawSql } from '../src/store/testing.ts';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitFor(condition: () => boolean) {
@@ -42,7 +43,7 @@ function socket(url: string, headers?: Record<string, string>) {
   };
 }
 
-async function setup() {
+async function setup(now?: () => number) {
   const dir = await restored('api-now-playing', async (dir) => {
     const store = await openStore(dir);
     try {
@@ -78,7 +79,7 @@ async function setup() {
         player: createPlayer(),
         outputs,
         library,
-        nowPlaying: createNowPlaying(f.store, { state: f.state }),
+        nowPlaying: createNowPlaying(f.store, { state: f.state, now }),
         cfg: f.cfg,
         notify: f.notify,
       });
@@ -243,12 +244,114 @@ async function setup() {
     async close() {
       for (const observer of observers) await observer.socket.close();
       await ownSocket.close();
-      playback.close();
+      await playback.close();
       await f.close();
       await Deno.remove(dir, { recursive: true });
     },
   };
 }
+
+Deno.test('household now-playing: scheduled expiry notifies before observer reads and never counts a listen', async () => {
+  let clock = Date.now();
+  const t = await setup(() => clock);
+  try {
+    assert(
+      (await Deno.resolveDns('melofon.home', 'A')).every((ip) =>
+        !ip.startsWith('127.')
+      ),
+    );
+    await t.f.state.set('playback.sessionGraceMinutes', '0.001');
+    await t.f.state.set('playback.pausedSessionMinutes', '0.002');
+    await t.f.state.set('playback.sessionSweepSeconds', '0.02');
+    await t.playback.startReportExpiry(t.f.state);
+    await t.playback.startReportExpiry(t.f.state); // idempotent lifecycle start
+    const duration = t.songs[0].durationMs!;
+    assert(duration >= 100);
+    for (
+      const [client, state] of [
+        ['Phone', 'playing'],
+        ['Starting', 'starting'],
+        ['Tablet', 'paused'],
+      ]
+    ) {
+      await t.rest('reportPlayback', {
+        c: client,
+        mediaId: t.songs[0].id,
+        mediaType: 'song',
+        state,
+        positionMs: String(duration - 100),
+        playbackRate: '2',
+      });
+    }
+    await t.changed();
+    const before = (await t.read()).nowPlaying;
+    assertEquals(before.length, 3);
+    const phoneId = before.find((r: { client: string }) =>
+      r.client === 'Phone'
+    ).appPlayerId;
+    t.clear();
+    clock += 109; // planned end in 50 ms + 60 ms grace; paused idle is 120 ms
+    assertEquals(await t.playback.expireReports(), false);
+    await t.drain();
+    for (const o of t.observers) {
+      assert(!o.socket.frames.some((f) => f.events?.nowPlaying));
+    }
+    t.clear();
+    clock++;
+    // No GET, report or explicit sweep here: the production lifecycle does the removal.
+    await t.changed();
+    assertEquals((await t.f.store.nowPlaying.list()).map((r) => r.client), [
+      'Tablet',
+    ]);
+    for (const o of t.observers) {
+      assertEquals(
+        (await t.read(o)).nowPlaying.map((r: { client: string }) => r.client),
+        ['Tablet'],
+      );
+      assert(!o.socket.frames.some((f) => f.events?.player));
+    }
+    assertEquals(t.ownSocket.frames, []);
+    t.clear();
+    clock += 10;
+    await t.changed();
+    assertEquals(
+      await t.f.store.nowPlaying.list(),
+      [],
+      'removal committed before invalidation/refetch',
+    );
+    for (const o of t.observers) assertEquals((await t.read(o)).nowPlaying, []);
+    assertEquals(await rawSql(t.f.store).all('SELECT * FROM listens'), []);
+    t.clear();
+    assertEquals(
+      await Promise.all([
+        t.playback.expireReports(),
+        t.playback.expireReports(),
+      ]),
+      [false, false],
+    );
+    await t.drain();
+    for (const o of t.observers) {
+      assert(!o.socket.frames.some((f) => f.events?.nowPlaying));
+    }
+    assertEquals(t.ownSocket.frames, []);
+    await t.rest('scrobble', { id: t.songs[0].id, submission: 'false' });
+    await t.changed();
+    assertEquals((await t.read()).nowPlaying[0].appPlayerId, phoneId);
+    // Stop lifecycle, then move beyond expiry: no background work survives close.
+    await t.playback.close();
+    t.clear();
+    clock += duration + 60000;
+    await sleep(80);
+    await t.drain();
+    assertEquals((await t.f.store.nowPlaying.list()).length, 1);
+    for (const o of t.observers) {
+      assert(!o.socket.frames.some((f) => f.events?.nowPlaying));
+    }
+    assertEquals(await rawSql(t.f.store).all('SELECT * FROM listens'), []);
+  } finally {
+    await t.close();
+  }
+});
 
 Deno.test('household now-playing: Subsonic reports invalidate every native member, not the OwnTone engine', async () => {
   const t = await setup();

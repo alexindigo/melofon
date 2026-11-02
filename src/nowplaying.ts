@@ -27,6 +27,8 @@ export interface NowPlaying {
   report(report: PlaybackReport, durationMs: number | null): Promise<void>;
   clearByStreamId(streamId: string): Promise<boolean>;
   list(): Promise<NowPlayingRow[]>;
+  /** Remove expired reports without recording listens; true only after a removal commits. */
+  expire(): Promise<boolean>;
 }
 
 export function createNowPlaying(store: Store, options: {
@@ -90,8 +92,6 @@ export function createNowPlaying(store: Store, options: {
         }
         return;
       }
-      // Purge before updating, including when an offline client reconnects.
-      await store.nowPlaying.list(await expiry(at));
       await store.nowPlaying.set(
         report.username,
         report.client,
@@ -105,9 +105,13 @@ export function createNowPlaying(store: Store, options: {
           durationMs,
           restart: report.state === 'starting',
         },
+        await expiry(at),
       );
     },
     clearByStreamId: store.nowPlaying.clearByStreamId,
+    async expire() {
+      return (await store.nowPlaying.expire(await expiry(now()))) > 0;
+    },
     async list() {
       const at = now();
       return (await store.nowPlaying.list(await expiry(at))).map((row) => ({

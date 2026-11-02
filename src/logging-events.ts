@@ -89,6 +89,7 @@ export interface EventFacts {
   server_failed: { port: number } & ErrorFacts;
   startup_failed: ErrorFacts;
   persistence_failed: ErrorFacts;
+  playback_expiry_failed: ErrorFacts;
   state_listener_failed: ErrorFacts;
   notify_listener_failed: ErrorFacts;
   output_listener_failed: ErrorFacts;
@@ -175,6 +176,12 @@ const definition = (
   fields: fields ? fields.split(' ') : [],
 });
 export const events: Record<EventId, EventDefinition> = {
+  playback_expiry_failed: definition(
+    'playback',
+    'error',
+    'Report expiry failed',
+    'error',
+  ),
   setup_code: definition(
     'setup',
     'notice',

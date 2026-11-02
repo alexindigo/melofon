@@ -113,6 +113,20 @@ or when the configured base URL is HTTPS and its host (including port) matches
 the request's host. Forwarded headers never supply an origin, scheme or client
 address.
 
+### Now-playing expiry
+
+Apps explicitly report playback; fetching media does not report a play.
+Signed-in clients can read the household view at `GET /api/v1/now-playing`
+and re-fetch when `/api/v1/events` sends a `nowPlaying` invalidation.
+Core expires playing/starting reports after their projected end plus
+`playback.sessionGraceMinutes`, and paused reports after
+`playback.pausedSessionMinutes` since the last report (both default to 30).
+Expiry never records a listen. A background sweep removes expired reports
+and notifies observers even when nobody reads the view. Its live setting
+`playback.sessionSweepSeconds` defaults to 1 second (range 0.01–3600),
+configurable through the admin settings API. Reads hide expired reports
+without deleting them; retained app-player identities survive expiry.
+
 ## Catalog identity
 
 ### Browse ordering

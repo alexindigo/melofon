@@ -17,6 +17,7 @@
 import type { Library, SongRow } from './library.ts';
 import type { NowPlaying, PlaybackReport } from './nowplaying.ts';
 import type { Notify } from './notify.ts';
+import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
 import type {
   CommandSource,
@@ -128,8 +129,11 @@ export interface Playback {
   nowPlayingView(): Promise<NowPlayingViewRow[]>;
   /** The last recorded engine mutation (null before the first). */
   lastCommand(): LastCommand | null;
-  /** Stop the position-persistence tick and shared-view subscriptions. */
-  close(): void;
+  /** Core lifecycle; also callable with a controlled report clock in tests. */
+  expireReports(): Promise<boolean>;
+  startReportExpiry(state: State): Promise<void>;
+  /** Stop ticks/subscriptions and drain any in-flight expiry before store close. */
+  close(): Promise<void>;
 }
 
 export function createPlayback(deps: {
@@ -236,7 +240,58 @@ export function createPlayback(deps: {
   const tick = persistence === undefined ? null : setInterval(() => {
     if (player.status().state === 'play') flushState();
   }, 1000);
+  let closed = false;
+  let expiryStarted = false;
+  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+  let expiryTask: Promise<void> | undefined;
+  let expiryWork: Promise<boolean> | undefined;
+  // A timer and an explicit sweep share one operation, not competing removals
+  // or duplicate events. Persistence completes before the invalidation is emitted.
+  const expireReports = (): Promise<boolean> => {
+    if (closed) return Promise.resolve(false);
+    return expiryWork ??= (async () => {
+      try {
+        const changed = await nowPlaying.expire();
+        if (changed) invalidateNowPlaying();
+        return changed;
+      } finally {
+        expiryWork = undefined;
+      }
+    })();
+  };
   return {
+    expireReports,
+    async startReportExpiry(state) {
+      if (closed || expiryStarted) return;
+      expiryStarted = true;
+      state.declare('playback.sessionSweepSeconds', {
+        type: 'number',
+        minimum: 0.01,
+        maximum: 3600,
+        default: 1,
+      });
+      let intervalMs = 1000;
+      const cycle = async () => {
+        try {
+          intervalMs =
+            (await state.getTyped('playback.sessionSweepSeconds') as number) *
+            1000;
+          if (!closed) await expireReports();
+        } catch (error) {
+          log.event('playback_expiry_failed', { error });
+        } finally {
+          // Self-scheduling bounds work even if a store call takes longer than
+          // the cadence. Read live policy again each cycle; no per-hat timer.
+          if (!closed) {
+            expiryTimer = setTimeout(() => {
+              expiryTask = cycle();
+            }, intervalMs);
+          }
+        }
+      };
+      expiryTask = cycle();
+      await expiryTask;
+    },
     async reportPlaying(report) {
       // Queue the session write before an abort can queue its clear. Catalog
       // duration is resolved by the store's session view, not awaited here.
@@ -468,9 +523,13 @@ export function createPlayback(deps: {
       return out;
     },
 
-    close() {
+    async close() {
+      closed = true;
+      clearTimeout(expiryTimer);
       if (tick !== null) clearInterval(tick);
       unsubscribeOutputs?.();
+      await expiryTask;
+      await expiryWork;
     },
   };
 }

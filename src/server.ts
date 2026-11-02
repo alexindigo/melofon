@@ -352,6 +352,7 @@ export async function startServer(options: {
   // at track-end in 'play' forever and HA extrapolated ("57 min of a 3 min
   // track").
   const engineClock = setInterval(() => playback.advanceEnded(), 500);
+  await playback.startReportExpiry(state);
 
   // MELOFON_AIRPLAY_HOST=<ip>[:port] — unicast-resolve TXT at that host, then
   // register. The CRUD twin is POST /_/outputs. Bare IP if resolve times out.
@@ -398,7 +399,7 @@ export async function startServer(options: {
       await listens.shutdown();
       await airplayBoot.close();
       shutdownNativeLogging();
-      playback.close();
+      await playback.close();
       await persistence.drain();
       await store.close();
     },
