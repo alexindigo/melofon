@@ -1,5 +1,26 @@
 import type { LyricsEntryRow } from '#opensubsonic/types.ts';
 
+type Cues = NonNullable<LyricsEntryRow['lines'][number]['cues']>;
+
+/** Navidrome 18205366 model/lyrics_normalize.go:129–170, called by
+ * server/subsonic/lyrics.go:236–245 with line.End. Core lines have no end,
+ * so that fallback is absent here too. Never mutate the shared source facts. */
+function normalizedCues(cues: Cues) {
+  if (!cues.some((cue) => cue.end !== undefined)) return cues;
+  const ends = cues.map((cue, i) => {
+    const nextStart = cues[i + 1]?.start;
+    const end = cue.end ?? nextStart;
+    return end === undefined
+      ? undefined
+      : Math.max(cue.start, Math.min(end, nextStart ?? end));
+  });
+  const complete = ends.every((end) => end !== undefined);
+  return cues.map(({ end: _end, ...cue }, i) => ({
+    ...cue,
+    ...(complete ? { end: ends[i] } : {}),
+  }));
+}
+
 // SongLyrics v1 is a strict projection: no kind, cueLine or agents escape.
 // Local sources have one default vocal agent; none is emitted without cues.
 export function structuredLyrics(entry: LyricsEntryRow, enhanced: boolean) {
@@ -11,7 +32,10 @@ export function structuredLyrics(entry: LyricsEntryRow, enhanced: boolean) {
           agentId: 'main',
           ...(line.start !== undefined ? { start: line.start } : {}),
           value: line.text,
-          cue: line.cues.map(({ text, ...cue }) => ({ ...cue, value: text })),
+          cue: normalizedCues(line.cues).map(({ text, ...cue }) => ({
+            ...cue,
+            value: text,
+          })),
         }]
         : []
     )

@@ -309,3 +309,126 @@ Deno.test('lyrics runner: declared track identifiers gate acquisition without in
     await f.close();
   }
 });
+
+Deno.test('lyrics runner: automatic missing intake shares live local/strong selection, weak and rejected remain missing, read-only roots need no writes', async () => {
+  const f = await setup();
+  try {
+    for (
+      const name of [
+        'embedded',
+        'sidecar',
+        'strong',
+        'medium',
+        'low',
+        'rejected',
+        'malformed',
+      ]
+    ) {
+      await lyricMp3(
+        `${f.root}/${name}.mp3`,
+        name === 'embedded'
+          ? [{ text: 'Local embedded' }]
+          : name === 'malformed'
+          ? [{ text: 'x'.repeat(1048600) }]
+          : [],
+        { TIT2: name },
+      );
+    }
+    await Deno.writeTextFile(`${f.root}/sidecar.txt`, 'Local sidecar');
+    await Deno.writeTextFile(
+      `${f.root}/malformed.elrc`,
+      '[00:01.00]<00:broken>bad',
+    );
+    await scanLibrary(f.store);
+    const songs = await f.library.listSongs({ offset: 0, size: 100 });
+    for (const name of ['strong', 'medium', 'low', 'rejected'] as const) {
+      const song = songs.find((s) => s.title === name)!;
+      const [candidate] = await f.store.candidates.addCandidates([{
+        entityType: 'song',
+        entityId: song.id,
+        kind: 'lyrics',
+        source: 'prior-source',
+        confidence: name === 'rejected' ? 'strong' : name,
+        imageHash: 'prior-lyrics',
+        imageExt: 'lyrics',
+        libraryId: f.libraryId,
+        origin: 'https://provenance.invalid/prior',
+        details: {
+          lyrics: {
+            origin: 'https://provenance.invalid/prior',
+            entries: lookupLyrics,
+          },
+        },
+      }]);
+      if (name === 'rejected') {
+        await f.store.candidates.setState(candidate.id, 'rejected');
+      }
+    }
+    const before = await Promise.all(
+      songs.map((song) => Deno.readFile(song.path)),
+    );
+    await Deno.chmod(f.root, 0o555);
+    await f.state.set('lookups.plugin.lyrics-fixture.enabled', 'false');
+    const runner = await f.start();
+    await runner.afterScan();
+    assertEquals(await f.stats(), {
+      done: 0,
+      active: 0,
+      waiting: 0,
+      failed: 0,
+    });
+    await f.state.set('lookups.plugin.lyrics-fixture.enabled', 'true');
+    await runner.afterScan();
+    await eventually(async () => (await f.stats()).done === 4);
+    const jobs = await rawSql(f.store).all<{ entity_id: string; mode: string }>(
+      "SELECT entity_id, mode FROM lookup_jobs WHERE plugin = 'lyrics-fixture'",
+    );
+    assertEquals(
+      jobs.map((j) => j.entity_id).sort(),
+      songs.filter((s) =>
+        ['medium', 'low', 'rejected', 'malformed'].includes(s.title!)
+      ).map((s) => s.id).sort(),
+    );
+    assert(jobs.every((j) => j.mode === 'missing'));
+    for (const [i, song] of songs.entries()) {
+      const selected = await f.library.lyricsBySongId(song.id);
+      assertEquals(
+        selected,
+        song.title === 'embedded'
+          ? [{
+            language: 'eng',
+            synced: false,
+            lines: [{ text: 'Local embedded' }],
+          }]
+          : song.title === 'sidecar'
+          ? [{
+            language: 'xxx',
+            synced: false,
+            lines: [{ text: 'Local sidecar' }],
+          }]
+          : lookupLyrics,
+      );
+      assertEquals(await Deno.readFile(song.path), before[i]);
+    }
+    await runner.afterScan();
+    await runner.afterScan();
+    assertEquals(await f.stats(), {
+      done: 4,
+      active: 0,
+      waiting: 0,
+      failed: 0,
+    });
+    assert(
+      ![...Deno.readDirSync(f.root)].some((entry) => entry.name === '.melofon'),
+    );
+    await Deno.chmod(f.root, 0o755);
+    await Deno.remove(`${f.root}/sidecar.txt`);
+    await runner.afterScan();
+    await eventually(async () => (await f.stats()).done === 5);
+    const sidecar = songs.find((song) => song.title === 'sidecar')!;
+    assertEquals(await f.library.lyricsBySongId(sidecar.id), lookupLyrics);
+  } finally {
+    await Deno.chmod(f.root, 0o755);
+    await f.close();
+  }
+});

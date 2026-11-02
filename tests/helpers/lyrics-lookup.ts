@@ -26,6 +26,7 @@ export async function lyricsLookupPlugin(
   root: string,
   id = 'lyrics-fixture',
   requires: string[] = [],
+  lyrics: LyricsEntry[] = lookupLyrics,
 ) {
   return await lookupPlugin(
     root,
@@ -35,12 +36,12 @@ export async function lyricsLookupPlugin(
     if (behavior === 'empty') return {candidates:[]};
     if (behavior === 'retry') return {retryAfter:30,reason:'fixture busy'};
     if (behavior === 'network') await (await ctx.fetch('https://fixture.test/lyrics')).text();
-    const entries = ${JSON.stringify(lookupLyrics)};
-    entries[1].offset += ctx.settings.shift;
+    const entries = ${JSON.stringify(lyrics)};
+    if (entries[1]?.offset !== undefined) entries[1].offset += ctx.settings.shift;
     if (behavior === 'oversize') entries[0].lines[0].text = 'x'.repeat(10000);
     const proposal = {
       target:{type:'track',id:behavior === 'foreign' ? 'foreign' : item.id},
-      confidence:'strong',
+      confidence:ctx.settings.confidence,
       values:{'track.lyrics':{url:'https://provenance.invalid/song',entries}},
       ids:{fixture:'external-song'},
       evidence:{facts:item,lyrics:'untrusted evidence must not replace the payload'}
@@ -64,6 +65,7 @@ export async function lyricsLookupPlugin(
         properties: {
           behavior: { type: 'string', default: 'found' },
           shift: { type: 'integer', default: 0 },
+          confidence: { type: 'string', default: 'strong' },
         },
       },
     }),

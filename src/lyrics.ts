@@ -6,6 +6,7 @@ import type { Store } from './store/index.ts';
 import { createState, type State } from './state.ts';
 import { imageHash, libraryImagesWritable } from './images.ts';
 import { lyricsMetadata } from './lyrics-metadata.ts';
+import { parseLyricsValue } from './lookups/lyrics-values.ts';
 
 export interface LyricsCue {
   start: number;
@@ -352,18 +353,41 @@ export function createLyrics(
       source.entry
     );
   };
+  const selected = async (id: string, path: string): Promise<LyricsEntry[]> => {
+    const local = shown(await sources(path));
+    if (local.length) return local;
+    const candidate = await store.candidates.strongestOpen(
+      'song',
+      id,
+      'lyrics',
+    );
+    if (!candidate) return [];
+    const value = candidate.details.lyrics as { entries?: unknown } | undefined;
+    // Online proposals own a complete entry set, unlike local conflict backups.
+    // Reuse admission validation and the live reader budget for kept values too.
+    if (utf8(JSON.stringify(value) ?? '') > await maxBytes()) return [];
+    try {
+      return parseLyricsValue({
+        url: candidate.origin,
+        entries: value?.entries,
+      })
+        .entries;
+    } catch {
+      return []; // A legacy/unusable proposal cannot become display data.
+    }
+  };
   return {
     maxBytes,
     sources,
     shown,
     async bySongId(id: string): Promise<LyricsEntry[]> {
       const path = await store.catalog.songPath(id);
-      return path === null ? [] : shown(await sources(path));
+      return path === null ? [] : await selected(id, path);
     },
     async legacy(query: { artist?: string; title?: string }) {
       const limit = Number(await state.getTyped('lyrics.legacyCandidates'));
       for (const song of await store.catalog.songsForLyrics(query, limit)) {
-        const entry = shown(await sources(song.path))[0];
+        const entry = (await selected(song.id, song.path))[0];
         if (entry) {
           return {
             artist: query.artist ?? null,

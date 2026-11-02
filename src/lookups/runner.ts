@@ -346,9 +346,9 @@ export async function createLookupRunner(options: {
         }
       }
     }
-    // Explicit requests acquire whole lyrics candidates even when local lyrics
-    // exist. Automatic missing-lyrics intake belongs to the lyrics reader policy.
-    if (mode === 'all' && accepts('track') && target?.type !== 'artist') {
+    // Missing means the shared reader has no usable local or strong proposal.
+    // Explicit requests still acquire candidates regardless of displayed lyrics.
+    if (accepts('track') && target?.type !== 'artist') {
       const tracks = async function* () {
         if (target?.type === 'song') {
           yield target.id;
@@ -371,6 +371,7 @@ export async function createLookupRunner(options: {
       };
       for await (const id of tracks()) {
         if (closed) return;
+        if (mode === 'missing' && (await lyrics.bySongId(id)).length) continue;
         const facts = await referenceFacts(store, 'track', id);
         if (!facts || facts.type !== 'track') continue;
         for (const host of hosts) {
