@@ -20,6 +20,34 @@ export interface Session {
   createdAt: string;
   lastUsedAt: string;
 }
+export interface PlaybackCapabilities {
+  name: string;
+  platform: string;
+  maxAudioBitrate?: number;
+  maxTranscodingAudioBitrate?: number;
+  directPlayProfiles?: {
+    containers: string[];
+    audioCodecs: string[];
+    protocols: string[];
+    maxAudioChannels?: number;
+  }[];
+  transcodingProfiles?: {
+    container: string;
+    audioCodec: string;
+    protocol: string;
+    maxAudioChannels?: number;
+  }[];
+  codecProfiles?: {
+    type: string;
+    name: string;
+    limitations?: {
+      name: string;
+      comparison: string;
+      values: string[];
+      required: boolean;
+    }[];
+  }[];
+}
 export interface Hat {
   name: string;
   state: 'found' | 'loaded' | 'active' | 'failed';
@@ -242,6 +270,15 @@ export interface HatContext {
       userAgent: string;
     }): Promise<{ session: Session; key: string }>;
     sessions: {
+      playbackCapabilities(
+        caller: string,
+        sessionId: string,
+      ): Promise<PlaybackCapabilities | null>;
+      replacePlaybackCapabilities(
+        caller: string,
+        sessionId: string,
+        input: unknown,
+      ): Promise<PlaybackCapabilities>;
       authenticate(
         key: string,
         options?: { touch?: boolean },

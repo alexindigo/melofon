@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at TIMESTAMPTZ NOT NULL,
   last_used_at TIMESTAMPTZ NOT NULL
 );
+-- A declaration belongs to the login itself and disappears on every end path.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS playback_capabilities VARCHAR;
 -- M3 scan sources: disjoint folders, one OpenSubsonic music folder per row.
 -- Preferences survive rescans and upgrades. NULL is a reset revision tombstone.
 CREATE TABLE IF NOT EXISTS user_preferences (

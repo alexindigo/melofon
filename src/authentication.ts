@@ -100,6 +100,8 @@ export function createAuthentication(
     // operations accept the caller ID and enforce ownership themselves.
     sessions: {
       authenticate: sessions.authenticate,
+      playbackCapabilities: sessions.playbackCapabilities,
+      replacePlaybackCapabilities: sessions.replacePlaybackCapabilities,
       list(caller: string, target = caller) {
         return sessions.list(target, caller);
       },

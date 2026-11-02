@@ -35,7 +35,8 @@ Deno.test('store.nowPlaying.set supersedes atomically and rolls back failures', 
 Deno.test('store.nowPlaying native order and atomic finish retain terminal run watermarks', async () => {
   const t = await domainFixture(createNowPlayingStore);
   try {
-    await t.run(`INSERT INTO sessions VALUES
+    await t.run(`INSERT INTO sessions
+      (id, user_id, key_hash, device_name, user_agent, created_at, last_used_at) VALUES
       ('login', 'u', 'hash', 'Phone', 'agent', now(), now())`);
     const report = {
       userId: 'u',
@@ -152,7 +153,7 @@ Deno.test('native report schema upgrades legacy keys and preserves ids across re
       99,
     );
     await rawSql(store).run(
-      "INSERT INTO sessions VALUES ('login', 'u', 'hash', 'Phone', 'agent', now(), now())",
+      "INSERT INTO sessions (id, user_id, key_hash, device_name, user_agent, created_at, last_used_at) VALUES ('login', 'u', 'hash', 'Phone', 'agent', now(), now())",
     );
     const native = {
       userId: 'u',

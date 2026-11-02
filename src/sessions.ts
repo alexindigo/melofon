@@ -4,6 +4,8 @@ import type { Store } from './store/index.ts';
 import type { State } from './state.ts';
 import { scopedLog } from './logging.ts';
 import type { Notify } from './notify.ts';
+import { normalizeCapabilities } from './stream-capabilities.ts';
+import type { ClientCapabilities } from './stream-negotiation.ts';
 
 export interface SessionsEnded {
   userId: string;
@@ -25,6 +27,13 @@ export function createSessions(
     type: 'integer',
     minimum: 60,
     default: 60,
+  });
+  state.declare('stream.capabilitiesMaxBytes', {
+    type: 'integer',
+    minimum: 2,
+    default: 65536,
+    description:
+      'Maximum serialized UTF-8 bytes in a device playback declaration',
   });
   const listeners = new Set<(event: SessionsEnded) => void>();
   const log = scopedLog('sessions');
@@ -80,6 +89,32 @@ export function createSessions(
       return result.auth;
     },
     list: store.sessions.list,
+    async playbackCapabilities(
+      caller: string,
+      sessionId: string,
+    ): Promise<ClientCapabilities | null> {
+      const value = await store.sessions.playbackCapabilities(
+        caller,
+        sessionId,
+      );
+      return value === null ? null : JSON.parse(value);
+    },
+    async replacePlaybackCapabilities(
+      caller: string,
+      sessionId: string,
+      input: unknown,
+    ) {
+      const value = normalizeCapabilities(
+        input,
+        Number(await state.getTyped('stream.capabilitiesMaxBytes')),
+      );
+      await store.sessions.replacePlaybackCapabilities(
+        caller,
+        sessionId,
+        JSON.stringify(value),
+      );
+      return value;
+    },
     async revoke(caller: string, sessionId: string) {
       ended(await store.sessions.revoke(caller, sessionId));
     },

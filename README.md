@@ -127,6 +127,21 @@ and notifies observers even when nobody reads the view. Its live setting
 configurable through the admin settings API. Reads hide expired reports
 without deleting them; retained app-player identities survive expiry.
 
+### Device playback abilities
+
+`PUT /api/v1/me/playback-capabilities` replaces the current login's audio
+declaration; `GET` returns `{capabilities: ...}` (`null` before registration).
+Send an object with `name`, `platform`, optional bitrate ceilings in bits/s,
+`directPlayProfiles`, `transcodingProfiles` and `codecProfiles`. Core trims
+names, normalizes profile tokens to lowercase and removes duplicate token
+values. Other logins keep independent declarations, even with the same device
+name. Declarations survive restart and disappear with the login on sign-out,
+revocation, password change or observed idle expiry. They are not published in
+household events. `stream.capabilitiesMaxBytes` (default 65536) limits both the
+submitted and normalized JSON's UTF-8 bytes; invalid or oversized replacements
+leave the previous declaration intact. This records client-declared abilities,
+not evidence of a connected speaker or a guarantee that a profile is supported.
+
 ## Catalog identity
 
 ### Browse ordering

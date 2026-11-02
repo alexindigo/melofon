@@ -11,6 +11,9 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
   } catch (error) {
     if (!(error instanceof Error) || !('code' in error)) throw error;
     const code = error.code;
+    if (error.name === 'CapabilityError') {
+      fail(code === 'too_large' ? 413 : 400, String(code), error.message);
+    }
     if (error.name === 'PluginError') {
       fail(code === 'not_found' ? 404 : 400, String(code), error.message);
     }

@@ -60,9 +60,9 @@ export function createSessionsStore(engine: Engine) {
           }
         }
         await q.run(
-          `INSERT INTO sessions VALUES (${esc(input.id)}, ${
-            esc(input.userId)
-          }, ${esc(input.keyHash)},
+          `INSERT INTO sessions
+          (id, user_id, key_hash, device_name, user_agent, created_at, last_used_at)
+          VALUES (${esc(input.id)}, ${esc(input.userId)}, ${esc(input.keyHash)},
           ${esc(input.deviceName)}, ${
             esc(input.userAgent)
           }, epoch_ms(${input.now}), epoch_ms(${input.now}))`,
@@ -119,6 +119,22 @@ export function createSessionsStore(engine: Engine) {
         )).map(sessionRecord);
       });
     },
+    playbackCapabilities(caller: string, id: string) {
+      return engine.exclusive(async (q) => {
+        const row = await ownedSession(q, caller, id);
+        return row.capabilities;
+      });
+    },
+    replacePlaybackCapabilities(caller: string, id: string, value: string) {
+      return atomic(engine, async (q) => {
+        await ownedSession(q, caller, id);
+        await q.run(
+          `UPDATE sessions SET playback_capabilities = ${
+            esc(value)
+          } WHERE id = ${esc(id)}`,
+        );
+      });
+    },
     revoke(caller: string, id: string) {
       return atomic(engine, async (q) => {
         const row = (await q.all<{ userId: string }>(
@@ -140,4 +156,14 @@ export function createSessionsStore(engine: Engine) {
       });
     },
   };
+}
+
+async function ownedSession(q: Queries, caller: string, id: string) {
+  const row = (await q.all<{ userId: string; capabilities: string | null }>(
+    `SELECT user_id AS userId, playback_capabilities AS capabilities
+    FROM sessions WHERE id = ${esc(id)}`,
+  ))[0];
+  if (!row) throw new UserError('not_found');
+  if (row.userId !== caller) throw new UserError('forbidden');
+  return row;
 }
