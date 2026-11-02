@@ -5,6 +5,9 @@ import { convertCaptions } from './video.ts';
 import type { Store } from './store/index.ts';
 import type { CatalogReads, LyricsRow } from './store/catalog.ts';
 import { createLyrics, type Lyrics, type LyricsEntry } from './lyrics.ts';
+import { type CatalogOrder, createCatalogOrder } from './catalog-order.ts';
+import { createState, type State } from './state.ts';
+import type { Notify } from './notify.ts';
 import {
   artistImagePaths,
   embeddedPictures,
@@ -41,6 +44,8 @@ export interface Library extends
     | 'albumSongPath'
     | 'albumCoverDirectories'
   > {
+  /** Shared browse policy, with a revision for conditional representations. */
+  order(): Promise<CatalogOrder>;
   /** Lyrics of the bounded best artist/title match, from the shared service. */
   lyrics(query: { artist?: string; title?: string }): Promise<LyricsRow | null>;
   lyricsBySongId(id: string): Promise<LyricsEntry[]>;
@@ -70,7 +75,8 @@ export interface Library extends
 export function createLibrary(
   store: Store,
   lyrics: Lyrics = createLyrics(store),
-  options: { dataDir?: string; media?: Media } = {},
+  options: { dataDir?: string; media?: Media; state?: State; notify?: Notify } =
+    {},
 ): Library {
   const catalog = store.catalog;
   const localArtistPath = async (id: string) => {
@@ -80,6 +86,10 @@ export function createLibrary(
       : null;
   };
   return {
+    order: createCatalogOrder(
+      options.state ?? createState(store),
+      options.notify,
+    ),
     artistFolder: catalog.artistFolder,
     videoDetails: catalog.videoDetails,
     async caption(videoId, selection = {}) {

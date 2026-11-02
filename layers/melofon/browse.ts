@@ -56,9 +56,10 @@ async function browsePaging(
   const defaultLimit = Number(
     await context.app.state.getTyped('melofon.browsePageRecords'),
   );
+  const order = await context.app.library.order();
   return {
-    // a20 replaces [] with the shared core article setting; fold without stripping.
-    ignoredArticles: [],
+    ignoredArticles: order.ignoredArticles,
+    articleRevision: order.revision,
     folderId: browseLibrary(params),
     offset: browseInteger(
       params,
@@ -90,17 +91,19 @@ export async function searchPageQuery(
     'songOffset',
     'songLimit',
   ]);
-  const { folderId, ignoredArticles, ...artists } = await browsePaging(
-    params,
-    context,
-    'artist',
-  );
+  const { folderId, ignoredArticles, articleRevision, ...artists } =
+    await browsePaging(
+      params,
+      context,
+      'artist',
+    );
   const albumPage = await browsePaging(params, context, 'album');
   const songPage = await browsePaging(params, context, 'song');
   return {
     query: params.get('query') ?? '',
     folderId,
     ignoredArticles,
+    articleRevision,
     artists,
     albums: { offset: albumPage.offset, limit: albumPage.limit },
     songs: { offset: songPage.offset, limit: songPage.limit },
@@ -119,16 +122,18 @@ export async function folderPageQuery(
     'songOffset',
     'songLimit',
   ]);
-  const { folderId, ignoredArticles, offset, limit } = await browsePaging(
-    params,
-    context,
-    'folder',
-  );
+  const { folderId, ignoredArticles, articleRevision, offset, limit } =
+    await browsePaging(
+      params,
+      context,
+      'folder',
+    );
   const songPage = await browsePaging(params, context, 'song');
   return {
     libraryId: folderId,
     path: params.get('path') ?? '',
     ignoredArticles,
+    articleRevision,
     folders: { offset, limit },
     songs: { offset: songPage.offset, limit: songPage.limit },
   };
@@ -153,11 +158,12 @@ export async function playlistPageQuery(
   if ((params.get('sort') ?? 'name') !== 'name') {
     fail(400, 'invalid_field', 'Invalid sort');
   }
-  const { offset, limit, ignoredArticles } = await browsePaging(
-    params,
-    context,
-  );
-  return { offset, limit, ignoredArticles };
+  const { offset, limit, ignoredArticles, articleRevision } =
+    await browsePaging(
+      params,
+      context,
+    );
+  return { offset, limit, ignoredArticles, articleRevision };
 }
 
 export function personalAlbumSort(sort: string): boolean {

@@ -115,6 +115,22 @@ address.
 
 ## Catalog identity
 
+### Browse ordering
+
+The core setting `catalog.ignoredArticles` is an array of leading words ignored
+by native catalog name ordering and OpenSubsonic artist indexes/alphabetical
+album lists. Its default is `The, El, La, Los, Las, Le, Les, Os, As, O, A`,
+preserving the OpenSubsonic defaults. Edit it through
+`PATCH /api/v1/admin/settings` with, for example,
+`{"changes":[{"key":"catalog.ignoredArticles","value":["The","A"]}]}`.
+Each entry is one nonempty word (no whitespace or commas); `[]` disables
+article stripping while retaining case/accent folding. Changes apply without a
+scan or restart, invalidate native list validators, and send signed-in clients
+a `library` change event. `reference.ignoredArticles` remains independent: it
+controls matching external reference names, not browse order.
+
+### Stable identities
+
 Scanning records an `afp/1` audio fingerprint from compressed audio packets,
 excluding tags. Unchanged stat tuples reuse the cached fingerprint, including
 same-filesystem moves. Song ids stay stable across tag edits and automatically

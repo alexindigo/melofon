@@ -144,7 +144,12 @@ export async function startServer(options: {
     devices: airplay,
     savedOutput: (id) => persistence.savedOutput(id),
   });
-  const library = createLibrary(store, lyrics, { dataDir: cfg.dataDir, media });
+  const library = createLibrary(store, lyrics, {
+    dataDir: cfg.dataDir,
+    media,
+    state,
+    notify,
+  });
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store, { state });
   const playback = createPlayback({

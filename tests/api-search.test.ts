@@ -21,7 +21,9 @@ const text = (row: Row, category: Category) =>
     ? row.title ?? row.fileName!
     : row.name ?? row.folderName!;
 const folded = (value: string) =>
-  value.normalize('NFD').replace(/\p{M}/gu, '').trim().toLowerCase();
+  // The is this fixture's only leading article in the shared core defaults.
+  value.normalize('NFD').replace(/\p{M}/gu, '').trim().replace(/^The /, '')
+    .toLowerCase();
 function expected(rows: Row[], category: Category, query = '') {
   return rows.filter((r) =>
     text(r, category).toLowerCase().includes(query.toLowerCase())
@@ -238,7 +240,7 @@ Deno.test('API search: matching, empty query, absent matches and library-scoped 
           const pages = await response.json();
           const legacy = await f.store.catalog.search3(query, {
             folderId: library?.id,
-            ignoredArticles: [],
+            ignoredArticles: ['The'],
             artistCount: 100,
             artistOffset: 0,
             albumCount: 100,

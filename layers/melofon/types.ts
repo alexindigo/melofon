@@ -146,6 +146,7 @@ export interface HatContext {
         total: number;
         revision: string;
       }>;
+      order(): Promise<{ ignoredArticles: string[]; revision: number }>;
       getArtistSnapshot(ref: ArtistGroupRef, folderId?: string): Promise<{
         artist: ArtistGroupRow | null;
         revision: string;
@@ -389,6 +390,7 @@ export interface SongMetadata {
   albumSortName: string | null;
 }
 export interface BrowsePageOptions {
+  articleRevision?: number;
   ignoredArticles?: string[];
   sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
   seed?: string;
@@ -405,6 +407,7 @@ export interface FolderRow {
   name: string;
 }
 export interface PlaylistPageOptions {
+  articleRevision?: number;
   ignoredArticles?: string[];
   offset: number;
   limit: number;
@@ -421,6 +424,7 @@ export interface PlaylistRow {
   durationMs: number;
 }
 export interface FolderPageOptions {
+  articleRevision?: number;
   libraryId?: string;
   path?: string;
   ignoredArticles?: string[];
@@ -449,6 +453,7 @@ export interface ArtistGroupRow {
   albumCount: number;
 }
 export interface ArtistPageOptions {
+  articleRevision?: number;
   ignoredArticles?: string[];
   folderId?: string;
   offset: number;
@@ -456,6 +461,7 @@ export interface ArtistPageOptions {
 }
 export type GenrePageOptions = ArtistPageOptions;
 export interface SearchPageOptions {
+  articleRevision?: number;
   ignoredArticles?: string[];
   folderId?: string;
   artists: { offset: number; limit: number };

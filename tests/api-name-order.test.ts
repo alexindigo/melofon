@@ -31,6 +31,10 @@ async function nameFixture(entity: Entity) {
   try {
     const f = await apiFixture({
       services: async (f) => {
+        // This fixture isolates folding without stripping; article defaults and
+        // live changes are covered by api-browse-order.test.ts.
+        const library = createLibrary(f.store, undefined, { state: f.state });
+        await f.state.set('catalog.ignoredArticles', '');
         const libraries = createLibraries(f.store, { notify: f.notify });
         await libraries.add('Music', root);
         for (const [i, name] of names.entries()) {
@@ -45,7 +49,7 @@ async function nameFixture(entity: Entity) {
           });
         }
         await scanLibrary(f.store);
-        return { libraries, library: createLibrary(f.store) };
+        return { libraries, library };
       },
     });
     await f.auth.users.create(f.admin.id, {

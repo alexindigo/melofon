@@ -507,7 +507,11 @@ Deno.test('API folders: configured empty and unavailable roots exist, non-media 
     await f.close();
   }
   const empty = await apiFixture({
-    services: (f) => Promise.resolve({ folders: createFolders(f.store) }),
+    services: (f) =>
+      Promise.resolve({
+        folders: createFolders(f.store),
+        library: createLibrary(f.store),
+      }),
   });
   try {
     for (const use of ['cookie', 'bearer'] as const) {

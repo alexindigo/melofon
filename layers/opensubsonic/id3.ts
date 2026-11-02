@@ -33,21 +33,6 @@ import type {
   StarredItem,
 } from '#opensubsonic/types.ts';
 
-export const IGNORED_ARTICLES = 'The El La Los Las Le Les Os As O A';
-const ARTICLES = [
-  'The',
-  'El',
-  'La',
-  'Los',
-  'Las',
-  'Le',
-  'Les',
-  'Os',
-  'As',
-  'O',
-  'A',
-];
-
 // SHA-256(`melofon-placeholder-artist\n${kind}`), first 32 hex characters.
 const PLACEHOLDER_IDS = {
   various: '5db4f9f82609e01429419e6affafb434',
@@ -375,11 +360,12 @@ function indexName(key: string): string {
 export async function artistIndex(
   context: HatContext,
   build: typeof artistOf,
+  ignoredArticles: string[],
 ): Promise<Record<string, unknown>[]> {
   const folderId = await folderIdParam(context);
   const artists = await context.app.library.listArtists(
     folderId,
-    { ignoredArticles: ARTICLES },
+    { ignoredArticles },
   );
   for (const kind of PLACEHOLDER_KINDS) {
     const albums = await context.app.library.albumsWithoutArtist(kind, {
@@ -472,7 +458,7 @@ export async function albumListAlbums(
     offset: safeIntParam(params, 'offset', 0),
     folderId: await folderIdParam(context),
     username: context.state.user!.username,
-    ignoredArticles: ARTICLES,
+    ignoredArticles: (await context.app.library.order()).ignoredArticles,
   };
   if (sort === 'genre') {
     const genre = requiredParam(context, 'genre');

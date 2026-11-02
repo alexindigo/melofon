@@ -107,6 +107,7 @@ export interface HatContext {
       start(): Promise<void>;
     };
     library: {
+      order(): Promise<{ ignoredArticles: string[]; revision: number }>;
       listArtists(
         folderId?: string,
         opts?: { ignoredArticles?: string[] },
