@@ -121,6 +121,7 @@ Deno.test('playback commands emit: engine → player/options/volume/queue', () =
       clearByStreamId: () => Promise.resolve(true),
       list: () => Promise.resolve([]),
       expire: () => Promise.resolve(false),
+      reportSession: () => Promise.resolve(false),
     },
     library: {} as never, // views under test here don't touch the library
     cfg: {},
@@ -210,6 +211,7 @@ Deno.test('household invalidations follow selected speaker facts and commander i
       clearByStreamId: () => Promise.resolve(false),
       list: () => Promise.resolve([]),
       expire: () => Promise.resolve(false),
+      reportSession: () => Promise.resolve(false),
     },
     library: {} as never,
     cfg: {},
@@ -281,6 +283,7 @@ Deno.test('playback expiry emits only after success, shares in-flight work and c
       report: () => Promise.resolve(),
       clearByStreamId: () => Promise.resolve(false),
       list: () => Promise.resolve([]),
+      reportSession: () => Promise.resolve(false),
       expire: () => {
         calls++;
         if (calls === 1) {

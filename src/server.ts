@@ -156,6 +156,7 @@ export async function startServer(options: {
     player,
     outputs,
     nowPlaying,
+    sessions: authentication.sessions,
     library,
     cfg,
     notify,

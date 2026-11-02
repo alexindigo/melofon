@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { apiFixture, error } from './helpers/api.ts';
 import { restored } from './helpers/prepared.ts';
 import { openStore } from '../src/store/index.ts';
@@ -9,6 +9,7 @@ import { createLibrary } from '../src/library.ts';
 import { createUserService } from '../src/user.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
+import { createClientQueue } from '../src/clientqueue.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPlayback, type Playback } from '../src/playback.ts';
 import { createOutputs, createPlayer, type Outputs } from '../src/player.ts';
@@ -81,6 +82,7 @@ async function setup(now?: () => number) {
         outputs,
         library,
         nowPlaying: createNowPlaying(f.store, { state: f.state, now }),
+        sessions: f.auth.sessions,
         cfg: f.cfg,
         notify: f.notify,
       });
@@ -90,6 +92,7 @@ async function setup(now?: () => number) {
         user: createUserService(f.store, f.cfg),
         annotation: createAnnotation(f.store),
         listens: createListens(f.store),
+        clientQueue: createClientQueue(f.store),
         outputs,
         playback,
       });
@@ -604,6 +607,275 @@ Deno.test('household now-playing: legacy scrobbles and competing reported stops 
       [server],
       'engine stays independent',
     );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('household now-playing: native sessions separate same-name devices and guard same-song runs', async () => {
+  let clock = Date.now();
+  const t = await setup(() => clock);
+  try {
+    const ips = await Deno.resolveDns('melofon.home', 'A');
+    assert(ips.length > 0 && ips.every((ip) => !ip.startsWith('127.')));
+    const a = await t.f.login('cookie', 'admin', 'password-admin', 'Phone');
+    const b = await t.f.login('bearer', 'admin', 'password-admin', 'Phone');
+    const c = await t.f.login('bearer', 'alice', 'password-member', 'Phone');
+    const song = t.songs[0];
+    const base = {
+      userId: a.body.user.id,
+      sessionId: a.body.session.id,
+      run: 1,
+      sequence: 0,
+      trackId: song.id,
+      positionMs: 10,
+      state: 'starting' as const,
+      playbackRate: 1,
+      ignoreScrobble: false,
+    };
+    const send = (
+      extra: Partial<Parameters<Playback['reportSessionPlayback']>[0]> = {},
+    ) => t.playback.reportSessionPlayback({ ...base, ...extra });
+    const engine = t.playback.playerView();
+    const queue = await t.f.get('/api/v1/me/queue', a.credential);
+    assertEquals(queue.status, 200);
+    const savedQueue = await queue.json();
+    assertEquals(await send(), true);
+    assertEquals(
+      await send({ sessionId: b.body.session.id, state: 'paused' }),
+      true,
+    );
+    assertEquals(
+      await send({
+        userId: c.body.user.id,
+        sessionId: c.body.session.id,
+        state: 'paused',
+      }),
+      true,
+    );
+    await t.rest('reportPlayback', {
+      mediaId: song.id,
+      mediaType: 'song',
+      state: 'paused',
+      positionMs: '100',
+    });
+    await t.changed();
+    const before = (await t.read()).nowPlaying;
+    assertEquals(before.length, 4);
+    assertEquals(
+      new Set(before.map((r: { appPlayerId: number }) => r.appPlayerId)).size,
+      4,
+    );
+    assert(before.every((r: { client: string }) => r.client === 'Phone'));
+    assertEquals(before.map((r: { username: string }) => r.username).sort(), [
+      'admin',
+      'admin',
+      'admin',
+      'alice',
+    ]);
+    const nativeId = (await t.f.store.nowPlaying.list()).find((r) =>
+      r.state === 'starting'
+    )!.playerId;
+    for (const observer of t.observers) {
+      assertEquals((await t.read(observer)).nowPlaying, before);
+    }
+    for (const login of [a, b, c]) {
+      assert(!JSON.stringify(before).includes(login.body.session.id));
+      assert(!JSON.stringify(before).includes(login.credential));
+    }
+    t.clear();
+    for (
+      const extra of [
+        {},
+        { run: 0 },
+        { sequence: -1 },
+        { positionMs: NaN },
+        { playbackRate: 0 },
+      ]
+    ) {
+      if (Object.keys(extra).length === 0) assertEquals(await send(), false);
+      else {await assertRejects(
+          () => send(extra),
+          Error,
+          'Invalid session playback report',
+        );}
+    }
+    assertEquals(await send({ userId: c.body.user.id, sequence: 1 }), false);
+    assertEquals(await send({ sequence: 1, trackId: 'missing' }), false);
+    assertEquals(await send({ sequence: 1, trackId: t.songs[1].id }), false);
+    await t.drain();
+    assert(
+      t.observers.every((o) =>
+        !o.socket.frames.some((f) => f.events?.nowPlaying)
+      ),
+    );
+    assertEquals((await t.read()).nowPlaying, before);
+    clock += 1000;
+    assertEquals(
+      await send({ run: 2, state: 'paused', positionMs: 200 }),
+      true,
+    );
+    await t.changed();
+    const current = (await t.read()).nowPlaying;
+    const row = current.find((r: { appPlayerId: number }) =>
+      r.appPlayerId === nativeId
+    )!;
+    assertEquals(row.startedAtMs, clock);
+    assertEquals(row.positionMs, 200);
+    t.clear();
+    assertEquals(
+      await send({
+        sequence: 100,
+        state: 'stopped',
+        positionMs: song.durationMs!,
+      }),
+      false,
+    );
+    assertEquals(await send({ sequence: 101, state: 'starting' }), false);
+    assertEquals((await t.read()).nowPlaying, current);
+    assertEquals(
+      await send({ run: 2, sequence: 2, state: 'paused', positionMs: 250 }),
+      true,
+    );
+    assertEquals(await send({ run: 2, sequence: 1, state: 'playing' }), false);
+    assertEquals(
+      (await t.read()).nowPlaying.find((r: { appPlayerId: number }) =>
+        r.appPlayerId === nativeId
+      ).positionMs,
+      250,
+    );
+    assertEquals(
+      await Promise.all([
+        send({
+          run: 2,
+          sequence: 3,
+          state: 'stopped',
+          positionMs: song.durationMs!,
+        }),
+        send({
+          run: 2,
+          sequence: 3,
+          state: 'stopped',
+          positionMs: song.durationMs!,
+        }),
+      ]),
+      [true, false],
+    );
+    await t.changed();
+    for (const observer of t.observers) {
+      assertEquals((await t.read(observer)).nowPlaying.length, 3);
+    }
+    assertEquals(await send({ run: 2, sequence: 4, state: 'playing' }), false);
+    assertEquals(
+      await rawSql(t.f.store).all('SELECT source, duration_ms FROM listens'),
+      [
+        { source: 'melofon', duration_ms: song.durationMs },
+      ],
+    );
+    assertEquals(t.playback.playerView(), engine);
+    const afterQueue = await t.f.get('/api/v1/me/queue', a.credential);
+    assertEquals(afterQueue.status, 200);
+    assertEquals(await afterQueue.json(), savedQueue);
+    assertEquals(t.ownSocket.frames, []);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('household now-playing: logout revoke-all password and observed idle end native reports without listens', async () => {
+  const t = await setup();
+  try {
+    const login = () => t.f.login('bearer', 'admin', 'password-admin', 'Phone');
+    let a = await login();
+    const seed = (signed: typeof a, run = 1) =>
+      t.playback.reportSessionPlayback({
+        userId: signed.body.user.id,
+        sessionId: signed.body.session.id,
+        run,
+        sequence: 0,
+        trackId: t.songs[0].id,
+        positionMs: 0,
+        state: 'paused',
+        playbackRate: 1,
+        ignoreScrobble: false,
+      });
+    const ended = async () => {
+      await t.changed();
+      for (const observer of t.observers) {
+        assertEquals((await t.read(observer)).nowPlaying, []);
+      }
+      assertEquals(
+        await rawSql(t.f.store).all('SELECT * FROM now_playing'),
+        [],
+      );
+      assertEquals(await rawSql(t.f.store).all('SELECT * FROM listens'), []);
+      t.clear();
+    };
+    assertEquals(await seed(a), true);
+    await t.changed();
+    t.clear();
+    const revoked = await t.f.json(
+      `/api/v1/me/sessions/${a.body.session.id}`,
+      'DELETE',
+      undefined,
+      t.observers[2].credential,
+    );
+    assertEquals(revoked.status, 200);
+    await revoked.body?.cancel();
+    await ended();
+    assertEquals(await seed(a, 2), false);
+    assertEquals(await t.playback.expireReports(), false);
+    a = await login();
+    const b = await login();
+    await seed(a);
+    await seed(b);
+    await t.changed();
+    t.clear();
+    const all = await t.f.json(
+      '/api/v1/me/sessions',
+      'DELETE',
+      undefined,
+      a.credential,
+    );
+    assertEquals(all.status, 200);
+    await all.body?.cancel();
+    // The admin observer was also signed out; ordinary household observers remain.
+    await waitFor(() =>
+      t.observers[2].socket.ws.readyState === WebSocket.CLOSED
+    );
+    t.observers.pop();
+    await ended();
+    assertEquals(await seed(a, 2), false);
+    assertEquals(await seed(b, 2), false);
+    a = await login();
+    await seed(a);
+    await t.changed();
+    t.clear();
+    t.f.advance(86400);
+    // Keep observers active while only the reporting device goes idle.
+    for (const observer of t.observers) await t.read(observer);
+    await t.f.state.set('auth.sessionIdleDays', '0.001');
+    await error(
+      await t.f.get('/api/v1/me', a.credential),
+      401,
+      'unauthenticated',
+    );
+    await ended();
+    await t.f.state.set('auth.sessionIdleDays', '0');
+    assertEquals(await seed(a, 2), false);
+    a = await login();
+    await seed(a);
+    await t.changed();
+    t.clear();
+    const password = await t.f.json('/api/v1/me/password', 'PUT', {
+      current: 'password-admin',
+      new: 'password-reset',
+    }, a.credential);
+    assertEquals(password.status, 200);
+    await password.body?.cancel();
+    await ended();
+    assertEquals(await seed(a, 2), false);
+    assertEquals(t.ownSocket.frames, []);
   } finally {
     await t.close();
   }

@@ -15,7 +15,12 @@
 //   queueView()       the engine queue (real queue-local ids)
 //   nowPlayingView()  all B sessions + the engine's current when play/pause
 import type { Library, SongRow } from './library.ts';
-import type { NowPlaying, PlaybackReport } from './nowplaying.ts';
+import type {
+  NowPlaying,
+  PlaybackReport,
+  SessionPlaybackReport,
+} from './nowplaying.ts';
+import type { Sessions } from './sessions.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
@@ -76,6 +81,7 @@ export interface Playback {
   reportPlaying(report: ReportPlaying): Promise<void>;
   reportStopped(opts: { streamId: string }): Promise<void>;
   reportPlayback(report: PlaybackReport): Promise<boolean>;
+  reportSessionPlayback(report: SessionPlaybackReport): Promise<boolean>;
 
   /** Mutating commands take an optional provenance source (plan
    * command-provenance): hats pass the request's peer/user-agent; omitted
@@ -143,6 +149,7 @@ export function createPlayback(deps: {
   cfg: { user?: string };
   outputs?: Pick<Outputs, 'list'>;
   notify?: Notify;
+  sessions?: Pick<Sessions, 'onSessionsEnded'>;
   /** Restart transparency (plan restart-transparency): when present, every
    * state change flushes the engine snapshot and queue, and a 1 Hz tick
    * keeps position_ms current while playing. */
@@ -241,6 +248,7 @@ export function createPlayback(deps: {
     if (player.status().state === 'play') flushState();
   }, 1000);
   let closed = false;
+  let closing = false;
   let expiryStarted = false;
   let expiryTimer: ReturnType<typeof setTimeout> | undefined;
   let expiryTask: Promise<void> | undefined;
@@ -259,6 +267,15 @@ export function createPlayback(deps: {
       }
     })();
   };
+  // One subscription per aggregate owner. Queue after any in-flight sweep so
+  // a revoke cannot be missed by a sweep whose transaction preceded it.
+  let sessionCleanup = Promise.resolve();
+  const unsubscribeSessions = deps.sessions?.onSessionsEnded(() => {
+    sessionCleanup = sessionCleanup.then(async () => {
+      await expiryWork;
+      await expireReports();
+    }).catch((error) => log.event('playback_expiry_failed', { error }));
+  });
   return {
     expireReports,
     async startReportExpiry(state) {
@@ -276,13 +293,13 @@ export function createPlayback(deps: {
           intervalMs =
             (await state.getTyped('playback.sessionSweepSeconds') as number) *
             1000;
-          if (!closed) await expireReports();
+          if (!closing) await expireReports();
         } catch (error) {
           log.event('playback_expiry_failed', { error });
         } finally {
           // Self-scheduling bounds work even if a store call takes longer than
           // the cadence. Read live policy again each cycle; no per-hat timer.
-          if (!closed) {
+          if (!closing) {
             expiryTimer = setTimeout(() => {
               expiryTask = cycle();
             }, intervalMs);
@@ -316,6 +333,14 @@ export function createPlayback(deps: {
       await nowPlaying.report(report, song.durationMs);
       invalidateNowPlaying();
       return true;
+    },
+
+    async reportSessionPlayback(report) {
+      const song = await library.getSong(report.trackId);
+      if (!song) return false;
+      const changed = await nowPlaying.reportSession(report, song.durationMs);
+      if (changed) invalidateNowPlaying();
+      return changed;
     },
 
     play(source) {
@@ -524,10 +549,13 @@ export function createPlayback(deps: {
     },
 
     async close() {
-      closed = true;
+      closing = true;
+      unsubscribeSessions?.();
+      unsubscribeOutputs?.();
       clearTimeout(expiryTimer);
       if (tick !== null) clearInterval(tick);
-      unsubscribeOutputs?.();
+      await sessionCleanup;
+      closed = true;
       await expiryTask;
       await expiryWork;
     },

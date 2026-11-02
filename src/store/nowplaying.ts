@@ -29,11 +29,55 @@ export interface SessionUpdate {
   restart: boolean;
 }
 
+export interface SessionReference {
+  userId: string;
+  sessionId: string;
+}
+
+export interface NativeReport extends SessionReference {
+  /** Increasing per login, including repeat plays of the same song. */
+  run: number;
+  /** Increasing within a run; retries reuse their sequence. */
+  sequence: number;
+  trackId: string;
+  positionMs: number;
+  state: NowPlayingRow['state'] | 'stopped';
+  playbackRate: number;
+}
+
 /** Existing sessions gain real, retained player identities on upgrade. */
 export async function upgradeNowPlaying(q: Queries): Promise<void> {
-  await q.run(`INSERT INTO client_players (user_id, client)
-    SELECT user_id, client FROM now_playing ORDER BY user_id, client
-    ON CONFLICT (user_id, client) DO NOTHING`);
+  await q.run('BEGIN TRANSACTION');
+  try {
+    // Move keys as a set: a legacy label may itself start with our prefix.
+    for (const table of ['client_players', 'now_playing']) {
+      if (
+        !(await q.all(`SELECT 1 FROM ${table} WHERE protocol IS NULL LIMIT 1`))
+          .length
+      ) continue;
+      await q.run(
+        `CREATE TEMP TABLE old_report_keys AS SELECT * FROM ${table} WHERE protocol IS NULL`,
+      );
+      await q.run(`DELETE FROM ${table} WHERE protocol IS NULL`);
+      await q.run(
+        `UPDATE old_report_keys SET ${
+          table === 'client_players' ? 'display_name = client,' : ''
+        }
+        client = 'opensubsonic:' || client, protocol = 'opensubsonic'`,
+      );
+      await q.run(`INSERT INTO ${table} SELECT * FROM old_report_keys`);
+      await q.run('DROP TABLE old_report_keys');
+    }
+    await q.run(
+      `INSERT INTO client_players (user_id, client, protocol, display_name)
+      SELECT user_id, client, protocol, substring(client, 14) FROM now_playing
+      ORDER BY user_id, client ON CONFLICT (user_id, client) DO NOTHING`,
+    );
+    await q.run('COMMIT');
+  } catch (error) {
+    await q.run('ROLLBACK');
+    throw error;
+  }
 }
 
 function expiredKeys(expiry: SessionExpiry): string {
@@ -41,7 +85,9 @@ function expiredKeys(expiry: SessionExpiry): string {
   // and catalog duration, so a restart cannot give an old session a new lease.
   return `SELECT n.user_id, n.client FROM now_playing n
     LEFT JOIN files f ON f.id = n.track_id
-    WHERE CASE WHEN n.state = 'paused' THEN
+    LEFT JOIN client_players p ON p.user_id = n.user_id AND p.client = n.client
+    LEFT JOIN sessions s ON s.id = p.auth_session_id AND s.user_id = n.user_id
+    WHERE (n.protocol = 'melofon' AND s.id IS NULL) OR CASE WHEN n.state = 'paused' THEN
       epoch_ms(coalesce(n.reported_at, n.started_at)) <= ${expiry.pausedBeforeMs}
     ELSE epoch_ms(coalesce(n.reported_at, n.started_at)) +
       greatest(0, coalesce(n.duration_ms, f.duration_ms, 0) - coalesce(n.position_ms, 0)) /
@@ -51,6 +97,7 @@ function expiredKeys(expiry: SessionExpiry): string {
 async function rows(
   q: Queries,
   expiry?: SessionExpiry,
+  protocol?: string,
 ): Promise<NowPlayingRow[]> {
   const result = await q.all<{
     username: string;
@@ -64,17 +111,20 @@ async function rows(
     state: NowPlayingRow['state'];
     playback_rate: number;
     player_id: number;
-  }>(`SELECT u.name AS username, n.client, n.track_id, n.stream_id,
+  }>(`SELECT u.name AS username,
+    CASE WHEN p.protocol = 'melofon' THEN s.device_name ELSE p.display_name END AS client,
+    n.track_id, n.stream_id,
     n.position_ms, epoch_ms(n.started_at)::BIGINT AS started_ms,
     epoch_ms(coalesce(n.reported_at, n.started_at))::BIGINT AS reported_ms,
     coalesce(n.duration_ms, f.duration_ms) AS duration_ms,
     n.state, n.playback_rate, p.player_id
     FROM now_playing n JOIN users u ON u.id = n.user_id
     JOIN client_players p ON p.user_id = n.user_id AND p.client = n.client
+    LEFT JOIN sessions s ON s.id = p.auth_session_id AND s.user_id = n.user_id
     LEFT JOIN files f ON f.id = n.track_id
-    ${
-    expiry ? `WHERE (n.user_id, n.client) NOT IN (${expiredKeys(expiry)})` : ''
-  }
+    WHERE (p.protocol <> 'melofon' OR s.id IS NOT NULL)
+    ${protocol ? `AND p.protocol = ${esc(protocol)}` : ''}
+    ${expiry ? `AND (n.user_id, n.client) NOT IN (${expiredKeys(expiry)})` : ''}
     ORDER BY coalesce(n.reported_at, n.started_at) DESC, p.player_id DESC`);
   return result.map((r) => ({
     username: r.username,
@@ -91,6 +141,33 @@ async function rows(
   }));
 }
 
+async function writeRow(
+  q: Queries,
+  userId: string,
+  client: string,
+  trackId: string,
+  streamId: string,
+  positionMs: number | undefined,
+  update: SessionUpdate,
+  protocol: string,
+): Promise<void> {
+  const at = `epoch_ms(${Math.trunc(update.reportedAtMs)}::BIGINT)`;
+  await q.run(`INSERT INTO now_playing
+    (user_id, client, track_id, stream_id, position_ms, started_at,
+     reported_at, state, playback_rate, duration_ms, protocol)
+    VALUES (${esc(userId)}, ${esc(client)}, ${esc(trackId)}, ${esc(streamId)},
+      ${positionMs === undefined ? 'NULL' : Math.trunc(positionMs)}, ${at},
+      ${at}, ${esc(update.state)}, ${update.playbackRate},
+      ${update.durationMs ?? 'NULL'}, ${esc(protocol)})
+    ON CONFLICT (user_id, client) DO UPDATE SET
+      started_at = CASE WHEN now_playing.track_id <> excluded.track_id OR
+        ${update.restart} THEN excluded.started_at ELSE now_playing.started_at END,
+      track_id = excluded.track_id, stream_id = excluded.stream_id,
+      position_ms = excluded.position_ms, reported_at = excluded.reported_at,
+      state = excluded.state, playback_rate = excluded.playback_rate,
+      duration_ms = excluded.duration_ms`);
+}
+
 export function createNowPlayingStore(engine: Engine) {
   return {
     set(
@@ -103,49 +180,41 @@ export function createNowPlayingStore(engine: Engine) {
       expiry?: SessionExpiry,
     ): Promise<void> {
       return atomic(engine, async (q) => {
-        const userId = esc(await requireUserId(q, username));
+        const userId = await requireUserId(q, username);
         // An offline report may replace an expired row before the next sweep.
         // It starts a new clock without deleting other rows behind the event owner.
         const restart = (update?.restart ?? true) || (expiry !== undefined &&
-          !(await rows(q, expiry)).some((r) =>
+          !(await rows(q, expiry, 'opensubsonic')).some((r) =>
             r.username === username && r.client === client &&
             r.trackId === trackId
           ));
-        await q.run(`INSERT INTO client_players (user_id, client)
-          VALUES (${userId}, ${
-          esc(client)
-        }) ON CONFLICT (user_id, client) DO NOTHING`);
-        const at = update
-          ? `epoch_ms(${Math.trunc(update.reportedAtMs)}::BIGINT)`
-          : 'now()';
-        await q.run(`INSERT INTO now_playing
-          (user_id, client, track_id, stream_id, position_ms, started_at,
-           reported_at, state, playback_rate, duration_ms)
-          VALUES (${userId}, ${esc(client)}, ${esc(trackId)}, ${esc(streamId)},
-            ${
-          positionMs === undefined ? 'NULL' : Math.trunc(positionMs)
-        }, ${at},
-            ${at}, ${esc(update?.state ?? 'playing')}, ${
-          update?.playbackRate ?? 1
-        },
-            ${update?.durationMs ?? 'NULL'})
-          ON CONFLICT (user_id, client) DO UPDATE SET
-            started_at = CASE WHEN now_playing.track_id <> excluded.track_id OR
-              ${restart} THEN excluded.started_at ELSE now_playing.started_at END,
-            track_id = excluded.track_id, stream_id = excluded.stream_id,
-            position_ms = excluded.position_ms, reported_at = excluded.reported_at,
-            state = excluded.state, playback_rate = excluded.playback_rate,
-            duration_ms = excluded.duration_ms`);
+        const key = `opensubsonic:${client}`;
+        await q.run(
+          `INSERT INTO client_players (user_id, client, protocol, display_name)
+          VALUES (${esc(userId)}, ${esc(key)}, 'opensubsonic', ${esc(client)})
+          ON CONFLICT (user_id, client) DO NOTHING`,
+        );
+        await writeRow(q, userId, key, trackId, streamId, positionMs, {
+          state: update?.state ?? 'playing',
+          playbackRate: update?.playbackRate ?? 1,
+          reportedAtMs: update?.reportedAtMs ?? Date.now(),
+          durationMs: update?.durationMs ?? null,
+          restart,
+        }, 'opensubsonic');
       });
     },
     clearByStreamId(streamId: string): Promise<boolean> {
       return atomic(engine, async (q) => {
         const existing = await q.all(
-          `SELECT 1 FROM now_playing WHERE stream_id = ${esc(streamId)}`,
+          `SELECT 1 FROM now_playing WHERE protocol = 'opensubsonic' AND stream_id = ${
+            esc(streamId)
+          }`,
         );
         if (!existing.length) return false;
         await q.run(
-          `DELETE FROM now_playing WHERE stream_id = ${esc(streamId)}`,
+          `DELETE FROM now_playing WHERE protocol = 'opensubsonic' AND stream_id = ${
+            esc(streamId)
+          }`,
         );
         return true;
       });
@@ -159,7 +228,7 @@ export function createNowPlayingStore(engine: Engine) {
       listen?: ListenAppend,
     ): Promise<NowPlayingRow | null> {
       return atomic(engine, async (q) => {
-        const row = (await rows(q, expiry)).find((r) =>
+        const row = (await rows(q, expiry, 'opensubsonic')).find((r) =>
           r.username === username && r.client === client &&
           r.trackId === trackId
         );
@@ -168,12 +237,91 @@ export function createNowPlayingStore(engine: Engine) {
           `DELETE FROM now_playing WHERE user_id = ${
             esc(await requireUserId(q, username))
           }
-          AND client = ${esc(client)} AND track_id = ${esc(trackId)}`,
+          AND client = ${esc(`opensubsonic:${client}`)} AND track_id = ${
+            esc(trackId)
+          }`,
         );
         if (listen && !(await appendListen(q, username, trackId, listen))) {
           throw new Error('Unknown track for reported finish');
         }
         return row;
+      });
+    },
+    /** Session validity, ordering, finish and listen append share one exclusive transaction. */
+    reportSession(
+      report: NativeReport,
+      update: Omit<SessionUpdate, 'state' | 'restart'>,
+      expiry: SessionExpiry,
+      listen?: ListenAppend,
+    ): Promise<boolean> {
+      return atomic(engine, async (q) => {
+        const session =
+          (await q.all<{ username: string }>(`SELECT u.name AS username
+          FROM sessions s JOIN users u ON u.id = s.user_id
+          WHERE s.id = ${esc(report.sessionId)} AND s.user_id = ${
+            esc(report.userId)
+          }`))[0];
+        if (!session) return false;
+        const key = `melofon:${report.sessionId}`;
+        const where = `user_id = ${esc(report.userId)} AND client = ${
+          esc(key)
+        }`;
+        const prior =
+          (await q.all<{ playback_run: number; report_sequence: number }>(
+            `SELECT playback_run, report_sequence FROM client_players WHERE ${where}`,
+          ))[0];
+        const run = prior?.playback_run === null || !prior
+          ? 0
+          : Number(prior.playback_run);
+        if (
+          report.run < run ||
+          (report.run === run &&
+            report.sequence <= Number(prior.report_sequence))
+        ) return false;
+        const active =
+          (await q.all<{ track_id: string }>(`SELECT track_id FROM now_playing
+          WHERE ${where} AND (user_id, client) NOT IN (${
+            expiredKeys(expiry)
+          })`))[0];
+        // A removed/expired run stays terminal even when its next packet arrives late.
+        if (
+          report.run === run && (!active || active.track_id !== report.trackId)
+        ) return false;
+        if (report.state === 'stopped' && (report.run !== run || !active)) {
+          return false;
+        }
+        await q.run(`INSERT INTO client_players
+          (user_id, client, protocol, auth_session_id, playback_run, report_sequence)
+          VALUES (${esc(report.userId)}, ${esc(key)}, 'melofon', ${
+          esc(report.sessionId)
+        }, ${report.run}, ${report.sequence})
+          ON CONFLICT (user_id, client) DO UPDATE SET
+            playback_run = excluded.playback_run, report_sequence = excluded.report_sequence`);
+        if (report.state === 'stopped') {
+          await q.run(`DELETE FROM now_playing WHERE ${where}`);
+          if (
+            listen &&
+            !await appendListen(q, session.username, report.trackId, listen)
+          ) {
+            throw new Error('Unknown track for reported finish');
+          }
+        } else {
+          await writeRow(
+            q,
+            report.userId,
+            key,
+            report.trackId,
+            crypto.randomUUID(),
+            report.positionMs,
+            {
+              ...update,
+              state: report.state,
+              restart: report.run !== run,
+            },
+            'melofon',
+          );
+        }
+        return true;
       });
     },
     list(expiry?: SessionExpiry): Promise<NowPlayingRow[]> {

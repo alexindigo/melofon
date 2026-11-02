@@ -285,6 +285,14 @@ ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS state VARCHAR DEFAULT 'playing'
 ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS playback_rate DOUBLE DEFAULT 1;
 ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS reported_at TIMESTAMPTZ;
 ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS duration_ms BIGINT;
+-- Native reporting: private protocol keys, independent public player numbers.
+-- NULL marks pre-namespace rows for the idempotent upgrade in nowplaying.ts.
+ALTER TABLE now_playing ADD COLUMN IF NOT EXISTS protocol VARCHAR;
+ALTER TABLE client_players ADD COLUMN IF NOT EXISTS protocol VARCHAR;
+ALTER TABLE client_players ADD COLUMN IF NOT EXISTS display_name VARCHAR;
+ALTER TABLE client_players ADD COLUMN IF NOT EXISTS auth_session_id VARCHAR;
+ALTER TABLE client_players ADD COLUMN IF NOT EXISTS playback_run BIGINT;
+ALTER TABLE client_players ADD COLUMN IF NOT EXISTS report_sequence BIGINT;
 -- M6: internal state (app.state) — operator-owned live config. The /_/config
 -- endpoints are its face, and the Settings UI (M5) will be a form on them.
 CREATE TABLE IF NOT EXISTS state (
