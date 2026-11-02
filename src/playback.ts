@@ -128,7 +128,7 @@ export interface Playback {
   nowPlayingView(): Promise<NowPlayingViewRow[]>;
   /** The last recorded engine mutation (null before the first). */
   lastCommand(): LastCommand | null;
-  /** Stop the position-persistence tick (tests; main.ts never closes). */
+  /** Stop the position-persistence tick and shared-view subscriptions. */
   close(): void;
 }
 
@@ -147,12 +147,43 @@ export function createPlayback(deps: {
 }): Playback {
   const { player, nowPlaying, library, outputs, notify, persistence } = deps;
   const log = deps.log ?? scopedLog('playback');
-  const emit = (types: string[]) => notify?.emit(types, undefined, 'all');
+  const selectedSpeakers = () =>
+    (outputs?.list() ?? []).filter((o) => o.selected).map(
+      ({ id, name }) => ({ id, name }),
+    );
+  const hasServerRow = () => player.status().current !== null;
+  const invalidateNowPlaying = () =>
+    notify?.emit(['nowPlaying'], undefined, 'all');
 
   // Provenance (plan command-provenance): every mutation is recorded and
   // logged with its source. Unsourced callers are internal drivers.
   let last: LastCommand | null = null;
   let commander: string | null = null;
+  let serverPresent = hasServerRow();
+  let announcedCommander: string | null = commander;
+  // Engine events keep their existing vocabulary. The aggregate additionally
+  // changes on clock/current transitions and on external attribution changes,
+  // including commands (volume/options/queue edits) without a player event.
+  const emit = (types: string[]) => {
+    const present = hasServerRow();
+    const changed = (types.includes('player') && (present || serverPresent)) ||
+      (present && commander !== announcedCommander);
+    serverPresent = present;
+    announcedCommander = commander;
+    notify?.emit(changed ? [...types, 'nowPlaying'] : types, undefined, 'all');
+  };
+  // Playback owns the aggregate dependency on selected target names/ids, not
+  // hats or individual output call sites. Ignore volume, admission and other
+  // output facts which do not appear in this view. Drop the subscription on close.
+  let speakers = JSON.stringify(selectedSpeakers());
+  const unsubscribeOutputs = outputs &&
+    notify?.subscribe((types, _keys, audience) => {
+      if (audience !== 'all' || !types.includes('outputs')) return;
+      const next = JSON.stringify(selectedSpeakers());
+      const changed = speakers !== next;
+      speakers = next;
+      if (changed && hasServerRow()) invalidateNowPlaying();
+    });
   const record = (
     kind: string,
     detail: string | undefined,
@@ -216,19 +247,19 @@ export function createPlayback(deps: {
         report.streamId,
         report.positionMs,
       );
-      emit(['player']);
+      invalidateNowPlaying();
     },
 
     async reportStopped({ streamId }) {
       // Clears only when this streamId is still the session's current one.
-      if (await nowPlaying.clearByStreamId(streamId)) emit(['player']);
+      if (await nowPlaying.clearByStreamId(streamId)) invalidateNowPlaying();
     },
 
     async reportPlayback(report) {
       const song = await library.getSong(report.trackId);
       if (!song) return false;
       await nowPlaying.report(report, song.durationMs);
-      emit(['player']);
+      invalidateNowPlaying();
       return true;
     },
 
@@ -393,6 +424,8 @@ export function createPlayback(deps: {
         { kind: 'internal', via: 'restore' },
         snapshot.state,
       );
+      serverPresent = hasServerRow();
+      announcedCommander = commander;
     },
 
     playerView: () => player.status(),
@@ -407,9 +440,7 @@ export function createPlayback(deps: {
           kind: 'server',
           label: 'melofon',
           commander,
-          speakers: (outputs?.list() ?? []).filter((o) => o.selected).map(
-            ({ id, name }) => ({ id, name }),
-          ),
+          speakers: selectedSpeakers(),
           song: status.current.song,
           positionMs: status.itemProgressMs,
           startedAtMs: status.clock.startedAtMs,
@@ -439,6 +470,7 @@ export function createPlayback(deps: {
 
     close() {
       if (tick !== null) clearInterval(tick);
+      unsubscribeOutputs?.();
     },
   };
 }

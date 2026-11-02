@@ -77,6 +77,9 @@ export interface HatContext {
         ) => void,
       ): () => void;
     };
+    playback: {
+      nowPlayingView(): Promise<NowPlayingViewRow[]>;
+    };
     libraries: {
       stats(id: string): Promise<unknown>;
       list(): Promise<Library[]>;
@@ -291,6 +294,25 @@ export interface SavedQueue {
   changedAtMs: number;
   changedBy: string | null;
 }
+
+export type NowPlayingViewRow =
+  & {
+    song: SongRow;
+    positionMs: number | null;
+    startedAtMs: number | null;
+    reportedAtMs: number;
+    state: 'starting' | 'playing' | 'paused';
+    playbackRate: number;
+  }
+  & (
+    | { kind: 'app'; username: string; client: string; appPlayerId: number }
+    | {
+      kind: 'server';
+      label: string;
+      commander: string | null;
+      speakers: { id: string; name: string }[];
+    }
+  );
 
 export interface Setting {
   key: string;

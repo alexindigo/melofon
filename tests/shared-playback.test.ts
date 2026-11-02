@@ -1,5 +1,5 @@
 // tests/shared-playback.test.ts — two planes, one playback core. Plane B
-// (client reports) shows on OpenSubsonic getNowPlaying and emits `player` —
+// (client reports) shows on OpenSubsonic getNowPlaying and emits `nowPlaying` —
 // but OwnTone /api/player stays ENGINE (stop/empty when idle; no mirrored
 // lie). reportStopped clears a session only when its streamId is still
 // current. Plane A (the engine) shows on /rest too, and HA's album select
@@ -145,7 +145,7 @@ Deno.test('client report: getNowPlaying has it; OwnTone player stays engine; not
       `/rest/scrobble?${NARJO}&f=json&id=${songs[0].id}&submission=false`,
     );
     assertEquals(scrobble.status, 200);
-    assertEquals(events, [['player']]);
+    assertEquals(events, [['nowPlaying']]);
 
     const entries = await npEntry(onDefault);
     assertEquals(entries.length, 1);
@@ -163,7 +163,7 @@ Deno.test('client report: getNowPlaying has it; OwnTone player stays engine; not
       onDefault,
       `/rest/scrobble?${NARJO}&f=json&id=${songs[1].id}&submission=false`,
     );
-    assertEquals(events, [['player'], ['player']]);
+    assertEquals(events, [['nowPlaying'], ['nowPlaying']]);
     const entries2 = await npEntry(onDefault);
     assertEquals(entries2.length, 1);
     assertEquals(entries2[0].title, songs[1].title);
@@ -227,7 +227,7 @@ Deno.test('reportStopped clears only the current streamId', async () => {
     // Current completion: session gone, one emit.
     await playback.reportStopped({ streamId: 'stream-2' });
     assertEquals((await npEntry(onDefault)).length, 0);
-    assertEquals(events, [['player']]);
+    assertEquals(events, [['nowPlaying']]);
   } finally {
     await close();
   }

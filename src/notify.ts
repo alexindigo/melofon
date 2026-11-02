@@ -26,6 +26,7 @@ const bootId = crypto.randomUUID();
 // extras their websocket.c knows: pairing/spotify/lastfm).
 const KNOWN = new Set([
   'player',
+  'nowPlaying',
   'outputs',
   'volume',
   'options',

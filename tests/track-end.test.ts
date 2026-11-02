@@ -92,8 +92,8 @@ Deno.test('repeat off: advances through the queue, stops past the last (current 
 
     // Emissions: queueAdd (queue+player), advance (player), stop (player).
     assertEquals(events.length, 3);
-    assertEquals(events[1], ['player']);
-    assertEquals(events[2], ['player']);
+    assertEquals(events[1], ['player', 'nowPlaying']);
+    assertEquals(events[2], ['player', 'nowPlaying']);
   } finally {
     await close();
   }
@@ -156,7 +156,7 @@ Deno.test('consume drops the finished item; queue+player emit; empty queue stops
     assertEquals(queue.items[0].song.id, b.id);
     assert(queue.version > versionBefore);
     assertEquals(player.status().current?.song.id, b.id);
-    assertEquals(events[events.length - 1], ['queue', 'player']);
+    assertEquals(events[events.length - 1], ['queue', 'player', 'nowPlaying']);
 
     await tick();
     playback.advanceEnded();

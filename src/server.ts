@@ -376,7 +376,7 @@ export async function startServer(options: {
   // action) and any connected hats pick up the restored state.
   if (restoredEngine) {
     notify.emit(
-      ['player', 'queue', 'outputs', 'volume', 'options'],
+      ['player', 'queue', 'outputs', 'volume', 'options', 'nowPlaying'],
       undefined,
       'all',
     );

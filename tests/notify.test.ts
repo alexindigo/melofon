@@ -139,13 +139,13 @@ Deno.test('playback commands emit: engine → player/options/volume/queue', () =
   playback.previous();
   playback.stop();
   assertEquals(events, [
-    ['player'],
-    ['player'],
-    ['player'],
-    ['player'],
-    ['player'],
-    ['player'],
-    ['player'],
+    ['player', 'nowPlaying'],
+    ['player', 'nowPlaying'],
+    ['player', 'nowPlaying'],
+    ['player', 'nowPlaying'],
+    ['player', 'nowPlaying'],
+    ['player', 'nowPlaying'],
+    ['player', 'nowPlaying'],
   ]);
 
   events.length = 0;
@@ -162,12 +162,12 @@ Deno.test('playback commands emit: engine → player/options/volume/queue', () =
 
   events.length = 0;
   playback.seek({ positionMs: 1000 });
-  assertEquals(events, [['player']]);
+  assertEquals(events, [['player', 'nowPlaying']]);
 
   // queueClear stops the engine too — both reads changed.
   events.length = 0;
   playback.queueClear();
-  assertEquals(events, [['queue', 'player']]);
+  assertEquals(events, [['queue', 'player', 'nowPlaying']]);
 });
 
 Deno.test('outputs emit: outputs on every mutation, volume along when per-output volume changes', () => {
@@ -195,6 +195,74 @@ Deno.test('outputs emit: outputs on every mutation, volume along when per-output
 
   outputs.unregister('0');
   assertEquals(events, [['outputs']]);
+});
+
+Deno.test('household invalidations follow selected speaker facts and commander independently; close unsubscribes', () => {
+  const { notify } = recorder();
+  const outputs = createOutputs({ notify });
+  const playback = createPlayback({
+    player: createPlayer(),
+    outputs,
+    nowPlaying: {
+      set: () => Promise.resolve(),
+      report: () => Promise.resolve(),
+      clearByStreamId: () => Promise.resolve(false),
+      list: () => Promise.resolve([]),
+    },
+    library: {} as never,
+    cfg: {},
+    notify,
+  });
+  const changes: { keys: unknown; audience: NotifyAudience }[] = [];
+  notify.subscribe((types, keys, audience) => {
+    if (types.includes('nowPlaying')) changes.push({ keys, audience });
+  });
+  const check = (action: () => void, count: number) => {
+    changes.length = 0;
+    action();
+    assertEquals(
+      changes,
+      Array.from({ length: count }, () => ({
+        keys: undefined,
+        audience: 'all',
+      })),
+    );
+  };
+  try {
+    check(() => outputs.register(SPEAKER), 0); // No server row while stopped.
+    check(() => playback.queueAdd([song()], { play: true }), 1);
+    check(() => outputs.update('0', { volume: 42, needsAuthKey: true }), 0);
+    check(() => outputs.register({ ...SPEAKER, name: 'Renamed' }), 1);
+    check(() => outputs.register({ ...SPEAKER, name: 'Renamed' }), 0);
+    check(() => outputs.update('0', { selected: false }), 1);
+    check(() => outputs.update('0', { selected: false }), 0);
+    check(() => outputs.toggle('0'), 1);
+    check(() => outputs.setEnabled([]), 1);
+    check(() => outputs.setEnabled(['0']), 1);
+    check(() => outputs.unregister('0'), 1);
+    check(() => outputs.unregister('0'), 0);
+    check(() => outputs.setEnabled(['missing']), 0);
+    for (
+      const action of [
+        () =>
+          playback.setVolume({ volume: 42 }, { kind: 'http', user: 'alice' }),
+        () => playback.setShuffle(true, { kind: 'http', user: 'bob' }),
+        () => playback.setConsume(true, { kind: 'http', user: 'alice' }),
+        () => playback.setRepeat('all', { kind: 'http', user: 'bob' }),
+        () => playback.queueAdd([], {}, { kind: 'http', user: 'alice' }),
+      ]
+    ) check(action, 1);
+    check(() => playback.setVolume({ volume: 40 }), 0); // Internal retains attribution.
+    check(() => playback.setVolume({ volume: 41 }, { kind: 'http' }), 1);
+    check(() => playback.playerView(), 0); // Reading/extrapolation emits nothing.
+    check(() => playback.stop(), 1);
+    check(() => outputs.register(SPEAKER), 0);
+    check(() => playback.play(), 1);
+    playback.close();
+    check(() => outputs.toggle('0'), 0);
+  } finally {
+    playback.close();
+  }
 });
 
 Deno.test('player/outputs without a hub: mutations work, nothing throws', () => {

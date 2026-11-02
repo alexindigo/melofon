@@ -433,7 +433,7 @@ Deno.test('events: household queue, player and speaker changes reach cookie/Bear
       await waitFor(() => socket.frames.some((frame) => frame.events?.queue));
       assertEquals(socket.frames.shift(), {
         type: 'changed',
-        events: { queue: [], player: [] },
+        events: { queue: [], player: [], nowPlaying: [] },
       });
     }
     outputs.register({

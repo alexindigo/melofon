@@ -194,7 +194,7 @@ Deno.test('getNowPlaying renders entries as XML', async () => {
   }
 });
 
-Deno.test('playback.reportPlaying emits player; a failed report emits nothing', async () => {
+Deno.test('playback.reportPlaying emits nowPlaying; a failed report emits nothing', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-np-emit-' });
   const store = await openStore(dir);
   const db = store;
@@ -225,7 +225,7 @@ Deno.test('playback.reportPlaying emits player; a failed report emits nothing', 
       trackId: 'some-track-id',
       streamId: 'stream-1',
     });
-    assertEquals(events, [['player']]);
+    assertEquals(events, [['nowPlaying']]);
 
     // A failed report (unknown user) emits nothing.
     await playback.reportPlaying({
@@ -234,7 +234,7 @@ Deno.test('playback.reportPlaying emits player; a failed report emits nothing', 
       trackId: 'some-track-id',
       streamId: 'stream-2',
     }).catch(() => {});
-    assertEquals(events, [['player']]);
+    assertEquals(events, [['nowPlaying']]);
   } finally {
     await db.close();
     await Deno.remove(dir, { recursive: true });

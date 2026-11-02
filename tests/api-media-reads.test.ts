@@ -158,7 +158,7 @@ for (const reported of [false, true]) {
         });
         await t.barrier();
         assert(
-          t.frames.some((frame) => frame.events?.player),
+          t.frames.some((frame) => frame.events?.nowPlaying),
           'explicit report reaches native observer',
         );
       }
@@ -300,7 +300,7 @@ for (const reported of [false, true]) {
       // and the core report path; no synthetic emit proves that feature.
       await t.call('scrobble', { id: t.song.id, submission: 'false' });
       await t.barrier();
-      assert(t.frames.some((frame) => frame.events?.player));
+      assert(t.frames.some((frame) => frame.events?.nowPlaying));
       assertEquals(
         (await t.call('getNowPlaying')).nowPlaying.entry[0].state,
         'playing',
