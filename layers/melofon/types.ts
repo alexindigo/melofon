@@ -105,6 +105,12 @@ export interface HatContext {
       ): Promise<{ rows: PlaylistRow[]; total: number } | null>;
     };
     reference: {
+      radio(
+        id: string,
+        count: number,
+        username: string,
+        options?: { type?: 'song' | 'album' | 'artist'; folderId?: string },
+      ): Promise<string[] | null>;
       get(
         type: 'artist',
         id: string,

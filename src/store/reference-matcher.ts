@@ -31,6 +31,7 @@ export function createReferenceMatcherStore(engine: Engine) {
       count: number,
       username: string,
       folderId?: string,
+      exclude?: string,
     ): Promise<string[]> {
       if (!Number.isSafeInteger(count) || count < 0) {
         return Promise.reject(new RangeError('Invalid reference count'));
@@ -51,6 +52,7 @@ export function createReferenceMatcherStore(engine: Engine) {
         LEFT JOIN song_plays sp ON sp.track_id = f.id
         WHERE ${present} AND f.artist_id = ${esc(artistId)}
           ${folderId === undefined ? '' : `AND f.library_id = ${esc(folderId)}`}
+          ${exclude === undefined ? '' : `AND f.id <> ${esc(exclude)}`}
         ORDER BY (sp.n IS NOT NULL) DESC, sp.n DESC NULLS LAST,
           sp.latest DESC NULLS LAST, ap.n DESC, f.album_id,
           coalesce(f.disc, 1), coalesce(f.track, 0), f.id LIMIT ${count}`))
@@ -106,14 +108,31 @@ export function createReferenceMatcherStore(engine: Engine) {
         ORDER BY f.id`)
       );
     },
-    genreTracks(seedId: string, count: number): Promise<string[]> {
+    /** Shared presence/library admission, including radio seeds before sampling. */
+    eligibleTracks(ids: string[], folderId?: string): Promise<string[]> {
+      if (!ids.length) return Promise.resolve([]);
+      return engine.exclusive(async (q) =>
+        (await q.all<{ id: string }>(`
+        SELECT f.id FROM files f LEFT JOIN file_identity fi ON fi.id = f.id
+        WHERE ${present} AND f.id IN (${ids.map(esc).join(', ')})
+          ${folderId === undefined ? '' : `AND f.library_id = ${esc(folderId)}`}
+        ORDER BY f.id`)).map((row) => row.id)
+      );
+    },
+    genreTracks(
+      seedId: string,
+      count: number,
+      folderId?: string,
+    ): Promise<string[]> {
       if (!Number.isSafeInteger(count) || count < 0) {
         return Promise.reject(new RangeError('Invalid reference count'));
       }
       return engine.exclusive(async (q) =>
         (await q.all<{ id: string }>(`
         SELECT f.id FROM files f LEFT JOIN file_identity fi ON fi.id = f.id
-        WHERE ${present} AND f.id <> ${esc(seedId)} AND EXISTS (
+        WHERE ${present} AND f.id <> ${esc(seedId)}
+          ${folderId === undefined ? '' : `AND f.library_id = ${esc(folderId)}`}
+          AND EXISTS (
           SELECT 1 FROM files seed LEFT JOIN file_identity si ON si.id = seed.id
           WHERE seed.id = ${esc(seedId)} AND COALESCE(si.present, true)
             AND list_has_any(f.genres, seed.genres))

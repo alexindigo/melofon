@@ -13,6 +13,11 @@ export interface ReferenceProvider {
   plugin: string;
   capability: ReferenceCapability;
 }
+export interface RadioOptions {
+  /** Omit only for legacy callers that resolve song, then album, then artist. */
+  type?: 'song' | 'album' | 'artist';
+  folderId?: string;
+}
 /** Reference policy owns settings and selection; the lookup runner alone owns
  * Workers and persistent job intake. Neither reads nor refreshes await a Worker. */
 export function createReference(options: {
@@ -87,11 +92,13 @@ export function createReference(options: {
     count: number,
     user: string,
     exclude?: string,
+    folderId?: string,
   ) => {
     const similar = await service.similarArtists(
       artistId,
       await setting('radioSimilarArtists'),
       true,
+      folderId,
     );
     const artists = [
       artistId,
@@ -101,7 +108,13 @@ export function createReference(options: {
     const seedWeight = await setting('radioArtistWeight');
     const weights = new Map<string, number>();
     for (const id of new Set(artists)) {
-      const tracks = await service.topTracks(id, topCount, user);
+      const tracks = await service.topTracks(
+        id,
+        topCount,
+        user,
+        folderId,
+        exclude,
+      );
       tracks.forEach((track, index) => {
         if (track === exclude) return;
         const weight = id === artistId
@@ -184,17 +197,26 @@ export function createReference(options: {
       trackId: string,
       count: number,
       user: string,
+      folderId?: string,
     ): Promise<string[]> {
+      validCount(count);
       const values = await service.get('track', trackId, ['track.similar']);
       return values['track.similar']?.length
-        ? matcher.tracks(values['track.similar'], count, user, trackId)
-        : store.referenceMatcher.genreTracks(trackId, count);
+        ? matcher.tracks(
+          values['track.similar'],
+          count,
+          user,
+          trackId,
+          folderId,
+        )
+        : store.referenceMatcher.genreTracks(trackId, count, folderId);
     },
     async topTracks(
       artistId: string,
       count: number,
       user: string,
       folderId?: string,
+      exclude?: string,
     ): Promise<string[]> {
       validCount(count);
       const values = await service.get('artist', artistId, [
@@ -205,7 +227,7 @@ export function createReference(options: {
           values['artist.topTracks'],
           count,
           user,
-          undefined,
+          exclude,
           folderId,
         )
         : store.referenceMatcher.localTopTracks(
@@ -213,6 +235,7 @@ export function createReference(options: {
           count,
           user,
           folderId,
+          exclude,
         );
     },
     artistByName: store.referenceMatcher.artistByName,
@@ -221,33 +244,65 @@ export function createReference(options: {
       seedId: string,
       count: number,
       user: string,
+      options: RadioOptions = {},
     ): Promise<string[] | null> {
       validCount(count);
-      const song = await store.catalog.getSong(seedId);
+      const { type, folderId } = options;
+      const song = type === undefined || type === 'song'
+        ? await store.catalog.getSong(seedId)
+        : null;
       if (song) {
+        if (
+          !(await store.referenceMatcher.eligibleTracks([seedId], folderId))
+            .length
+        ) return null;
         if (!count) return [];
-        const tracks = await service.similarTracks(seedId, count, user);
+        const tracks = await service.similarTracks(
+          seedId,
+          count,
+          user,
+          folderId,
+        );
         if (tracks.length < count && song.artistId) {
-          tracks.push(...await artistMix(song.artistId, count, user, seedId));
+          tracks.push(
+            ...await artistMix(song.artistId, count, user, seedId, folderId),
+          );
         }
         return [...new Set(tracks)].filter((id) => id !== seedId).slice(
           0,
           count,
         );
       }
-      const album = await store.catalog.getAlbum(seedId);
+      const album = type === undefined || type === 'album'
+        ? await store.catalog.getAlbum(seedId)
+        : null;
       if (album) {
+        const eligible = await store.referenceMatcher.eligibleTracks(
+          album.songs.map((s) => s.id),
+          folderId,
+        );
+        if (!eligible.length) return null;
         if (!count) return [];
-        const seeds = shuffle(album.songs.map((s) => s.id))
+        const present = new Set(eligible);
+        const seeds = shuffle(
+          album.songs.filter((s) => present.has(s.id)).map((s) => s.id),
+        )
           .slice(0, await setting('radioAlbumSeeds'));
         const tracks: string[] = [];
         for (const id of seeds) {
-          tracks.push(...await service.similarTracks(id, count, user));
+          tracks.push(
+            ...await service.similarTracks(id, count, user, folderId),
+          );
         }
         return shuffle([...new Set(tracks)]).slice(0, count);
       }
-      const artist = await store.catalog.artistById(seedId);
-      return artist ? count ? artistMix(seedId, count, user) : [] : null;
+      const artist = (type === undefined || type === 'artist') &&
+        (await store.referenceMatcher.artists(folderId)).some((a) =>
+          a.id === seedId
+        );
+      return artist
+        ? count ? artistMix(seedId, count, user, undefined, folderId) : []
+        : null;
     },
     async similarArtists(
       artistId: string,

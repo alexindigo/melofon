@@ -148,6 +148,7 @@ export function createReferenceMatcher(store: Store, state: State) {
             referenceSimilarity(external.title, c.title) >= threshold
           );
         }
+        candidates = candidates.filter((c) => c.id !== exclude);
         const facts = await store.annotations.facts(
           user,
           candidates.map((c) => c.id),
