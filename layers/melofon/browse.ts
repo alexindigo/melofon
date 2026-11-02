@@ -45,6 +45,15 @@ export function browseLibrary(params: URLSearchParams): string | undefined {
   return library ?? undefined;
 }
 
+function naturalOption(params: URLSearchParams): { natural?: boolean } {
+  const raw = params.get('natural');
+  if (raw === null) return {};
+  if (raw !== 'true' && raw !== 'false') {
+    fail(400, 'invalid_field', 'Invalid natural');
+  }
+  return { natural: raw === 'true' };
+}
+
 async function browsePaging(
   params: URLSearchParams,
   context: HatContext,
@@ -90,6 +99,7 @@ export async function searchPageQuery(
     'albumLimit',
     'songOffset',
     'songLimit',
+    'natural',
   ]);
   const { folderId, ignoredArticles, articleRevision, ...artists } =
     await browsePaging(
@@ -104,6 +114,7 @@ export async function searchPageQuery(
     folderId,
     ignoredArticles,
     articleRevision,
+    ...naturalOption(params),
     artists,
     albums: { offset: albumPage.offset, limit: albumPage.limit },
     songs: { offset: songPage.offset, limit: songPage.limit },
@@ -143,11 +154,17 @@ export async function namePageQuery(
   request: HatRequest,
   context: HatContext,
 ): Promise<ArtistPageOptions> {
-  const params = browseQuery(request, ['library', 'offset', 'limit', 'sort']);
+  const params = browseQuery(request, [
+    'library',
+    'offset',
+    'limit',
+    'sort',
+    'natural',
+  ]);
   if ((params.get('sort') ?? 'name') !== 'name') {
     fail(400, 'invalid_field', 'Invalid sort');
   }
-  return await browsePaging(params, context);
+  return { ...await browsePaging(params, context), ...naturalOption(params) };
 }
 
 export async function playlistPageQuery(
@@ -193,6 +210,7 @@ export async function browsePageQuery(
     'seed',
     'fromYear',
     'toYear',
+    'natural',
   ]);
   const sort = params.get('sort') ?? 'name';
   const personal = collection === 'albums' && personalAlbumSort(sort);
@@ -226,6 +244,7 @@ export async function browsePageQuery(
     ...(personal ? { username: context.state.user.username } : {}),
     seed,
     ...await browsePaging(params, context),
+    ...naturalOption(params),
     genre,
     fromYear,
     toYear,

@@ -6,7 +6,11 @@ export function sortKeySql(
   column: string,
   articles?: string[],
   tag?: string,
+  natural = false,
 ): string {
+  if (natural) {
+    return naturalKeySql(sortKeySql(column, articles ?? [], tag));
+  }
   if (tag !== undefined) {
     return `CASE WHEN nullif(trim(${tag}), '') IS NOT NULL THEN ${
       sortKeySql(tag, articles === undefined ? undefined : [])
@@ -23,6 +27,21 @@ export function sortKeySql(
     ? folded
     : `CASE ${branches.join(' ')} ELSE ${folded} END`;
   return `lower(trim(${stripped}))`;
+}
+
+/** Locale-independent lexicographic token list, compared by DuckDB before LIMIT.
+ * ASCII digit runs sort before text tokens. Numbers compare by significant
+ * digit count then digits, never a bounded numeric cast or a padded string.
+ * Leading zeros are insignificant; callers append the entity identity for ties.
+ * Text must already have passed through the shared folding/article/tag policy.
+ * NULL stays NULL, the empty string is an empty list, and punctuation/non-ASCII
+ * digits are ordinary text (no signed-number or decimal interpretation).
+ */
+export function naturalKeySql(text: string): string {
+  return `list_transform(regexp_extract_all(${text}, '[0-9]+|[^0-9]+'),
+    token -> CASE WHEN regexp_full_match(token, '[0-9]+')
+      THEN struct_pack(kind := 0, digits := length(ltrim(token, '0')), value := ltrim(token, '0'))
+      ELSE struct_pack(kind := 1, digits := 0::BIGINT, value := token) END)`;
 }
 
 // Source membership (musicFolderId) of a catalog id, one owner for every

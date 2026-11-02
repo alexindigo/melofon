@@ -465,3 +465,115 @@ Deno.test('sort tags: existing schema upgrades and the unchanged files gain fact
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test('natural sort: scanned sort tags and missing-name fallbacks compose across core consumers', async () => {
+  const f = await scanFixture();
+  try {
+    for (const role of ['Member', '']) {
+      for (
+        const [name, key] of [['The Zulu 10', 'Étage 2'], [
+          'The Alpha 2',
+          'Etage 10',
+        ], ['The Coda 3', '   ']]
+      ) {
+        await write(`${f.root}/A/${role || 'unknown'}/${name}/${name}.mp3`, {
+          TIT2: role ? name : '',
+          TALB: role ? name : '',
+          TPE1: role,
+          TCON: 'Fixture',
+          TDRC: '2000',
+          TSOT: key,
+          TSOA: key,
+          TSOP: role ? 'The Member 2' : '',
+        });
+      }
+    }
+    const folder = await f.add('A');
+    await f.scan();
+    const library = createLibrary(f.store);
+    const opts = {
+      natural: true,
+      sortTags: true,
+      ignoredArticles: ['The'],
+      folderId: folder.id,
+    };
+    const member = (await library.listArtists())[0];
+    const expected = ['The Coda 3', 'The Zulu 10', 'The Alpha 2'];
+    assertEquals(
+      names(await library.albumsByArtist(member.id, opts)),
+      expected,
+    );
+    assertEquals(
+      (await library.artistAlbumsPage({ kind: 'artist', id: member.id }, {
+        ...opts,
+        offset: 0,
+        limit: 10,
+      })).rows.map((r) => r.name),
+      expected,
+    );
+    const missing = await library.albumsWithoutArtist('unknown', opts);
+    assertEquals(missing.map((r) => r.folderName), expected);
+    assertEquals(names(missing), [null, null, null]);
+    const ordered = await library.listAlbums({
+      ...page,
+      ...opts,
+      sort: 'name',
+    });
+    const expectedNames = [
+      'The Coda 3',
+      'The Coda 3',
+      'The Zulu 10',
+      'The Zulu 10',
+      'The Alpha 2',
+      'The Alpha 2',
+    ];
+    assertEquals(ordered.map((r) => r.name ?? r.folderName), expectedNames);
+    for (const sort of ['genre', 'year'] as const) {
+      assertEquals(
+        (await library.listAlbums({
+          ...page,
+          ...opts,
+          sort,
+          genre: 'Fixture',
+          fromYear: 0,
+          toYear: 9999,
+        })).map((r) => r.id),
+        ordered.map((r) => r.id),
+      );
+    }
+    const songs = await library.songsByGenre('Fixture', { ...page, ...opts });
+    assertEquals(songs.map((r) => r.title ?? r.fileName), expectedNames);
+    assertEquals(songs.filter((r) => r.title === null).length, 3);
+    const found = await library.search3('', { ...search, ...opts });
+    assertEquals(found.albums.map((r) => r.id), ordered.map((r) => r.id));
+    assertEquals(found.songs.map((r) => r.id), songs.map((r) => r.id));
+    // Nonempty sort tags are authoritative: don't strip their leading article.
+    assertEquals(
+      (await library.listArtists(folder.id, opts))[0].sortKey,
+      'the member 2',
+    );
+    const untagged = await library.albumsByArtist(member.id, {
+      natural: true,
+      ignoredArticles: ['The'],
+    });
+    assertEquals(names(untagged), ['The Alpha 2', 'The Coda 3', 'The Zulu 10']);
+    // Historical callers do not opt in merely because the capability exists.
+    const rest = (await f.rest('search3', { query: '' })).searchResult3;
+    assertEquals(
+      rest.album.map((r: { id: string }) => r.id),
+      (await library.search3('', search)).albums.map((r) => r.id),
+    );
+    const ownResponse = await fetch(
+      `${f.origin.replace(/:\d+$/, `:${f.extraPorts[0]}`)}/api/library/artists`,
+      { signal: AbortSignal.timeout(5000) },
+    );
+    assertEquals(ownResponse.status, 200);
+    assertEquals(
+      (await ownResponse.json()).items.map((r: { name: string }) => r.name)
+        .filter((r: string) => r === 'Member'),
+      ['Member'],
+    );
+  } finally {
+    await f.close();
+  }
+});

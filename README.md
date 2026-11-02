@@ -129,6 +129,16 @@ scan or restart, invalidate native list validators, and send signed-in clients
 a `library` change event. `reference.ignoredArticles` remains independent: it
 controls matching external reference names, not browse order.
 
+Native catalog collections, artist album memberships and search accept
+`natural=true` (default off; `natural=false` retains lexical ordering). For
+example, `/api/v1/songs?sort=name&natural=true` puts `Episode 2` before
+`Episode 10`, before paging. The locale-independent core key folds case and
+accents after resolving articles/optional sort tags, then compares ASCII digit
+runs by numeric magnitude without a fixed precision limit. Leading zeros are
+insignificant; equal keys use the entity id (the literal name for genres).
+Punctuation and non-ASCII digits are ordinary text, not signs or decimals.
+Other hats keep their existing defaults.
+
 ### Stable identities
 
 Scanning records an `afp/1` audio fingerprint from compressed audio packets,

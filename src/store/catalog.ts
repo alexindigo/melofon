@@ -1,7 +1,11 @@
 // Catalog data access. Every public operation owns one exclusive engine slot.
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
 import { userIdForName } from './users.ts';
-import { artistAlbumFolderFilter, sortKeySql } from './catalog-sql.ts';
+import {
+  artistAlbumFolderFilter,
+  naturalKeySql,
+  sortKeySql,
+} from './catalog-sql.ts';
 import { isAlbumFolderHint } from '../albums.ts';
 import { dirname } from 'node:path';
 import { LibraryError, LibrarySourcesChanged } from '../library-errors.ts';
@@ -33,7 +37,7 @@ export interface ArtistRow {
   /** Present when files carry an artist sort tag. */
   sortName?: string;
   albumCount: number;
-  /** Present on article-aware or sort-tag lists; the exact ordering/grouping key. */
+  /** Resolved text/grouping key on opted-in lists; natural tokens stay internal. */
   sortKey?: string;
 }
 
@@ -92,6 +96,7 @@ export interface GenreRow {
 
 export interface GenrePageOptions {
   ignoredArticles?: string[];
+  natural?: boolean;
   folderId?: string;
   offset: number;
   limit: number;
@@ -134,6 +139,8 @@ export interface RandomSongOptions {
 
 export interface NameSortOptions {
   ignoredArticles?: string[];
+  /** Folded text and arbitrary-length numeric tokens; off unless opted in. */
+  natural?: boolean;
   /** Prefer tagged sort names; off unless explicitly requested by the caller. */
   sortTags?: boolean;
 }
@@ -768,6 +775,7 @@ function catalogReads(q: Queries): CatalogReads {
       SONG_TITLE,
       opts.ignoredArticles,
       opts.sortTags ? 'f.sort_title' : undefined,
+      opts.natural,
     );
     let order: string;
     switch (opts.sort) {
@@ -786,6 +794,7 @@ function catalogReads(q: Queries): CatalogReads {
             'ar.name',
             opts.ignoredArticles,
             opts.sortTags ? 'f.artist_sort_name' : undefined,
+            opts.natural,
           )
         } NULLS LAST, ${name}`;
         break;
@@ -844,6 +853,7 @@ function catalogReads(q: Queries): CatalogReads {
         'name',
         opts.ignoredArticles,
         opts.sortTags ? 'sort_name' : undefined,
+        opts.natural,
       );
       const rows = await q.all<ArtistGroupSqlRow>(
         `SELECT * FROM (${select}) groups ORDER BY ${key} NULLS LAST,
@@ -874,6 +884,7 @@ function catalogReads(q: Queries): CatalogReads {
         'COALESCE(al.name, al.folder_name)',
         opts.ignoredArticles,
         opts.sortTags ? 'first(al.sort_name)' : undefined,
+        opts.natural,
       );
       const rows = artist === null ? [] : await q.all<AlbumSqlRow>(
         `${albumSelect({ folderId: opts.folderId })} HAVING ${membership}
@@ -890,7 +901,7 @@ function catalogReads(q: Queries): CatalogReads {
     async listArtists(folderId, opts = {}): Promise<ArtistRow[]> {
       const key = sortKeySql(
         'ar.name',
-        opts.ignoredArticles,
+        opts.ignoredArticles ?? (opts.natural ? [] : undefined),
         opts.sortTags ? 'first(ar.sort_name)' : undefined,
       );
       const res = await q.all(
@@ -899,7 +910,9 @@ function catalogReads(q: Queries): CatalogReads {
          JOIN albums al ON al.album_artist_id = ar.id
          WHERE 1 = 1 ${artistAlbumFolderFilter(folderId)}
          GROUP BY ar.id, ar.name, ar.musicbrainz_id
-          ORDER BY sort_key, ar.id`,
+           ORDER BY ${
+          opts.natural ? naturalKeySql('sort_key') : 'sort_key'
+        }, ar.id`,
       );
       return (res as {
         id: string;
@@ -914,7 +927,8 @@ function catalogReads(q: Queries): CatalogReads {
         musicBrainzId: row.musicbrainz_id,
         ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
         albumCount: Number(row.album_count),
-        ...(opts.ignoredArticles === undefined && !opts.sortTags
+        ...(opts.ignoredArticles === undefined && !opts.sortTags &&
+            !opts.natural
           ? {}
           : { sortKey: row.sort_key }),
       }));
@@ -944,6 +958,7 @@ function catalogReads(q: Queries): CatalogReads {
             'COALESCE(al.name, al.folder_name)',
             opts.ignoredArticles,
             opts.sortTags ? 'first(al.sort_name)' : undefined,
+            opts.natural,
           )
         }, al.id`,
       );
@@ -958,6 +973,7 @@ function catalogReads(q: Queries): CatalogReads {
           'COALESCE(al.name, al.folder_name)',
           opts.ignoredArticles,
           opts.sortTags ? 'first(al.sort_name)' : undefined,
+          opts.natural,
         )
       }, al.id`);
       return (res as unknown as AlbumSqlRow[]).map(albumOf);
@@ -969,10 +985,12 @@ function catalogReads(q: Queries): CatalogReads {
         'COALESCE(al.name, al.folder_name)',
         opts.ignoredArticles,
         opts.sortTags ? 'first(al.sort_name)' : undefined,
+        opts.natural,
       );
       // These modes historically used a raw name as their secondary key, even
-      // when callers supplied articles. Keep that contract with sort tags off.
-      const secondaryKey = opts.sortTags
+      // when callers supplied articles. Keep that contract unless a caller opts
+      // into sort tags or natural ordering.
+      const secondaryKey = opts.sortTags || opts.natural
         ? albumKey
         : 'COALESCE(al.name, al.folder_name)';
       let order: string;
@@ -989,6 +1007,7 @@ function catalogReads(q: Queries): CatalogReads {
               'ar.name',
               opts.ignoredArticles,
               opts.sortTags ? 'first(ar.sort_name)' : undefined,
+              opts.natural,
             )
           }, ${albumKey}`;
           break;
@@ -1060,6 +1079,7 @@ function catalogReads(q: Queries): CatalogReads {
         'COALESCE(al.name, al.folder_name)',
         opts.ignoredArticles,
         opts.sortTags ? 'first(al.sort_name)' : undefined,
+        opts.natural,
       );
       let order: string;
       switch (opts.sort) {
@@ -1095,6 +1115,7 @@ function catalogReads(q: Queries): CatalogReads {
               'ar.name',
               opts.ignoredArticles,
               opts.sortTags ? 'first(ar.sort_name)' : undefined,
+              opts.natural,
             )
           } NULLS LAST, ${name}`;
           break;
@@ -1189,6 +1210,7 @@ function catalogReads(q: Queries): CatalogReads {
             'ar.name',
             opts.ignoredArticles,
             opts.sortTags ? 'ar.sort_name' : undefined,
+            opts.natural,
           )
         }, ar.id`,
         opts.artists,
@@ -1200,6 +1222,7 @@ function catalogReads(q: Queries): CatalogReads {
             'COALESCE(al.name, al.folder_name)',
             opts.ignoredArticles,
             opts.sortTags ? 'first(al.sort_name)' : undefined,
+            opts.natural,
           )
         }, al.id`,
         opts.albums,
@@ -1211,6 +1234,7 @@ function catalogReads(q: Queries): CatalogReads {
             SONG_TITLE,
             opts.ignoredArticles,
             opts.sortTags ? 'f.sort_title' : undefined,
+            opts.natural,
           )
         }, f.id`,
         opts.songs,
@@ -1236,6 +1260,7 @@ function catalogReads(q: Queries): CatalogReads {
             'ar.name',
             opts.ignoredArticles,
             opts.sortTags ? 'first(ar.sort_name)' : undefined,
+            opts.natural,
           )
         }, ar.id
            LIMIT ${opts.artistCount} OFFSET ${opts.artistOffset}`,
@@ -1248,6 +1273,7 @@ function catalogReads(q: Queries): CatalogReads {
             'COALESCE(al.name, al.folder_name)',
             opts.ignoredArticles,
             opts.sortTags ? 'first(al.sort_name)' : undefined,
+            opts.natural,
           )
         }, al.id
            LIMIT ${opts.albumCount} OFFSET ${opts.albumOffset}`,
@@ -1259,6 +1285,7 @@ function catalogReads(q: Queries): CatalogReads {
             SONG_TITLE,
             opts.ignoredArticles,
             opts.sortTags ? 'f.sort_title' : undefined,
+            opts.natural,
           )
         }, f.id
            LIMIT ${opts.songCount} OFFSET ${opts.songOffset}`,
@@ -1347,7 +1374,7 @@ function catalogReads(q: Queries): CatalogReads {
       );
       const rows = await q.all<GenreSqlRow>(
         `${select} ORDER BY ${
-          sortKeySql('f.genre', opts.ignoredArticles)
+          sortKeySql('f.genre', opts.ignoredArticles, undefined, opts.natural)
         }, f.genre LIMIT ${opts.limit} OFFSET ${opts.offset}`,
       );
       return {
@@ -1408,6 +1435,7 @@ function catalogReads(q: Queries): CatalogReads {
             SONG_TITLE,
             opts.ignoredArticles,
             opts.sortTags ? 'f.sort_title' : undefined,
+            opts.natural,
           )
         }, f.id
          LIMIT ${opts.size} OFFSET ${opts.offset}`,

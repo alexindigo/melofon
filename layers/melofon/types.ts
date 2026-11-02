@@ -392,6 +392,7 @@ export interface SongMetadata {
 export interface BrowsePageOptions {
   articleRevision?: number;
   ignoredArticles?: string[];
+  natural?: boolean;
   sort: 'name' | 'artist' | 'year' | 'newest' | 'genre' | 'random';
   seed?: string;
   offset: number;
@@ -455,6 +456,7 @@ export interface ArtistGroupRow {
 export interface ArtistPageOptions {
   articleRevision?: number;
   ignoredArticles?: string[];
+  natural?: boolean;
   folderId?: string;
   offset: number;
   limit: number;
@@ -463,6 +465,7 @@ export type GenrePageOptions = ArtistPageOptions;
 export interface SearchPageOptions {
   articleRevision?: number;
   ignoredArticles?: string[];
+  natural?: boolean;
   folderId?: string;
   artists: { offset: number; limit: number };
   albums: { offset: number; limit: number };
