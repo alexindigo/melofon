@@ -10,8 +10,40 @@ import { animatedImage, playlistImage, resizeImage } from './media.ts';
 import { createArtworkCache } from './artwork-cache.ts';
 import type { Podcasts } from './podcasts.ts';
 
+export type ArtworkRef = {
+  kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast';
+  id: string;
+};
+export interface ArtworkDescriptor {
+  sourceHash: string;
+  version: string;
+  sourceKind:
+    | 'embedded'
+    | 'album-file'
+    | 'album-candidate'
+    | 'artist-photo'
+    | 'playlist'
+    | 'podcast';
+  /** Original dimensions, not rendition dimensions; null for unknown headers. */
+  width: number | null;
+  height: number | null;
+  mime: string;
+}
+export type ArtworkDescription = { kind: 'unknown' | 'missing' } | {
+  kind: 'image';
+  descriptor: ArtworkDescriptor;
+};
+export type ArtworkSnapshot = { kind: 'unknown' } | { kind: 'missing' } | {
+  kind: 'image';
+  descriptor: ArtworkDescriptor;
+  bytes: Uint8Array;
+};
 export type ArtworkResult = { kind: 'unknown' } | {
-  kind: 'image' | 'placeholder';
+  kind: 'placeholder';
+  response: Response;
+} | {
+  kind: 'image';
+  descriptor: ArtworkDescriptor;
   response: Response;
 };
 interface Options {
@@ -22,13 +54,31 @@ interface Image {
   bytes: Uint8Array;
   format: string;
 }
+interface Source extends Image {
+  sourceKind: ArtworkDescriptor['sourceKind'];
+}
+interface Policy {
+  maxBytes: number;
+  maxPixels: number;
+  quality: number;
+}
 
 export interface ArtworkService {
   /** A real artist photo, never the first-album artwork fallback. */
   hasArtistPhoto(id: string): Promise<boolean>;
-  get(id: string, options?: Options): Promise<ArtworkResult>;
+  /** Plain facts and owned encoded bytes from one authorized source resolution. */
+  snapshot(
+    ref: ArtworkRef,
+    options?: Pick<Options, 'username'>,
+  ): Promise<ArtworkSnapshot>;
+  describe(
+    ref: ArtworkRef,
+    options?: Pick<Options, 'username'>,
+  ): Promise<ArtworkDescription>;
+  /** Strings adapt legacy catalog ids and pl- playlist aliases. */
+  get(id: string | ArtworkRef, options?: Options): Promise<ArtworkResult>;
   /** HTTP-native convenience for OwnTone: unknown is 404, never error 70. */
-  cover(id: string, options?: Options): Promise<Response>;
+  cover(id: string | ArtworkRef, options?: Options): Promise<Response>;
   /** The missing-cover tile, for callers with no cover concept (getAvatar). */
   placeholder(): Response;
 }
@@ -106,18 +156,24 @@ export function createArtwork(library: Library, options: {
   async function resolve(
     id: string,
     maxBytes: number,
-  ): Promise<Image | null | 'unknown'> {
-    const podcast = await options.podcasts?.cover(id, maxBytes);
-    if (podcast !== undefined && podcast !== 'unknown') return podcast;
-    const song = await library.getSong(id);
+    kind?: ArtworkRef['kind'],
+  ): Promise<Source | null | 'unknown'> {
+    if (!kind || kind === 'podcast') {
+      const podcast = await options.podcasts?.cover(id, maxBytes);
+      if (podcast !== undefined && podcast !== 'unknown') {
+        return podcast && { ...podcast, sourceKind: 'podcast' };
+      }
+      if (kind === 'podcast') return 'unknown';
+    }
+    const song = !kind || kind === 'song' ? await library.getSong(id) : null;
     if (song !== null) {
       const own = await library.embeddedCover(id, maxBytes);
-      if (own !== null) return own;
+      if (own !== null) return { ...own, sourceKind: 'embedded' };
       return song.albumId === null
         ? null
-        : await resolve(song.albumId, maxBytes);
+        : await resolve(song.albumId, maxBytes, 'album');
     }
-    if (await library.getAlbum(id) !== null) {
+    if ((!kind || kind === 'album') && await library.getAlbum(id) !== null) {
       const path = await library.albumCoverPath(id);
       if (path !== null) {
         try {
@@ -125,6 +181,7 @@ export function createArtwork(library: Library, options: {
           if (bytes) {
             return {
               bytes,
+              sourceKind: 'album-file',
               format: path.toLowerCase().endsWith('.png')
                 ? 'image/png'
                 : path.toLowerCase().endsWith('.webp')
@@ -137,14 +194,17 @@ export function createArtwork(library: Library, options: {
         }
       }
       const embedded = await library.embeddedCover(id, maxBytes);
-      if (embedded !== null) return embedded;
-      return await library.candidateCover(id, maxBytes);
+      if (embedded !== null) return { ...embedded, sourceKind: 'embedded' };
+      const candidate = await library.candidateCover(id, maxBytes);
+      return candidate && { ...candidate, sourceKind: 'album-candidate' };
     }
-    if (await library.artistById(id) !== null) {
+    if ((!kind || kind === 'artist') && await library.artistById(id) !== null) {
       const photo = await library.artistPhoto(id, maxBytes);
-      if (photo) return photo;
+      if (photo) return { ...photo, sourceKind: 'artist-photo' };
       const albums = await library.albumsByArtist(id);
-      return albums.length ? await resolve(albums[0].id, maxBytes) : null;
+      return albums.length
+        ? await resolve(albums[0].id, maxBytes, 'album')
+        : null;
     }
     return 'unknown';
   }
@@ -161,7 +221,7 @@ export function createArtwork(library: Library, options: {
     username: string | undefined,
     maxBytes: number,
     maxPixels: number,
-  ): Promise<Image | null | 'unknown'> {
+  ): Promise<Source | null | 'unknown'> {
     // Always authorize BEFORE resolving any bytes or reading any cached cover.
     if (!username || !options.playlists) return 'unknown';
     const list = await options.playlists.get(username, id);
@@ -211,38 +271,80 @@ export function createArtwork(library: Library, options: {
       if (!bytes) return null;
       await cache.put(key, bytes, limit);
     }
-    return { bytes, format: 'image/png' };
+    return { bytes, format: 'image/png', sourceKind: 'playlist' };
   }
 
-  async function get(id: string, opts: Options = {}): Promise<ArtworkResult> {
-    const maxBytes = await setting('maxSourceMegabytes') * 1024 * 1024;
-    const maxPixels = await setting('maxPixels');
-    const source = id.startsWith('pl-')
-      ? await playlist(id.slice(3), opts.username, maxBytes, maxPixels)
-      : await resolve(id, maxBytes);
+  async function policy(): Promise<Policy> {
+    return {
+      maxBytes: await setting('maxSourceMegabytes') * 1024 * 1024,
+      maxPixels: await setting('maxPixels'),
+      quality: await setting('jpegQuality'),
+    };
+  }
+  async function snapshot(
+    ref: string | ArtworkRef,
+    opts: Options,
+    rules: Policy,
+  ): Promise<ArtworkSnapshot> {
+    const typed = typeof ref === 'string'
+      ? ref.startsWith('pl-')
+        ? { kind: 'playlist' as const, id: ref.slice(3) }
+        : null
+      : ref;
+    const source = typed?.kind === 'playlist'
+      ? await playlist(typed.id, opts.username, rules.maxBytes, rules.maxPixels)
+      : await resolve(typed?.id ?? ref as string, rules.maxBytes, typed?.kind);
     if (source === 'unknown') return { kind: 'unknown' };
-    if (source === null) {
+    if (source === null) return { kind: 'missing' };
+    const header = imageHeader(source.bytes);
+    const sourceHash = await imageHash(source.bytes);
+    return {
+      kind: 'image',
+      bytes: source.bytes,
+      descriptor: {
+        sourceHash,
+        // Bump the revision when the rendition algorithm/encoder policy changes.
+        version: await imageHash(new TextEncoder().encode(
+          `${sourceHash}:rendition-v1:${rules.quality}:${rules.maxPixels}`,
+        )),
+        sourceKind: source.sourceKind,
+        width: header?.width ?? null,
+        height: header?.height ?? null,
+        mime: source.format,
+      },
+    };
+  }
+  async function get(
+    id: string | ArtworkRef,
+    opts: Options = {},
+  ): Promise<ArtworkResult> {
+    const rules = await policy();
+    const selected = await snapshot(id, opts, rules);
+    if (selected.kind === 'unknown') return { kind: 'unknown' };
+    if (selected.kind === 'missing') {
       return { kind: 'placeholder', response: placeholder() };
     }
+    const { descriptor } = selected;
+    const source = { bytes: selected.bytes, format: descriptor.mime };
     const size = opts.size ?? 0;
     const header = imageHeader(source.bytes);
     if (
       !Number.isSafeInteger(size) || size <= 0 ||
-      !withinPixels(header, maxPixels) ||
+      !withinPixels(header, rules.maxPixels) ||
       header.animated && header.format !== 'gif' ||
       !header.animated && size >= Math.max(header.width, header.height)
     ) {
-      return { kind: 'image', response: response(source) };
+      return { kind: 'image', descriptor, response: response(source) };
     }
     const format = header.format === 'png'
       ? 'png'
       : header.format === 'gif' && header.animated
       ? 'webp'
       : 'jpeg';
-    const quality = await setting('jpegQuality');
+    const quality = rules.quality;
     const key = `${await imageHash(
       new TextEncoder().encode(
-        `${await imageHash(source.bytes)}:${size}:${format}:${quality}`,
+        `${descriptor.sourceHash}:${size}:${format}:${quality}`,
       ),
     )}.${format}`;
     const limit = await setting('cacheMegabytes') * 1024 * 1024;
@@ -250,6 +352,7 @@ export function createArtwork(library: Library, options: {
     if (cached) {
       return {
         kind: 'image',
+        descriptor,
         response: response({ bytes: cached, format: `image/${format}` }, 'hit'),
       };
     }
@@ -271,11 +374,12 @@ export function createArtwork(library: Library, options: {
         await cache.put(key, bytes, limit);
         return {
           kind: 'image',
+          descriptor,
           response: response({ bytes, format: `image/${format}` }, 'miss'),
         };
       }
     } catch { /* Navidrome resize.go: failed resize serves original bytes. */ }
-    return { kind: 'image', response: response(source) };
+    return { kind: 'image', descriptor, response: response(source) };
   }
   return {
     async hasArtistPhoto(id) {
@@ -285,6 +389,14 @@ export function createArtwork(library: Library, options: {
       );
     },
     placeholder,
+    snapshot: async (ref, opts = {}) =>
+      await snapshot(ref, opts, await policy()),
+    async describe(ref, opts = {}) {
+      const selected = await snapshot(ref, opts, await policy());
+      return selected.kind === 'image'
+        ? { kind: 'image', descriptor: selected.descriptor }
+        : selected;
+    },
     get,
     async cover(id, opts) {
       const result = await get(id, opts);

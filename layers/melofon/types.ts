@@ -2,6 +2,33 @@
 import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 export type HatRequest = PathfinderRequest<Record<string, string>>;
+export type ArtworkRef = {
+  kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast';
+  id: string;
+};
+export interface ArtworkDescriptor {
+  sourceHash: string;
+  version: string;
+  sourceKind:
+    | 'embedded'
+    | 'album-file'
+    | 'album-candidate'
+    | 'artist-photo'
+    | 'playlist'
+    | 'podcast';
+  width: number | null;
+  height: number | null;
+  mime: string;
+}
+export type ArtworkDescription = { kind: 'unknown' | 'missing' } | {
+  kind: 'image';
+  descriptor: ArtworkDescriptor;
+};
+export type ArtworkSnapshot = { kind: 'unknown' } | { kind: 'missing' } | {
+  kind: 'image';
+  descriptor: ArtworkDescriptor;
+  bytes: Uint8Array;
+};
 export interface User {
   id: string;
   username: string;
@@ -63,6 +90,26 @@ export interface HatContext {
   meta: { jsonMaxBytesSetting?: string };
   app: {
     cfg: { dataDir?: string };
+    artwork: {
+      describe(
+        ref: ArtworkRef,
+        options?: { username?: string },
+      ): Promise<ArtworkDescription>;
+      snapshot(
+        ref: ArtworkRef,
+        options?: { username?: string },
+      ): Promise<ArtworkSnapshot>;
+      get(
+        ref: string | ArtworkRef,
+        options?: { username?: string; size?: number },
+      ): Promise<
+        { kind: 'unknown' } | { kind: 'placeholder'; response: Response } | {
+          kind: 'image';
+          descriptor: ArtworkDescriptor;
+          response: Response;
+        }
+      >;
+    };
     media: {
       hls(
         path: string,
