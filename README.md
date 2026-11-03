@@ -167,6 +167,26 @@ HEAD never starts an encoder. Media reads, EOF and disconnects never update
 now playing or record listens. Browser media uses same-origin cookies; this
 route does not mint casting URLs.
 
+### Video HLS
+
+`GET /api/v1/videos/{id}/hls.m3u8` returns an authenticated H.264/AAC HLS
+playlist. With no rendition request, compatible sources are remuxed. Optional
+`bitRate` is a positive safe integer in kbps, optionally followed by exact even
+dimensions (`1000@640x360`); repeating it returns a master playlist. Alternatively
+use `size=640x360`. `audioTrack` is a nonnegative demuxer stream index from the
+video's indexed audio facts. Unknown/repeated parameters (except master
+`bitRate`), conflicting sizes, invalid dimensions and unknown audio tracks fail
+with 400; audio-only and unknown ids return 404.
+
+Follow playlist-relative links as returned, including
+`hls/segments/{index}.ts`. Every playlist and segment request needs its own
+cookie or Bearer authentication; URLs contain only rendition/track choices.
+Links preserve root, configured base-prefix and forced-hat mounts. Playlists
+use EVENT while encoding and VOD with ENDLIST when complete; segments are
+`video/MP2T`. Both are `no-store`. Core owns encoding, the bounded cache and
+read leases through EOF or cancellation. Audio ability declarations do not
+negotiate video renditions.
+
 ## Catalog identity
 
 ### Browse ordering

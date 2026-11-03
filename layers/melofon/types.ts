@@ -62,6 +62,14 @@ export interface Hat {
 export interface HatContext {
   meta: { jsonMaxBytesSetting?: string };
   app: {
+    cfg: { dataDir?: string };
+    media: {
+      hls(
+        path: string,
+        root: string,
+        options?: HlsOptions,
+      ): Promise<HlsView | null>;
+    };
     publicAddress: {
       prefix(): Promise<string>;
       acceptsOrigin(request: Request, origin: string): Promise<boolean>;
@@ -644,6 +652,21 @@ export interface MediaTrack {
   language: string | null;
   title: string | null;
   channels?: number;
+}
+export interface HlsOptions {
+  kbps?: number;
+  width?: number;
+  height?: number;
+  audioTrack?: number;
+}
+export interface HlsView {
+  width: number;
+  height: number;
+  bandwidth: number;
+  complete: boolean;
+  segments: { duration: number }[];
+  segment(index: number): Promise<ReadableStream<Uint8Array> | null>;
+  release(): Promise<void>;
 }
 export interface LyricsCue {
   start: number;
