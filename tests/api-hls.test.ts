@@ -539,3 +539,97 @@ Deno.test('API HLS: shared bounded cache releases playlist views and segment EOF
     await t.close();
   }
 });
+
+Deno.test('API HLS: discovered stream indices select distinct decoded audio through master and segment links', async () => {
+  const t = await setup();
+  const music = await Deno.makeTempDir();
+  try {
+    await videoFixture(`${music}/choices.mkv`, 320, 180, 2, 25, 'h264');
+    await createLibraries(t.f.store).add('Choices', music);
+    await scanLibrary(t.f.store);
+    const video = (await t.library.videos()).find((song) =>
+      song.path.endsWith('choices.mkv')
+    )!;
+    await t.f.state.set('server.baseUrl', `${t.f.origin}/music`);
+    const discovery = new URL(
+      `/music/_melofon/api/v1/videos/${video.id}/playback`,
+      t.f.origin,
+    );
+    const response = await t.read(discovery, t.cookie);
+    assertEquals(response.status, 200);
+    const playback = await response.json();
+    assertEquals(
+      playback.audioTracks.map((track: { index: number }) => track.index),
+      [1, 2],
+    );
+    assertEquals(
+      playback.audioTracks.map((track: { channels: number }) => track.channels),
+      [1, 2],
+    );
+    for (const [ordinal, track] of playback.audioTracks.entries()) {
+      for (const encode of [false, true]) {
+        const parent = new URL(playback.hls, discovery);
+        parent.searchParams.set('audioTrack', String(track.index));
+        if (encode) {
+          parent.searchParams.append('bitRate', '100@160x90');
+          parent.searchParams.append('bitRate', '200@320x180');
+        }
+        const initial = await t.playlist(parent, t.cookie);
+        const variant = encode ? t.resolve(uris(initial)[0], parent) : parent;
+        assertEquals(
+          variant.searchParams.get('audioTrack'),
+          String(track.index),
+        );
+        const text = await t.complete(
+          variant,
+          t.bearer,
+          encode ? undefined : initial,
+        );
+        let samples = 0;
+        for (const uri of uris(text)) {
+          const segment = t.resolve(uri, variant);
+          assertEquals(
+            segment.searchParams.get('audioTrack'),
+            String(track.index),
+          );
+          const received = await t.read(segment, t.bearer);
+          assertEquals(received.status, 200);
+          await using input = await Demuxer.open(
+            Buffer.from(await received.arrayBuffer()),
+          );
+          const audio = input.audio()!;
+          assertEquals(audio.codecpar.codecId, AV_CODEC_ID_AAC);
+          assertEquals(audio.codecpar.channelLayout.nbChannels, ordinal + 1);
+          using decoder = await Decoder.create(audio);
+          const consume = (
+            frames: Awaited<ReturnType<Decoder['decodeAll']>>,
+          ) => {
+            for (const frame of frames) {
+              assertEquals(frame.channelLayout.nbChannels, ordinal + 1);
+              samples += frame.nbSamples;
+              frame.free();
+            }
+          };
+          for await (const packet of input.packets()) {
+            if (!packet) continue;
+            try {
+              if (packet.streamIndex === audio.index) {
+                consume(await decoder.decodeAll(packet));
+              }
+            } finally {
+              packet.free();
+            }
+          }
+          consume(await decoder.decodeAll(null));
+        }
+        assert(
+          samples >= 48000 * 1.9 && samples <= 48000 * 2.2,
+          String(samples),
+        );
+      }
+    }
+  } finally {
+    await t.close();
+    await Deno.remove(music, { recursive: true });
+  }
+});

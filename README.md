@@ -187,6 +187,16 @@ use EVENT while encoding and VOD with ENDLIST when complete; segments are
 read leases through EOF or cancellation. Audio ability declarations do not
 negotiate video renditions.
 
+`GET /api/v1/videos/{id}/playback` discovers `audioTracks` (actual demuxer
+stream indices), safe `captions` descriptors and a relative `hls` link. Choose
+an audio track with `audioTrack=<index>` on that HLS URL; each output multiplexes
+one selected audio stream, rather than alternate-audio master groups. Caption
+`href` links resolve against the discovery URL and default to WebVTT for an
+HTML `<track>`. `GET /api/v1/videos/{id}/captions?key=<opaque-key>&format=vtt`
+reads only that video's scanned sidecar or embedded text track; `format=srt`
+is also supported. Keys must be passed unchanged, never interpreted as paths.
+Both resources require cookie or Bearer authentication and are `no-store`.
+
 ## Catalog identity
 
 ### Browse ordering

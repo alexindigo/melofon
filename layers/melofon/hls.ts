@@ -1,5 +1,6 @@
 import { fail } from './errors.ts';
 import type { HatContext, HatRequest, HlsOptions, HlsView } from './types.ts';
+import { getVideo } from './video.ts';
 
 function integer(raw: string, minimum: number): number {
   const value = Number(raw);
@@ -73,8 +74,7 @@ export async function hlsVideo(
   id: string,
   options: HlsOptions[],
 ) {
-  const { detail } = await context.app.library.getVideoSnapshot(id);
-  if (!detail) fail(404, 'not_found', 'Video not found');
+  const detail = await getVideo(context, id);
   if (
     options.some((option) =>
       option.audioTrack !== undefined &&

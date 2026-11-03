@@ -181,16 +181,21 @@ function mediaTrack(track: MediaTrack) {
 export function videoDetail(song: SongRow, details: VideoDetails | null) {
   return {
     ...songDetail(song),
-    details: details === null ? null : {
-      audio: details.audio.map(mediaTrack),
-      subtitles: details.subtitles.map(mediaTrack),
-      // Caption paths are internal resolution facts, never native payloads.
-      captions: details.captions.map((caption) => ({
-        key: caption.key,
-        name: caption.name,
-        format: caption.format,
-        ...(caption.stream === undefined ? {} : { stream: caption.stream }),
-      })),
-    },
+    details: videoFacts(details),
+  };
+}
+
+/** One safe projection for browse details and playback discovery. */
+export function videoFacts(details: VideoDetails | null) {
+  return details === null ? null : {
+    audio: details.audio.map(mediaTrack),
+    subtitles: details.subtitles.map(mediaTrack),
+    // Caption paths are internal resolution facts, never native payloads.
+    captions: details.captions.map((caption) => ({
+      key: caption.key,
+      name: caption.name,
+      format: caption.format,
+      ...(caption.stream === undefined ? {} : { stream: caption.stream }),
+    })),
   };
 }

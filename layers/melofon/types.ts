@@ -242,6 +242,10 @@ export interface HatContext {
         detail: { song: SongRow; details: VideoDetails | null } | null;
         revision: string;
       }>;
+      caption(videoId: string, selection: {
+        key: string;
+        format: 'srt' | 'vtt';
+      }): Promise<{ text: string; format: 'srt' | 'vtt' } | null>;
       searchPages(query: string, opts: SearchPageOptions): Promise<{
         artists: { rows: ArtistGroupRow[]; total: number };
         albums: { rows: AlbumRow[]; total: number };
