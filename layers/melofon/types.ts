@@ -29,6 +29,13 @@ export type ArtworkSnapshot = { kind: 'unknown' } | { kind: 'missing' } | {
   descriptor: ArtworkDescriptor;
   bytes: Uint8Array;
 };
+export type ArtworkPixels = { kind: 'unknown' | 'unavailable' } | {
+  kind: 'pixels';
+  descriptor: ArtworkDescriptor;
+  width: number;
+  height: number;
+  rgba: Uint8Array;
+};
 export interface User {
   id: string;
   username: string;
@@ -91,6 +98,10 @@ export interface HatContext {
   app: {
     cfg: { dataDir?: string };
     artwork: {
+      pixels(
+        ref: ArtworkRef,
+        options: { username?: string; size: number },
+      ): Promise<ArtworkPixels>;
       describe(
         ref: ArtworkRef,
         options?: { username?: string },

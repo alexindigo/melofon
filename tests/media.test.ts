@@ -17,7 +17,8 @@ import { createBookmarks } from '../src/bookmarks.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createStream } from '../src/stream.ts';
 import { createFileSource } from '../src/file-source.ts';
-import { createMedia } from '../src/media.ts';
+import { createMedia, imagePixels } from '../src/media.ts';
+import { pixelPng, twoFrameGif } from './helpers/pixel-image.ts';
 import { createZip } from '../src/zip.ts';
 import { BlobReader, Uint8ArrayWriter, ZipReader } from '@zip-js/zip-js';
 import { loadLayers } from '../src/layers.ts';
@@ -25,6 +26,65 @@ import { createState } from '../src/state.ts';
 import { facade } from '../src/facade.ts';
 
 const AUTH = 'u=admin&p=test&v=1.16.1&c=melofon-test';
+
+Deno.test('native image pixels pack odd-width rows and own straight RGBA after disposal', async () => {
+  const expected = new Uint8Array([
+    255,
+    0,
+    0,
+    255,
+    0,
+    255,
+    0,
+    128,
+    0,
+    0,
+    255,
+    0,
+    19,
+    37,
+    71,
+    64,
+    127,
+    89,
+    53,
+    200,
+    251,
+    241,
+    231,
+    255,
+  ]);
+  const bytes = pixelPng(3, 2, expected);
+  const pixels = await imagePixels(bytes, 3, 2);
+  assertEquals(pixels, expected);
+  for (let n = 0; n < 8; n++) {
+    const next = await imagePixels(
+      pixelPng(3, 2, new Uint8Array(24).fill(n)),
+      3,
+      2,
+    );
+    next.fill(99);
+  }
+  assertEquals(pixels, expected);
+  pixels.fill(0);
+  assertEquals(await imagePixels(bytes, 3, 2), expected);
+});
+
+Deno.test('native image pixels sample the first animation frame', async () => {
+  assertEquals(
+    await imagePixels(twoFrameGif(), 2, 1),
+    new Uint8Array([
+      255,
+      0,
+      0,
+      255,
+      0,
+      0,
+      255,
+      255,
+    ]),
+  );
+});
 
 async function setup() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-media-' });

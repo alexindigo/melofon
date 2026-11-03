@@ -414,6 +414,39 @@ async function encodeImage(
   return Buffer.concat(chunks);
 }
 
+/** First-frame, straight RGBA, packed into JS-owned memory before native disposal. */
+export async function imagePixels(
+  bytes: Uint8Array,
+  width: number,
+  height: number,
+): Promise<Uint8Array> {
+  await using input = await Demuxer.open(Buffer.from(bytes));
+  const stream = input.video();
+  if (!stream) throw new Error('Image has no video stream');
+  await using decoder = await Decoder.create(stream);
+  for await (const frame of decoder.frames(input.packets(stream.index))) {
+    if (!frame) continue;
+    try {
+      using rgba = await scaleImage(frame, width, height, AV_PIX_FMT_RGBA);
+      const pixels = new Uint8Array(width * height * 4);
+      const source = rgba.data![0];
+      for (let row = 0; row < height; row++) {
+        pixels.set(
+          source.subarray(
+            row * rgba.linesize[0],
+            row * rgba.linesize[0] + width * 4,
+          ),
+          row * width * 4,
+        );
+      }
+      return pixels;
+    } finally {
+      frame.free();
+    }
+  }
+  throw new Error('Image has no decoded frame');
+}
+
 export async function resizeImage(
   bytes: Uint8Array,
   width: number,

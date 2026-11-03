@@ -6,7 +6,12 @@ import type { Playlists } from './playlists.ts';
 import type { State } from './state.ts';
 import { imageHash, readImage } from './images.ts';
 import { imageHeader, withinPixels } from './image-header.ts';
-import { animatedImage, playlistImage, resizeImage } from './media.ts';
+import {
+  animatedImage,
+  imagePixels,
+  playlistImage,
+  resizeImage,
+} from './media.ts';
 import { createArtworkCache } from './artwork-cache.ts';
 import type { Podcasts } from './podcasts.ts';
 import { type ArtworkImage, createArtworkSources } from './artwork-sources.ts';
@@ -48,6 +53,14 @@ export type ArtworkResult = { kind: 'unknown' } | {
   descriptor: ArtworkDescriptor;
   response: Response;
 };
+export type ArtworkPixels = { kind: 'unknown' | 'unavailable' } | {
+  kind: 'pixels';
+  descriptor: ArtworkDescriptor;
+  width: number;
+  height: number;
+  /** Packed, straight (not premultiplied) RGBA; independent of native memory. */
+  rgba: Uint8Array;
+};
 interface Options {
   size?: number;
   username?: string;
@@ -74,6 +87,11 @@ export interface ArtworkService {
     ref: ArtworkRef,
     options?: Pick<Options, 'username'>,
   ): Promise<ArtworkDescription>;
+  /** First-frame aspect fit, no upscale; never encoded bytes or a stand-in tile. */
+  pixels(
+    ref: ArtworkRef,
+    options: Options & { size: number },
+  ): Promise<ArtworkPixels>;
   /** Strings adapt legacy catalog ids and pl- playlist aliases. */
   get(id: string | ArtworkRef, options?: Options): Promise<ArtworkResult>;
   /** HTTP-native convenience for OwnTone: unknown is 404, never error 70. */
@@ -101,6 +119,7 @@ export function createArtwork(library: Library, options: {
   facts?: Store['artwork'];
   /** Native processing port, also lets admission be exercised deterministically. */
   resize?: typeof resizeImage;
+  pixels?: typeof imagePixels;
 } = {}): ArtworkService {
   const concurrent = Math.max(2, Math.floor(navigator.hardwareConcurrency / 2));
   const defaults: Record<string, number> = {
@@ -432,6 +451,40 @@ export function createArtwork(library: Library, options: {
       return selected.kind === 'image'
         ? { kind: 'image', descriptor: selected.descriptor }
         : selected;
+    },
+    async pixels(ref, opts) {
+      const rules = await policy();
+      const selected = await snapshot(ref, opts, rules);
+      if (selected.kind === 'unknown') return selected;
+      if (selected.kind === 'missing') return { kind: 'unavailable' };
+      const header = imageHeader(selected.bytes);
+      if (
+        !Number.isSafeInteger(opts.size) || opts.size <= 0 ||
+        selected.bytes.length > rules.maxBytes ||
+        !withinPixels(header, rules.maxPixels)
+      ) return { kind: 'unavailable' };
+      const ratio = Math.min(
+        1,
+        opts.size / Math.max(header.width, header.height),
+      );
+      const width = Math.max(1, Math.floor(header.width * ratio));
+      const height = Math.max(1, Math.floor(header.height * ratio));
+      try {
+        const rgba = await admitted(() =>
+          (options.pixels ?? imagePixels)(selected.bytes, width, height)
+        );
+        return rgba
+          ? {
+            kind: 'pixels',
+            descriptor: selected.descriptor,
+            width,
+            height,
+            rgba,
+          }
+          : { kind: 'unavailable' };
+      } catch {
+        return { kind: 'unavailable' };
+      }
     },
     get,
     async cover(id, opts) {
