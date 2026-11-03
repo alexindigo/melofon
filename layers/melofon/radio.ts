@@ -1,6 +1,6 @@
 import type { HatContext, HatRequest, SongRow } from './types.ts';
 import { browseInteger, browseLibrary, browseQuery } from './browse.ts';
-import { artistReference, songDetail } from './browse-payloads.ts';
+import { artistReference, browseArtwork } from './browse-payloads.ts';
 import { core, fail } from './errors.ts';
 
 /** Typed catalog mixes use the reference owner, separate from saved stations. */
@@ -58,7 +58,10 @@ export async function radioResponse(
       songs.push(song);
     }
   }
-  return Response.json({ songs: songs.map(songDetail), limit }, {
+  return Response.json({
+    songs: await Promise.all(songs.map(browseArtwork(context).song)),
+    limit,
+  }, {
     headers: { 'Cache-Control': 'private, no-store' },
   });
 }

@@ -1,10 +1,11 @@
 import type { HatContext, HatRequest } from '#melofon/types.ts';
 import { artistReferenceQuery } from '#melofon/artist-reference.ts';
-import { artistSummary } from '#melofon/browse-payloads.ts';
+import { browseArtwork } from '#melofon/browse-payloads.ts';
 
 export default async function (request: HatRequest, context: HatContext) {
   const { artist, folderId, limit, includeNotPresent } =
     await artistReferenceQuery(request, context, true);
+  const payload = browseArtwork(context);
   const info = {
     biography: null,
     musicBrainzId: null,
@@ -39,7 +40,10 @@ export default async function (request: HatRequest, context: HatContext) {
           id: match.id,
         }, folderId);
         if (local) {
-          info.similarArtists.push({ present: true, ...artistSummary(local) });
+          info.similarArtists.push({
+            present: true,
+            ...await payload.artist(local),
+          });
         }
       } else {
         info.similarArtists.push({

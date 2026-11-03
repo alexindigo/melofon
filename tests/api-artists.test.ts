@@ -139,6 +139,7 @@ Deno.test('API artists: album-artist root pages include each present factual pla
         );
         assertEquals(Object.keys(artist).sort(), [
           'albumCount',
+          'artwork',
           'id',
           'kind',
           'label',
@@ -164,6 +165,7 @@ Deno.test('API artists: album-artist root pages include each present factual pla
           musicBrainzId: null,
           sortName: null,
           albumCount: 2,
+          artwork: null,
         },
       );
       assertEquals(
@@ -176,6 +178,7 @@ Deno.test('API artists: album-artist root pages include each present factual pla
           musicBrainzId: null,
           sortName: null,
           albumCount: 1,
+          artwork: null,
         },
       );
       assert(!JSON.stringify(all).includes(f.root));

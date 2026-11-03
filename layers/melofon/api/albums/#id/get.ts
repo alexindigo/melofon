@@ -1,6 +1,6 @@
 import type { HatContext, HatRequest } from '#melofon/types.ts';
 import { browseLibrary, browseQuery } from '#melofon/browse.ts';
-import { albumSummary, songDetail } from '#melofon/browse-payloads.ts';
+import { browseArtwork } from '#melofon/browse-payloads.ts';
 import { catalogResponse } from '#melofon/cache.ts';
 import { core, fail } from '#melofon/errors.ts';
 
@@ -10,6 +10,7 @@ export default async function (request: HatRequest, context: HatContext) {
     context.app.library.getAlbumSnapshot(request.params.id, folderId)
   );
   if (detail === null) fail(404, 'not_found', 'Album not found');
+  const payload = browseArtwork(context);
   return catalogResponse(request, revision, [
     'album',
     1,
@@ -17,8 +18,8 @@ export default async function (request: HatRequest, context: HatContext) {
     folderId ?? null,
   ], {
     album: {
-      ...albumSummary(detail.album),
-      songs: detail.songs.map(songDetail),
+      ...await payload.album(detail.album),
+      songs: await Promise.all(detail.songs.map(payload.song)),
     },
   });
 }

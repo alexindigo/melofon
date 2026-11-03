@@ -1,6 +1,6 @@
 import type { HatContext, HatRequest } from '#melofon/types.ts';
 import { browseLibrary, browseQuery } from '#melofon/browse.ts';
-import { videoDetail } from '#melofon/browse-payloads.ts';
+import { browseArtwork } from '#melofon/browse-payloads.ts';
 import { catalogResponse } from '#melofon/cache.ts';
 import { core, fail } from '#melofon/errors.ts';
 
@@ -14,6 +14,11 @@ export default async function (request: HatRequest, context: HatContext) {
     request,
     snapshot.revision,
     ['video', 1, request.params.id, folderId],
-    { video: videoDetail(snapshot.detail.song, snapshot.detail.details) },
+    {
+      video: await browseArtwork(context).video(
+        snapshot.detail.song,
+        snapshot.detail.details,
+      ),
+    },
   );
 }

@@ -16,7 +16,8 @@ export function matches(field: string | null, etag: string): boolean {
 
 /** Call only after authentication, query validation and resource resolution.
  * The representation key includes its version and canonical query inputs.
- * Only catalog facts belong here: no sidecars, personal or lazy artwork facts. */
+ * Include the returned body: lazy artwork readiness and source versions can
+ * change independently of the catalog revision. Personal reads remain no-store. */
 export async function catalogResponse(
   request: HatRequest,
   revision: string,
@@ -25,7 +26,7 @@ export async function catalogResponse(
 ): Promise<Response> {
   const digest = await crypto.subtle.digest(
     'SHA-256',
-    new TextEncoder().encode(JSON.stringify([revision, representation])),
+    new TextEncoder().encode(JSON.stringify([revision, representation, body])),
   );
   const hash = Array.from(
     new Uint8Array(digest),

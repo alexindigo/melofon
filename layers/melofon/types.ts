@@ -97,6 +97,10 @@ export interface HatContext {
   meta: { jsonMaxBytesSetting?: string };
   app: {
     cfg: { dataDir?: string };
+    hatData: {
+      get(key: string): Promise<{ kind: string; value: unknown } | null>;
+      put(key: string, record: { kind: 'data'; value: unknown }): Promise<void>;
+    };
     artwork: {
       pixels(
         ref: ArtworkRef,

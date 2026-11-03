@@ -1,6 +1,6 @@
 import type { FolderRow, HatContext, HatRequest } from '#melofon/types.ts';
 import { folderPageQuery } from '#melofon/browse.ts';
-import { songDetail } from '#melofon/browse-payloads.ts';
+import { browseArtwork } from '#melofon/browse-payloads.ts';
 import { catalogResponse } from '#melofon/cache.ts';
 import { core } from '#melofon/errors.ts';
 
@@ -19,7 +19,9 @@ export default async function (request: HatRequest, context: HatContext) {
       ...query.folders,
     },
     songs: {
-      songs: pages.songs.rows.map(songDetail),
+      songs: await Promise.all(
+        pages.songs.rows.map(browseArtwork(context).song),
+      ),
       total: pages.songs.total,
       ...query.songs,
     },

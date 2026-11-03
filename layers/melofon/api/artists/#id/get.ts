@@ -1,6 +1,6 @@
 import type { HatContext, HatRequest } from '#melofon/types.ts';
 import { browseLibrary, browseQuery } from '#melofon/browse.ts';
-import { artistReference, artistSummary } from '#melofon/browse-payloads.ts';
+import { artistReference, browseArtwork } from '#melofon/browse-payloads.ts';
 import { catalogResponse } from '#melofon/cache.ts';
 import { core, fail } from '#melofon/errors.ts';
 
@@ -18,5 +18,5 @@ export default async function (request: HatRequest, context: HatContext) {
     1,
     request.params.id,
     folderId ?? null,
-  ], { artist: artistSummary(artist) });
+  ], { artist: await browseArtwork(context).artist(artist) });
 }

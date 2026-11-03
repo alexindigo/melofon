@@ -1,6 +1,6 @@
 import type { HatContext, HatRequest, SongRow } from '#melofon/types.ts';
 import { artistReferenceQuery } from '#melofon/artist-reference.ts';
-import { songDetail } from '#melofon/browse-payloads.ts';
+import { browseArtwork } from '#melofon/browse-payloads.ts';
 
 export default async function (request: HatRequest, context: HatContext) {
   const { artist, folderId, limit } = await artistReferenceQuery(
@@ -22,7 +22,10 @@ export default async function (request: HatRequest, context: HatContext) {
       songs.push(song);
     }
   }
-  return Response.json({ songs: songs.map(songDetail), limit }, {
+  return Response.json({
+    songs: await Promise.all(songs.map(browseArtwork(context).song)),
+    limit,
+  }, {
     headers: { 'Cache-Control': 'private, no-store' },
   });
 }

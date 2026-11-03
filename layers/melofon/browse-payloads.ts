@@ -3,6 +3,7 @@ import type {
   AlbumRow,
   ArtistGroupRef,
   ArtistGroupRow,
+  HatContext,
   Library,
   MediaTrack,
   PlaylistRow,
@@ -10,6 +11,40 @@ import type {
   SongRow,
   VideoDetails,
 } from './types.ts';
+import { artworkFacts } from './artwork-facts.ts';
+
+/** Share one lazy-facts budget and source deduplication across the whole reply. */
+export function browseArtwork(context: HatContext) {
+  const artwork = artworkFacts(context);
+  return {
+    async song(song: SongRow) {
+      return {
+        ...songDetail(song),
+        artwork: await artwork({ kind: 'song', id: song.id }),
+      };
+    },
+    async album(album: AlbumRow) {
+      return {
+        ...albumSummary(album),
+        artwork: await artwork({ kind: 'album', id: album.id }),
+      };
+    },
+    async artist(artist: ArtistGroupRow) {
+      return {
+        ...artistSummary(artist),
+        artwork: artist.kind === 'artist'
+          ? await artwork({ kind: 'artist', id: artist.id! })
+          : null,
+      };
+    },
+    async video(song: SongRow, details: VideoDetails | null) {
+      return {
+        ...videoDetail(song, details),
+        artwork: await artwork({ kind: 'song', id: song.id }),
+      };
+    },
+  };
+}
 
 // Reserved native IDs cannot collide with the catalog's hashed artist IDs.
 export function artistReference(id: string): ArtistGroupRef {

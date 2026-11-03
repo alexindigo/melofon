@@ -1,6 +1,6 @@
 import type { HatContext, HatRequest } from '#melofon/types.ts';
 import { indexPayload, namePageQuery } from '#melofon/browse.ts';
-import { albumSummary, artistReference } from '#melofon/browse-payloads.ts';
+import { artistReference, browseArtwork } from '#melofon/browse-payloads.ts';
 import { catalogResponse } from '#melofon/cache.ts';
 import { core, fail } from '#melofon/errors.ts';
 
@@ -19,7 +19,7 @@ export default async function (request: HatRequest, context: HatContext) {
     request.params.id,
     query,
   ], {
-    albums: page.rows.map(albumSummary),
+    albums: await Promise.all(page.rows.map(browseArtwork(context).album)),
     total: page.total,
     offset: query.offset,
     limit: query.limit,

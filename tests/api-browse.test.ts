@@ -129,6 +129,7 @@ Deno.test('API browse: song detail preserves indexed metadata and relative paths
         suffix: 'mp3',
         contentType: 'audio/mpeg',
         metadata: expectedMetadata,
+        artwork: null,
       });
       assert(body.song.durationMs > 0);
       assert(
