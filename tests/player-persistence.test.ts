@@ -367,6 +367,8 @@ Deno.test('output selection and volume survive a restart', async () => {
     selected: false,
     volume: 100,
   });
+  await outputs.adopt('111');
+  await outputs.adopt('222');
   outputs.update('111', { selected: true, volume: 42 });
   outputs.toggle('222');
   await persistence.drain();
@@ -426,8 +428,8 @@ Deno.test('output model identity survives a restart; legacy rows read unknown', 
   // re-adds the column idempotently.
   await rawSql(db).run('ALTER TABLE output_state DROP COLUMN model');
   await rawSql(db).run(
-    'INSERT INTO output_state (id, host, port, name, type, selected, volume) ' +
-      "VALUES ('legacy', '10.4.10.200', 7000, 'old-atv', 'AirPlay', false, 100)",
+    'INSERT INTO output_state (id, host, port, name, type, selected, volume, adopted) ' +
+      "VALUES ('legacy', '10.4.10.200', 7000, 'old-atv', 'AirPlay', false, 100, true)",
   );
   await rawSql(db).run(
     'ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR',
@@ -444,6 +446,7 @@ Deno.test('output model identity survives a restart; legacy rows read unknown', 
     port: 7000,
     model: 'AppleTV3,1',
   });
+  await outputs.adopt('111');
   await persistence.drain();
   await close(true); // keep the dir — the "restart" reopens it
 
@@ -496,6 +499,7 @@ Deno.test('unregister keeps the persisted row (last-seen state)', async () => {
       host: '192.168.1.50',
       port: 7000,
     });
+    await outputs.adopt('111');
     outputs.update('111', { selected: true, volume: 42 });
     assertEquals(outputs.unregister('111'), true, 'mDNS down unregisters');
     await persistence.drain();

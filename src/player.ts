@@ -294,7 +294,18 @@ export interface Outputs {
   /** Adds a boot's output; last-wins when the id is already registered.
    * Mutations take a provenance source like the player commands (plan
    * command-provenance): [cmd]-logged, no wire surface this round. */
-  register(output: OutputRegistration, source?: CommandSource): void;
+  register(
+    output: OutputRegistration,
+    source?: CommandSource,
+    lifetime?: 'observation' | 'restore',
+  ): void;
+  /** Restore identity/preferences without claiming a current observation. */
+  restore(output: OutputRegistration, source?: CommandSource): void;
+  /** Explicit configuration, never implied by selection or observation. */
+  adopt(id: string): Promise<Output | null>;
+  lifetime(id: string): { adopted: boolean; discovered: boolean };
+  /** Withdraw live presence; adopted identity/preferences remain registered. */
+  withdraw(id: string, source?: CommandSource): void;
   ready(): Promise<void>;
   lastCommand(): OutputCommand | null;
   /** Removes a registered output; false when the id was never registered. */
@@ -321,8 +332,8 @@ export interface Outputs {
   onCommand(fn: (id: string, cmd: { pin?: string }) => void): void;
 }
 
-/** The persisted output remote (output_state row): mDNS-discovered and
- * hand-added alike. Session knobs (devtype/encrypt/…) are not persisted —
+/** The adopted output remote (output_state row). Discovered-only devices
+ * are session-local. Session knobs (devtype/encrypt/…) are not persisted —
  * discovery re-derives them from TXT. The model IS persisted: it is
  * identity, and the ATV3 recycle policy must survive a restart. */
 export interface PersistedOutput {
@@ -337,12 +348,11 @@ export interface PersistedOutput {
   connectionStrategy?: ConnectionStrategy;
 }
 
-/** Persistence port for output remotes (plan restart-transparency):
- * register/update/setEnabled/toggle upsert the full row; unregister keeps
- * it — the row is the last-seen state a re-announced or rebooted device
- * falls back to. Fire-and-forget like the player port. */
+/** Only adopted preferences may be saved. Explicit adoption is awaited;
+ * ordinary preference updates are serialized like the player port. */
 export interface OutputPersistence {
   saveOutput(row: PersistedOutput): void;
+  adoptOutput?(row: PersistedOutput): Promise<void>;
   savedOutput?(id: string): PersistedOutput | undefined;
 }
 
@@ -635,6 +645,12 @@ export function createOutputs(
   const emit = (types: string[]) => notify?.emit(types, undefined, 'all');
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];
+  const adopted = new Set<string>();
+  const discovered = new Set<string>();
+  const isAdopted = (id: string) =>
+    persistence?.savedOutput
+      ? persistence.savedOutput(id) !== undefined
+      : adopted.has(id);
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
   let last: OutputCommand | null = null;
   const record = (
@@ -677,20 +693,22 @@ export function createOutputs(
   const commandListeners = new Set<
     (id: string, cmd: { pin?: string }) => void
   >();
-  const saveRow = (o: Output) =>
-    persistence?.saveOutput({
-      id: o.id,
-      host: o.host,
-      port: o.port,
-      name: o.name,
-      type: o.type,
-      selected: o.selected,
-      volume: o.volume,
-      model: o.model,
-      connectionStrategy: o.connectionStrategy,
-    });
+  const snapshot = (o: Output): PersistedOutput => ({
+    id: o.id,
+    host: o.host,
+    port: o.port,
+    name: o.name,
+    type: o.type,
+    selected: o.selected,
+    volume: o.volume,
+    model: o.model,
+    connectionStrategy: o.connectionStrategy,
+  });
+  const saveRow = (o: Output) => {
+    if (isAdopted(o.id)) persistence?.saveOutput(snapshot(o));
+  };
 
-  return {
+  const api: Outputs = {
     ready: () => initialization,
     lastCommand: () => last,
     list: () => outputs.map((o) => ({ ...o })),
@@ -698,7 +716,40 @@ export function createOutputs(
       const found = find(id);
       return found === null ? null : { ...found };
     },
-    register(output, source) {
+    lifetime: (id) => ({
+      adopted: isAdopted(id),
+      discovered: discovered.has(id),
+    }),
+    restore(output, source) {
+      // Restoration uses the adopted cache, never caller-supplied live facts.
+      api.register(output, source, 'restore');
+    },
+    async adopt(id) {
+      let row = find(id);
+      if (row === null) return null;
+      if (persistence && !persistence.adoptOutput) {
+        throw new Error('speaker adoption persistence unavailable');
+      }
+      // A control change during the write must also be durable on return.
+      let saved: PersistedOutput;
+      do {
+        saved = snapshot(row);
+        await persistence?.adoptOutput?.(saved);
+        row = find(id);
+      } while (
+        row !== null && JSON.stringify(snapshot(row)) !== JSON.stringify(saved)
+      );
+      if (row === null) return null;
+      if (!persistence?.savedOutput) adopted.add(id);
+      emit(['outputs']);
+      return { ...row };
+    },
+    withdraw(id, source) {
+      discovered.delete(id);
+      if (isAdopted(id)) emit(['outputs']);
+      else api.unregister(id, source);
+    },
+    register(output, source, lifetime = 'observation') {
       if (output.connectionStrategy !== undefined) {
         requireConnectionStrategy(output.connectionStrategy);
       }
@@ -715,6 +766,7 @@ export function createOutputs(
           ? defaultStrategy
           : saved.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY);
       requireConnectionStrategy(connectionStrategy);
+      if (lifetime === 'observation') discovered.add(output.id);
       if (idx === -1) outputs.push({ ...output, connectionStrategy });
       else {
         // Model is identity, not a session knob: a model-less same-id
@@ -728,7 +780,7 @@ export function createOutputs(
           ...(model === undefined ? {} : { model }),
         };
       }
-      saveRow(find(output.id)!);
+      if (lifetime === 'observation') saveRow(find(output.id)!);
       record('register', source);
       log.event('command', {
         command: 'output.register',
@@ -741,6 +793,7 @@ export function createOutputs(
       const idx = outputs.findIndex((o) => o.id === id);
       if (idx === -1) return false;
       outputs.splice(idx, 1);
+      discovered.delete(id);
       record('unregister', source);
       // The persisted row stays: last-seen state for a re-announcement.
       log.event('command', {
@@ -839,4 +892,5 @@ export function createOutputs(
       commandListeners.add(fn);
     },
   };
+  return api;
 }

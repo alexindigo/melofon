@@ -42,6 +42,10 @@ async function setup() {
           saveOutput() {
             saves++;
           },
+          adoptOutput() {
+            saves++;
+            return Promise.resolve();
+          },
         },
       });
       admission = createOutputAdmission({
@@ -187,6 +191,8 @@ Deno.test('speaker HTTP reads project discovered facts and failures while OwnTon
       selected: false,
       volume: 100,
       connectionStrategy: 'melofon',
+      adopted: false,
+      discovered: true,
       state: {
         preparation: {
           state: 'ready',

@@ -188,8 +188,8 @@ export async function startServer(options: {
   // a warn), then the snapshot. Auto-resume PLAY only inside the freshness
   // window with the environment still matching; anything else pauses at the
   // saved place, so a stale save can't surprise the household (3am speaker).
-  // First re-register persisted remotes (hand-added and last-seen mDNS
-  // alike) so a saved selection is present for the resume decision.
+  // Only adopted remotes are restored. Identity/preferences are not live
+  // observations and never supply admission facts.
   for (const row of savedOutputs) {
     const existing = outputs.get(row.id);
     if (existing !== null) {
@@ -214,7 +214,7 @@ export async function startServer(options: {
           });
         }
       }
-    } else if (row.host !== undefined) {
+    } else {
       airplay.register({
         id: row.id,
         name: row.name,

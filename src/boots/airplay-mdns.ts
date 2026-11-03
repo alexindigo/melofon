@@ -5,8 +5,8 @@
 //
 // The toggle lives in internal state (app.state, /_/config): key
 // airplay.mdns, unset ⇒ on (the default), 'off' ⇒ off. Flipping off closes
-// the browser and unregisters every discovered output (a playing one tears
-// down like any unregister); flipping on starts a fresh browse.
+// the browser and withdraws every observation. Adopted configuration remains;
+// observation-only rows are released. Flipping on starts a fresh browse.
 //
 // TXT mapping (OwnTone's raop_device_cb): tp must contain "UDP"; am →
 // devtype (helper start token); ek=1 → encrypt; sf bit 9 → needsAuthKey;
@@ -95,7 +95,7 @@ export function createAirplayDiscovery(
     if (event === 'down') {
       const parsed = parseInstance(svc.name);
       if (parsed !== null && discovered.delete(parsed.id)) {
-        outputs.unregister(parsed.id, {
+        deps.devices.withdraw(parsed.id, {
           kind: 'internal',
           via: 'airplay-discovery',
         });
@@ -166,6 +166,7 @@ export function createAirplayDiscovery(
     // TXT without `am` neither erases nor churns the known model.
     if (
       existing !== null &&
+      outputs.lifetime(parsed.id).discovered &&
       existing.host === svc.address &&
       existing.port === svc.port &&
       signatures.get(parsed.id) === signature &&
@@ -240,7 +241,7 @@ export function createAirplayDiscovery(
     browser?.close();
     browser = null;
     for (const id of discovered) {
-      outputs.unregister(id, { kind: 'internal', via: 'airplay-discovery' });
+      deps.devices.withdraw(id, { kind: 'internal', via: 'airplay-discovery' });
     }
     discovered.clear();
   };

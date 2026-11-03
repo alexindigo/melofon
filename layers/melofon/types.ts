@@ -483,6 +483,8 @@ export interface SessionPlaybackReport {
 }
 
 export interface SpeakerView {
+  adopted: boolean;
+  discovered: boolean;
   id: string;
   name: string;
   protocol: string;

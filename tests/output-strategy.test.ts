@@ -92,7 +92,7 @@ Deno.test('strategies: invalid mixed strategy command has zero state/save/PIN/no
     )
   );
   assertEquals(outputs.get('1'), before);
-  assertEquals([saves, pins, emits], [1, 0, 0]);
+  assertEquals([saves, pins, emits], [0, 0, 0]);
 });
 
 Deno.test('strategies: invalid known state value is rejected before SQL or onChange', async () => {
@@ -126,6 +126,7 @@ Deno.test('strategies: native API, new-ID default, saved-cache gap and reopen pr
     assertEquals(await s.state.get(KEY), null);
     assertEquals(await s.state.getTyped(KEY), 'melofon');
     s.outputs.register(registration('1'), source);
+    await s.outputs.adopt('1');
     let result = await jsonPut('http://x/outputs/1', {
       connectionStrategy: 'audiostation',
     });
@@ -135,6 +136,7 @@ Deno.test('strategies: native API, new-ID default, saved-cache gap and reopen pr
     assertEquals(result.status, 200);
     assertEquals(strategy(s.outputs.get('1')), 'audiostation');
     s.outputs.register(registration('2'), source);
+    await s.outputs.adopt('2');
     assertEquals(strategy(s.outputs.get('2')), 'owntone');
     s.outputs.update('1', { selected: true, volume: 42 }, source);
     s.outputs.unregister('1', source);
@@ -212,7 +214,7 @@ Deno.test('strategies: migration backfills legacy Melofon, does not overwrite sa
       'ALTER TABLE output_state DROP COLUMN IF EXISTS connection_strategy',
     );
     await rawSql(s.db).run(
-      "INSERT INTO output_state (id,name,type,selected,volume) VALUES ('legacy','old','AirPlay',false,100)",
+      "INSERT INTO output_state (id,name,type,selected,volume,adopted) VALUES ('legacy','old','AirPlay',false,100,true)",
     );
     await s.state.set(KEY, 'owntone');
     await s.db.close();
@@ -325,6 +327,7 @@ Deno.test('all three native choices survive real discovery registration gaps, un
     }
     for (let i = 1; i <= 3; i++) {
       announce('up', service(i));
+      await s.outputs.adopt(String(i));
       const put = await s.core(
         new Request(`http://x/outputs/${i}`, {
           method: 'PUT',
@@ -339,7 +342,10 @@ Deno.test('all three native choices survive real discovery registration gaps, un
     await s.state.set(KEY, 'audiostation');
     for (let i = 1; i <= 3; i++) {
       announce('down', service(i));
-      assertEquals(s.outputs.get(String(i)), null);
+      assertEquals(s.outputs.lifetime(String(i)), {
+        adopted: true,
+        discovered: false,
+      });
       announce('up', service(i, true));
       assertEquals(
         s.outputs.get(String(i))?.connectionStrategy,

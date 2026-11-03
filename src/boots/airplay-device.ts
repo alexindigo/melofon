@@ -61,7 +61,10 @@ export function createAirplayDevices(deps: {
         !signal.aborted && current?.host === endpoint.address &&
         current.port === endpoint.port
       ) {
-        if (config.model !== undefined && current.model !== config.model) {
+        if (
+          !outputs.lifetime(endpoint.id).discovered ||
+          (config.model !== undefined && current.model !== config.model)
+        ) {
           outputs.register({
             ...current,
             model: config.model,
@@ -105,13 +108,20 @@ export function createAirplayDevices(deps: {
     admission,
     protocol,
     observe: accept,
+    withdraw(id: string, source?: CommandSource) {
+      // Withdrawal is not forgetting: revoke live facts/attempts first, then
+      // release only observation-owned registry entries.
+      admission.invalidate(id);
+      outputs.withdraw(id, source);
+    },
     register(
       row: OutputRegistration,
       source?: CommandSource,
       service?: MdnsService,
     ) {
       const id = row.id;
-      outputs.register(row, source);
+      if (service) outputs.register(row, source);
+      else outputs.restore(row, source);
       if (service) {
         try {
           accept(id, service);
@@ -137,7 +147,7 @@ export function createAirplayDevices(deps: {
     ) {
       const id = outputs.list().find((o) => o.host === input.host)?.id ??
         airplayOutputId(input.host);
-      outputs.register({
+      outputs.restore({
         id,
         name: input.name,
         host: input.host,
@@ -158,6 +168,7 @@ export function createAirplayDevices(deps: {
         refresh: true,
         isCurrent: () => outputs.get(id) !== null,
       });
+      await outputs.adopt(id);
       return outputs.get(id);
     },
     close() {

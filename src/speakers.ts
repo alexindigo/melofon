@@ -16,13 +16,15 @@ export interface SpeakerView {
   selected: boolean;
   volume: number;
   connectionStrategy: Output['connectionStrategy'];
+  adopted: boolean;
+  discovered: boolean;
   state: SpeakerAdapterView;
 }
 
 /** One protocol-neutral read boundary over control preferences and live facts.
  * Reading never acquires facts, starts a session or saves configuration. */
 export function createSpeakers(deps: {
-  outputs: Pick<Outputs, 'list' | 'get'>;
+  outputs: Pick<Outputs, 'list' | 'get' | 'lifetime'>;
   adapterView(id: string): SpeakerAdapterView;
 }) {
   const view = (row: Output): SpeakerView => ({
@@ -35,6 +37,7 @@ export function createSpeakers(deps: {
     selected: row.selected,
     volume: row.volume,
     connectionStrategy: row.connectionStrategy,
+    ...deps.outputs.lifetime(row.id),
     state: structuredClone(deps.adapterView(row.id)),
   });
   return {
