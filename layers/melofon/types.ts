@@ -124,6 +124,10 @@ export interface HatContext {
   meta: { jsonMaxBytesSetting?: string };
   app: {
     cfg: { dataDir?: string };
+    speakers: {
+      list(): SpeakerView[];
+      get(id: string): SpeakerView | null;
+    };
     radio: {
       list(): Promise<StationRow[]>;
       get(id: string): Promise<StationRow | null>;
@@ -476,6 +480,27 @@ export interface SessionPlaybackReport {
   positionMs: number;
   playbackRate: number;
   ignoreScrobble: boolean;
+}
+
+export interface SpeakerView {
+  id: string;
+  name: string;
+  protocol: string;
+  address?: string;
+  port?: number;
+  model?: string;
+  selected: boolean;
+  volume: number;
+  connectionStrategy: 'melofon' | 'owntone' | 'audiostation';
+  state: {
+    preparation: {
+      state: 'unresolved' | 'preparing' | 'ready' | 'failed';
+      targetRevision: number;
+      source?: string;
+      expiresAt?: number;
+      error?: { code: string; message: string };
+    };
+  };
 }
 
 export interface SavedQueue {

@@ -43,6 +43,7 @@ import { createAirplayBoot } from './boots/airplay.ts';
 import { createAirplayDiscovery } from './boots/airplay-mdns.ts';
 import { createAirplayDevices } from './boots/airplay-device.ts';
 import { createOutputAdmission } from './output-admission.ts';
+import { createSpeakers } from './speakers.ts';
 import { createHats, type Hats } from './hats.ts';
 import { createHatServices } from './hat-service.ts';
 import { createHatData } from './hat-data.ts';
@@ -139,6 +140,10 @@ export async function startServer(options: {
     changed: () => notify.emit(['outputs'], undefined, 'all'),
   });
   const airplay = createAirplayDevices({ outputs, admission: outputAdmission });
+  const speakers = createSpeakers({
+    outputs,
+    adapterView: (id) => ({ preparation: outputAdmission.describe(id) }),
+  });
   const discovery = createAirplayDiscovery({
     outputs,
     state,
@@ -315,6 +320,7 @@ export async function startServer(options: {
     }),
     player,
     outputs,
+    speakers,
     notify,
     state,
     binds: createBinds(() => hats?.layers() ?? [], mapping),
