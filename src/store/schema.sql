@@ -347,6 +347,12 @@ ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR;
 -- Connection strategies: legacy speakers retain the chosen Melofon policy.
 ALTER TABLE output_state ADD COLUMN IF NOT EXISTS connection_strategy VARCHAR DEFAULT 'melofon';
 UPDATE output_state SET connection_strategy = 'melofon' WHERE connection_strategy IS NULL;
+-- Adoption is explicit for new rows. The release migration preserves every
+-- previously saved row once, without guessing historical user intent.
+ALTER TABLE output_state ADD COLUMN IF NOT EXISTS adopted BOOLEAN DEFAULT false;
+CREATE TABLE IF NOT EXISTS speaker_ignores (
+  id VARCHAR PRIMARY KEY
+);
 -- H3 star history: every star and unstar is one appended event. Rows are
 -- never updated or deleted. seq (from star_event_seq) orders a user's events
 -- for an item. The latest event says whether the item is starred now, and

@@ -1,4 +1,7 @@
 import { type Engine, esc } from './engine.ts';
+import { createSpeakersStore } from './speakers.ts';
+
+export type { OutputSnapshot } from './speakers.ts';
 
 export interface PlayerSnapshot {
   state: 'play' | 'pause' | 'stop';
@@ -15,20 +18,10 @@ export interface PersistedPlayerState extends PlayerSnapshot {
   updatedAtMs: number;
 }
 
-/** Storage data only; the persistence service validates transport policy. */
-export interface OutputSnapshot {
-  id: string;
-  host?: string;
-  port?: number;
-  name: string;
-  type: string;
-  selected: boolean;
-  volume: number;
-  model?: string;
-  connectionStrategy?: string;
-}
-
-export function createPlaybackStore(engine: Engine) {
+export function createPlaybackStore(
+  engine: Engine,
+  speakers = createSpeakersStore(engine),
+) {
   return {
     saveQueue(songIds: string[]): Promise<void> {
       return engine.exclusive(async (q) => {
@@ -117,63 +110,7 @@ export function createPlaybackStore(engine: Engine) {
       });
     },
 
-    saveOutput(
-      row: OutputSnapshot & { connectionStrategy: string },
-    ): Promise<void> {
-      return engine.exclusive(async (q) => {
-        await q.run(
-          `INSERT INTO output_state (id, host, port, name, type, selected,
-             volume, model, connection_strategy)
-           VALUES (${esc(row.id)},
-             ${row.host === undefined ? 'NULL' : esc(row.host)},
-             ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
-             ${esc(row.name)}, ${esc(row.type)},
-             ${row.selected}, ${Math.trunc(row.volume)},
-             ${row.model === undefined ? 'NULL' : esc(row.model)}, ${
-            esc(row.connectionStrategy)
-          })
-           ON CONFLICT (id) DO UPDATE SET
-             host = excluded.host,
-             port = excluded.port,
-             name = excluded.name,
-             type = excluded.type,
-             selected = excluded.selected,
-             volume = excluded.volume,
-             model = excluded.model,
-             connection_strategy = excluded.connection_strategy`,
-        );
-      });
-    },
-
-    loadOutputs(): Promise<OutputSnapshot[]> {
-      return engine.exclusive(async (q) => {
-        const rows = await q.all<{
-          id: string;
-          host: string | null;
-          port: number | null;
-          name: string | null;
-          type: string | null;
-          selected: boolean;
-          volume: number;
-          model: string | null;
-          connection_strategy: string | null;
-        }>(
-          'SELECT id, host, port, name, type, selected, volume, model, connection_strategy FROM output_state',
-        );
-        return rows.map((row) => ({
-          id: row.id,
-          ...(row.host === null ? {} : { host: row.host }),
-          ...(row.port === null ? {} : { port: Number(row.port) }),
-          name: row.name ?? '',
-          type: row.type ?? '',
-          selected: row.selected,
-          volume: Number(row.volume),
-          ...(row.model === null ? {} : { model: row.model }),
-          ...(row.connection_strategy === null
-            ? {}
-            : { connectionStrategy: row.connection_strategy }),
-        }));
-      });
-    },
+    saveOutput: speakers.saveOutput,
+    loadOutputs: speakers.loadOutputs,
   };
 }
