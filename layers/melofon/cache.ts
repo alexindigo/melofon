@@ -2,7 +2,7 @@ import type { HatRequest } from './types.ts';
 
 /** HTTP weak comparison, including lists and commas inside opaque tags. A
  * malformed field is ignored; it cannot turn an authorized read into a 304. */
-function matches(field: string | null, etag: string): boolean {
+export function matches(field: string | null, etag: string): boolean {
   if (field === null) return false;
   if (field.trim() === '*') return true;
   const tag = '(?:W/)?"[\\x21\\x23-\\x7e\\x80-\\xff]*"';

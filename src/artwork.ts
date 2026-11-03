@@ -51,6 +51,8 @@ export type ArtworkResult = { kind: 'unknown' } | {
 } | {
   kind: 'image';
   descriptor: ArtworkDescriptor;
+  /** Fallback bytes are valid, but must not make a transient failure immutable. */
+  rendition: 'original' | 'resized' | 'fallback';
   response: Response;
 };
 export type ArtworkPixels = { kind: 'unknown' | 'unavailable' } | {
@@ -388,7 +390,12 @@ export function createArtwork(library: Library, options: {
       header.animated && header.format !== 'gif' ||
       !header.animated && size >= Math.max(header.width, header.height)
     ) {
-      return { kind: 'image', descriptor, response: response(source) };
+      return {
+        kind: 'image',
+        descriptor,
+        rendition: 'original',
+        response: response(source),
+      };
     }
     const format = header.format === 'png'
       ? 'png'
@@ -398,7 +405,7 @@ export function createArtwork(library: Library, options: {
     const quality = rules.quality;
     const key = `${await imageHash(
       new TextEncoder().encode(
-        `${descriptor.sourceHash}:${size}:${format}:${quality}`,
+        `${descriptor.version}:${size}:${format}:${quality}`,
       ),
     )}.${format}`;
     const limit = await setting('cacheMegabytes') * 1024 * 1024;
@@ -407,6 +414,7 @@ export function createArtwork(library: Library, options: {
       return {
         kind: 'image',
         descriptor,
+        rendition: 'resized',
         response: response({ bytes: cached, format: `image/${format}` }, 'hit'),
       };
     }
@@ -429,11 +437,17 @@ export function createArtwork(library: Library, options: {
         return {
           kind: 'image',
           descriptor,
+          rendition: 'resized',
           response: response({ bytes, format: `image/${format}` }, 'miss'),
         };
       }
     } catch { /* Navidrome resize.go: failed resize serves original bytes. */ }
-    return { kind: 'image', descriptor, response: response(source) };
+    return {
+      kind: 'image',
+      descriptor,
+      rendition: 'fallback',
+      response: response(source),
+    };
   }
   return {
     async hasArtistPhoto(id) {

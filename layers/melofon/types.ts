@@ -117,6 +117,7 @@ export interface HatContext {
         { kind: 'unknown' } | { kind: 'placeholder'; response: Response } | {
           kind: 'image';
           descriptor: ArtworkDescriptor;
+          rendition: 'original' | 'resized' | 'fallback';
           response: Response;
         }
       >;
