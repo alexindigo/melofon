@@ -383,7 +383,7 @@ Deno.test('non-AirTunes (no UDP in tp) and odd instance names are skipped', asyn
 });
 
 Deno.test('manual registration wins the host; discovery does not duplicate', async () => {
-  const { outputs, browsers, logs, discovery } = await setup();
+  const { outputs, browsers, discovery } = await setup();
   try {
     await settle();
     outputs.register({
@@ -398,7 +398,7 @@ Deno.test('manual registration wins the host; discovery does not duplicate', asy
     const list = outputs.list();
     assertEquals(list.length, 1);
     assertEquals(list[0].id, 'manual');
-    assert(logs.some((l) => JSON.parse(l).reason === 'host_owned'));
+    assertEquals(list[0].receiverIdentity, BigInt('0xA4B2C1D2E3F4').toString());
   } finally {
     discovery.close();
   }

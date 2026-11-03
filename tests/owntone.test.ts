@@ -10,6 +10,7 @@ import { scanLibrary } from '../src/scan.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
+import { createSpeakers } from '../src/speakers.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
@@ -76,6 +77,11 @@ async function setup(env: Record<string, string> = {}) {
       cfg,
       outputs,
       airplay: devices,
+      speakers: createSpeakers({
+        outputs,
+        registerAddress: devices.registerAddress,
+        adapterView: (id) => ({ preparation: devices.admission.describe(id) }),
+      }),
       outputAdmission: devices.admission,
     },
   });

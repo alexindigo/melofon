@@ -142,13 +142,8 @@ export async function startServer(options: {
   const airplay = createAirplayDevices({ outputs, admission: outputAdmission });
   const speakers = createSpeakers({
     outputs,
+    registerAddress: airplay.registerAddress,
     adapterView: (id) => ({ preparation: outputAdmission.describe(id) }),
-  });
-  const discovery = createAirplayDiscovery({
-    outputs,
-    state,
-    devices: airplay,
-    savedOutput: (id) => persistence.savedOutput(id),
   });
   const library = createLibrary(store, lyrics, {
     dataDir: cfg.dataDir,
@@ -173,6 +168,7 @@ export async function startServer(options: {
     cfg,
     libraries,
     outputs,
+    speakers,
     playback,
     state,
     airplay,
@@ -193,7 +189,7 @@ export async function startServer(options: {
   for (const row of savedOutputs) {
     const existing = outputs.get(row.id);
     if (existing !== null) {
-      // Discovery beat the restore: keep its fresh record, apply user state.
+      // Keep any already registered facts, applying only saved user state.
       outputs.update(row.id, {
         selected: row.selected,
         volume: row.volume,
@@ -225,9 +221,19 @@ export async function startServer(options: {
         host: row.host,
         ...(row.port === undefined ? {} : { port: row.port }),
         ...(row.model === undefined ? {} : { model: row.model }),
+        ...(row.receiverIdentity === undefined
+          ? {}
+          : { receiverIdentity: row.receiverIdentity }),
       }, { kind: 'internal', via: 'restore' });
     }
   }
+  // Install saved receiver bindings before browsing can introduce aliases.
+  const discovery = createAirplayDiscovery({
+    outputs,
+    state,
+    devices: airplay,
+    savedOutput: (id) => persistence.savedOutput(id),
+  });
   const restoreSnapshot = await planRestore({
     queueIds: await persistence.loadQueue(),
     saved: await persistence.loadPlayerState(),

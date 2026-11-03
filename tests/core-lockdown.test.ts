@@ -2,6 +2,7 @@ import { assert, assertEquals } from '@std/assert';
 import { apiFixture } from './helpers/api.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createOutputs } from '../src/player.ts';
+import { createSpeakers } from '../src/speakers.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
 import { PreparationError } from '../src/output-admission.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
@@ -195,6 +196,13 @@ Deno.test('core lockdown: loopback config, libraries, all outputs routes and dia
         libraries: createLibraries(f.store, { dataDir: f.dir }),
         outputs,
         airplay,
+        speakers: createSpeakers({
+          outputs,
+          registerAddress: airplay.registerAddress,
+          adapterView: (id) => ({
+            preparation: airplay.admission.describe(id),
+          }),
+        }),
         outputAdmission: airplay.admission,
         playback: { lastCommand: () => null },
       };

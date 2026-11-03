@@ -350,6 +350,9 @@ UPDATE output_state SET connection_strategy = 'melofon' WHERE connection_strateg
 -- Adoption is explicit for new rows. The release migration preserves every
 -- previously saved row once, without guessing historical user intent.
 ALTER TABLE output_state ADD COLUMN IF NOT EXISTS adopted BOOLEAN DEFAULT false;
+-- Acquired receiver identity survives address changes. Existing installs retain
+-- unknown identity until acquisition. An address is never a receiver binding.
+ALTER TABLE output_state ADD COLUMN IF NOT EXISTS receiver_identity VARCHAR;
 CREATE TABLE IF NOT EXISTS speaker_ignores (
   id VARCHAR PRIMARY KEY
 );

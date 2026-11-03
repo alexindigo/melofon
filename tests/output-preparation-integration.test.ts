@@ -11,6 +11,7 @@ import { createNotify } from '../src/notify.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createMedia } from '../src/media.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { createSpeakers } from '../src/speakers.ts';
 import { createAirplayDiscovery } from '../src/boots/airplay-mdns.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createMdnsResolver } from '../src/mdns-resolver.ts';
@@ -215,6 +216,13 @@ Deno.test({
                 cfg: {},
                 outputs,
                 airplay: devices,
+                speakers: createSpeakers({
+                  outputs,
+                  registerAddress: devices.registerAddress,
+                  adapterView: (id) => ({
+                    preparation: devices.admission.describe(id),
+                  }),
+                }),
                 outputAdmission: devices.admission,
               },
             });

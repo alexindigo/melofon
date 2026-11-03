@@ -3,7 +3,7 @@
 // resolves `_raop._tcp` at the host and copies device TXT when it answers;
 // a timeout still registers the row but without pretending md=7. The id is
 // stable from the host (or the discovered instance if that row exists).
-import type { AirplayDevices } from '../../src/boots/airplay-device.ts';
+import { SpeakerError, type Speakers } from '../../src/speakers.ts';
 import { isConnectionStrategy } from '../../src/connection-strategy.ts';
 import {
   type CommandSource,
@@ -19,7 +19,7 @@ interface OutputsApp {
       get(id: string): Output | null;
       register(output: OutputRegistration, source?: CommandSource): void;
     };
-    airplay: AirplayDevices;
+    speakers: Speakers;
   };
 }
 
@@ -72,16 +72,25 @@ export default async function (
     return badRequest('port must be a positive integer');
   }
   const address = host.trim();
-  const output = await context.app.airplay.registerAddress({
-    name: name.trim(),
-    host: address,
-    ...(port === undefined ? {} : { port: port as number }),
-    ...(connectionStrategy === undefined ? {} : { connectionStrategy }),
-  }, source);
-  return {
-    output: output === null ? null : {
-      ...output,
-      preparation: context.app.airplay.admission.describe(output.id),
-    },
-  };
+  try {
+    const speaker = await context.app.speakers.add({
+      protocol: type,
+      name: name.trim(),
+      address,
+      ...(port === undefined ? {} : { port: port as number }),
+      ...(connectionStrategy === undefined ? {} : { connectionStrategy }),
+    }, source);
+    const output = context.app.outputs.get(speaker.id);
+    return {
+      output: output === null ? null : {
+        ...output,
+        preparation: speaker.state.preparation,
+      },
+    };
+  } catch (error) {
+    if (!(error instanceof SpeakerError)) throw error;
+    return Response.json({ error: error.message }, {
+      status: error.code === 'persistence_failed' ? 500 : 400,
+    });
+  }
 }

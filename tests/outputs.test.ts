@@ -4,6 +4,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { createOutputs } from '../src/player.ts';
+import { createSpeakers } from '../src/speakers.ts';
 import type { MdnsService } from '../src/mdns.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
 import { PreparationError } from '../src/output-admission.ts';
@@ -23,7 +24,17 @@ async function setup() {
   });
   const core = await pathfinder({
     roots: ['core/'],
-    app: { cfg: {}, outputs, airplay, outputAdmission: airplay.admission },
+    app: {
+      cfg: {},
+      outputs,
+      airplay,
+      outputAdmission: airplay.admission,
+      speakers: createSpeakers({
+        outputs,
+        registerAddress: airplay.registerAddress,
+        adapterView: (id) => ({ preparation: airplay.admission.describe(id) }),
+      }),
+    },
   });
   return { core, outputs };
 }
@@ -176,6 +187,11 @@ Deno.test('core /_/outputs copies TXT when unicast resolve answers', async () =>
       cfg: {},
       outputs,
       airplay,
+      speakers: createSpeakers({
+        outputs,
+        registerAddress: airplay.registerAddress,
+        adapterView: (id) => ({ preparation: airplay.admission.describe(id) }),
+      }),
       outputAdmission: airplay.admission,
     },
   });
@@ -226,6 +242,11 @@ Deno.test('core /_/outputs re-registration: model preserved on timeout, replaced
       cfg: {},
       outputs,
       airplay,
+      speakers: createSpeakers({
+        outputs,
+        registerAddress: airplay.registerAddress,
+        adapterView: (id) => ({ preparation: airplay.admission.describe(id) }),
+      }),
       outputAdmission: airplay.admission,
     },
   });

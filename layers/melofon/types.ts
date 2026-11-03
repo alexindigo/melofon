@@ -127,6 +127,13 @@ export interface HatContext {
     speakers: {
       list(): SpeakerView[];
       get(id: string): SpeakerView | null;
+      add(input: unknown, source?: Source): Promise<SpeakerView>;
+      adopt(id: string): Promise<SpeakerView>;
+      configure(
+        id: string,
+        input: unknown,
+        source?: Source,
+      ): Promise<SpeakerView>;
     };
     radio: {
       list(): Promise<StationRow[]>;

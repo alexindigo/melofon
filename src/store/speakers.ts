@@ -10,6 +10,7 @@ export interface OutputSnapshot {
   selected: boolean;
   volume: number;
   model?: string;
+  receiverIdentity?: string;
   connectionStrategy?: string;
 }
 
@@ -29,14 +30,17 @@ async function save(
 ): Promise<void> {
   await q.run(
     `INSERT INTO output_state (id, host, port, name, type, selected,
-       volume, model, connection_strategy, adopted)
+       volume, model, connection_strategy, adopted, receiver_identity)
      VALUES (${esc(row.id)},
        ${row.host === undefined ? 'NULL' : esc(row.host)},
        ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
        ${esc(row.name)}, ${esc(row.type)},
        ${row.selected}, ${Math.trunc(row.volume)},
        ${row.model === undefined ? 'NULL' : esc(row.model)},
-       ${esc(row.connectionStrategy)}, ${adopted})
+       ${esc(row.connectionStrategy)}, ${adopted},
+       ${
+      row.receiverIdentity === undefined ? 'NULL' : esc(row.receiverIdentity)
+    })
      ON CONFLICT (id) DO UPDATE SET
        host = excluded.host,
        port = excluded.port,
@@ -45,6 +49,7 @@ async function save(
        selected = excluded.selected,
        volume = excluded.volume,
        model = excluded.model,
+       receiver_identity = excluded.receiver_identity,
        connection_strategy = excluded.connection_strategy,
        adopted = output_state.adopted OR excluded.adopted`,
   );
@@ -63,10 +68,11 @@ async function load(
     selected: boolean;
     volume: number;
     model: string | null;
+    receiver_identity: string | null;
     connection_strategy: string | null;
   }>(
     `SELECT id, host, port, name, type, selected, volume, model,
-       connection_strategy FROM output_state${
+       connection_strategy, receiver_identity FROM output_state${
       adoptedOnly ? ' WHERE adopted' : ''
     }
      ORDER BY id`,
@@ -80,6 +86,9 @@ async function load(
     selected: row.selected,
     volume: Number(row.volume),
     ...(row.model === null ? {} : { model: row.model }),
+    ...(row.receiver_identity === null
+      ? {}
+      : { receiverIdentity: row.receiver_identity }),
     ...(row.connection_strategy === null
       ? {}
       : { connectionStrategy: row.connection_strategy }),

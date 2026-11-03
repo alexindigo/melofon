@@ -14,6 +14,13 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
     if (error.name === 'HlsError') {
       fail(400, String(code), error.message);
     }
+    if (error.name === 'SpeakerError') {
+      fail(
+        code === 'not_found' ? 404 : code === 'persistence_failed' ? 500 : 400,
+        String(code),
+        error.message,
+      );
+    }
     if (error.name === 'StreamError') {
       fail(
         code === 'incompatible_media' ? 422 : 500,

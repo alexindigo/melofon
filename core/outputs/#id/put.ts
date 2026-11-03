@@ -1,13 +1,14 @@
 // Native output settings; automatically discovered by the core router.
 import { isConnectionStrategy } from '../../../src/connection-strategy.ts';
 import { type Outputs, sourceFromRequest } from '../../../src/player.ts';
+import { SpeakerError, type Speakers } from '../../../src/speakers.ts';
 
 export default async function (request: {
   params: { id: string };
   body: { json(): Promise<unknown> };
   headers?: { get(name: string): string | null };
   remoteAddr?: { hostname?: string };
-}, context: { app: { outputs: Pick<Outputs, 'update'> } }) {
+}, context: { app: { outputs: Pick<Outputs, 'get'>; speakers: Speakers } }) {
   let body: unknown;
   try {
     body = await request.body.json();
@@ -23,10 +24,22 @@ export default async function (request: {
       error: 'connectionStrategy must be an exact strategy',
     }, { status: 400 });
   }
-  const output = context.app.outputs.update(request.params.id, {
-    connectionStrategy: body.connectionStrategy,
-  }, sourceFromRequest(request));
-  return output === null
-    ? Response.json({ error: 'output not found' }, { status: 404 })
-    : { output };
+  try {
+    const speaker = await context.app.speakers.configure(request.params.id, {
+      connectionStrategy: body.connectionStrategy,
+    }, sourceFromRequest(request));
+    const output = context.app.outputs.get(speaker.id);
+    return output === null
+      ? Response.json({ error: 'output not found' }, { status: 404 })
+      : { output };
+  } catch (error) {
+    if (!(error instanceof SpeakerError)) throw error;
+    return Response.json({ error: error.message }, {
+      status: error.code === 'not_found'
+        ? 404
+        : error.code === 'persistence_failed'
+        ? 500
+        : 400,
+    });
+  }
 }

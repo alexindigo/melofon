@@ -1,7 +1,7 @@
 // src/boots/airplay-mdns.ts — AirPlay 1 discovery: browses _raop._tcp via
 // src/mdns.ts (querier only — no Avahi, no daemon) and registers devices as
-// outputs. Dedupe is by host: a manually-registered device (POST /_/outputs,
-// MELOFON_AIRPLAY_HOST) wins over a discovered one at the same address.
+// outputs. The adapter reconciles acquired receiver identity with provisional
+// address registrations; an address alone cannot replace a bound receiver.
 //
 // The toggle lives in internal state (app.state, /_/config): key
 // airplay.mdns, unset ⇒ on (the default), 'off' ⇒ off. Flipping off closes
@@ -20,6 +20,7 @@ import type { State } from '../state.ts';
 import type { ConnectionStrategy } from '../connection-strategy.ts';
 import type { AirplayDevices } from './airplay-device.ts';
 import { profileFromService } from './airplay-profile.ts';
+import { airplayInstance } from './airplay-address.ts';
 export {
   devtypeFromAm,
   sessionFieldsFromTxt,
@@ -31,14 +32,7 @@ export const MDNS_KEY = 'airplay.mdns';
 
 /** Parse the mDNS instance name: <64-bit hex id>@<pretty name>, with the
  * `._raop._tcp.local` domain suffix stripped (the label is `id@name`). */
-function parseInstance(name: string): { id: string; name: string } | null {
-  const label = name.replace(/\._raop\._tcp\.local\.?$/i, '');
-  const at = label.indexOf('@');
-  if (at < 1 || at + 1 >= label.length) return null;
-  const hex = label.slice(0, at);
-  if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
-  return { id: BigInt(`0x${hex}`).toString(10), name: label.slice(at + 1) };
-}
+const parseInstance = airplayInstance;
 
 export interface AirplayDiscoveryDeps {
   outputs: Outputs;
@@ -94,8 +88,9 @@ export function createAirplayDiscovery(
   const onService = (event: 'up' | 'down', svc: MdnsService) => {
     if (event === 'down') {
       const parsed = parseInstance(svc.name);
-      if (parsed !== null && discovered.delete(parsed.id)) {
-        deps.devices.withdraw(parsed.id, {
+      const id = parsed === null ? null : deps.devices.observationId(svc);
+      if (id !== null && discovered.delete(id)) {
+        deps.devices.withdraw(id, {
           kind: 'internal',
           via: 'airplay-discovery',
         });
@@ -115,6 +110,7 @@ export function createAirplayDiscovery(
       });
       return;
     }
+    parsed.id = deps.devices.observationId(svc);
 
     if (svc.txt.pw !== undefined && svc.txt.pw !== 'false') {
       const existing = outputs.get(parsed.id);
@@ -125,7 +121,9 @@ export function createAirplayDiscovery(
       deps.devices.register(
         {
           id: parsed.id,
-          name: parsed.name,
+          name: existing && outputs.lifetime(parsed.id).adopted
+            ? existing.name
+            : parsed.name,
           type: 'AirPlay',
           host: svc.address,
           port: svc.port,
@@ -176,18 +174,6 @@ export function createAirplayDiscovery(
       return;
     }
 
-    // Host dedupe is for a DIFFERENT device claiming an owned address (a
-    // manual registration wins over discovery). The same device updating
-    // its own record is not a conflict.
-    if (
-      outputs.list().some((o) => o.id !== parsed.id && o.host === svc.address)
-    ) {
-      log.event('discovery_skipped', {
-        instance: parsed.name,
-        reason: 'host_owned',
-      });
-      return;
-    }
     if (svc.txt.pw !== undefined && svc.txt.pw !== 'false') {
       log.event('discovery_password', { instance: parsed.name });
     }
@@ -206,7 +192,9 @@ export function createAirplayDiscovery(
     deps.devices.register(
       {
         id: parsed.id,
-        name: parsed.name,
+        name: existing && outputs.lifetime(parsed.id).adopted
+          ? existing.name
+          : parsed.name,
         type: 'AirPlay',
         // Re-announcement must never wipe user state: an ethernet→wifi move
         // replaces the record (identity, address, TXT fields) but keeps

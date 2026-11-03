@@ -271,6 +271,8 @@ export interface Output {
    * re-registration, and what the boot's affected-model predicate matches
    * (plan atv3-session-recycle). */
   model?: string;
+  /** Adapter-acquired stable receiver identity, never an address or live fact. */
+  receiverIdentity?: string;
   /** TXT `sf` bit 9: device verification. OwnTone `requires_auth`. */
   requiresAuth?: boolean;
   /** The device wants a PIN/password (OwnTone needs_auth_key on the wire);
@@ -345,6 +347,7 @@ export interface PersistedOutput {
   selected: boolean;
   volume: number;
   model?: string;
+  receiverIdentity?: string;
   connectionStrategy?: ConnectionStrategy;
 }
 
@@ -702,6 +705,7 @@ export function createOutputs(
     selected: o.selected,
     volume: o.volume,
     model: o.model,
+    receiverIdentity: o.receiverIdentity,
     connectionStrategy: o.connectionStrategy,
   });
   const saveRow = (o: Output) => {
@@ -772,12 +776,16 @@ export function createOutputs(
         // Model is identity, not a session knob: a model-less same-id
         // re-registration (resolve timeout, TXT without `am`) keeps the
         // known model — only an explicit different model replaces it. No
-        // other old field is merged forward.
+        // other transient field is merged forward. The acquired receiver
+        // binding is identity too and must not be erased by preference restores.
         const model = output.model ?? outputs[idx].model;
+        const receiverIdentity = output.receiverIdentity ??
+          outputs[idx].receiverIdentity;
         outputs[idx] = {
           ...output,
           connectionStrategy,
           ...(model === undefined ? {} : { model }),
+          ...(receiverIdentity === undefined ? {} : { receiverIdentity }),
         };
       }
       if (lifetime === 'observation') saveRow(find(output.id)!);

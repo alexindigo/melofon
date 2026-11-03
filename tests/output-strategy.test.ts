@@ -5,6 +5,7 @@ import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs } from '../src/player.ts';
+import { createSpeakers } from '../src/speakers.ts';
 import { createPersistence } from '../src/persistence.ts';
 import { createState } from '../src/state.ts';
 import { createAirplayDiscovery } from '../src/boots/airplay-mdns.ts';
@@ -47,6 +48,11 @@ async function setup(dir?: string) {
       outputs,
       state,
       airplay: devices,
+      speakers: createSpeakers({
+        outputs,
+        registerAddress: devices.registerAddress,
+        adapterView: (id) => ({ preparation: devices.admission.describe(id) }),
+      }),
       outputAdmission: devices.admission,
     },
   });
