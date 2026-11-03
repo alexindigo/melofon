@@ -16,9 +16,10 @@ import { createArtworkCache } from './artwork-cache.ts';
 import type { Podcasts } from './podcasts.ts';
 import { type ArtworkImage, createArtworkSources } from './artwork-sources.ts';
 import type { Store } from './store/index.ts';
+import type { createRadio } from './radio.ts';
 
 export type ArtworkRef = {
-  kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast';
+  kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast' | 'radio';
   id: string;
 };
 export interface ArtworkDescriptor {
@@ -30,7 +31,8 @@ export interface ArtworkDescriptor {
     | 'album-candidate'
     | 'artist-photo'
     | 'playlist'
-    | 'podcast';
+    | 'podcast'
+    | 'radio-upload';
   /** Original dimensions, not rendition dimensions; null for unknown headers. */
   width: number | null;
   height: number | null;
@@ -118,6 +120,7 @@ export function createArtwork(library: Library, options: {
   dataDir?: string;
   playlists?: Playlists;
   podcasts?: Pick<Podcasts, 'cover'>;
+  radio?: Pick<ReturnType<typeof createRadio>, 'cover'>;
   facts?: Store['artwork'];
   /** Native processing port, also lets admission be exercised deterministically. */
   resize?: typeof resizeImage;
@@ -184,6 +187,12 @@ export function createArtwork(library: Library, options: {
     maxBytes: number,
     kind?: ArtworkRef['kind'],
   ): Promise<Source | null | 'unknown'> {
+    if (kind === 'radio' || !kind && id.startsWith('radio-')) {
+      const image = await options.radio?.cover(id, maxBytes);
+      return image === undefined || image === 'unknown'
+        ? 'unknown'
+        : image && { ...image, sourceKind: 'radio-upload' };
+    }
     if (!kind || kind === 'podcast') {
       const podcast = await options.podcasts?.cover(
         id,

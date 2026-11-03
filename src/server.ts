@@ -242,6 +242,7 @@ export async function startServer(options: {
     });
   }
   const playlists = createPlaylists(store);
+  const radio = createRadio(store, { dataDir: cfg.dataDir, state, notify });
   const settings = createSettings(store, state);
   let hats: Hats | undefined = undefined;
   const bag = {
@@ -289,7 +290,7 @@ export async function startServer(options: {
     annotation: createAnnotation(store),
     listens: createListens(store),
     playlists,
-    radio: createRadio(store),
+    radio,
     shares: createShares(store, state, library, playlists),
     podcasts,
     clientQueue: createClientQueue(store),
@@ -310,6 +311,7 @@ export async function startServer(options: {
       dataDir: cfg.dataDir,
       playlists,
       podcasts,
+      radio,
     }),
     player,
     outputs,

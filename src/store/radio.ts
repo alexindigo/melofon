@@ -33,7 +33,9 @@ export function createRadioStore(engine: Engine) {
         // Catalog identities are unprefixed hashes; station ids have their own namespace.
         const id = `radio-${crypto.randomUUID()}`;
         await q.run(
-          `INSERT INTO radio_stations VALUES (${esc(id)}, ${esc(input.name)},
+          `INSERT INTO radio_stations
+          (id, name, stream_url, home_page_url, created_at, updated_at)
+          VALUES (${esc(id)}, ${esc(input.name)},
           ${esc(input.streamUrl)}, ${
             input.homePageUrl === null ? 'NULL' : esc(input.homePageUrl)
           }, now(), now())`,
@@ -57,6 +59,40 @@ export function createRadioStore(engine: Engine) {
         if (await get(q, id) === null) return false;
         await q.run(`DELETE FROM radio_stations WHERE id = ${esc(id)}`);
         return true;
+      });
+    },
+    artwork(id: string): Promise<string | null | undefined> {
+      return engine.exclusive(async (q) => {
+        const rows = await q.all<{ payload: string | null }>(
+          `SELECT uploaded_artwork AS payload FROM radio_stations WHERE id = ${
+            esc(id)
+          }`,
+        );
+        return rows[0]?.payload;
+      });
+    },
+    imagePayloads(): Promise<string[]> {
+      return engine.exclusive(async (q) =>
+        (await q.all<{ payload: string }>(
+          'SELECT uploaded_artwork AS payload FROM radio_stations WHERE uploaded_artwork IS NOT NULL',
+        )).map((row) => row.payload)
+      );
+    },
+    setArtwork(id: string, payload: string | null) {
+      return atomic(engine, async (q) => {
+        const rows = await q.all<{ previous: string | null }>(
+          `SELECT uploaded_artwork AS previous FROM radio_stations WHERE id = ${
+            esc(id)
+          }`,
+        );
+        if (!rows.length) return null;
+        await q.run(
+          `UPDATE radio_stations SET uploaded_artwork = ${
+            payload === null ? 'NULL' : esc(payload)
+          },
+          updated_at = now() WHERE id = ${esc(id)}`,
+        );
+        return rows[0];
       });
     },
   };

@@ -22,7 +22,7 @@ function artworkRef(id: string): ArtworkRef {
   const kind = id.slice(0, colon);
   if (
     colon < 1 || !id.slice(colon + 1) ||
-    !['song', 'album', 'artist', 'playlist', 'podcast'].includes(kind)
+    !['song', 'album', 'artist', 'playlist', 'podcast', 'radio'].includes(kind)
   ) fail(400, 'invalid_field', 'Invalid artwork id');
   return { kind: kind as ArtworkRef['kind'], id: id.slice(colon + 1) };
 }

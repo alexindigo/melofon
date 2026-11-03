@@ -3,7 +3,7 @@ import type { PathfinderRequest } from '@pathfinder/pathfinder';
 
 export type HatRequest = PathfinderRequest<Record<string, string>>;
 export type ArtworkRef = {
-  kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast';
+  kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast' | 'radio';
   id: string;
 };
 export interface ArtworkDescriptor {
@@ -15,7 +15,8 @@ export interface ArtworkDescriptor {
     | 'album-candidate'
     | 'artist-photo'
     | 'playlist'
-    | 'podcast';
+    | 'podcast'
+    | 'radio-upload';
   width: number | null;
   height: number | null;
   mime: string;
@@ -97,6 +98,13 @@ export interface HatContext {
   meta: { jsonMaxBytesSetting?: string };
   app: {
     cfg: { dataDir?: string };
+    radio: {
+      artworkMaxBytes(): Promise<number>;
+      putArtwork(id: string, bytes: Uint8Array): Promise<
+        { ok: true } | { invalid: 'too_large' | 'invalid_image' } | null
+      >;
+      removeArtwork(id: string): Promise<boolean>;
+    };
     hatData: {
       get(key: string): Promise<{ kind: string; value: unknown } | null>;
       put(key: string, record: { kind: 'data'; value: unknown }): Promise<void>;

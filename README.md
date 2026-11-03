@@ -121,6 +121,17 @@ or when the configured base URL is HTTPS and its host (including port) matches
 the request's host. Forwarded headers never supply an origin, scheme or client
 address.
 
+### Radio artwork uploads
+
+Signed-in users can send raw PNG, JPEG, GIF or WebP bytes to
+`PUT /api/v1/radio-stations/{id}/artwork`. Core validates and durably stores the
+image; the response's `artwork` includes its versioned local `url` and original
+dimensions. Cookie and Bearer authentication work over plain HTTP; change
+requests follow the usual Origin policy. `DELETE` removes the override.
+`radio.maxArtworkBytes` (default 20971520) and `radio.maxArtworkPixels` (default
+64000000) bound uploads. Invalid images leave the previous override intact.
+Back up `radio-images/` together with the database, just like `hat-images/`.
+
 ### Now-playing expiry
 
 Apps explicitly report playback; fetching media does not report a play.
