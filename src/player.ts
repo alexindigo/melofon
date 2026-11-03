@@ -305,6 +305,10 @@ export interface Outputs {
   restore(output: OutputRegistration, source?: CommandSource): void;
   /** Explicit configuration, never implied by selection or observation. */
   adopt(id: string): Promise<Output | null>;
+  /** Cancel use and durably remove configuration. Observations may return later. */
+  forget(id: string, source?: CommandSource): Promise<void>;
+  /** Fences async work across removal/re-registration, not preference edits. */
+  revision(id: string): number;
   lifetime(id: string): { adopted: boolean; discovered: boolean };
   /** Withdraw live presence; adopted identity/preferences remain registered. */
   withdraw(id: string, source?: CommandSource): void;
@@ -330,8 +334,10 @@ export interface Outputs {
     },
     source?: CommandSource,
   ): Output | null;
-  /** Boots subscribe here for pin commands routed through update(). */
-  onCommand(fn: (id: string, cmd: { pin?: string }) => void): void;
+  /** Boots receive transient PIN commands and awaited forget cancellation. */
+  onCommand(
+    fn: (id: string, cmd: { pin?: string; forget?: true }) => unknown,
+  ): void;
 }
 
 /** The adopted output remote (output_state row). Discovered-only devices
@@ -356,6 +362,7 @@ export interface PersistedOutput {
 export interface OutputPersistence {
   saveOutput(row: PersistedOutput): void;
   adoptOutput?(row: PersistedOutput): Promise<void>;
+  deleteOutput?(id: string): Promise<void>;
   savedOutput?(id: string): PersistedOutput | undefined;
 }
 
@@ -650,6 +657,10 @@ export function createOutputs(
   const outputs: Output[] = [];
   const adopted = new Set<string>();
   const discovered = new Set<string>();
+  const forgetting = new Set<string>();
+  const revisions = new Map<string, number>();
+  const revision = (id: string) => revisions.get(id) ?? 0;
+  const bump = (id: string) => revisions.set(id, revision(id) + 1);
   const isAdopted = (id: string) =>
     persistence?.savedOutput
       ? persistence.savedOutput(id) !== undefined
@@ -694,7 +705,7 @@ export function createOutputs(
   // The ready() caller owns the rejection; prevent an unobserved startup task.
   void initialization.catch(() => {});
   const commandListeners = new Set<
-    (id: string, cmd: { pin?: string }) => void
+    (id: string, cmd: { pin?: string; forget?: true }) => unknown
   >();
   const snapshot = (o: Output): PersistedOutput => ({
     id: o.id,
@@ -714,6 +725,7 @@ export function createOutputs(
 
   const api: Outputs = {
     ready: () => initialization,
+    revision,
     lastCommand: () => last,
     list: () => outputs.map((o) => ({ ...o })),
     get: (id) => {
@@ -730,7 +742,8 @@ export function createOutputs(
     },
     async adopt(id) {
       let row = find(id);
-      if (row === null) return null;
+      if (row === null || forgetting.has(id)) return null;
+      const current = revision(id);
       if (persistence && !persistence.adoptOutput) {
         throw new Error('speaker adoption persistence unavailable');
       }
@@ -739,6 +752,7 @@ export function createOutputs(
       do {
         saved = snapshot(row);
         await persistence?.adoptOutput?.(saved);
+        if (revision(id) !== current || forgetting.has(id)) return null;
         row = find(id);
       } while (
         row !== null && JSON.stringify(snapshot(row)) !== JSON.stringify(saved)
@@ -748,12 +762,46 @@ export function createOutputs(
       emit(['outputs']);
       return { ...row };
     },
+    async forget(id, source) {
+      const row = find(id);
+      if (!row || forgetting.has(id)) throw new Error('speaker not found');
+      if (persistence && !persistence.deleteOutput) {
+        throw new Error('speaker deletion persistence unavailable');
+      }
+      forgetting.add(id);
+      bump(id);
+      // Revoke boot authority before publishing removal. Both command listeners
+      // and the unregister notification see this incarnation as no longer usable.
+      row.selected = false;
+      const cancellations = [...commandListeners].map((fn) => {
+        try {
+          return Promise.resolve(fn(id, { forget: true }));
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      });
+      api.unregister(id, source);
+      try {
+        await Promise.all(cancellations);
+        await persistence?.deleteOutput?.(id);
+        adopted.delete(id);
+      } catch (error) {
+        // A failed forget is retryable, but must never resume the old session.
+        outputs.push({ ...row });
+        saveRow(row);
+        throw error;
+      } finally {
+        forgetting.delete(id);
+        emit(['outputs']);
+      }
+    },
     withdraw(id, source) {
       discovered.delete(id);
       if (isAdopted(id)) emit(['outputs']);
       else api.unregister(id, source);
     },
     register(output, source, lifetime = 'observation') {
+      if (forgetting.has(output.id)) return;
       if (output.connectionStrategy !== undefined) {
         requireConnectionStrategy(output.connectionStrategy);
       }
@@ -771,8 +819,10 @@ export function createOutputs(
           : saved.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY);
       requireConnectionStrategy(connectionStrategy);
       if (lifetime === 'observation') discovered.add(output.id);
-      if (idx === -1) outputs.push({ ...output, connectionStrategy });
-      else {
+      if (idx === -1) {
+        bump(output.id);
+        outputs.push({ ...output, connectionStrategy });
+      } else {
         // Model is identity, not a session knob: a model-less same-id
         // re-registration (resolve timeout, TXT without `am`) keeps the
         // known model — only an explicit different model replaces it. No
@@ -801,6 +851,7 @@ export function createOutputs(
       const idx = outputs.findIndex((o) => o.id === id);
       if (idx === -1) return false;
       outputs.splice(idx, 1);
+      bump(id);
       discovered.delete(id);
       record('unregister', source);
       // The persisted row stays: last-seen state for a re-announcement.

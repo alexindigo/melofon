@@ -42,6 +42,7 @@ export function createPersistence(
     });
   };
   const outputCache = new Map<string, PersistedOutput>();
+  const outputRevisions = new Map<string, number>();
 
   return {
     saveQueue(songIds) {
@@ -69,6 +70,7 @@ export function createPersistence(
     },
 
     async adoptOutput(row) {
+      const revision = outputRevisions.get(row.id);
       const connectionStrategy = requireConnectionStrategy(
         row.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY,
       );
@@ -78,7 +80,27 @@ export function createPersistence(
       // to the explicit configuration caller. Publish only a durable cache.
       tail = write.catch((error) => log.event('persistence_failed', { error }));
       await write;
-      outputCache.set(row.id, saved);
+      if (outputRevisions.get(row.id) === revision) {
+        outputCache.set(row.id, saved);
+      }
+    },
+
+    async deleteOutput(id) {
+      const previous = outputCache.get(id);
+      outputRevisions.set(id, (outputRevisions.get(id) ?? 0) + 1);
+      outputCache.delete(id);
+      // Previously queued writes finish before deletion; later temporary
+      // updates cannot pass the cache gate. Explicit errors reach the caller.
+      const write = tail.then(async () => {
+        await store.speakers.deleteAdopted(id);
+      });
+      tail = write.catch((error) => log.event('persistence_failed', { error }));
+      try {
+        await write;
+      } catch (error) {
+        if (previous) outputCache.set(id, previous);
+        throw error;
+      }
     },
 
     async loadOutputs() {

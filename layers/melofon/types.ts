@@ -129,6 +129,7 @@ export interface HatContext {
       get(id: string): SpeakerView | null;
       add(input: unknown, source?: Source): Promise<SpeakerView>;
       adopt(id: string): Promise<SpeakerView>;
+      forget(id: string, source?: Source): Promise<void>;
       configure(
         id: string,
         input: unknown,

@@ -22,7 +22,7 @@ async function fixture(dir?: string) {
   let outputs!: ReturnType<typeof createOutputs>;
   let persistence!: ReturnType<typeof createPersistence>;
   let announce!: (event: 'up' | 'down', service: MdnsService) => void;
-  let answer: MdnsService | null = null;
+  let answer: MdnsService | Promise<MdnsService> | null = null;
   let lookups = 0, starts = 0;
   let failSave = false;
   const f = await apiFixture({
@@ -115,7 +115,7 @@ async function fixture(dir?: string) {
     read,
     write,
     speaker,
-    answer: (value: MdnsService | null) => {
+    answer: (value: MdnsService | Promise<MdnsService> | null) => {
       answer = value;
     },
     announce: (value = receiver) => announce('up', value),
@@ -442,6 +442,263 @@ Deno.test('speaker HTTP adoption reports a safe durability failure and remains r
     );
     assertEquals((await t.f.store.speakers.loadAdopted()).length, 1);
   } finally {
+    await t.close();
+  }
+});
+
+Deno.test('speaker HTTP forget is durable across queued preferences, discovery and reopen', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'speaker-forget-' });
+  try {
+    const t = await fixture(dir);
+    try {
+      t.announce();
+      const id = (await t.read())[0].id;
+      await error(
+        await t.write(`/${id}`, 'DELETE', undefined),
+        409,
+        'not_adopted',
+      );
+      await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+      t.outputs.update(id, {
+        selected: true,
+        volume: 24,
+        connectionStrategy: 'owntone',
+      });
+      const response = await t.write(`/${id}`, 'DELETE', undefined);
+      assertEquals(response.status, 204, await response.text());
+      assertEquals(t.persistence.savedOutput(id), undefined);
+      t.announce();
+      const row = (await t.read())[0];
+      assertEquals(row.adopted, false);
+      assertEquals(row.selected, false);
+      assertEquals(row.volume, 100);
+      assertEquals(row.connectionStrategy, 'melofon');
+      t.outputs.update(id, { selected: true, volume: 17 });
+      await t.persistence.drain();
+      assertEquals(await t.f.store.speakers.loadAdopted(), []);
+      assertEquals(await t.f.store.playback.loadOutputs(), []);
+      assertEquals(await t.f.store.speakers.loadIgnored(), []);
+    } finally {
+      await t.close();
+    }
+    const next = await fixture(dir);
+    try {
+      assertEquals(await next.read(), []);
+      next.announce();
+      assertEquals((await next.read())[0].adopted, false);
+    } finally {
+      await next.close();
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('speaker forget enforces auth and Origin and shares durable operator deletion', async () => {
+  const t = await fixture();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    await error(
+      await t.f.json(`/api/v1/speakers/${id}`, 'DELETE', undefined),
+      401,
+      'unauthenticated',
+    );
+    await error(
+      await t.f.json(
+        `/api/v1/speakers/${id}`,
+        'DELETE',
+        undefined,
+        t.credential,
+        'http://other.home',
+      ),
+      403,
+      'origin',
+    );
+    await error(
+      await t.write('/missing', 'DELETE', undefined),
+      404,
+      'not_found',
+    );
+    const response = await t.f.json(
+      `/_/outputs/${id}`,
+      'DELETE',
+      undefined,
+      undefined,
+      null,
+      true,
+    );
+    assertEquals(response.status, 200, await response.clone().text());
+    await response.json();
+    assertEquals(t.persistence.savedOutput(id), undefined);
+    assertEquals(await t.f.store.speakers.loadAdopted(), []);
+    t.announce();
+    const conflict = await t.f.json(
+      `/_/outputs/${id}`,
+      'DELETE',
+      undefined,
+      undefined,
+      null,
+      true,
+    );
+    assertEquals(conflict.status, 409);
+    await conflict.body?.cancel();
+    await error(
+      await t.write(`/${id}`, 'DELETE', undefined),
+      409,
+      'not_adopted',
+    );
+    const { credential } = await t.f.login(
+      'cookie',
+      'member',
+      'password-member',
+    );
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    const gone = await t.f.json(
+      `/api/v1/speakers/${id}`,
+      'DELETE',
+      undefined,
+      credential,
+    );
+    assertEquals(gone.status, 204);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('forget fences an in-flight adoption and advertisements during its durable write', async () => {
+  const t = await fixture();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    const save = t.f.store.speakers.saveAdopted;
+    const entered = Promise.withResolvers<void>();
+    t.f.store.speakers.saveAdopted = async (row) => {
+      entered.resolve();
+      await held;
+      await save(row);
+    };
+    const adopting = t.write(`/${id}/adopt`, 'POST', {});
+    await entered.promise;
+    const deleting = t.write(`/${id}`, 'DELETE', undefined);
+    // GET is ordered after the DELETE reached core, without a timing sleep.
+    for (let i = 0; (await t.read()).length; i++) {
+      assert(i < 100, 'forget removes the runtime entry before awaiting disk');
+    }
+    t.announce();
+    assertEquals(await t.read(), []);
+    release();
+    await error(await adopting, 404, 'not_found');
+    const deleted = await deleting;
+    assertEquals(deleted.status, 204, await deleted.text());
+    t.announce();
+    assertEquals((await t.read())[0].adopted, false);
+    await t.persistence.drain();
+    assertEquals(t.persistence.savedOutput(id), undefined);
+    assertEquals(await t.f.store.playback.loadOutputs(), []);
+  } finally {
+    release();
+    await t.close();
+  }
+});
+
+Deno.test('forget defeats a late address lookup even when the same receiver is rediscovered', async () => {
+  const t = await fixture();
+  const reply = Promise.withResolvers<MdnsService>();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    t.answer(reply.promise);
+    const before = t.effects().lookups;
+    const adding = t.write('', 'POST', {
+      protocol: 'AirPlay',
+      address: receiver.address,
+      port: receiver.port,
+    });
+    for (let i = 0; t.effects().lookups === before; i++) {
+      assert(i < 100, 'address lookup starts');
+      await t.read();
+    }
+    const deleted = await t.write(`/${id}`, 'DELETE', undefined);
+    assertEquals(deleted.status, 204, await deleted.text());
+    t.announce();
+    reply.resolve(receiver);
+    await error(await adding, 404, 'not_found');
+    assertEquals((await t.read())[0].adopted, false);
+    await t.persistence.drain();
+    assertEquals(await t.f.store.playback.loadOutputs(), []);
+  } finally {
+    reply.resolve(receiver);
+    await t.close();
+  }
+});
+
+Deno.test('speaker HTTP forget reports delete failure safely and permits a durable retry', async () => {
+  const t = await fixture();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    t.outputs.update(id, { selected: true });
+    await t.persistence.drain();
+    const remove = t.f.store.speakers.deleteAdopted;
+    t.f.store.speakers.deleteAdopted = () =>
+      Promise.reject(new Error('private delete fault'));
+    const failure = await error(
+      await t.write(`/${id}`, 'DELETE', undefined),
+      500,
+      'persistence_failed',
+    );
+    assert(!JSON.stringify(failure).includes('private delete fault'));
+    assertEquals((await t.read())[0].adopted, true);
+    assertEquals((await t.read())[0].selected, false);
+    assertEquals((await t.f.store.speakers.loadAdopted()).length, 1);
+    t.f.store.speakers.deleteAdopted = remove;
+    const deleted = await t.write(`/${id}`, 'DELETE', undefined);
+    assertEquals(deleted.status, 204, await deleted.text());
+    assertEquals(t.persistence.savedOutput(id), undefined);
+    assertEquals(await t.f.store.playback.loadOutputs(), []);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('an address alias resolving after forget cannot re-adopt the forgotten receiver', async () => {
+  const t = await fixture();
+  const reply = Promise.withResolvers<MdnsService>();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    t.answer(reply.promise);
+    const before = t.effects().lookups;
+    const adding = t.write('', 'POST', {
+      protocol: 'AirPlay',
+      address: 'alias.local',
+    });
+    for (let i = 0; t.effects().lookups === before; i++) {
+      assert(i < 100, 'alias lookup starts');
+      await t.read();
+    }
+    const deleted = await t.write(`/${id}`, 'DELETE', undefined);
+    assertEquals(deleted.status, 204, await deleted.text());
+    t.announce();
+    reply.resolve(receiver);
+    await error(await adding, 404, 'not_found');
+    const rows = await t.read();
+    assertEquals(rows.length, 1);
+    assertEquals(rows[0].adopted, false);
+    await t.persistence.drain();
+    assertEquals(await t.f.store.playback.loadOutputs(), []);
+  } finally {
+    reply.resolve(receiver);
     await t.close();
   }
 });

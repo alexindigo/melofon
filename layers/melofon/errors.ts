@@ -16,7 +16,13 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
     }
     if (error.name === 'SpeakerError') {
       fail(
-        code === 'not_found' ? 404 : code === 'persistence_failed' ? 500 : 400,
+        code === 'not_found'
+          ? 404
+          : code === 'not_adopted'
+          ? 409
+          : code === 'persistence_failed'
+          ? 500
+          : 400,
         String(code),
         error.message,
       );

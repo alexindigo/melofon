@@ -41,6 +41,19 @@ export function createAirplayDevices(deps: {
       },
     });
   const resolver = deps.resolver ?? createMdnsResolver();
+  const forgottenReceivers = new Map<string, number>();
+  outputs.onCommand((id, command) => {
+    if (command.forget) {
+      const identity = outputs.get(id)?.receiverIdentity;
+      if (identity !== undefined) {
+        forgottenReceivers.set(
+          identity,
+          (forgottenReceivers.get(identity) ?? 0) + 1,
+        );
+      }
+      admission.invalidate(id);
+    }
+  });
   const spawn = deps.spawn ?? createFfiSpawn();
   const drivers = new WeakMap<AirplayDriver['transport'], AirplayDriver>();
   const receiverIdentity = (id: string, service: MdnsService) => {
@@ -194,6 +207,7 @@ export function createAirplayDevices(deps: {
       source?: CommandSource,
     ) {
       const host = normalizeAirplayAddress(input.host);
+      const receiverRevisions = new Map(forgottenReceivers);
       const candidates = outputs.list().filter((o) =>
         o.type === 'AirPlay' && o.host !== undefined &&
         normalizeAirplayAddress(o.host) === host
@@ -219,6 +233,9 @@ export function createAirplayDevices(deps: {
           ? {}
           : { connectionStrategy: input.connectionStrategy }),
       }, source);
+      let revision = outputs.revision(id);
+      const isCurrent = () =>
+        outputs.get(id) !== null && outputs.revision(id) === revision;
       const controller = new AbortController();
       // Catalog preparation has no playback authority; permits are discarded.
       await protocol.prepare({
@@ -226,9 +243,22 @@ export function createAirplayDevices(deps: {
         targetRevision: admission.describe(id).targetRevision,
         signal: controller.signal,
         refresh: true,
-        isCurrent: () => outputs.get(id) !== null,
+        isCurrent,
       });
+      if (!isCurrent()) return null;
       const acquired = outputs.get(id);
+      if (
+        acquired?.receiverIdentity !== undefined &&
+        receiverRevisions.get(acquired.receiverIdentity) !==
+          forgottenReceivers.get(acquired.receiverIdentity)
+      ) {
+        // An alias lookup begun before forget cannot re-adopt that receiver.
+        if (!outputs.lifetime(id).adopted) {
+          admission.invalidate(id);
+          outputs.unregister(id, source);
+        }
+        return null;
+      }
       const canonical = acquired?.receiverIdentity === undefined
         ? undefined
         : outputs.list().find((o) =>
@@ -250,16 +280,17 @@ export function createAirplayDevices(deps: {
             ? {}
             : { connectionStrategy: input.connectionStrategy }),
         }, source);
+        revision = outputs.revision(id);
         await protocol.prepare({
           id,
           targetRevision: admission.describe(id).targetRevision,
           signal: controller.signal,
           refresh: true,
-          isCurrent: () => outputs.get(id) !== null,
+          isCurrent,
         });
       }
-      await outputs.adopt(id);
-      return outputs.get(id);
+      if (!isCurrent()) return null;
+      return await outputs.adopt(id);
     },
     close() {
       resolver.close();

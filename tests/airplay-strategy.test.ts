@@ -3,6 +3,8 @@ import { assert, assertEquals } from '@std/assert';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
+import { createSpeakers } from '../src/speakers.ts';
+import { apiFixture } from './helpers/api.ts';
 import type { Library, SongRow } from '../src/library.ts';
 import type { NowPlaying } from '../src/nowplaying.ts';
 import type { Media } from '../src/media.ts';
@@ -182,6 +184,111 @@ Deno.test('strategy retry units: tokens are seconds, boot table is milliseconds'
     60000,
   ]);
   assertEquals(parseRetryBackoff('2,70'), [2000, 60000]);
+});
+
+Deno.test('forget awaits retirement, fences late events and pauses the last target at its bookmark', async () => {
+  const s = setup();
+  let api: Awaited<ReturnType<typeof apiFixture>> | undefined;
+  let release = () => {};
+  try {
+    s.register('1', 'owntone');
+    await s.outputs.adopt('1');
+    s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
+    const transport = s.transports[0];
+    transport.event('state', 'connected');
+    await until(() => transport.writes.length > 0);
+    transport.closeGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const speakers = createSpeakers({
+      outputs: s.outputs,
+      playback: s.playback,
+      adapterView: () => ({
+        preparation: { state: 'unresolved', targetRevision: 1 },
+      }),
+    });
+    api = await apiFixture({
+      services: () => Promise.resolve({ speakers, outputs: s.outputs }),
+    });
+    const { credential } = await api.login('cookie');
+    let finished = false;
+    const forgotten = api.json(
+      '/api/v1/speakers/1',
+      'DELETE',
+      undefined,
+      credential,
+    ).then(async (response) => {
+      assertEquals(response.status, 204, await response.text());
+      finished = true;
+    });
+    await until(() => s.playback.playerView().state === 'pause');
+    assertEquals(finished, false);
+    assertEquals(s.playback.playerView().state, 'pause');
+    const bookmark = s.playback.playerView().itemProgressMs;
+    const writes = transport.writes.length;
+    transport.event('state', 'connected');
+    transport.event('state', 'failed');
+    await sleep(30);
+    assertEquals(transport.writes.length, writes);
+    assertEquals(s.playback.playerView().itemProgressMs, bookmark);
+    assertEquals(s.playback.queueView().items.length, 1);
+    release();
+    await forgotten;
+    assertEquals(transport.closed, true);
+    s.outputs.register({
+      id: '1',
+      type: 'AirPlay',
+      name: 'rediscovered',
+      host: '192.0.2.1',
+      selected: false,
+      volume: 100,
+    });
+    await sleep(80);
+    assertEquals(s.outputs.lifetime('1').adopted, false);
+    assertEquals(s.transports.length, 1);
+    assertEquals(s.playback.playerView().state, 'pause');
+  } finally {
+    release();
+    await api?.close();
+    await s.close();
+  }
+});
+
+Deno.test('forget of one playing target preserves its healthy peer and queue', async () => {
+  const s = setup();
+  try {
+    s.register('1');
+    s.register('2');
+    await s.outputs.adopt('1');
+    s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 2);
+    for (const transport of s.transports) transport.event('state', 'connected');
+    await until(() => s.transports.some((t) => t.writes.length > 0));
+    const removed = s.transports.find((t) =>
+      t.commands.some((c) => c.host === '192.0.2.1')
+    )!;
+    const peer = s.transports.find((t) =>
+      t.commands.some((c) => c.host === '192.0.2.2')
+    )!;
+    const speakers = createSpeakers({
+      outputs: s.outputs,
+      playback: s.playback,
+      adapterView: () => ({
+        preparation: { state: 'unresolved', targetRevision: 1 },
+      }),
+    });
+    await speakers.forget('1');
+    assertEquals(removed.closed, true);
+    assertEquals(peer.closed, false);
+    assertEquals(s.outputs.get('2')?.selected, true);
+    assertEquals(s.playback.playerView().state, 'play');
+    const delivered = peer.writes.length;
+    await until(() => peer.writes.length > delivered);
+    assertEquals(s.playback.queueView().items.length, 1);
+  } finally {
+    await s.close();
+  }
 });
 Deno.test('default and AudioStation retire unknown-model sessions on Pause and reconnect at latest position', async () => {
   for (const choice of ['melofon', 'audiostation'] as const) {

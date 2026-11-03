@@ -760,6 +760,16 @@ export function createAirplayBoot(
     });
   }
   outputs.onCommand((id, cmd) => {
+    if (cmd.forget) {
+      revoke(id);
+      const runtime = runtimes.get(id);
+      const retirement = runtime
+        ? retire(id, runtime, 'forget')
+        : retiring.get(id);
+      return retirement?.then((ok) => {
+        if (!ok) throw new Error('Speaker retirement failed');
+      });
+    }
     const r = runtimes.get(id);
     if (cmd.pin !== undefined && r?.transport) {
       void r.transport.send({ cmd: 'pin', pin: cmd.pin }).catch((error) => {

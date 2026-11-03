@@ -10,6 +10,7 @@ export class SpeakerError extends Error {
       | 'invalid_field'
       | 'unknown_field'
       | 'unsupported_protocol'
+      | 'not_adopted'
       | 'persistence_failed',
     message: string,
   ) {
@@ -63,7 +64,11 @@ export interface SpeakerView {
 /** One protocol-neutral boundary over control preferences and live facts.
  * Reading never acquires facts, starts a session or saves configuration. */
 export function createSpeakers(deps: {
-  outputs: Pick<Outputs, 'list' | 'get' | 'lifetime' | 'adopt' | 'update'>;
+  outputs: Pick<
+    Outputs,
+    'list' | 'get' | 'lifetime' | 'adopt' | 'update' | 'forget'
+  >;
+  playback?: { pause(source?: CommandSource): void };
   adapterView(id: string): SpeakerAdapterView;
   registerAddress?(input: {
     host: string;
@@ -172,6 +177,29 @@ export function createSpeakers(deps: {
     async adopt(id: string): Promise<SpeakerView> {
       requireRow(id);
       return await durable(() => deps.outputs.adopt(id));
+    },
+    async forget(id: string, source?: CommandSource): Promise<void> {
+      const row = requireRow(id);
+      if (!deps.outputs.lifetime(id).adopted) {
+        throw new SpeakerError(
+          'not_adopted',
+          'Discovered speakers cannot be forgotten; use ignore',
+        );
+      }
+      const operation = deps.outputs.forget(id, source);
+      if (
+        row.selected && !deps.outputs.list().some((speaker) => speaker.selected)
+      ) {
+        deps.playback?.pause(source);
+      }
+      try {
+        await operation;
+      } catch {
+        throw new SpeakerError(
+          'persistence_failed',
+          'Speaker configuration could not be removed',
+        );
+      }
     },
     async configure(
       id: string,
