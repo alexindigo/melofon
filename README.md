@@ -62,6 +62,14 @@ Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — keep deployment secrets out of source control.
 
+### Hat-private images
+
+Core stores hats' image records as files in the server data directory, alongside
+the database. Back up both together. Images stay private to their hat and owner.
+The admin settings `hatData.maxImageBytes` (default 20971520, 20 MiB) and
+`hatData.maxImagePixels` (default 64000000) bound accepted image bytes and
+header dimensions. Supported headers are PNG, JPEG, GIF and WebP.
+
 ### Serving in a sub-folder
 
 The core setting `server.baseUrl` is empty by default. Set it through the

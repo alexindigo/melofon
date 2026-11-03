@@ -501,7 +501,7 @@ CREATE TABLE IF NOT EXISTS hat_records (
   hat VARCHAR NOT NULL,
   owner_scope VARCHAR NOT NULL,
   key VARCHAR NOT NULL,
-  kind VARCHAR NOT NULL CHECK (kind IN ('data', 'credential')),
+  kind VARCHAR NOT NULL CHECK (kind IN ('data', 'credential', 'image')),
   payload VARCHAR NOT NULL,
   PRIMARY KEY (hat, owner_scope, key)
 );

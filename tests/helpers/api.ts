@@ -60,7 +60,7 @@ export async function apiFixture(
     settings: createSettings(f.store, f.state),
     preferences: createPreferences(f.store, f.state, notify),
     hats: createHatServices(f.store, () => hats!),
-    hatData: createHatData(f.store, f.cfg),
+    hatData: createHatData(f.store, f.cfg, f.state),
     signIn(input: Parameters<typeof f.auth.signIn>[0]) {
       peers.push(input.clientAddress);
       if (options.failSignIn) throw new Error('private fixture failure');

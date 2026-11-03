@@ -261,7 +261,7 @@ export async function startServer(options: {
     plugins: createPlugins(store, lookups, settings),
     preferences: createPreferences(store, state, notify),
     hats: createHatServices(store, () => hats!),
-    hatData: createHatData(store, cfg),
+    hatData: createHatData(store, cfg, state),
     cfg,
     startedAt,
     server: createServerStatus({

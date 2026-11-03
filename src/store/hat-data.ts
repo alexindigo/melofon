@@ -5,11 +5,37 @@ export interface HatDataRow {
   hat: string;
   ownerScope: string;
   key: string;
-  kind: 'data' | 'credential';
+  kind: 'data' | 'credential' | 'image';
   payload: string;
 }
 
 const fields = 'hat, owner_scope AS ownerScope, key, kind, payload';
+
+/** DuckDB cannot expand a CHECK in place. Rebuild from canonical DDL in one
+ * transaction, preserving data and encrypted credentials byte for byte. */
+export async function upgradeHatData(q: Queries, schema: string) {
+  const constraints = await q.all<{ constraint_text: string }>(
+    "SELECT constraint_text FROM duckdb_constraints() WHERE table_name = 'hat_records' AND constraint_type = 'CHECK'",
+  );
+  if (!constraints.some((c) => !c.constraint_text.includes("'image'"))) return;
+  const definition = schema.split(';').find((sql) =>
+    /CREATE TABLE IF NOT EXISTS hat_records\s*\(/.test(sql)
+  );
+  if (!definition) throw new Error('Missing canonical hat record schema');
+  await q.run('BEGIN TRANSACTION');
+  try {
+    await q.run('ALTER TABLE hat_records RENAME TO hat_records_before_images');
+    await q.run(definition);
+    await q.run(
+      'INSERT INTO hat_records SELECT * FROM hat_records_before_images',
+    );
+    await q.run('DROP TABLE hat_records_before_images');
+    await q.run('COMMIT');
+  } catch (error) {
+    await q.run('ROLLBACK');
+    throw error;
+  }
+}
 
 function scope(hat: string, ownerScope: string): string {
   return `hat = ${esc(hat)} AND owner_scope = ${esc(ownerScope)}`;
@@ -31,6 +57,12 @@ export function deleteHatRecordsForUser(
 
 export function createHatDataStore(engine: Engine) {
   return {
+    imagePayloads: () =>
+      engine.exclusive(async (q) =>
+        (await q.all<{ payload: string }>(
+          "SELECT payload FROM hat_records WHERE kind = 'image'",
+        )).map((r) => r.payload)
+      ),
     get: (hat: string, ownerScope: string, key: string) =>
       engine.exclusive(async (q) =>
         (await q.all<HatDataRow>(
@@ -53,6 +85,11 @@ export function createHatDataStore(engine: Engine) {
         if (row.ownerScope && !await readUser(q, row.ownerScope)) {
           throw new Error('Hat record owner does not exist');
         }
+        const previous = (await q.all<HatDataRow>(
+          `SELECT ${fields} FROM hat_records WHERE ${
+            scope(row.hat, row.ownerScope)
+          } AND key = ${esc(row.key)}`,
+        ))[0] ?? null;
         await q.run(
           `INSERT INTO hat_records (hat, owner_scope, key, kind, payload)
         VALUES (${esc(row.hat)}, ${esc(row.ownerScope)}, ${esc(row.key)}, ${
@@ -61,14 +98,15 @@ export function createHatDataStore(engine: Engine) {
         ON CONFLICT (hat, owner_scope, key) DO UPDATE SET
         kind = excluded.kind, payload = excluded.payload`,
         );
+        return previous;
       }),
     remove: (hat: string, ownerScope: string, key: string) =>
       engine.exclusive(async (q) =>
-        (await q.all<{ key: string }>(
+        (await q.all<HatDataRow>(
           `DELETE FROM hat_records WHERE ${scope(hat, ownerScope)} AND key = ${
             esc(key)
-          } RETURNING key`,
-        )).length !== 0
+          } RETURNING ${fields}`,
+        ))[0] ?? null
       ),
   };
 }
