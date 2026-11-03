@@ -5,6 +5,7 @@ import { findHats, loadHat } from '../../src/layers.ts';
 import { authFixture } from './authentication.ts';
 import { createHats, type Hats } from '../../src/hats.ts';
 import { createHatServices } from '../../src/hat-service.ts';
+import { createHatData } from '../../src/hat-data.ts';
 import { createPortMapping } from '../../src/binds.ts';
 import {
   createListenManager,
@@ -59,6 +60,7 @@ export async function apiFixture(
     settings: createSettings(f.store, f.state),
     preferences: createPreferences(f.store, f.state, notify),
     hats: createHatServices(f.store, () => hats!),
+    hatData: createHatData(f.store, f.cfg),
     signIn(input: Parameters<typeof f.auth.signIn>[0]) {
       peers.push(input.clientAddress);
       if (options.failSignIn) throw new Error('private fixture failure');

@@ -6,6 +6,7 @@ import { scopedLog } from './logging.ts';
 import type { State } from './state.ts';
 import { parseSettingsSchema } from './settings-schema.ts';
 import type { HatServices } from './hat-service.ts';
+import type { HatDataServices } from './hat-data.ts';
 
 export interface HeaderMatch {
   name: string;
@@ -222,13 +223,14 @@ export async function findHats(opts: {
 
 /** Startup only. Callers own the per-hat import failure boundary. */
 export async function loadHat(hat: FoundHat, bag: object): Promise<Layer> {
-  const { store: _store, hats, setup, ...services } = bag as
+  const { store: _store, hats, hatData, setup, ...services } = bag as
     & Record<string, unknown>
-    & { hats?: HatServices };
+    & { hats?: HatServices; hatData?: HatDataServices };
   const app = {
     ...services,
     log: scopedLog(`hat:${hat.name}`),
     ...(hats ? { hats: hats(hat.name) } : {}),
+    ...(hatData ? { hatData: hatData(hat.name) } : {}),
     ...(hat.setup && setup ? { setup } : {}),
   };
   if ('users' in app && app.users !== null && typeof app.users === 'object') {

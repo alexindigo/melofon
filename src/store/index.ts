@@ -23,8 +23,10 @@ import { createPreferencesStore } from './preferences.ts';
 import { createScanStore } from './scan.ts';
 import { createFoldersStore } from './folders.ts';
 import { createArtworkStore } from './artwork.ts';
+import { createHatDataStore } from './hat-data.ts';
 
 export interface Store {
+  hatData: ReturnType<typeof createHatDataStore>;
   artwork: ReturnType<typeof createArtworkStore>;
   folders: ReturnType<typeof createFoldersStore>;
   scan: ReturnType<typeof createScanStore>;
@@ -58,6 +60,7 @@ export async function openStore(
 ): Promise<Store> {
   const engine = await openEngine(dataDir, opts);
   const store: Store = {
+    hatData: createHatDataStore(engine),
     artwork: createArtworkStore(engine),
     folders: createFoldersStore(engine),
     scan: createScanStore(engine),

@@ -45,6 +45,7 @@ import { createAirplayDevices } from './boots/airplay-device.ts';
 import { createOutputAdmission } from './output-admission.ts';
 import { createHats, type Hats } from './hats.ts';
 import { createHatServices } from './hat-service.ts';
+import { createHatData } from './hat-data.ts';
 import { createBinds, createPortMapping } from './binds.ts';
 import { createListenManager } from './listen-manager.ts';
 import { scopedLog } from './logging.ts';
@@ -260,6 +261,7 @@ export async function startServer(options: {
     plugins: createPlugins(store, lookups, settings),
     preferences: createPreferences(store, state, notify),
     hats: createHatServices(store, () => hats!),
+    hatData: createHatData(store, cfg),
     cfg,
     startedAt,
     server: createServerStatus({
