@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+  <meta charset="utf-8">
+  <title>Native API media consumer</title>
+  <h1>Native API media consumer</h1>
+  <audio id="audio" controls></audio>
+  <video id="video" controls width="640" height="360"></video>
+  <script>
+  const prefix = location.pathname.startsWith('/music/') ? '/music' : '';
+  const api = `${prefix}/api/v1`;
+  const audio = document.querySelector('#audio');
+  const video = document.querySelector('#video');
+  const frames = [];
+  async function json(path, method, body) {
+    const response = await fetch(api + path, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`${path}: ${response.status}`);
+    return response.json();
+  }
+  async function login(username) {
+    const result = await json('/session', 'POST', {
+      username,
+      password: `password-${username}`,
+      deviceName: 'Chromium',
+      use: 'cookie',
+    });
+    return result.session.id;
+  }
+  function observe() {
+    window.events = new WebSocket(
+      `${location.origin.replace('http:', 'ws:')}${api}/events`,
+    );
+    events.onmessage = (event) => frames.push(JSON.parse(event.data));
+  }
+  async function report(songId, run, sequence, media, state = 'playing') {
+    return json('/me/playback', 'POST', {
+      songId,
+      run,
+      sequence,
+      state,
+      positionMs: Math.floor(media.currentTime * 1000),
+    });
+  }
+  async function prepareVideo(id) {
+    const parent = new URL(`${api}/videos/${id}/playback`, location.origin);
+    const facts = await (await fetch(parent)).json();
+    const hls = new URL(facts.hls, parent);
+    hls.searchParams.set('audioTrack', facts.audioTracks[1].index);
+    // A master and its child must both be followed by the native HLS player.
+    hls.searchParams.append('bitRate', '300@160x90');
+    hls.searchParams.append('bitRate', '600@320x180');
+    const masterResponse = await fetch(hls);
+    if (!masterResponse.ok) throw new Error(`HLS: ${masterResponse.status}`);
+    const master = await masterResponse.text();
+    const renditions = [];
+    // Chromium's native HLS cannot resume a paused EVENT playlist after its
+    // published segments are used up. Prepare finite VOD before playback.
+    for (const uri of master.split('\n').filter((s) => s && !s.startsWith('#'))) {
+      const url = new URL(uri, hls);
+      const deadline = performance.now() + 15000;
+      while (true) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HLS: ${response.status}`);
+        const playlist = await response.text();
+        if (playlist.includes('#EXT-X-ENDLIST')) {
+          renditions.push({ url: url.href, playlist });
+          break;
+        }
+        if (performance.now() > deadline) throw new Error('HLS VOD timeout');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    const caption = facts.captions.find((c) => c.name === 'en');
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.srclang = 'en';
+    track.label = 'Browser caption';
+    track.default = true;
+    track.src = new URL(caption.href, parent);
+    video.append(track);
+    track.track.mode = 'showing';
+    video.src = hls;
+    return { hls: hls.href, caption: track.src, renditions };
+  }
+  </script>
+</html>
