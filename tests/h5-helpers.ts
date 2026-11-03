@@ -139,7 +139,7 @@ export async function setupH5() {
 }
 
 export async function decoded(
-  s: Awaited<ReturnType<typeof setupH5>>,
+  s: Pick<Awaited<ReturnType<typeof setupH5>>, 'dir' | 'media'>,
   response: Response,
   codec: string,
   offset?: number,

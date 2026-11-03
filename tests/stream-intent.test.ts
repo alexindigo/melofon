@@ -130,6 +130,32 @@ Deno.test('stream intent: current session prepares and executes without transpor
       new Uint8Array(await direct.arrayBuffer()),
       await Deno.readFile(audioPath),
     );
+    const selected = await stream.decision(audio, capabilities, 'admin');
+    const staleRange = () =>
+      new Request('http://melofon.home/media', {
+        headers: { Range: 'bytes=0-31', 'If-Range': '"stale"' },
+      });
+    // The shared original-file owner enforces If-Range for every adapter.
+    for (
+      const read of [
+        () => stream.file(staleRange(), audioPath),
+        () => stream.play(staleRange(), audio, 'raw'),
+        () =>
+          stream.negotiated(
+            staleRange(),
+            audio,
+            selected!.transcodeParams,
+            'admin',
+          ),
+      ]
+    ) {
+      const response = (await read())!;
+      assertEquals(response.status, 200);
+      assertEquals(
+        new Uint8Array(await response.arrayBuffer()),
+        await Deno.readFile(audioPath),
+      );
+    }
     const limited = {
       ...capabilities,
       codecProfiles: [{

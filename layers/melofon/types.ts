@@ -109,6 +109,19 @@ export interface HatContext {
       nowPlayingView(): Promise<NowPlayingViewRow[]>;
       reportSessionPlayback(report: SessionPlaybackReport): Promise<boolean>;
     };
+    stream: {
+      session(
+        request: Request,
+        file: { path: string; isVideo: boolean },
+        caller: string,
+        sessionId: string,
+        options?: {
+          format?: string;
+          maxBitRateKbps?: number;
+          timeOffset?: number;
+        },
+      ): Promise<Response>;
+    };
     libraries: {
       stats(id: string): Promise<unknown>;
       list(): Promise<Library[]>;

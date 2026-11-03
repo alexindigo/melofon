@@ -24,6 +24,10 @@ export interface StreamOptions {
   timeOffset?: number;
   estimateContentLength?: boolean;
 }
+export interface SessionStreamOptions extends StreamOptions {
+  format?: string;
+  maxBitRateKbps?: number;
+}
 export type StreamDecision =
   | { kind: 'direct'; intent: MediaIntent }
   | {
@@ -66,7 +70,7 @@ export interface StreamService {
     file: StreamFile,
     caller: string,
     sessionId: string,
-    options?: StreamOptions,
+    options?: SessionStreamOptions,
   ): Promise<Response>;
   negotiated(
     request: Request,
@@ -103,6 +107,29 @@ export function createStream(
     request: Request,
     path: string,
   ) => {
+    // std's file server owns ranges/validators but does not implement If-Range.
+    // Enforce it here for every original-file consumer, before opening a body.
+    const ifRange = request.headers.get('if-range');
+    if (
+      request.method === 'GET' && request.headers.has('range') &&
+      ifRange !== null
+    ) {
+      const metadata = await serveFile(
+        new Request(request, { method: 'HEAD' }),
+        path,
+      );
+      const tag = metadata.headers.get('etag');
+      const modified = metadata.headers.get('last-modified');
+      const matches = ifRange.startsWith('"')
+        ? ifRange === tag
+        : !ifRange.startsWith('W/') && modified !== null &&
+          ifRange === modified;
+      if (!matches) {
+        const headers = new Headers(request.headers);
+        headers.delete('range');
+        request = new Request(request, { headers });
+      }
+    }
     const response = await serveFile(request, path);
     const probe = await media.probe(path);
     if (probe.durationMs !== null) {
@@ -247,27 +274,55 @@ export function createStream(
       }
       return { ...result, transcodeParams: token };
     },
-    async session(request, file, caller, sessionId, options) {
+    async session(request, file, caller, sessionId, options = {}) {
       if (!sessions) throw new Error('Session streaming is not configured');
       // Resolve for every read: declaration replacement, revocation, live
       // encoder settings and source facts must not be cached in a token.
-      const capabilities = await sessions.playbackCapabilities(
+      const registered = await sessions.playbackCapabilities(
         caller,
         sessionId,
       );
-      const result = await prepare(
-        file,
-        capabilities ?? {
-          name: 'Default audio',
-          platform: 'http',
+      let capabilities: ClientCapabilities = registered ?? {
+        name: 'Default audio',
+        platform: 'http',
+        transcodingProfiles: [{
+          container: 'mp3',
+          audioCodec: 'mp3',
+          protocol: 'http',
+        }],
+      };
+      // A format override is an explicit replacement of device preferences,
+      // never the legacy selector's permissive fallback to another encoder.
+      if (options.format !== undefined) {
+        const profile = (await media.audioProfiles()).find((p) =>
+          p.format === options.format
+        );
+        if (!profile) {
+          throw new StreamError(
+            'incompatible_media',
+            'Requested encoder is unavailable',
+          );
+        }
+        capabilities = {
+          name: capabilities.name,
+          platform: capabilities.platform,
+          maxAudioBitrate: capabilities.maxAudioBitrate,
+          maxTranscodingAudioBitrate: capabilities.maxTranscodingAudioBitrate,
           transcodingProfiles: [{
-            container: 'mp3',
-            audioCodec: 'mp3',
+            container: profile.container,
+            audioCodec: profile.codec,
             protocol: 'http',
           }],
-        },
-        'audio',
-      );
+        };
+      }
+      if (options.maxBitRateKbps !== undefined) {
+        capabilities = {
+          ...capabilities,
+          maxAudioBitrate: options.maxBitRateKbps * 1000,
+          maxTranscodingAudioBitrate: options.maxBitRateKbps * 1000,
+        };
+      }
+      const result = await prepare(file, capabilities, 'audio');
       if (!result) {
         throw new StreamError(
           'cannot_stream_media',

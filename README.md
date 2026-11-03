@@ -142,6 +142,31 @@ submitted and normalized JSON's UTF-8 bytes; invalid or oversized replacements
 leave the previous declaration intact. This records client-declared abilities,
 not evidence of a connected speaker or a guarantee that a profile is supported.
 
+### Song streams
+
+`GET` and `HEAD /api/v1/songs/{id}/stream` authenticate with the current
+cookie or Bearer login. Each request negotiates against that login's latest
+declaration and current encoder settings. Without a declaration, the server
+encodes MP3; an unavailable encoder or incompatible declaration returns a native
+`incompatible_media` error (422), never arbitrary original bytes. Catalog video
+ids on this route deliver audio only. Podcast ids are not song ids.
+
+Optional query parameters are `format=mp3|aac|opus|ogg`, `maxBitRate` (positive
+integer kbps), and `offset` (nonnegative integer seconds). Unknown, repeated or
+malformed parameters fail with 400. An explicit format replaces registered
+profile/codec preferences and forces that encoder; an unavailable encoder fails
+with 422. An explicit bitrate ceiling replaces registered bitrate ceilings,
+still bounded by the encoder's configured default. Without a format override,
+the cap uses only declared profiles (MP3 when undeclared), never inventing a
+different codec to satisfy it. Registration itself is unchanged.
+
+Allowed originals retain byte ranges, ETag and conditional requests. Transcodes
+have `Accept-Ranges: none`, no ETag or estimated length; `offset` seeks encoded
+audio and at/past EOF returns an empty 200. Original bytes ignore `offset`.
+HEAD never starts an encoder. Media reads, EOF and disconnects never update
+now playing or record listens. Browser media uses same-origin cookies; this
+route does not mint casting URLs.
+
 ## Catalog identity
 
 ### Browse ordering
