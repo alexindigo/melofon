@@ -2,6 +2,7 @@
 // Persisted paths and feed text are never authority to touch arbitrary files.
 import { basename, join, resolve } from 'node:path';
 import { readImage } from './images.ts';
+import type { ReadArtworkSource } from './artwork-sources.ts';
 
 const id = (value: string, prefix: string) => {
   if (!new RegExp(`^${prefix}-[a-f0-9-]{36}$`).test(value)) {
@@ -122,7 +123,12 @@ export function createPodcastFiles(dataDir: string) {
       }
       return path;
     },
-    async image(channelId: string, path: string | null, maxBytes: number) {
+    async image(
+      channelId: string,
+      path: string | null,
+      maxBytes: number,
+      read?: ReadArtworkSource,
+    ) {
       if (!path || !/^cover\.(png|jpg|gif|webp)$/.test(basename(path))) {
         return null;
       }
@@ -131,15 +137,18 @@ export function createPodcastFiles(dataDir: string) {
           return null;
         }
         if ((await Deno.lstat(path)).isSymlink) return null;
-        const bytes = await readImage(path, maxBytes);
-        return bytes
-          ? {
-            bytes,
-            format: `image/${
-              path.endsWith('.jpg') ? 'jpeg' : path.split('.').pop()
-            }`,
-          }
-          : null;
+        const load = async () => {
+          const bytes = await readImage(path, maxBytes);
+          return bytes
+            ? {
+              bytes,
+              format: `image/${
+                path.endsWith('.jpg') ? 'jpeg' : path.split('.').pop()
+              }`,
+            }
+            : null;
+        };
+        return read ? await read(path, 'image-v1', load) : await load();
       } catch (error) {
         if (missing(error)) return null;
         throw error;

@@ -1,4 +1,5 @@
 import type { Store } from './store/index.ts';
+import type { ReadArtworkSource } from './artwork-sources.ts';
 import type { State } from './state.ts';
 import {
   type CoreNetworkAuthority,
@@ -429,11 +430,11 @@ export async function createPodcasts(
       const path = await files.episodePath(row.channelId, row.id, row.filePath);
       return path ? { path, isVideo: false } : null;
     },
-    async cover(id: string, maxBytes: number) {
+    async cover(id: string, maxBytes: number, read?: ReadArtworkSource) {
       if (!id.startsWith('podcast-')) return 'unknown' as const;
       const row = await store.podcasts.channel(id);
       return row
-        ? files.image(id, row.imagePath, maxBytes)
+        ? files.image(id, row.imagePath, maxBytes, read)
         : 'unknown' as const;
     },
     /** Lifecycle/test drain, including the scheduled work already enqueued. */

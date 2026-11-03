@@ -8,8 +8,10 @@ import { createLyrics, type Lyrics, type LyricsEntry } from './lyrics.ts';
 import { type CatalogOrder, createCatalogOrder } from './catalog-order.ts';
 import { createState, type State } from './state.ts';
 import type { Notify } from './notify.ts';
+import type { ArtworkImage, ReadArtworkSource } from './artwork-sources.ts';
 import {
   artistImagePaths,
+  candidateImagePath,
   embeddedPictures,
   imageContentType,
   isCoverFile,
@@ -59,18 +61,21 @@ export interface Library extends
   embeddedCover(
     id: string,
     maxBytes?: number,
-  ): Promise<{ bytes: Uint8Array; format: string } | null>;
+    read?: ReadArtworkSource,
+  ): Promise<ArtworkImage | null>;
   /** Absolute path of cover.{jpg,jpeg,png,webp} in album folder/root. */
   albumCoverPath(id: string): Promise<string | null>;
   /** Strong open album proposal, resolved outside the store slot. */
   candidateCover(
     id: string,
     maxBytes?: number,
-  ): Promise<{ bytes: Uint8Array; format: string } | null>;
+    read?: ReadArtworkSource,
+  ): Promise<ArtworkImage | null>;
   artistPhoto(
     id: string,
     maxBytes?: number,
-  ): Promise<{ bytes: Uint8Array; format: string } | null>;
+    read?: ReadArtworkSource,
+  ): Promise<ArtworkImage | null>;
   artistPhotoMissing(id: string): Promise<boolean>;
 }
 
@@ -81,6 +86,7 @@ export function createLibrary(
     {},
 ): Library {
   const catalog = store.catalog;
+  const direct: ReadArtworkSource = (_path, _kind, load) => load();
   const localArtistPath = async (id: string) => {
     const folder = await catalog.artistFolder(id);
     return folder
@@ -128,28 +134,41 @@ export function createLibrary(
       return !await localArtistPath(id) &&
         !await store.candidates.acceptedArtistPhoto(id);
     },
-    async artistPhoto(id, maxBytes = Infinity) {
+    async artistPhoto(id, maxBytes = Infinity, read = direct) {
       const local = await localArtistPath(id);
       if (local) {
         try {
-          const bytes = await readImage(local, maxBytes);
-          if (bytes) {
-            return { bytes, format: imageContentType(local.split('.').pop()!) };
-          }
+          const image = await read(local, 'image-v1', async () => {
+            const bytes = await readImage(local, maxBytes);
+            return bytes
+              ? { bytes, format: imageContentType(local.split('.').pop()!) }
+              : null;
+          });
+          if (image) return image;
         } catch { /* A vanished local picture falls through. */ }
       }
       const candidate = await store.candidates.acceptedArtistPhoto(id) ??
         await store.candidates.strongestOpen('artist', id, 'cover');
       if (!candidate || !options.dataDir) return null;
-      const bytes = await readCandidateImage(
-        { path: options.dataDir },
-        candidate.imageHash,
-        candidate.imageExt,
-        maxBytes,
+      return await read(
+        candidateImagePath(
+          { path: options.dataDir },
+          candidate.imageHash,
+          candidate.imageExt,
+        ),
+        'image-v1',
+        async () => {
+          const bytes = await readCandidateImage(
+            { path: options.dataDir! },
+            candidate.imageHash,
+            candidate.imageExt,
+            maxBytes,
+          );
+          return bytes
+            ? { bytes, format: imageContentType(candidate.imageExt) }
+            : null;
+        },
       );
-      return bytes
-        ? { bytes, format: imageContentType(candidate.imageExt) }
-        : null;
     },
     listArtists: catalog.listArtists,
     artistsPage: catalog.artistsPage,
@@ -182,14 +201,19 @@ export function createLibrary(
     songsByGenre: catalog.songsByGenre,
     lyrics: lyrics.legacy,
     lyricsBySongId: lyrics.bySongId,
-    async embeddedCover(id, maxBytes = Infinity) {
+    async embeddedCover(id, maxBytes = Infinity, read = direct) {
       const path = await catalog.coverSongPath(id);
       if (path === null) return null;
       try {
-        const meta = await boundedMetadata(path, maxBytes, { duration: false });
-        const picture = embeddedPictures(meta)[0];
-        if (!picture) return null;
-        return { bytes: picture.data, format: picture.format };
+        return await read(path, 'embedded-v1', async () => {
+          const meta = await boundedMetadata(path, maxBytes, {
+            duration: false,
+          });
+          const picture = embeddedPictures(meta)[0];
+          return picture
+            ? { bytes: picture.data, format: picture.format }
+            : null;
+        });
       } catch {
         return null; // unreadable file — treated as no embedded cover
       }
@@ -215,7 +239,7 @@ export function createLibrary(
       }
       return null;
     },
-    async candidateCover(id, maxBytes) {
+    async candidateCover(id, maxBytes, read = direct) {
       const candidate = await store.candidates.strongestOpen(
         'album',
         id,
@@ -226,15 +250,21 @@ export function createLibrary(
         l.id === candidate.libraryId
       );
       if (!library) return null;
-      const bytes = await readCandidateImage(
-        library,
-        candidate.imageHash,
-        candidate.imageExt,
-        maxBytes,
+      return await read(
+        candidateImagePath(library, candidate.imageHash, candidate.imageExt),
+        'image-v1',
+        async () => {
+          const bytes = await readCandidateImage(
+            library,
+            candidate.imageHash,
+            candidate.imageExt,
+            maxBytes,
+          );
+          return bytes === null
+            ? null
+            : { bytes, format: imageContentType(candidate.imageExt) };
+        },
       );
-      return bytes === null
-        ? null
-        : { bytes, format: imageContentType(candidate.imageExt) };
     },
   };
 }

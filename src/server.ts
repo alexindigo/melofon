@@ -303,6 +303,7 @@ export async function startServer(options: {
     ),
     zip: createZip(),
     artwork: createArtwork(library, {
+      facts: store.artwork,
       state,
       dataDir: cfg.dataDir,
       playlists,

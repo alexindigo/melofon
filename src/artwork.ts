@@ -9,6 +9,8 @@ import { imageHeader, withinPixels } from './image-header.ts';
 import { animatedImage, playlistImage, resizeImage } from './media.ts';
 import { createArtworkCache } from './artwork-cache.ts';
 import type { Podcasts } from './podcasts.ts';
+import { type ArtworkImage, createArtworkSources } from './artwork-sources.ts';
+import type { Store } from './store/index.ts';
 
 export type ArtworkRef = {
   kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast';
@@ -50,10 +52,7 @@ interface Options {
   size?: number;
   username?: string;
 }
-interface Image {
-  bytes: Uint8Array;
-  format: string;
-}
+type Image = ArtworkImage;
 interface Source extends Image {
   sourceKind: ArtworkDescriptor['sourceKind'];
 }
@@ -99,6 +98,7 @@ export function createArtwork(library: Library, options: {
   dataDir?: string;
   playlists?: Playlists;
   podcasts?: Pick<Podcasts, 'cover'>;
+  facts?: Store['artwork'];
   /** Native processing port, also lets admission be exercised deterministically. */
   resize?: typeof resizeImage;
 } = {}): ArtworkService {
@@ -132,6 +132,11 @@ export function createArtwork(library: Library, options: {
   const cache = createArtworkCache(
     options.dataDir ? `${options.dataDir}/cache/images` : undefined,
   );
+  const sources = createArtworkSources(
+    options.facts,
+    cache,
+    async () => await setting('cacheMegabytes') * 1024 * 1024,
+  );
   let active = 0;
   const waiting: (() => void)[] = [];
   async function admitted<T>(job: () => Promise<T>): Promise<T | null> {
@@ -159,7 +164,11 @@ export function createArtwork(library: Library, options: {
     kind?: ArtworkRef['kind'],
   ): Promise<Source | null | 'unknown'> {
     if (!kind || kind === 'podcast') {
-      const podcast = await options.podcasts?.cover(id, maxBytes);
+      const podcast = await options.podcasts?.cover(
+        id,
+        maxBytes,
+        sources.file(maxBytes),
+      );
       if (podcast !== undefined && podcast !== 'unknown') {
         return podcast && { ...podcast, sourceKind: 'podcast' };
       }
@@ -167,7 +176,11 @@ export function createArtwork(library: Library, options: {
     }
     const song = !kind || kind === 'song' ? await library.getSong(id) : null;
     if (song !== null) {
-      const own = await library.embeddedCover(id, maxBytes);
+      const own = await library.embeddedCover(
+        id,
+        maxBytes,
+        sources.file(maxBytes),
+      );
       if (own !== null) return { ...own, sourceKind: 'embedded' };
       return song.albumId === null
         ? null
@@ -177,29 +190,47 @@ export function createArtwork(library: Library, options: {
       const path = await library.albumCoverPath(id);
       if (path !== null) {
         try {
-          const bytes = await readImage(path, maxBytes);
-          if (bytes) {
-            return {
-              bytes,
-              sourceKind: 'album-file',
-              format: path.toLowerCase().endsWith('.png')
-                ? 'image/png'
-                : path.toLowerCase().endsWith('.webp')
-                ? 'image/webp'
-                : 'image/jpeg',
-            };
-          }
+          const image = await sources.file(maxBytes)(
+            path,
+            'image-v1',
+            async () => {
+              const bytes = await readImage(path, maxBytes);
+              return bytes
+                ? {
+                  bytes,
+                  format: path.toLowerCase().endsWith('.png')
+                    ? 'image/png'
+                    : path.toLowerCase().endsWith('.webp')
+                    ? 'image/webp'
+                    : 'image/jpeg',
+                }
+                : null;
+            },
+          );
+          if (image) return { ...image, sourceKind: 'album-file' };
         } catch {
           /* Vanished/unreadable sources fall through the same chain. */
         }
       }
-      const embedded = await library.embeddedCover(id, maxBytes);
+      const embedded = await library.embeddedCover(
+        id,
+        maxBytes,
+        sources.file(maxBytes),
+      );
       if (embedded !== null) return { ...embedded, sourceKind: 'embedded' };
-      const candidate = await library.candidateCover(id, maxBytes);
+      const candidate = await library.candidateCover(
+        id,
+        maxBytes,
+        sources.file(maxBytes),
+      );
       return candidate && { ...candidate, sourceKind: 'album-candidate' };
     }
     if ((!kind || kind === 'artist') && await library.artistById(id) !== null) {
-      const photo = await library.artistPhoto(id, maxBytes);
+      const photo = await library.artistPhoto(
+        id,
+        maxBytes,
+        sources.file(maxBytes),
+      );
       if (photo) return { ...photo, sourceKind: 'artist-photo' };
       const albums = await library.albumsByArtist(id);
       return albums.length
@@ -251,7 +282,7 @@ export function createArtwork(library: Library, options: {
     const tileSize = 2 * await setting('playlistTileSize');
     if (tileSize > maxPixels / tileSize) return null;
     const hashes = await Promise.all(
-      images.map((image) => imageHash(image.bytes)),
+      images.map((image) => image.facts?.sourceHash ?? imageHash(image.bytes)),
     );
     const key = `${await imageHash(
       new TextEncoder().encode(
@@ -259,19 +290,22 @@ export function createArtwork(library: Library, options: {
       ),
     )}.png`;
     const limit = await setting('cacheMegabytes') * 1024 * 1024;
-    let bytes = await cache.get(key, limit);
-    if (!bytes) {
-      try {
-        bytes = await admitted(() =>
-          playlistImage(images.map((image) => image.bytes), tileSize)
-        );
-      } catch {
-        return null;
+    const image = await sources.generated(`playlist:${id}`, key, async () => {
+      let bytes = await cache.get(key, limit);
+      if (!bytes) {
+        try {
+          bytes = await admitted(() =>
+            playlistImage(images.map((image) => image.bytes), tileSize)
+          );
+        } catch {
+          return null;
+        }
+        if (!bytes) return null;
+        await cache.put(key, bytes, limit);
       }
-      if (!bytes) return null;
-      await cache.put(key, bytes, limit);
-    }
-    return { bytes, format: 'image/png', sourceKind: 'playlist' };
+      return { bytes, format: 'image/png' };
+    });
+    return image && { ...image, sourceKind: 'playlist' };
   }
 
   async function policy(): Promise<Policy> {
@@ -297,7 +331,8 @@ export function createArtwork(library: Library, options: {
     if (source === 'unknown') return { kind: 'unknown' };
     if (source === null) return { kind: 'missing' };
     const header = imageHeader(source.bytes);
-    const sourceHash = await imageHash(source.bytes);
+    const sourceHash = source.facts?.sourceHash ??
+      await imageHash(source.bytes);
     return {
       kind: 'image',
       bytes: source.bytes,
@@ -308,8 +343,8 @@ export function createArtwork(library: Library, options: {
           `${sourceHash}:rendition-v1:${rules.quality}:${rules.maxPixels}`,
         )),
         sourceKind: source.sourceKind,
-        width: header?.width ?? null,
-        height: header?.height ?? null,
+        width: source.facts ? source.facts.width : header?.width ?? null,
+        height: source.facts ? source.facts.height : header?.height ?? null,
         mime: source.format,
       },
     };
@@ -386,6 +421,7 @@ export function createArtwork(library: Library, options: {
       return !!await library.artistPhoto(
         id,
         await setting('maxSourceMegabytes') * 1024 * 1024,
+        sources.file(await setting('maxSourceMegabytes') * 1024 * 1024),
       );
     },
     placeholder,

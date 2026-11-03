@@ -487,3 +487,10 @@ CREATE TABLE IF NOT EXISTS migrations (
   id VARCHAR PRIMARY KEY,
   applied_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
+
+-- Disposable artwork facts, added on both fresh installs and existing upgrades.
+CREATE TABLE IF NOT EXISTS artwork_sources (
+  source_key VARCHAR PRIMARY KEY,
+  signature VARCHAR NOT NULL,
+  facts JSON
+);

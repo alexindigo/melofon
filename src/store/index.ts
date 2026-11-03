@@ -22,8 +22,10 @@ import { createSessionsStore } from './sessions.ts';
 import { createPreferencesStore } from './preferences.ts';
 import { createScanStore } from './scan.ts';
 import { createFoldersStore } from './folders.ts';
+import { createArtworkStore } from './artwork.ts';
 
 export interface Store {
+  artwork: ReturnType<typeof createArtworkStore>;
   folders: ReturnType<typeof createFoldersStore>;
   scan: ReturnType<typeof createScanStore>;
   preferences: ReturnType<typeof createPreferencesStore>;
@@ -56,6 +58,7 @@ export async function openStore(
 ): Promise<Store> {
   const engine = await openEngine(dataDir, opts);
   const store: Store = {
+    artwork: createArtworkStore(engine),
     folders: createFoldersStore(engine),
     scan: createScanStore(engine),
     preferences: createPreferencesStore(engine),
