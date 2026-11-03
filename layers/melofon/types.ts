@@ -16,7 +16,8 @@ export interface ArtworkDescriptor {
     | 'artist-photo'
     | 'playlist'
     | 'podcast'
-    | 'radio-upload';
+    | 'radio-upload'
+    | 'radio-name';
   width: number | null;
   height: number | null;
   mime: string;

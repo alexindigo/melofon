@@ -17,6 +17,7 @@ import type { Podcasts } from './podcasts.ts';
 import { type ArtworkImage, createArtworkSources } from './artwork-sources.ts';
 import type { Store } from './store/index.ts';
 import type { createRadio } from './radio.ts';
+import { createRadioArtwork, RADIO_TILE_REVISION } from './radio-artwork.ts';
 
 export type ArtworkRef = {
   kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast' | 'radio';
@@ -32,7 +33,8 @@ export interface ArtworkDescriptor {
     | 'artist-photo'
     | 'playlist'
     | 'podcast'
-    | 'radio-upload';
+    | 'radio-upload'
+    | 'radio-name';
   /** Original dimensions, not rendition dimensions; null for unknown headers. */
   width: number | null;
   height: number | null;
@@ -120,7 +122,7 @@ export function createArtwork(library: Library, options: {
   dataDir?: string;
   playlists?: Playlists;
   podcasts?: Pick<Podcasts, 'cover'>;
-  radio?: Pick<ReturnType<typeof createRadio>, 'cover'>;
+  radio?: Pick<ReturnType<typeof createRadio>, 'cover' | 'get'>;
   facts?: Store['artwork'];
   /** Native processing port, also lets admission be exercised deterministically. */
   resize?: typeof resizeImage;
@@ -135,6 +137,8 @@ export function createArtwork(library: Library, options: {
     maxQueuedResizes: concurrent * 2,
     cacheMegabytes: 100,
     playlistTileSize: 300,
+    radioTileSize: 512,
+    radioTileCharacters: 512,
   };
   for (const [name, value] of Object.entries(defaults)) {
     options.state?.declare(`artwork.${name}`, {
@@ -148,6 +152,7 @@ export function createArtwork(library: Library, options: {
           ? 0
           : 1,
       ...(name === 'jpegQuality' ? { maximum: 100 } : {}),
+      ...(name === 'radioTileSize' ? { minimum: 64, maximum: 2048 } : {}),
       default: value,
     });
   }
@@ -161,6 +166,7 @@ export function createArtwork(library: Library, options: {
     cache,
     async () => await setting('cacheMegabytes') * 1024 * 1024,
   );
+  const radioTile = createRadioArtwork();
   let active = 0;
   const waiting: (() => void)[] = [];
   async function admitted<T>(job: () => Promise<T>): Promise<T | null> {
@@ -189,9 +195,39 @@ export function createArtwork(library: Library, options: {
   ): Promise<Source | null | 'unknown'> {
     if (kind === 'radio' || !kind && id.startsWith('radio-')) {
       const image = await options.radio?.cover(id, maxBytes);
-      return image === undefined || image === 'unknown'
-        ? 'unknown'
-        : image && { ...image, sourceKind: 'radio-upload' };
+      if (image === undefined || image === 'unknown') return 'unknown';
+      if (image) return { ...image, sourceKind: 'radio-upload' };
+      const station = await options.radio?.get(id);
+      if (!station) return 'unknown';
+      const size = await setting('radioTileSize');
+      const characters = await setting('radioTileCharacters');
+      if (size * size > await setting('maxPixels')) return null;
+      const stamp = JSON.stringify([
+        RADIO_TILE_REVISION,
+        station.name,
+        station.streamUrl,
+        size,
+        characters,
+      ]);
+      const generated = await sources.generated(
+        `radio-name:${id}`,
+        stamp,
+        async () => {
+          try {
+            const bytes = await admitted(() =>
+              radioTile(station.name, station.streamUrl, size, characters)
+            );
+            return bytes && bytes.length <= maxBytes
+              ? { bytes, format: 'image/png' }
+              : null;
+          } catch {
+            return null;
+          }
+        },
+      );
+      return generated && generated.bytes.length <= maxBytes
+        ? { ...generated, sourceKind: 'radio-name' }
+        : null;
     }
     if (!kind || kind === 'podcast') {
       const podcast = await options.podcasts?.cover(

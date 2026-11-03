@@ -142,10 +142,12 @@ Deno.test('radio artwork HTTP: upload, shared pixels/legacy delivery, replacemen
       ),
     );
     const cookie = (await t.f.login()).credential;
-    assertEquals(
-      (await t.artwork.describe({ kind: 'radio', id: t.station.id })).kind,
-      'missing',
-    );
+    const fallback = await t.artwork.describe({
+      kind: 'radio',
+      id: t.station.id,
+    });
+    assert(fallback.kind === 'image');
+    assertEquals(fallback.descriptor.sourceKind, 'radio-name');
     await error(
       await t.write('PUT', undefined, source(200)),
       401,
@@ -230,15 +232,22 @@ Deno.test('radio artwork HTTP: upload, shared pixels/legacy delivery, replacemen
     const removed = await t.write('DELETE', after);
     assertEquals(removed.status, 200);
     await removed.json();
-    const missing = await t.f.get(second.url, after, { 'If-None-Match': '*' });
-    assertEquals(missing.headers.get('cache-control'), 'no-store');
-    assertEquals(missing.headers.get('etag'), null);
-    await missing.arrayBuffer();
+    const revealed = await t.f.get(second.url, after, {
+      'If-None-Match': `"${second.sourceHash}"`,
+    });
+    assertEquals(revealed.status, 200);
+    assertEquals(revealed.headers.get('cache-control'), 'private, no-cache');
+    assertNotEquals(revealed.headers.get('etag'), `"${second.sourceHash}"`);
+    const revealedBytes = new Uint8Array(await revealed.arrayBuffer());
+    assertEquals(imageHeader(revealedBytes)?.width, 512);
     await t.restart();
-    assertEquals(
-      (await t.artwork.describe({ kind: 'radio', id: t.station.id })).kind,
-      'missing',
-    );
+    const restored = await t.artwork.snapshot({
+      kind: 'radio',
+      id: t.station.id,
+    });
+    assert(restored.kind === 'image');
+    assertEquals(restored.descriptor.sourceKind, 'radio-name');
+    assertEquals(restored.bytes, revealedBytes);
     assertEquals(
       Array.from(Deno.readDirSync(`${t.root}/data/radio-images`)),
       [],
@@ -408,6 +417,255 @@ Deno.test('radio artwork HTTP: six-column installed schema upgrades without losi
     const restored = (await t.f.login()).credential;
     await original(t.f, art.url, restored, source(80));
     assertEquals((await t.radio.list()).length, 2);
+  } finally {
+    await t.close();
+  }
+});
+
+function radioUrl(id: string, version?: string) {
+  return `/api/v1/artwork/${encodeURIComponent(`radio:${id}`)}${
+    version ? `?v=${version}` : ''
+  }`;
+}
+
+// Independent upstream glyph vectors (Unifont 18.0.01), not renderer output.
+// Compare the entire decoded HTTP tile with the expected glyph mask at 5x.
+function assertGlyph(pixels: Uint8Array, glyph: string) {
+  const width = glyph.length / 4;
+  const background = pixels.slice(0, 4);
+  assertEquals(background[3], 255);
+  assert(
+    background.subarray(0, 3).every((value) => value >= 24 && value <= 87),
+  );
+  const left = (512 - width * 5) / 2;
+  const top = (512 - 16 * 5) / 2;
+  for (let y = 0; y < 512; y++) {
+    for (let x = 0; x < 512; x++) {
+      const col = Math.floor((x - left) / 5);
+      const row = Math.floor((y - top) / 5);
+      const ink = col >= 0 && col < width && row >= 0 && row < 16 &&
+        (parseInt(glyph.slice(row * width / 4, (row + 1) * width / 4), 16) &
+          (1 << (width - col - 1)));
+      const i = (y * 512 + x) * 4;
+      for (let c = 0; c < 4; c++) {
+        assertEquals(pixels[i + c], ink ? 255 : background[c]);
+      }
+    }
+  }
+}
+
+Deno.test('radio name tile HTTP: real Latin, Cyrillic, Greek, Chinese, Japanese and Korean glyph pixels', async () => {
+  const t = await fixture();
+  try {
+    const cookie = (await t.f.login()).credential;
+    const bearer = (await t.f.login('bearer')).credential;
+    const samples = [
+      ['A', '0000000018242442427E424242420000'],
+      ['e\u0301', '00000C3000003C42427E4040423C0000'],
+      ['\u0420', '000000007C4242427C40404040400000'],
+      ['\u03a9', '000000003E4141414141221414770000'],
+      [
+        '\u4e2d',
+        '01000100010001003FF8210821082108210821083FF821080100010001000100',
+      ],
+      [
+        '\u65e5',
+        '00001FF0101010101010101010101FF01010101010101010101010101FF01010',
+      ],
+      [
+        '\u3042',
+        '00000400020002C01F000480048007E00D101508220826082A10106000000000',
+      ],
+      [
+        '\u30a2',
+        '00000000000021F01E1000200240018001000100010002000200040008000000',
+      ],
+      [
+        '\ud55c',
+        '0000000004047FC400041F07208420841F040004000410041000100010000FFC',
+      ],
+    ];
+    for (const [index, [name, glyph]] of samples.entries()) {
+      await t.radio.update(t.station.id, { ...t.station, name });
+      const response = await t.f.get(
+        radioUrl(t.station.id),
+        index % 2 ? cookie : bearer,
+      );
+      assertEquals(response.status, 200);
+      assertEquals(response.headers.get('content-type'), 'image/png');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      assertEquals([imageHeader(bytes)!.width, imageHeader(bytes)!.height], [
+        512,
+        512,
+      ]);
+      assertGlyph(await imagePixels(bytes, 512, 512), glyph);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('radio name tile HTTP: stable source/palette/version across restart; name and URL edits invalidate; upload removal reveals same source', async () => {
+  const t = await fixture();
+  try {
+    const key = (await t.f.login()).credential;
+    const ref = { kind: 'radio' as const, id: t.station.id };
+    const first = await t.artwork.snapshot(ref);
+    assert(first.kind === 'image');
+    assertEquals(first.descriptor.sourceKind, 'radio-name');
+    await original(
+      t.f,
+      radioUrl(t.station.id, first.descriptor.version),
+      key,
+      first.bytes,
+    );
+    const firstPixels = await t.artwork.pixels(ref, { size: 73 });
+    assert(firstPixels.kind === 'pixels');
+    assertEquals([
+      firstPixels.width,
+      firstPixels.height,
+      firstPixels.rgba.length,
+    ], [73, 73, 73 * 73 * 4]);
+    const resized = await t.f.get(`${radioUrl(t.station.id)}?size=73`, key);
+    assertEquals(
+      await imagePixels(new Uint8Array(await resized.arrayBuffer()), 73, 73),
+      firstPixels.rgba,
+    );
+    assertEquals(
+      new Uint8Array(await (await t.artwork.cover(t.station.id)).arrayBuffer()),
+      first.bytes,
+    );
+    const repeat = await t.f.get(
+      radioUrl(t.station.id, first.descriptor.version),
+      key,
+      { 'If-None-Match': `W/"${first.descriptor.sourceHash}"` },
+    );
+    assertEquals(repeat.status, 304);
+    assertEquals(await repeat.text(), '');
+    await t.restart();
+    const after = (await t.f.login('bearer')).credential;
+    const restored = await t.artwork.snapshot(ref);
+    assert(restored.kind === 'image');
+    assertEquals(restored.descriptor, first.descriptor);
+    assertEquals(restored.bytes, first.bytes);
+    // A new owner without the disposable cache also produces the identical PNG.
+    const uncached = createArtwork(createLibrary(t.f.store), {
+      radio: t.radio,
+    });
+    const regenerated = await uncached.snapshot(ref);
+    assert(regenerated.kind === 'image');
+    assertEquals(regenerated.bytes, first.bytes);
+    await t.radio.update(t.station.id, {
+      ...t.station,
+      name: 'Different station',
+    });
+    const renamed = await t.artwork.snapshot(ref);
+    assert(renamed.kind === 'image');
+    assertNotEquals(renamed.descriptor.version, first.descriptor.version);
+    const a = await imagePixels(first.bytes, 512, 512);
+    const b = await imagePixels(renamed.bytes, 512, 512);
+    assertEquals(a.slice(0, 4), b.slice(0, 4));
+    assertNotEquals(a, b);
+    await t.radio.update(t.station.id, {
+      ...t.station,
+      name: 'Different station',
+      streamUrl: 'https://another.home/radio',
+    });
+    const moved = await t.artwork.snapshot(ref);
+    assert(moved.kind === 'image');
+    assertNotEquals(moved.descriptor.version, renamed.descriptor.version);
+    const c = await imagePixels(moved.bytes, 512, 512);
+    assertNotEquals(c.slice(0, 4), b.slice(0, 4));
+    // The same glyph mask remains after changing the URL-derived palette.
+    for (let i = 0; i < b.length; i += 4) {
+      assertEquals(b[i] === 255, c[i] === 255);
+    }
+    const override = await uploaded(await t.write('PUT', after, source(80)));
+    await original(t.f, override.url, after, source(80));
+    const removal = await t.write('DELETE', after);
+    assertEquals(removal.status, 200);
+    await removal.json();
+    await original(
+      t.f,
+      radioUrl(t.station.id, moved.descriptor.version),
+      after,
+      moved.bytes,
+    );
+    const stale = await t.f.get(
+      radioUrl(t.station.id, first.descriptor.version),
+      after,
+      { 'If-None-Match': `"${first.descriptor.sourceHash}"` },
+    );
+    assertEquals(stale.status, 200);
+    assertEquals(stale.headers.get('cache-control'), 'private, no-cache');
+    assertEquals(new Uint8Array(await stale.arrayBuffer()), moved.bytes);
+    // Normalization can produce identical pixels for different stored names.
+    // Input identity still changes the encoded source and immutable URL version.
+    await t.radio.update(t.station.id, { ...t.station, name: 'Cafe\u0301' });
+    const decomposed = await t.artwork.snapshot(ref);
+    await t.radio.update(t.station.id, { ...t.station, name: 'Caf\u00e9' });
+    const composed = await t.artwork.snapshot(ref);
+    assert(decomposed.kind === 'image' && composed.kind === 'image');
+    assertEquals(
+      await imagePixels(decomposed.bytes, 512, 512),
+      await imagePixels(composed.bytes, 512, 512),
+    );
+    assertNotEquals(decomposed.descriptor.version, composed.descriptor.version);
+    assertNotEquals(
+      decomposed.descriptor.sourceHash,
+      composed.descriptor.sourceHash,
+    );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('radio name tile HTTP: bounded wrapped text, size settings and unavailable admission are retryable', async () => {
+  const t = await fixture();
+  try {
+    const key = (await t.f.login('bearer')).credential;
+    const ref = { kind: 'radio' as const, id: t.station.id };
+    const before = await t.artwork.describe(ref);
+    assert(before.kind === 'image');
+    await t.f.state.set('artwork.radioTileSize', '64');
+    await t.f.state.set('artwork.radioTileCharacters', '12');
+    await t.radio.update(t.station.id, {
+      ...t.station,
+      name: 'Long unbroken name: \u4e2d\u6587'.repeat(100),
+    });
+    const result = await t.f.get(radioUrl(t.station.id), key);
+    assertEquals(result.status, 200);
+    const bytes = new Uint8Array(await result.arrayBuffer());
+    assertEquals([imageHeader(bytes)!.width, imageHeader(bytes)!.height], [
+      64,
+      64,
+    ]);
+    const pixels = await imagePixels(bytes, 64, 64);
+    assert(pixels.some((v, i) => i % 4 === 0 && v === 255));
+    // Text is wrapped inside the padding, never clipped into the border.
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 64; x++) {
+        if (x < 4 || y < 4 || x >= 60 || y >= 60) {
+          assertEquals(pixels[(y * 64 + x) * 4], pixels[0]);
+        }
+      }
+    }
+    const changed = await t.artwork.describe(ref);
+    assert(changed.kind === 'image');
+    assertNotEquals(changed.descriptor.version, before.descriptor.version);
+    await t.f.state.set('artwork.maxPixels', '4095');
+    assertEquals(
+      (await t.artwork.pixels(ref, { size: 10 })).kind,
+      'unavailable',
+    );
+    await t.f.state.set('artwork.maxPixels', '64000000');
+    await t.f.state.set('artwork.maxSourceMegabytes', '0');
+    assertEquals(
+      (await t.artwork.pixels(ref, { size: 10 })).kind,
+      'unavailable',
+    );
+    await t.f.state.set('artwork.maxSourceMegabytes', '20');
+    assertEquals((await t.artwork.pixels(ref, { size: 10 })).kind, 'pixels');
   } finally {
     await t.close();
   }

@@ -132,6 +132,16 @@ requests follow the usual Origin policy. `DELETE` removes the override.
 64000000) bound uploads. Invalid images leave the previous override intact.
 Back up `radio-images/` together with the database, just like `hat-images/`.
 
+Without an override, core renders the station name as a PNG tile on a plain,
+stream-URL-derived background. All hats share the same source, versions and
+pixel/resize paths. `artwork.radioTileSize` defaults to 512 (64-2048 pixels);
+`artwork.radioTileCharacters` defaults to 512 graphemes. Names wrap and shrink
+to fit, with an ellipsis for overflow. The bundled GNU Unifont bitmap font
+supports printable BMP Latin, Cyrillic, Greek and CJK names without system fonts
+or network services; its licence is in `src/fonts/`. Unsupported characters use
+a replacement glyph; complex-script shaping is not provided. Removing an upload
+reveals the tile again. Generated images are disposable cache data.
+
 ### Now-playing expiry
 
 Apps explicitly report playback; fetching media does not report a play.

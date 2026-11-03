@@ -414,6 +414,26 @@ async function encodeImage(
   return Buffer.concat(chunks);
 }
 
+/** Encode owned packed RGBA through the same native boundary as other artwork. */
+export async function encodeImagePixels(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+): Promise<Uint8Array> {
+  if (
+    !Number.isSafeInteger(width) || !Number.isSafeInteger(height) ||
+    width < 1 || height < 1 || pixels.length !== width * height * 4
+  ) throw new Error('Invalid packed artwork pixels');
+  using frame = imageFrame(width, height, AV_PIX_FMT_RGBA);
+  for (let row = 0; row < height; row++) {
+    frame.data![0].set(
+      pixels.subarray(row * width * 4, (row + 1) * width * 4),
+      row * frame.linesize[0],
+    );
+  }
+  return await encodeImage(frame, 'png', 75);
+}
+
 /** First-frame, straight RGBA, packed into JS-owned memory before native disposal. */
 export async function imagePixels(
   bytes: Uint8Array,
