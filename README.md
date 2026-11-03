@@ -121,6 +121,21 @@ or when the configured base URL is HTTPS and its host (including port) matches
 the request's host. Forwarded headers never supply an origin, scheme or client
 address.
 
+### Native artwork metadata
+
+Song, album, artist, playlist, station and podcast reads expose `artwork` with a
+versioned local `url`, original dimensions, `thumbHash` and `dominantColor`.
+Missing ordinary artwork is `null`. Facts are lazy: a cache miss returns null
+hash/colour fields while computing them; the next read includes the saved facts.
+
+Read-only lists/details are available at `/api/v1/playlists`,
+`/api/v1/radio-stations` and `/api/v1/podcasts` (append `/{id}` for details).
+Playlist reads follow core visibility and remain private/no-store. Podcast
+episodes at `/api/v1/podcasts/{id}/episodes` and
+`/api/v1/podcast-episodes/{id}` use their channel's artwork. These projections
+expose no server file paths. Cookie and Bearer credentials both work for the
+metadata and image URLs; repeat image requests can use `If-None-Match` for 304.
+
 ### Radio artwork uploads
 
 Signed-in users can send raw PNG, JPEG, GIF or WebP bytes to

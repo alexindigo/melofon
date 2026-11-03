@@ -6,6 +6,31 @@ export type ArtworkRef = {
   kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast' | 'radio';
   id: string;
 };
+export interface StationRow {
+  id: string;
+  name: string;
+  streamUrl: string;
+  homePageUrl: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+export interface PodcastChannel {
+  id: string;
+  feedUrl: string;
+  title: string | null;
+  description: string | null;
+  status: 'new' | 'completed' | 'error';
+  lastRefreshMs: number | null;
+}
+export interface PodcastEpisode {
+  id: string;
+  channelId: string;
+  title: string | null;
+  description: string | null;
+  publishDate: string | null;
+  duration: number | null;
+  status: 'new' | 'downloading' | 'completed' | 'error' | 'deleted' | 'skipped';
+}
 export interface ArtworkDescriptor {
   sourceHash: string;
   version: string;
@@ -100,11 +125,18 @@ export interface HatContext {
   app: {
     cfg: { dataDir?: string };
     radio: {
+      list(): Promise<StationRow[]>;
+      get(id: string): Promise<StationRow | null>;
       artworkMaxBytes(): Promise<number>;
       putArtwork(id: string, bytes: Uint8Array): Promise<
         { ok: true } | { invalid: 'too_large' | 'invalid_image' } | null
       >;
       removeArtwork(id: string): Promise<boolean>;
+    };
+    podcasts: {
+      channels(): Promise<PodcastChannel[]>;
+      episodes(id: string): Promise<PodcastEpisode[]>;
+      episode(id: string): Promise<PodcastEpisode | null>;
     };
     hatData: {
       get(key: string): Promise<{ kind: string; value: unknown } | null>;
@@ -228,6 +260,11 @@ export interface HatContext {
       }>;
     };
     playlists: {
+      visible(username: string): Promise<PlaylistRow[] | null | 'forbidden'>;
+      get(
+        username: string,
+        id: string,
+      ): Promise<(PlaylistRow & { trackIds: string[] }) | null>;
       containingSong(
         username: string,
         songId: string,

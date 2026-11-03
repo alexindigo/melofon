@@ -7,8 +7,11 @@ import type {
   Library,
   MediaTrack,
   PlaylistRow,
+  PodcastChannel,
+  PodcastEpisode,
   SongMetadata,
   SongRow,
+  StationRow,
   VideoDetails,
 } from './types.ts';
 import { artworkFacts } from './artwork-facts.ts';
@@ -41,6 +44,46 @@ export function browseArtwork(context: HatContext) {
       return {
         ...videoDetail(song, details),
         artwork: await artwork({ kind: 'song', id: song.id }),
+      };
+    },
+    async playlist(playlist: PlaylistRow) {
+      return {
+        ...playlistSummary(playlist),
+        artwork: await artwork({ kind: 'playlist', id: playlist.id }),
+      };
+    },
+    async station(station: StationRow) {
+      return {
+        id: station.id,
+        name: station.name,
+        streamUrl: station.streamUrl,
+        homePageUrl: station.homePageUrl,
+        createdAtMs: station.createdAtMs,
+        updatedAtMs: station.updatedAtMs,
+        artwork: await artwork({ kind: 'radio', id: station.id }),
+      };
+    },
+    async podcast(channel: PodcastChannel) {
+      return {
+        id: channel.id,
+        feedUrl: channel.feedUrl,
+        title: channel.title,
+        description: channel.description,
+        status: channel.status,
+        lastRefreshMs: channel.lastRefreshMs,
+        artwork: await artwork({ kind: 'podcast', id: channel.id }),
+      };
+    },
+    async episode(episode: PodcastEpisode) {
+      return {
+        id: episode.id,
+        channelId: episode.channelId,
+        title: episode.title,
+        description: episode.description,
+        publishDate: episode.publishDate,
+        duration: episode.duration,
+        status: episode.status,
+        artwork: await artwork({ kind: 'podcast', id: episode.channelId }),
       };
     },
   };

@@ -106,7 +106,7 @@ async function read(
   assertEquals(response.headers.get('cache-control'), 'private, no-store');
   assertEquals(response.headers.get('etag'), null);
   const body = await response.json() as {
-    playlists: PlaylistRow[];
+    playlists: (PlaylistRow & { artwork: null })[];
     total: number;
     offset: number;
     limit: number;
@@ -157,8 +157,9 @@ Deno.test('API song playlists: core own/public/admin visibility agrees with the 
           const detail = await f.playlists.get(username, row.id);
           assert(detail);
           const { trackIds: _tracks, ...summary } = detail;
-          assertEquals(row, summary);
+          assertEquals(row, { ...summary, artwork: null });
           assertEquals(Object.keys(row).sort(), [
+            'artwork',
             'changedAtMs',
             'comment',
             'createdAtMs',
