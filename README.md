@@ -96,6 +96,23 @@ owner's pending-read idle budget, without the resolution lifetime/byte caps.
 This is a core byte-source facility; queue admission and playback integration
 follow separately.
 
+Core media can decode owned compressed byte streams without giving FFmpeg a URL.
+It probes and replays a bounded prefix, ignores MIME hints, and accepts direct
+MP3, AAC, WAV, FLAC, Ogg and forward-readable MOV/MP4 containers. Playlists and
+secondary network/file resources are not opened by FFmpeg. These inputs cannot
+seek; containers requiring backward reads need finite preparation. Non-seekable
+MP3 decoding follows FFmpeg's streaming padding behavior rather than promising
+seekable-file gapless trimming.
+
+The media owner declares `media.input.probeBytes` (65536 bytes),
+`media.input.openBytes` (1048576 bytes consumed during acquisition),
+`media.input.openTimeoutMs` (10000 milliseconds for probing/opening) and
+`media.input.bufferBytes` (1048576 bytes per upstream chunk). Prefix storage and
+one upstream chunk are bounded separately; native demux/decoder buffers are
+additional. Successful live decoding has no total byte or lifetime cap. Caller
+abort, iterator return and failed acquisition close the owned input; the PCM
+completion promise settles after cleanup.
+
 ### Ignoring discovered speakers
 
 Any signed-in user can hide an unadopted speaker with

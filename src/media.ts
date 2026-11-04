@@ -29,6 +29,7 @@ import {
   AV_TIME_BASE,
   AV_TIME_BASE_Q,
   AVDISCARD_ALL,
+  AVERROR_EIO,
   avGetCodecName,
   AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_SUBTITLE,
@@ -136,6 +137,19 @@ export interface ExtractedAudio {
   contentType: string;
 }
 
+/** Core owns the bytes (including any ICY removal), never a URL for FFmpeg.
+ * Ownership transfers on call, including failed or cancelled acquisition. */
+export interface CompressedInput {
+  body: ReadableStream<Uint8Array>;
+  close(): Promise<void>;
+}
+
+export interface InputPcm extends AsyncIterableIterator<Uint8Array> {
+  return(): Promise<IteratorResult<Uint8Array>>;
+  /** Settles after reader, source lease, demuxer, decoder and frames release. */
+  completion: Promise<void>;
+}
+
 export interface Media {
   /** afp/1: compressed audio packets only, excluding tags and container data.
    * Throws on I/O/demux failure. No audio or packets yields a null fingerprint.
@@ -196,6 +210,12 @@ export interface Media {
     path: string,
     opts?: { startMs?: number },
   ): Promise<AsyncIterable<Uint8Array> | null>;
+  /** Non-seekable core-fed audio. MIME is not evidence of format. Throws on
+   * unsupported input, source failure or abort, preserving source errors. */
+  decodeInputPcm(
+    source: CompressedInput,
+    opts?: { signal?: AbortSignal },
+  ): Promise<InputPcm>;
 }
 
 export interface AudioFingerprint {
@@ -336,6 +356,95 @@ const EMPTY: Probe = {
 const PCM_RATE = 44100;
 const PCM_CHANNELS = 2;
 const PCM_BYTES_PER_SAMPLE = 2 * PCM_CHANNELS; // s16le interleaved
+
+// Only direct containers: no playlist/demuxer may open secondary resources.
+const INPUT_FORMATS = ['mp3', 'aac', 'wav', 'flac', 'ogg', 'mov'];
+const INPUT_LIMITS = {
+  probeBytes: 65536,
+  openBytes: 1048576,
+  openTimeoutMs: 10000,
+  bufferBytes: 1048576,
+};
+
+function pcmDecoder(input: Demuxer): Promise<Decoder> {
+  const audio = input.audio();
+  if (!audio) throw new Error('Media input has no audio');
+  return Decoder.create(audio, {
+    resample: {
+      sampleRate: PCM_RATE,
+      sampleFormat: AV_SAMPLE_FMT_S16,
+      channelLayout: AV_CHANNEL_LAYOUT_STEREO,
+    },
+  });
+}
+
+/** Acquisition ownership is outside the generator, including return-before-next.
+ * Stop pending IO first, but queue native disposal behind active iteration. */
+function ownedPcm(
+  input: Demuxer,
+  decoder: Decoder,
+  owner?: { stop(): void; release(): Promise<void>; check(): void },
+): InputPcm {
+  let complete!: () => void;
+  const completion = new Promise<void>((resolve) => complete = resolve);
+  let closing: Promise<void> | undefined;
+  const close = () =>
+    closing ??= (async () => {
+      try {
+        await owner?.release();
+      } finally {
+        decoder[Symbol.dispose]();
+        try {
+          await input.close();
+        } finally {
+          complete();
+        }
+      }
+    })();
+  const iterator = (async function* () {
+    try {
+      owner?.check();
+      for await (
+        const frame of decoder.frames(input.packets(input.audio()!.index))
+      ) {
+        if (frame === null) continue;
+        try {
+          owner?.check();
+          const plane = frame.data?.[0];
+          if (plane !== undefined && frame.nbSamples > 0) {
+            const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
+            const chunk = new Uint8Array(Math.min(bytes, plane.length));
+            chunk.set(plane.subarray(0, chunk.length));
+            yield chunk;
+          }
+        } finally {
+          frame.free();
+        }
+      }
+      owner?.check();
+    } catch (error) {
+      owner?.check(); // Native EIO/EOF must not hide the original byte failure.
+      throw error;
+    } finally {
+      await close();
+    }
+  })();
+  return {
+    completion,
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    next: () => iterator.next(),
+    async return() {
+      owner?.stop();
+      try {
+        return await iterator.return();
+      } finally {
+        await close();
+      }
+    },
+  };
+}
 
 // Artwork's native boundary. Callers inspect image headers and admit work first.
 // Fresh frames intentionally carry neither EXIF orientation nor ICC side data.
@@ -664,6 +773,13 @@ export function createMedia(
       return null;
     }
   }, state);
+  for (const [name, value] of Object.entries(INPUT_LIMITS)) {
+    state?.declare(`media.input.${name}`, {
+      type: 'integer',
+      minimum: 1,
+      default: value,
+    });
+  }
 
   async function encodeHls(
     path: string,
@@ -832,6 +948,173 @@ export function createMedia(
 
   return {
     ...hls,
+    async decodeInputPcm(source, opts = {}) {
+      const abort = new AbortController();
+      const signal = abort.signal;
+      let reader: ReadableStreamDefaultReader<Uint8Array>;
+      try {
+        reader = source.body.getReader();
+      } catch (error) {
+        await source.close();
+        throw error;
+      }
+      let failure: { error: unknown } | undefined;
+      let pending: Uint8Array = new Uint8Array(0);
+      let releasePromise: Promise<void> | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const release = () =>
+        releasePromise ??= (async () => {
+          clearTimeout(timer);
+          opts.signal?.removeEventListener('abort', onAbort);
+          signal.removeEventListener('abort', cancelRead);
+          try {
+            await reader.cancel();
+          } finally {
+            reader.releaseLock();
+            pending = new Uint8Array(0);
+            await source.close();
+          }
+        })();
+      const cancelRead = () => {
+        void reader.cancel(signal.reason).catch(() => {});
+      };
+      const onAbort = () => abort.abort(opts.signal!.reason);
+      signal.addEventListener('abort', cancelRead, { once: true });
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
+      if (opts.signal?.aborted) onAbort();
+      const check = () => {
+        signal.throwIfAborted();
+        if (failure) throw failure.error;
+      };
+      let input: Demuxer | undefined;
+      let decoder: Decoder | undefined;
+      try {
+        const limits = { ...INPUT_LIMITS };
+        for (const name of Object.keys(limits) as (keyof typeof limits)[]) {
+          limits[name] = Number(
+            await state?.getTyped(`media.input.${name}`) ?? limits[name],
+          );
+        }
+        check();
+        timer = setTimeout(
+          () =>
+            abort.abort(
+              new DOMException('Media input open timed out', 'TimeoutError'),
+            ),
+          limits.openTimeoutMs,
+        );
+        let opening = true;
+        let readBytes = 0;
+        const read = async (size: number): Promise<Buffer | null> => {
+          check();
+          while (!pending.length) {
+            const part = await reader.read();
+            check();
+            if (part.done) return null;
+            if (part.value.length > limits.bufferBytes) {
+              throw new Error('Media input chunk exceeds buffer limit');
+            }
+            pending = part.value;
+          }
+          const count = Math.min(size, pending.length);
+          if (opening && readBytes + count > limits.openBytes) {
+            throw new Error('Media input open byte limit exceeded');
+          }
+          const result = Buffer.from(pending.subarray(0, count));
+          pending = pending.subarray(count);
+          if (opening) readBytes += count;
+          return result;
+        };
+        const probe = Buffer.alloc(limits.probeBytes);
+        let probed = 0;
+        let format: string | undefined;
+        let target = Math.min(2048, limits.probeBytes);
+        while (true) {
+          let eof = false;
+          while (probed < target) {
+            const part = await read(target - probed);
+            if (!part) {
+              eof = true;
+              break;
+            }
+            probe.set(part, probed);
+            probed += part.length;
+          }
+          const found = await Demuxer.probeFormat(probe.subarray(0, probed));
+          check();
+          if (found && found.confidence > 25) {
+            format = INPUT_FORMATS.find((name) =>
+              found.format.split(',').includes(name)
+            );
+            if (!format) throw new Error('Unsupported core media input format');
+            break;
+          }
+          if (eof || target === limits.probeBytes) {
+            throw new Error('Unrecognized core media input format');
+          }
+          target = Math.min(target * 2, limits.probeBytes);
+        }
+        let prefix = probe.subarray(0, probed);
+        input = await Demuxer.open({
+          async read(size) {
+            try {
+              check();
+              if (prefix.length) {
+                const result = prefix.subarray(0, size);
+                prefix = prefix.subarray(result.length);
+                return result;
+              }
+              return await read(size);
+            } catch (error) {
+              failure ??= { error };
+              return AVERROR_EIO;
+            }
+          },
+        }, {
+          format,
+          signal,
+          options: {
+            protocol_whitelist: 'NONE',
+            format_whitelist: INPUT_FORMATS.join(','),
+            enable_drefs: 0,
+            use_absolute_path: 0,
+            probesize: limits.probeBytes,
+            analyzeduration: 0,
+          },
+        });
+        check();
+        decoder = await pcmDecoder(input);
+        check();
+        opening = false;
+        clearTimeout(timer);
+        const stream = ownedPcm(input, decoder, {
+          stop: () =>
+            abort.abort(new DOMException('PCM input cancelled', 'AbortError')),
+          release,
+          check,
+        });
+        // Abort also releases a successfully acquired but unconsumed iterator.
+        const retire = () => {
+          void stream.return().catch(() => {});
+        };
+        signal.addEventListener('abort', retire, { once: true });
+        void stream.completion.then(() =>
+          signal.removeEventListener('abort', retire)
+        );
+        if (signal.aborted) retire();
+        return stream;
+      } catch (error) {
+        const reason = signal.aborted ? signal.reason : failure?.error ?? error;
+        abort.abort(reason);
+        try {
+          await release();
+        } finally {
+          decoder?.[Symbol.dispose]();
+          await input?.close();
+        }
+        throw reason;
+      }
+    },
     async captions(path, index, format) {
       try {
         await using input = await Demuxer.open(path);
@@ -1258,63 +1541,13 @@ export function createMedia(
         }
         // Allocate only after successful seeking; a failed preflight owns
         // just the input, which the existing failure handler closes.
-        decoder = await Decoder.create(audio, {
-          resample: {
-            sampleRate: PCM_RATE,
-            sampleFormat: AV_SAMPLE_FMT_S16,
-            channelLayout: AV_CHANNEL_LAYOUT_STEREO,
-          },
-        });
+        decoder = await pcmDecoder(input);
       } catch (err) {
         log.event('media_failed', { operation: 'decodePcm', path, error: err });
         await input.close().catch(() => {});
         return null;
       }
-      const frames = decoder.frames(input.packets());
-      let closing: Promise<void> | undefined;
-      const close = () =>
-        closing ??= (async () => {
-          decoder[Symbol.dispose]();
-          await input.close().catch(() => {});
-        })();
-      const iterator = (async function* () {
-        try {
-          for await (const frame of frames) {
-            if (frame === null) continue; // flush signal, not media
-            try {
-              const plane = frame.data?.[0];
-              if (plane !== undefined && frame.nbSamples > 0) {
-                // Packed s16 stereo; copy before releasing the native frame.
-                const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
-                const chunk = new Uint8Array(Math.min(bytes, plane.length));
-                chunk.set(plane.subarray(0, chunk.length));
-                yield chunk;
-              }
-            } finally {
-              frame.free();
-            }
-          }
-        } finally {
-          await close();
-        }
-      })();
-      // Generator finally does not execute when return() precedes first next().
-      // Keep acquisition ownership outside it, while queueing return behind any
-      // pending next() so native resources cannot be freed during decoding.
-      const stream: AsyncIterableIterator<Uint8Array> = {
-        [Symbol.asyncIterator]() {
-          return this;
-        },
-        next: () => iterator.next(),
-        async return() {
-          try {
-            return await iterator.return();
-          } finally {
-            await close();
-          }
-        },
-      };
-      return stream;
+      return ownedPcm(input, decoder);
     },
   };
 }
