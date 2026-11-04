@@ -443,7 +443,14 @@ Deno.test('late credential encryption cannot resurrect a forgotten or released s
       await queueWait;
       await saveQueue(ids);
     };
-    t.persistence.saveQueue([]);
+    t.persistence.saveQueue({ items: [], nextId: 1, version: 0 }, {
+      state: 'stop',
+      currentIndex: null,
+      positionMs: 0,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+    });
     await queueReady;
     const queuedAdoption = t.outputs.adopt('3');
     const stale = assertRejects(

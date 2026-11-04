@@ -1,32 +1,42 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createPlaybackStore } from '../src/store/playback.ts';
 import { domainFixture } from './helpers/store.ts';
+import { songQueue } from './helpers/queue.ts';
+import { stopped } from './helpers/queue.ts';
+import { openStore } from '../src/store/index.ts';
+import { rawSql } from '../src/store/testing.ts';
 
 Deno.test('store.playback.saveQueue replaces zero-based positions, preserves duplicates and orphan ids, and clears', async () => {
   const t = await domainFixture(createPlaybackStore);
   try {
-    await t.domain.saveQueue(['old']);
-    await t.domain.saveQueue(["missing'", 'song', "missing'"]);
-    assertEquals(await t.all('SELECT * FROM server_queue ORDER BY pos'), [
-      { pos: 0, song_id: "missing'" },
-      { pos: 1, song_id: 'song' },
-      { pos: 2, song_id: "missing'" },
+    await t.domain.saveQueue(songQueue(['old']));
+    const queue = songQueue(["missing'", 'song', "missing'"]);
+    await t.domain.saveQueue(queue);
+    assertEquals(await t.domain.loadQueue(), queue);
+    assertEquals(await t.all('SELECT pos FROM server_queue ORDER BY pos'), [
+      { pos: 0 },
+      { pos: 1 },
+      { pos: 2 },
     ]);
-    await t.domain.saveQueue([]);
-    assertEquals(await t.domain.loadQueue(), []);
+    await t.domain.saveQueue(songQueue([]));
+    assertEquals(await t.domain.loadQueue(), songQueue([]));
   } finally {
     await t.close();
   }
 });
 
-Deno.test('store.playback.loadQueue returns empty or song ids ordered by position', async () => {
+Deno.test('store.playback.loadQueue returns empty or typed references ordered by position', async () => {
   const t = await domainFixture(createPlaybackStore);
   try {
-    assertEquals(await t.domain.loadQueue(), []);
+    assertEquals(await t.domain.loadQueue(), songQueue([]));
     await t.run(
-      "INSERT INTO server_queue VALUES (8, 'last'), (2, 'first'), (5, 'middle')",
+      "INSERT INTO server_queue VALUES (8, 3, 'song', 'last'), (2, 1, 'song', 'first'), (5, 2, 'song', 'middle')",
     );
-    assertEquals(await t.domain.loadQueue(), ['first', 'middle', 'last']);
+    await t.run('UPDATE server_queue_state SET next_id = 4, version = 1');
+    assertEquals(
+      await t.domain.loadQueue(),
+      songQueue(['first', 'middle', 'last']),
+    );
   } finally {
     await t.close();
   }
@@ -183,21 +193,89 @@ Deno.test('store.playback.saveQueue restores the previous queue after real input
     await t.run('DROP TABLE server_queue');
     await t.run(`CREATE TABLE server_queue (
       pos INTEGER PRIMARY KEY,
-      song_id VARCHAR NOT NULL REFERENCES files(id)
+      entry_id BIGINT UNIQUE NOT NULL,
+      reference_kind VARCHAR NOT NULL,
+      reference_value VARCHAR NOT NULL REFERENCES files(id)
     )`);
-    await t.domain.saveQueue(['song', 'song']);
+    await t.domain.saveQueue(songQueue(['song', 'song']));
     await assertRejects(
-      () => t.domain.saveQueue(['song', 'missing']),
+      () => t.domain.saveQueue(songQueue(['song', 'missing'])),
       Error,
       'Constraint',
     );
-    assertEquals(await t.domain.loadQueue(), ['song', 'song']);
-    assertEquals(await t.all('SELECT * FROM server_queue ORDER BY pos'), [
-      { pos: 0, song_id: 'song' },
-      { pos: 1, song_id: 'song' },
-    ]);
-    await t.domain.saveQueue(['song']);
-    assertEquals(await t.domain.loadQueue(), ['song']);
+    assertEquals(await t.domain.loadQueue(), songQueue(['song', 'song']));
+    await t.domain.saveQueue(songQueue(['song']));
+    assertEquals(await t.domain.loadQueue(), songQueue(['song']));
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('store.playback upgrades a song-only queue once, preserving order, duplicates and bookmark across reopens', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-queue-upgrade-' });
+  let store = await openStore(dir);
+  try {
+    await rawSql(store).run(
+      "DELETE FROM migrations WHERE id = 'server-queue-001'",
+    );
+    await rawSql(store).run('DROP TABLE server_queue');
+    await rawSql(store).run('DROP TABLE server_queue_state');
+    await rawSql(store).run(
+      'CREATE TABLE server_queue (pos INTEGER PRIMARY KEY, song_id VARCHAR NOT NULL)',
+    );
+    await rawSql(store).run(
+      "INSERT INTO server_queue VALUES (2, 'duplicate'), (0, 'duplicate'), (1, 'middle')",
+    );
+    await store.playback.saveState({
+      ...stopped,
+      state: 'pause',
+      currentIndex: 1,
+      positionMs: 4321,
+    });
+    const saved = await store.playback.loadPlayerState();
+    await store.close();
+    store = await openStore(dir);
+    const queue = await store.playback.loadQueue();
+    assertEquals(queue, songQueue(['duplicate', 'middle', 'duplicate']));
+    assertEquals(await store.playback.loadPlayerState(), saved);
+    await store.close();
+    store = await openStore(dir);
+    assertEquals(
+      await store.playback.loadQueue(),
+      queue,
+      'ids/allocator unchanged by another upgrade open',
+    );
+    assertEquals(await store.playback.loadPlayerState(), saved);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('store.playback rolls back queue, allocator, revision and bookmark together on commit failure', async () => {
+  const t = await domainFixture(createPlaybackStore);
+  try {
+    const original = songQueue(['song']);
+    await t.domain.saveQueue(original, {
+      ...stopped,
+      state: 'pause',
+      currentIndex: 0,
+      positionMs: 55,
+    });
+    const state = await t.domain.loadPlayerState();
+    t.failCommit();
+    await assertRejects(
+      () =>
+        t.domain.saveQueue({
+          ...songQueue(['other', 'other']),
+          nextId: 99,
+          version: 8,
+        }, stopped),
+      Error,
+      'injected commit failure',
+    );
+    assertEquals(await t.domain.loadQueue(), original);
+    assertEquals(await t.domain.loadPlayerState(), state);
   } finally {
     await t.close();
   }

@@ -18,6 +18,8 @@ import {
   shouldAutoResume,
 } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
+import { songQueue, songResolver, stopped } from './helpers/queue.ts';
+import { createQueueResolver } from '../src/queue-source.ts';
 
 let songN = 0;
 function song(durationMs: number | null = 180_000): SongRow {
@@ -145,7 +147,7 @@ Deno.test('queue, state, and position survive a restart', async () => {
   try {
     assertEquals(
       await restarted.persistence.loadQueue(),
-      songs.map((s) => s.id),
+      songQueue(songs.map((s) => s.id)),
       'queue ids in order',
     );
     const saved = await restarted.persistence.loadPlayerState();
@@ -163,9 +165,11 @@ Deno.test('queue, state, and position survive a restart', async () => {
 
     // The boot path: rehydrate, decide (fresh + environment matches), load.
     const snapshot = await planRestore({
-      queueIds: await restarted.persistence.loadQueue(),
+      queue: await restarted.persistence.loadQueue(),
       saved,
-      getSong: (id) => Promise.resolve(songs.find((s) => s.id === id) ?? null),
+      resolve: songResolver((id) =>
+        Promise.resolve(songs.find((s) => s.id === id) ?? null)
+      ),
       nowMs: Date.now(),
       maxAgeMs: 300_000,
       selectedOutputPresent: true,
@@ -207,9 +211,11 @@ Deno.test('a stale save restores paused at the saved place', async () => {
     const saved = await restarted.persistence.loadPlayerState();
     assert(saved !== null);
     const snapshot = await planRestore({
-      queueIds: await restarted.persistence.loadQueue(),
+      queue: await restarted.persistence.loadQueue(),
       saved,
-      getSong: (id) => Promise.resolve(songs.find((s) => s.id === id) ?? null),
+      resolve: songResolver((id) =>
+        Promise.resolve(songs.find((s) => s.id === id) ?? null)
+      ),
       // Past the 300 s freshness window: the save is stale.
       nowMs: saved.updatedAtMs + 301_000,
       maxAgeMs: 300_000,
@@ -247,10 +253,11 @@ Deno.test('missing tracks drop with a warn and the current index remaps', async 
   const warns: string[] = [];
   const restoreWith = (present: SongRow[]) =>
     planRestore({
-      queueIds: songs.map((s) => s.id),
+      queue: songQueue(songs.map((s) => s.id)),
       saved,
-      getSong: (id) =>
-        Promise.resolve(present.find((s) => s.id === id) ?? null),
+      resolve: songResolver((id) =>
+        Promise.resolve(present.find((s) => s.id === id) ?? null)
+      ),
       nowMs: Date.now(),
       maxAgeMs: 300_000,
       selectedOutputPresent: true,
@@ -266,7 +273,10 @@ Deno.test('missing tracks drop with a warn and the current index remaps', async 
   // b dropped: c shifts from index 2 to 1, position preserved, still plays.
   const shifted = await restoreWith([a, c, d]);
   assert(shifted !== null);
-  assertEquals(shifted.queue.map((s) => s.id), [a.id, c.id, d.id]);
+  assertEquals(
+    shifted.queue.map((s) => 'reference' in s ? s.reference : null),
+    [a, c, d].map((s) => ({ kind: 'song' as const, id: s.id })),
+  );
   assertEquals(shifted.currentIndex, 1);
   assertEquals(shifted.positionMs, 7000);
   assertEquals(shifted.state, 'play');
@@ -277,16 +287,19 @@ Deno.test('missing tracks drop with a warn and the current index remaps', async 
   // place is current, position 0, and play never auto-resumes.
   const currentGone = await restoreWith([a, c, d].filter((s) => s !== c));
   assert(currentGone !== null);
-  assertEquals(currentGone.queue.map((s) => s.id), [a.id, d.id]);
+  assertEquals(
+    currentGone.queue.map((s) => 'reference' in s ? s.reference : null),
+    [a, d].map((s) => ({ kind: 'song' as const, id: s.id })),
+  );
   assertEquals(currentGone.currentIndex, 1, 'd lands where c was');
   assertEquals(currentGone.positionMs, 0, 'a different song has no place');
   assertEquals(currentGone.state, 'pause');
 
   // Nothing persisted at all: nothing to restore.
   const nothing = await planRestore({
-    queueIds: [],
+    queue: songQueue([]),
     saved: null,
-    getSong: () => Promise.resolve(null),
+    resolve: () => Promise.resolve(null),
     nowMs: Date.now(),
     maxAgeMs: 300_000,
     selectedOutputPresent: false,
@@ -301,11 +314,14 @@ Deno.test('queue mutations rewrite server_queue (insert order, clear)', async ()
     playback.queueAdd([a, b]);
     playback.queueAdd([c], { position: 0 });
     await persistence.drain();
-    assertEquals(await persistence.loadQueue(), [c.id, a.id, b.id]);
+    assertEquals(
+      (await persistence.loadQueue()).items.map((e) => e.reference),
+      [c, a, b].map((s) => ({ kind: 'song' as const, id: s.id })),
+    );
 
     playback.queueClear();
     await persistence.drain();
-    assertEquals(await persistence.loadQueue(), []);
+    assertEquals((await persistence.loadQueue()).items, []);
     const saved = await persistence.loadPlayerState();
     assert(saved !== null);
     assertEquals(saved.state, 'stop', 'the clear also stopped the engine');
@@ -539,10 +555,105 @@ Deno.test('a failed save is drained and counted once; a broken logger is harmles
   try {
     const persistence = createPersistence(store, log);
     await db.close();
-    persistence.saveQueue(['a', 'b']);
+    persistence.saveQueue(songQueue(['a', 'b']), stopped);
     await persistence.drain();
     assertEquals(events.filter((id) => id === 'persistence_failed').length, 1);
   } finally {
     await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('restore resolves station edits, drops deleted stations and never restores live titles or positions', async () => {
+  const t = await setup();
+  let reopened: Awaited<ReturnType<typeof reopen>> | undefined;
+  try {
+    const station = await t.db.radio.create({
+      name: 'Edited',
+      streamUrl: 'http://melofon.home/new',
+      homePageUrl: null,
+    });
+    const queue = {
+      items: [
+        { id: 12, reference: { kind: 'station' as const, id: 'deleted' } },
+        { id: 13, reference: { kind: 'station' as const, id: station.id } },
+        {
+          id: 14,
+          reference: {
+            kind: 'url' as const,
+            url: 'http://melofon.home/audio?x=1#exact',
+          },
+        },
+      ],
+      nextId: 25,
+      version: 9,
+    };
+    t.persistence.saveQueue(queue, {
+      ...stopped,
+      state: 'play',
+      currentIndex: 1,
+      positionMs: 99999,
+    });
+    await t.persistence.drain();
+    await t.close(true);
+    reopened = await reopen(t.dir);
+    const resolve = createQueueResolver({
+      getSong: () => Promise.resolve(null),
+      getStation: reopened.db.radio.get,
+    });
+    const snapshot = await planRestore({
+      queue: await reopened.persistence.loadQueue(),
+      saved: await reopened.persistence.loadPlayerState(),
+      resolve,
+      nowMs: Date.now(),
+      maxAgeMs: 300000,
+      selectedOutputPresent: true,
+    });
+    assert(snapshot);
+    assertEquals(snapshot.currentIndex, 0);
+    assertEquals(
+      snapshot.positionMs,
+      0,
+      'live restart begins at the live edge',
+    );
+    const player = createPlayer();
+    const playback = createPlayback({
+      player,
+      nowPlaying: createNowPlaying(reopened.db),
+      library: createLibrary(reopened.db),
+      cfg: {},
+      persistence: reopened.persistence,
+    });
+    try {
+      await playback.restore(snapshot);
+      const current = playback.playerView().current;
+      assert(current?.facts.kind === 'web');
+      assertEquals(current.id, 13);
+      assertEquals(current.facts.title, 'Edited');
+      assertEquals(current.facts.url, 'http://melofon.home/new');
+      assertEquals(current.facts.streamTitle, null);
+      assertEquals(current.facts.streamUrl, null);
+      await reopened.persistence.drain();
+      assertEquals(
+        (await reopened.persistence.loadQueue()).items.map((e) => e.id),
+        [13, 14],
+      );
+      assertEquals(
+        (await reopened.persistence.loadPlayerState())?.currentIndex,
+        0,
+        'normalized references and bookmark saved together',
+      );
+      const appended = await playback.queueAdd([song()]);
+      assertEquals(
+        appended[0].id,
+        25,
+        'missing entries cannot rewind allocator',
+      );
+    } finally {
+      await playback.close();
+      await reopened.persistence.drain();
+    }
+  } finally {
+    if (reopened) await reopened.close();
+    else await t.close();
   }
 });

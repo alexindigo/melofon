@@ -2,6 +2,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
 import dgram from 'node:dgram';
+import { songResolver } from './helpers/queue.ts';
 import {
   createOutputs,
   createPlayer,
@@ -744,9 +745,9 @@ Deno.test({
             persistence,
           });
           const snapshot = await planRestore({
-            queueIds: await persistence.loadQueue(),
+            queue: await persistence.loadQueue(),
             saved: await persistence.loadPlayerState(),
-            getSong: (id) => library.getSong(id),
+            resolve: songResolver((id) => library.getSong(id)),
             nowMs: Date.now(),
             maxAgeMs: 300000,
             selectedOutputPresent: outputs.list().some((o) => o.selected),

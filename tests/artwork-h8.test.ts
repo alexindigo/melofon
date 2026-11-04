@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { Buffer } from 'node:buffer';
+import { songEntries } from './helpers/queue.ts';
 import { deflateSync } from 'node:zlib';
 import { AV_PIX_FMT_RGBA, Decoder, Demuxer } from 'node-av';
 import { pathfinder } from '@pathfinder/pathfinder';
@@ -304,7 +305,7 @@ Deno.test('H8 artwork consumer contract', async (t) => {
           own,
         );
         await playback.restore({
-          queue: [song],
+          queue: songEntries([song]),
           state: 'pause',
           currentIndex: 0,
           positionMs: 0,

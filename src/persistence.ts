@@ -15,12 +15,13 @@ import type {
 } from './player.ts';
 import type { PersistedPlayerState } from './store/playback.ts';
 import type { SpeakerCredentials } from './speaker-credentials.ts';
+import type { QueueSnapshot } from './queue-source.ts';
 
 export type { PersistedPlayerState } from './store/playback.ts';
 
 export interface Persistence extends PlayerPersistence, OutputPersistence {
-  /** The persisted queue, pos-ordered library song ids. */
-  loadQueue(): Promise<string[]>;
+  /** Ordered occurrences, durable allocator and revision, without runtime facts. */
+  loadQueue(): Promise<QueueSnapshot>;
   /** The singleton state row, or null when never persisted. */
   loadPlayerState(): Promise<PersistedPlayerState | null>;
   /** Adopted output preferences only (also seeds the savedOutput cache). */
@@ -48,8 +49,9 @@ export function createPersistence(
   const ignored = new Set<string>();
 
   return {
-    saveQueue(songIds) {
-      enqueue(() => store.playback.saveQueue(songIds));
+    saveQueue(snapshot, state) {
+      const copy = structuredClone(snapshot);
+      enqueue(() => store.playback.saveQueue(copy, state));
     },
 
     saveState(snapshot) {

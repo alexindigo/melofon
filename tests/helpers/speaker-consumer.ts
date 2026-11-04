@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { apiFixture } from './api.ts';
+import { songResolver } from './queue.ts';
 import {
   createOutputs,
   createPlayer,
@@ -182,9 +183,9 @@ export async function speakerConsumer(
         targets: speakers,
       });
       const snapshot = await planRestore({
-        queueIds: await persistence.loadQueue(),
+        queue: await persistence.loadQueue(),
         saved: await persistence.loadPlayerState(),
-        getSong: (id) => library.getSong(id),
+        resolve: songResolver((id) => library.getSong(id)),
         nowMs: Date.now(),
         maxAgeMs: 300000,
         selectedOutputPresent: outputs.list().some((row) => row.selected),

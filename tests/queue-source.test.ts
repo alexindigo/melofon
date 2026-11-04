@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertThrows } from '@std/assert';
+import { assert, assertEquals } from '@std/assert';
 import { apiFixture } from './helpers/api.ts';
 import { restored } from './helpers/prepared.ts';
 import { openStore } from '../src/store/index.ts';
@@ -15,9 +15,14 @@ import { createPlayer, type PlayerPersistence } from '../src/player.ts';
 import {
   catalogMedia,
   type QueueMedia,
+  type QueueSnapshot,
   queueSong,
 } from '../src/queue-source.ts';
 import { wireInt } from '../layers/owntone/payloads.ts';
+import { createPersistence, type Persistence } from '../src/persistence.ts';
+import { createQueueResolver } from '../src/queue-source.ts';
+import { planRestore } from '../src/player.ts';
+import { assertRejects } from '@std/assert';
 
 function web(kind: 'station' | 'url' = 'url'): QueueMedia {
   const url = 'http://melofon.home:1234/radio?token=private-query#station';
@@ -37,8 +42,8 @@ function web(kind: 'station' | 'url' = 'url'): QueueMedia {
   };
 }
 
-async function setup(persistence?: PlayerPersistence) {
-  const dir = await restored('queue-source', async (dir) => {
+async function setup(persistence?: PlayerPersistence | true, dataDir?: string) {
+  const dir = dataDir ?? await restored('queue-source', async (dir) => {
     const store = await openStore(dir);
     try {
       await seedFirstUser(store, {
@@ -58,6 +63,7 @@ async function setup(persistence?: PlayerPersistence) {
     }
   }, 'melofon-queue-source-');
   let playback!: Playback;
+  let durable: Persistence | undefined;
   const f = await apiFixture({
     storeDir: dir,
     hats: {
@@ -67,13 +73,23 @@ async function setup(persistence?: PlayerPersistence) {
     },
     services: (f) => {
       const library = createLibrary(f.store);
+      durable = persistence === true ? createPersistence(f.store) : undefined;
       playback = createPlayback({
         player: createPlayer(),
         library,
         nowPlaying: createNowPlaying(f.store),
         cfg: f.cfg,
         notify: f.notify,
-        persistence,
+        persistence: durable ??
+          (persistence === true ? undefined : persistence),
+        ...(durable
+          ? {
+            resolveQueueReference: createQueueResolver({
+              getSong: library.getSong,
+              getStation: f.store.radio.get,
+            }),
+          }
+          : {}),
       });
       return Promise.resolve({
         library,
@@ -106,10 +122,13 @@ async function setup(persistence?: PlayerPersistence) {
     songs,
     own,
     rest,
-    async close() {
+    durable,
+    dir,
+    async close(keep = false) {
       await playback.close();
+      await durable?.drain();
       await f.close();
-      await Deno.remove(dir, { recursive: true });
+      if (!keep) await Deno.remove(dir, { recursive: true });
     },
   };
 }
@@ -245,8 +264,8 @@ Deno.test('typed queue: duplicate sources retain independent occurrence ids and 
   }
 });
 
-Deno.test('typed queue: legacy persistence refuses remote replacement before losing the queue or bookmark', async () => {
-  const saved: string[][] = [];
+Deno.test('typed queue: persistence receives reference-only snapshots for remote replacement', async () => {
+  const saved: QueueSnapshot[] = [];
   const t = await setup({
     saveQueue: (ids) => saved.push(ids),
     saveState() {},
@@ -254,16 +273,16 @@ Deno.test('typed queue: legacy persistence refuses remote replacement before los
   try {
     await t.playback.queueAdd([t.songs[0]], { play: true });
     t.playback.pause();
-    const before = t.playback.queueView();
-    const state = t.playback.playerView();
-    assertThrows(
-      () => t.playback.queueAddSources([web()], { clear: true, play: true }),
-      Error,
-      'Typed queue persistence',
+    const added = await t.playback.queueAddSources([web()], {
+      clear: true,
+      play: true,
+    });
+    assertEquals(
+      saved.at(-1)?.items,
+      added.map(({ id, reference }) => ({ id, reference })),
     );
-    assertEquals(t.playback.queueView(), before);
-    assertEquals(t.playback.playerView(), state);
-    assertEquals(saved, [[t.songs[0].id]]);
+    assertEquals(saved.length, 2);
+    assert(!JSON.stringify(saved).includes('On air'));
   } finally {
     await t.close();
   }
@@ -303,6 +322,215 @@ Deno.test('typed queue: OwnTone URL admission stays closed and preserves a nonca
     assertEquals(t.playback.queueView(), before);
     assertEquals((await (await t.own('/api/queue')).json()).count, 1);
   } finally {
+    await t.close();
+  }
+});
+
+Deno.test('typed queue: mixed references, permanent ids and bookmark survive reopen into fresh HTTP services', async () => {
+  const first = await setup(true);
+  const station = await first.f.store.radio.create({
+    name: 'Original',
+    streamUrl: 'http://melofon.home/original',
+    homePageUrl: null,
+  });
+  const source = web('station');
+  source.reference = { kind: 'station', id: station.id };
+  const added = await first.playback.queueAddSources([
+    catalogMedia(first.songs[0]),
+    source,
+    web(),
+    source,
+  ], { play: true });
+  await first.playback.seek({ positionMs: 123 });
+  first.playback.pause();
+  const before = first.playback.playerView().itemProgressMs;
+  const original = first.playback.queueView();
+  await first.close(true);
+  const second = await setup(true, first.dir);
+  try {
+    const queue = await second.durable!.loadQueue();
+    assertEquals(
+      queue.items,
+      added.map(({ id, reference }) => ({ id, reference })),
+    );
+    assertEquals(queue.version, original.version);
+    const snapshot = await planRestore({
+      queue,
+      saved: await second.durable!.loadPlayerState(),
+      resolve: createQueueResolver({
+        getSong: createLibrary(second.f.store).getSong,
+        getStation: second.f.store.radio.get,
+      }),
+      nowMs: Date.now(),
+      maxAgeMs: 300000,
+      selectedOutputPresent: true,
+    });
+    assert(snapshot);
+    await second.playback.restore(snapshot);
+    const wire = await (await second.own('/api/queue')).json();
+    assertEquals(
+      wire.items.map((e: { id: number }) => e.id),
+      added.map((e) => e.id),
+    );
+    assertEquals(wire.items[1].title, 'Original');
+    assert(!('album' in wire.items[1]));
+    assertEquals(second.playback.playerView().itemProgressMs, before);
+    assertEquals(second.playback.queueView().version, original.version);
+    const rows = second.playback.queueView().items;
+    for (const row of rows.slice(1)) {
+      assert(row.facts.kind === 'web');
+      assertEquals(row.facts.streamTitle, null);
+      assertEquals(row.facts.streamUrl, null);
+      assertEquals(row.facts.durationMs, null);
+    }
+    const next = await second.playback.queueAdd([second.songs[0]]);
+    assert(next[0].id > Math.max(...added.map((e) => e.id)));
+    second.playback.queueClear();
+    await second.durable!.drain();
+    const empty = await second.durable!.loadQueue();
+    const player = createPlayer();
+    const emptyRestore = await planRestore({
+      queue: empty,
+      saved: await second.durable!.loadPlayerState(),
+      resolve: () => Promise.resolve(null),
+      nowMs: Date.now(),
+      maxAgeMs: 300000,
+      selectedOutputPresent: false,
+    });
+    assert(emptyRestore);
+    player.restore(emptyRestore);
+    assert(player.queueAdd([second.songs[0]])[0].id > next[0].id);
+  } finally {
+    await second.close();
+  }
+});
+
+Deno.test('typed queue: station edits wait for activation, deleted stations skip and repeat-all is bounded', async () => {
+  const t = await setup(true);
+  try {
+    const station = await t.f.store.radio.create({
+      name: 'Before',
+      streamUrl: 'http://melofon.home/before',
+      homePageUrl: null,
+    });
+    const source = web('station');
+    source.reference = { kind: 'station', id: station.id };
+    const added = await t.playback.queueAddSources([
+      source,
+      source,
+      catalogMedia(t.songs[0]),
+    ], { play: true });
+    assertEquals(
+      (await (await t.own('/api/queue')).json()).items[0].title,
+      'Before',
+    );
+    await t.f.store.radio.update(station.id, {
+      name: 'After',
+      streamUrl: 'http://melofon.home/after',
+      homePageUrl: null,
+    });
+    assertEquals(
+      (await (await t.own('/api/queue')).json()).items[0].uri,
+      'http://melofon.home/before',
+    );
+    await t.playback.queueAdd([t.songs[1]], { play: true });
+    const unchanged = t.playback.playerView().current;
+    assert(unchanged?.facts.kind === 'web');
+    assertEquals(unchanged.facts.url, 'http://melofon.home/before');
+    await t.playback.next();
+    const current = t.playback.playerView().current;
+    assert(current?.facts.kind === 'web');
+    assertEquals(current.id, added[1].id);
+    assertEquals(current.facts.url, 'http://melofon.home/after');
+    assertEquals(current.facts.title, 'After');
+    await t.f.store.radio.delete(station.id);
+    assertEquals(
+      t.playback.playerView().current,
+      current,
+      'deletion does not interrupt current run',
+    );
+    await t.playback.previous();
+    assertEquals(t.playback.playerView().state, 'stop');
+    await t.playback.play();
+    assertEquals(
+      (await (await t.own('/api/player')).json()).item_id,
+      added[2].id,
+    );
+    await t.playback.queueAddSources([source, source], { clear: true });
+    t.playback.setRepeat('all');
+    await t.playback.play();
+    assertEquals((await (await t.own('/api/player')).json()).state, 'stop');
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('typed queue: a newer clear cancels pending station resolution before any stale activation', async () => {
+  const t = await setup();
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => release = resolve);
+  const started = new Promise<void>((resolve) => entered = resolve);
+  const core = createPlayback({
+    player: createPlayer(),
+    nowPlaying: createNowPlaying(t.f.store),
+    library: createLibrary(t.f.store),
+    cfg: {},
+    resolveQueueReference: async () => {
+      entered();
+      await gate;
+      return web('station');
+    },
+  });
+  try {
+    await core.queueAddSources([web('station')]);
+    const pending = core.play();
+    await started;
+    core.queueClear();
+    release();
+    await assertRejects(
+      () => Promise.resolve(pending),
+      Error,
+      'Playback start cancelled',
+    );
+    assertEquals(core.queueView().items, []);
+    assertEquals(core.playerView().state, 'stop');
+  } finally {
+    release();
+    await core.close();
+    await t.close();
+  }
+});
+
+Deno.test('typed queue: natural and consume transitions resolve and skip stations before publishing current', async () => {
+  const t = await setup();
+  let mono = 0;
+  const core = createPlayback({
+    player: createPlayer({ monotonicNow: () => mono }),
+    nowPlaying: createNowPlaying(t.f.store),
+    library: createLibrary(t.f.store),
+    cfg: {},
+    resolveQueueReference: createQueueResolver({
+      getSong: createLibrary(t.f.store).getSong,
+      getStation: t.f.store.radio.get,
+    }),
+  });
+  try {
+    for (const consume of [false, true]) {
+      const short = { ...t.songs[0], durationMs: 10 };
+      const added = await core.queueAddSources([
+        catalogMedia(short),
+        web('station'),
+        catalogMedia(t.songs[1]),
+      ], { clear: true, play: true });
+      core.setConsume(consume);
+      mono += 10;
+      await core.advanceEnded();
+      assertEquals(core.playerView().current?.id, added[2].id);
+      assertEquals(core.queueView().items.length, consume ? 2 : 3);
+    }
+  } finally {
+    await core.close();
     await t.close();
   }
 });

@@ -11,6 +11,7 @@ import {
   assertThrows,
 } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
+import { songEntries } from './helpers/queue.ts';
 import { openStore } from '../src/store/index.ts';
 import { createBinds } from '../src/binds.ts';
 import { facade } from '../src/facade.ts';
@@ -181,7 +182,7 @@ Deno.test('restore is recorded with via restore and keeps engine purity', async 
   const { playback, logs, close } = await setup();
   try {
     playback.restore({
-      queue: [song(90_000_000)],
+      queue: songEntries([song(90_000_000)]),
       state: 'pause',
       currentIndex: 0,
       positionMs: 71033416,
@@ -618,7 +619,7 @@ Deno.test('native last-command: OwnTone seek, volume and selection share the rea
   const { playback, outputs, onHook, onDefault, close } = await setupWire();
   try {
     playback.restore({
-      queue: [song(90_000_000)],
+      queue: songEntries([song(90_000_000)]),
       state: 'pause',
       currentIndex: 0,
       positionMs: 0,
@@ -700,7 +701,7 @@ Deno.test('native last-command: internal pause and restore provenance stays visi
   const { playback, outputs, onDefault, close } = await setupWire();
   try {
     playback.restore({
-      queue: [song()],
+      queue: songEntries([song()]),
       state: 'pause',
       currentIndex: 0,
       positionMs: 1234,
@@ -747,7 +748,7 @@ Deno.test('native last-command: observer GETs preserve records, state and notifi
   const unsubscribe = notify.subscribe((types) => notifications.push(types));
   try {
     playback.restore({
-      queue: [song()],
+      queue: songEntries([song()]),
       state: 'pause',
       currentIndex: 0,
       positionMs: 4321,

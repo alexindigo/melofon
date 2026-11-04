@@ -3,6 +3,7 @@ import { seedMelofonHat, seedShippedHats } from './hats.ts';
 import { migrateUserNames } from './users.ts';
 import { migrateSettings } from './state.ts';
 import { migrateAdoptedSpeakers } from './speakers.ts';
+import { migrateQueueReferences } from './playback.ts';
 
 /** Run each release migration and its receipt in the same transaction. */
 export async function migrate(q: Queries): Promise<string[]> {
@@ -19,6 +20,9 @@ export async function migrate(q: Queries): Promise<string[]> {
   }, {
     id: 'speakers-001',
     apply: migrateAdoptedSpeakers,
+  }, {
+    id: 'server-queue-001',
+    apply: migrateQueueReferences,
   }];
   for (const migration of migrations) {
     await q.run('BEGIN TRANSACTION');

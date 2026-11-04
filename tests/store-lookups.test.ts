@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore, type Store } from '../src/store/index.ts';
 import type { LookupInput } from '../src/store/lookups.ts';
+import { songQueue } from './helpers/queue.ts';
 
 const input = (overrides: Partial<LookupInput> = {}): LookupInput => ({
   plugin: 'fixture',
@@ -79,7 +80,7 @@ Deno.test('claimNext is atomic, FIFO and per-plugin under concurrent claims and 
     const claims = await Promise.all(
       Array.from({ length: 50 }, async (_, n) => {
         const job = store.lookups.claimNext('fixture');
-        await store.playback.saveQueue([`${n}`]);
+        await store.playback.saveQueue(songQueue([`${n}`]));
         return await job;
       }),
     );
@@ -88,7 +89,7 @@ Deno.test('claimNext is atomic, FIFO and per-plugin under concurrent claims and 
       new Set(claims.filter((j) => j !== null).map((j) => j!.id)).size,
       40,
     );
-    assertEquals(await store.playback.loadQueue(), ['49']);
+    assertEquals(await store.playback.loadQueue(), songQueue(['49']));
     assertEquals((await store.lookups.claimNext('other'))?.plugin, 'other');
   });
 });

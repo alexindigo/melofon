@@ -6,6 +6,7 @@ import { createAnnotation } from '../src/annotation.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createPersistence } from '../src/persistence.ts';
 import { createState } from '../src/state.ts';
+import { songQueue, stopped } from './helpers/queue.ts';
 
 function snapshot(): CatalogSnapshot {
   return {
@@ -78,7 +79,7 @@ Deno.test('overlapping writers keep every expected row for 200 rounds', async ()
       lists.push(await playlists.create('alice', `list-${i}`, []));
     }
     const results = await Promise.allSettled(lists.map(async (list, i) => {
-      persistence.saveQueue(['song']);
+      persistence.saveQueue(songQueue(['song']), stopped);
       persistence.saveState({
         state: 'stop',
         currentIndex: null,
@@ -109,7 +110,7 @@ Deno.test('overlapping writers keep every expected row for 200 rounds', async ()
         'song',
       ]);
     }
-    assertEquals(await persistence.loadQueue(), ['song']);
+    assertEquals(await persistence.loadQueue(), songQueue(['song']));
     assertEquals((await persistence.loadPlayerState())?.positionMs, 199);
   } finally {
     await close();

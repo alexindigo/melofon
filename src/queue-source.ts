@@ -36,6 +36,45 @@ export type QueueEntry = QueueMedia & {
   id: number;
 };
 
+/** Durable identity only. Resolved URLs, decoder facts and broadcast metadata
+ * belong to an activation, never to the saved queue. */
+export interface QueueSnapshot {
+  items: { id: number; reference: QueueReference }[];
+  nextId: number;
+  version: number;
+}
+
+export function createQueueResolver(deps: {
+  getSong(id: string): Promise<SongRow | null>;
+  getStation(id: string): Promise<{ name: string; streamUrl: string } | null>;
+}) {
+  return async (reference: QueueReference): Promise<QueueMedia | null> => {
+    if (reference.kind === 'song') {
+      const song = await deps.getSong(reference.id);
+      return song ? catalogMedia(song) : null;
+    }
+    const station = reference.kind === 'station'
+      ? await deps.getStation(reference.id)
+      : null;
+    if (reference.kind === 'station' && !station) return null;
+    const url = reference.kind === 'url' ? reference.url : station!.streamUrl;
+    return {
+      reference: { ...reference },
+      facts: {
+        kind: 'web',
+        url,
+        title: station?.name ?? null,
+        artistName: null,
+        durationMs: null,
+        mode: station ? 'live' : 'unknown',
+        seekable: false,
+        streamTitle: null,
+        streamUrl: null,
+      },
+    };
+  };
+}
+
 /** Compatibility adapter for existing catalog enqueue callers. */
 export function catalogMedia(song: SongRow): QueueMedia {
   return {

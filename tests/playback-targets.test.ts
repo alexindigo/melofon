@@ -2,6 +2,7 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import { PlaybackError } from '../src/playback-errors.ts';
 import { apiFixture } from './helpers/api.ts';
 import { createOutputs, createPlayer, planRestore } from '../src/player.ts';
+import { songEntries, songResolver } from './helpers/queue.ts';
 import { createPersistence } from '../src/persistence.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createSpeakers } from '../src/speakers.ts';
@@ -137,9 +138,9 @@ async function setup(storeDir?: string, retryPolicy?: string) {
       for (const row of savedOutputs) devices.register(row);
       if (persistence) {
         const snapshot = await planRestore({
-          queueIds: await persistence.loadQueue(),
+          queue: await persistence.loadQueue(),
           saved: await persistence.loadPlayerState(),
-          getSong: library.getSong,
+          resolve: songResolver(library.getSong),
           nowMs: Date.now(),
           maxAgeMs: 300000,
           selectedOutputPresent: outputs.list().some((row) => row.selected),
@@ -476,7 +477,7 @@ Deno.test('core restore pauses safely without prepared targets and automatic adv
   const t = await setup();
   try {
     const snapshot = {
-      queue: t.songs,
+      queue: songEntries(t.songs),
       state: 'play' as const,
       currentIndex: 0,
       positionMs: 500,
@@ -535,7 +536,7 @@ Deno.test('automatic repeat, consume and next transitions validate before mutati
       });
       try {
         await core.restore({
-          queue: t.songs,
+          queue: songEntries(t.songs),
           state: 'play',
           currentIndex: 0,
           positionMs: 0,

@@ -6,6 +6,7 @@
 // yields a real queue item. Hats never merge — the projection is core's.
 import { assert, assertEquals } from '@std/assert';
 import { pathfinder } from '@pathfinder/pathfinder';
+import { songEntries } from './helpers/queue.ts';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { seedFirstUser } from '../src/users.ts';
@@ -453,7 +454,7 @@ Deno.test('core server row retains truthful clocks, selected speakers and extern
       'app',
     ]);
     s.playback.restore({
-      queue: [song],
+      queue: songEntries([song]),
       state: 'pause',
       currentIndex: 0,
       positionMs: 250,

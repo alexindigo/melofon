@@ -37,6 +37,7 @@ import {
 } from './player.ts';
 import { createPersistence } from './persistence.ts';
 import { createPlayback } from './playback.ts';
+import { createQueueResolver } from './queue-source.ts';
 import { createNotify } from './notify.ts';
 import { createState } from './state.ts';
 import { createPublicAddress } from './public-address.ts';
@@ -176,6 +177,11 @@ export async function startServer(options: {
     notify,
   });
   const player = createPlayer();
+  const radio = createRadio(store, { dataDir: cfg.dataDir, state, notify });
+  const resolveQueueReference = createQueueResolver({
+    getSong: (id) => library.getSong(id),
+    getStation: (id) => radio.get(id),
+  });
   const nowPlaying = createNowPlaying(store, { state });
   const speakers = createSpeakers({
     outputs,
@@ -200,6 +206,7 @@ export async function startServer(options: {
     notify,
     persistence,
     targets: speakers,
+    resolveQueueReference,
   });
   const app = {
     store,
@@ -273,9 +280,9 @@ export async function startServer(options: {
     savedOutput: (id) => persistence.savedOutput(id),
   });
   const restoreSnapshot = await planRestore({
-    queueIds: await persistence.loadQueue(),
+    queue: await persistence.loadQueue(),
     saved: await persistence.loadPlayerState(),
-    getSong: (id) => library.getSong(id),
+    resolve: resolveQueueReference,
     nowMs: Date.now(),
     maxAgeMs: (cfg.resumeMaxAgeSec ?? 300) * 1000,
     selectedOutputPresent: outputs.list().some((o) => o.selected),
@@ -291,7 +298,6 @@ export async function startServer(options: {
     });
   }
   const playlists = createPlaylists(store);
-  const radio = createRadio(store, { dataDir: cfg.dataDir, state, notify });
   const settings = createSettings(store, state);
   let hats: Hats | undefined = undefined;
   const bag = {

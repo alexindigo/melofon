@@ -4,6 +4,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import type { SongRow } from '../src/library.ts';
+import { songEntries } from './helpers/queue.ts';
 
 let songN = 0;
 function song(durationMs = 180_000): SongRow {
@@ -341,7 +342,7 @@ Deno.test('engine clock facts follow every activation path, not status reads or 
   at(11_000);
   wall = 12_000;
   player.restore({
-    queue: songs,
+    queue: songEntries(songs),
     state: 'pause',
     currentIndex: 0,
     positionMs: 20,

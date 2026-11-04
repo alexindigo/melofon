@@ -1,5 +1,5 @@
 // src/player.ts — app.player / app.outputs: the server-side player engine
-// (the OwnTone control plane). One in-memory queue (restart-lossy is fine),
+// (the OwnTone control plane). One restart-transparent queue,
 // play/pause/stop state, master volume, and the outputs list. The outputs
 // list starts EMPTY — no dummy sink; a boot registers real outputs
 // (app.outputs.register, M6: Chromecast / AirPlay / FS) and an empty list is
@@ -19,6 +19,8 @@ import {
   queueDuration,
   type QueueEntry,
   type QueueMedia,
+  type QueueReference,
+  type QueueSnapshot,
 } from './queue-source.ts';
 export type { QueueEntry } from './queue-source.ts';
 import type { Notify } from './notify.ts';
@@ -121,15 +123,18 @@ export interface PlayerStateSnapshot {
  * DuckDB store; playback drives the cadence (flush on every state change,
  * 1 Hz position tick while playing). */
 export interface PlayerPersistence {
-  /** Rewrite the persisted queue (pos-ordered library song ids). */
-  saveQueue(songIds: string[]): void;
+  /** Atomically save occurrence references/allocator/revision and bookmark. */
+  saveQueue(snapshot: QueueSnapshot, state: PlayerStateSnapshot): void;
   /** Upsert the singleton player_state row (updated_at = now). */
   saveState(snapshot: PlayerStateSnapshot): void;
 }
 
 /** What restore() loads at boot: the rehydrated queue plus the snapshot. */
 export interface RestoreSnapshot extends PlayerStateSnapshot {
-  queue: SongRow[];
+  queue: QueueEntry[];
+  nextId?: number;
+  version?: number;
+  queueChanged?: boolean;
 }
 
 /** Auto-resume PLAY only when the save is fresh and the environment still
@@ -156,28 +161,34 @@ export function shouldAutoResume(opts: {
  * persisted current index onto the kept songs, and decide play-vs-pause
  * per shouldAutoResume. Null when there is nothing to restore. */
 export async function planRestore(opts: {
-  queueIds: string[];
+  queue: QueueSnapshot;
   saved: (PlayerStateSnapshot & { updatedAtMs: number }) | null;
-  getSong: (id: string) => Promise<SongRow | null>;
+  resolve: (reference: QueueReference) => Promise<QueueMedia | null>;
   nowMs: number;
   maxAgeMs: number;
   selectedOutputPresent: boolean;
   log?: Log;
 }): Promise<RestoreSnapshot | null> {
   const log = opts.log ?? scopedLog('player');
-  const queue: SongRow[] = [];
+  const queue: QueueEntry[] = [];
   const keptPositions: number[] = []; // original queue pos per kept song
-  for (const [pos, id] of opts.queueIds.entries()) {
-    const song = await opts.getSong(id);
-    if (song === null) {
-      log.event('restore_missing', { track: id });
+  for (const [pos, entry] of opts.queue.items.entries()) {
+    const media = await opts.resolve(entry.reference);
+    if (media === null) {
+      log.event('restore_missing', {
+        track: entry.reference.kind === 'url'
+          ? String(entry.id)
+          : entry.reference.id,
+      });
       continue;
     }
     keptPositions.push(pos);
-    queue.push(song);
+    queue.push({ ...media, id: entry.id });
   }
   const { saved } = opts;
-  if (saved === null && queue.length === 0) return null;
+  if (saved === null && queue.length === 0 && opts.queue.nextId === 1) {
+    return null;
+  }
   // Map the persisted current index onto the rehydrated queue: subtract
   // the missing tracks before it. The current track itself missing leaves
   // the engine at the entry that shifted into its place, position 0.
@@ -191,6 +202,12 @@ export async function planRestore(opts: {
     currentIndex = currentTrackPresent
       ? keptBefore
       : Math.min(keptBefore, Math.max(0, queue.length - 1));
+    if (
+      !currentTrackPresent && keptBefore >= queue.length &&
+      opts.queue.items[saved.currentIndex]?.reference.kind === 'station'
+    ) {
+      currentIndex = null;
+    }
   }
   const resume = saved !== null && shouldAutoResume({
     savedState: saved.state,
@@ -200,15 +217,21 @@ export async function planRestore(opts: {
     currentTrackPresent,
     selectedOutputPresent: opts.selectedOutputPresent,
   });
+  const current = currentIndex === null ? undefined : queue[currentIndex];
+  const seekable = current?.facts.kind === 'song' || current?.facts.seekable;
   return {
     queue,
+    nextId: opts.queue.nextId,
+    version: opts.queue.version +
+      (queue.length !== opts.queue.items.length ? 1 : 0),
+    queueChanged: queue.length !== opts.queue.items.length,
     state: saved === null || saved.state === 'stop'
       ? 'stop'
       : resume
       ? 'play'
       : 'pause',
     currentIndex,
-    positionMs: currentTrackPresent ? saved?.positionMs ?? 0 : 0,
+    positionMs: currentTrackPresent && seekable ? saved?.positionMs ?? 0 : 0,
     repeat: saved?.repeat ?? 'off',
     shuffle: saved?.shuffle ?? false,
     consume: saved?.consume ?? false,
@@ -238,6 +261,9 @@ export interface Player {
    * starts playback (OwnTone semantics). False when the queue is empty. */
   seek(opts: { positionMs?: number; seekMs?: number }): boolean;
   queue(): { version: number; items: QueueEntry[] };
+  queueSnapshot(): QueueSnapshot;
+  /** Publish newly resolved facts at activation, never on station CRUD. */
+  replaceMedia(index: number, media: QueueMedia): void;
   /** Appends — or inserts at 0-based `position` (OwnTone queue add
    * semantics: omit = append). Inserting at/before the current item shifts
    * it so it stays current. */
@@ -580,6 +606,22 @@ export function createPlayer(options: {
     queue() {
       return { version, items: [...items] };
     },
+    queueSnapshot() {
+      return {
+        version,
+        nextId,
+        items: items.map(({ id, reference }) => ({
+          id,
+          reference: { ...reference },
+        })),
+      };
+    },
+    replaceMedia(index, media) {
+      items = items.map((entry, at) =>
+        at === index ? { ...media, id: entry.id } : entry
+      );
+      version++;
+    },
 
     queueAdd(songs, position) {
       return addSources(songs.map(catalogMedia), position);
@@ -632,11 +674,12 @@ export function createPlayer(options: {
     },
 
     restore(snapshot) {
-      items = snapshot.queue.map((song) => ({
-        ...catalogMedia(song),
-        id: nextId++,
-      }));
-      if (items.length > 0) version++;
+      items = [...snapshot.queue];
+      nextId = Math.max(
+        snapshot.nextId ?? nextId,
+        ...items.map((entry) => entry.id + 1),
+      );
+      version = snapshot.version ?? (items.length ? version + 1 : version);
       repeat = snapshot.repeat;
       consume = snapshot.consume;
       shuffle = snapshot.shuffle;

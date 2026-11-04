@@ -307,11 +307,17 @@ ALTER TABLE state ADD COLUMN IF NOT EXISTS revision BIGINT DEFAULT 0;
 ALTER TABLE state ADD COLUMN IF NOT EXISTS declared BOOLEAN DEFAULT false;
 ALTER TABLE state ADD COLUMN IF NOT EXISTS write_only BOOLEAN DEFAULT false;
 -- Restart transparency (plan restart-transparency): the server engine's queue
--- and player state, keep-on-rescan user state. The queue stores library song
--- ids in order and rehydrates via the library at boot (missing tracks drop).
+-- and player state, keep-on-rescan user state. Only typed references are saved.
 CREATE TABLE IF NOT EXISTS server_queue (
   pos INTEGER PRIMARY KEY,
-  song_id VARCHAR NOT NULL
+  entry_id BIGINT UNIQUE NOT NULL,
+  reference_kind VARCHAR NOT NULL CHECK (reference_kind IN ('song', 'station', 'url')),
+  reference_value VARCHAR NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_queue_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  next_id BIGINT NOT NULL,
+  version BIGINT NOT NULL
 );
 -- One-row table (id = 1): the last persisted engine snapshot. updated_at
 -- (tz-aware, like now_playing.started_at) drives the resume-freshness

@@ -25,7 +25,11 @@ import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { PlaybackError } from './playback-errors.ts';
-import { catalogMedia, type QueueMedia, queueSong } from './queue-source.ts';
+import {
+  catalogMedia,
+  type QueueMedia,
+  type QueueReference,
+} from './queue-source.ts';
 import type {
   CommandSource,
   LastCommand,
@@ -181,6 +185,9 @@ export function createPlayback(deps: {
    * state change flushes the engine snapshot and queue, and a 1 Hz tick
    * keeps position_ms current while playing. */
   persistence?: PlayerPersistence;
+  resolveQueueReference?: (
+    reference: QueueReference,
+  ) => Promise<QueueMedia | null>;
   log?: Log;
 }): Playback {
   const { player, nowPlaying, library, outputs, notify, persistence } = deps;
@@ -228,8 +235,14 @@ export function createPlayback(deps: {
   let targets = targetKey();
   const transition = <T>(
     starts: boolean,
-    commit: () => T,
+    commit: (activate: () => void) => T,
     authority?: PlaybackAuthority,
+    activation?: {
+      index: number;
+      items?: QueueMedia[];
+      direction?: number;
+      wrap?: boolean;
+    },
   ): T | Promise<T> => {
     const current = () =>
       !authority || !authority.signal.aborted && authority.isCurrent();
@@ -237,17 +250,59 @@ export function createPlayback(deps: {
       new PlaybackError('playback_cancelled', 'Playback start cancelled');
     if (!current()) throw cancelled();
     cancelStart();
-    if (!starts || !deps.targets) return commit();
+    const items = activation?.items ?? player.queue().items;
+    const needsResolution = starts && activation &&
+      deps.resolveQueueReference &&
+      items[activation.index]?.reference.kind === 'station';
+    if (!starts || !deps.targets && !needsResolution) return commit(() => {});
     const controller = new AbortController();
     const abort = () => controller.abort();
     authority?.signal.addEventListener('abort', abort, { once: true });
     pendingStart = controller;
-    return deps.targets.preparePlayback(controller.signal).then(() => {
+    const prepare = async () => {
+      let selected: { index: number; media: QueueMedia } | null | undefined;
+      if (needsResolution) {
+        selected = null;
+        let index = activation.index;
+        for (let visited = 0; visited < items.length; visited++) {
+          if (index < 0 || index >= items.length) break;
+          const item = items[index];
+          const media = item.reference.kind === 'station'
+            ? await deps.resolveQueueReference!(item.reference)
+            : item;
+          if (controller.signal.aborted) throw cancelled();
+          if (media) {
+            selected = { index, media };
+            break;
+          }
+          index += activation.direction ?? 1;
+          if (activation.wrap) index = (index + items.length) % items.length;
+        }
+      }
+      if (selected !== null) {
+        await deps.targets?.preparePlayback(controller.signal);
+      }
+      return selected;
+    };
+    return prepare().then((selected) => {
       if (
         controller.signal.aborted || pendingStart !== controller || !current()
       ) throw cancelled();
       pendingStart = undefined;
-      return commit();
+      const result = commit(() => {
+        if (selected === undefined) return;
+        if (selected === null) {
+          player.stop();
+          return;
+        }
+        player.replaceMedia(selected.index, selected.media);
+        if (selected.index !== activation!.index) player.play(selected.index);
+      });
+      if (selected !== undefined) {
+        flushQueue();
+        emit(['queue']);
+      }
+      return result;
     }).finally(() => {
       authority?.signal.removeEventListener('abort', abort);
       if (pendingStart === controller) pendingStart = undefined;
@@ -311,29 +366,23 @@ export function createPlayback(deps: {
 
   // Persistence flushes: the same paths that emit. Fire-and-forget — the
   // adapter serializes writes; the engine stays synchronous.
-  const flushQueue = () =>
-    persistence?.saveQueue(
-      player.queue().items.map((e) => {
-        const song = queueSong(e);
-        if (!song) throw new Error('Typed queue persistence is not available');
-        return song.id;
-      }),
-    );
-  const flushState = () => {
-    if (persistence === undefined) return;
+  const stateSnapshot = () => {
     const status = player.status();
     const currentIndex = status.current === null
       ? null
       : player.queue().items.findIndex((e) => e.id === status.current!.id);
-    persistence.saveState({
+    return {
       state: status.state,
       currentIndex: currentIndex === -1 ? null : currentIndex,
       positionMs: status.itemProgressMs,
       repeat: status.repeat,
       shuffle: status.shuffle,
       consume: status.consume,
-    });
+    };
   };
+  const flushQueue = () =>
+    persistence?.saveQueue(player.queueSnapshot(), stateSnapshot());
+  const flushState = () => persistence?.saveState(stateSnapshot());
   // The position tick: writes only while the engine plays ("on while play,
   // off otherwise"), so a restored play needs no extra wiring. SIGKILL
   // loses at most ~1 s of position.
@@ -374,42 +423,57 @@ export function createPlayback(deps: {
     opts: QueueAddOptions = {},
     source?: CommandSource,
   ): QueueEntry[] | Promise<QueueEntry[]> => {
-    // Until the typed persistence item lands, refuse before clear/prepare rather
-    // than silently dropping noncatalog entries or writing fabricated song ids.
-    if (persistence && media.some((item) => item.reference.kind !== 'song')) {
-      throw new Error('Typed queue persistence is not available');
-    }
     const size = media.length + (opts.clear ? 0 : player.queue().items.length);
-    return transition(opts.play === true && size > 0, () => {
-      if (opts.clear) player.queueClear();
-      const added = player.queueAddSources(media, opts.position);
-      if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
-      if (opts.play) player.play(opts.playbackFromPosition);
-      record(
-        'queueAdd',
-        `songs=${media.length}` + (opts.clear ? ' clear' : '') +
-          (opts.play ? ' play' : '') +
-          (opts.position !== undefined ? ` position=${opts.position}` : ''),
-        source,
-        opts.play ? 'play' : opts.clear ? 'stop' : 'none',
-        opts.clear === true,
-        {
-          songs: media.length,
-          clear: opts.clear,
-          play: opts.play,
-          position: opts.position,
-          playbackFromPosition: opts.playbackFromPosition,
-          shuffle: opts.shuffle,
-        },
-      );
-      flushQueue();
-      flushState();
-      const types = ['queue'];
-      if (opts.clear || opts.play) types.push('player');
-      if (opts.shuffle !== undefined) types.push('options');
-      emit(types);
-      return added;
-    });
+    const future = opts.clear ? [] : player.queue().items;
+    const at = Math.min(
+      Math.max(0, Math.trunc(opts.position ?? future.length)),
+      future.length,
+    );
+    const items = [...future.slice(0, at), ...media, ...future.slice(at)];
+    const oldCurrent = player.status().current;
+    const index = opts.playbackFromPosition !== undefined
+      ? Math.min(Math.max(0, Math.trunc(opts.playbackFromPosition)), size - 1)
+      : oldCurrent && !opts.clear
+      ? items.indexOf(oldCurrent)
+      : 0;
+    return transition(
+      opts.play === true && size > 0,
+      (activate) => {
+        if (opts.clear) player.queueClear();
+        const added = player.queueAddSources(media, opts.position);
+        if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
+        if (opts.play) player.play(opts.playbackFromPosition);
+        activate();
+        record(
+          'queueAdd',
+          `songs=${media.length}` + (opts.clear ? ' clear' : '') +
+            (opts.play ? ' play' : '') +
+            (opts.position !== undefined ? ` position=${opts.position}` : ''),
+          source,
+          opts.play ? 'play' : opts.clear ? 'stop' : 'none',
+          opts.clear === true,
+          {
+            songs: media.length,
+            clear: opts.clear,
+            play: opts.play,
+            position: opts.position,
+            playbackFromPosition: opts.playbackFromPosition,
+            shuffle: opts.shuffle,
+          },
+        );
+        flushQueue();
+        const types = ['queue'];
+        if (opts.clear || opts.play) types.push('player');
+        if (opts.shuffle !== undefined) types.push('options');
+        emit(types);
+        return added;
+      },
+      undefined,
+      opts.clear || opts.playbackFromPosition !== undefined ||
+        player.status().state !== 'play'
+        ? { index, items }
+        : undefined,
+    );
   };
   return {
     expireReports,
@@ -479,12 +543,22 @@ export function createPlayback(deps: {
     },
 
     play(source, authority) {
-      return transition(player.queue().items.length > 0, () => {
-        player.play();
-        record('play', undefined, source, 'play');
-        flushState();
-        emit(['player']);
-      }, authority);
+      const view = player.status();
+      const index = view.current
+        ? player.queue().items.findIndex((e) => e.id === view.current!.id)
+        : 0;
+      return transition(
+        player.queue().items.length > 0,
+        (activate) => {
+          player.play();
+          activate();
+          record('play', undefined, source, 'play');
+          flushState();
+          emit(['player']);
+        },
+        authority,
+        view.state === 'play' ? undefined : { index },
+      );
     },
     pause(source) {
       cancelStart();
@@ -501,14 +575,21 @@ export function createPlayback(deps: {
       emit(['player']);
     },
     toggle(source) {
+      const view = player.status();
+      const index = view.current
+        ? player.queue().items.findIndex((e) => e.id === view.current!.id)
+        : 0;
       return transition(
         player.status().state !== 'play' && player.queue().items.length > 0,
-        () => {
+        (activate) => {
           player.toggle();
+          activate();
           record('toggle', undefined, source, player.status().state);
           flushState();
           emit(['player']);
         },
+        undefined,
+        { index },
       );
     },
     next(source) {
@@ -517,20 +598,37 @@ export function createPlayback(deps: {
       const next = current
         ? queue.findIndex((row) => row.id === current.id) + 1
         : 0;
-      return transition(next < queue.length, () => {
-        player.next();
-        record('next', undefined, source, player.status().state);
-        flushState();
-        emit(['player']);
-      });
+      return transition(
+        next < queue.length,
+        (activate) => {
+          player.next();
+          activate();
+          record('next', undefined, source, player.status().state);
+          flushState();
+          emit(['player']);
+        },
+        undefined,
+        { index: next },
+      );
     },
     previous(source) {
-      return transition(player.queue().items.length > 0, () => {
-        player.previous();
-        record('previous', undefined, source, player.status().state);
-        flushState();
-        emit(['player']);
-      });
+      const view = player.status();
+      const index = Math.max(
+        0,
+        player.queue().items.findIndex((e) => e.id === view.current?.id) - 1,
+      );
+      return transition(
+        player.queue().items.length > 0,
+        (activate) => {
+          player.previous();
+          activate();
+          record('previous', undefined, source, player.status().state);
+          flushState();
+          emit(['player']);
+        },
+        undefined,
+        { index, direction: -1 },
+      );
     },
     setShuffle(on, source) {
       cancelStart();
@@ -578,31 +676,41 @@ export function createPlayback(deps: {
       emit(['volume']);
     },
     seek(opts, source) {
-      return transition(player.queue().items.length > 0, () => {
-        const ok = player.seek(opts);
-        if (ok) {
-          record(
-            'seek',
-            opts.positionMs !== undefined
-              ? `position_ms=${Math.trunc(opts.positionMs)}`
-              : `seek_ms=${opts.seekMs ?? 0}`,
-            source,
-            'play',
-            false,
-            {
-              position_ms: opts.positionMs === undefined
-                ? undefined
-                : Math.trunc(opts.positionMs),
-              seek_ms: opts.positionMs === undefined
-                ? opts.seekMs ?? 0
-                : undefined,
-            },
-          );
-          flushState();
-          emit(['player']);
-        }
-        return ok;
-      });
+      const view = player.status();
+      const index = view.current
+        ? player.queue().items.findIndex((e) => e.id === view.current!.id)
+        : 0;
+      return transition(
+        player.queue().items.length > 0,
+        (activate) => {
+          const ok = player.seek(opts);
+          activate();
+          if (ok) {
+            record(
+              'seek',
+              opts.positionMs !== undefined
+                ? `position_ms=${Math.trunc(opts.positionMs)}`
+                : `seek_ms=${opts.seekMs ?? 0}`,
+              source,
+              'play',
+              false,
+              {
+                position_ms: opts.positionMs === undefined
+                  ? undefined
+                  : Math.trunc(opts.positionMs),
+                seek_ms: opts.positionMs === undefined
+                  ? opts.seekMs ?? 0
+                  : undefined,
+              },
+            );
+            flushState();
+            emit(['player']);
+          }
+          return ok;
+        },
+        undefined,
+        view.state === 'stop' ? { index } : undefined,
+      );
     },
     queueAdd(songs, opts = {}, source) {
       return addSources(songs.map(catalogMedia), opts, source);
@@ -613,7 +721,6 @@ export function createPlayback(deps: {
       player.queueClear();
       record('queueClear', undefined, source, 'stop', true);
       flushQueue();
-      flushState();
       // The clear also stopped the engine — both reads changed.
       emit(['queue', 'player']);
     },
@@ -624,15 +731,33 @@ export function createPlayback(deps: {
         pendingStart || view.state !== 'play' || view.itemLengthMs <= 0 ||
         view.itemProgressMs < view.itemLengthMs
       ) return;
-      const commit = () => {
+      const items = player.queue().items;
+      const current = items.findIndex((e) => e.id === view.current?.id);
+      const index = view.repeat === 'single'
+        ? current
+        : view.repeat === 'all'
+        ? (current + 1) % items.length
+        : view.consume
+        ? current
+        : current + 1;
+      const future = view.consume && view.repeat === 'off'
+        ? items.filter((_, i) => i !== current)
+        : items;
+      const commit = (activate: () => void) => {
         const result = player.advanceEnded();
         if (result === 'none') return;
+        activate();
         if (result === 'player+queue') flushQueue();
-        flushState();
+        else flushState();
         emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
       };
-      if (!deps.targets) return commit();
-      return Promise.resolve(transition(true, commit)).catch((error) => {
+      return Promise.resolve(
+        transition(true, commit, undefined, {
+          index,
+          items: future,
+          wrap: view.repeat !== 'off',
+        }),
+      ).catch((error) => {
         // Internal transitions have no HTTP caller. Keep the bookmark/queue and
         // publish a paused clock; an explicit newer command always wins.
         if (
@@ -661,6 +786,7 @@ export function createPlayback(deps: {
         );
         serverPresent = hasServerRow();
         announcedCommander = commander;
+        if (restored.queueChanged) flushQueue();
       };
       if (
         snapshot.state !== 'play' || !snapshot.queue.length || !deps.targets
