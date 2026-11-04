@@ -62,6 +62,22 @@ Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — keep deployment secrets out of source control.
 
+### Ignoring discovered speakers
+
+Any signed-in user can hide an unadopted speaker with
+`POST /api/v1/speakers/{id}/ignore` and JSON `{}`. Deselect it first, even when
+playback is paused. Adopted speakers must be forgotten before they can be ignored.
+Ignore saves only an identity marker, which survives advertisements and restarts.
+It does not save the discovered speaker's configuration or credentials.
+
+Normal speaker reads and OwnTone output lists omit ignored devices. Use
+`GET /api/v1/speakers?includeIgnored=true` (or the same query on a detail read)
+to see them. An ignored device without a current observation has only `id`,
+`ignored:true`, `adopted:false` and `discovered:false`; no stale endpoint is restored.
+`DELETE /api/v1/speakers/{id}/ignore` undoes ignore, including while offline.
+Fresh observations become visible again. Explicit adoption also replaces ignore.
+Writes use the usual cookie/Bearer authentication and Origin checks.
+
 ### Hat-private images
 
 Core stores hats' image records as files in the server data directory, alongside

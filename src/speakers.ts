@@ -1,22 +1,8 @@
 import type { CommandSource, Output, Outputs } from './player.ts';
 import type { PreparationView } from './output-admission.ts';
 import { isConnectionStrategy } from './connection-strategy.ts';
-
-export class SpeakerError extends Error {
-  override name = 'SpeakerError';
-  constructor(
-    public code:
-      | 'not_found'
-      | 'invalid_field'
-      | 'unknown_field'
-      | 'unsupported_protocol'
-      | 'not_adopted'
-      | 'persistence_failed',
-    message: string,
-  ) {
-    super(message);
-  }
-}
+import { SpeakerError } from './speaker-errors.ts';
+export { SpeakerError } from './speaker-errors.ts';
 
 function fields(input: unknown, allowed: string[]): Record<string, unknown> {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -47,6 +33,7 @@ export interface SpeakerAdapterView {
 }
 
 export interface SpeakerView {
+  ignored?: true;
   id: string;
   name: string;
   protocol: string;
@@ -61,12 +48,29 @@ export interface SpeakerView {
   state: SpeakerAdapterView;
 }
 
+/** An offline ignore marker retains identity only, never old protocol facts. */
+export interface SpeakerIgnoreView {
+  id: string;
+  ignored: true;
+  adopted: false;
+  discovered: false;
+}
+export type SpeakerListEntry = SpeakerView | SpeakerIgnoreView;
+
 /** One protocol-neutral boundary over control preferences and live facts.
  * Reading never acquires facts, starts a session or saves configuration. */
 export function createSpeakers(deps: {
   outputs: Pick<
     Outputs,
-    'list' | 'get' | 'lifetime' | 'adopt' | 'update' | 'forget'
+    | 'list'
+    | 'get'
+    | 'lifetime'
+    | 'adopt'
+    | 'update'
+    | 'forget'
+    | 'ignored'
+    | 'ignore'
+    | 'unignore'
   >;
   playback?: { pause(source?: CommandSource): void };
   adapterView(id: string): SpeakerAdapterView;
@@ -78,6 +82,7 @@ export function createSpeakers(deps: {
   }, source?: CommandSource): Promise<Output | null>;
 }) {
   const view = (row: Output): SpeakerView => ({
+    ...(deps.outputs.ignored().includes(row.id) ? { ignored: true } : {}),
     id: row.id,
     name: row.name,
     protocol: row.type,
@@ -90,8 +95,8 @@ export function createSpeakers(deps: {
     ...deps.outputs.lifetime(row.id),
     state: structuredClone(deps.adapterView(row.id)),
   });
-  const requireRow = (id: string) => {
-    const row = deps.outputs.get(id);
+  const requireRow = (id: string, includeIgnored = false) => {
+    const row = deps.outputs.get(id, { includeIgnored });
     if (!row) throw new SpeakerError('not_found', 'Speaker not found');
     return row;
   };
@@ -108,13 +113,51 @@ export function createSpeakers(deps: {
       );
     }
   };
+  const marker = (id: string): SpeakerIgnoreView => ({
+    id,
+    ignored: true,
+    adopted: false,
+    discovered: false,
+  });
+  const changeIgnore = async (operation: () => Promise<void>) => {
+    try {
+      await operation();
+    } catch (error) {
+      if (error instanceof SpeakerError) throw error;
+      throw new SpeakerError(
+        'persistence_failed',
+        'Speaker ignore could not be saved',
+      );
+    }
+  };
   return {
-    list(): SpeakerView[] {
-      return deps.outputs.list().map(view);
+    list(options?: { includeIgnored?: boolean }): SpeakerListEntry[] {
+      const rows: SpeakerListEntry[] = deps.outputs.list(options).map(view);
+      if (options?.includeIgnored) {
+        const present = new Set(rows.map((row) => row.id));
+        for (const id of deps.outputs.ignored()) {
+          if (!present.has(id)) rows.push(marker(id));
+        }
+      }
+      return rows;
     },
-    get(id: string): SpeakerView | null {
-      const row = deps.outputs.get(id);
-      return row === null ? null : view(row);
+    get(
+      id: string,
+      options?: { includeIgnored?: boolean },
+    ): SpeakerListEntry | null {
+      const row = deps.outputs.get(id, options);
+      if (row) return view(row);
+      return options?.includeIgnored && deps.outputs.ignored().includes(id)
+        ? marker(id)
+        : null;
+    },
+    async ignore(id: string): Promise<SpeakerListEntry> {
+      await changeIgnore(() => deps.outputs.ignore(id));
+      const row = deps.outputs.get(id, { includeIgnored: true });
+      return row ? view(row) : marker(id);
+    },
+    async unignore(id: string): Promise<void> {
+      await changeIgnore(() => deps.outputs.unignore(id));
     },
     async add(input: unknown, source?: CommandSource): Promise<SpeakerView> {
       const body = fields(input, [
@@ -175,7 +218,7 @@ export function createSpeakers(deps: {
       );
     },
     async adopt(id: string): Promise<SpeakerView> {
-      requireRow(id);
+      requireRow(id, true);
       return await durable(() => deps.outputs.adopt(id));
     },
     async forget(id: string, source?: CommandSource): Promise<void> {

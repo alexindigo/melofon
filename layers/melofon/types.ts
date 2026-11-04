@@ -125,8 +125,13 @@ export interface HatContext {
   app: {
     cfg: { dataDir?: string };
     speakers: {
-      list(): SpeakerView[];
-      get(id: string): SpeakerView | null;
+      list(options?: { includeIgnored?: boolean }): SpeakerListEntry[];
+      get(
+        id: string,
+        options?: { includeIgnored?: boolean },
+      ): SpeakerListEntry | null;
+      ignore(id: string): Promise<SpeakerListEntry>;
+      unignore(id: string): Promise<void>;
       add(input: unknown, source?: Source): Promise<SpeakerView>;
       adopt(id: string): Promise<SpeakerView>;
       forget(id: string, source?: Source): Promise<void>;
@@ -491,6 +496,7 @@ export interface SessionPlaybackReport {
 }
 
 export interface SpeakerView {
+  ignored?: true;
   adopted: boolean;
   discovered: boolean;
   id: string;
@@ -512,6 +518,13 @@ export interface SpeakerView {
     };
   };
 }
+
+export type SpeakerListEntry = SpeakerView | {
+  id: string;
+  ignored: true;
+  adopted: false;
+  discovered: false;
+};
 
 export interface SavedQueue {
   trackIds: string[];

@@ -127,7 +127,7 @@ export async function startServer(options: {
   const savedOutputs = await persistence.loadOutputs();
   const outputAdmission = createOutputAdmission({
     endpoint(id) {
-      const row = outputs.get(id);
+      const row = outputs.get(id, { includeIgnored: true });
       return row?.host
         ? {
           id,

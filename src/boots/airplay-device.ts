@@ -29,7 +29,7 @@ export function createAirplayDevices(deps: {
   const admission = deps.admission ??
     createOutputAdmission({
       endpoint: (id) => {
-        const output = outputs.get(id);
+        const output = outputs.get(id, { includeIgnored: true });
         return output?.host
           ? {
             id,
@@ -41,14 +41,15 @@ export function createAirplayDevices(deps: {
       },
     });
   const resolver = deps.resolver ?? createMdnsResolver();
-  const forgottenReceivers = new Map<string, number>();
+  const configurationRevisions = new Map<string, number>();
   outputs.onCommand((id, command) => {
-    if (command.forget) {
-      const identity = outputs.get(id)?.receiverIdentity;
+    if (command.forget || command.ignore) {
+      const identity = outputs.get(id, { includeIgnored: true })
+        ?.receiverIdentity;
       if (identity !== undefined) {
-        forgottenReceivers.set(
+        configurationRevisions.set(
           identity,
-          (forgottenReceivers.get(identity) ?? 0) + 1,
+          (configurationRevisions.get(identity) ?? 0) + 1,
         );
       }
       admission.invalidate(id);
@@ -61,7 +62,7 @@ export function createAirplayDevices(deps: {
     if (!identity) {
       throw new PreparationError('invalid', 'Receiver identity is missing');
     }
-    const bound = outputs.get(id)?.receiverIdentity;
+    const bound = outputs.get(id, { includeIgnored: true })?.receiverIdentity;
     if (bound !== undefined && bound !== identity) {
       throw new PreparationError(
         'invalid',
@@ -85,7 +86,7 @@ export function createAirplayDevices(deps: {
       );
       const identity = receiverIdentity(endpoint.id, service);
       const config = profileFromService(service, endpoint.address);
-      const current = outputs.get(endpoint.id);
+      const current = outputs.get(endpoint.id, { includeIgnored: true });
       if (
         !signal.aborted && current?.host === endpoint.address &&
         current.port === endpoint.port
@@ -130,7 +131,7 @@ export function createAirplayDevices(deps: {
     close: (transport) => transport.close(),
   });
   const accept = (id: string, service: MdnsService) => {
-    const row = outputs.get(id);
+    const row = outputs.get(id, { includeIgnored: true });
     if (!row?.host) return;
     receiverIdentity(id, service);
     const profile = profileFromService(service, row.host);
@@ -152,7 +153,9 @@ export function createAirplayDevices(deps: {
       if (!parsed) {
         throw new PreparationError('invalid', 'Receiver identity is missing');
       }
-      const rows = outputs.list().filter((o) => o.type === 'AirPlay');
+      const rows = outputs.list({ includeIgnored: true }).filter((o) =>
+        o.type === 'AirPlay'
+      );
       // An acquired identity wins over endpoint aliases, including after restart.
       const known = rows.find((o) => o.receiverIdentity === parsed.id);
       if (known) return known.id;
@@ -207,8 +210,8 @@ export function createAirplayDevices(deps: {
       source?: CommandSource,
     ) {
       const host = normalizeAirplayAddress(input.host);
-      const receiverRevisions = new Map(forgottenReceivers);
-      const candidates = outputs.list().filter((o) =>
+      const receiverRevisions = new Map(configurationRevisions);
+      const candidates = outputs.list({ includeIgnored: true }).filter((o) =>
         o.type === 'AirPlay' && o.host !== undefined &&
         normalizeAirplayAddress(o.host) === host
       );
@@ -226,8 +229,8 @@ export function createAirplayDevices(deps: {
         name: input.name ?? existing?.name ?? host,
         host,
         type: 'AirPlay',
-        selected: outputs.get(id)?.selected ?? false,
-        volume: outputs.get(id)?.volume ?? 100,
+        selected: outputs.get(id, { includeIgnored: true })?.selected ?? false,
+        volume: outputs.get(id, { includeIgnored: true })?.volume ?? 100,
         ...(input.port === undefined ? {} : { port: input.port }),
         ...(input.connectionStrategy === undefined
           ? {}
@@ -235,7 +238,8 @@ export function createAirplayDevices(deps: {
       }, source);
       let revision = outputs.revision(id);
       const isCurrent = () =>
-        outputs.get(id) !== null && outputs.revision(id) === revision;
+        outputs.get(id, { includeIgnored: true }) !== null &&
+        outputs.revision(id) === revision;
       const controller = new AbortController();
       // Catalog preparation has no playback authority; permits are discarded.
       await protocol.prepare({
@@ -246,13 +250,13 @@ export function createAirplayDevices(deps: {
         isCurrent,
       });
       if (!isCurrent()) return null;
-      const acquired = outputs.get(id);
+      const acquired = outputs.get(id, { includeIgnored: true });
       if (
         acquired?.receiverIdentity !== undefined &&
         receiverRevisions.get(acquired.receiverIdentity) !==
-          forgottenReceivers.get(acquired.receiverIdentity)
+          configurationRevisions.get(acquired.receiverIdentity)
       ) {
-        // An alias lookup begun before forget cannot re-adopt that receiver.
+        // An alias lookup begun before forget/ignore cannot re-adopt that receiver.
         if (!outputs.lifetime(id).adopted) {
           admission.invalidate(id);
           outputs.unregister(id, source);
@@ -261,7 +265,7 @@ export function createAirplayDevices(deps: {
       }
       const canonical = acquired?.receiverIdentity === undefined
         ? undefined
-        : outputs.list().find((o) =>
+        : outputs.list({ includeIgnored: true }).find((o) =>
           o.id !== id && o.type === 'AirPlay' &&
           o.receiverIdentity === acquired.receiverIdentity
         );

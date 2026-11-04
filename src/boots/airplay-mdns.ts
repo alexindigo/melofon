@@ -113,7 +113,7 @@ export function createAirplayDiscovery(
     parsed.id = deps.devices.observationId(svc);
 
     if (svc.txt.pw !== undefined && svc.txt.pw !== 'false') {
-      const existing = outputs.get(parsed.id);
+      const existing = outputs.get(parsed.id, { includeIgnored: true });
       const saved = existing === null
         ? deps.savedOutput?.(parsed.id)
         : undefined;
@@ -150,7 +150,7 @@ export function createAirplayDiscovery(
       needsAuthKey: profile.requiresAuth,
     };
     const signature = JSON.stringify(profile);
-    const existing = outputs.get(parsed.id);
+    const existing = outputs.get(parsed.id, { includeIgnored: true });
     // A device re-announcing while not registered (mDNS down→up, or a
     // restart before its row re-registers) gets its persisted user state
     // back — selection and volume survive the gap.

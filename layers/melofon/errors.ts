@@ -18,7 +18,8 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
       fail(
         code === 'not_found'
           ? 404
-          : code === 'not_adopted'
+          : code === 'not_adopted' || code === 'already_adopted' ||
+              code === 'speaker_in_use' || code === 'speaker_busy'
           ? 409
           : code === 'persistence_failed'
           ? 500

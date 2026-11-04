@@ -16,6 +16,7 @@
 import type { SongRow } from './library.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
+import { SpeakerError } from './speaker-errors.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   CONNECTION_STRATEGIES,
@@ -291,8 +292,11 @@ export interface OutputCommand {
 }
 
 export interface Outputs {
-  list(): Output[];
-  get(id: string): Output | null;
+  list(options?: { includeIgnored?: boolean }): Output[];
+  get(id: string, options?: { includeIgnored?: boolean }): Output | null;
+  ignored(): string[];
+  ignore(id: string): Promise<void>;
+  unignore(id: string): Promise<void>;
   /** Adds a boot's output; last-wins when the id is already registered.
    * Mutations take a provenance source like the player commands (plan
    * command-provenance): [cmd]-logged, no wire surface this round. */
@@ -336,7 +340,10 @@ export interface Outputs {
   ): Output | null;
   /** Boots receive transient PIN commands and awaited forget cancellation. */
   onCommand(
-    fn: (id: string, cmd: { pin?: string; forget?: true }) => unknown,
+    fn: (
+      id: string,
+      cmd: { pin?: string; forget?: true; ignore?: true },
+    ) => unknown,
   ): void;
 }
 
@@ -364,6 +371,8 @@ export interface OutputPersistence {
   adoptOutput?(row: PersistedOutput): Promise<void>;
   deleteOutput?(id: string): Promise<void>;
   savedOutput?(id: string): PersistedOutput | undefined;
+  ignoredOutputs?(): string[];
+  setOutputIgnored?(id: string, value: boolean): Promise<void>;
 }
 
 function clampVolume(n: number): number {
@@ -658,6 +667,12 @@ export function createOutputs(
   const adopted = new Set<string>();
   const discovered = new Set<string>();
   const forgetting = new Set<string>();
+  const ignored = new Set<string>();
+  const ignoring = new Map<string, Promise<void>>();
+  const adopting = new Map<string, number>();
+  const ignoredIds = () => persistence?.ignoredOutputs?.() ?? [...ignored];
+  const isIgnored = (id: string) => ignoredIds().includes(id);
+  const blocked = (id: string) => isIgnored(id) || ignoring.has(id);
   const revisions = new Map<string, number>();
   const revision = (id: string) => revisions.get(id) ?? 0;
   const bump = (id: string) => revisions.set(id, revision(id) + 1);
@@ -705,7 +720,7 @@ export function createOutputs(
   // The ready() caller owns the rejection; prevent an unobserved startup task.
   void initialization.catch(() => {});
   const commandListeners = new Set<
-    (id: string, cmd: { pin?: string; forget?: true }) => unknown
+    (id: string, cmd: { pin?: string; forget?: true; ignore?: true }) => unknown
   >();
   const snapshot = (o: Output): PersistedOutput => ({
     id: o.id,
@@ -722,16 +737,67 @@ export function createOutputs(
   const saveRow = (o: Output) => {
     if (isAdopted(o.id)) persistence?.saveOutput(snapshot(o));
   };
+  const changeIgnored = (id: string, value: boolean): Promise<void> => {
+    const previous = ignoring.get(id) ?? Promise.resolve();
+    // Every marker mutation has its own result; a rejected predecessor must not
+    // poison subsequent undo/retry. The reservation also fences control writes.
+    const write = previous.catch(() => {}).then(async () => {
+      if (value) {
+        if (isAdopted(id) || adopting.has(id)) {
+          throw new SpeakerError(
+            'already_adopted',
+            'Forget the adopted speaker before ignoring it',
+          );
+        }
+        if (isIgnored(id)) return;
+        const row = find(id);
+        if (!row) throw new SpeakerError('not_found', 'Speaker not found');
+        if (row.selected) {
+          throw new SpeakerError(
+            'speaker_in_use',
+            'Deselect the speaker before ignoring it',
+          );
+        }
+      } else if (!isIgnored(id)) {
+        throw new SpeakerError('not_found', 'Ignored speaker not found');
+      }
+      if (persistence && !persistence.setOutputIgnored) {
+        throw new Error('speaker ignore persistence unavailable');
+      }
+      await persistence?.setOutputIgnored?.(id, value);
+      if (value) {
+        ignored.add(id);
+        // A catalog lookup begun before ignore cannot later replace the marker
+        // through implicit completion of an older add-by-address operation.
+        bump(id);
+        await Promise.all(
+          [...commandListeners].map((fn) => fn(id, { ignore: true })),
+        );
+      } else ignored.delete(id);
+      emit(['outputs']);
+    }).finally(() => {
+      if (ignoring.get(id) === write) ignoring.delete(id);
+    });
+    ignoring.set(id, write);
+    return write;
+  };
 
   const api: Outputs = {
     ready: () => initialization,
     revision,
     lastCommand: () => last,
-    list: () => outputs.map((o) => ({ ...o })),
-    get: (id) => {
+    list: (options) =>
+      outputs.filter((o) => options?.includeIgnored || !isIgnored(o.id)).map((
+        o,
+      ) => ({ ...o })),
+    get: (id, options) => {
+      if (!options?.includeIgnored && isIgnored(id)) return null;
       const found = find(id);
       return found === null ? null : { ...found };
     },
+    ignored: ignoredIds,
+    ignore: (id) => changeIgnored(id, true),
+    unignore: (id) => changeIgnored(id, false),
     lifetime: (id) => ({
       adopted: isAdopted(id),
       discovered: discovered.has(id),
@@ -743,24 +809,36 @@ export function createOutputs(
     async adopt(id) {
       let row = find(id);
       if (row === null || forgetting.has(id)) return null;
-      const current = revision(id);
-      if (persistence && !persistence.adoptOutput) {
-        throw new Error('speaker adoption persistence unavailable');
+      if (ignoring.has(id)) {
+        throw new SpeakerError('speaker_busy', 'Speaker ignore is in progress');
       }
-      // A control change during the write must also be durable on return.
-      let saved: PersistedOutput;
-      do {
-        saved = snapshot(row);
-        await persistence?.adoptOutput?.(saved);
-        if (revision(id) !== current || forgetting.has(id)) return null;
-        row = find(id);
-      } while (
-        row !== null && JSON.stringify(snapshot(row)) !== JSON.stringify(saved)
-      );
-      if (row === null) return null;
-      if (!persistence?.savedOutput) adopted.add(id);
-      emit(['outputs']);
-      return { ...row };
+      adopting.set(id, (adopting.get(id) ?? 0) + 1);
+      try {
+        const current = revision(id);
+        if (persistence && !persistence.adoptOutput) {
+          throw new Error('speaker adoption persistence unavailable');
+        }
+        // A control change during the write must also be durable on return.
+        let saved: PersistedOutput;
+        do {
+          saved = snapshot(row);
+          await persistence?.adoptOutput?.(saved);
+          if (revision(id) !== current || forgetting.has(id)) return null;
+          row = find(id);
+        } while (
+          row !== null &&
+          JSON.stringify(snapshot(row)) !== JSON.stringify(saved)
+        );
+        if (row === null) return null;
+        if (!persistence?.savedOutput) adopted.add(id);
+        ignored.delete(id);
+        emit(['outputs']);
+        return { ...row };
+      } finally {
+        const count = adopting.get(id)! - 1;
+        if (count) adopting.set(id, count);
+        else adopting.delete(id);
+      }
     },
     async forget(id, source) {
       const row = find(id);
@@ -821,7 +899,11 @@ export function createOutputs(
       if (lifetime === 'observation') discovered.add(output.id);
       if (idx === -1) {
         bump(output.id);
-        outputs.push({ ...output, connectionStrategy });
+        outputs.push({
+          ...output,
+          connectionStrategy,
+          ...(blocked(output.id) ? { selected: false } : {}),
+        });
       } else {
         // Model is identity, not a session knob: a model-less same-id
         // re-registration (resolve timeout, TXT without `am`) keeps the
@@ -834,6 +916,7 @@ export function createOutputs(
         outputs[idx] = {
           ...output,
           connectionStrategy,
+          ...(blocked(output.id) ? { selected: false } : {}),
           ...(model === undefined ? {} : { model }),
           ...(receiverIdentity === undefined ? {} : { receiverIdentity }),
         };
@@ -864,7 +947,7 @@ export function createOutputs(
       return true;
     },
     setEnabled(ids, source) {
-      if (ids.some((id) => find(id) === null)) return false;
+      if (ids.some((id) => find(id) === null || blocked(id))) return false;
       for (const o of outputs) o.selected = ids.includes(o.id);
       for (const o of outputs) saveRow(o);
       record(
@@ -881,6 +964,7 @@ export function createOutputs(
       return true;
     },
     toggle(id, source) {
+      if (blocked(id)) return null;
       const found = find(id);
       if (found === null) return null;
       found.selected = !found.selected;
@@ -895,6 +979,7 @@ export function createOutputs(
       return { ...found };
     },
     update(id, opts, source) {
+      if (blocked(id)) return null;
       if (opts.connectionStrategy !== undefined) {
         requireConnectionStrategy(opts.connectionStrategy);
       }

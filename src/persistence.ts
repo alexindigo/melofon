@@ -43,6 +43,7 @@ export function createPersistence(
   };
   const outputCache = new Map<string, PersistedOutput>();
   const outputRevisions = new Map<string, number>();
+  const ignored = new Set<string>();
 
   return {
     saveQueue(songIds) {
@@ -82,6 +83,7 @@ export function createPersistence(
       await write;
       if (outputRevisions.get(row.id) === revision) {
         outputCache.set(row.id, saved);
+        ignored.delete(row.id);
       }
     },
 
@@ -104,6 +106,9 @@ export function createPersistence(
     },
 
     async loadOutputs() {
+      const markers = await store.speakers.loadIgnored();
+      ignored.clear();
+      for (const id of markers) ignored.add(id);
       const rows = (await store.speakers.loadAdopted()).map((row) => ({
         ...row,
         connectionStrategy: requireConnectionStrategy(
@@ -116,6 +121,19 @@ export function createPersistence(
     },
 
     savedOutput: (id) => outputCache.get(id),
+
+    ignoredOutputs: () => [...ignored],
+
+    async setOutputIgnored(id, value) {
+      const write = tail.then(async () => {
+        if (value) await store.speakers.saveIgnored(id);
+        else await store.speakers.deleteIgnored(id);
+        if (value) ignored.add(id);
+        else ignored.delete(id);
+      });
+      tail = write.catch((error) => log.event('persistence_failed', { error }));
+      await write;
+    },
 
     drain: () => tail,
   };

@@ -95,8 +95,8 @@ async function fixture(dir?: string) {
     });
   }
   const { credential } = await f.login('bearer', 'member', 'password-member');
-  const read = async () => {
-    const r = await f.get('/api/v1/speakers', credential);
+  const read = async (query = '') => {
+    const r = await f.get(`/api/v1/speakers${query}`, credential);
     assertEquals(r.status, 200);
     return (await r.json()).speakers;
   };
@@ -119,6 +119,7 @@ async function fixture(dir?: string) {
       answer = value;
     },
     announce: (value = receiver) => announce('up', value),
+    withdraw: () => announce('down', receiver),
     effects: () => ({ lookups, starts }),
     failSave: (value: boolean) => {
       failSave = value;
@@ -700,5 +701,336 @@ Deno.test('an address alias resolving after forget cannot re-adopt the forgotten
   } finally {
     reply.resolve(receiver);
     await t.close();
+  }
+});
+
+Deno.test('speaker HTTP ignore survives advertisements and reopen without saving configuration', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'speaker-ignore-' });
+  const id = BigInt('0x001122334455').toString();
+  try {
+    const t = await fixture(dir);
+    try {
+      t.announce();
+      const ignored = await t.speaker(
+        await t.write(`/${id}/ignore`, 'POST', {}),
+      );
+      assertEquals(ignored.ignored, true);
+      assertEquals(ignored.adopted, false);
+      assertEquals(await t.read(), []);
+      await error(
+        await t.f.get(`/api/v1/speakers/${id}`, t.credential),
+        404,
+        'not_found',
+      );
+      t.announce({ ...receiver, address: '192.0.2.99' });
+      assertEquals(await t.read(), []);
+      const visible = await t.read('?includeIgnored=true');
+      assertEquals(visible.length, 1);
+      assertEquals(visible[0].ignored, true);
+      assertEquals(visible[0].address, '192.0.2.99');
+      const detail = await t.f.get(
+        `/api/v1/speakers/${id}?includeIgnored=true`,
+        t.credential,
+      );
+      assertEquals(detail.status, 200);
+      assertEquals((await detail.json()).speaker, visible[0]);
+      assertEquals(await t.read('?includeIgnored=false'), []);
+      t.announce({
+        ...receiver,
+        address: '192.0.2.99',
+        txt: { ...receiver.txt, pw: 'true' },
+      });
+      assertEquals(await t.read(), []);
+      assertEquals((await t.read('?includeIgnored=true'))[0].ignored, true);
+      const own = await fetch(
+        `http://melofon.home:${t.f.extraPorts[0]}/api/outputs`,
+      );
+      assertEquals((await own.json()).outputs, []);
+      assertEquals(await t.f.store.speakers.loadIgnored(), [id]);
+      assertEquals(await t.f.store.playback.loadOutputs(), []);
+      assertEquals(t.persistence.savedOutput(id), undefined);
+      assertEquals(t.effects().starts, 0);
+    } finally {
+      await t.close();
+    }
+    const next = await fixture(dir);
+    try {
+      assertEquals(await next.read(), []);
+      assertEquals(await next.read('?includeIgnored=true'), [{
+        id,
+        ignored: true,
+        adopted: false,
+        discovered: false,
+      }]);
+      next.announce();
+      assertEquals(await next.read(), []);
+      assertEquals(
+        (await next.read('?includeIgnored=true'))[0].discovered,
+        true,
+      );
+      const response = await next.write(`/${id}/ignore`, 'DELETE', undefined);
+      assertEquals(response.status, 204, await response.text());
+      const row = (await next.read())[0];
+      assertEquals(row.id, id);
+      assertEquals(row.address, receiver.address);
+      assertEquals(row.adopted, false);
+      assertEquals(row.discovered, true);
+      assertEquals(await next.f.store.speakers.loadIgnored(), []);
+      assertEquals(await next.f.store.playback.loadOutputs(), []);
+    } finally {
+      await next.close();
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('speaker ignore and undo enforce auth, Origin, input and selected/adopted conflicts', async () => {
+  const t = await fixture();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    const path = `/api/v1/speakers/${id}/ignore`;
+    for (const method of ['POST', 'DELETE']) {
+      await error(await t.f.json(path, method, {}), 401, 'unauthenticated');
+      await error(
+        await t.f.json(path, method, {}, t.credential, 'http://other.home'),
+        403,
+        'origin',
+      );
+    }
+    await error(await t.write('/missing/ignore', 'POST', {}), 404, 'not_found');
+    await error(
+      await t.write('/missing/ignore', 'DELETE', undefined),
+      404,
+      'not_found',
+    );
+    await error(
+      await t.write(`/${id}/ignore`, 'POST', { selected: false }),
+      400,
+      'unknown_field',
+    );
+    await error(
+      await t.f.get('/api/v1/speakers?includeIgnored=yes', t.credential),
+      400,
+      'invalid_field',
+    );
+    // Selection is active intent even with a paused/stopped engine.
+    t.outputs.setEnabled([id]);
+    await error(
+      await t.write(`/${id}/ignore`, 'POST', {}),
+      409,
+      'speaker_in_use',
+    );
+    assertEquals(t.outputs.get(id)!.selected, true);
+    t.outputs.setEnabled([]);
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    await error(
+      await t.write(`/${id}/ignore`, 'POST', {}),
+      409,
+      'already_adopted',
+    );
+    assertEquals(await t.f.store.speakers.loadIgnored(), []);
+    const forgotten = await t.write(`/${id}`, 'DELETE', undefined);
+    assertEquals(forgotten.status, 204);
+    t.announce();
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await t.f.login(mode, 'member', 'password-member');
+      await t.speaker(await t.f.json(path, 'POST', {}, credential));
+      // A repeated ignore is idempotent, not a missing hidden row.
+      await t.speaker(await t.f.json(path, 'POST', {}, credential));
+      const undone = await t.f.json(path, 'DELETE', undefined, credential);
+      assertEquals(undone.status, 204);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('ignored receivers cannot be selected through any OwnTone control and undo retains fresh observations only', async () => {
+  const t = await fixture();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/ignore`, 'POST', {}));
+    for (
+      const [path, body] of [
+        [`/api/outputs/set`, { outputs: [id] }],
+        [`/api/outputs/${id}/toggle`, undefined],
+        [`/api/outputs/${id}`, { selected: true }],
+      ] as const
+    ) {
+      const response = await fetch(
+        `http://melofon.home:${t.f.extraPorts[0]}${path}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        },
+      );
+      assertEquals(response.status, 400);
+      await response.body?.cancel();
+    }
+    t.withdraw();
+    assertEquals(await t.read('?includeIgnored=true'), [{
+      id,
+      ignored: true,
+      adopted: false,
+      discovered: false,
+    }]);
+    const removed = await t.write(`/${id}/ignore`, 'DELETE', undefined);
+    assertEquals(removed.status, 204);
+    assertEquals(await t.read(), []);
+    t.announce({ ...receiver, address: '192.0.2.80' });
+    const row = (await t.read())[0];
+    assertEquals(row.address, '192.0.2.80');
+    assertEquals(row.selected, false);
+    assertEquals(t.effects().starts, 0);
+    assertEquals(await t.f.store.playback.loadOutputs(), []);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('speaker ignore durability failures preserve the prior visible lifetime and permit retry', async () => {
+  const t = await fixture();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    const save = t.f.store.speakers.saveIgnored;
+    t.f.store.speakers.saveIgnored = () =>
+      Promise.reject(new Error('private ignore fault'));
+    const failure = await error(
+      await t.write(`/${id}/ignore`, 'POST', {}),
+      500,
+      'persistence_failed',
+    );
+    assert(!JSON.stringify(failure).includes('private ignore fault'));
+    assertEquals((await t.read()).length, 1);
+    assertEquals(await t.f.store.speakers.loadIgnored(), []);
+    t.f.store.speakers.saveIgnored = save;
+    await t.speaker(await t.write(`/${id}/ignore`, 'POST', {}));
+    const remove = t.f.store.speakers.deleteIgnored;
+    t.f.store.speakers.deleteIgnored = () =>
+      Promise.reject(new Error('private undo fault'));
+    await error(
+      await t.write(`/${id}/ignore`, 'DELETE', undefined),
+      500,
+      'persistence_failed',
+    );
+    assertEquals(await t.read(), []);
+    assertEquals(await t.f.store.speakers.loadIgnored(), [id]);
+    t.f.store.speakers.deleteIgnored = remove;
+    assertEquals(
+      (await t.write(`/${id}/ignore`, 'DELETE', undefined)).status,
+      204,
+    );
+    assertEquals((await t.read()).length, 1);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('pending ignore fences selection and adoption while undo and advertisements remain ordered', async () => {
+  const t = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    const save = t.f.store.speakers.saveIgnored;
+    t.f.store.speakers.saveIgnored = async (id) => {
+      entered.resolve();
+      await release.promise;
+      await save(id);
+    };
+    const ignoring = t.write(`/${id}/ignore`, 'POST', {});
+    await entered.promise;
+    assertEquals(t.outputs.setEnabled([id]), false);
+    assertEquals(t.outputs.toggle(id), null);
+    assertEquals(t.outputs.update(id, { selected: true }), null);
+    await error(await t.write(`/${id}/adopt`, 'POST', {}), 409, 'speaker_busy');
+    t.announce({ ...receiver, address: '192.0.2.70' });
+    const undoing = t.write(`/${id}/ignore`, 'DELETE', undefined);
+    release.resolve();
+    await t.speaker(await ignoring);
+    assertEquals((await undoing).status, 204);
+    assertEquals((await t.read())[0].address, '192.0.2.70');
+    assertEquals(await t.f.store.speakers.loadIgnored(), []);
+    assertEquals(await t.f.store.playback.loadOutputs(), []);
+  } finally {
+    release.resolve();
+    await t.close();
+  }
+});
+
+Deno.test('explicit adoption replaces ignore durably and an in-flight adoption cannot be ignored', async () => {
+  const t = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/ignore`, 'POST', {}));
+    const save = t.f.store.speakers.saveAdopted;
+    t.f.store.speakers.saveAdopted = async (row) => {
+      entered.resolve();
+      await release.promise;
+      await save(row);
+    };
+    const adopting = t.write(`/${id}/adopt`, 'POST', {});
+    await entered.promise;
+    await error(
+      await t.write(`/${id}/ignore`, 'POST', {}),
+      409,
+      'already_adopted',
+    );
+    release.resolve();
+    assertEquals((await t.speaker(await adopting)).adopted, true);
+    assertEquals((await t.read()).length, 1);
+    assertEquals(await t.f.store.speakers.loadIgnored(), []);
+    assertEquals((await t.f.store.speakers.loadAdopted()).length, 1);
+  } finally {
+    release.resolve();
+    await t.close();
+  }
+});
+
+Deno.test('ignore defeats older address and alias lookups but permits a subsequent explicit address adoption', async () => {
+  for (const address of [receiver.address, 'alias.local']) {
+    const t = await fixture();
+    const reply = Promise.withResolvers<MdnsService>();
+    try {
+      t.announce();
+      const id = (await t.read())[0].id;
+      t.answer(reply.promise);
+      const adding = t.write('', 'POST', { protocol: 'AirPlay', address });
+      for (let i = 0; t.effects().lookups === 0; i++) {
+        assert(i < 100, 'address lookup starts');
+        await t.read();
+      }
+      await t.speaker(await t.write(`/${id}/ignore`, 'POST', {}));
+      reply.resolve(receiver);
+      await error(await adding, 404, 'not_found');
+      assertEquals(await t.read(), []);
+      assertEquals(await t.f.store.speakers.loadIgnored(), [id]);
+      assertEquals(await t.f.store.playback.loadOutputs(), []);
+      t.answer(receiver);
+      const adopted = await t.speaker(
+        await t.write('', 'POST', {
+          protocol: 'AirPlay',
+          address,
+        }),
+        201,
+      );
+      assertEquals(adopted.id, id);
+      assertEquals(adopted.adopted, true);
+      assertEquals(adopted.selected, false);
+      assertEquals(await t.f.store.speakers.loadIgnored(), []);
+      assertEquals((await t.read()).length, 1);
+    } finally {
+      reply.resolve(receiver);
+      await t.close();
+    }
   }
 });
