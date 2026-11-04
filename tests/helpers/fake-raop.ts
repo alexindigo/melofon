@@ -56,6 +56,7 @@ export function startFakeRaop(
     withholdTeardownReply?: boolean;
     flushDelayMs?: number;
     captureAudio?: boolean;
+    refuseRecord?: () => boolean;
   } = {},
 ): Promise<FakeRaop> {
   const sessions: FakeRaopSession[] = [];
@@ -269,7 +270,11 @@ export function startFakeRaop(
         }
         await conn.write(
           encoder.encode(
-            `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\n${extra}Server: fake-raop\r\nContent-Length: 0\r\n\r\n`,
+            `RTSP/1.0 ${
+              method === 'RECORD' && opts.refuseRecord?.()
+                ? '500 Refused'
+                : '200 OK'
+            }\r\nCSeq: ${cseq}\r\n${extra}Server: fake-raop\r\nContent-Length: 0\r\n\r\n`,
           ),
         );
       }

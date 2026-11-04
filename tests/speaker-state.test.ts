@@ -129,6 +129,7 @@ async function setup() {
           outputs,
           playback,
           adapterView: devices.describe,
+          retry: boot.retry,
         }),
       };
     },
@@ -326,6 +327,71 @@ Deno.test('speaker HTTP session/auth views refetch on native speaker and OwnTone
     );
   } finally {
     for (const ws of sockets) await ws.close();
+    await t.close();
+  }
+});
+
+Deno.test('speaker HTTP retry validates auth and input and refreshes paused/stopped preparation without playback', async () => {
+  const t = await setup();
+  try {
+    await t.f.auth.users.create(t.f.admin.id, {
+      username: 'retry-member',
+      password: 'password-member',
+      role: 'user',
+    });
+    const cookie = await t.f.login('cookie', 'retry-member', 'password-member');
+    const bearer = await t.f.login('bearer', 'retry-member', 'password-member');
+    t.register();
+    const path = '/api/v1/speakers/1/retry';
+    for (
+      const [credential, body, origin, status] of [
+        [undefined, {}, undefined, 401],
+        [cookie.credential, {}, 'http://wrong.home', 403],
+        [bearer.credential, { selected: true }, undefined, 400],
+      ] as const
+    ) {
+      const r = await t.f.json(path, 'POST', body, credential, origin);
+      assertEquals(r.status, status, await r.text());
+    }
+    const missing = await t.f.json(
+      '/api/v1/speakers/missing/retry',
+      'POST',
+      {},
+      bearer.credential,
+    );
+    assertEquals(missing.status, 404, await missing.text());
+    assertEquals(t.effects(), { starts: 0, writes: 0, lookups: 0 });
+    for (
+      const [credential, state] of [[cookie.credential, 'stop'], [
+        bearer.credential,
+        'pause',
+      ]] as const
+    ) {
+      if (state === 'pause') {
+        await t.play();
+        await until(() => t.effects().starts === 1);
+        t.events[0]('state', 'connected');
+        await t.own('/player/pause', 'PUT');
+      }
+      const effects = t.effects();
+      const pending = t.f.json(path, 'POST', {}, credential);
+      await until(() => t.effects().lookups === (state === 'stop' ? 1 : 2));
+      assertEquals(
+        (await t.read(credential)).state.preparation.state,
+        'preparing',
+      );
+      t.resolve();
+      const r = await pending;
+      assertEquals(r.status, 200, await r.clone().text());
+      const row = (await r.json()).speaker;
+      assertEquals(row.state.preparation.state, 'ready');
+      assertEquals(row.state.connection, 'disconnected');
+      assertEquals(row.adopted, false);
+      assertEquals(t.playback.playerView().state, state);
+      assertEquals(t.effects().starts, effects.starts);
+      assertEquals(t.effects().writes, effects.writes);
+    }
+  } finally {
     await t.close();
   }
 });

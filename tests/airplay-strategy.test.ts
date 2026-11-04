@@ -9,6 +9,9 @@ import type { Library, SongRow } from '../src/library.ts';
 import type { NowPlaying } from '../src/nowplaying.ts';
 import type { Media } from '../src/media.ts';
 import type { State } from '../src/state.ts';
+import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import type { MdnsResolver } from '../src/mdns-resolver.ts';
+import type { MdnsService } from '../src/mdns.ts';
 import {
   createTestAirplayDevices,
   recordingSpawn,
@@ -100,6 +103,7 @@ function setup(backoff = [0, 20], finite = false, opts: {
   state?: State;
   decode?: Media['decodePcm'];
   spawnFailure?: boolean;
+  resolver?: MdnsResolver;
 } = {}) {
   Transport.feed = null;
   const notify = createNotify();
@@ -128,15 +132,15 @@ function setup(backoff = [0, 20], finite = false, opts: {
     }),
   } as unknown as Media;
   const transports: Transport[] = [];
-  const devices = createTestAirplayDevices(
-    outputs,
-    recordingSpawn((event) => {
-      const t = new Transport(event);
-      transports.push(t);
-      if (opts.spawnFailure) throw new Error('injected spawn failure');
-      return t;
-    }),
-  );
+  const spawn = recordingSpawn((event) => {
+    const t = new Transport(event);
+    transports.push(t);
+    if (opts.spawnFailure) throw new Error('injected spawn failure');
+    return t;
+  });
+  const devices = opts.resolver
+    ? createAirplayDevices({ outputs, spawn, resolver: opts.resolver })
+    : createTestAirplayDevices(outputs, spawn);
   const boot = createAirplayBoot({
     outputs,
     playback,
@@ -165,6 +169,12 @@ function setup(backoff = [0, 20], finite = false, opts: {
     transports,
     decoded,
     register,
+    speakers: createSpeakers({
+      outputs,
+      playback,
+      adapterView: devices.describe,
+      retry: boot.retry,
+    }),
     close: async () => {
       await boot.close();
       devices.close();
@@ -383,6 +393,111 @@ Deno.test('retry-owned Play authorizes only its target, not an exhausted/down se
     assertEquals(s.transports.length, 4);
   } finally {
     await s.close();
+  }
+});
+Deno.test('core speaker retry renews only its failed demand with another bounded budget', async () => {
+  const s = setup([0]);
+  const forId = (id: string) =>
+    s.transports.filter((t) =>
+      t.commands.some((c) => c.host === `192.0.2.${id}`)
+    );
+  try {
+    s.register('1');
+    s.register('2');
+    s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 2);
+    for (const transport of s.transports) transport.event('state', 'connected');
+    for (const id of ['1', '2']) {
+      forId(id)[0].event('state', 'failed');
+      await until(() => forId(id).length === 2);
+      forId(id)[1].event('state', 'connected');
+      forId(id)[1].event('state', 'failed');
+    }
+    await sleep(50);
+    assertEquals(s.playback.playerView().state, 'pause');
+    assertEquals(s.transports.length, 4);
+    const row = await s.speakers.retry('1');
+    assertEquals(row.adopted, false);
+    assert(row.state.connection !== 'connected');
+    await until(() => forId('1').length === 3);
+    forId('1')[2].event('state', 'failed');
+    await until(() => forId('1').length === 4);
+    forId('1')[3].event('state', 'failed');
+    for (let i = 0; i < 3; i++) {
+      s.register('1');
+      s.speakers.get('1');
+    }
+    await sleep(100);
+    assertEquals(forId('1').length, 4);
+    assertEquals(
+      forId('2').length,
+      2,
+      'retry does not grant authority to exhausted peers',
+    );
+    assertEquals(s.playback.playerView().state, 'pause');
+    assertEquals(s.playback.queueView().items.length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+Deno.test('pause, stop, forget, deselect and endpoint replacement defeat retry preparation and late activation', async () => {
+  for (
+    const change of ['pause', 'stop', 'forget', 'deselect', 'endpoint'] as const
+  ) {
+    let hold = false, complete!: (row: MdnsService) => void;
+    let signal: AbortSignal | undefined;
+    const receiver: MdnsService = {
+      name: '001122334455@Retry._raop._tcp.local',
+      host: 'fixture.local',
+      address: '192.0.2.1',
+      port: 7000,
+      ttlMs: 60000,
+      txt: { tp: 'UDP', sr: '44100', ss: '16', ch: '2' },
+    };
+    const s = setup([], true, {
+      resolver: {
+        resolve(_host, _port, abort) {
+          if (!hold) return Promise.resolve(receiver);
+          signal = abort;
+          return new Promise<MdnsService>((yes) => complete = yes);
+        },
+        close() {},
+      },
+    });
+    try {
+      s.register('1');
+      await s.outputs.adopt('1');
+      s.playback.queueAdd([song()], { play: true });
+      await until(() => s.transports.length === 1);
+      s.transports[0].event('state', 'failed');
+      await until(() => s.transports[0].closed);
+      hold = true;
+      await s.speakers.retry('1');
+      await until(() => signal !== undefined);
+      if (change === 'pause') s.playback.pause();
+      if (change === 'stop') s.playback.stop();
+      if (change === 'forget') await s.speakers.forget('1');
+      if (change === 'deselect') s.outputs.setEnabled([]);
+      if (change === 'endpoint') {
+        s.outputs.register({ ...s.outputs.get('1')!, host: '192.0.2.2' });
+      }
+      assert(signal!.aborted, `${change} cancels the pending lookup`);
+      complete(receiver); // A resolver ignoring abort cannot resurrect authority.
+      await sleep(50);
+      assertEquals(s.transports.length, 1, change);
+      assertEquals(s.transports[0].writes.length, 0);
+      assertEquals(s.playback.queueView().items.length, 1);
+      if (change === 'pause' || change === 'forget') {
+        assertEquals(s.playback.playerView().state, 'pause');
+      }
+      if (change === 'stop') {
+        assertEquals(s.playback.playerView().state, 'stop');
+      }
+    } finally {
+      complete?.(receiver);
+      await s.close();
+    }
   }
 });
 Deno.test('compound clear+play retires OwnTone held/active session before one replacement', async () => {

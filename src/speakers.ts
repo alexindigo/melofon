@@ -91,6 +91,7 @@ export function createSpeakers(deps: {
   >;
   playback?: { pause(source?: CommandSource): void };
   adapterView(id: string): SpeakerAdapterView;
+  retry?(id: string): Promise<void>;
   registerAddress?(input: {
     host: string;
     name?: string;
@@ -247,6 +248,18 @@ export function createSpeakers(deps: {
     async adopt(id: string): Promise<SpeakerView> {
       requireRow(id, true);
       return await durable(() => deps.outputs.adopt(id));
+    },
+    async retry(id: string): Promise<SpeakerView> {
+      const row = requireRow(id);
+      if (row.type !== 'AirPlay') {
+        throw new SpeakerError(
+          'unsupported_protocol',
+          'Unsupported speaker protocol',
+        );
+      }
+      if (!deps.retry) throw new Error('Speaker lifecycle unavailable');
+      await deps.retry(id);
+      return view(requireRow(id));
     },
     async forget(id: string, source?: CommandSource): Promise<void> {
       const row = requireRow(id);

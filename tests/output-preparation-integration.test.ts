@@ -163,6 +163,187 @@ const quietState: State = {
 
 Deno.test({
   name:
+    'HTTP speaker retry renews exhausted native receiver demand and delivers exact decoded audio',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'melofon-retry-wire-' });
+    const input = await fixture(dir);
+    let refuse = true, decodedStart = 0, lookups = 0;
+    const fake = await startFakeRaop({
+      captureAudio: true,
+      refuseRecord: () => refuse,
+    });
+    let boot!: ReturnType<typeof createAirplayBoot>;
+    let devices!: ReturnType<typeof createAirplayDevices>;
+    let playback!: ReturnType<typeof createPlayback>;
+    const f = await apiFixture({
+      hats: {
+        layersRoot: 'layers',
+        extraPorts: 1,
+        env: ([port]) => ({ MELOFON_LISTEN_owntone: `${port},${port}` }),
+      },
+      services: (f) => {
+        assert(f.notify);
+        const outputs = createOutputs({ notify: f.notify });
+        devices = createAirplayDevices({
+          outputs,
+          changed: () => f.notify!.emit(['outputs'], undefined, 'all'),
+          resolver: {
+            resolve() {
+              lookups++;
+              return Promise.resolve(receiverService(fake.port));
+            },
+            close() {},
+          },
+        });
+        playback = createPlayback({
+          player: createPlayer(),
+          library: {} as Library,
+          outputs,
+          nowPlaying: createNowPlaying(f.store),
+          cfg: f.cfg,
+          notify: f.notify,
+        });
+        const media = createMedia();
+        boot = createAirplayBoot({
+          outputs,
+          playback,
+          devices,
+          notify: f.notify,
+          retryBackoffMs: [0],
+          media: {
+            ...media,
+            decodePcm(path, options) {
+              decodedStart = options?.startMs ?? 0;
+              return media.decodePcm(path, options);
+            },
+          },
+        });
+        devices.register({
+          id: '1',
+          name: 'Retry receiver',
+          host: '127.0.0.1',
+          port: fake.port,
+          type: 'AirPlay',
+          selected: true,
+          volume: 100,
+        });
+        playback.queueAdd([input.song]);
+        return Promise.resolve({
+          outputs,
+          playback,
+          speakers: createSpeakers({
+            outputs,
+            playback,
+            adapterView: devices.describe,
+            retry: boot.retry,
+          }),
+        });
+      },
+    });
+    const own = async (path: string) => {
+      const r = await fetch(
+        `http://melofon.home:${f.extraPorts[0]}/api${path}`,
+        {
+          method: 'PUT',
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      assertEquals(r.status, 204, await r.text());
+    };
+    try {
+      await f.auth.users.create(f.admin.id, {
+        username: 'retry-user',
+        password: 'retry-password',
+        role: 'user',
+      });
+      const { credential } = await f.login(
+        'bearer',
+        'retry-user',
+        'retry-password',
+      );
+      await own('/player/play');
+      await until(() =>
+        fake.sessions.length === 2 &&
+        fake.sessions.every((s) => s.closedAtMs !== null)
+      );
+      assertEquals(fake.sessions.map((s) => s.audioPackets), [0, 0]);
+      assert(
+        fake.sessions.every((s) =>
+          s.requests.some((r) => r.method === 'RECORD')
+        ),
+      );
+      await until(() => playback.playerView().state === 'pause');
+      assertEquals(playback.playerView().state, 'pause');
+      const before = await f.get('/api/v1/speakers/1', credential);
+      assertEquals((await before.json()).speaker.state.connection, 'failed');
+      await new Promise((r) => setTimeout(r, 100));
+      assertEquals(
+        fake.sessions.length,
+        2,
+        'automatic retry budget is exhausted',
+      );
+      const oldLookups = lookups;
+      refuse = false;
+      const retry = await f.json(
+        '/api/v1/speakers/1/retry',
+        'POST',
+        {},
+        credential,
+      );
+      assertEquals(retry.status, 200, await retry.clone().text());
+      const pending = (await retry.json()).speaker;
+      assertEquals(pending.adopted, false);
+      assert(
+        pending.state.connection !== 'connected',
+        'retry acceptance does not claim a connected session',
+      );
+      await until(() => (fake.sessions[2]?.audioPackets ?? 0) > 400);
+      assertEquals(lookups, oldLookups + 1, 'retry reacquires target facts');
+      const session = fake.sessions[2];
+      const received = decodeReceiverAudio(session.sdp, session.audioPayloads);
+      const start = Math.round(decodedStart * 44100 / 1000) * 4;
+      assert(received.length > 44100 * 4);
+      assertEquals(
+        received,
+        input.pcm.subarray(start, start + received.length),
+      );
+      assert(received.some((byte) => byte !== 0));
+      const after = await f.get('/api/v1/speakers/1', credential);
+      assertEquals((await after.json()).speaker.state.connection, 'connected');
+      assertEquals(playback.playerView().state, 'play');
+      assertEquals(playback.queueView().items.length, 1);
+      assertEquals(await f.store.speakers.loadAdopted(), []);
+      await own('/player/pause');
+      const count = fake.sessions.length;
+      const paused = await f.json(
+        '/api/v1/speakers/1/retry',
+        'POST',
+        {},
+        (await f.login('cookie')).credential,
+      );
+      assertEquals(paused.status, 200, await paused.clone().text());
+      assertEquals(
+        (await paused.json()).speaker.state.preparation.state,
+        'ready',
+      );
+      await new Promise((r) => setTimeout(r, 100));
+      assertEquals(fake.sessions.length, count);
+      assertEquals(playback.playerView().state, 'pause');
+    } finally {
+      await boot.close();
+      devices.close();
+      playback.close();
+      await f.close();
+      fake.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
     'composition: all ingress paths admit receiver-derived profiles and real receiver PCM/metadata',
   sanitizeOps: false,
   sanitizeResources: false,

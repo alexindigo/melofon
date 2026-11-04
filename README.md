@@ -587,6 +587,13 @@ on `/api/v1/events` `speakers` invalidations, including fact expiry; OwnTone
 keeps its `outputs` notification and snake_case auth fields. Reading or
 publishing status never creates a playback demand or renews retry authority.
 
+Any signed-in user can `POST /api/v1/speakers/{id}/retry` with JSON `{}`.
+It refreshes preparation and renews the bounded retry budget only for that
+speaker's current failed playback demand. An explicit Pause or Stop remains
+paused or stopped; retry does not select or adopt a speaker. The response is a
+current `{speaker}` snapshot, not a promise of connection or sound. Pause, Stop,
+forget, deselection or an endpoint change cancels pending playback preparation.
+
 AirPlay manual registration and `MELOFON_AIRPLAY_HOST` perform bounded,
 target-specific unicast DNS-SD lookup independently of automatic browsing.
 `airplay.mdns=off` disables browsing, not explicit preparation. TXT/SRV/address

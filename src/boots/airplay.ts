@@ -72,7 +72,7 @@ interface Runtime {
 
 export function createAirplayBoot(
   deps: AirplayBootDeps,
-): { close(): Promise<void> } {
+): { retry(id: string): Promise<void>; close(): Promise<void> } {
   const { outputs, playback, media, notify } = deps;
   // Keep the existing permissive off/list parser (including clamping) at its owner.
   deps.state?.declare(AIRPLAY_RETRY_KEY, {
@@ -645,8 +645,8 @@ export function createAirplayBoot(
     for (const [id, work] of preparing) {
       const row = outputs.get(id);
       if (!row || row.host !== work.host || row.port !== work.port) {
-        work.controller.abort();
-        preparing.delete(id);
+        // Preparation authority belongs to this endpoint, not just this id.
+        revoke(id);
         devices.admission.describe(id);
       }
     }
@@ -831,6 +831,38 @@ export function createAirplayBoot(
   });
   if (startupIds.length) reconcile();
   return {
+    async retry(id: string) {
+      consumeCommands();
+      const out = outputs.get(id);
+      if (closed || !out || out.type !== 'AirPlay') return;
+      const e = epoch(id), view = playback.playerView();
+      const failedDemand = e.failed && out.selected && intent === 'play' &&
+        (view.state === 'play' ||
+          (lease?.intent === intentEpoch &&
+            lease.outputs.get(id) === e.generation));
+      // Only the lifecycle owner can renew a demand or its resume lease.
+      // Refreshing facts alone never creates either one.
+      if (failedDemand) resetDemand(id);
+      else if (preparing.has(id)) {
+        preparing.get(id)!.controller.abort();
+        preparing.delete(id);
+      }
+      devices.admission.invalidate(id);
+      reconcile();
+      if (failedDemand || preparing.has(id)) return;
+      const revision = outputs.revision(id);
+      const controller = new AbortController();
+      // Catalog-only refresh: discard the permit, including on Pause/Stop.
+      await devices.protocol.prepare({
+        id,
+        targetRevision: devices.admission.describe(id).targetRevision,
+        refresh: true,
+        signal: controller.signal,
+        isCurrent: () =>
+          !closed && outputs.get(id) !== null &&
+          outputs.revision(id) === revision,
+      });
+    },
     async close() {
       closed = true;
       unsubscribe();
