@@ -190,7 +190,8 @@ export interface Media {
    * safe after the frame is freed). `startMs` seeks (keyframe granularity)
    * for a pause → resume. Null when the file has no audio, seeking fails, or
    * the decoder cannot be created; mid-stream errors propagate. Breaking
-   * out of the iteration cancels the decode and frees everything. */
+   * out of the iteration cancels the decode and frees everything. Returning
+   * its iterator also releases an acquired stream before its first next(). */
   decodePcm(
     path: string,
     opts?: { startMs?: number },
@@ -1270,26 +1271,50 @@ export function createMedia(
         return null;
       }
       const frames = decoder.frames(input.packets());
-      return (async function* () {
+      let closing: Promise<void> | undefined;
+      const close = () =>
+        closing ??= (async () => {
+          decoder[Symbol.dispose]();
+          await input.close().catch(() => {});
+        })();
+      const iterator = (async function* () {
         try {
           for await (const frame of frames) {
             if (frame === null) continue; // flush signal, not media
-            const plane = frame.data?.[0];
-            if (plane !== undefined && frame.nbSamples > 0) {
-              // Packed s16 stereo: nbSamples * 4 bytes (the plane can be
-              // linesize-padded); copy — frame.free() reuses native memory.
-              const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
-              const chunk = new Uint8Array(Math.min(bytes, plane.length));
-              chunk.set(plane.subarray(0, chunk.length));
-              yield chunk;
+            try {
+              const plane = frame.data?.[0];
+              if (plane !== undefined && frame.nbSamples > 0) {
+                // Packed s16 stereo; copy before releasing the native frame.
+                const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
+                const chunk = new Uint8Array(Math.min(bytes, plane.length));
+                chunk.set(plane.subarray(0, chunk.length));
+                yield chunk;
+              }
+            } finally {
+              frame.free();
             }
-            frame.free();
           }
         } finally {
-          decoder[Symbol.dispose]();
-          await input.close().catch(() => {});
+          await close();
         }
       })();
+      // Generator finally does not execute when return() precedes first next().
+      // Keep acquisition ownership outside it, while queueing return behind any
+      // pending next() so native resources cannot be freed during decoding.
+      const stream: AsyncIterableIterator<Uint8Array> = {
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next: () => iterator.next(),
+        async return() {
+          try {
+            return await iterator.return();
+          } finally {
+            await close();
+          }
+        },
+      };
+      return stream;
     },
   };
 }

@@ -4,7 +4,13 @@
 // startMs seek and the null contract on audio-less/undecodable input. No
 // AirPlay device involved: the PCM path is proven at the decoder.
 import { assert, assertEquals } from '@std/assert';
-import { AVERROR_EINVAL, FormatContext } from 'node-av';
+import {
+  AVERROR_EINVAL,
+  Decoder,
+  Demuxer,
+  FormatContext,
+  type Frame,
+} from 'node-av';
 import { createMedia } from '../src/media.ts';
 
 const FIXTURE_MP3 =
@@ -151,4 +157,96 @@ Deno.test('decodePcm on undecodable input returns null instead of throwing', asy
     null,
   );
   assertEquals(await media.decodePcm('/no/such/file.mp3'), null);
+});
+
+Deno.test('PCM iterator return releases acquisition before first next and frees a yielded frame on cancellation', async () => {
+  const decoderDescriptor = Object.getOwnPropertyDescriptor(Decoder, 'create')!;
+  const demuxerDescriptor = Object.getOwnPropertyDescriptor(Demuxer, 'open')!;
+  const receive = Decoder.prototype.receive;
+  const decoders: { value: Decoder; closed: boolean }[] = [];
+  const inputs: { value: Demuxer; closed: boolean }[] = [];
+  const frames: { value: Frame; freed: boolean }[] = [];
+  try {
+    Object.defineProperty(Decoder, 'create', {
+      ...decoderDescriptor,
+      async value(...args: unknown[]) {
+        const value = await Reflect.apply(
+          decoderDescriptor.value,
+          Decoder,
+          args,
+        ) as Decoder;
+        const record = { value, closed: false };
+        decoders.push(record);
+        const close = value.close.bind(value);
+        value.close = () => {
+          record.closed = true;
+          close();
+        };
+        return value;
+      },
+    });
+    Object.defineProperty(Demuxer, 'open', {
+      ...demuxerDescriptor,
+      async value(...args: unknown[]) {
+        const value = await Reflect.apply(
+          demuxerDescriptor.value,
+          Demuxer,
+          args,
+        ) as Demuxer;
+        const record = { value, closed: false };
+        inputs.push(record);
+        const close = value.close.bind(value);
+        value.close = () => {
+          record.closed = true;
+          return close();
+        };
+        return value;
+      },
+    });
+    Decoder.prototype.receive = async function () {
+      const value = await receive.call(this);
+      if (value) {
+        const record = { value, freed: false };
+        frames.push(record);
+        const free = value.free.bind(value);
+        value.free = () => {
+          record.freed = true;
+          free();
+        };
+      }
+      return value;
+    };
+    for (const started of [false, true]) {
+      const stream = await createMedia().decodePcm(FIXTURE_MP3);
+      assert(stream);
+      const iterator = stream[Symbol.asyncIterator]();
+      if (started) assert((await iterator.next()).value!.length > 0);
+      await iterator.return?.();
+      await iterator.return?.(); // Disposal is idempotent.
+      assert(
+        decoders.every((row) => row.closed),
+        'Acquired decoder was not closed',
+      );
+      assert(
+        inputs.every((row) => row.closed),
+        'Acquired demuxer was not closed',
+      );
+      assert(
+        frames.every((row) => row.freed),
+        'Yielded native frame was not freed',
+      );
+    }
+    assert(
+      frames.length > 0,
+      'Partial iteration did not exercise native frames',
+    );
+  } finally {
+    // Also clean up when exercising the old implementation in the red run.
+    for (const row of frames) if (!row.freed) row.value.free();
+    for (const row of decoders) if (!row.closed) row.value.close();
+    for (const row of inputs) if (!row.closed) await row.value.close();
+    Object.defineProperty(Decoder, 'create', decoderDescriptor);
+    Object.defineProperty(Demuxer, 'open', demuxerDescriptor);
+    Decoder.prototype.receive = receive;
+  }
 });

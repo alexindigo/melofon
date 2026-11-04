@@ -196,6 +196,59 @@ Deno.test('strategy retry units: tokens are seconds, boot table is milliseconds'
   assertEquals(parseRetryBackoff('2,70'), [2000, 60000]);
 });
 
+Deno.test('boot close awaits late PCM acquisition and returns its unstarted iterator without delivering bytes', async () => {
+  let release!: (stream: AsyncIterable<Uint8Array>) => void;
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => entered = resolve);
+  const held = new Promise<AsyncIterable<Uint8Array>>((resolve) =>
+    release = resolve
+  );
+  let returned = false, next = 0, closed = false;
+  const stream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          next++;
+          return Promise.resolve({
+            done: false as const,
+            value: new Uint8Array(4),
+          });
+        },
+        return() {
+          returned = true;
+          return Promise.resolve({ done: true as const, value: undefined });
+        },
+      };
+    },
+  };
+  const s = setup([], false, {
+    decode: () => {
+      entered();
+      return held;
+    },
+  });
+  try {
+    s.register('1');
+    s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 1);
+    s.transports[0].event('state', 'connected');
+    await ready;
+    const closing = s.close().then(() => {
+      closed = true;
+    });
+    await sleep(10);
+    assert(!closed, 'Boot closed before its decoder acquisition settled');
+    release(stream);
+    await closing;
+    assert(returned, 'Revoked acquisition was not released');
+    assertEquals(next, 0, 'Revoked decoder was advanced');
+    assertEquals(s.transports[0].writes.length, 0);
+  } finally {
+    release(stream);
+    await s.close();
+  }
+});
+
 Deno.test('forget awaits retirement, fences late events and pauses the last target at its bookmark', async () => {
   const s = setup();
   let api: Awaited<ReturnType<typeof apiFixture>> | undefined;

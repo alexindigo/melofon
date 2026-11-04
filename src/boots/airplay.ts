@@ -113,6 +113,7 @@ export function createAirplayBoot(
   const retiring = new Map<string, Promise<boolean>>();
   const blocked = new Set<string>();
   const pendingPumps = new Map<string, Runtime>();
+  const pumps = new Set<Promise<void>>();
   const forceRelease = new Set<string>();
   let closed = false, running = false, rerun = false, collecting = false;
   let needsHandoff = false;
@@ -325,33 +326,43 @@ export function createAirplayBoot(
     const owns = () =>
       !closed && runtimes.get(id) === r && r.transport === t &&
       r.session === session && r.pump === generation;
-    void (async () => {
+    const pumping = (async () => {
       let bytes = 0;
       try {
         const stream = await media.decodePcm(
           path,
           startMs > 0 ? { startMs } : undefined,
         );
-        if (!owns()) return;
-        if (!stream) throw new Error('no decodable audio');
-        for await (const chunk of stream) {
+        if (!stream) {
           if (!owns()) return;
-          if (DEBUG && bytes === 0) {
-            log.event('pump_first', {
-              output: id,
-              generation: session,
-              path,
-              bytes: chunk.length,
-            });
-          }
-          try {
-            await t.pcm(chunk);
-          } catch (error) {
-            if (owns()) sessionFailed(id, r, 'PCM', error);
-            return;
-          }
+          throw new Error('no decodable audio');
+        }
+        const iterator = stream[Symbol.asyncIterator]();
+        try {
           if (!owns()) return;
-          bytes += chunk.length;
+          for await (
+            const chunk of { [Symbol.asyncIterator]: () => iterator }
+          ) {
+            if (!owns()) return;
+            if (DEBUG && bytes === 0) {
+              log.event('pump_first', {
+                output: id,
+                generation: session,
+                path,
+                bytes: chunk.length,
+              });
+            }
+            try {
+              await t.pcm(chunk);
+            } catch (error) {
+              if (owns()) sessionFailed(id, r, 'PCM', error);
+              return;
+            }
+            if (!owns()) return;
+            bytes += chunk.length;
+          }
+        } finally {
+          await iterator.return?.();
         }
         if (!owns()) return;
         if (!bytes) throw new Error('empty decoder stream');
@@ -386,6 +397,8 @@ export function createAirplayBoot(
         }
       }
     })();
+    pumps.add(pumping);
+    void pumping.finally(() => pumps.delete(pumping));
   };
   const drainPumps = () => {
     if (closed || collecting || retiring.size) return;
@@ -989,6 +1002,7 @@ export function createAirplayBoot(
         );
       }
       await Promise.all(closes);
+      await Promise.all(pumps);
     },
   };
 }
