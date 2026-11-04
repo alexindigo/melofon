@@ -29,7 +29,12 @@ import { createFileSource } from './file-source.ts';
 import { createZip } from './zip.ts';
 import { createMedia } from './media.ts';
 import { createArtwork } from './artwork.ts';
-import { createOutputs, createPlayer, planRestore } from './player.ts';
+import {
+  createOutputs,
+  createPlayer,
+  type Outputs,
+  planRestore,
+} from './player.ts';
 import { createPersistence } from './persistence.ts';
 import { createPlayback } from './playback.ts';
 import { createNotify } from './notify.ts';
@@ -44,6 +49,8 @@ import { createAirplayDiscovery } from './boots/airplay-mdns.ts';
 import { createAirplayDevices } from './boots/airplay-device.ts';
 import { createOutputAdmission } from './output-admission.ts';
 import { createSpeakers } from './speakers.ts';
+import { createSecrets } from './secrets.ts';
+import { createSpeakerCredentials } from './speaker-credentials.ts';
 import { createHats, type Hats } from './hats.ts';
 import { createHatServices } from './hat-service.ts';
 import { createHatData } from './hat-data.ts';
@@ -70,7 +77,19 @@ export async function startServer(options: {
   const store = await openStore(cfg.dataDir, {
     debugLogQueries: cfg.debugLogRequests,
   });
-  const persistence = createPersistence(store);
+  const credentials = createSpeakerCredentials({
+    store: store.speakers,
+    secrets: createSecrets(cfg.secret),
+    current(id) {
+      return outputs?.get(id, { includeIgnored: true })
+        ? {
+          revision: outputs.revision(id),
+          adopted: outputs.lifetime(id).adopted,
+        }
+        : null;
+    },
+  });
+  const persistence = createPersistence(store, undefined, credentials);
   await seedFirstUser(store, cfg);
   const setupMode = await store.users.adminCount() === 0;
   const notify = createNotify();
@@ -89,7 +108,12 @@ export async function startServer(options: {
   );
   const media = createMedia(undefined, state);
   const lyrics = createLyrics(store, state);
-  const outputs = createOutputs({ notify, persistence, state });
+  const outputs: Outputs = createOutputs({
+    notify,
+    persistence,
+    state,
+    releaseCredentials: credentials.release,
+  });
   await outputs.ready();
   const scan = createScan(store, media, { notify, lyrics, state });
   const libraries = createLibraries(store, {

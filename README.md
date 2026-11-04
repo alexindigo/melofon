@@ -137,6 +137,22 @@ or when the configured base URL is HTTPS and its host (including port) matches
 the request's host. Forwarded headers never supply an origin, scheme or client
 address.
 
+### Speaker credential storage
+
+Saved speaker passwords and pairing keys use authenticated encryption in DuckDB,
+with a separate, versioned key derived from `MELOFON_SECRET`. Keep that deployment
+secret stable and back it up separately from the database. Restoring credentials
+requires the same secret. A missing secret refuses saved credential writes/reads;
+a wrong secret or modified ciphertext fails authentication. Neither case creates
+a new key or falls back to plaintext. Losing the secret means re-entering speaker
+passwords and pairing again. Changing it is not automatic key rotation.
+
+Credentials for unadopted speakers stay in memory until their session identity is
+released or the server exits. Explicit adoption encrypts them atomically with the
+saved speaker configuration; forget deletes both credential kinds with that
+configuration. PINs are transient commands, not stored credentials. Public speaker
+reads and notifications contain no password or pairing key.
+
 ### Native artwork metadata
 
 Song, album, artist, playlist, station and podcast reads expose `artwork` with a

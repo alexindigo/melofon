@@ -356,6 +356,14 @@ ALTER TABLE output_state ADD COLUMN IF NOT EXISTS receiver_identity VARCHAR;
 CREATE TABLE IF NOT EXISTS speaker_ignores (
   id VARCHAR PRIMARY KEY
 );
+-- Core speaker secrets only. Added idempotently to existing installs. Plaintext
+-- and cryptographic work never enter the store. Forget removes these atomically.
+CREATE TABLE IF NOT EXISTS speaker_credentials (
+  speaker_id VARCHAR NOT NULL,
+  kind VARCHAR NOT NULL CHECK (kind IN ('password', 'pairing-key')),
+  ciphertext VARCHAR NOT NULL,
+  PRIMARY KEY (speaker_id, kind)
+);
 -- H3 star history: every star and unstar is one appended event. Rows are
 -- never updated or deleted. seq (from star_event_seq) orders a user's events
 -- for an item. The latest event says whether the item is starred now, and

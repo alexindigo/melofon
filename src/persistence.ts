@@ -14,6 +14,7 @@ import type {
   PlayerPersistence,
 } from './player.ts';
 import type { PersistedPlayerState } from './store/playback.ts';
+import type { SpeakerCredentials } from './speaker-credentials.ts';
 
 export type { PersistedPlayerState } from './store/playback.ts';
 
@@ -34,6 +35,7 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
 export function createPersistence(
   store: Store,
   log: Log = scopedLog('persistence'),
+  credentials?: Pick<SpeakerCredentials, 'adopt'>,
 ): Persistence {
   let tail: Promise<void> = Promise.resolve();
   const enqueue = (write: () => Promise<void>): void => {
@@ -76,15 +78,24 @@ export function createPersistence(
         row.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY,
       );
       const saved = { ...row, connectionStrategy };
-      const write = tail.then(() => store.speakers.saveAdopted(saved));
+      const save = async (
+        records: Parameters<Store['speakers']['saveAdopted']>[1],
+      ) => {
+        await store.speakers.saveAdopted(saved, records);
+        if (outputRevisions.get(row.id) === revision) {
+          outputCache.set(row.id, saved);
+          ignored.delete(row.id);
+        }
+      };
+      // Reserve the credential incarnation now, before an older queued write
+      // can yield to unregister/re-registration of the same speaker id.
+      const write = credentials
+        ? credentials.adopt(row.id, save, tail)
+        : tail.then(() => save([]));
       // Keep the serialization tail usable, but return the original rejection
       // to the explicit configuration caller. Publish only a durable cache.
       tail = write.catch((error) => log.event('persistence_failed', { error }));
       await write;
-      if (outputRevisions.get(row.id) === revision) {
-        outputCache.set(row.id, saved);
-        ignored.delete(row.id);
-      }
     },
 
     async deleteOutput(id) {

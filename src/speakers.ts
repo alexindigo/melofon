@@ -4,6 +4,7 @@ import { isConnectionStrategy } from './connection-strategy.ts';
 import { SpeakerError } from './speaker-errors.ts';
 import { PlaybackError } from './playback-errors.ts';
 import type { State } from './state.ts';
+import { SecretError } from './secrets.ts';
 export { SpeakerError } from './speaker-errors.ts';
 
 function fields(input: unknown, allowed: string[]): Record<string, unknown> {
@@ -157,7 +158,9 @@ export function createSpeakers(deps: {
       if (!row) throw new SpeakerError('not_found', 'Speaker not found');
       return view(row);
     } catch (error) {
-      if (error instanceof SpeakerError) throw error;
+      if (error instanceof SpeakerError || error instanceof SecretError) {
+        throw error;
+      }
       throw new SpeakerError(
         'persistence_failed',
         'Speaker configuration could not be saved',

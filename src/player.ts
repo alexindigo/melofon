@@ -654,11 +654,18 @@ export function createPlayer(options: {
 }
 
 export function createOutputs(
-  { notify, persistence, state, log = scopedLog('outputs') }: {
+  {
+    notify,
+    persistence,
+    state,
+    log = scopedLog('outputs'),
+    releaseCredentials,
+  }: {
     notify?: Notify;
     persistence?: OutputPersistence;
     state?: State;
     log?: Log;
+    releaseCredentials?: (id: string) => void;
   } = {},
 ): Outputs {
   state?.declare(CONNECTION_STRATEGY_DEFAULT_KEY, {
@@ -682,7 +689,10 @@ export function createOutputs(
   const blocked = (id: string) => isIgnored(id) || ignoring.has(id);
   const revisions = new Map<string, number>();
   const revision = (id: string) => revisions.get(id) ?? 0;
-  const bump = (id: string) => revisions.set(id, revision(id) + 1);
+  const bump = (id: string) => {
+    revisions.set(id, revision(id) + 1);
+    releaseCredentials?.(id);
+  };
   const isAdopted = (id: string) =>
     persistence?.savedOutput
       ? persistence.savedOutput(id) !== undefined

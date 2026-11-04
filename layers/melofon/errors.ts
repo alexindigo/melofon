@@ -14,6 +14,9 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
     if (error.name === 'HlsError') {
       fail(400, String(code), error.message);
     }
+    if (error.name === 'SecretError') {
+      fail(500, String(code), error.message);
+    }
     if (error.name === 'SpeakerError') {
       fail(
         code === 'not_found'

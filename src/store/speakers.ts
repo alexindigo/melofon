@@ -1,5 +1,20 @@
 import { atomic, type Engine, esc, type Queries } from './engine.ts';
 
+export interface EncryptedSpeakerCredential {
+  kind: 'password' | 'pairing-key';
+  ciphertext: string;
+}
+
+async function saveCredential(
+  q: Queries,
+  id: string,
+  record: EncryptedSpeakerCredential,
+): Promise<void> {
+  await q.run(`INSERT INTO speaker_credentials (speaker_id, kind, ciphertext)
+    VALUES (${esc(id)}, ${esc(record.kind)}, ${esc(record.ciphertext)})
+    ON CONFLICT (speaker_id, kind) DO UPDATE SET ciphertext = excluded.ciphertext`);
+}
+
 /** Saved identity/preferences only, never live protocol or readiness facts. */
 export interface OutputSnapshot {
   id: string;
@@ -98,15 +113,24 @@ async function load(
 /** Sole writer for speaker configuration and independent ignore identities. */
 export function createSpeakersStore(engine: Engine) {
   return {
-    saveAdopted(row: AdoptedSpeakerSnapshot): Promise<void> {
+    saveAdopted(
+      row: AdoptedSpeakerSnapshot,
+      credentials: EncryptedSpeakerCredential[] = [],
+    ): Promise<void> {
       return atomic(engine, async (q) => {
         await q.run(`DELETE FROM speaker_ignores WHERE id = ${esc(row.id)}`);
         await save(q, row, true);
+        for (const record of credentials) {
+          await saveCredential(q, row.id, record);
+        }
       });
     },
 
     deleteAdopted(id: string): Promise<boolean> {
       return atomic(engine, async (q) => {
+        await q.run(
+          `DELETE FROM speaker_credentials WHERE speaker_id = ${esc(id)}`,
+        );
         const rows = await q.all(
           `DELETE FROM output_state WHERE id = ${
             esc(id)
@@ -118,6 +142,41 @@ export function createSpeakersStore(engine: Engine) {
 
     loadAdopted(): Promise<OutputSnapshot[]> {
       return engine.exclusive((q) => load(q, true));
+    },
+
+    loadCredential(
+      id: string,
+      kind: EncryptedSpeakerCredential['kind'],
+    ): Promise<string | null> {
+      return engine.exclusive(async (q) => {
+        const rows = await q.all<{ ciphertext: string }>(
+          `SELECT ciphertext FROM speaker_credentials
+          WHERE speaker_id = ${esc(id)} AND kind = ${esc(kind)}`,
+        );
+        return rows[0]?.ciphertext ?? null;
+      });
+    },
+
+    saveCredential(
+      id: string,
+      kind: EncryptedSpeakerCredential['kind'],
+      ciphertext: string | null,
+    ): Promise<void> {
+      return atomic(engine, async (q) => {
+        const adopted = await q.all(
+          `SELECT id FROM output_state WHERE id = ${esc(id)} AND adopted`,
+        );
+        if (!adopted.length) {
+          throw new Error('Saved speaker credential requires adoption');
+        }
+        if (ciphertext === null) {
+          await q.run(
+            `DELETE FROM speaker_credentials WHERE speaker_id = ${
+              esc(id)
+            } AND kind = ${esc(kind)}`,
+          );
+        } else await saveCredential(q, id, { kind, ciphertext });
+      });
     },
 
     saveIgnored(id: string): Promise<void> {
