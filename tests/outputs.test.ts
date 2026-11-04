@@ -33,6 +33,12 @@ async function setup() {
         outputs,
         registerAddress: airplay.registerAddress,
         adapterView: (id) => ({ preparation: airplay.admission.describe(id) }),
+        submitPin: async (id, pin) => {
+          // Recording lifecycle port for this operator-route-only fixture.
+          outputs.update(id, { pin });
+          await Promise.resolve();
+          return { state: 'pairing' as const, saved: false };
+        },
       }),
     },
   });

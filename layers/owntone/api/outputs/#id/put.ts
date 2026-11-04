@@ -16,7 +16,13 @@ export default async (request: HatRequest, context: HatContext) => {
   const opts: { selected?: boolean; volume?: number; pin?: string } = {};
   if (typeof body.selected === 'boolean') opts.selected = body.selected;
   if (typeof body.volume === 'number') opts.volume = body.volume;
-  if (typeof body.pin === 'string') opts.pin = body.pin;
+  if (typeof body.pin === 'string') {
+    try {
+      await context.app.speakers.submitPin(id, { pin: body.pin });
+    } catch {
+      return badRequest();
+    }
+  }
   const updated = context.app.outputs.update(id, opts, sourceFrom(request));
   return updated === null ? badRequest() : noContent();
 };

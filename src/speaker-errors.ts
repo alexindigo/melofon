@@ -10,6 +10,8 @@ export class SpeakerError extends Error {
       | 'already_adopted'
       | 'speaker_in_use'
       | 'speaker_busy'
+      | 'pairing_required'
+      | 'pairing_unavailable'
       | 'persistence_failed',
     message: string,
   ) {

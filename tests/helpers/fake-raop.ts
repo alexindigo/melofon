@@ -104,6 +104,9 @@ export function startFakeRaop(
     captureAudio?: boolean;
     refuseRecord?: () => boolean;
     digest?: { password: string; realm?: string };
+    /** Test barrier for inspecting restored native input before fake rejection.
+     * This receiver deliberately does not implement cryptographic fruit pairing. */
+    beforePairVerify?: () => Promise<void>;
   } = {},
 ): Promise<FakeRaop> {
   const sessions: FakeRaopSession[] = [];
@@ -290,6 +293,9 @@ export function startFakeRaop(
           continue;
         }
         session.acceptedRequests.push(method);
+        if (method === 'POST' && uri === '/pair-verify') {
+          await opts.beforePairVerify?.();
+        }
         if (method === 'ANNOUNCE') session.sdp = body;
         if (method === 'SET_PARAMETER') {
           session.parameters.push({

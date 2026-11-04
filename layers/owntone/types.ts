@@ -142,6 +142,9 @@ export interface HatContext {
       list(username: string): Promise<PlaylistRow[]>;
       get(username: string, id: string): Promise<PlaylistWithTracks | null>;
     };
+    speakers: {
+      submitPin(id: string, input: unknown): Promise<unknown>;
+    };
     outputs: {
       list(): OutputRow[];
       get(id: string): OutputRow | null;

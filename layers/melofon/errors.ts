@@ -22,7 +22,8 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
         code === 'not_found'
           ? 404
           : code === 'not_adopted' || code === 'already_adopted' ||
-              code === 'speaker_in_use' || code === 'speaker_busy'
+              code === 'speaker_in_use' || code === 'speaker_busy' ||
+              code === 'pairing_required'
           ? 409
           : code === 'persistence_failed'
           ? 500

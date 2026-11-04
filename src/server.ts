@@ -187,6 +187,8 @@ export async function startServer(options: {
     retry: (id) => airplayBoot.retry(id),
     credentials,
     changeCredentials: (id, save) => airplayBoot.changeCredentials(id, save),
+    pair: (id) => airplayBoot.pair(id),
+    submitPin: (id, pin) => airplayBoot.submitPin(id, pin),
   });
   const playback = createPlayback({
     player,

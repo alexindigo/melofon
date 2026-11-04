@@ -18,6 +18,8 @@ export interface AirplayTransport {
   cancelPcm(): void;
 }
 export interface AirplayInput {
+  /** Control-only probe; never supplies PCM or starts the player. */
+  probe?: boolean;
   volume: number;
   positionMs: number;
   lengthMs: number;

@@ -45,6 +45,19 @@ export interface SpeakerSessionView {
   connection: 'disconnected' | 'connecting' | 'connected' | 'failed';
   authentication: 'none' | 'authentication_required';
   error?: { code: string; message: string };
+  pairing?: SpeakerPairingView;
+}
+
+export interface SpeakerPairingView {
+  state:
+    | 'preparing'
+    | 'awaiting_pin'
+    | 'pairing'
+    | 'complete'
+    | 'failed'
+    | 'cancelled';
+  saved: boolean;
+  error?: { code: string; message: string };
 }
 
 export interface SpeakerAdapterView {
@@ -100,6 +113,8 @@ export function createSpeakers(deps: {
   retry?(id: string): Promise<void>;
   credentials?: Pick<SpeakerCredentials, 'set'>;
   changeCredentials?(id: string, save: () => Promise<void>): Promise<void>;
+  pair?(id: string): Promise<SpeakerPairingView>;
+  submitPin?(id: string, pin: string): Promise<SpeakerPairingView>;
   state?: State;
   prepare?(id: string, signal: AbortSignal): Promise<boolean>;
   registerAddress?(input: {
@@ -206,6 +221,33 @@ export function createSpeakers(deps: {
     return { passwordSet: value !== null };
   };
   return {
+    async pair(id: string, input: unknown): Promise<SpeakerPairingView> {
+      fields(input, []);
+      const row = requireRow(id);
+      if (row.type !== 'AirPlay') {
+        throw new SpeakerError(
+          'unsupported_protocol',
+          'Unsupported speaker protocol',
+        );
+      }
+      if (!deps.pair) throw new Error('Speaker pairing unavailable');
+      return await deps.pair(id);
+    },
+    async submitPin(id: string, input: unknown): Promise<SpeakerPairingView> {
+      if (
+        input && typeof input === 'object' && 'pin' in input &&
+        typeof input.pin === 'string'
+      ) {
+        appLogger().registerSecrets([input.pin]);
+      }
+      const body = fields(input, ['pin']);
+      if (typeof body.pin !== 'string' || !/^[0-9]{4}$/.test(body.pin)) {
+        throw new SpeakerError('invalid_field', 'PIN must contain four digits');
+      }
+      requireRow(id);
+      if (!deps.submitPin) throw new Error('Speaker pairing unavailable');
+      return await deps.submitPin(id, body.pin);
+    },
     async setPassword(
       id: string,
       input: unknown,

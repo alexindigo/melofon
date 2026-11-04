@@ -91,17 +91,59 @@ export function createSpeakerCredentials(deps: {
     },
     /** Both kinds from one serialized lifetime. A replacement request immediately
      * fences any earlier start snapshot; a snapshot never grants playback. */
-    async session(id: string) {
+    async session(id: string, options?: { pairing?: boolean }) {
       return await serialize(id, async (revision) => {
-        const version = versions.get(id);
+        let version = versions.get(id);
         const password = await read(id, 'password', revision);
-        const pairingKey = await read(id, 'pairing-key', revision);
+        const pairingKey = options?.pairing
+          ? null
+          : await read(id, 'pairing-key', revision);
+        const isCurrent = () =>
+          deps.current(id)?.revision === revision &&
+          versions.get(id) === version;
         return {
           password,
           pairingKey,
-          isCurrent: () =>
-            deps.current(id)?.revision === revision &&
-            versions.get(id) === version,
+          isCurrent,
+          /** One session's mailbox cannot overwrite a newer explicit credential
+           * mutation or cross release/re-registration, even during encryption. */
+          async acceptPairing(value: string | null, current: () => boolean) {
+            if (value !== null) deps.secrets.register(value);
+            const check = () => {
+              if (!isCurrent() || !current()) {
+                throw new SpeakerError(
+                  'speaker_busy',
+                  'Pairing result expired',
+                );
+              }
+            };
+            check();
+            await serialize(id, async () => {
+              check();
+              if (requireCurrent(id, revision).adopted) {
+                const ciphertext = value === null
+                  ? null
+                  : await deps.secrets.encrypt({
+                    speakerId: id,
+                    kind: 'pairing-key',
+                  }, value);
+                check();
+                await durable(() =>
+                  deps.store.saveCredential(id, 'pairing-key', ciphertext)
+                );
+                check();
+              } else {
+                const values = memory.get(id) ??
+                  new Map<SpeakerCredentialKind, string>();
+                if (value === null) values.delete('pairing-key');
+                else values.set('pairing-key', value);
+                if (values.size) memory.set(id, values);
+                else memory.delete(id);
+              }
+              changed(id);
+              version = versions.get(id);
+            });
+          },
         };
       });
     },

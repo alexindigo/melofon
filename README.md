@@ -162,6 +162,27 @@ sessions and can recover an existing play intent after saving. It never override
 Pause, Stop, deselection or forgetting. `has_password` in OwnTone remains the
 receiver's advertised requirement, not whether Melofon has a password saved.
 
+Any signed-in user can start PIN pairing without playing music:
+`POST /api/v1/speakers/{id}/pair` with `{}`, then wait for
+`state.pairing.state` to become `awaiting_pin` on the speaker read. Submit the
+four displayed digits with `POST /api/v1/speakers/{id}/pin` and `{ "pin": "1234" }`.
+Both commands return 202 with `{ "pairing": ... }`; acceptance is not completion.
+The states are `preparing`, `awaiting_pin`, `pairing`, `complete`, `failed` and
+`cancelled`. Only `complete` with `saved:true` reports an adopted key saved to
+disk. Temporary speakers keep the result in memory; adoption can save it later.
+
+Pair uses a control-only probe, does not select a speaker or start the player,
+and requests a fresh PIN even if a previous key exists. The setting
+`airplay.pairingSeconds` bounds the whole operation (default 120 seconds).
+Pause, Stop, selection changes, endpoint replacement and forget cancel it.
+A current playback PIN challenge can also accept a PIN through the same owner;
+OwnTone's existing output `pin` field uses that owner. A PIN without either
+an explicit pairing operation or a current challenge fails instead of succeeding
+silently. Key export is acknowledged only after durable storage (or temporary
+memory acceptance). Rejected keys clear saved state; network outages do not.
+Real Apple TV pairing interoperability remains unverified by the automated fake
+receiver, which does not implement cryptographic fruit pairing.
+
 ### Native artwork metadata
 
 Song, album, artist, playlist, station and podcast reads expose `artwork` with a

@@ -58,6 +58,30 @@ const SYMBOLS = {
     ],
     result: 'i32',
   },
+  raop_probe_v2: {
+    parameters: [
+      'pointer',
+      'buffer',
+      'i32',
+      'buffer',
+      'i32',
+      'i32',
+      'i32',
+      'u32',
+      'u32',
+      'u16',
+      'i32',
+      'i32',
+      'buffer',
+      'buffer',
+      'i32',
+      'buffer',
+      'usize',
+      'buffer',
+      'usize',
+    ],
+    result: 'i32',
+  },
   raop_write: { parameters: ['pointer', 'buffer', 'usize'], result: 'i32' },
   raop_volume: { parameters: ['pointer', 'i32'], result: 'i32' },
   raop_flush: { parameters: ['pointer'], result: 'i32' },
@@ -251,10 +275,12 @@ class FfiTransport implements AirplayTransport {
         ) {
           throw new Error('RAOP credential acknowledgement failed');
         }
+        this.onEvent('credential', key === null ? 'cleared' : 'saved');
       }
     } catch {
       // Retain the lease for retry. Arbitrary consumer errors may contain the
       // key; neither those errors nor the credential become diagnostic events.
+      if (!this.closed) this.onEvent('credential', 'unavailable');
     } finally {
       bytes.fill(0);
       revision.fill(0n);
@@ -315,7 +341,10 @@ class FfiTransport implements AirplayTransport {
     }
     let rc: number;
     try {
-      rc = this.lib.symbols.raop_start_v2(
+      const open = input.probe
+        ? this.lib.symbols.raop_probe_v2
+        : this.lib.symbols.raop_start_v2;
+      rc = open(
         this.handle,
         cstr(profile.host),
         profile.port,
@@ -368,7 +397,18 @@ class FfiTransport implements AirplayTransport {
         rc = s.raop_teardown(this.handle);
         break;
       case 'pin':
-        rc = s.raop_pin(this.handle, cstr(cmd.pin));
+        appLogger().registerSecrets([cmd.pin]);
+        if (!/^[0-9]{4}$/.test(cmd.pin)) {
+          return Promise.reject(new Error('Invalid speaker PIN'));
+        }
+        {
+          const pin = cstr(cmd.pin);
+          try {
+            rc = s.raop_pin(this.handle, pin);
+          } finally {
+            pin.fill(0);
+          }
+        }
         break;
       default:
         return Promise.resolve();

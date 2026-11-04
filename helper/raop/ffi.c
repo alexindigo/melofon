@@ -126,6 +126,7 @@ typedef struct cmd
   int authsetup;                /* TXT et token 4 */
   int requires_auth;            /* TXT sf bit 9 */
   int has_password;
+  int probe;
   char *password;
   char *auth_key;
   char title[256];
@@ -461,7 +462,7 @@ device_start(raop_t *h, cmd *c)
              (re->supports_auth_setup ? 4 : 0) | (c->devtype << 3)
   });
 
-  if (output_raop.device_start(dev, 0) < 0)
+  if ((c->probe ? output_raop.device_probe(dev, 0) : output_raop.device_start(dev, 0)) < 0)
     {
       device_free(h);
       h->state = OUTPUT_STATE_FAILED;
@@ -577,7 +578,10 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
 
           case CMD_PIN:
             if (h->device)
-              output_raop.device_authorize(h->device, c->pin, 0);
+              {
+                if (output_raop.device_authorize(h->device, c->pin, 0) < 0)
+                  event_push(h, "failed");
+              }
             break;
 
           case CMD_FREE:
@@ -856,13 +860,13 @@ raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
                        title, artist, 0, NULL, 0, NULL, 0);
 }
 
-int
-raop_start_v2(raop_t *h, const char *host, int port, const char *name, int volume,
+static int
+raop_open(raop_t *h, const char *host, int port, const char *name, int volume,
               int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms,
               uint16_t wanted_metadata, int authsetup, int requires_auth,
               const char *title, const char *artist, int has_password,
               const uint8_t *password, size_t password_len,
-              const uint8_t *auth_key, size_t auth_key_len)
+              const uint8_t *auth_key, size_t auth_key_len, int probe)
 {
   cmd *c;
 
@@ -886,6 +890,7 @@ raop_start_v2(raop_t *h, const char *host, int port, const char *name, int volum
   if (!c)
     return -1;
   c->type = CMD_START;
+  c->probe = probe;
   c->has_password = has_password ? 1 : 0;
   if (password) {
     c->password = calloc(password_len + 1, 1);
@@ -914,6 +919,32 @@ raop_start_v2(raop_t *h, const char *host, int port, const char *name, int volum
     snprintf(c->artist, sizeof(c->artist), "%s", artist);
 
   return cmd_push(h, c);
+}
+
+int
+raop_start_v2(raop_t *h, const char *host, int port, const char *name, int volume,
+              int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms,
+              uint16_t wanted_metadata, int authsetup, int requires_auth,
+              const char *title, const char *artist, int has_password,
+              const uint8_t *password, size_t password_len,
+              const uint8_t *auth_key, size_t auth_key_len)
+{
+  return raop_open(h, host, port, name, volume, devtype, encrypt, pos_ms, len_ms,
+                   wanted_metadata, authsetup, requires_auth, title, artist,
+                   has_password, password, password_len, auth_key, auth_key_len, 0);
+}
+
+int
+raop_probe_v2(raop_t *h, const char *host, int port, const char *name, int volume,
+              int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms,
+              uint16_t wanted_metadata, int authsetup, int requires_auth,
+              const char *title, const char *artist, int has_password,
+              const uint8_t *password, size_t password_len,
+              const uint8_t *auth_key, size_t auth_key_len)
+{
+  return raop_open(h, host, port, name, volume, devtype, encrypt, pos_ms, len_ms,
+                   wanted_metadata, authsetup, requires_auth, title, artist,
+                   has_password, password, password_len, auth_key, auth_key_len, 1);
 }
 
 int
@@ -973,7 +1004,8 @@ raop_pin(raop_t *h, const char *pin)
 {
   cmd *c;
 
-  if (!h || !pin || !*pin)
+  if (!h || !pin || strnlen(pin, 5) != 4 ||
+      strspn(pin, "0123456789") != 4)
     return -1;
   c = calloc(1, sizeof(*c));
   if (!c)

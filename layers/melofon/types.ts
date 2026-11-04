@@ -140,6 +140,8 @@ export interface HatContext {
         input: unknown,
       ): Promise<{ passwordSet: boolean }>;
       clearPassword(id: string): Promise<{ passwordSet: boolean }>;
+      pair(id: string, input: unknown): Promise<SpeakerPairingView>;
+      submitPin(id: string, input: unknown): Promise<SpeakerPairingView>;
       forget(id: string, source?: Source): Promise<void>;
       configure(
         id: string,
@@ -501,6 +503,18 @@ export interface SessionPlaybackReport {
   ignoreScrobble: boolean;
 }
 
+export interface SpeakerPairingView {
+  state:
+    | 'preparing'
+    | 'awaiting_pin'
+    | 'pairing'
+    | 'complete'
+    | 'failed'
+    | 'cancelled';
+  saved: boolean;
+  error?: { code: string; message: string };
+}
+
 export interface SpeakerView {
   ignored?: true;
   adopted: boolean;
@@ -524,6 +538,7 @@ export interface SpeakerView {
   state: {
     connection: 'disconnected' | 'connecting' | 'connected' | 'failed';
     authentication: 'none' | 'authentication_required';
+    pairing?: SpeakerPairingView;
     error?: { code: string; message: string };
     preparation: {
       state: 'unresolved' | 'preparing' | 'ready' | 'failed';

@@ -170,6 +170,7 @@ async function setup(
   });
   return {
     outputs,
+    boot,
     playback,
     spawned,
     devices,
@@ -404,7 +405,7 @@ Deno.test('OwnTone pause flushes, resume re-decodes, Stop holds; deselect immedi
 });
 
 Deno.test('volume and pin reach the helper; password event sets needsAuthKey', async () => {
-  const { outputs, playback, spawned, close } = await setup();
+  const { outputs, boot, playback, spawned, close } = await setup();
   try {
     registerSelected(outputs);
     playback.queueAdd([fixtureSong()], { play: true });
@@ -428,15 +429,14 @@ Deno.test('volume and pin reach the helper; password event sets needsAuthKey', a
       () => t.cmds().some((c) => c.cmd === 'volume' && c.volume === 42),
     );
 
-    outputs.update(ID, { pin: '1234' });
+    assertEquals(outputs.get(ID)!.needsAuthKey, undefined);
+    t.onEvent('state', 'password');
+    assertEquals(outputs.get(ID)!.needsAuthKey, true);
+    await boot.submitPin(ID, '1234');
     await until(
       'pin cmd',
       () => t.cmds().some((c) => c.cmd === 'pin' && c.pin === '1234'),
     );
-
-    assertEquals(outputs.get(ID)!.needsAuthKey, undefined);
-    t.onEvent('state', 'password');
-    assertEquals(outputs.get(ID)!.needsAuthKey, true);
   } finally {
     await close();
   }

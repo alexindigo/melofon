@@ -62,6 +62,16 @@ async function setup(env: Record<string, string> = {}) {
     player,
     outputs,
     notify,
+    speakers: createSpeakers({
+      outputs,
+      adapterView: (id) => ({ preparation: devices.admission.describe(id) }),
+      // This protocol-only fixture records the injected lifecycle command.
+      submitPin: async (id, pin) => {
+        outputs.update(id, { pin });
+        await Promise.resolve();
+        return { state: 'pairing' as const, saved: false };
+      },
+    }),
     binds: createBinds(() => layers, env),
     playback: createPlayback({
       player,

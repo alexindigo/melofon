@@ -8,11 +8,8 @@ export default async function (
   },
   context: {
     app: {
-      outputs: {
-        update(
-          id: string,
-          opts: { pin?: string },
-        ): { id: string } | null;
+      speakers: {
+        submitPin(id: string, input: unknown): Promise<unknown>;
       };
     };
   },
@@ -31,11 +28,18 @@ export default async function (
       status: 400,
     });
   }
-  const updated = context.app.outputs.update(request.params.id, {
-    pin: pin.trim(),
-  });
-  if (updated === null) {
-    return Response.json({ error: 'unknown output id' }, { status: 404 });
+  try {
+    await context.app.speakers.submitPin(request.params.id, { pin });
+  } catch (error) {
+    if (
+      error instanceof Error && 'code' in error && error.code === 'not_found'
+    ) {
+      return Response.json({ error: 'unknown output id' }, { status: 404 });
+    }
+    return Response.json(
+      { error: 'PIN requires an active pairing operation' },
+      { status: 400 },
+    );
   }
   return { ok: true };
 }

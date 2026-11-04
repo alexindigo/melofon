@@ -19,6 +19,7 @@ import {
   type AirplayProfile,
   type AirplaySpawn,
   type AirplayTransport,
+  type PairingCredentialConsumer,
   passwordRequiredFromTxt,
   profileFromService,
   validateAirplayProfile,
@@ -76,6 +77,8 @@ export function createAirplayDevices(deps: {
   const spawn = deps.spawn ?? createFfiSpawn();
   const drivers = new WeakMap<AirplayDriver['transport'], AirplayDriver>();
   const privateInputs = new WeakMap<AirplayInput, AirplayCredentials>();
+  const receipts = new WeakMap<AirplayInput, PairingCredentialConsumer>();
+  const consumers = new WeakMap<AirplayTransport, PairingCredentialConsumer>();
   const receiverIdentity = (id: string, service: MdnsService) => {
     const identity = airplayInstance(service.name)?.id;
     if (!identity) {
@@ -149,11 +152,20 @@ export function createAirplayDevices(deps: {
     },
     validate: validateAirplayProfile,
     create(onEvent) {
-      const driver = spawn((event, value) => onEvent({ event, value }));
+      const driver = spawn(
+        (event, value) => onEvent({ event, value }),
+        async (change) => {
+          const consumer = consumers.get(driver.transport);
+          if (!consumer) throw new Error('Pairing consumer unavailable');
+          await consumer(change);
+        },
+      );
       drivers.set(driver.transport, driver);
       return driver.transport;
     },
     start(transport, config, input) {
+      const receipt = receipts.get(input);
+      if (receipt) consumers.set(transport, receipt);
       return drivers.get(transport)!.start(
         config,
         input,
@@ -190,11 +202,26 @@ export function createAirplayDevices(deps: {
       const privateInput = { ...input };
       try {
         if (deps.credentials) {
-          const snapshot = await deps.credentials.session(context.id);
+          const snapshot = await deps.credentials.session(context.id, {
+            pairing: input.probe === true,
+          });
           context.current = snapshot.isCurrent;
           privateInputs.set(privateInput, {
             password: snapshot.password,
-            pairingKey: snapshot.pairingKey,
+            // Explicit Pair requests a fresh PIN even when an older key exists.
+            pairingKey: input.probe ? null : snapshot.pairingKey,
+          });
+          const row = outputs.get(context.id);
+          const incarnation = outputs.revision(context.id);
+          receipts.set(privateInput, async (change) => {
+            const current = () => {
+              const latest = outputs.get(context.id);
+              return change.isCurrent() && context.current() &&
+                outputs.revision(context.id) === incarnation &&
+                latest?.host === row?.host && latest?.port === row?.port &&
+                latest?.receiverIdentity === row?.receiverIdentity;
+            };
+            await snapshot.acceptPairing(change.key, current);
           });
         }
         return await admitted.activate(permit, privateInput, lifecycle);
@@ -209,6 +236,7 @@ export function createAirplayDevices(deps: {
         };
       } finally {
         privateInputs.delete(privateInput);
+        receipts.delete(privateInput);
       }
     },
   };

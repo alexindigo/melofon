@@ -110,3 +110,33 @@ int probe_pairing_verify(int step, int code)
   pthread_mutex_destroy(&p.lock); pthread_cond_destroy(&p.done);
   return p.result;
 }
+
+struct restored_probe {
+  pthread_mutex_t lock;
+  pthread_cond_t done;
+  const char *key;
+  int result, completed;
+};
+static void probe_restored_cb(evutil_socket_t fd, short what, void *arg)
+{
+  (void)fd; (void)what;
+  struct restored_probe *p = arg;
+  raop_t *h = rt.handles_list;
+  p->result = h && h->device && h->device->auth_key &&
+              strcmp(h->device->auth_key, p->key) == 0;
+  pthread_mutex_lock(&p->lock); p->completed = 1;
+  pthread_cond_signal(&p->done); pthread_mutex_unlock(&p->lock);
+}
+/* Compares on the native loop, never exposes or prints device credentials. */
+int probe_pairing_restored(const char *key)
+{
+  struct restored_probe p = { .lock = PTHREAD_MUTEX_INITIALIZER,
+    .done = PTHREAD_COND_INITIALIZER, .key = key };
+  struct timeval zero = {0};
+  pthread_mutex_lock(&p.lock);
+  if (event_base_once(evbase_player, -1, EV_TIMEOUT, probe_restored_cb, &p, &zero)) abort();
+  while (!p.completed) pthread_cond_wait(&p.done, &p.lock);
+  pthread_mutex_unlock(&p.lock);
+  pthread_mutex_destroy(&p.lock); pthread_cond_destroy(&p.done);
+  return p.result;
+}

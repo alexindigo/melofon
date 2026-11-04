@@ -126,8 +126,21 @@ revoke credentials. Successful setup checks allocation/export before stopped.
 The TS drain has one asynchronous receipt in flight, acknowledges only after the
 private consumer resolves, retries rejection without logging its error, and
 fences late acknowledgements before native free. It registers output keys for
-central redaction before consumer code. Stable-id binding, durable core receipt
-and explicit pairing operation integration are the S16 consumer of this seam.
+central redaction before consumer code. The device adapter now binds receipt
+consumers to stable identity, endpoint, incarnation and credential revision.
+Core encrypts adopted results before the store call; only successful acceptance
+permits acknowledgement. FFI emits a safe saved/cleared completion after ack;
+ordinary stopped events alone cannot report pairing success. Retired handles
+cancel receipts and never acknowledge late work against freed pointers.
+
+`raop_probe_v2` is additive and shares start_v2's copied/validated credential
+input, but calls the vendor's `device_probe`, not `device_start`. Explicit
+pair operations use it with no old pairing key, no PCM and a bounded owned
+control lifetime. PINs are exactly four digits at both boundaries and erased
+after enqueue. The vendor pin-start callback cleans its probe session before
+`device_authorize` creates setup's session. Setup completion needs both the
+acknowledged key receipt and stopped; normal playback is re-entered only under
+the existing user intent, never from the credential cache itself.
 
 `test/probe_pairing_export.c` is compiled only by the Deno native test. It includes
 the actual bridge/backend to drive the real stub export and all three native

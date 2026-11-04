@@ -199,6 +199,11 @@ Deno.test('core lockdown: loopback config, libraries, all outputs routes and dia
         speakers: createSpeakers({
           outputs,
           registerAddress: airplay.registerAddress,
+          submitPin: async (id, pin) => {
+            outputs.update(id, { pin });
+            await Promise.resolve();
+            return { state: 'pairing' as const, saved: false };
+          },
           adapterView: (id) => ({
             preparation: airplay.admission.describe(id),
           }),

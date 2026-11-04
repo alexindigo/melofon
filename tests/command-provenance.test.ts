@@ -31,6 +31,7 @@ import {
 import { projectCommandProvenance } from '../src/command-provenance.ts';
 import lastCommandGet from '../core/last-command/get.ts';
 import { createPlayback } from '../src/playback.ts';
+import { createSpeakers } from '../src/speakers.ts';
 import { createStream } from '../src/stream.ts';
 import { createFileSource } from '../src/file-source.ts';
 import { createUserService } from '../src/user.ts';
@@ -231,6 +232,7 @@ async function setupWire() {
     notify,
     log,
   });
+  const outputs = createOutputs({ notify, log });
   const bag = {
     state: createState(store),
     cfg,
@@ -240,7 +242,18 @@ async function setupWire() {
     listens: createListens(store),
     nowPlaying,
     player,
-    outputs: createOutputs({ notify, log }),
+    outputs,
+    speakers: createSpeakers({
+      outputs,
+      adapterView: () => ({
+        preparation: { state: 'unresolved', targetRevision: 0 },
+      }),
+      submitPin: async (id, pin) => {
+        outputs.update(id, { pin });
+        await Promise.resolve();
+        return { state: 'pairing' as const, saved: false };
+      },
+    }),
     playback,
     stream: createStream(
       createMedia(),
@@ -818,11 +831,11 @@ Deno.test('native last-command: output update and PIN expose no inferred payload
           'content-type': 'application/json',
           'x-melofon-client': 'pin-control',
         },
-        body: JSON.stringify({ volume: 0, pin: 'private-pin-canary' }),
+        body: JSON.stringify({ volume: 0, pin: '8642' }),
       }),
     );
     assertEquals(response.status, 204);
-    assertEquals(pins, [{ id: '123', command: { pin: 'private-pin-canary' } }]);
+    assertEquals(pins, [{ id: '123', command: { pin: '8642' } }]);
     assertEquals(outputs.get('123')!.volume, 0);
     const native = await (await onHook(new Request('http://x/_/last-command')))
       .json();
@@ -833,7 +846,7 @@ Deno.test('native last-command: output update and PIN expose no inferred payload
         source: { kind: 'http', client: 'pin-control' },
       },
     });
-    assertEquals(JSON.stringify(native).includes('private-pin-canary'), false);
+    assertEquals(JSON.stringify(native).includes('8642'), false);
   } finally {
     await close();
   }

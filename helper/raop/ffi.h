@@ -62,6 +62,16 @@ int raop_start_v2(raop_t *h, const char *host, int port,
                   const uint8_t *password, size_t password_len,
                   const uint8_t *auth_key, size_t auth_key_len);
 
+/* Same validated/copied input as start_v2, but vendor device_probe only.
+ * No ANNOUNCE/SETUP/RECORD or audio. Caller owns the bounded control lifetime. */
+int raop_probe_v2(raop_t *h, const char *host, int port,
+                  const char *name, int volume, int devtype, int encrypt,
+                  uint32_t pos_ms, uint32_t len_ms,
+                  uint16_t wanted_metadata, int authsetup, int requires_auth,
+                  const char *title, const char *artist, int has_password,
+                  const uint8_t *password, size_t password_len,
+                  const uint8_t *auth_key, size_t auth_key_len);
+
 /* Append s16le/44100/stereo PCM to the pacing buffer. Returns bytes
  * accepted; < len means the buffer is at the high-water mark (caller
  * retries — that is the backpressure). */
