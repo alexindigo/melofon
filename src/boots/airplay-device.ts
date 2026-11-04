@@ -174,6 +174,19 @@ export function createAirplayDevices(deps: {
   return {
     admission,
     protocol,
+    async preparePlayback(id: string, signal: AbortSignal): Promise<boolean> {
+      const revision = outputs.revision(id);
+      const result = await protocol.prepare({
+        id,
+        signal,
+        targetRevision: admission.describe(id).targetRevision,
+        isCurrent: () =>
+          outputs.get(id)?.selected === true &&
+          outputs.revision(id) === revision,
+      });
+      // Preparation supplies facts, not a start grant. The boot owns activation.
+      return result.ok;
+    },
     describe(id: string): SpeakerAdapterView {
       const preparation = admission.describe(id);
       const facts = protocol.facts(id);

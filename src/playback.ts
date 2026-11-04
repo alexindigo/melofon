@@ -24,6 +24,7 @@ import type { Sessions } from './sessions.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
+import { PlaybackError } from './playback-errors.ts';
 import type {
   CommandSource,
   LastCommand,
@@ -77,6 +78,13 @@ export type NowPlayingViewRow =
     }
   );
 
+/** A boot retains its own admission authority across asynchronous preparation.
+ * Core checks it again immediately before committing the engine transition. */
+export interface PlaybackAuthority {
+  signal: AbortSignal;
+  isCurrent(): boolean;
+}
+
 export interface Playback {
   reportPlaying(report: ReportPlaying): Promise<void>;
   reportStopped(opts: { streamId: string }): Promise<void>;
@@ -87,12 +95,15 @@ export interface Playback {
    * command-provenance): hats pass the request's peer/user-agent; omitted
    * means an internal driver (boot, retry, restore). Every mutation is
    * recorded as lastCommand and logged as one [cmd] line. */
-  play(source?: CommandSource): void;
+  play(
+    source?: CommandSource,
+    authority?: PlaybackAuthority,
+  ): void | Promise<void>;
   pause(source?: CommandSource): void;
   stop(source?: CommandSource): void;
-  toggle(source?: CommandSource): void;
-  next(source?: CommandSource): void;
-  previous(source?: CommandSource): void;
+  toggle(source?: CommandSource): void | Promise<void>;
+  next(source?: CommandSource): void | Promise<void>;
+  previous(source?: CommandSource): void | Promise<void>;
   setShuffle(on: boolean, source?: CommandSource): void;
   setConsume(on: boolean, source?: CommandSource): void;
   setRepeat(mode: RepeatMode, source?: CommandSource): void;
@@ -103,7 +114,7 @@ export interface Playback {
   seek(
     opts: { positionMs?: number; seekMs?: number },
     source?: CommandSource,
-  ): boolean;
+  ): boolean | Promise<boolean>;
   /** OwnTone queue add: `clear` first, then insert at `position` (omit =
    * append), `shuffle` mode set when given, and `play` starts playback (at
    * `playbackFromPosition` when given). One command, one emit. */
@@ -117,18 +128,18 @@ export interface Playback {
       shuffle?: boolean;
     },
     source?: CommandSource,
-  ): QueueEntry[];
+  ): QueueEntry[] | Promise<QueueEntry[]>;
   queueClear(source?: CommandSource): void;
 
   /** The engine's clock: end-of-item transition when progress reached the
    * item length (main.ts drives it on an interval; tests drive it directly).
    * Emits player (+queue when consume dropped the finished item). */
-  advanceEnded(): void;
+  advanceEnded(): void | Promise<void>;
 
   /** Boot-time restore (main.ts): delegates to player.restore and records
    * it with source internal:restore. Emits and persists nothing — the
    * values came from the store. */
-  restore(snapshot: RestoreSnapshot): void;
+  restore(snapshot: RestoreSnapshot): void | Promise<void>;
 
   playerView(): PlayerStatus;
   queueView(): { version: number; items: QueueEntry[] };
@@ -148,6 +159,12 @@ export function createPlayback(deps: {
   library: Library;
   cfg: { user?: string };
   outputs?: Pick<Outputs, 'list'>;
+  /** Server composition supplies the speaker owner. Engine-only callers can
+   * stay synchronous without outbound adapters. */
+  targets?: {
+    preparePlayback(signal: AbortSignal): Promise<void>;
+    hasPlaybackTarget(): boolean;
+  };
   notify?: Notify;
   sessions?: Pick<Sessions, 'onSessionsEnded'>;
   /** Restart transparency (plan restart-transparency): when present, every
@@ -187,12 +204,72 @@ export function createPlayback(deps: {
   // hats or individual output call sites. Ignore volume, admission and other
   // output facts which do not appear in this view. Drop the subscription on close.
   let speakers = JSON.stringify(selectedSpeakers());
+  let pendingStart: AbortController | undefined;
+  const cancelStart = () => {
+    pendingStart?.abort();
+    pendingStart = undefined;
+  };
+  const targetKey = () =>
+    JSON.stringify(
+      outputs?.list().filter((o) => o.selected).map((
+        o,
+      ) => [o.id, o.type, o.host, o.port]),
+    );
+  let targets = targetKey();
+  const transition = <T>(
+    starts: boolean,
+    commit: () => T,
+    authority?: PlaybackAuthority,
+  ): T | Promise<T> => {
+    const current = () =>
+      !authority || !authority.signal.aborted && authority.isCurrent();
+    const cancelled = () =>
+      new PlaybackError('playback_cancelled', 'Playback start cancelled');
+    if (!current()) throw cancelled();
+    cancelStart();
+    if (!starts || !deps.targets) return commit();
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    authority?.signal.addEventListener('abort', abort, { once: true });
+    pendingStart = controller;
+    return deps.targets.preparePlayback(controller.signal).then(() => {
+      if (
+        controller.signal.aborted || pendingStart !== controller || !current()
+      ) throw cancelled();
+      pendingStart = undefined;
+      return commit();
+    }).finally(() => {
+      authority?.signal.removeEventListener('abort', abort);
+      if (pendingStart === controller) pendingStart = undefined;
+    });
+  };
   const unsubscribeOutputs = outputs &&
     notify?.subscribe((types, _keys, audience) => {
       if (audience !== 'all' || !types.includes('outputs')) return;
       const next = JSON.stringify(selectedSpeakers());
       const changed = speakers !== next;
       speakers = next;
+      const key = targetKey();
+      if (key !== targets) {
+        targets = key;
+        cancelStart();
+      }
+      if (pendingStart && deps.targets && !deps.targets.hasPlaybackTarget()) {
+        cancelStart();
+      }
+      if (
+        deps.targets && player.status().state === 'play' &&
+        !deps.targets.hasPlaybackTarget()
+      ) {
+        cancelStart();
+        player.pause();
+        record('pause', undefined, {
+          kind: 'internal',
+          via: 'playback-target-loss',
+        }, 'pause');
+        flushState();
+        emit(['player']);
+      }
       if (changed && hasServerRow()) invalidateNowPlaying();
     });
   const record = (
@@ -343,43 +420,62 @@ export function createPlayback(deps: {
       return changed;
     },
 
-    play(source) {
-      player.play();
-      record('play', undefined, source, 'play');
-      flushState();
-      emit(['player']);
+    play(source, authority) {
+      return transition(player.queue().items.length > 0, () => {
+        player.play();
+        record('play', undefined, source, 'play');
+        flushState();
+        emit(['player']);
+      }, authority);
     },
     pause(source) {
+      cancelStart();
       player.pause();
       record('pause', undefined, source, 'pause');
       flushState();
       emit(['player']);
     },
     stop(source) {
+      cancelStart();
       player.stop();
       record('stop', undefined, source, 'stop');
       flushState();
       emit(['player']);
     },
     toggle(source) {
-      player.toggle();
-      record('toggle', undefined, source, player.status().state);
-      flushState();
-      emit(['player']);
+      return transition(
+        player.status().state !== 'play' && player.queue().items.length > 0,
+        () => {
+          player.toggle();
+          record('toggle', undefined, source, player.status().state);
+          flushState();
+          emit(['player']);
+        },
+      );
     },
     next(source) {
-      player.next();
-      record('next', undefined, source, player.status().state);
-      flushState();
-      emit(['player']);
+      const queue = player.queue().items;
+      const current = player.status().current;
+      const next = current
+        ? queue.findIndex((row) => row.id === current.id) + 1
+        : 0;
+      return transition(next < queue.length, () => {
+        player.next();
+        record('next', undefined, source, player.status().state);
+        flushState();
+        emit(['player']);
+      });
     },
     previous(source) {
-      player.previous();
-      record('previous', undefined, source, player.status().state);
-      flushState();
-      emit(['player']);
+      return transition(player.queue().items.length > 0, () => {
+        player.previous();
+        record('previous', undefined, source, player.status().state);
+        flushState();
+        emit(['player']);
+      });
     },
     setShuffle(on, source) {
+      cancelStart();
       player.setShuffle(on);
       record('shuffle', `shuffle=${on}`, source, 'none', false, {
         shuffle: on,
@@ -388,6 +484,7 @@ export function createPlayback(deps: {
       emit(['options']);
     },
     setConsume(on, source) {
+      cancelStart();
       player.setConsume(on);
       record('consume', `consume=${on}`, source, 'none', false, {
         consume: on,
@@ -396,6 +493,7 @@ export function createPlayback(deps: {
       emit(['options']);
     },
     setRepeat(mode, source) {
+      cancelStart();
       player.setRepeat(mode);
       record('repeat', `repeat=${mode}`, source, 'none', false, {
         repeat: mode,
@@ -422,64 +520,71 @@ export function createPlayback(deps: {
       emit(['volume']);
     },
     seek(opts, source) {
-      const ok = player.seek(opts);
-      if (ok) {
-        record(
-          'seek',
-          opts.positionMs !== undefined
-            ? `position_ms=${Math.trunc(opts.positionMs)}`
-            : `seek_ms=${opts.seekMs ?? 0}`,
-          source,
-          'play',
-          false,
-          {
-            position_ms: opts.positionMs === undefined
-              ? undefined
-              : Math.trunc(opts.positionMs),
-            seek_ms: opts.positionMs === undefined
-              ? opts.seekMs ?? 0
-              : undefined,
-          },
-        );
-        flushState();
-        emit(['player']);
-      }
-      return ok;
+      return transition(player.queue().items.length > 0, () => {
+        const ok = player.seek(opts);
+        if (ok) {
+          record(
+            'seek',
+            opts.positionMs !== undefined
+              ? `position_ms=${Math.trunc(opts.positionMs)}`
+              : `seek_ms=${opts.seekMs ?? 0}`,
+            source,
+            'play',
+            false,
+            {
+              position_ms: opts.positionMs === undefined
+                ? undefined
+                : Math.trunc(opts.positionMs),
+              seek_ms: opts.positionMs === undefined
+                ? opts.seekMs ?? 0
+                : undefined,
+            },
+          );
+          flushState();
+          emit(['player']);
+        }
+        return ok;
+      });
     },
     queueAdd(songs, opts = {}, source) {
-      if (opts.clear) player.queueClear();
-      const added = player.queueAdd(songs, opts.position);
-      if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
-      if (opts.play) player.play(opts.playbackFromPosition);
-      record(
-        'queueAdd',
-        `songs=${songs.length}` +
-          (opts.clear ? ' clear' : '') +
-          (opts.play ? ' play' : '') +
-          (opts.position !== undefined ? ` position=${opts.position}` : ''),
-        source,
-        opts.play ? 'play' : opts.clear ? 'stop' : 'none',
-        opts.clear === true,
-        {
-          songs: songs.length,
-          clear: opts.clear,
-          play: opts.play,
-          position: opts.position,
-          playbackFromPosition: opts.playbackFromPosition,
-          shuffle: opts.shuffle,
-        },
-      );
-      // An insert can shift the current index, so the state row flushes
-      // with the queue even when playback did not start or stop.
-      flushQueue();
-      flushState();
-      const types = ['queue'];
-      if (opts.clear || opts.play) types.push('player');
-      if (opts.shuffle !== undefined) types.push('options');
-      emit(types);
-      return added;
+      const size = songs.length +
+        (opts.clear ? 0 : player.queue().items.length);
+      return transition(opts.play === true && size > 0, () => {
+        if (opts.clear) player.queueClear();
+        const added = player.queueAdd(songs, opts.position);
+        if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
+        if (opts.play) player.play(opts.playbackFromPosition);
+        record(
+          'queueAdd',
+          `songs=${songs.length}` +
+            (opts.clear ? ' clear' : '') +
+            (opts.play ? ' play' : '') +
+            (opts.position !== undefined ? ` position=${opts.position}` : ''),
+          source,
+          opts.play ? 'play' : opts.clear ? 'stop' : 'none',
+          opts.clear === true,
+          {
+            songs: songs.length,
+            clear: opts.clear,
+            play: opts.play,
+            position: opts.position,
+            playbackFromPosition: opts.playbackFromPosition,
+            shuffle: opts.shuffle,
+          },
+        );
+        // An insert can shift the current index, so the state row flushes
+        // with the queue even when playback did not start or stop.
+        flushQueue();
+        flushState();
+        const types = ['queue'];
+        if (opts.clear || opts.play) types.push('player');
+        if (opts.shuffle !== undefined) types.push('options');
+        emit(types);
+        return added;
+      });
     },
     queueClear(source) {
+      cancelStart();
       player.queueClear();
       record('queueClear', undefined, source, 'stop', true);
       flushQueue();
@@ -489,23 +594,65 @@ export function createPlayback(deps: {
     },
 
     advanceEnded() {
-      const result = player.advanceEnded();
-      if (result === 'none') return;
-      if (result === 'player+queue') flushQueue();
-      flushState();
-      emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+      const view = player.status();
+      if (
+        pendingStart || view.state !== 'play' || view.itemLengthMs <= 0 ||
+        view.itemProgressMs < view.itemLengthMs
+      ) return;
+      const commit = () => {
+        const result = player.advanceEnded();
+        if (result === 'none') return;
+        if (result === 'player+queue') flushQueue();
+        flushState();
+        emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+      };
+      if (!deps.targets) return commit();
+      return Promise.resolve(transition(true, commit)).catch((error) => {
+        // Internal transitions have no HTTP caller. Keep the bookmark/queue and
+        // publish a paused clock; an explicit newer command always wins.
+        if (
+          error instanceof PlaybackError && error.code === 'playback_cancelled'
+        ) return;
+        if (player.status().state === 'play' && !pendingStart) {
+          player.pause();
+          record('pause', undefined, {
+            kind: 'internal',
+            via: 'playback-target-loss',
+          }, 'pause');
+          flushState();
+          emit(['player']);
+        }
+      });
     },
 
     restore(snapshot) {
-      player.restore(snapshot);
-      record(
-        'restore',
-        undefined,
-        { kind: 'internal', via: 'restore' },
-        snapshot.state,
+      const commit = (restored = snapshot) => {
+        player.restore(restored);
+        record(
+          'restore',
+          undefined,
+          { kind: 'internal', via: 'restore' },
+          restored.state,
+        );
+        serverPresent = hasServerRow();
+        announcedCommander = commander;
+      };
+      if (
+        snapshot.state !== 'play' || !snapshot.queue.length || !deps.targets
+      ) {
+        cancelStart();
+        return commit();
+      }
+      return Promise.resolve(transition(true, () => commit())).catch(
+        (error) => {
+          if (
+            error instanceof PlaybackError &&
+              error.code === 'target_unavailable' ||
+            error instanceof PlaybackError && error.code === 'no_target'
+          ) commit({ ...snapshot, state: 'pause' });
+          else throw error;
+        },
       );
-      serverPresent = hasServerRow();
-      announcedCommander = commander;
     },
 
     playerView: () => player.status(),
@@ -549,6 +696,7 @@ export function createPlayback(deps: {
     },
 
     async close() {
+      cancelStart();
       closing = true;
       unsubscribeSessions?.();
       unsubscribeOutputs?.();

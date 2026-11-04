@@ -16,6 +16,7 @@ import {
   findSongByWire,
   intParam,
   notFound,
+  playbackCommand,
   queueItemPayload,
   sourceFrom,
 } from '#owntone/payloads.ts';
@@ -93,30 +94,32 @@ export default async (request: HatRequest, context: HatContext) => {
   if (playbackFromPosition === null) return badRequest();
   const shuffleParam = request.query.get('shuffle');
 
-  const added = context.app.playback.queueAdd(songs, {
-    position,
-    playbackFromPosition,
-    play: request.query.get('playback') === 'start',
-    clear: boolParam(request.query.get('clear')),
-    shuffle: shuffleParam === null ? undefined : boolParam(shuffleParam),
-  }, sourceFrom(request));
+  return playbackCommand(async () => {
+    const added = await context.app.playback.queueAdd(songs, {
+      position,
+      playbackFromPosition,
+      play: request.query.get('playback') === 'start',
+      clear: boolParam(request.query.get('clear')),
+      shuffle: shuffleParam === null ? undefined : boolParam(shuffleParam),
+    }, sourceFrom(request));
 
-  const queue = context.app.playback.queueView();
-  const positions = new Map(
-    queue.items.map((entry, position) => [entry.id, position]),
-  );
-  const albumArtist = albumArtistResolver(context.app);
-  return {
-    version: queue.version,
-    count: added.length,
-    items: await Promise.all(
-      added.map(async (entry) =>
-        queueItemPayload(
-          entry,
-          positions.get(entry.id)!,
-          await albumArtist(entry.song.albumId),
-        )
+    const queue = context.app.playback.queueView();
+    const positions = new Map(
+      queue.items.map((entry, position) => [entry.id, position]),
+    );
+    const albumArtist = albumArtistResolver(context.app);
+    return {
+      version: queue.version,
+      count: added.length,
+      items: await Promise.all(
+        added.map(async (entry) =>
+          queueItemPayload(
+            entry,
+            positions.get(entry.id)!,
+            await albumArtist(entry.song.albumId),
+          )
+        ),
       ),
-    ),
-  };
+    };
+  }, (result) => result);
 };

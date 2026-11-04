@@ -300,6 +300,31 @@ export const notFound = () => new Response(null, { status: 404 });
 
 export const internalError = () => new Response(null, { status: 500 });
 
+/** OwnTone reports start failures as HTTP 500 (httpd_jsonapi.c:1997-2107).
+ * Only the core's typed refusals get explanatory text; unknown errors propagate. */
+export async function playbackCommand<T>(
+  command: () => T | Promise<T>,
+  encode: (value: T) => unknown = () => noContent(),
+) {
+  try {
+    return encode(await command());
+  } catch (error) {
+    if (
+      error instanceof Error && error.name === 'PlaybackError' &&
+      'code' in error
+    ) {
+      const messages: Record<string, string> = {
+        no_target: 'Select a speaker before playing',
+        target_unavailable: 'Selected speakers are unavailable',
+        playback_cancelled: 'Playback start cancelled',
+      };
+      const message = messages[String(error.code)];
+      if (message) return new Response(message, { status: 500 });
+    }
+    throw error;
+  }
+}
+
 /** OwnTone boolean query params: exactly "true" is true, anything else false. */
 export function boolParam(value: string | null): boolean {
   return value === 'true';

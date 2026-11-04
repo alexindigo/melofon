@@ -152,6 +152,15 @@ export async function startServer(options: {
   });
   const player = createPlayer();
   const nowPlaying = createNowPlaying(store, { state });
+  const speakers = createSpeakers({
+    outputs,
+    state,
+    playback: { pause: (source) => playback.pause(source) },
+    prepare: airplay.preparePlayback,
+    registerAddress: airplay.registerAddress,
+    adapterView: airplay.describe,
+    retry: (id) => airplayBoot.retry(id),
+  });
   const playback = createPlayback({
     player,
     outputs,
@@ -161,13 +170,7 @@ export async function startServer(options: {
     cfg,
     notify,
     persistence,
-  });
-  const speakers = createSpeakers({
-    outputs,
-    playback,
-    registerAddress: airplay.registerAddress,
-    adapterView: airplay.describe,
-    retry: (id) => airplayBoot.retry(id),
+    targets: speakers,
   });
   const app = {
     store,
@@ -250,10 +253,10 @@ export async function startServer(options: {
   });
   const restoredEngine = restoreSnapshot !== null;
   if (restoreSnapshot !== null) {
-    playback.restore(restoreSnapshot);
+    await playback.restore(restoreSnapshot);
     log.event('restore_complete', {
       queued: restoreSnapshot.queue.length,
-      state: restoreSnapshot.state,
+      state: playback.playerView().state,
       currentIndex: restoreSnapshot.currentIndex,
       positionMs: restoreSnapshot.positionMs,
     });
@@ -376,7 +379,9 @@ export async function startServer(options: {
   // (advance/replay/drop/stop per repeat/consume). Without this the engine sat
   // at track-end in 'play' forever and HA extrapolated ("57 min of a 3 min
   // track").
-  const engineClock = setInterval(() => playback.advanceEnded(), 500);
+  const engineClock = setInterval(() => {
+    void playback.advanceEnded();
+  }, 500);
   await playback.startReportExpiry(state);
 
   // MELOFON_AIRPLAY_HOST=<ip>[:port] — unicast-resolve TXT at that host, then

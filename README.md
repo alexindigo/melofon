@@ -594,6 +594,17 @@ paused or stopped; retry does not select or adopt a speaker. The response is a
 current `{speaker}` snapshot, not a promise of connection or sound. Pause, Stop,
 forget, deselection or an endpoint change cancels pending playback preparation.
 
+Playback starts require a selected target. No selection or a known-gone idle
+speaker fails before changing the clock, queue or bookmark; queue-add-with-play
+also leaves the old queue and options intact on refusal. Unknown restored
+targets get bounded preparation (`speakers.preparationSeconds`, default 5).
+OwnTone reports start refusals as HTTP 500 with explanatory text; an empty
+play remains a no-op. Connection and authentication failures after preparation
+appear in speaker state. Healthy peers keep playing; loss of the last selected
+or usable target pauses at the bookmark. Discovery withdrawal alone does not
+interrupt an already connected session. Restart resumes only after fresh target
+preparation; otherwise it restores the queue paused at the saved position.
+
 AirPlay manual registration and `MELOFON_AIRPLAY_HOST` perform bounded,
 target-specific unicast DNS-SD lookup independently of automatic browsing.
 `airplay.mdns=off` disables browsing, not explicit preparation. TXT/SRV/address

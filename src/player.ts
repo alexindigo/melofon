@@ -316,6 +316,8 @@ export interface Outputs {
   /** Fences async work across removal/re-registration, not preference edits. */
   revision(id: string): number;
   lifetime(id: string): { adopted: boolean; discovered: boolean };
+  /** Unknown restored reachability differs from an explicit withdrawal. */
+  presence(id: string): 'observed' | 'unknown' | 'gone';
   /** Withdraw presence; adopted or selected identity/preferences remain.
    * A withdrawn temporary row is released when its last control reference ends. */
   withdraw(id: string, source?: CommandSource): void;
@@ -824,6 +826,8 @@ export function createOutputs(
       adopted: isAdopted(id),
       discovered: discovered.has(id),
     }),
+    presence: (id) =>
+      withdrawn.has(id) ? 'gone' : discovered.has(id) ? 'observed' : 'unknown',
     restore(output, source) {
       // Restoration uses the adopted cache, never caller-supplied live facts.
       api.register(output, source, 'restore');

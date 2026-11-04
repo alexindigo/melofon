@@ -97,12 +97,12 @@ export interface HatContext {
        * (stop ⇒ no current). Mutations take a provenance source. */
       playerView(): PlayerViewRow;
       queueView(): { version: number; items: QueueEntryRow[] };
-      play(source?: CommandSourceRow): void;
+      play(source?: CommandSourceRow): void | Promise<void>;
       pause(source?: CommandSourceRow): void;
       stop(source?: CommandSourceRow): void;
-      toggle(source?: CommandSourceRow): void;
-      next(source?: CommandSourceRow): void;
-      previous(source?: CommandSourceRow): void;
+      toggle(source?: CommandSourceRow): void | Promise<void>;
+      next(source?: CommandSourceRow): void | Promise<void>;
+      previous(source?: CommandSourceRow): void | Promise<void>;
       setShuffle(on: boolean, source?: CommandSourceRow): void;
       setConsume(on: boolean, source?: CommandSourceRow): void;
       setRepeat(
@@ -116,7 +116,7 @@ export interface HatContext {
       seek(
         opts: { positionMs?: number; seekMs?: number },
         source?: CommandSourceRow,
-      ): boolean;
+      ): boolean | Promise<boolean>;
       /** OwnTone queue add: clear first, insert at position (omit = append),
        * shuffle when given, play (at playbackFromPosition) when asked. */
       queueAdd(
@@ -129,7 +129,7 @@ export interface HatContext {
           shuffle?: boolean;
         },
         source?: CommandSourceRow,
-      ): QueueEntryRow[];
+      ): QueueEntryRow[] | Promise<QueueEntryRow[]>;
       queueClear(source?: CommandSourceRow): void;
       /** The last recorded engine mutation (provenance), null before any. */
       lastCommand(): LastCommandRow | null;

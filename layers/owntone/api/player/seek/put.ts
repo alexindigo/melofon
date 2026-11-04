@@ -6,6 +6,7 @@ import {
   internalError,
   intParam,
   noContent,
+  playbackCommand,
   sourceFrom,
 } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
@@ -13,15 +14,17 @@ import type { HatContext, HatRequest } from '#owntone/types.ts';
 export default (request: HatRequest, context: HatContext) => {
   const positionMs = intParam(request.query.get('position_ms'));
   if (positionMs !== null) {
-    return context.app.playback.seek({ positionMs }, sourceFrom(request))
-      ? noContent()
-      : internalError();
+    return playbackCommand(
+      () => context.app.playback.seek({ positionMs }, sourceFrom(request)),
+      (ok) => ok ? noContent() : internalError(),
+    );
   }
   const seekMs = intParam(request.query.get('seek_ms'));
   if (seekMs !== null) {
-    return context.app.playback.seek({ seekMs }, sourceFrom(request))
-      ? noContent()
-      : internalError();
+    return playbackCommand(
+      () => context.app.playback.seek({ seekMs }, sourceFrom(request)),
+      (ok) => ok ? noContent() : internalError(),
+    );
   }
   return badRequest();
 };

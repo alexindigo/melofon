@@ -58,6 +58,7 @@ interface Runtime {
   pump: number;
   authorizedPump: number | null;
   connected: boolean;
+  authenticationRequired: boolean;
   entry: number | null;
   strategy: ConnectionStrategy;
   host: string;
@@ -68,6 +69,12 @@ interface Runtime {
   held: boolean;
   deadline?: number;
   holdTimer?: ReturnType<typeof setTimeout>;
+}
+interface ResumeWork {
+  controller: AbortController;
+  grant?: Grant;
+  runtime?: Runtime;
+  isCurrent(): boolean;
 }
 
 export function createAirplayBoot(
@@ -98,6 +105,7 @@ export function createAirplayBoot(
   const epochs = new Map<string, Epoch>();
   const generations = new Map<string, number>();
   const grants = new Map<string, Grant>();
+  const resuming = new Map<string, ResumeWork>();
   const preparing = new Map<
     string,
     { controller: AbortController; grant: Grant; host: string; port?: number }
@@ -130,6 +138,12 @@ export function createAirplayBoot(
     }
     return e;
   };
+  const cancelResume = (id: string) => {
+    const work = resuming.get(id);
+    if (!work) return;
+    resuming.delete(id);
+    work.controller.abort();
+  };
   const cancelRetry = (id: string) => {
     const e = epoch(id);
     e.timer?.cancel();
@@ -138,8 +152,10 @@ export function createAirplayBoot(
     if (preparing.get(id)?.grant.kind === 'retry') {
       preparing.get(id)!.controller.abort();
     }
+    if (resuming.get(id)?.grant?.kind === 'retry') cancelResume(id);
   };
   const revoke = (id: string) => {
+    cancelResume(id);
     preparing.get(id)?.controller.abort();
     preparing.delete(id);
     cancelRetry(id);
@@ -199,6 +215,90 @@ export function createAirplayBoot(
     [...runtimes.entries()].some(([id, r]) =>
       r.connected && r.transport && outputs.get(id)?.selected
     );
+  const pauseWithoutPeer = () => {
+    if (
+      intent !== 'play' || playback.playerView().state !== 'play' || usable()
+    ) return;
+    lease = {
+      intent: intentEpoch,
+      outputs: new Map(
+        [...epochs].map(([id, value]) => [id, value.generation]),
+      ),
+    };
+    playback.pause(ownedSource);
+  };
+  const resume = (out: Output, permission?: Grant, r?: Runtime) => {
+    const id = out.id;
+    if (resuming.has(id)) return;
+    const authority = lease;
+    const demand = intentEpoch, generation = epoch(id).generation;
+    const incarnation = outputs.revision(id);
+    const session = r?.session, transport = r?.transport;
+    const controller = new AbortController();
+    const work: ResumeWork = {
+      controller,
+      grant: permission,
+      runtime: r,
+      isCurrent() {
+        const row = outputs.get(id);
+        return resuming.get(id) === work && !controller.signal.aborted &&
+          !closed && intent === 'play' && intentEpoch === demand &&
+          epoch(id).generation === generation &&
+          outputs.revision(id) === incarnation &&
+          row?.selected === true && row.type === out.type &&
+          row.host === out.host && row.port === out.port &&
+          !blocked.has(id) && !retiring.has(id) &&
+          (permission
+            ? grants.get(id) === permission &&
+              (permission.kind !== 'retry' || policyReady && backoff !== null)
+            : r !== undefined && runtimes.get(id) === r &&
+              r.session === session &&
+              r.transport === transport && r.connected);
+      },
+    };
+    resuming.set(id, work);
+    let retry = false;
+    void (async () => {
+      await playback.play(ownedSource, {
+        signal: controller.signal,
+        isCurrent: work.isCurrent,
+      });
+      consumeCommands();
+      const view = playback.playerView();
+      if (!work.isCurrent() || view.state !== 'play' || !view.current) return;
+      if (lease === authority) lease = null;
+      if (r) {
+        r.progress = view.itemProgressMs;
+        r.at = performance.now();
+        requestPump(id, r);
+      }
+    })().catch((error) => {
+      if (!work.isCurrent()) return;
+      // This exact attempt is spent. Reconciliation cannot reuse its grant;
+      // only the finite retry scheduler may authorize another preparation.
+      if (permission && grants.get(id) === permission) grants.delete(id);
+      epoch(id).failed = true;
+      retry = true;
+      if (r) {
+        void retire(id, r, 'failed');
+        devices.sessionChanged(id, {
+          connection: 'failed',
+          authentication: 'none',
+          error: {
+            code: 'transport_failed',
+            message: 'Speaker could not resume playback',
+          },
+        });
+      }
+      log.event('preparation_error', { output: id, error });
+    }).finally(() => {
+      if (resuming.get(id) === work) resuming.delete(id);
+      if (
+        retry && intentEpoch === demand && epoch(id).generation === generation
+      ) scheduleRetry(id);
+      reconcile();
+    });
+  };
   const cancelPump = (id: string, r: Runtime) => {
     r.pump++;
     r.authorizedPump = null;
@@ -315,6 +415,7 @@ export function createAirplayBoot(
   const retire = (id: string, r: Runtime, reason: string): Promise<boolean> => {
     const existing = retiring.get(id);
     if (existing) return existing;
+    if (resuming.get(id)?.runtime === r) cancelResume(id);
     const t = r.transport;
     const wasFeed = t?.ownsSharedFeed() === true;
     if (wasFeed) {
@@ -331,7 +432,9 @@ export function createAirplayBoot(
     if (reason !== 'failed' && reason !== 'content') {
       devices.sessionChanged(id, {
         connection: 'disconnected',
-        authentication: 'none',
+        authentication: r.authenticationRequired
+          ? 'authentication_required'
+          : 'none',
       });
     }
     if (!t) return Promise.resolve(true);
@@ -428,20 +531,13 @@ export function createAirplayBoot(
       authentication: 'none',
       error: { code: 'transport_failed', message: 'Speaker connection failed' },
     });
-    const view = playback.playerView();
-    if (intent === 'play' && view.state === 'play' && !usable()) {
-      // Acquire authority BEFORE synchronous internal Pause notification.
-      lease = {
-        intent: intentEpoch,
-        outputs: new Map([...epochs].map(([key, v]) => [key, v.generation])),
-      };
-      playback.pause(ownedSource);
-    }
+    pauseWithoutPeer();
     if (intent === 'play') scheduleRetry(id);
   };
   const volume = (out: Output, v: View) =>
     out.volume >= 100 ? v.volume : Math.round(out.volume * v.volume / 100);
   const spawnSession = (out: Output) => {
+    if (resuming.has(out.id)) return;
     const id = out.id, e = epoch(id), permission = grants.get(id);
     if (
       !permission || permission.epoch !== e.generation || blocked.has(id) ||
@@ -461,14 +557,8 @@ export function createAirplayBoot(
         lease.intent !== intentEpoch ||
         lease.outputs.get(id) !== e.generation || intent !== 'play'
       ) return;
-      lease = null;
-      playback.play(ownedSource);
-      view = playback.playerView();
-      // A synchronously reentrant USER Pause/Stop wins over owned resume.
-      if (
-        intent !== 'play' || grants.get(id) !== permission ||
-        permission.epoch !== e.generation || view.state !== 'play'
-      ) return;
+      resume(out, permission);
+      return;
     }
     if (!view.current) return;
     if (preparing.has(id)) return;
@@ -510,15 +600,7 @@ export function createAirplayBoot(
           authentication: 'none',
         });
         log.event('preparation_failed', { output: id, error: prepared.error });
-        if (!usable() && playback.playerView().state === 'play') {
-          lease = {
-            intent: intentEpoch,
-            outputs: new Map(
-              [...epochs].map(([key, value]) => [key, value.generation]),
-            ),
-          };
-          playback.pause(ownedSource);
-        }
+        pauseWithoutPeer();
         scheduleRetry(id);
         return;
       }
@@ -534,6 +616,7 @@ export function createAirplayBoot(
         pump: 0,
         authorizedPump: null,
         connected: false,
+        authenticationRequired: false,
         // Retain queue identity for same-entry seeks before CONNECTED is
         // polled. Entry changes during the handshake still absorb the latest
         // item when the connecting generation starts its first pump.
@@ -577,11 +660,15 @@ export function createAirplayBoot(
             if (event === 'state' && value === 'failed') {
               sessionFailed(id, r, 'helper event');
             } else if (event === 'state' && value === 'password') {
+              r.connected = false;
+              r.authenticationRequired = true;
+              cancelPump(id, r);
               outputs.update(id, { needsAuthKey: true }, ownedSource);
               devices.sessionChanged(id, {
                 connection: 'connecting',
                 authentication: 'authentication_required',
               });
+              pauseWithoutPeer();
             } else if (event === 'state' && value === 'connected') {
               const wasConnected = r.connected;
               r.connected = true;
@@ -592,7 +679,16 @@ export function createAirplayBoot(
               if (outputs.get(id)?.needsAuthKey) {
                 outputs.update(id, { needsAuthKey: false }, ownedSource);
               }
+              r.authenticationRequired = false;
               const latest = playback.playerView();
+              if (
+                latest.state === 'pause' && lease?.intent === intentEpoch &&
+                lease.outputs.get(id) === epoch(id).generation &&
+                intent === 'play'
+              ) {
+                resume(outputs.get(id)!, undefined, r);
+                return;
+              }
               r.progress = latest.itemProgressMs;
               r.at = performance.now();
               if (!wasConnected && !r.held && latest.state === 'play') {
@@ -613,6 +709,15 @@ export function createAirplayBoot(
     );
   };
   const idle = (id: string, r: Runtime, choice: ConnectionStrategy) => {
+    // An internal no-audio pause retains the challenged control session so its
+    // bounded native auth handshake can complete. Explicit Pause/Stop revokes
+    // the lease and follows the normal retirement policy.
+    if (
+      (r.authenticationRequired || resuming.has(id)) && intent === 'play' &&
+      (resuming.has(id) ||
+        lease?.intent === intentEpoch &&
+          lease.outputs.get(id) === epoch(id).generation)
+    ) return;
     r.strategy = choice;
     if (CONNECTION_STRATEGIES[choice].idle === 'retire') {
       void retire(id, r, 'idle');
@@ -642,6 +747,9 @@ export function createAirplayBoot(
     );
     const retirements: [string, Runtime, string][] = [];
     const actions: (() => void)[] = [];
+    for (const [id, work] of resuming) {
+      if (!work.isCurrent()) revoke(id);
+    }
     for (const [id, work] of preparing) {
       const row = outputs.get(id);
       if (!row || row.host !== work.host || row.port !== work.port) {
@@ -865,6 +973,7 @@ export function createAirplayBoot(
     },
     async close() {
       closed = true;
+      for (const id of resuming.keys()) cancelResume(id);
       unsubscribe();
       unsubscribePolicy?.();
       lease = null;

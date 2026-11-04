@@ -2,6 +2,8 @@ import type { CommandSource, Output, Outputs } from './player.ts';
 import type { PreparationView } from './output-admission.ts';
 import { isConnectionStrategy } from './connection-strategy.ts';
 import { SpeakerError } from './speaker-errors.ts';
+import { PlaybackError } from './playback-errors.ts';
+import type { State } from './state.ts';
 export { SpeakerError } from './speaker-errors.ts';
 
 function fields(input: unknown, allowed: string[]): Record<string, unknown> {
@@ -88,10 +90,13 @@ export function createSpeakers(deps: {
     | 'ignored'
     | 'ignore'
     | 'unignore'
+    | 'presence'
   >;
   playback?: { pause(source?: CommandSource): void };
   adapterView(id: string): SpeakerAdapterView;
   retry?(id: string): Promise<void>;
+  state?: State;
+  prepare?(id: string, signal: AbortSignal): Promise<boolean>;
   registerAddress?(input: {
     host: string;
     name?: string;
@@ -99,6 +104,24 @@ export function createSpeakers(deps: {
     connectionStrategy?: Output['connectionStrategy'];
   }, source?: CommandSource): Promise<Output | null>;
 }) {
+  deps.state?.declare('speakers.preparationSeconds', {
+    type: 'number',
+    minimum: 0.01,
+    maximum: 60,
+    default: 5,
+    description:
+      'Maximum wait for selected speaker preparation before playback',
+  });
+  const selected = () => deps.outputs.list().filter((row) => row.selected);
+  const connected = (id: string) => {
+    const session = deps.adapterView(id).session;
+    return session?.connection === 'connected' &&
+      session.authentication === 'none';
+  };
+  const eligible = (id: string) =>
+    connected(id) ||
+    deps.outputs.presence(id) !== 'gone' ||
+    deps.adapterView(id).preparation.state === 'ready';
   const view = (row: Output): SpeakerView => {
     const adapter = deps.adapterView(row.id);
     return ({
@@ -159,6 +182,75 @@ export function createSpeakers(deps: {
     }
   };
   return {
+    /** Ongoing sessions outlive discovery, but withdrawn idle targets cannot start. */
+    hasPlaybackTarget(): boolean {
+      return selected().some((row) => eligible(row.id));
+    },
+    async preparePlayback(signal: AbortSignal): Promise<void> {
+      const rows = selected();
+      if (!rows.length) {
+        throw new PlaybackError('no_target', 'Select a speaker before playing');
+      }
+      const candidates = rows.filter((row) => eligible(row.id));
+      if (!candidates.length) {
+        throw new PlaybackError(
+          'target_unavailable',
+          'Selected speakers are unavailable',
+        );
+      }
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      signal.addEventListener('abort', cancel, { once: true });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        if (signal.aborted) {
+          throw new PlaybackError(
+            'playback_cancelled',
+            'Playback start cancelled',
+          );
+        }
+        const seconds = deps.state
+          ? await deps.state.getTyped('speakers.preparationSeconds') as number
+          : 5;
+        const aborted = new Promise<boolean>((resolve) => {
+          controller.signal.addEventListener('abort', () => resolve(false), {
+            once: true,
+          });
+          if (controller.signal.aborted) resolve(false);
+        });
+        timer = setTimeout(cancel, seconds * 1000);
+        // One ready peer suffices. Slower/failed peers remain independently visible
+        // and the boot decides their later sessions, never this catalog preflight.
+        const prepared = Promise.any(candidates.map(async (row) => {
+          const key = JSON.stringify([row.type, row.host, row.port]);
+          const ok = connected(row.id) ||
+            await deps.prepare?.(row.id, controller.signal);
+          const current = deps.outputs.get(row.id);
+          if (
+            !ok || !current?.selected || !eligible(row.id) ||
+            JSON.stringify([current.type, current.host, current.port]) !== key
+          ) throw new Error('unavailable');
+          return true;
+        })).catch(() => false);
+        const ok = await Promise.race([prepared, aborted]);
+        if (signal.aborted) {
+          throw new PlaybackError(
+            'playback_cancelled',
+            'Playback start cancelled',
+          );
+        }
+        if (!ok) {
+          throw new PlaybackError(
+            'target_unavailable',
+            'Selected speakers could not be prepared',
+          );
+        }
+      } finally {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', cancel);
+        controller.abort();
+      }
+    },
     list(options?: { includeIgnored?: boolean }): SpeakerListEntry[] {
       const rows: SpeakerListEntry[] = deps.outputs.list(options).map(view);
       if (options?.includeIgnored) {
