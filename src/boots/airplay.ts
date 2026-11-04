@@ -79,7 +79,11 @@ interface ResumeWork {
 
 export function createAirplayBoot(
   deps: AirplayBootDeps,
-): { retry(id: string): Promise<void>; close(): Promise<void> } {
+): {
+  retry(id: string): Promise<void>;
+  changeCredentials(id: string, save: () => Promise<void>): Promise<void>;
+  close(): Promise<void>;
+} {
   const { outputs, playback, media, notify } = deps;
   // Keep the existing permissive off/list parser (including clamping) at its owner.
   deps.state?.declare(AIRPLAY_RETRY_KEY, {
@@ -952,6 +956,47 @@ export function createAirplayBoot(
   });
   if (startupIds.length) reconcile();
   return {
+    async changeCredentials(id: string, save: () => Promise<void>) {
+      consumeCommands();
+      const out = outputs.get(id);
+      if (closed || !out) throw new Error('Speaker lifecycle unavailable');
+      const incarnation = outputs.revision(id), demand = intentEpoch;
+      const view = playback.playerView();
+      const authorized = out.selected && intent === 'play' &&
+        (view.state === 'play' || lease?.intent === intentEpoch &&
+            lease.outputs.get(id) === epoch(id).generation);
+      // Revoke immediately, before encryption/store awaits. A replacement is an
+      // explicit credential operation, never a catalog update or a play intent.
+      revoke(id);
+      const generation = epoch(id).generation;
+      if (authorized && lease?.intent === demand) {
+        lease.outputs.set(id, generation);
+      }
+      devices.admission.invalidate(id);
+      const runtime = runtimes.get(id);
+      const released = runtime
+        ? retire(id, runtime, 'credentials')
+        : retiring.get(id) ?? Promise.resolve(true);
+      if (authorized) pauseWithoutPeer();
+      await save();
+      if (!await released) {
+        throw new Error('Speaker session could not be released');
+      }
+      consumeCommands();
+      const current = outputs.get(id);
+      if (
+        !closed && authorized && current?.selected &&
+        outputs.revision(id) === incarnation && current.host === out.host &&
+        current.port === out.port && intent === 'play' &&
+        intentEpoch === demand &&
+        epoch(id).generation === generation &&
+        (playback.playerView().state === 'play' ||
+          lease?.intent === demand && lease.outputs.get(id) === generation)
+      ) {
+        resetDemand(id);
+        reconcile();
+      }
+    },
     async retry(id: string) {
       consumeCommands();
       const out = outputs.get(id);

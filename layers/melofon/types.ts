@@ -135,6 +135,11 @@ export interface HatContext {
       add(input: unknown, source?: Source): Promise<SpeakerView>;
       adopt(id: string): Promise<SpeakerView>;
       retry(id: string): Promise<SpeakerView>;
+      setPassword(
+        id: string,
+        input: unknown,
+      ): Promise<{ passwordSet: boolean }>;
+      clearPassword(id: string): Promise<{ passwordSet: boolean }>;
       forget(id: string, source?: Source): Promise<void>;
       configure(
         id: string,

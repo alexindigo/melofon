@@ -153,6 +153,15 @@ saved speaker configuration; forget deletes both credential kinds with that
 configuration. PINs are transient commands, not stored credentials. Public speaker
 reads and notifications contain no password or pairing key.
 
+Any signed-in user can set a receiver password with
+`PUT /api/v1/speakers/{id}/password` and JSON `{ "password": "..." }`, or clear it
+with `DELETE` on the same route. Both return only `{ "passwordSet": true|false }`.
+An empty password is distinct from clearing it; passwords must contain no NUL and
+fit the native bridge's 4096-byte UTF-8 limit. Replacement retires old credential
+sessions and can recover an existing play intent after saving. It never overrides
+Pause, Stop, deselection or forgetting. `has_password` in OwnTone remains the
+receiver's advertised requirement, not whether Melofon has a password saved.
+
 ### Native artwork metadata
 
 Song, album, artist, playlist, station and podcast reads expose `artwork` with a

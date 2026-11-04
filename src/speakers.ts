@@ -5,6 +5,8 @@ import { SpeakerError } from './speaker-errors.ts';
 import { PlaybackError } from './playback-errors.ts';
 import type { State } from './state.ts';
 import { SecretError } from './secrets.ts';
+import type { SpeakerCredentials } from './speaker-credentials.ts';
+import { appLogger } from './logging.ts';
 export { SpeakerError } from './speaker-errors.ts';
 
 function fields(input: unknown, allowed: string[]): Record<string, unknown> {
@@ -96,6 +98,8 @@ export function createSpeakers(deps: {
   playback?: { pause(source?: CommandSource): void };
   adapterView(id: string): SpeakerAdapterView;
   retry?(id: string): Promise<void>;
+  credentials?: Pick<SpeakerCredentials, 'set'>;
+  changeCredentials?(id: string, save: () => Promise<void>): Promise<void>;
   state?: State;
   prepare?(id: string, signal: AbortSignal): Promise<boolean>;
   registerAddress?(input: {
@@ -184,7 +188,48 @@ export function createSpeakers(deps: {
       );
     }
   };
+  const password = async (id: string, value: string | null) => {
+    const row = requireRow(id);
+    if (row.type !== 'AirPlay') {
+      throw new SpeakerError(
+        'unsupported_protocol',
+        'Unsupported speaker protocol',
+      );
+    }
+    if (!deps.credentials || !deps.changeCredentials) {
+      throw new Error('Speaker credentials unavailable');
+    }
+    await deps.changeCredentials(
+      id,
+      () => deps.credentials!.set(id, 'password', value),
+    );
+    return { passwordSet: value !== null };
+  };
   return {
+    async setPassword(
+      id: string,
+      input: unknown,
+    ): Promise<{ passwordSet: boolean }> {
+      // Register before validation, including rejected values. Never put input in
+      // command provenance, public views, events or arbitrary error messages.
+      if (
+        input && typeof input === 'object' && 'password' in input &&
+        typeof input.password === 'string'
+      ) {
+        appLogger().registerSecrets([input.password]);
+      }
+      const body = fields(input, ['password']);
+      if (
+        typeof body.password !== 'string' || body.password.includes('\0') ||
+        new TextEncoder().encode(body.password).length > 4096
+      ) {
+        throw new SpeakerError('invalid_field', 'Invalid speaker password');
+      }
+      return await password(id, body.password);
+    },
+    async clearPassword(id: string): Promise<{ passwordSet: boolean }> {
+      return await password(id, null);
+    },
     /** Ongoing sessions outlive discovery, but withdrawn idle targets cannot start. */
     hasPlaybackTarget(): boolean {
       return selected().some((row) => eligible(row.id));

@@ -128,6 +128,7 @@ export function createAirplayDevices(deps: {
               ...current,
               model: config.model,
               requiresAuth: config.requiresAuth,
+              hasPassword,
               receiverIdentity: identity,
             },
             { kind: 'internal', via: 'airplay-preparation' },
