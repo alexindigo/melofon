@@ -116,7 +116,9 @@ export default async (request: HatRequest, context: HatContext) => {
           queueItemPayload(
             entry,
             positions.get(entry.id)!,
-            await albumArtist(entry.song.albumId),
+            entry.facts.kind === 'song'
+              ? await albumArtist(entry.facts.song.albumId)
+              : null,
           )
         ),
       ),

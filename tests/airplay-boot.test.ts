@@ -296,6 +296,54 @@ Deno.test('selected + play: start command, then the track as PCM', async () => {
   }
 });
 
+Deno.test('noncatalog core row never reaches the catalog decoder bridge', async () => {
+  let decodes = 0;
+  const t = await setup({
+    media: {
+      ...createMedia(),
+      decodePcm() {
+        decodes++;
+        return Promise.resolve(null);
+      },
+    },
+  });
+  try {
+    registerSelected(t.outputs);
+    await t.playback.queueAddSources([{
+      reference: { kind: 'station', id: 'station-1' },
+      facts: {
+        kind: 'web',
+        url: 'http://melofon.home/radio',
+        title: 'Station',
+        artistName: null,
+        durationMs: null,
+        mode: 'live',
+        seekable: false,
+        streamTitle: null,
+        streamUrl: null,
+      },
+    }], { play: true });
+    await until('helper spawned', () => t.spawned.length === 1);
+    assertEquals(
+      t.spawned[0].cmds().find((cmd) => cmd.cmd === 'start')?.title,
+      'Station',
+    );
+    t.spawned[0].onEvent('state', 'connected');
+    await until(
+      'unsupported source paused',
+      () => t.playback.playerView().state === 'pause',
+    );
+    assertEquals(decodes, 0);
+    assertEquals(t.spawned[0].pcmBytes(), 0);
+    assertEquals(t.playback.queueView().items[0].reference, {
+      kind: 'station',
+      id: 'station-1',
+    });
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('no PCM before the helper reports connected', async () => {
   const realMedia = createMedia();
   let decodeCalls = 0;

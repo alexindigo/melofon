@@ -25,6 +25,7 @@ import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { PlaybackError } from './playback-errors.ts';
+import { catalogMedia, type QueueMedia, queueSong } from './queue-source.ts';
 import type {
   CommandSource,
   LastCommand,
@@ -49,7 +50,6 @@ export interface ReportPlaying {
 }
 
 interface NowPlayingFacts {
-  song: SongRow;
   positionMs: number | null;
   startedAtMs: number | null;
   reportedAtMs: number;
@@ -59,6 +59,7 @@ interface NowPlayingFacts {
 
 export type NowPlayingViewRow =
   & NowPlayingFacts
+  & QueueMedia
   & (
     | {
       kind: 'app';
@@ -68,6 +69,7 @@ export type NowPlayingViewRow =
     }
     | {
       kind: 'server';
+      entryId: number;
       label: string;
       /** Last external commander's known username, not the seeded account.
        * An anonymous external command replaces it with null; internal commands
@@ -83,6 +85,14 @@ export type NowPlayingViewRow =
 export interface PlaybackAuthority {
   signal: AbortSignal;
   isCurrent(): boolean;
+}
+
+export interface QueueAddOptions {
+  position?: number;
+  playbackFromPosition?: number;
+  play?: boolean;
+  clear?: boolean;
+  shuffle?: boolean;
 }
 
 export interface Playback {
@@ -120,13 +130,13 @@ export interface Playback {
    * `playbackFromPosition` when given). One command, one emit. */
   queueAdd(
     songs: SongRow[],
-    opts?: {
-      position?: number;
-      playbackFromPosition?: number;
-      play?: boolean;
-      clear?: boolean;
-      shuffle?: boolean;
-    },
+    opts?: QueueAddOptions,
+    source?: CommandSource,
+  ): QueueEntry[] | Promise<QueueEntry[]>;
+  /** Already resolved core media, not a public URL admission API. */
+  queueAddSources(
+    media: QueueMedia[],
+    opts?: QueueAddOptions,
     source?: CommandSource,
   ): QueueEntry[] | Promise<QueueEntry[]>;
   queueClear(source?: CommandSource): void;
@@ -302,7 +312,13 @@ export function createPlayback(deps: {
   // Persistence flushes: the same paths that emit. Fire-and-forget — the
   // adapter serializes writes; the engine stays synchronous.
   const flushQueue = () =>
-    persistence?.saveQueue(player.queue().items.map((e) => e.song.id));
+    persistence?.saveQueue(
+      player.queue().items.map((e) => {
+        const song = queueSong(e);
+        if (!song) throw new Error('Typed queue persistence is not available');
+        return song.id;
+      }),
+    );
   const flushState = () => {
     if (persistence === undefined) return;
     const status = player.status();
@@ -353,6 +369,48 @@ export function createPlayback(deps: {
       await expireReports();
     }).catch((error) => log.event('playback_expiry_failed', { error }));
   });
+  const addSources = (
+    media: QueueMedia[],
+    opts: QueueAddOptions = {},
+    source?: CommandSource,
+  ): QueueEntry[] | Promise<QueueEntry[]> => {
+    // Until the typed persistence item lands, refuse before clear/prepare rather
+    // than silently dropping noncatalog entries or writing fabricated song ids.
+    if (persistence && media.some((item) => item.reference.kind !== 'song')) {
+      throw new Error('Typed queue persistence is not available');
+    }
+    const size = media.length + (opts.clear ? 0 : player.queue().items.length);
+    return transition(opts.play === true && size > 0, () => {
+      if (opts.clear) player.queueClear();
+      const added = player.queueAddSources(media, opts.position);
+      if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
+      if (opts.play) player.play(opts.playbackFromPosition);
+      record(
+        'queueAdd',
+        `songs=${media.length}` + (opts.clear ? ' clear' : '') +
+          (opts.play ? ' play' : '') +
+          (opts.position !== undefined ? ` position=${opts.position}` : ''),
+        source,
+        opts.play ? 'play' : opts.clear ? 'stop' : 'none',
+        opts.clear === true,
+        {
+          songs: media.length,
+          clear: opts.clear,
+          play: opts.play,
+          position: opts.position,
+          playbackFromPosition: opts.playbackFromPosition,
+          shuffle: opts.shuffle,
+        },
+      );
+      flushQueue();
+      flushState();
+      const types = ['queue'];
+      if (opts.clear || opts.play) types.push('player');
+      if (opts.shuffle !== undefined) types.push('options');
+      emit(types);
+      return added;
+    });
+  };
   return {
     expireReports,
     async startReportExpiry(state) {
@@ -547,42 +605,9 @@ export function createPlayback(deps: {
       });
     },
     queueAdd(songs, opts = {}, source) {
-      const size = songs.length +
-        (opts.clear ? 0 : player.queue().items.length);
-      return transition(opts.play === true && size > 0, () => {
-        if (opts.clear) player.queueClear();
-        const added = player.queueAdd(songs, opts.position);
-        if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
-        if (opts.play) player.play(opts.playbackFromPosition);
-        record(
-          'queueAdd',
-          `songs=${songs.length}` +
-            (opts.clear ? ' clear' : '') +
-            (opts.play ? ' play' : '') +
-            (opts.position !== undefined ? ` position=${opts.position}` : ''),
-          source,
-          opts.play ? 'play' : opts.clear ? 'stop' : 'none',
-          opts.clear === true,
-          {
-            songs: songs.length,
-            clear: opts.clear,
-            play: opts.play,
-            position: opts.position,
-            playbackFromPosition: opts.playbackFromPosition,
-            shuffle: opts.shuffle,
-          },
-        );
-        // An insert can shift the current index, so the state row flushes
-        // with the queue even when playback did not start or stop.
-        flushQueue();
-        flushState();
-        const types = ['queue'];
-        if (opts.clear || opts.play) types.push('player');
-        if (opts.shuffle !== undefined) types.push('options');
-        emit(types);
-        return added;
-      });
+      return addSources(songs.map(catalogMedia), opts, source);
     },
+    queueAddSources: addSources,
     queueClear(source) {
       cancelStart();
       player.queueClear();
@@ -663,12 +688,14 @@ export function createPlayback(deps: {
       const out: NowPlayingViewRow[] = [];
       const status = player.status();
       if (status.current !== null && status.clock !== null) {
+        const { id, ...media } = status.current;
         out.push({
+          ...media,
           kind: 'server',
+          entryId: id,
           label: 'melofon',
           commander,
           speakers: selectedSpeakers(),
-          song: status.current.song,
           positionMs: status.itemProgressMs,
           startedAtMs: status.clock.startedAtMs,
           reportedAtMs: status.clock.reportedAtMs,
@@ -683,7 +710,7 @@ export function createPlayback(deps: {
           kind: 'app',
           username: row.username,
           client: row.client,
-          song,
+          ...catalogMedia(song),
           positionMs: row.positionMs,
           startedAtMs: row.startedAtMs,
           reportedAtMs: row.reportedAtMs,

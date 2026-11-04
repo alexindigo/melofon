@@ -427,7 +427,10 @@ Deno.test('events: household queue, player and speaker changes reach cookie/Bear
     });
     assertEquals(songs.length, 1);
     playback.queueAdd(songs, { play: true });
-    assertEquals(playback.queueView().items[0].song.id, songs[0].id);
+    assertEquals(playback.queueView().items[0].reference, {
+      kind: 'song',
+      id: songs[0].id,
+    });
     assertEquals(playback.playerView().state, 'play');
     for (const socket of sockets) {
       await waitFor(() => socket.frames.some((frame) => frame.events?.queue));

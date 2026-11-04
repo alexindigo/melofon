@@ -222,13 +222,33 @@ export function queueItemPayload(
   position: number,
   albumArtist: { id: string; name: string } | null,
 ) {
+  if (entry.facts.kind === 'web') {
+    const facts = entry.facts;
+    // OwnTone httpd_jsonapi.c:2253-2287: nonpersistent items have no track_id
+    // and replay their remote path instead of manufacturing a library URI.
+    return {
+      id: entry.id,
+      position,
+      ...(facts.title === null ? {} : { title: facts.title }),
+      ...(facts.artistName === null ? {} : {
+        artist: facts.artistName,
+        artist_sort: facts.artistName,
+      }),
+      length_ms: facts.durationMs ?? 0,
+      media_kind: 'music',
+      data_kind: 'http',
+      path: facts.url,
+      uri: entry.reference.kind === 'url' ? entry.reference.url : facts.url,
+    };
+  }
+  const song = entry.facts.song;
   return {
     // trackPayload first: its `id` is the library wire id — the queue item's
     // own `id` is queue-local and must win.
-    ...trackPayload(entry.song, albumArtist),
+    ...trackPayload(song, albumArtist),
     id: entry.id,
     position,
-    track_id: wireInt(entry.song.id),
+    track_id: wireInt(song.id),
   };
 }
 

@@ -179,12 +179,14 @@ Deno.test('queue, state, and position survive a restart', async () => {
     player2.restore(snapshot);
     const status = player2.status();
     assertEquals(status.state, 'play');
-    assertEquals(status.current?.song.id, songs[1].id);
+    assertEquals(status.current?.reference, { kind: 'song', id: songs[1].id });
     assert(status.itemProgressMs >= 4000);
     assertEquals(status.repeat, 'all');
     assertEquals(status.shuffle, true);
     assertEquals(
-      player2.queue().items.map((e) => e.song.id),
+      player2.queue().items.map((e) =>
+        e.reference.kind === 'song' ? e.reference.id : null
+      ),
       songs.map((s) => s.id),
     );
   } finally {

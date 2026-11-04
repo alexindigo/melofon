@@ -7,8 +7,10 @@ import type { HatContext } from '#owntone/types.ts';
 
 export default async (_request: unknown, context: HatContext) => {
   const view = await context.app.playback.playerView();
-  if (view.current === null) return notFound();
-  const song = view.current.song;
+  if (view.current === null || view.current.facts.kind !== 'song') {
+    return notFound();
+  }
+  const song = view.current.facts.song;
   return context.app.artwork.cover(
     song.pictureHash ? song.id : song.albumId ?? song.id,
   );

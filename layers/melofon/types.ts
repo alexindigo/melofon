@@ -567,13 +567,27 @@ export interface SavedQueue {
 
 export type NowPlayingViewRow =
   & {
-    song: SongRow;
     positionMs: number | null;
     startedAtMs: number | null;
     reportedAtMs: number;
     state: 'starting' | 'playing' | 'paused';
     playbackRate: number;
   }
+  & (
+    | { facts: { kind: 'song'; song: SongRow } }
+    | {
+      reference: { kind: 'station'; id: string } | { kind: 'url'; url: string };
+      facts: {
+        kind: 'web';
+        title: string | null;
+        artistName: string | null;
+        durationMs: number | null;
+        mode: 'live' | 'finite' | 'unknown';
+        seekable: boolean;
+        streamTitle: string | null;
+      };
+    }
+  )
   & (
     | { kind: 'app'; username: string; client: string; appPlayerId: number }
     | {

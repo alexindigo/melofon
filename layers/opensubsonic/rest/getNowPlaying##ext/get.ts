@@ -10,7 +10,11 @@ import { loadPersonal } from '#opensubsonic/personal.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
-  const rows = await context.app.playback.nowPlayingView();
+  // NowPlayingEntry extends Child, whose id is a media id. Radio/URL plays
+  // have no catalog Child to stream or personalize; do not invent one.
+  const rows = (await context.app.playback.nowPlayingView()).flatMap((row) =>
+    row.facts.kind === 'song' ? [{ ...row, song: row.facts.song }] : []
+  );
   const p = await loadPersonal(context, {
     songs: rows.map((row) => row.song.id),
   });

@@ -10,6 +10,7 @@ import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
+import { queueSong } from '../src/queue-source.ts';
 
 let songN = 0;
 function song(durationMs: number | null = 1): SongRow {
@@ -75,11 +76,11 @@ Deno.test('repeat off: advances through the queue, stops past the last (current 
     const a = song();
     const b = song();
     playback.queueAdd([a, b], { play: true });
-    assertEquals(player.status().current?.song.id, a.id);
+    assertEquals(queueSong(player.status().current)?.id, a.id);
 
     await tick();
     playback.advanceEnded();
-    assertEquals(player.status().current?.song.id, b.id);
+    assertEquals(queueSong(player.status().current)?.id, b.id);
     assertEquals(player.status().state, 'play');
 
     await tick();
@@ -109,13 +110,13 @@ Deno.test('repeat single replays the same item forever', async () => {
     playback.advanceEnded();
     const status = player.status();
     assertEquals(status.state, 'play');
-    assertEquals(status.current?.song.id, a.id);
+    assertEquals(queueSong(status.current)?.id, a.id);
     // The clock reset: progress is near zero again, not at the length.
     assert(status.itemProgressMs < 50);
     // And it never advances out of the item.
     await tick();
     playback.advanceEnded();
-    assertEquals(player.status().current?.song.id, a.id);
+    assertEquals(queueSong(player.status().current)?.id, a.id);
   } finally {
     await close();
   }
@@ -130,10 +131,10 @@ Deno.test('repeat all wraps to the head past the last item', async () => {
     playback.setRepeat('all');
     await tick();
     playback.advanceEnded();
-    assertEquals(player.status().current?.song.id, b.id);
+    assertEquals(queueSong(player.status().current)?.id, b.id);
     await tick();
     playback.advanceEnded();
-    assertEquals(player.status().current?.song.id, a.id);
+    assertEquals(queueSong(player.status().current)?.id, a.id);
     assertEquals(player.status().state, 'play');
   } finally {
     await close();
@@ -153,9 +154,9 @@ Deno.test('consume drops the finished item; queue+player emit; empty queue stops
     playback.advanceEnded();
     const queue = player.queue();
     assertEquals(queue.items.length, 1);
-    assertEquals(queue.items[0].song.id, b.id);
+    assertEquals(queueSong(queue.items[0])?.id, b.id);
     assert(queue.version > versionBefore);
-    assertEquals(player.status().current?.song.id, b.id);
+    assertEquals(queueSong(player.status().current)?.id, b.id);
     assertEquals(events[events.length - 1], ['queue', 'player', 'nowPlaying']);
 
     await tick();
@@ -178,7 +179,7 @@ Deno.test('no transition while paused, stopped, or length unknown', async () => 
     await tick();
     playback.advanceEnded();
     assertEquals(player.status().state, 'pause');
-    assertEquals(player.status().current?.song.id, a.id);
+    assertEquals(queueSong(player.status().current)?.id, a.id);
 
     playback.play();
     playback.stop();
@@ -191,7 +192,7 @@ Deno.test('no transition while paused, stopped, or length unknown', async () => 
     await tick();
     playback.advanceEnded();
     assertEquals(player.status().state, 'play');
-    assertEquals(player.status().current?.song.id, b.id);
+    assertEquals(queueSong(player.status().current)?.id, b.id);
   } finally {
     await close();
   }

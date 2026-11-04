@@ -235,10 +235,26 @@ export interface AlbumRow {
   durationMs: number;
 }
 
-export interface QueueEntryRow {
-  id: number;
-  song: SongRow;
-}
+export type QueueMediaRow =
+  | {
+    reference: { kind: 'song'; id: string };
+    facts: { kind: 'song'; song: SongRow };
+  }
+  | {
+    reference: { kind: 'station'; id: string } | { kind: 'url'; url: string };
+    facts: {
+      kind: 'web';
+      url: string;
+      title: string | null;
+      artistName: string | null;
+      durationMs: number | null;
+      mode: 'live' | 'finite' | 'unknown';
+      seekable: boolean;
+      streamTitle: string | null;
+      streamUrl: string | null;
+    };
+  };
+export type QueueEntryRow = QueueMediaRow & { id: number };
 
 export interface OutputRow {
   id: string;
@@ -294,7 +310,7 @@ export interface PlayerViewRow {
   volume: number;
   /** Engine entry, or a synthetic current (id −1) for a mirrored client
    * report; null when neither plane has anything. */
-  current: { id: number; song: SongRow } | null;
+  current: QueueEntryRow | null;
   itemLengthMs: number;
   itemProgressMs: number;
 }

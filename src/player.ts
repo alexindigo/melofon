@@ -14,6 +14,13 @@
 // repeat/consume modes — "no auto-advance" was fine for a queue-less mirror,
 // it is a lie with boots attached (HA extrapolates past the end).
 import type { SongRow } from './library.ts';
+import {
+  catalogMedia,
+  queueDuration,
+  type QueueEntry,
+  type QueueMedia,
+} from './queue-source.ts';
+export type { QueueEntry } from './queue-source.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { SpeakerError } from './speaker-errors.ts';
@@ -25,12 +32,6 @@ import {
   DEFAULT_CONNECTION_STRATEGY,
   requireConnectionStrategy,
 } from './connection-strategy.ts';
-
-export interface QueueEntry {
-  /** Queue-local int id (monotonic within the process, never reused). */
-  id: number;
-  song: SongRow;
-}
 
 export type PlayerState = 'play' | 'pause' | 'stop';
 export type RepeatMode = 'off' | 'all' | 'single';
@@ -241,6 +242,8 @@ export interface Player {
    * semantics: omit = append). Inserting at/before the current item shifts
    * it so it stays current. */
   queueAdd(songs: SongRow[], position?: number): QueueEntry[];
+  /** Core-only additive path for resolved media; hats retain catalog admission. */
+  queueAddSources(media: QueueMedia[], position?: number): QueueEntry[];
   /** Clears the queue and stops playback. */
   queueClear(): void;
   /** End-of-item transition (the engine's clock — driven by the playback
@@ -419,7 +422,7 @@ export function createPlayer(options: {
   const progressMs = (): number => {
     const entry = currentEntry();
     if (entry === null) return 0;
-    const length = entry.song.durationMs ?? 0;
+    const length = queueDuration(entry) ?? 0;
     const elapsed = state === 'play'
       ? baseProgressMs + (monotonicNow() - startedAt)
       : baseProgressMs;
@@ -470,6 +473,21 @@ export function createPlayer(options: {
     clock = null;
   };
 
+  const addSources = (media: QueueMedia[], position?: number) => {
+    const added = media.map((item) => ({ ...item, id: nextId++ }));
+    if (position === undefined || position >= items.length) {
+      items = [...items, ...added];
+    } else {
+      const at = Math.max(0, Math.trunc(position));
+      items = [...items.slice(0, at), ...added, ...items.slice(at)];
+      if (currentIndex !== null && at <= currentIndex) {
+        currentIndex += added.length;
+      }
+    }
+    version++;
+    return added;
+  };
+
   return {
     status(): PlayerStatus {
       // Stopped means no current — not the queue head. A queue-head-as-
@@ -483,7 +501,7 @@ export function createPlayer(options: {
         shuffle,
         volume,
         current: entry,
-        itemLengthMs: entry?.song.durationMs ?? 0,
+        itemLengthMs: entry === null ? 0 : queueDuration(entry) ?? 0,
         itemProgressMs: state === 'stop' ? 0 : progressMs(),
         clock: clock === null ? null : { ...clock },
       };
@@ -546,7 +564,7 @@ export function createPlayer(options: {
       const index = currentIndex ?? (items.length > 0 ? 0 : null);
       if (index === null) return false;
       const entry = items[index];
-      const length = entry.song.durationMs ?? 0;
+      const length = queueDuration(entry) ?? 0;
       const target = opts.positionMs !== undefined
         ? opts.positionMs
         : progressMs() + (opts.seekMs ?? 0);
@@ -564,20 +582,9 @@ export function createPlayer(options: {
     },
 
     queueAdd(songs, position) {
-      const added = songs.map((song) => ({ id: nextId++, song }));
-      if (position === undefined || position >= items.length) {
-        items = [...items, ...added];
-      } else {
-        const at = Math.max(0, Math.trunc(position));
-        items = [...items.slice(0, at), ...added, ...items.slice(at)];
-        // Inserted at/before the current item: shift so it stays current.
-        if (currentIndex !== null && at <= currentIndex) {
-          currentIndex += added.length;
-        }
-      }
-      version++;
-      return added;
+      return addSources(songs.map(catalogMedia), position);
     },
+    queueAddSources: addSources,
 
     queueClear() {
       items = [];
@@ -590,7 +597,7 @@ export function createPlayer(options: {
       if (state !== 'play') return 'none';
       const entry = currentEntry();
       if (entry === null) return 'none';
-      const length = entry.song.durationMs ?? 0;
+      const length = queueDuration(entry) ?? 0;
       if (length <= 0 || progressMs() < length) return 'none';
 
       if (repeat === 'single') {
@@ -625,7 +632,10 @@ export function createPlayer(options: {
     },
 
     restore(snapshot) {
-      items = snapshot.queue.map((song) => ({ id: nextId++, song }));
+      items = snapshot.queue.map((song) => ({
+        ...catalogMedia(song),
+        id: nextId++,
+      }));
       if (items.length > 0) version++;
       repeat = snapshot.repeat;
       consume = snapshot.consume;
@@ -640,7 +650,7 @@ export function createPlayer(options: {
         return;
       }
       currentIndex = Math.min(Math.max(0, index), items.length - 1);
-      const length = items[currentIndex].song.durationMs ?? 0;
+      const length = queueDuration(items[currentIndex]) ?? 0;
       baseProgressMs = Math.min(
         Math.max(0, Math.round(snapshot.positionMs)),
         length,

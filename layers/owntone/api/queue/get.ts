@@ -11,7 +11,13 @@ export default async (_request: unknown, context: HatContext) => {
     count: items.length,
     items: await Promise.all(
       items.map(async (entry, position) =>
-        queueItemPayload(entry, position, await albumArtist(entry.song.albumId))
+        queueItemPayload(
+          entry,
+          position,
+          entry.facts.kind === 'song'
+            ? await albumArtist(entry.facts.song.albumId)
+            : null,
+        )
       ),
     ),
   };

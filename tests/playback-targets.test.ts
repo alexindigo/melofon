@@ -549,7 +549,10 @@ Deno.test('automatic repeat, consume and next transitions validate before mutati
         await core.advanceEnded();
         assertEquals(preparations, 2, mode);
         assertEquals(core.playerView().state, 'pause', mode);
-        assertEquals(core.playerView().current?.song.id, t.songs[0].id, mode);
+        assertEquals(core.playerView().current?.reference, {
+          kind: 'song',
+          id: t.songs[0].id,
+        }, mode);
         assertEquals(core.queueView(), queue, mode);
       } finally {
         await core.close();
@@ -588,9 +591,14 @@ Deno.test('store/server-service reopen keeps adopted selection and queue but res
     ]);
     assertEquals(t.playback.playerView().state, 'pause');
     assertEquals(t.playback.playerView().itemProgressMs, saved!.positionMs);
-    assertEquals(t.playback.queueView().items.map((entry) => entry.song.id), [
-      t.songs[0].id,
-    ]);
+    assertEquals(
+      t.playback.queueView().items.map((entry) =>
+        entry.reference.kind === 'song' ? entry.reference.id : null
+      ),
+      [
+        t.songs[0].id,
+      ],
+    );
     await sleep(25);
     assertEquals(t.playback.playerView().itemProgressMs, saved!.positionMs);
     assertEquals(t.sessions.length, 0);

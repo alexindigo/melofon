@@ -688,7 +688,6 @@ export interface LyricsRow {
 /** app.playback.nowPlayingView() row: a now-playing entry with the song
  * already resolved by core (client rows plus the engine's current). */
 interface NowPlayingFacts {
-  song: SongRow;
   positionMs: number | null;
   startedAtMs: number | null;
   reportedAtMs: number;
@@ -698,6 +697,10 @@ interface NowPlayingFacts {
 
 export type NowPlayingViewRow =
   & NowPlayingFacts
+  & (
+    | { facts: { kind: 'song'; song: SongRow } }
+    | { facts: { kind: 'web' } }
+  )
   & (
     | { kind: 'app'; username: string; client: string; appPlayerId: number }
     | {

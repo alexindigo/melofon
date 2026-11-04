@@ -2,6 +2,7 @@
 // One scheduler, per-output intent epochs, proven local-release barriers.
 import type { Media } from '../media.ts';
 import { type Log, scopedLog } from '../logging.ts';
+import { queueDisplay } from '../queue-source.ts';
 import type { Notify } from '../notify.ts';
 import type { CommandSource, Output, Outputs } from '../player.ts';
 import type { Playback } from '../playback.ts';
@@ -412,13 +413,17 @@ export function createAirplayBoot(
     const generation = ++r.pump, session = r.session;
     r.authorizedPump = generation;
     r.entry = view.current.id;
-    const path = view.current.song.path, startMs = view.itemProgressMs;
+    const facts = view.current.facts, startMs = view.itemProgressMs;
     const owns = () =>
       !closed && runtimes.get(id) === r && r.transport === t &&
       r.session === session && r.pump === generation;
     const pumping = (async () => {
       let bytes = 0;
       try {
+        if (facts.kind !== 'song') {
+          throw new Error('Web source playback is not available');
+        }
+        const path = facts.song.path;
         const stream = await media.decodePcm(
           path,
           startMs > 0 ? { startMs } : undefined,
@@ -748,9 +753,9 @@ export function createAirplayBoot(
         const result = await devices.protocol.activate(prepared.value, {
           volume: r.volume,
           positionMs: 0,
-          lengthMs: view.current.song.durationMs ?? 0,
-          title: view.current.song.title ?? '',
-          artist: view.current.song.artistName ?? '',
+          lengthMs: view.itemLengthMs,
+          title: queueDisplay(view.current).title ?? '',
+          artist: queueDisplay(view.current).artistName ?? '',
         }, {
           publish(transport) {
             r.transport = transport;
@@ -760,7 +765,9 @@ export function createAirplayBoot(
             });
           },
           onEvent({ event, value }) {
-            if (!own()) return;
+            if (!own()) {
+              return;
+            }
             const pin = r.pin;
             if (event === 'credential' && value === 'saved') {
               if (pin?.current()) pin.saved = true;
