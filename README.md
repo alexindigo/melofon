@@ -75,6 +75,27 @@ supply their own open/read budgets. Healthy streams have no lifetime timer
 or cumulative byte cap; body failures are surfaced without hidden retries.
 Buffered lookup and file-download limits remain separate.
 
+### Core radio playlist resolution
+
+The core radio source resolver supports ordinary PLS/M3U wrappers around
+HTTP(S) audio. Links are ordered alternatives for one station, visited lazily
+within the caller's retry budget. Relative links use the final playlist URL.
+Only the entered host grants LAN trust, including references back to that host;
+redirects and playlist entries never grant another private host access. HLS
+manifests and legacy `ICY 200 OK` status lines are rejected.
+
+When constructed, the resolver declares `radio.resolveTimeoutSeconds` (default
+10 seconds per resolution attempt), `radio.playlistMaxBytes` (65536 per
+document), `radio.playlistMaxDepth` (4 nested playlist documents),
+`radio.playlistMaxDocuments` (16) and `radio.playlistMaxEntries` (128). Document
+and entry totals span the alternative traversal until it starts again at the
+entered URL. `radio.playlistProbeBytes` (512) bounds wrapper-prefix inspection;
+`radio.sourceRequestsPerMinute` (600) bounds request frequency through the net
+owner. Final audio retains its inspection bytes and streams under the net
+owner's pending-read idle budget, without the resolution lifetime/byte caps.
+This is a core byte-source facility; queue admission and playback integration
+follow separately.
+
 ### Ignoring discovered speakers
 
 Any signed-in user can hide an unadopted speaker with
