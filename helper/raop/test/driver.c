@@ -122,6 +122,8 @@ main(int argc, char **argv)
   bool schedfail;
   bool teardownfail;
   bool password_required;
+  bool credentials;
+  bool isolation;
   int port;
   int feed_seconds = 0;
   int feed_bytes;
@@ -139,6 +141,8 @@ main(int argc, char **argv)
   schedfail = argc > 2 && strcmp(argv[2], "schedfail") == 0;
   teardownfail = argc > 2 && strcmp(argv[2], "teardownfail") == 0;
   password_required = argc > 2 && strcmp(argv[2], "password-required") == 0;
+  credentials = argc > 2 && strcmp(argv[2], "credentials") == 0;
+  isolation = argc > 2 && strcmp(argv[2], "isolation") == 0;
   if (backlog)
     feed_seconds = atoi(argv[3]);
 
@@ -179,7 +183,19 @@ main(int argc, char **argv)
       return 0;
     }
 
-  if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0, 0,
+  if (credentials || isolation) {
+    const char *secret = getenv("DRIVER_PASSWORD");
+    char *copy = secret ? strdup(secret) : NULL;
+    if (raop_start_v2(h, "127.0.0.1", port, "Credential receiver", 80, 3, 0, 0,
+                       1000, 0, 0, 0, "", "", 1,
+                       (const uint8_t *)copy, copy ? strlen(copy) : 0, NULL, 0) < 0) return 1;
+    /* Queue must own an independent copy before the API returns. */
+    if (copy) { memset(copy, 'x', strlen(copy)); free(copy); }
+    if (getenv("DRIVER_REJECT")) {
+      if (wait_event(h, "\"password\"", 15000) < 0 || raop_free(h) != 0) return 1;
+      puts("DRIVER-OK"); return 0;
+    }
+  } else if (raop_start(h, "127.0.0.1", port, "Fake ATV", 80, 3, 0, 0,
                  contract ? 3000 : 1000,
                  contract ? 7 : 0,
                  authsetup ? 1 : 0,
@@ -187,6 +203,22 @@ main(int argc, char **argv)
                  contract ? "Cool Vibes" : "",
                  contract ? "Blue Tattoo" : "") < 0)
     return 1;
+
+  raop_t *peer = NULL;
+  if (isolation) {
+    if (wait_event(h, "\"connected\"", 15000) < 0) return 1;
+    peer = raop_new();
+    const char *first = getenv("DRIVER_PASSWORD"), *second = getenv("DRIVER_PEER_PASSWORD");
+    int peer_port = atoi(getenv("DRIVER_PEER_PORT"));
+    if (!peer || !first || !second) return 1;
+    if (raop_start_v2(peer, "127.0.0.1", peer_port, "Peer", 80, 3, 0, 0, 1000, 0, 0, 0,
+                       "", "", 1, (const uint8_t *)first, strlen(first), NULL, 0) < 0 ||
+        wait_event(peer, "\"password\"", 15000) < 0) return 1;
+    /* Replacement on the same native handle crosses the local release barrier. */
+    if (raop_start_v2(peer, "127.0.0.1", peer_port, "Peer", 80, 3, 0, 0, 1000, 0, 0, 0,
+                       "", "", 1, (const uint8_t *)second, strlen(second), NULL, 0) < 0 ||
+        wait_event(peer, "\"connected\"", 15000) < 0) return 1;
+  }
 
   if (teardownfail)
     {
@@ -231,7 +263,7 @@ main(int argc, char **argv)
     }
   else
     {
-      if (wait_event(h, "\"connected\"", 15000) < 0)
+      if (!isolation && wait_event(h, "\"connected\"", 15000) < 0)
         return 1;
 
       feed_bytes = contract ? 3 * PCM_BYTES : PCM_BYTES;
@@ -265,6 +297,7 @@ main(int argc, char **argv)
   wait_event(h, "\"stopped\"", 10000);
 
   raop_free(h);
+  if (peer && raop_free(peer) != 0) return 1;
   printf("DRIVER-OK\n");
   return 0;
 }

@@ -90,6 +90,19 @@ covers the supported native C API: normal `FfiTransport` retains its sole feed
 token until free and constructs fresh replacement handles. It does not elect
 native feed producers or authorize competing PCM feeds.
 
+## Device credential input
+
+`raop_start_v2` adds length-delimited per-device password and restored fruit
+key inputs while preserving `raop_start`. Commands copy and own the bytes until
+loop-thread transfer to `output_device`; the stub erases/frees remaining strings
+after native local release. Native discovery/config strings are not used. Invalid
+lengths, NULs and non-hex fruit keys reject the entire command without truncation.
+The local `outputs/raop.c` patch removes digest Authorization debug output;
+`MELOFON_RAOP_DEBUG` must never expose credentials or digest responses. Pair-key
+export and invalidation acknowledgement are a separate ABI, not this start input.
+Existing native key invalidation/replacement paths also erase the old owned key
+before freeing it; no credential notification/export is added here.
+
 ## Shared logging ingress
 
 `stub/stubs.c` owns diagnostics: typed `helper_log_event` facts for Melofon-owned

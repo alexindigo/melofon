@@ -165,6 +165,7 @@ export async function startServer(options: {
   });
   const airplay = createAirplayDevices({
     outputs,
+    credentials,
     admission: outputAdmission,
     changed: () => notify.emit(['outputs'], undefined, 'all'),
   });

@@ -7,6 +7,7 @@ import ast
 import hashlib
 import os
 import re
+import secrets
 import select
 import socket
 import struct
@@ -343,6 +344,66 @@ def password_scenarios():
     print('password digest: OK (correct + iTunes, tampering rejected, admitted RTP)')
 
 
+def credential_scenarios():
+    # Secrets originate in the guest, never argv/receipts or failure output.
+    password = secrets.token_hex(24)
+    for mode in ('missing', 'wrong', 'correct', 'maximum'):
+        expected = 'p' * 4096 if mode == 'maximum' else password
+        fake, port = start_fake({'FAKE_PASSWORD': expected})
+        try:
+            env = {**os.environ, 'MELOFON_RAOP_DEBUG': '1'}
+            if mode != 'missing': env['DRIVER_PASSWORD'] = secrets.token_hex(24) if mode == 'wrong' else expected
+            if mode in ('missing', 'wrong'): env['DRIVER_REJECT'] = '1'
+            driver = subprocess.run([DRIVER, port, 'credentials'], env=env,
+                                    capture_output=True, text=True, timeout=30)
+            # Never render captured diagnostics on a failure in this path.
+            assert expected not in driver.stderr, 'native credential diagnostic leak'
+            assert env.get('DRIVER_PASSWORD', expected) not in driver.stdout, 'driver credential leak'
+            assert 'Authorization header:' not in driver.stderr, 'digest diagnostic leak'
+            assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, 'credential driver failed'
+            report = read_report(fake)
+            if mode in ('missing', 'wrong'):
+                assert report['auth_challenges'] >= 1
+                assert 'RECORD' not in report['accepted_requests'] and report['audio_packets'] == 0
+            else:
+                assert 'RECORD' in report['accepted_requests'] and report['audio_packets'] > 100
+                assert report['teardowns'] == 1
+        finally:
+            fake.kill(); fake.wait()
+        print(f'native credentials {mode}: OK')
+    peer_password = secrets.token_hex(24)
+    fake, port = start_fake({'FAKE_PASSWORD': password})
+    peer, peer_port = start_fake({'FAKE_PASSWORD': peer_password})
+    try:
+        driver = subprocess.run([DRIVER, port, 'isolation'], capture_output=True, text=True, timeout=45,
+            env={**os.environ, 'MELOFON_RAOP_DEBUG': '1', 'DRIVER_PASSWORD': password,
+                 'DRIVER_PEER_PASSWORD': peer_password, 'DRIVER_PEER_PORT': peer_port})
+        assert all(value not in driver.stderr + driver.stdout for value in (password, peer_password))
+        assert 'Authorization header:' not in driver.stderr
+        assert driver.returncode == 0, 'per-device credential isolation failed'
+        first, second = read_report(fake), read_report(peer)
+        assert first['audio_packets'] > 100 and second['audio_packets'] > 100
+        assert second['accepted_requests'].count('RECORD') == 1
+        assert second['auth_challenges'] >= 3
+    finally:
+        fake.kill(); fake.wait(); peer.kill(); peer.wait()
+    print('native credential isolation: OK (wrong peer password rejected, replacement delivers RTP)')
+
+    probe = os.path.join(HERE, 'probe_credentials')
+    subprocess.run(['cc', '-O1', '-g', '-D_GNU_SOURCE', '-I' + os.path.join(LIBDIR, 'stub'),
+        '-I' + os.path.join(LIBDIR, 'vendor'), '-o', probe, probe + '.c', '-L', LIBDIR,
+        '-lmelofon_raop', '-levent', '-ldl', '-pthread', '-Wl,-rpath', LIBDIR], check=True)
+    for mode in ([], ['invalidate']):
+        fake, port = start_fake({'FAKE_DELAY_METHOD': 'POST'})
+        try:
+            result = subprocess.run([probe, port] + mode, capture_output=True, text=True, timeout=30,
+                                    env={**os.environ, 'MELOFON_RAOP_DEBUG': '1'})
+            assert result.returncode == 0 and 'CREDENTIAL-SEAM-OK' in result.stdout, 'native input/release seam failed'
+        finally:
+            fake.kill(); fake.wait()
+    print('native credential seam: OK (validation, copied 128-hex key, erased on release and invalidation)')
+
+
 # --- Failure-injection scenarios (plan atv3-session-recycle) -------------
 # The queue/cleanup failure contract: cmd_push must roll back a failed
 # event_base_once (else the queue wedges permanently and raop_free hangs),
@@ -597,6 +658,7 @@ def main():
     contract_scenario()
     authsetup_scenario()
     password_scenarios()
+    credential_scenarios()
     schedfail_scenario()
     teardownfail_scenario()
     free_contract_scenario()

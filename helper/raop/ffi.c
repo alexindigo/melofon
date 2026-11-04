@@ -51,6 +51,7 @@
 #include "logger.h"
 #include "misc.h"
 #include "outputs.h"
+#include "ffi.h"
 #include "raop-bridge.h"
 
 /* The RAOP output backend (raop.c). */
@@ -124,11 +125,23 @@ typedef struct cmd
   uint16_t wanted_metadata;     /* TXT md bitmask (raop_device_cb) */
   int authsetup;                /* TXT et token 4 */
   int requires_auth;            /* TXT sf bit 9 */
+  int has_password;
+  char *password;
+  char *auth_key;
   char title[256];
   char artist[256];
   free_sync *sync;              /* CMD_FREE only */
   struct cmd *next;
 } cmd;
+
+static void
+cmd_free(cmd *c)
+{
+  if (c->password) { explicit_bzero(c->password, strlen(c->password)); free(c->password); }
+  if (c->auth_key) { explicit_bzero(c->auth_key, strlen(c->auth_key)); free(c->auth_key); }
+  explicit_bzero(c->pin, sizeof(c->pin));
+  free(c);
+}
 
 struct raop_handle
 {
@@ -334,7 +347,7 @@ static const char *raop_devtype_name[] =
 
 /* Loop thread: create the device for h and open the RAOP session. */
 static int
-device_start(raop_t *h, const cmd *c)
+device_start(raop_t *h, cmd *c)
 {
   struct output_device *dev;
   struct raop_extra_mirror *re;
@@ -372,6 +385,11 @@ device_start(raop_t *h, const cmd *c)
   dev->volume = c->volume;
   dev->relvol = c->volume;
   dev->requires_auth = c->requires_auth ? 1 : 0;
+  dev->has_password = c->has_password;
+  dev->password = c->password;
+  dev->auth_key = c->auth_key;
+  c->password = NULL;
+  c->auth_key = NULL;
   /* OwnTone's RAOP_CONFIG_MAX_VOLUME: pct 100 maps to 0 dB, pct 0 to -30. */
   dev->max_volume = 11;
   dev->quality.sample_rate = 44100;
@@ -494,7 +512,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
           pthread_cond_signal(&c->sync->cond);
           pthread_mutex_unlock(&c->sync->lock);
         } else event_push(h, "failed");
-        free(c);
+        cmd_free(c);
         continue;
       }
       switch (c->type)
@@ -543,10 +561,10 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             c->sync->done = 1;
             pthread_cond_signal(&c->sync->cond);
             pthread_mutex_unlock(&c->sync->lock);
-            free(c);
+            cmd_free(c);
             return;
         }
-      free(c);
+      cmd_free(c);
     }
 }
 
@@ -568,7 +586,7 @@ cmd_push(raop_t *h, cmd *c)
 
   pthread_mutex_lock(&h->cmds_lock);
   if (h->free_requested && c->type != CMD_FREE) {
-    pthread_mutex_unlock(&h->cmds_lock); free(c); return -1;
+    pthread_mutex_unlock(&h->cmds_lock); cmd_free(c); return -1;
   }
   c->next = NULL;
   if (h->cmds_tail)
@@ -614,7 +632,7 @@ cmd_push(raop_t *h, cmd *c)
         }
       h->cmds_scheduled = 0;
       pthread_mutex_unlock(&h->cmds_lock);
-      free(c);
+      cmd_free(c);
       return -1;
     }
   pthread_mutex_unlock(&h->cmds_lock);
@@ -786,10 +804,32 @@ raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
            uint16_t wanted_metadata, int authsetup, int requires_auth,
            const char *title, const char *artist)
 {
+  return raop_start_v2(h, host, port, name, volume, devtype, encrypt,
+                       pos_ms, len_ms, wanted_metadata, authsetup, requires_auth,
+                       title, artist, 0, NULL, 0, NULL, 0);
+}
+
+int
+raop_start_v2(raop_t *h, const char *host, int port, const char *name, int volume,
+              int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms,
+              uint16_t wanted_metadata, int authsetup, int requires_auth,
+              const char *title, const char *artist, int has_password,
+              const uint8_t *password, size_t password_len,
+              const uint8_t *auth_key, size_t auth_key_len)
+{
   cmd *c;
 
   if (!h || !host || !*host)
     return -1;
+  if ((!password && password_len) || password_len > 4096 ||
+      (password && memchr(password, 0, password_len)) ||
+      (!auth_key && auth_key_len) || (auth_key && auth_key_len != 128))
+    return -1;
+  for (size_t i = 0; i < auth_key_len; i++)
+    if (!((auth_key[i] >= '0' && auth_key[i] <= '9') ||
+          (auth_key[i] >= 'a' && auth_key[i] <= 'f') ||
+          (auth_key[i] >= 'A' && auth_key[i] <= 'F')))
+      return -1;
   if (port <= 0 || port > 65535)
     port = 7000;
   if (!name || !*name)
@@ -799,6 +839,17 @@ raop_start(raop_t *h, const char *host, int port, const char *name, int volume,
   if (!c)
     return -1;
   c->type = CMD_START;
+  c->has_password = has_password ? 1 : 0;
+  if (password) {
+    c->password = calloc(password_len + 1, 1);
+    if (!c->password) { cmd_free(c); return -1; }
+    memcpy(c->password, password, password_len);
+  }
+  if (auth_key) {
+    c->auth_key = calloc(auth_key_len + 1, 1);
+    if (!c->auth_key) { cmd_free(c); return -1; }
+    memcpy(c->auth_key, auth_key, auth_key_len);
+  }
   snprintf(c->host, sizeof(c->host), "%s", host);
   c->port = port;
   snprintf(c->name, sizeof(c->name), "%s", name);

@@ -20,19 +20,20 @@
 // atv3-session-recycle).
 import type {
   AirplayControl,
+  AirplayCredentials,
   AirplayDriver,
   AirplayInput,
   AirplayProfile,
   AirplayTransport,
   HelperEventFn,
 } from './airplay-profile.ts';
-import { type EventFacts, type Log, scopedLog } from '../logging.ts';
+import { appLogger, type EventFacts, type Log, scopedLog } from '../logging.ts';
 
 const SYMBOLS = {
   raop_log_consumer: { parameters: ['i32'], result: 'i32' },
   raop_log_poll: { parameters: ['buffer', 'usize'], result: 'i32' },
   raop_new: { parameters: [], result: 'pointer' },
-  raop_start: {
+  raop_start_v2: {
     parameters: [
       'pointer',
       'buffer',
@@ -48,6 +49,11 @@ const SYMBOLS = {
       'i32',
       'buffer',
       'buffer',
+      'i32',
+      'buffer',
+      'usize',
+      'buffer',
+      'usize',
     ],
     result: 'i32',
   },
@@ -218,26 +224,61 @@ class FfiTransport implements AirplayTransport {
     }
   }
 
-  start(profile: Readonly<AirplayProfile>, input: AirplayInput): Promise<void> {
+  start(
+    profile: Readonly<AirplayProfile>,
+    input: AirplayInput,
+    credentials?: AirplayCredentials,
+  ): Promise<void> {
     if (this.closed) {
       return Promise.reject(new Error('raop start on a closed transport'));
     }
-    const rc = this.lib.symbols.raop_start(
-      this.handle,
-      cstr(profile.host),
-      profile.port,
-      cstr(profile.name),
-      input.volume,
-      DEVTYPE[profile.devtype],
-      profile.encrypt ? 1 : 0,
-      input.positionMs,
-      input.lengthMs,
-      profile.wantedMetadata,
-      profile.supportsAuthSetup ? 1 : 0,
-      profile.requiresAuth ? 1 : 0,
-      cstr(input.title),
-      cstr(input.artist),
-    );
+    const password = credentials?.password ?? null;
+    const pairingKey = credentials?.pairingKey ?? null;
+    appLogger().registerSecrets([
+      password ?? undefined,
+      pairingKey ?? undefined,
+    ]);
+    // Keep a non-NULL buffer even for an empty password, distinct from absent.
+    const passwordBytes = password === null ? null : cstr(password);
+    const keyBytes = pairingKey === null ? null : text.encode(pairingKey);
+    // Validate before calling C. Native length-delimited validation is
+    // independent, including callers that do not use this adapter.
+    if (
+      (password !== null &&
+        (password.includes('\0') || passwordBytes!.length - 1 > 4096)) ||
+      (pairingKey !== null && !/^[0-9a-fA-F]{128}$/.test(pairingKey))
+    ) {
+      passwordBytes?.fill(0);
+      keyBytes?.fill(0);
+      return Promise.reject(new Error('Invalid RAOP credential input'));
+    }
+    let rc: number;
+    try {
+      rc = this.lib.symbols.raop_start_v2(
+        this.handle,
+        cstr(profile.host),
+        profile.port,
+        cstr(profile.name),
+        input.volume,
+        DEVTYPE[profile.devtype],
+        profile.encrypt ? 1 : 0,
+        input.positionMs,
+        input.lengthMs,
+        profile.wantedMetadata,
+        profile.supportsAuthSetup ? 1 : 0,
+        profile.requiresAuth ? 1 : 0,
+        cstr(input.title),
+        cstr(input.artist),
+        profile.hasPassword ? 1 : 0,
+        passwordBytes,
+        BigInt(passwordBytes === null ? 0 : passwordBytes.length - 1),
+        keyBytes,
+        BigInt(keyBytes?.length ?? 0),
+      );
+    } finally {
+      passwordBytes?.fill(0);
+      keyBytes?.fill(0);
+    }
     return rc < 0
       ? Promise.reject(new Error('raop start enqueue failed'))
       : Promise.resolve();
@@ -370,7 +411,8 @@ export function createFfiSpawn(log: Log = scopedLog('raop-native')): (
     const transport = new FfiTransport(lib, onEvent);
     return {
       transport,
-      start: (profile, input) => transport.start(profile, input),
+      start: (profile, input, credentials) =>
+        transport.start(profile, input, credentials),
     };
   };
 }

@@ -32,9 +32,13 @@ Deno.test('AirPlay profiles distinguish acquired missing-md from absent/incompat
     () => profileFromService(service({ tp: 'UDP', ch: '1' })),
     PreparationError,
   );
-  assertThrows(
-    () => profileFromService(service({ tp: 'UDP', pw: 'true' })),
-    PreparationError,
+  assertEquals(
+    profileFromService(service({ tp: 'UDP', pw: 'true' })).hasPassword,
+    true,
+  );
+  assertEquals(
+    profileFromService(service({ tp: 'UDP', pw: 'false' })).hasPassword,
+    false,
   );
 });
 

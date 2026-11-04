@@ -14,6 +14,8 @@ export function createSpeakerCredentials(deps: {
 }) {
   const memory = new Map<string, Map<SpeakerCredentialKind, string>>();
   const tails = new Map<string, Promise<unknown>>();
+  const versions = new Map<string, number>();
+  const changed = (id: string) => versions.set(id, (versions.get(id) ?? 0) + 1);
   const requireCurrent = (id: string, revision?: number) => {
     const current = deps.current(id);
     if (!current || (revision !== undefined && current.revision !== revision)) {
@@ -66,24 +68,46 @@ export function createSpeakerCredentials(deps: {
       );
     }
   };
+  const read = async (
+    id: string,
+    kind: SpeakerCredentialKind,
+    revision: number,
+  ) => {
+    if (!requireCurrent(id, revision).adopted) {
+      return memory.get(id)?.get(kind) ?? null;
+    }
+    const stored = await durable(() => deps.store.loadCredential(id, kind));
+    const value = stored === null
+      ? null
+      : await deps.secrets.decrypt({ speakerId: id, kind }, stored);
+    requireCurrent(id, revision);
+    return value;
+  };
   return {
     /** Called synchronously when the registry ends an incarnation. */
     release(id: string): void {
+      changed(id);
       memory.delete(id);
+    },
+    /** Both kinds from one serialized lifetime. A replacement request immediately
+     * fences any earlier start snapshot; a snapshot never grants playback. */
+    async session(id: string) {
+      return await serialize(id, async (revision) => {
+        const version = versions.get(id);
+        const password = await read(id, 'password', revision);
+        const pairingKey = await read(id, 'pairing-key', revision);
+        return {
+          password,
+          pairingKey,
+          isCurrent: () =>
+            deps.current(id)?.revision === revision &&
+            versions.get(id) === version,
+        };
+      });
     },
     async get(id: string, kind: SpeakerCredentialKind): Promise<string | null> {
       kindOf(kind);
-      return await serialize(id, async (revision) => {
-        if (!requireCurrent(id, revision).adopted) {
-          return memory.get(id)?.get(kind) ?? null;
-        }
-        const stored = await durable(() => deps.store.loadCredential(id, kind));
-        const value = stored === null
-          ? null
-          : await deps.secrets.decrypt({ speakerId: id, kind }, stored);
-        requireCurrent(id, revision);
-        return value;
-      });
+      return await serialize(id, (revision) => read(id, kind, revision));
     },
     async set(
       id: string,
@@ -96,6 +120,7 @@ export function createSpeakerCredentials(deps: {
       if (value !== null && typeof value !== 'string') {
         throw new SpeakerError('invalid_field', 'Invalid speaker credential');
       }
+      changed(id);
       await serialize(id, async (revision) => {
         if (requireCurrent(id, revision).adopted) {
           const ciphertext = value === null

@@ -7,10 +7,12 @@ import {
 import { createMdnsResolver, type MdnsResolver } from '../mdns-resolver.ts';
 import type { MdnsService } from '../mdns.ts';
 import type { SpeakerAdapterView, SpeakerSessionView } from '../speakers.ts';
+import type { SpeakerCredentials } from '../speaker-credentials.ts';
 import { airplayInstance, normalizeAirplayAddress } from './airplay-address.ts';
 import { createFfiSpawn } from './raop-ffi.ts';
 import {
   airplayAbilities,
+  type AirplayCredentials,
   type AirplayDriver,
   type AirplayInput,
   airplayOutputId,
@@ -27,6 +29,7 @@ export function createAirplayDevices(deps: {
   admission?: OutputAdmission;
   resolver?: MdnsResolver;
   spawn?: AirplaySpawn;
+  credentials?: Pick<SpeakerCredentials, 'session'>;
   changed?(): void;
 }) {
   const { outputs } = deps;
@@ -72,6 +75,7 @@ export function createAirplayDevices(deps: {
   });
   const spawn = deps.spawn ?? createFfiSpawn();
   const drivers = new WeakMap<AirplayDriver['transport'], AirplayDriver>();
+  const privateInputs = new WeakMap<AirplayInput, AirplayCredentials>();
   const receiverIdentity = (id: string, service: MdnsService) => {
     const identity = airplayInstance(service.name)?.id;
     if (!identity) {
@@ -86,7 +90,7 @@ export function createAirplayDevices(deps: {
     }
     return identity;
   };
-  const protocol = admission.register<
+  const admitted = admission.register<
     'AirPlay',
     AirplayProfile,
     AirplayInput,
@@ -149,10 +153,64 @@ export function createAirplayDevices(deps: {
       return driver.transport;
     },
     start(transport, config, input) {
-      return drivers.get(transport)!.start(config, input);
+      return drivers.get(transport)!.start(
+        config,
+        input,
+        privateInputs.get(input),
+      );
     },
     close: (transport) => transport.close(),
   });
+  type Permit = Parameters<typeof admitted.activate>[0];
+  const contexts = new WeakMap<Permit, { id: string; current(): boolean }>();
+  const protocol: typeof admitted = {
+    ...admitted,
+    async prepare(request) {
+      const incarnation = outputs.revision(request.id);
+      const context = { id: request.id, current: () => true };
+      const result = await admitted.prepare({
+        ...request,
+        isCurrent: () =>
+          request.isCurrent() &&
+          outputs.revision(request.id) === incarnation && context.current(),
+      });
+      if (result.ok) contexts.set(result.value, context);
+      return result;
+    },
+    async activate(permit, input, lifecycle) {
+      const context = contexts.get(permit);
+      contexts.delete(permit);
+      if (!context) {
+        return {
+          ok: false,
+          error: new PreparationError('stale', 'foreign or consumed permit'),
+        };
+      }
+      const privateInput = { ...input };
+      try {
+        if (deps.credentials) {
+          const snapshot = await deps.credentials.session(context.id);
+          context.current = snapshot.isCurrent;
+          privateInputs.set(privateInput, {
+            password: snapshot.password,
+            pairingKey: snapshot.pairingKey,
+          });
+        }
+        return await admitted.activate(permit, privateInput, lifecycle);
+      } catch {
+        // No arbitrary dependency error (or plaintext) crosses into public state.
+        return {
+          ok: false,
+          error: new PreparationError(
+            'start-failed',
+            'Speaker credentials unavailable',
+          ),
+        };
+      } finally {
+        privateInputs.delete(privateInput);
+      }
+    },
+  };
   const accept = (id: string, service: MdnsService) => {
     const row = outputs.get(id, { includeIgnored: true });
     if (!row?.host) return;

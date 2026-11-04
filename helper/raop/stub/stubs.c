@@ -435,6 +435,13 @@ outputs_device_free(struct output_device *device)
   free(device->name);
   free(device->v4_address);
   free(device->v6_address);
+  /* The bridge supplies owned strings; session_make borrows password until
+   * local release. Native discovery/config is disabled in this library. */
+  if (device->password) {
+    explicit_bzero((char *)device->password, strlen(device->password));
+    free((char *)device->password);
+  }
+  if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
   free(device->auth_key);
   free(device);
 }

@@ -36,13 +36,23 @@ export interface AirplayProfile {
   wantedMetadata: number;
   supportsAuthSetup: boolean;
   requiresAuth: boolean;
+  hasPassword: boolean;
   sampleRate: number;
   bitsPerSample: number;
   channels: number;
 }
 export interface AirplayDriver {
   transport: AirplayTransport;
-  start(profile: Readonly<AirplayProfile>, input: AirplayInput): Promise<void>;
+  start(
+    profile: Readonly<AirplayProfile>,
+    input: AirplayInput,
+    credentials?: AirplayCredentials,
+  ): Promise<void>;
+}
+/** Private start input, never part of normalized facts or diagnostics. */
+export interface AirplayCredentials {
+  password: string | null;
+  pairingKey: string | null;
 }
 export type AirplaySpawn = (event: HelperEventFn) => AirplayDriver;
 
@@ -54,7 +64,7 @@ export function airplayAbilities(
     volume: true,
     seek: true,
     pin: profile.requiresAuth,
-    password: false, // Credential input is not implemented yet.
+    password: profile.hasPassword,
     formats: ['pcm'],
   };
 }
@@ -123,6 +133,7 @@ export function sessionFieldsFromTxt(txt: Record<string, string>) {
     wantedMetadata: wantedMetadataFromMd(txt.md),
     supportsAuthSetup: supportsAuthSetupFromEt(txt.et),
     requiresAuth,
+    hasPassword: passwordRequiredFromTxt(txt),
     sampleRate: quality(txt, 'sr', 44100),
     bitsPerSample: quality(txt, 'ss', 16),
     channels: quality(txt, 'ch', 2),
@@ -132,12 +143,6 @@ export function profileFromService(
   service: MdnsService,
   requestedHost = service.address,
 ): AirplayProfile {
-  if (passwordRequiredFromTxt(service.txt)) {
-    throw new PreparationError(
-      'unsupported',
-      'receiver password is unsupported',
-    );
-  }
   if (!(service.txt.tp ?? '').split(',').includes('UDP')) {
     throw new PreparationError(
       'unsupported',
@@ -179,6 +184,7 @@ export function validateAirplayProfile(
     typeof profile.encrypt !== 'boolean' ||
     typeof profile.supportsAuthSetup !== 'boolean' ||
     typeof profile.requiresAuth !== 'boolean' ||
+    typeof profile.hasPassword !== 'boolean' ||
     !Number.isInteger(profile.wantedMetadata) || profile.wantedMetadata < 0 ||
     profile.wantedMetadata > 7
   ) throw new PreparationError('invalid', 'incomplete receiver configuration');

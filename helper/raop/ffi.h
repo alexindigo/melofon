@@ -46,6 +46,22 @@ int raop_start(raop_t *h, const char *host, int port,
                uint16_t wanted_metadata, int authsetup, int requires_auth,
                const char *title, const char *artist);
 
+/* Additive credential input. Old raop_start remains credential-free.
+ * Password is UTF-8 bytes, 0..4096 bytes; NULL/0 means absent (a non-NULL
+ * pointer with length zero is an empty password). Pairing key is NULL/0 or
+ * exactly 128 ASCII hex bytes. Embedded NULs and invalid lengths reject the
+ * whole command with -1. No truncation. Inputs are copied before return,
+ * transferred to device ownership on the loop. Password survives until native
+ * local release; keys are erased before native invalidation/replacement or
+ * local release. Neither input is diagnostic data. */
+int raop_start_v2(raop_t *h, const char *host, int port,
+                  const char *name, int volume, int devtype, int encrypt,
+                  uint32_t pos_ms, uint32_t len_ms,
+                  uint16_t wanted_metadata, int authsetup, int requires_auth,
+                  const char *title, const char *artist, int has_password,
+                  const uint8_t *password, size_t password_len,
+                  const uint8_t *auth_key, size_t auth_key_len);
+
 /* Append s16le/44100/stereo PCM to the pacing buffer. Returns bytes
  * accepted; < len means the buffer is at the high-water mark (caller
  * retries — that is the backpressure). */

@@ -242,13 +242,24 @@ Deno.test('speaker HTTP reads project discovered facts and failures while OwnTon
     assertEquals(detail.status, 200);
     assertEquals(await detail.json(), ownBody.outputs[0]);
     assertEquals(t.effects(), before, 'reads cannot discover, save or start');
+    t.announce('up', { ...service, txt: { ...service.txt, pw: 'true' } });
+    const protectedSpeaker = (await t.read(credential)).speakers[0];
+    assertEquals(protectedSpeaker.state.preparation.state, 'ready');
+    assertEquals(protectedSpeaker.abilities.password, true);
+    assertEquals(protectedSpeaker.state.authentication, 'none');
+    assertEquals((await (await t.own()).json()).outputs[0].has_password, true);
+    assertEquals(t.effects(), before, 'password facts cannot grant sessions');
     t.expire();
     assertEquals(
       (await t.read(credential)).speakers[0].state.preparation.state,
       'unresolved',
     );
     assertEquals((await t.read(credential)).speakers[0].abilities, null);
-    t.announce('up', { ...service, txt: { ...service.txt, pw: 'true' } });
+    // Passwords are supported; incompatible PCM remains a preparation failure.
+    t.announce('up', {
+      ...service,
+      txt: { ...service.txt, pw: 'true', ch: '1' },
+    });
     const failed = (await t.read(credential)).speakers[0].state.preparation;
     assertEquals(failed.state, 'failed');
     assertEquals(failed.error.code, 'unsupported');

@@ -1162,7 +1162,7 @@ raop_add_auth(struct raop_session *rs, struct evrtsp_request *req, const char *m
 
   evrtsp_add_header(req->output_headers, "Authorization", auth);
 
-  DPRINTF(E_DBG, L_RAOP, "Authorization header: %s\n", auth);
+  /* Credentials and their digest responses never enter native diagnostics. */
 
   rs->req_has_auth = 1;
 
@@ -4232,6 +4232,7 @@ raop_cb_pair_verify_step2(struct evrtsp_request *req, void *arg)
 	goto error;
 
       // Clear auth_key, the device did not accept it
+      if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
       free(device->auth_key);
       device->auth_key = NULL;
       goto error;
@@ -4265,6 +4266,7 @@ raop_cb_pair_verify_step1(struct evrtsp_request *req, void *arg)
 	goto error;
 
       // Clear auth_key, the device did not accept it
+      if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
       free(device->auth_key);
       device->auth_key = NULL;
       goto error;
@@ -4299,6 +4301,7 @@ raop_pair_verify(struct raop_session *rs)
     {
       DPRINTF(E_LOG, L_RAOP, "Verification authorization key invalid, resetting\n");
 
+      if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
       free(device->auth_key);
       device->auth_key = NULL;
       goto error;
@@ -4341,6 +4344,7 @@ raop_cb_pair_setup_step3(struct evrtsp_request *req, void *arg)
   if (!device)
     goto out;
 
+  if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
   free(device->auth_key);
   device->auth_key = strdup(authorization_key);
 
