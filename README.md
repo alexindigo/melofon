@@ -62,6 +62,19 @@ Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — keep deployment secrets out of source control.
 
+### Outbound response streams
+
+Core-owned HTTP response streams share the outbound host checks, DNS pinning
+and redirect policy used by buffered downloads. Their admin settings are
+`net.streamOpenTimeoutSeconds` (default 10 seconds, covering rate waits, DNS
+and all redirect headers), `net.streamBodyIdleSeconds` (default 10 seconds
+per pending read) and `net.streamBufferBytes` (default 65536 bytes for the
+transport's web-stream queue, plus native socket/decoder buffers). Consumer
+backpressure does not count as upstream idleness. Core source owners may
+supply their own open/read budgets. Healthy streams have no lifetime timer
+or cumulative byte cap; body failures are surfaced without hidden retries.
+Buffered lookup and file-download limits remain separate.
+
 ### Ignoring discovered speakers
 
 Any signed-in user can hide an unadopted speaker with

@@ -77,6 +77,97 @@ export interface CoreNetworkAuthority {
 }
 type Authority = NetworkAuthority | CoreNetworkAuthority;
 type Limits = { timeoutMs: number; maxBytes: number };
+export interface StreamLimits {
+  /** Whole open budget, including rate waits, DNS and all redirect headers. */
+  openTimeoutMs: number;
+  /** Pending body-read budget; downstream backpressure is not upstream idleness. */
+  idleTimeoutMs: number;
+}
+export interface OwnedResponse {
+  response: Response;
+  /** Final logical URL, not a fixture endpoint or a newly trusted address. */
+  url: string;
+  /** Idempotent; also releases an unread body or a pending read. */
+  close(): Promise<void>;
+}
+
+async function ownResponse(
+  response: Response,
+  url: string,
+  signal: AbortSignal,
+  arm: () => void,
+  disarm: () => void,
+  release: () => Promise<void>,
+): Promise<OwnedResponse> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    await release();
+    return { response, url, close: () => Promise.resolve() };
+  }
+  let output: ReadableStreamDefaultController<Uint8Array>;
+  let finished = false;
+  let closing: Promise<void> | undefined;
+  const finish = () => {
+    if (closing) return closing;
+    finished = true;
+    disarm();
+    signal.removeEventListener('abort', abort);
+    closing = (async () => {
+      try {
+        await reader.cancel();
+      } catch {
+        /* Preserve the original body failure. */
+      } finally {
+        reader.releaseLock();
+        await release();
+      }
+    })();
+    return closing;
+  };
+  const abort = () => {
+    if (finished) return;
+    output.error(signal.reason);
+    void finish();
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      output = controller;
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    },
+    async pull(controller) {
+      if (finished) return;
+      try {
+        arm();
+        const part = await abortable(reader.read(), signal);
+        disarm();
+        if (finished) return;
+        if (part.done) {
+          controller.close();
+          await finish();
+        } else controller.enqueue(part.value);
+      } catch (error) {
+        if (!finished) controller.error(error);
+        await finish();
+      }
+    },
+    cancel: finish,
+  }, { highWaterMark: 0 });
+  return {
+    response: new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+    url,
+    close() {
+      if (!finished) {
+        output.error(new DOMException('Response stream closed', 'AbortError'));
+      }
+      return finish();
+    },
+  };
+}
 export function createLookupNetwork(options: {
   version?: string;
   log?: Log;
@@ -96,6 +187,29 @@ export function createLookupNetwork(options: {
     minimum: 0,
     maximum: 20,
   });
+  const streamDeclarations = {
+    streamOpenTimeoutSeconds: {
+      type: 'number',
+      default: 10,
+      minimum: 0.001,
+      maximum: 600,
+    },
+    streamBodyIdleSeconds: {
+      type: 'number',
+      default: 10,
+      minimum: 0.001,
+      maximum: 600,
+    },
+    streamBufferBytes: {
+      type: 'integer',
+      default: 65536,
+      minimum: 1,
+      maximum: 1048576,
+    },
+  };
+  for (const [key, schema] of Object.entries(streamDeclarations)) {
+    options.state?.declare(`net.${key}`, schema);
+  }
   const declarations = {
     requestTimeoutSeconds: {
       type: 'number',
@@ -137,7 +251,8 @@ export function createLookupNetwork(options: {
     init: RequestInit,
     limits: Limits,
     destination?: string,
-  ): Promise<{ response: Response; size: number }> {
+    stream?: { idleMs: number; bufferBytes: number },
+  ): Promise<{ response: Response; size: number; lease?: OwnedResponse }> {
     const caller = 'caller' in authority ? authority.caller : authority.plugin;
     const controller = new AbortController();
     const signal = AbortSignal.any([
@@ -146,7 +261,12 @@ export function createLookupNetwork(options: {
       controller.signal,
     ]);
     const timer = setTimeout(
-      () => controller.abort(new Error('Lookup request timed out')),
+      () =>
+        controller.abort(
+          new Error(
+            stream ? 'Stream open timed out' : 'Lookup request timed out',
+          ),
+        ),
       limits.timeoutMs,
     );
     try {
@@ -155,7 +275,9 @@ export function createLookupNetwork(options: {
       const trustedHosts = 'caller' in authority
         ? authority.trustedHosts
         : authority.hosts;
-      const budget = await settings();
+      const budget = stream
+        ? { responseMs: limits.timeoutMs, idleMs: stream.idleMs, attempts: 1 }
+        : await settings();
       const maxRedirects = Number(
         await options.state?.getTyped('net.maxRedirects') ?? 5,
       );
@@ -178,6 +300,23 @@ export function createLookupNetwork(options: {
           let transport: Awaited<ReturnType<typeof pinnedRequest>> | undefined;
           let file: Deno.FsFile | undefined;
           let partial: string | undefined;
+          let transferred = false;
+          const release = async () => {
+            clearTimeout(phaseTimer);
+            request.abort();
+            try {
+              await reader?.cancel();
+            } catch {
+              // The original fetch/read failure (or abort reason) owns the
+              // outcome; an already-errored stream cannot be cancelled again.
+            } finally {
+              reader?.releaseLock();
+              file?.close();
+              if (partial) await Deno.remove(partial);
+              await transport?.close();
+              log.event('lookup_request', { plugin: caller, host, status });
+            }
+          };
           try {
             signal.throwIfAborted();
             if (
@@ -245,6 +384,7 @@ export function createLookupNetwork(options: {
               },
               requestSignal,
               options.ca,
+              stream?.bufferBytes,
             );
             const response = transport.response;
             transportFailure = false;
@@ -257,6 +397,19 @@ export function createLookupNetwork(options: {
               await response.body?.cancel();
               url = new URL(response.headers.get('location')!, url);
               break;
+            }
+            if (stream) {
+              signal.throwIfAborted();
+              const lease = await ownResponse(
+                response,
+                url.href,
+                requestSignal,
+                () => arm(stream.idleMs, 'body idle'),
+                () => clearTimeout(phaseTimer),
+                release,
+              );
+              transferred = true;
+              return { response: lease.response, size: 0, lease };
             }
             reader = response.body?.getReader();
             const chunks: Uint8Array[] = [];
@@ -329,24 +482,7 @@ export function createLookupNetwork(options: {
               throw request.signal.aborted ? request.signal.reason : error;
             }
           } finally {
-            clearTimeout(phaseTimer);
-            request.abort();
-            try {
-              await reader?.cancel();
-            } catch {
-              // The original fetch/read failure (or abort reason) owns the
-              // outcome; an already-errored stream cannot be cancelled again.
-            } finally {
-              reader?.releaseLock();
-              file?.close();
-              if (partial) await Deno.remove(partial);
-              await transport?.close();
-              log.event('lookup_request', {
-                plugin: caller,
-                host,
-                status,
-              });
-            }
+            if (!transferred) await release();
           }
         }
       }
@@ -356,6 +492,41 @@ export function createLookupNetwork(options: {
     }
   }
   return {
+    /** Core-only streaming lease. Published body failures are never retried. */
+    async stream(
+      authority: CoreNetworkAuthority,
+      input: string,
+      init: RequestInit = {},
+      limits?: StreamLimits,
+    ): Promise<OwnedResponse> {
+      const read = async (key: keyof typeof streamDeclarations) =>
+        Number(
+          await options.state?.getTyped(`net.${key}`) ??
+            streamDeclarations[key].default,
+        );
+      const openMs = limits?.openTimeoutMs ??
+        await read('streamOpenTimeoutSeconds') * 1000;
+      const idleMs = limits?.idleTimeoutMs ??
+        await read('streamBodyIdleSeconds') * 1000;
+      const bufferBytes = await read('streamBufferBytes');
+      if (
+        ![openMs, idleMs].every((value) => Number.isFinite(value) && value > 0)
+      ) {
+        throw new Error('Stream timeouts must be positive and finite');
+      }
+      const result = await execute(
+        authority,
+        input,
+        init,
+        {
+          timeoutMs: openMs,
+          maxBytes: Infinity,
+        },
+        undefined,
+        { idleMs, bufferBytes },
+      );
+      return result.lease!;
+    },
     async fetch(
       authority: Authority,
       input: string,

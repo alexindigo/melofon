@@ -13,6 +13,7 @@ export async function pinnedRequest(
   init: RequestInit,
   signal: AbortSignal,
   ca?: string,
+  bufferBytes?: number,
 ): Promise<{ response: Response; close(): Promise<void> }> {
   const input = new Request(url, { ...init, signal });
   const body = input.body
@@ -74,7 +75,14 @@ export async function pinnedRequest(
       const noBody = input.method === 'HEAD' ||
         [204, 205, 304].includes(status);
       const response = new Response(
-        noBody ? null : Readable.toWeb(stream) as ReadableStream<Uint8Array>,
+        noBody ? null : Readable.toWeb(stream, {
+          // Node's default web strategy counts chunks, not bytes. A live
+          // consumer must exert byte-bounded backpressure on the native stream.
+          strategy: {
+            highWaterMark: bufferBytes ?? stream.readableHighWaterMark,
+            size: (chunk: Uint8Array) => chunk.byteLength,
+          },
+        }) as ReadableStream<Uint8Array>,
         {
           status,
           statusText: message.statusMessage,
