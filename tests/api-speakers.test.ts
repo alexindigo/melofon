@@ -327,3 +327,57 @@ Deno.test('speaker HTTP reads track preparation without granting sessions or inf
     await t.close();
   }
 });
+
+Deno.test('temporary selected speakers retain session intent across withdrawal and release on every deselection path', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    const command = async (path: string, body?: unknown) => {
+      const response = await fetch(
+        `http://melofon.home:${t.f.extraPorts[0]}/api/outputs${path}`,
+        {
+          method: 'PUT',
+          signal: AbortSignal.timeout(5000),
+          headers: { 'Content-Type': 'application/json' },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        },
+      );
+      assertEquals(response.status, 204, await response.text());
+    };
+    for (const mode of ['set', 'toggle', 'update'] as const) {
+      t.announce('up');
+      await command('/set', { outputs: [id] });
+      await command(`/${id}`, { volume: 37 });
+      t.announce('down');
+      let row = (await t.read(credential)).speakers[0];
+      assert(row, 'selected temporary identity survives observation loss');
+      assertEquals(row.adopted, false);
+      assertEquals(row.discovered, false);
+      assertEquals(row.selected, true);
+      assertEquals(row.volume, 37);
+      assertEquals(row.state.preparation.state, 'unresolved');
+      t.announce('up');
+      row = (await t.read(credential)).speakers[0];
+      assertEquals(row.selected, true);
+      assertEquals(row.volume, 37);
+      assertEquals(row.discovered, true);
+      assertEquals(row.state.preparation.state, 'ready');
+      t.announce('down');
+      if (mode === 'set') await command('/set', { outputs: [] });
+      else if (mode === 'toggle') await command(`/${id}/toggle`);
+      else await command(`/${id}`, { selected: false });
+      assertEquals((await t.read(credential)).speakers, []);
+      assertEquals(await (await t.own()).json(), { outputs: [] });
+      t.announce('up');
+      row = (await t.read(credential)).speakers[0];
+      assertEquals(row.selected, false);
+      assertEquals(row.volume, 100, 'released temporary preferences are gone');
+      t.announce('down');
+      assertEquals((await t.read(credential)).speakers, []);
+    }
+    assertEquals(t.effects().saves, 0);
+    assertEquals(t.effects().starts, 0);
+  } finally {
+    await t.close();
+  }
+});

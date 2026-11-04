@@ -6,6 +6,7 @@ import {
   createOutputs,
   createPlayer,
   type PersistedOutput,
+  planRestore,
 } from '../src/player.ts';
 import { createNotify } from '../src/notify.ts';
 import { createPlayback } from '../src/playback.ts';
@@ -16,7 +17,13 @@ import { createAirplayDiscovery } from '../src/boots/airplay-mdns.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createMdnsResolver } from '../src/mdns-resolver.ts';
 import { dnsQuestions, type MdnsService } from '../src/mdns.ts';
-import type { Library, SongRow } from '../src/library.ts';
+import { createLibrary, type Library, type SongRow } from '../src/library.ts';
+import { createLibraries } from '../src/libraries.ts';
+import { scanLibrary } from '../src/scan.ts';
+import { createNowPlaying } from '../src/nowplaying.ts';
+import { createPersistence } from '../src/persistence.ts';
+import { apiFixture } from './helpers/api.ts';
+import { wireInt } from '../layers/owntone/payloads.ts';
 import type { NowPlaying } from '../src/nowplaying.ts';
 import type { State } from '../src/state.ts';
 import { airplayAnswer } from './mdns-builder.ts';
@@ -493,4 +500,256 @@ Deno.test('composition: Pause cancels lookup and late facts cannot start a sessi
     playback.close();
     await Deno.remove(dir, { recursive: true });
   }
+});
+
+Deno.test({
+  name:
+    'temporary speaker HTTP playback delivers decoded audio without saving a target; explicit adoption survives reopen',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'melofon-temporary-wire-' });
+    const mediaDir = `${dir}/media`;
+    await Deno.mkdir(mediaDir);
+    const input = await fixture(mediaDir);
+    const fake = await startFakeRaop({ captureAudio: true });
+    const id = BigInt('0x001122334455').toString();
+    const setup = async () => {
+      let outputs!: ReturnType<typeof createOutputs>;
+      let persistence!: ReturnType<typeof createPersistence>;
+      let playback!: ReturnType<typeof createPlayback>;
+      let devices!: ReturnType<typeof createAirplayDevices>;
+      let discovery!: ReturnType<typeof createAirplayDiscovery>;
+      let boot!: ReturnType<typeof createAirplayBoot>;
+      let announce!: (event: 'up' | 'down', service: MdnsService) => void;
+      let song!: SongRow;
+      let decodedStart = 0;
+      const f = await apiFixture({
+        storeDir: `${dir}/db`,
+        hats: {
+          layersRoot: 'layers',
+          extraPorts: 1,
+          env: ([port]) => ({ MELOFON_LISTEN_owntone: `${port},${port}` }),
+        },
+        services: async (f) => {
+          assert(f.notify);
+          const libraries = createLibraries(f.store);
+          if (!(await libraries.list()).length) {
+            await libraries.add('Receiver proof', mediaDir);
+            await scanLibrary(f.store);
+          }
+          const library = createLibrary(f.store);
+          [song] = await library.listSongs({ offset: 0, size: 10 });
+          assert(song);
+          persistence = createPersistence(f.store);
+          const saved = await persistence.loadOutputs();
+          outputs = createOutputs({ notify: f.notify, persistence });
+          devices = createAirplayDevices({
+            outputs,
+            resolver: {
+              resolve: () => Promise.resolve(receiverService(fake.port)),
+              close() {},
+            },
+          });
+          for (const row of saved) devices.register(row);
+          playback = createPlayback({
+            player: createPlayer(),
+            library,
+            outputs,
+            nowPlaying: createNowPlaying(f.store),
+            cfg: f.cfg,
+            notify: f.notify,
+            persistence,
+          });
+          const snapshot = await planRestore({
+            queueIds: await persistence.loadQueue(),
+            saved: await persistence.loadPlayerState(),
+            getSong: (id) => library.getSong(id),
+            nowMs: Date.now(),
+            maxAgeMs: 300000,
+            selectedOutputPresent: outputs.list().some((o) => o.selected),
+          });
+          if (snapshot) playback.restore(snapshot);
+          const media = createMedia();
+          boot = createAirplayBoot({
+            outputs,
+            playback,
+            notify: f.notify,
+            devices,
+            media: {
+              ...media,
+              decodePcm(path: string, options?: { startMs?: number }) {
+                decodedStart = options?.startMs ?? 0;
+                return media.decodePcm(path, options);
+              },
+            },
+            retryBackoffMs: [],
+          });
+          discovery = createAirplayDiscovery({
+            outputs,
+            devices,
+            state: f.state,
+            savedOutput: (id) => persistence.savedOutput(id),
+            createBrowser(callback) {
+              announce = callback;
+              return { resolve() {}, close() {} };
+            },
+          });
+          await f.state.getTyped('airplay.mdns');
+          return {
+            library,
+            outputs,
+            playback,
+            speakers: createSpeakers({
+              outputs,
+              playback,
+              adapterView: (id) => ({
+                preparation: devices.admission.describe(id),
+              }),
+            }),
+          };
+        },
+      });
+      const { credential } = await f.login('bearer');
+      const own = async (path: string, method = 'GET', body?: unknown) => {
+        const r = await fetch(
+          `http://melofon.home:${f.extraPorts[0]}/api${path}`,
+          {
+            method,
+            signal: AbortSignal.timeout(5000),
+            headers: { 'Content-Type': 'application/json' },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          },
+        );
+        const text = await r.text();
+        assert(r.ok, text);
+        return text ? JSON.parse(text) : undefined;
+      };
+      const read = async () => {
+        const r = await f.get('/api/v1/speakers', credential);
+        assertEquals(r.status, 200);
+        return (await r.json()).speakers;
+      };
+      const audio = async (sessionIndex: number) => {
+        await until(() =>
+          (fake.sessions[sessionIndex]?.audioPackets ?? 0) > 400
+        );
+        const session = fake.sessions[sessionIndex];
+        const received = decodeReceiverAudio(
+          session.sdp,
+          session.audioPayloads,
+        );
+        const startFrame = Math.round(decodedStart * 44100 / 1000);
+        assert(received.length > 44100 * 4);
+        assertEquals(
+          received,
+          input.pcm.subarray(startFrame * 4, startFrame * 4 + received.length),
+          'HTTP-selected receiver decoded the exact current-position PCM',
+        );
+        assert(
+          received.some((byte) => byte !== 0),
+          'received signal is not silence',
+        );
+      };
+      return {
+        f,
+        own,
+        read,
+        audio,
+        persistence,
+        announce: (event: 'up' | 'down') =>
+          announce(event, receiverService(fake.port)),
+        play: () => own('/player/play', 'PUT'),
+        queue: () =>
+          own(
+            `/queue/items/add?uris=library:track:${wireInt(song.id)}`,
+            'POST',
+          ),
+        async close() {
+          await boot.close();
+          await playback.close();
+          discovery.close();
+          devices.close();
+          await persistence.drain();
+          await f.close();
+        },
+      };
+    };
+    try {
+      const t = await setup();
+      try {
+        t.announce('up');
+        assertEquals((await t.read())[0].adopted, false);
+        await t.own('/outputs/set', 'PUT', { outputs: [id] });
+        await t.own(`/outputs/${id}`, 'PUT', { volume: 37 });
+        assertEquals((await t.queue()).count, 1);
+        await t.play();
+        await t.audio(0);
+        const packets = fake.sessions[0].audioPackets;
+        t.announce('down');
+        let row = (await t.read())[0];
+        assertEquals([row.adopted, row.discovered, row.selected], [
+          false,
+          false,
+          true,
+        ]);
+        await until(() => fake.sessions[0].audioPackets > packets + 30);
+        t.announce('up');
+        row = (await t.read())[0];
+        assertEquals([row.adopted, row.discovered, row.volume], [
+          false,
+          true,
+          37,
+        ]);
+        await t.persistence.drain();
+        assertEquals(await t.f.store.playback.loadOutputs(), []);
+        assertEquals(t.persistence.savedOutput(id), undefined);
+        assertEquals((await t.own('/queue')).count, 1);
+      } finally {
+        await t.close();
+      }
+      const next = await setup();
+      try {
+        assertEquals(await next.read(), []);
+        assertEquals((await next.own('/outputs')).outputs, []);
+        assertEquals((await next.own('/queue')).count, 1);
+        assertEquals((await next.own('/player')).state, 'pause');
+        next.announce('up');
+        assertEquals((await next.read())[0].selected, false);
+        await next.own('/outputs/set', 'PUT', { outputs: [id] });
+        await next.own(`/outputs/${id}`, 'PUT', { volume: 43 });
+        await next.play();
+        await next.audio(1);
+        const adopt = await next.f.json(
+          `/api/v1/speakers/${id}/adopt`,
+          'POST',
+          {},
+          (await next.f.login('cookie')).credential,
+        );
+        assertEquals(adopt.status, 200, await adopt.clone().text());
+        assertEquals((await adopt.json()).speaker.adopted, true);
+      } finally {
+        await next.close();
+      }
+      const adopted = await setup();
+      try {
+        const row = (await adopted.read())[0];
+        assertEquals([row.id, row.adopted, row.selected, row.volume], [
+          id,
+          true,
+          true,
+          43,
+        ]);
+        assertEquals(row.discovered, false);
+        assertEquals((await adopted.own('/queue')).count, 1);
+        await adopted.audio(2);
+        assertEquals((await adopted.f.store.speakers.loadAdopted()).length, 1);
+      } finally {
+        await adopted.close();
+      }
+    } finally {
+      fake.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
 });

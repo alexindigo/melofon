@@ -314,7 +314,8 @@ export interface Outputs {
   /** Fences async work across removal/re-registration, not preference edits. */
   revision(id: string): number;
   lifetime(id: string): { adopted: boolean; discovered: boolean };
-  /** Withdraw live presence; adopted identity/preferences remain registered. */
+  /** Withdraw presence; adopted or selected identity/preferences remain.
+   * A withdrawn temporary row is released when its last control reference ends. */
   withdraw(id: string, source?: CommandSource): void;
   ready(): Promise<void>;
   lastCommand(): OutputCommand | null;
@@ -666,6 +667,7 @@ export function createOutputs(
   const outputs: Output[] = [];
   const adopted = new Set<string>();
   const discovered = new Set<string>();
+  const withdrawn = new Set<string>();
   const forgetting = new Set<string>();
   const ignored = new Set<string>();
   const ignoring = new Map<string, Promise<void>>();
@@ -736,6 +738,23 @@ export function createOutputs(
   });
   const saveRow = (o: Output) => {
     if (isAdopted(o.id)) persistence?.saveOutput(snapshot(o));
+  };
+  // Observation and selection are independent runtime references. Losing the
+  // former cannot erase the latter, nor can either grant durable ownership.
+  const releaseWithdrawn = () => {
+    let changed = false;
+    for (const id of withdrawn) {
+      const row = find(id);
+      if (row?.selected || isAdopted(id) || adopting.has(id)) continue;
+      const idx = outputs.findIndex((o) => o.id === id);
+      if (idx !== -1) {
+        outputs.splice(idx, 1);
+        bump(id);
+        changed = true;
+      }
+      withdrawn.delete(id);
+    }
+    return changed;
   };
   const changeIgnored = (id: string, value: boolean): Promise<void> => {
     const previous = ignoring.get(id) ?? Promise.resolve();
@@ -838,6 +857,7 @@ export function createOutputs(
         const count = adopting.get(id)! - 1;
         if (count) adopting.set(id, count);
         else adopting.delete(id);
+        if (releaseWithdrawn()) emit(['outputs']);
       }
     },
     async forget(id, source) {
@@ -875,8 +895,11 @@ export function createOutputs(
     },
     withdraw(id, source) {
       discovered.delete(id);
-      if (isAdopted(id)) emit(['outputs']);
-      else api.unregister(id, source);
+      if (!find(id)) return;
+      withdrawn.add(id);
+      if (isAdopted(id) || find(id)?.selected || adopting.has(id)) {
+        emit(['outputs']);
+      } else api.unregister(id, source);
     },
     register(output, source, lifetime = 'observation') {
       if (forgetting.has(output.id)) return;
@@ -896,7 +919,10 @@ export function createOutputs(
           ? defaultStrategy
           : saved.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY);
       requireConnectionStrategy(connectionStrategy);
-      if (lifetime === 'observation') discovered.add(output.id);
+      if (lifetime === 'observation') {
+        discovered.add(output.id);
+        withdrawn.delete(output.id);
+      }
       if (idx === -1) {
         bump(output.id);
         outputs.push({
@@ -936,6 +962,7 @@ export function createOutputs(
       outputs.splice(idx, 1);
       bump(id);
       discovered.delete(id);
+      withdrawn.delete(id);
       record('unregister', source);
       // The persisted row stays: last-seen state for a re-announcement.
       log.event('command', {
@@ -950,6 +977,7 @@ export function createOutputs(
       if (ids.some((id) => find(id) === null || blocked(id))) return false;
       for (const o of outputs) o.selected = ids.includes(o.id);
       for (const o of outputs) saveRow(o);
+      releaseWithdrawn();
       record(
         'setEnabled',
         source,
@@ -969,6 +997,7 @@ export function createOutputs(
       if (found === null) return null;
       found.selected = !found.selected;
       saveRow(found);
+      releaseWithdrawn();
       record('toggle', source, [{ id, selected: found.selected }]);
       log.event('command', {
         command: 'output.toggle',
@@ -1029,6 +1058,7 @@ export function createOutputs(
           }
         }
       }
+      releaseWithdrawn();
       emit(opts.volume === undefined ? ['outputs'] : ['outputs', 'volume']);
       return { ...found };
     },
