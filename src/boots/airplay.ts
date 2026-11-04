@@ -4,7 +4,12 @@ import type { Media } from '../media.ts';
 import { type Log, scopedLog } from '../logging.ts';
 import { queueDisplay } from '../queue-source.ts';
 import type { Notify } from '../notify.ts';
-import type { CommandSource, Output, Outputs } from '../player.ts';
+import type {
+  CommandSource,
+  Output,
+  Outputs,
+  PlaybackSource,
+} from '../player.ts';
 import type { Playback } from '../playback.ts';
 import type { State } from '../state.ts';
 import {
@@ -40,7 +45,7 @@ export function parseRetryBackoff(raw: string | null): number[] | null {
     );
   return seconds.map((v) => v * 1000);
 }
-const HOLD_MS = 10_000, SEEK_JUMP_MS = 1500;
+const HOLD_MS = 10_000;
 const DEBUG = ['1', 'true'].includes(Deno.env.get('MELOFON_RAOP_DEBUG') ?? '');
 type View = ReturnType<Playback['playerView']>;
 interface Epoch {
@@ -68,11 +73,10 @@ interface Runtime {
   authenticationRequired: boolean;
   pin?: RuntimePin;
   entry: number | null;
+  playbackGeneration: number;
   strategy: ConnectionStrategy;
   host: string;
   port: number;
-  progress: number;
-  at: number;
   volume: number;
   held: boolean;
   deadline?: number;
@@ -147,8 +151,12 @@ export function createAirplayBoot(
   const pumps = new Set<Promise<void>>();
   // One source lifetime for the native shared stream, elected BEFORE acquisition.
   // Keep the slot through nonempty EOF: accepted PCM may still be playing out.
-  let source: { id: string; runtime: Runtime; generation: number } | null =
-    null;
+  let source: {
+    id: string;
+    runtime: Runtime;
+    generation: number;
+    lease: PlaybackSource;
+  } | null = null;
   const pairings = new Map<string, PairingWork>();
   const forceRelease = new Set<string>();
   let closed = false, running = false, rerun = false, collecting = false;
@@ -365,8 +373,6 @@ export function createAirplayBoot(
       if (!work.isCurrent() || view.state !== 'play' || !view.current) return;
       if (lease === authority) lease = null;
       if (r) {
-        r.progress = view.itemProgressMs;
-        r.at = performance.now();
         requestPump(id, r);
       }
     })().catch((error) => {
@@ -397,7 +403,10 @@ export function createAirplayBoot(
     });
   };
   const cancelPump = (id: string, r: Runtime) => {
-    if (source?.runtime === r) source = null;
+    if (source?.runtime === r) {
+      playback.cancelSource(source.lease);
+      source = null;
+    }
     r.pump++;
     r.transport?.cancelPcm();
     pendingPumps.delete(id);
@@ -415,13 +424,16 @@ export function createAirplayBoot(
       closed || blocked.has(id) || runtimes.get(id) !== r || !r.connected ||
       !t || !out?.selected || view.state !== 'play' || !view.current || source
     ) return;
+    const sourceLease = playback.openSource(view.current.id, view.generation);
+    if (!sourceLease) return;
     const generation = ++r.pump, session = r.session;
-    const authority = { id, runtime: r, generation };
+    const authority = { id, runtime: r, generation, lease: sourceLease };
     source = authority;
     r.entry = view.current.id;
     const facts = view.current.facts, startMs = view.itemProgressMs;
     const owns = () =>
-      source === authority && !closed && runtimes.get(id) === r &&
+      source === authority && !sourceLease.signal.aborted && !closed &&
+      runtimes.get(id) === r &&
       r.transport === t &&
       r.session === session && r.pump === generation;
     const pumping = (async () => {
@@ -462,6 +474,10 @@ export function createAirplayBoot(
             }
             if (!owns()) return;
             bytes += chunk.length;
+            playback.sourceAudio(
+              sourceLease,
+              chunk.length / (44100 * 2 * 2) * 1000,
+            );
           }
         } finally {
           await iterator.return?.();
@@ -477,6 +493,7 @@ export function createAirplayBoot(
           });
         }
         // Nonempty EOF is decoder completion, not audible/drained completion.
+        playback.reportSourceOutcome(sourceLease, 'eof');
       } catch (error) {
         if (!owns()) return;
         log.event('content_failed', { output: id, generation: session, error });
@@ -496,10 +513,10 @@ export function createAirplayBoot(
             },
           });
         }
+        playback.reportSourceOutcome(sourceLease, 'decode-error');
         for (const [peerId, peer] of [...runtimes]) {
           void retire(peerId, peer, 'content');
         }
-        if (playback.playerView().state === 'play') playback.pause(ownedSource);
       }
     })();
     pumps.add(pumping);
@@ -523,7 +540,9 @@ export function createAirplayBoot(
     pumpCurrent(id, r);
   };
   const requestPump = (id: string, r: Runtime) => {
-    r.entry = playback.playerView().current?.id ?? null;
+    const view = playback.playerView();
+    r.entry = view.current?.id ?? null;
+    r.playbackGeneration = view.generation;
     pendingPumps.set(id, r);
     drainPumps();
   };
@@ -737,11 +756,10 @@ export function createAirplayBoot(
         // polled. Entry changes during the handshake still absorb the latest
         // item when the connecting generation starts its first pump.
         entry: view.current.id,
+        playbackGeneration: view.generation,
         strategy: latestOut.connectionStrategy,
         host: latestOut.host!,
         port: latestOut.port ?? 7000,
-        progress: view.itemProgressMs,
-        at: performance.now(),
         volume: volume(latestOut, view),
         held: false,
       };
@@ -826,8 +844,6 @@ export function createAirplayBoot(
                 resume(outputs.get(id)!, undefined, r);
                 return;
               }
-              r.progress = latest.itemProgressMs;
-              r.at = performance.now();
               if (!wasConnected && !r.held && latest.state === 'play') {
                 requestPump(id, r);
               }
@@ -876,9 +892,7 @@ export function createAirplayBoot(
     }, Math.max(0, r.deadline! - performance.now()));
   };
   const reconcilePass = () => {
-    const view = playback.playerView(),
-      snapshot = outputs.list(),
-      now = performance.now();
+    const view = playback.playerView(), snapshot = outputs.list();
     const known = new Set(
       snapshot.filter((o) => o.type === 'AirPlay' && o.host).map((o) => o.id),
     );
@@ -953,6 +967,10 @@ export function createAirplayBoot(
         actions.push(() => spawnSession(outputs.get(id) ?? out));
         continue;
       }
+      // A guarded auth resume owns the transition through player.play's
+      // synchronous notification. Its continuation binds the new source run;
+      // reconciliation must not mistake that intermediate view for a seek.
+      if (resuming.get(id)?.runtime === r) continue;
       if (grants.get(id)?.kind === 'explicit') grants.delete(id);
       if (r.held) {
         actions.push(() => {
@@ -963,8 +981,7 @@ export function createAirplayBoot(
       } else if (
         r.entry !== null && (r.connected || r.entry === view.current.id) &&
         (r.entry !== view.current.id ||
-          Math.abs(view.itemProgressMs - (r.progress + (now - r.at))) >
-            SEEK_JUMP_MS)
+          r.playbackGeneration !== view.generation)
       ) {
         r.strategy = out.connectionStrategy; // Settings apply at transition.
         if (CONNECTION_STRATEGIES[r.strategy].discontinuity === 'retire') {
@@ -999,8 +1016,6 @@ export function createAirplayBoot(
             }
           });
         }
-        r.progress = current.itemProgressMs;
-        r.at = performance.now();
       });
     }
     // Complete snapshot's barriers FIRST, independent of iteration order.

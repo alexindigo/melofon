@@ -8,14 +8,16 @@
 // emits nothing itself — app.playback commands do (core owns the hub).
 //
 // No audio means progress is wall-clock: while state is 'play' the position
-// advances in real time from the last seek/start base, clamped at the item
-// length. Progress reaching the item length ENDS the item: advanceEnded()
+// advances in real time from the last seek/start base, clamped for finite
+// media, unbounded for live sources. An attached source additionally gates
+// completion on EOF and playout of accepted PCM. advanceEnded()
 // (driven by the playback core's clock) replays/advances/drops/stops per the
 // repeat/consume modes — "no auto-advance" was fine for a queue-less mirror,
 // it is a lie with boots attached (HA extrapolates past the end).
 import type { SongRow } from './library.ts';
 import {
   catalogMedia,
+  queueCapabilities,
   queueDuration,
   type QueueEntry,
   type QueueMedia,
@@ -88,6 +90,16 @@ export function sourceFromRequest(request: {
 /** What an end-of-item transition touched (the playback core emits on it). */
 export type AdvanceResult = 'none' | 'player' | 'player+queue';
 
+/** A single opened source, distinct from its occurrence and engine run.
+ * Private token identity plus occurrence/generation fences callbacks; its signal
+ * aborts on every discontinuity, cancellation or source-owner handoff. */
+export interface PlaybackSource {
+  readonly entryId: number;
+  readonly generation: number;
+  readonly signal: AbortSignal;
+}
+export type SourceOutcome = 'eof' | 'transport-error' | 'decode-error';
+
 export interface PlayerStatus {
   state: PlayerState;
   repeat: RepeatMode;
@@ -104,6 +116,9 @@ export interface PlayerStatus {
    * historical start is unknown; reportedAtMs is the observed transition,
    * never the time of a status read. Progress still uses a monotonic clock. */
   clock: { startedAtMs: number | null; reportedAtMs: number } | null;
+  /** Changes even for a same-position seek or repeat of the same occurrence. */
+  generation: number;
+  capabilities: { live: boolean; seekable: boolean };
 }
 
 /** The persisted engine snapshot (player_state row, minus updated_at). */
@@ -240,6 +255,12 @@ export async function planRestore(opts: {
 
 export interface Player {
   status(): PlayerStatus;
+  openSource(entryId: number, generation: number): PlaybackSource | null;
+  cancelSource(source: PlaybackSource): void;
+  /** Accepted PCM duration, reported after the sink write resolves. */
+  sourceAudio(source: PlaybackSource, durationMs: number): void;
+  sourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
+  canAdvanceEnded(): boolean;
   /** No-op on an empty queue (state stays 'stop'). `fromPosition` starts
    * the queue item at that 0-based index (OwnTone playback_from_position),
    * clamped into range; omitted → current (or queue head after stop). */
@@ -276,7 +297,8 @@ export interface Player {
    * core): progress at item length means the item ENDED. repeat `single`
    * replays; `all` wraps to the head past the last item; consume drops the
    * finished item and the next plays; otherwise next, stopping past the
-   * last. Unknown length (null duration) never ends. */
+   * last. Catalog unknown lengths never clock-end; finite web sources can end
+   * on EOF after accepted PCM plays out. Live EOF is a failure, not an end. */
   advanceEnded(): AdvanceResult;
   /** Boot-time restore (plan restart-transparency): load the rehydrated
    * queue plus the persisted snapshot in one shot. main.ts decides
@@ -434,6 +456,22 @@ export function createPlayer(options: {
   let baseProgressMs = 0;
   let startedAt = 0;
   let clock: PlayerStatus['clock'] = null;
+  let generation = 0, sourceGeneration = 0;
+  let source: {
+    token: PlaybackSource;
+    controller: AbortController;
+    outcome?: SourceOutcome;
+    drainAt: number;
+  } | null = null;
+  const cancelSource = () => {
+    const old = source;
+    source = null;
+    old?.controller.abort();
+  };
+  const discontinuity = () => {
+    generation++;
+    cancelSource();
+  };
   const anchor = (restart = false) => {
     const at = now();
     clock = {
@@ -448,15 +486,19 @@ export function createPlayer(options: {
   const progressMs = (): number => {
     const entry = currentEntry();
     if (entry === null) return 0;
-    const length = queueDuration(entry) ?? 0;
+    const length = queueDuration(entry);
     const elapsed = state === 'play'
       ? baseProgressMs + (monotonicNow() - startedAt)
       : baseProgressMs;
-    return Math.min(Math.max(0, Math.round(elapsed)), length);
+    const progress = Math.max(0, Math.round(elapsed));
+    return entry.facts.kind === 'web' && entry.facts.mode !== 'finite'
+      ? progress
+      : Math.min(progress, length ?? 0);
   };
 
   // Play from the current index (or the queue head), resetting the clock.
   const startAt = (index: number) => {
+    discontinuity();
     currentIndex = index;
     baseProgressMs = 0;
     startedAt = monotonicNow();
@@ -476,7 +518,10 @@ export function createPlayer(options: {
     }
     if (state === 'pause') {
       // Resume from the frozen position.
-      baseProgressMs = progressMs();
+      baseProgressMs = queueCapabilities(currentEntry()).live
+        ? 0
+        : progressMs();
+      discontinuity();
       startedAt = monotonicNow();
       state = 'play';
       anchor();
@@ -488,11 +533,13 @@ export function createPlayer(options: {
   const doPause = () => {
     if (state !== 'play') return;
     baseProgressMs = progressMs();
+    discontinuity();
     state = 'pause';
     anchor();
   };
 
   const doStop = () => {
+    discontinuity();
     state = 'stop';
     currentIndex = null;
     baseProgressMs = 0;
@@ -514,6 +561,26 @@ export function createPlayer(options: {
     return added;
   };
 
+  const canAdvanceEnded = () => {
+    if (state !== 'play') return false;
+    const entry = currentEntry();
+    if (!entry || entry.facts.kind === 'web' && entry.facts.mode !== 'finite') {
+      return false;
+    }
+    // An attached source must finish delivering and play out its accepted PCM.
+    // Decoder read-ahead is never permission to flush buffered tail audio.
+    if (
+      source && (source.outcome !== 'eof' ||
+        monotonicNow() < source.drainAt)
+    ) return false;
+    const length = queueDuration(entry) ?? 0;
+    if (entry.facts.kind === 'web' && source) {
+      return source.outcome === 'eof';
+    }
+    // Preserve library duration-clock behavior, including unknown lengths.
+    return length > 0 && progressMs() >= length;
+  };
+
   return {
     status(): PlayerStatus {
       // Stopped means no current — not the queue head. A queue-head-as-
@@ -530,8 +597,44 @@ export function createPlayer(options: {
         itemLengthMs: entry === null ? 0 : queueDuration(entry) ?? 0,
         itemProgressMs: state === 'stop' ? 0 : progressMs(),
         clock: clock === null ? null : { ...clock },
+        generation,
+        capabilities: queueCapabilities(entry),
       };
     },
+
+    openSource(entryId, expectedGeneration) {
+      if (
+        state !== 'play' || currentEntry()?.id !== entryId ||
+        generation !== expectedGeneration || source
+      ) return null;
+      const controller = new AbortController();
+      const token = Object.freeze({
+        entryId,
+        generation: ++sourceGeneration,
+        signal: controller.signal,
+      });
+      source = { token, controller, drainAt: monotonicNow() };
+      return token;
+    },
+    cancelSource(token) {
+      if (source?.token === token) cancelSource();
+    },
+    sourceAudio(token, durationMs) {
+      if (
+        source?.token !== token || source.outcome ||
+        !Number.isFinite(durationMs) || durationMs <= 0
+      ) return;
+      source.drainAt = Math.max(monotonicNow(), source.drainAt) + durationMs;
+    },
+    sourceOutcome(token, outcome) {
+      if (
+        source?.token !== token || source.outcome || state !== 'play' ||
+        currentEntry()?.id !== token.entryId
+      ) return false;
+      source.outcome = outcome;
+      return true;
+    },
+    canAdvanceEnded,
 
     play(fromPosition?: number) {
       doPlay(fromPosition);
@@ -590,11 +693,13 @@ export function createPlayer(options: {
       const index = currentIndex ?? (items.length > 0 ? 0 : null);
       if (index === null) return false;
       const entry = items[index];
+      if (!queueCapabilities(entry).seekable) return true;
       const length = queueDuration(entry) ?? 0;
       const target = opts.positionMs !== undefined
         ? opts.positionMs
         : progressMs() + (opts.seekMs ?? 0);
       const restart = state === 'stop';
+      discontinuity();
       currentIndex = index;
       baseProgressMs = Math.min(Math.max(0, Math.round(target)), length);
       startedAt = monotonicNow();
@@ -636,11 +741,7 @@ export function createPlayer(options: {
     },
 
     advanceEnded() {
-      if (state !== 'play') return 'none';
-      const entry = currentEntry();
-      if (entry === null) return 'none';
-      const length = queueDuration(entry) ?? 0;
-      if (length <= 0 || progressMs() < length) return 'none';
+      if (!canAdvanceEnded()) return 'none';
 
       if (repeat === 'single') {
         // Replay the same item: reset the clock, keep playing.
@@ -674,6 +775,7 @@ export function createPlayer(options: {
     },
 
     restore(snapshot) {
+      discontinuity();
       items = [...snapshot.queue];
       nextId = Math.max(
         snapshot.nextId ?? nextId,

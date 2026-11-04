@@ -1300,7 +1300,7 @@ Deno.test('ATV3 provenance: a recycle fabricates no core commands; catalog/volum
   }
 });
 
-Deno.test('ATV3 detection: a 500 ms same-entry seek does not recycle; a large seek and an entry change do', async () => {
+Deno.test('ATV3 generations: small seeks, large seeks and entry changes all recycle', async () => {
   const { outputs, playback, spawned, close } = await recycleSetup();
   try {
     registerAtv3(outputs);
@@ -1310,26 +1310,27 @@ Deno.test('ATV3 detection: a 500 ms same-entry seek does not recycle; a large se
     t1.onEvent('state', 'connected');
     await until('pcm', () => t1.pcmBytes() > 0);
 
-    // Below the 1500 ms detector: the pre-existing limitation stands.
+    // Every seek revokes the source generation, even below the old detector.
     const progress = playback.playerView().itemProgressMs;
     playback.seek({ positionMs: progress + 500 });
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    assertEquals(spawned.length, 1, 'a small same-entry seek: no recycle');
-    assert(!t1.closed, 'small seek: not retired');
+    await until('small seek recycle', () => spawned.length === 2);
+    assert(t1.closed, 'small seek releases the old source/session generation');
     assert(
       !t1.cmds().some((c) => c.cmd === 'flush'),
-      'small seek: not flushed either',
+      'retire strategy does not substitute a flush for release',
     );
+    spawned[1].onEvent('state', 'connected');
+    await until('small seek pcm', () => spawned[1].pcmBytes() > 0);
 
     // A large detected seek recycles.
     playback.seek({ positionMs: 90_000 });
-    await until('seek recycle', () => spawned.length === 2);
-    spawned[1].onEvent('state', 'connected');
-    await until('pcm2', () => spawned[1].pcmBytes() > 0);
+    await until('seek recycle', () => spawned.length === 3);
+    spawned[2].onEvent('state', 'connected');
+    await until('pcm2', () => spawned[2].pcmBytes() > 0);
 
     // A different queue-entry id transitions even within one song length.
     playback.next();
-    await until('track recycle', () => spawned.length === 3);
+    await until('track recycle', () => spawned.length === 4);
   } finally {
     await close();
   }

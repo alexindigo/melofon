@@ -93,6 +93,15 @@ export function queueDuration(media: QueueMedia): number | null {
     : media.facts.durationMs;
 }
 
+export function queueCapabilities(media: QueueMedia | null) {
+  return {
+    live: media?.facts.kind === 'web' && media.facts.mode === 'live',
+    seekable: media?.facts.kind === 'song' ||
+      media?.facts.kind === 'web' && media.facts.mode === 'finite' &&
+        media.facts.seekable,
+  };
+}
+
 export function queueDisplay(media: QueueMedia) {
   return media.facts.kind === 'song' ? media.facts.song : media.facts;
 }

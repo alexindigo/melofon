@@ -27,6 +27,7 @@ import { type Log, scopedLog } from './logging.ts';
 import { PlaybackError } from './playback-errors.ts';
 import {
   catalogMedia,
+  queueCapabilities,
   type QueueMedia,
   type QueueReference,
 } from './queue-source.ts';
@@ -34,12 +35,14 @@ import type {
   CommandSource,
   LastCommand,
   Outputs,
+  PlaybackSource,
   Player,
   PlayerPersistence,
   PlayerStatus,
   QueueEntry,
   RepeatMode,
   RestoreSnapshot,
+  SourceOutcome,
 } from './player.ts';
 
 export interface ReportPlaying {
@@ -149,6 +152,11 @@ export interface Playback {
    * item length (main.ts drives it on an interval; tests drive it directly).
    * Emits player (+queue when consume dropped the finished item). */
   advanceEnded(): void | Promise<void>;
+  /** Elected boot source lifetime; engine transitions synchronously revoke it. */
+  openSource(entryId: number, generation: number): PlaybackSource | null;
+  cancelSource(source: PlaybackSource): void;
+  sourceAudio(source: PlaybackSource, durationMs: number): void;
+  reportSourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
 
   /** Boot-time restore (main.ts): delegates to player.restore and records
    * it with source internal:restore. Emits and persists nothing — the
@@ -192,6 +200,7 @@ export function createPlayback(deps: {
 }): Playback {
   const { player, nowPlaying, library, outputs, notify, persistence } = deps;
   const log = deps.log ?? scopedLog('playback');
+  let openedSource: PlaybackSource | null = null;
   const selectedSpeakers = () =>
     (outputs?.list() ?? []).filter((o) => o.selected).map(
       ({ id, name }) => ({ id, name }),
@@ -476,6 +485,34 @@ export function createPlayback(deps: {
     );
   };
   return {
+    openSource: (entryId, generation) => {
+      if (closed || closing) return null;
+      const source = player.openSource(entryId, generation);
+      if (source) openedSource = source;
+      return source;
+    },
+    cancelSource: (source) => player.cancelSource(source),
+    sourceAudio: (source, durationMs) => player.sourceAudio(source, durationMs),
+    reportSourceOutcome(source, outcome) {
+      if (closed || !player.sourceOutcome(source, outcome)) return false;
+      const view = player.status();
+      if (
+        outcome !== 'eof' || view.current?.facts.kind === 'web' &&
+          view.current.facts.mode !== 'finite'
+      ) {
+        cancelStart();
+        player.pause();
+        record(
+          'pause',
+          undefined,
+          { kind: 'internal', via: 'source-outcome' },
+          'pause',
+        );
+        flushState();
+        emit(['player']);
+      }
+      return true;
+    },
     expireReports,
     async startReportExpiry(state) {
       if (closed || expiryStarted) return;
@@ -677,6 +714,10 @@ export function createPlayback(deps: {
     },
     seek(opts, source) {
       const view = player.status();
+      const entry = view.current ?? player.queue().items[0];
+      // A non-seekable source is a true no-op, including while paused/stopped:
+      // no target preparation, intent change, source reopen or notification.
+      if (entry && !queueCapabilities(entry).seekable) return true;
       const index = view.current
         ? player.queue().items.findIndex((e) => e.id === view.current!.id)
         : 0;
@@ -727,10 +768,7 @@ export function createPlayback(deps: {
 
     advanceEnded() {
       const view = player.status();
-      if (
-        pendingStart || view.state !== 'play' || view.itemLengthMs <= 0 ||
-        view.itemProgressMs < view.itemLengthMs
-      ) return;
+      if (pendingStart || !player.canAdvanceEnded()) return;
       const items = player.queue().items;
       const current = items.findIndex((e) => e.id === view.current?.id);
       const index = view.repeat === 'single'
@@ -744,6 +782,7 @@ export function createPlayback(deps: {
         ? items.filter((_, i) => i !== current)
         : items;
       const commit = (activate: () => void) => {
+        if (player.status().generation !== view.generation) return;
         const result = player.advanceEnded();
         if (result === 'none') return;
         activate();
@@ -850,6 +889,8 @@ export function createPlayback(deps: {
 
     async close() {
       cancelStart();
+      // Revoke a parked source even if its boot is being closed separately.
+      if (openedSource) player.cancelSource(openedSource);
       closing = true;
       unsubscribeSessions?.();
       unsubscribeOutputs?.();
