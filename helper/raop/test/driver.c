@@ -14,6 +14,8 @@
  *   driver <port> teardownfail   — failure injection: the teardown enqueue
  *                                  fails → raop_free must still fully release
  *                                  the handle and RETURN (not hang).
+ *   driver <port> password-required - missing password must raise the native
+ *                                    password state without reaching RECORD.
  * Prints DRIVER-OK on success. */
 #include <stdbool.h>
 #include <stdint.h>
@@ -119,13 +121,14 @@ main(int argc, char **argv)
   bool authsetup;
   bool schedfail;
   bool teardownfail;
+  bool password_required;
   int port;
   int feed_seconds = 0;
   int feed_bytes;
 
   if (argc < 2)
     {
-      fprintf(stderr, "usage: driver <port> [backlog <feed_seconds> | fail | contract | authsetup | schedfail | teardownfail]\n");
+      fprintf(stderr, "usage: driver <port> [backlog <feed_seconds> | fail | contract | authsetup | schedfail | teardownfail | password-required]\n");
       return 2;
     }
   port = atoi(argv[1]);
@@ -135,6 +138,7 @@ main(int argc, char **argv)
   authsetup = argc > 2 && strcmp(argv[2], "authsetup") == 0;
   schedfail = argc > 2 && strcmp(argv[2], "schedfail") == 0;
   teardownfail = argc > 2 && strcmp(argv[2], "teardownfail") == 0;
+  password_required = argc > 2 && strcmp(argv[2], "password-required") == 0;
   if (backlog)
     feed_seconds = atoi(argv[3]);
 
@@ -204,11 +208,11 @@ main(int argc, char **argv)
       return 0;
     }
 
-  if (fail)
+  if (fail || password_required)
     {
-      /* The fake refuses ANNOUNCE: the session must fail, and teardown+free
-       * must be clean (no crash — the JBL regression). */
-      if (wait_event(h, "\"failed\"", 15000) < 0)
+      /* Observe either ANNOUNCE refusal or an actual digest challenge.
+       * Credential inputs are deliberately left to the additive ABI item. */
+      if (wait_event(h, password_required ? "\"password\"" : "\"failed\"", 15000) < 0)
         return 1;
       raop_teardown(h);
       raop_free(h);

@@ -11,6 +11,49 @@
 // 'stopped' event as wire proof of a remote teardown — observations are
 // packet/request counts on this receiver only.
 import dgram from 'node:dgram';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+
+// RAOP no-qop MD5, including OwnTone's iTunes uppercase intermediate hashes.
+// Validate every field against the actual request before any session effects.
+function validDigest(
+  value: string,
+  password: string,
+  realm: string,
+  nonce: string,
+  method: string,
+  uri: string,
+): boolean {
+  if (!value.startsWith('Digest ')) return false;
+  const fields = new Map<string, string>();
+  let rest = value.slice(7);
+  while (rest) {
+    const match = /^\s*(\w+)="([^"\\\r\n]*)"\s*(,\s*|$)/.exec(rest);
+    if (!match || fields.has(match[1])) return false;
+    fields.set(match[1], match[2]);
+    rest = rest.slice(match[0].length);
+    if (match[3] && !rest) return false;
+  }
+  const username = fields.get('username');
+  if (
+    fields.size !== 5 || (username !== '' && username !== 'iTunes') ||
+    fields.get('realm') !== realm || fields.get('nonce') !== nonce ||
+    fields.get('uri') !== uri ||
+    !/^[a-fA-F0-9]{32}$/.test(fields.get('response') ?? '')
+  ) return false;
+  const md5 = (text: string) => {
+    const hash = createHash('md5').update(text).digest('hex');
+    return username === 'iTunes' ? hash.toUpperCase() : hash;
+  };
+  const expected = md5(
+    `${md5(`${username}:${realm}:${password}`)}:${nonce}:${
+      md5(`${method}:${uri}`)
+    }`,
+  );
+  return timingSafeEqual(
+    new TextEncoder().encode(fields.get('response')!),
+    new TextEncoder().encode(expected),
+  );
+}
 
 export interface FakeRaopRequest {
   method: string;
@@ -38,6 +81,9 @@ export interface FakeRaopSession {
   controlSenders: { address: string; port: number; atMs: number }[];
   timingSenders: { address: string; port: number; atMs: number }[];
   rtpSequences: number[];
+  /** Methods that passed the optional digest barrier; never stores headers. */
+  acceptedRequests: string[];
+  authChallenges: number;
 }
 
 export interface FakeRaop {
@@ -57,6 +103,7 @@ export function startFakeRaop(
     flushDelayMs?: number;
     captureAudio?: boolean;
     refuseRecord?: () => boolean;
+    digest?: { password: string; realm?: string };
   } = {},
 ): Promise<FakeRaop> {
   const sessions: FakeRaopSession[] = [];
@@ -66,11 +113,15 @@ export function startFakeRaop(
   const bindAddress = '127.0.0.1';
   const started = performance.now();
   const now = () => performance.now() - started;
+  const realm = opts.digest?.realm ?? 'Fake RAOP';
+  if (/[\r\n"\\]/.test(realm)) throw new Error('invalid fake digest realm');
 
   const tcp = Deno.listen({ hostname: bindAddress, port: 0 });
   const port = (tcp.addr as Deno.NetAddr).port;
 
   const respond = async (conn: Deno.TcpConn) => {
+    const nonce = randomBytes(16).toString('hex');
+    let recording = false;
     sessionSeq++;
     const session: FakeRaopSession = {
       id: `FAKE${sessionSeq.toString(16).toUpperCase().padStart(8, '0')}`,
@@ -93,6 +144,8 @@ export function startFakeRaop(
       controlSenders: [],
       timingSenders: [],
       rtpSequences: [],
+      acceptedRequests: [],
+      authChallenges: 0,
     };
     sessions.push(session);
 
@@ -132,6 +185,7 @@ export function startFakeRaop(
     );
     const audioPort = udp.address().port;
     udp.on('message', (msg, peer) => {
+      if (opts.digest && !recording) return;
       if (msg.length < 12 || (msg[1] & 0x7f) !== 96) return;
       recordPeer(session.rtpSenders, peer);
       session.audioPackets++;
@@ -199,7 +253,7 @@ export function startFakeRaop(
         const headLen = headerEnd();
         const head = decoder.decode(buf.subarray(0, headLen));
         const lines = head.split('\r\n');
-        const method = lines[0].split(' ')[0];
+        const [method, uri] = lines[0].split(' ');
         const headers = new Map<string, string>();
         for (const line of lines.slice(1)) {
           const idx = line.indexOf(': ');
@@ -219,6 +273,23 @@ export function startFakeRaop(
 
         const cseq = headers.get('cseq') ?? '0';
         session.requests.push({ method, cseq, atMs: now() });
+        if (
+          opts.digest && !validDigest(
+            headers.get('authorization') ?? '',
+            opts.digest.password,
+            realm,
+            nonce,
+            method,
+            uri,
+          )
+        ) {
+          session.authChallenges++;
+          await conn.write(encoder.encode(
+            `RTSP/1.0 401 Unauthorized\r\nCSeq: ${cseq}\r\nWWW-Authenticate: Digest realm="${realm}", nonce="${nonce}"\r\nContent-Length: 0\r\n\r\n`,
+          ));
+          continue;
+        }
+        session.acceptedRequests.push(method);
         if (method === 'ANNOUNCE') session.sdp = body;
         if (method === 'SET_PARAMETER') {
           session.parameters.push({
@@ -231,7 +302,10 @@ export function startFakeRaop(
           session.volumeParams.push(body.trim());
         }
         if (method === 'FLUSH') session.flushes++;
-        if (method === 'TEARDOWN') session.teardowns++;
+        if (method === 'TEARDOWN') {
+          session.teardowns++;
+          recording = false;
+        }
         if (method === 'TEARDOWN' && opts.withholdTeardownReply) continue;
         const delay = method === 'FLUSH' ? opts.flushDelayMs : undefined;
         if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
@@ -266,14 +340,13 @@ export function startFakeRaop(
           extra =
             `Session: ${session.id}\r\nTransport: RTP/AVP/UDP;unicast;mode=record;server_port=${audioPort};control_port=${control.address().port};timing_port=${timing.address().port}\r\n`;
         } else if (method === 'RECORD') {
+          recording = !opts.refuseRecord?.();
           extra = 'Audio-Latency: 11025\r\n';
         }
         await conn.write(
           encoder.encode(
             `RTSP/1.0 ${
-              method === 'RECORD' && opts.refuseRecord?.()
-                ? '500 Refused'
-                : '200 OK'
+              method === 'RECORD' && !recording ? '500 Refused' : '200 OK'
             }\r\nCSeq: ${cseq}\r\n${extra}Server: fake-raop\r\nContent-Length: 0\r\n\r\n`,
           ),
         );
@@ -281,6 +354,7 @@ export function startFakeRaop(
     } catch {
       /* client went away */
     } finally {
+      recording = false;
       session.closedAtMs ??= now();
       try {
         conn.close();

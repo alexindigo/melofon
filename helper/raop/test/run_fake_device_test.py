@@ -4,6 +4,7 @@ hardware): test/driver (linked against the .so) drives start → PCM → volume
 → flush → teardown; this script asserts what the fake device observed (RTSP
 sequence, RTP pacing, volume, flush, teardown)."""
 import ast
+import hashlib
 import os
 import re
 import select
@@ -238,6 +239,108 @@ def authsetup_scenario():
         f'auth-setup not before ANNOUNCE: {report["requests"]}'
     assert 'authsetup: 1' in driver.stderr
     print('authsetup test: OK (POST /auth-setup before ANNOUNCE)')
+
+
+def password_scenarios():
+    """Independent RTSP client proves the fake, before S13 adds FFI inputs.
+    Hash construction follows OwnTone raop_add_auth, not the receiver parser.
+    These packets prove fixture admission, not ALAC decoding or PIN pairing.
+    """
+    password = 'fixture-password'
+    fake, port = start_fake({'FAKE_PASSWORD': password})
+    try:
+        driver = subprocess.run([DRIVER, port, 'password-required'],
+                                capture_output=True, text=True, timeout=30)
+        assert driver.returncode == 0 and 'DRIVER-OK' in driver.stdout, \
+            'native client did not observe password state'
+        report = read_report(fake)
+        assert report['auth_challenges'] >= 1
+        assert 'RECORD' not in report['accepted_requests']
+        assert report['audio_packets'] == 0
+    finally:
+        fake.kill(); fake.wait()
+    print('password missing: OK (native password state, no RECORD/audio)')
+
+    for username in ('', 'iTunes'):
+        fake, port = start_fake({'FAKE_PASSWORD': password})
+        try:
+            with socket.create_connection(('127.0.0.1', int(port)), timeout=5) as conn:
+                wire = conn.makefile('rb')
+                cseq = 0
+                def request(method, uri, authorization='', extra=''):
+                    nonlocal cseq
+                    cseq += 1
+                    header = f'Authorization: {authorization}\r\n' if authorization else ''
+                    conn.sendall((f'{method} {uri} RTSP/1.0\r\nCSeq: {cseq}\r\n'
+                                  f'{header}{extra}Content-Length: 0\r\n\r\n').encode())
+                    status = int(wire.readline().split()[1])
+                    headers = {}
+                    while True:
+                        line = wire.readline().decode().strip()
+                        if not line: break
+                        key, value = line.split(': ', 1)
+                        headers[key.lower()] = value
+                    assert headers['cseq'] == str(cseq)
+                    return status, headers
+                status, headers = request('OPTIONS', '*')
+                assert status == 401
+                challenge = headers['www-authenticate']
+                realm = re.search(r'realm="([^"]+)"', challenge)[1]
+                nonce = re.search(r'nonce="([^"]+)"', challenge)[1]
+                def authorization(method, target_uri, secret=password, **changes):
+                    def md5(text):
+                        value = hashlib.md5(text.encode()).hexdigest()
+                        return value.upper() if username else value
+                    response = md5(f'{md5(f"{username}:{realm}:{secret}")}:{nonce}:{md5(f"{method}:{target_uri}")}')
+                    fields = dict(username=username, realm=realm, nonce=nonce, uri=target_uri, response=response)
+                    fields.update(changes)
+                    return 'Digest ' + ', '.join(f'{k}="{v}"' for k, v in fields.items())
+
+                uri = f'rtsp://127.0.0.1:{port}/fixture'
+                # Full validation, not header presence. No side effects even
+                # for authenticated-then-tampered methods on the same socket.
+                for bad in ('', 'Basic nonsense', 'Digest nonsense',
+                            authorization('RECORD', uri, secret='wrong'),
+                            authorization('OPTIONS', uri),
+                            authorization('RECORD', uri, realm='wrong'),
+                            authorization('RECORD', uri, nonce='stale'),
+                            authorization('RECORD', uri, uri='rtsp://wrong'),
+                            authorization('RECORD', uri) + ', nonce="duplicate"'):
+                    assert request('RECORD', uri, bad)[0] == 401
+                assert request('OPTIONS', '*', authorization('OPTIONS', '*'))[0] == 200
+                assert request('ANNOUNCE', uri, authorization('ANNOUNCE', uri))[0] == 200
+                # Answer the fake's timing probe during RECORD.
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as timing:
+                    timing.bind(('127.0.0.1', 0)); timing.settimeout(5)
+                    def answer_timing():
+                        packet, peer = timing.recvfrom(64)
+                        reply = bytearray(packet); reply[1] = 0xd3
+                        timing.sendto(reply, peer)
+                    import threading
+                    thread = threading.Thread(target=answer_timing)
+                    thread.start()
+                    status, headers = request('SETUP', uri, authorization('SETUP', uri),
+                        f'Transport: RTP/AVP/UDP;control_port=9;timing_port={timing.getsockname()[1]}\r\n')
+                    assert status == 200
+                    audio_port = int(re.search(r'server_port=(\d+)', headers['transport'])[1])
+                    assert request('RECORD', uri, authorization('RECORD', uri))[0] == 200
+                    thread.join(timeout=5)
+                    assert not thread.is_alive()
+                    timing.sendto(struct.pack('>BBHII', 0x80, 96, 1, 0, 0), ('127.0.0.1', audio_port))
+                    time.sleep(0.05)
+                # Neither a cached authenticated flag nor a digest from a
+                # different request may authorize a later mutation.
+                assert request('SET_PARAMETER', uri, authorization('RECORD', uri))[0] == 401
+                assert request('TEARDOWN', uri, authorization('TEARDOWN', uri))[0] == 200
+                wire.close()
+            report = read_report(fake)
+            assert report['accepted_requests'] == ['OPTIONS', 'ANNOUNCE', 'SETUP', 'RECORD', 'TEARDOWN']
+            assert report['audio_packets'] == 1
+            assert report['volume_params'] == []
+            assert report['auth_challenges'] == 11
+        finally:
+            fake.kill(); fake.wait()
+    print('password digest: OK (correct + iTunes, tampering rejected, admitted RTP)')
 
 
 # --- Failure-injection scenarios (plan atv3-session-recycle) -------------
@@ -493,6 +596,7 @@ def main():
     fail_scenario()
     contract_scenario()
     authsetup_scenario()
+    password_scenarios()
     schedfail_scenario()
     teardownfail_scenario()
     free_contract_scenario()

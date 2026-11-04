@@ -2,8 +2,12 @@
 """Fake AirPlay 1 (RAOP) device for the helper's functional test: answers
 enough RTSP to get melofon-raop streaming, then counts RTP audio packets on
 the UDP server port. Prints one REPORT line on stdin EOF."""
+import hashlib
+import hmac
 import os
 import queue
+import re
+import secrets
 import select
 import socket
 import socketserver
@@ -19,6 +23,39 @@ RECORD_DELAY_MS = int(os.environ.get('FAKE_RECORD_DELAY_MS', '0'))
 ANNOUNCE_403 = os.environ.get('FAKE_ANNOUNCE_403') == '1'
 WITHHOLD_TEARDOWN = os.environ.get('FAKE_WITHHOLD_TEARDOWN') == '1'
 DELAY_METHOD = os.environ.get('FAKE_DELAY_METHOD', '')
+# Opt-in RAOP's legacy, no-qop MD5 digest (not PIN pairing).
+PASSWORD = os.environ.get('FAKE_PASSWORD')
+REALM = os.environ.get('FAKE_DIGEST_REALM', 'Fake RAOP')
+if any(c in REALM for c in '\r\n"\\'):
+    raise ValueError('invalid fake digest realm')
+
+
+def valid_digest(value, nonce, method, uri):
+    if not value.startswith('Digest '):
+        return False
+    fields = {}
+    rest = value[7:]
+    while rest:
+        match = re.match(r'^\s*(\w+)="([^"\\\r\n]*)"\s*(,\s*|$)', rest)
+        if not match or match[1] in fields:
+            return False
+        fields[match[1]] = match[2]
+        rest = rest[match.end():]
+        if match[3] and not rest:
+            return False
+    if set(fields) != {'username', 'realm', 'nonce', 'uri', 'response'}:
+        return False
+    if (fields['username'] not in ('', 'iTunes') or fields['realm'] != REALM
+            or fields['nonce'] != nonce or fields['uri'] != uri
+            or not re.fullmatch(r'[a-fA-F0-9]{32}', fields['response'])):
+        return False
+    # OwnTone uses uppercase at ALL three hash stages for its iTunes quirk.
+    def md5(text):
+        result = hashlib.md5(text.encode()).hexdigest()
+        return result.upper() if fields['username'] == 'iTunes' else result
+    ha1 = md5(f'{fields["username"]}:{REALM}:{PASSWORD}')
+    ha2 = md5(f'{method}:{uri}')
+    return hmac.compare_digest(fields['response'], md5(f'{ha1}:{nonce}:{ha2}'))
 
 state = {
     'requests': [],
@@ -45,6 +82,9 @@ state = {
     'active_remotes': set(),
     'connections': [],
     'audio_by_source': {},
+    'accepted_requests': [],
+    'auth_challenges': 0,
+    'recordings': set(),
 }
 
 NTP_EPOCH_DELTA = 2208988800
@@ -64,6 +104,8 @@ class UDPCollector(threading.Thread):
     def run(self):
         while True:
             data, source = self.sock.recvfrom(4096)
+            if PASSWORD is not None and not state['recordings']:
+                continue
             if len(data) < 12:
                 continue
             state['audio_packets'] += 1
@@ -119,6 +161,7 @@ class RTSPHandler(socketserver.BaseRequestHandler):
 
     def setup(self):
         self.chunks = queue.Queue()
+        self.nonce = secrets.token_hex(16)
         self.connection = {'generation': len(state['connections']) + 1,
                            'closed_at': None, 'requests': []}
         state['connections'].append(self.connection)
@@ -169,6 +212,19 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                 state['requests'].append(method)
                 self.connection['requests'].append(method)
                 print(f'SEEN {self.connection["generation"]} {method} {headers.get("active-remote", "0")}', flush=True)
+                cseq = headers.get('cseq', '0')
+                if PASSWORD is not None and not valid_digest(
+                        headers.get('authorization', ''), self.nonce, method, url):
+                    state['auth_challenges'] += 1
+                    res = (f'RTSP/1.0 401 Unauthorized\r\nCSeq: {cseq}\r\n'
+                           f'WWW-Authenticate: Digest realm="{REALM}", nonce="{self.nonce}"\r\n'
+                           'Content-Length: 0\r\n\r\n')
+                    try:
+                        self.request.sendall(res.encode())
+                    except OSError:
+                        return
+                    continue
+                state['accepted_requests'].append(method)
                 if method == DELAY_METHOD and headers.get('active-remote') == '2':
                     time.sleep(0.6)
                 if method == 'RECORD' and RECORD_DELAY_MS > 0:
@@ -181,12 +237,14 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     state['active_remotes'].add(headers['active-remote'])
                 cseq = headers.get('cseq', '0')
                 if method == 'SETUP':
-                    print(f'SETUP headers: {headers!r}', file=sys.stderr, flush=True)
+                    safe_headers = {k: v for k, v in headers.items() if k != 'authorization'}
+                    print(f'SETUP headers: {safe_headers!r}', file=sys.stderr, flush=True)
                     print(f'CONTROL {headers.get("active-remote", "0")} {headers["transport"].split("control_port=")[1].split(";")[0]}', flush=True)
                 if method == 'ANNOUNCE':
                     state['sdp'] = body.decode(errors='replace')
                 if method == 'RECORD':
                     state['rtp_info'] = headers.get('rtp-info', '')
+                    state['recordings'].add(self.connection['generation'])
                 if method == 'POST' and 'auth-setup' in url:
                     state['auth_setups'] += 1
                     if state['auth_setup_before_announce'] is None:
@@ -204,6 +262,7 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                 if method == 'FLUSH':
                     state['flushes'] += 1
                 if method == 'TEARDOWN':
+                    state['recordings'].discard(self.connection['generation'])
                     state['teardowns'] += 1
                     if WITHHOLD_TEARDOWN:
                         # Keep reading the socket independently, never ack it.
@@ -250,6 +309,9 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     self.request.sendall(res.encode())
                 except OSError:
                     return
+
+    def finish(self):
+        state['recordings'].discard(self.connection['generation'])
 
 
 class Server(socketserver.ThreadingTCPServer):
