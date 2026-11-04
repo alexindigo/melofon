@@ -546,6 +546,7 @@ Deno.test({
           outputs = createOutputs({ notify: f.notify, persistence });
           devices = createAirplayDevices({
             outputs,
+            changed: () => f.notify!.emit(['outputs'], undefined, 'all'),
             resolver: {
               resolve: () => Promise.resolve(receiverService(fake.port)),
               close() {},
@@ -603,9 +604,7 @@ Deno.test({
             speakers: createSpeakers({
               outputs,
               playback,
-              adapterView: (id) => ({
-                preparation: devices.admission.describe(id),
-              }),
+              adapterView: devices.describe,
             }),
           };
         },
@@ -685,6 +684,10 @@ Deno.test({
         assertEquals((await t.queue()).count, 1);
         await t.play();
         await t.audio(0);
+        const connected = (await t.read())[0];
+        assertEquals(connected.state.connection, 'connected');
+        assertEquals(connected.state.authentication, 'none');
+        assertEquals(connected.abilities.formats, ['pcm']);
         const packets = fake.sessions[0].audioPackets;
         t.announce('down');
         let row = (await t.read())[0];

@@ -73,6 +73,8 @@ export type AdmissionResult<T> =
   | { ok: false; error: PreparationError };
 
 export interface OutputProtocol<P extends string, C, I, T, E> {
+  /** Adapter-only fresh normalized facts; never restored preferences. */
+  facts(id: string): Readonly<C> | null;
   observe(id: string, observation: TargetObservation<C>): void;
   fail(id: string, error: PreparationError): void;
   prepare(
@@ -92,6 +94,7 @@ interface Slot {
   view: PreparationView;
   attempts: Set<AbortController>;
   latest?: AbortController;
+  expiry?: ReturnType<typeof setTimeout>;
 }
 
 function immutable<C>(value: C): Readonly<C> {
@@ -156,6 +159,7 @@ export function createOutputAdmission(deps: {
       };
       slots.set(id, slot);
     } else if (slot.key !== key) {
+      clearTimeout(slot.expiry);
       for (const attempt of slot.attempts) attempt.abort();
       slot.key = key;
       slot.endpoint = endpoint;
@@ -165,14 +169,28 @@ export function createOutputAdmission(deps: {
     return slot;
   };
   const setView = (slot: Slot, view: PreparationView) => {
+    clearTimeout(slot.expiry);
     slot.view = view;
+    if (view.state === 'ready') {
+      const expire = () => {
+        if (closed || slot.view !== view) return;
+        const remaining = view.expiresAt! - now();
+        if (remaining <= 0) {
+          setView(slot, { state: 'unresolved', targetRevision: slot.revision });
+        } else {
+          slot.expiry = setTimeout(expire, Math.min(remaining, 2147483647));
+          Deno.unrefTimer(slot.expiry);
+        }
+      };
+      expire();
+    }
     deps.changed?.();
   };
   return {
     describe(id: string): PreparationView {
       const slot = sync(id);
       if (slot.view.state === 'ready' && slot.view.expiresAt! <= now()) {
-        slot.view = { state: 'unresolved', targetRevision: slot.revision };
+        return { state: 'unresolved', targetRevision: slot.revision };
       }
       return structuredClone(slot.view);
     },
@@ -185,6 +203,7 @@ export function createOutputAdmission(deps: {
     close(): void {
       closed = true;
       for (const slot of slots.values()) {
+        clearTimeout(slot.expiry);
         for (const attempt of slot.attempts) attempt.abort();
       }
     },
@@ -252,6 +271,14 @@ export function createOutputAdmission(deps: {
         return snapshot;
       };
       return {
+        facts(id) {
+          const slot = sync(id), saved = observations.get(id);
+          return slot.view.state === 'ready' &&
+              saved?.revision === slot.revision &&
+              saved.observation.expiresAt > now()
+            ? saved.observation.config
+            : null;
+        },
         observe(id, observation) {
           cache(id, observation);
         },

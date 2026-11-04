@@ -364,7 +364,7 @@ Deno.test('events: current admin role, per-user profile/session audience and hou
     for (const socket of [sa, sb, sd]) {
       assertEquals(socket.frames, [{
         type: 'changed',
-        events: { player: [], queue: [], outputs: [] },
+        events: { player: [], queue: [], speakers: [] },
       }]);
     }
     assertEquals(sc.frames, [{
@@ -372,7 +372,7 @@ Deno.test('events: current admin role, per-user profile/session audience and hou
       events: {
         player: [],
         queue: [],
-        outputs: [],
+        speakers: [],
         hats: [],
         settings: [],
         libraries: [],
@@ -446,10 +446,12 @@ Deno.test('events: household queue, player and speaker changes reach cookie/Bear
     outputs.update('speaker', { volume: 42 });
     assertEquals(outputs.get('speaker')?.volume, 42);
     for (const socket of sockets) {
-      await waitFor(() => socket.frames.some((frame) => frame.events?.outputs));
+      await waitFor(() =>
+        socket.frames.some((frame) => frame.events?.speakers)
+      );
       assertEquals(socket.frames.shift(), {
         type: 'changed',
-        events: { outputs: [], volume: [] },
+        events: { speakers: [], volume: [] },
       });
     }
   } finally {

@@ -139,7 +139,11 @@ export async function startServer(options: {
     },
     changed: () => notify.emit(['outputs'], undefined, 'all'),
   });
-  const airplay = createAirplayDevices({ outputs, admission: outputAdmission });
+  const airplay = createAirplayDevices({
+    outputs,
+    admission: outputAdmission,
+    changed: () => notify.emit(['outputs'], undefined, 'all'),
+  });
   const library = createLibrary(store, lyrics, {
     dataDir: cfg.dataDir,
     media,
@@ -162,7 +166,7 @@ export async function startServer(options: {
     outputs,
     playback,
     registerAddress: airplay.registerAddress,
-    adapterView: (id) => ({ preparation: outputAdmission.describe(id) }),
+    adapterView: airplay.describe,
   });
   const app = {
     store,

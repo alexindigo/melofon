@@ -276,6 +276,8 @@ export interface Output {
   receiverIdentity?: string;
   /** TXT `sf` bit 9: device verification. OwnTone `requires_auth`. */
   requiresAuth?: boolean;
+  /** Receiver advertises password protection; never contains a credential. */
+  hasPassword?: boolean;
   /** The device wants a PIN/password (OwnTone needs_auth_key on the wire);
    * set by the boot when its helper reports the auth/verification path. */
   needsAuthKey?: boolean;
@@ -335,6 +337,7 @@ export interface Outputs {
       pin?: string;
       needsAuthKey?: boolean;
       requiresAuth?: boolean;
+      hasPassword?: boolean;
       connectionStrategy?: ConnectionStrategy;
     },
     source?: CommandSource,
@@ -1047,6 +1050,9 @@ export function createOutputs(
       }
       if (opts.requiresAuth !== undefined) {
         found.requiresAuth = opts.requiresAuth;
+      }
+      if (opts.hasPassword !== undefined) {
+        found.hasPassword = opts.hasPassword;
       }
       if (opts.pin !== undefined) {
         // A command, not state: straight to the boot, never stored.

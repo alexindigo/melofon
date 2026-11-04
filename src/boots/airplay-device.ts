@@ -6,15 +6,18 @@ import {
 } from '../output-admission.ts';
 import { createMdnsResolver, type MdnsResolver } from '../mdns-resolver.ts';
 import type { MdnsService } from '../mdns.ts';
+import type { SpeakerAdapterView, SpeakerSessionView } from '../speakers.ts';
 import { airplayInstance, normalizeAirplayAddress } from './airplay-address.ts';
 import { createFfiSpawn } from './raop-ffi.ts';
 import {
+  airplayAbilities,
   type AirplayDriver,
   type AirplayInput,
   airplayOutputId,
   type AirplayProfile,
   type AirplaySpawn,
   type AirplayTransport,
+  passwordRequiredFromTxt,
   profileFromService,
   validateAirplayProfile,
 } from './airplay-profile.ts';
@@ -24,6 +27,7 @@ export function createAirplayDevices(deps: {
   admission?: OutputAdmission;
   resolver?: MdnsResolver;
   spawn?: AirplaySpawn;
+  changed?(): void;
 }) {
   const { outputs } = deps;
   const admission = deps.admission ??
@@ -42,6 +46,17 @@ export function createAirplayDevices(deps: {
     });
   const resolver = deps.resolver ?? createMdnsResolver();
   const configurationRevisions = new Map<string, number>();
+  const sessions = new Map<string, { key: string; view: SpeakerSessionView }>();
+  const sessionKey = (id: string) => {
+    const row = outputs.get(id, { includeIgnored: true });
+    return JSON.stringify([
+      outputs.revision(id),
+      row?.type,
+      row?.host,
+      row?.port,
+      row?.receiverIdentity,
+    ]);
+  };
   outputs.onCommand((id, command) => {
     if (command.forget || command.ignore) {
       const identity = outputs.get(id, { includeIgnored: true })
@@ -85,8 +100,16 @@ export function createAirplayDevices(deps: {
         signal,
       );
       const identity = receiverIdentity(endpoint.id, service);
-      const config = profileFromService(service, endpoint.address);
       const current = outputs.get(endpoint.id, { includeIgnored: true });
+      const hasPassword = passwordRequiredFromTxt(service.txt);
+      if (
+        !signal.aborted && current?.host === endpoint.address &&
+        current.port === endpoint.port &&
+        (current.hasPassword ?? false) !== hasPassword
+      ) {
+        outputs.update(endpoint.id, { hasPassword });
+      }
+      const config = profileFromService(service, endpoint.address);
       if (
         !signal.aborted && current?.host === endpoint.address &&
         current.port === endpoint.port
@@ -134,6 +157,10 @@ export function createAirplayDevices(deps: {
     const row = outputs.get(id, { includeIgnored: true });
     if (!row?.host) return;
     receiverIdentity(id, service);
+    const hasPassword = passwordRequiredFromTxt(service.txt);
+    if ((row.hasPassword ?? false) !== hasPassword) {
+      outputs.update(id, { hasPassword });
+    }
     const profile = profileFromService(service, row.host);
     protocol.observe(id, {
       config: profile,
@@ -147,6 +174,30 @@ export function createAirplayDevices(deps: {
   return {
     admission,
     protocol,
+    describe(id: string): SpeakerAdapterView {
+      const preparation = admission.describe(id);
+      const facts = protocol.facts(id);
+      const saved = sessions.get(id);
+      return {
+        preparation,
+        abilities: facts ? airplayAbilities(facts) : null,
+        session: structuredClone(
+          saved?.key === sessionKey(id) ? saved.view : {
+            connection: 'disconnected',
+            authentication: 'none',
+          },
+        ),
+      };
+    },
+    sessionChanged(id: string, view: SpeakerSessionView) {
+      const key = sessionKey(id), previous = sessions.get(id);
+      if (
+        previous?.key === key &&
+        JSON.stringify(previous.view) === JSON.stringify(view)
+      ) return;
+      sessions.set(id, { key, view: structuredClone(view) });
+      deps.changed?.();
+    },
     observe: accept,
     observationId(service: MdnsService): string {
       const parsed = airplayInstance(service.name);
@@ -183,6 +234,7 @@ export function createAirplayDevices(deps: {
       if (service) {
         outputs.register({
           ...row,
+          hasPassword: passwordRequiredFromTxt(service.txt),
           receiverIdentity: receiverIdentity(id, service),
         }, source);
       } else outputs.restore(row, source);

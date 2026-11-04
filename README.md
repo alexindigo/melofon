@@ -571,6 +571,22 @@ Native POST/GET outputs include `preparation`: `unresolved`, `preparing`,
 Selection and volume remain operator preferences even when preparation fails.
 The OwnTone output/player wire shape is unchanged.
 
+`GET /api/v1/speakers` and its detail route expose independent
+`state.preparation`, `state.connection` (`disconnected`, `connecting`,
+`connected`, `failed`) and `state.authentication` (`none`,
+`authentication_required`). The native helper's generic auth challenge does
+not identify a bad password versus a pending PIN. A completed handshake clears
+that pending action. Session failures include a safe `state.error`.
+
+`abilities` is null until fresh supported receiver facts are available and
+becomes null again when they expire. AirPlay reports volume and source seek,
+PIN when receiver verification requires it, and the bridge input format `pcm`,
+not AAC or the ALAC wire encoding. Password input remains unsupported at this
+stage. These facts do not imply connection or audio delivery. Clients refetch
+on `/api/v1/events` `speakers` invalidations, including fact expiry; OwnTone
+keeps its `outputs` notification and snake_case auth fields. Reading or
+publishing status never creates a playback demand or renews retry authority.
+
 AirPlay manual registration and `MELOFON_AIRPLAY_HOST` perform bounded,
 target-specific unicast DNS-SD lookup independently of automatic browsing.
 `airplay.mdns=off` disables browsing, not explicit preparation. TXT/SRV/address

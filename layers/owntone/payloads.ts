@@ -238,7 +238,7 @@ export function outputPayload(output: OutputRow) {
     name: output.name,
     type: output.type,
     selected: output.selected,
-    has_password: false,
+    has_password: output.hasPassword ?? false,
     requires_auth: output.requiresAuth ?? false,
     needs_auth_key: output.needsAuthKey ?? false,
     volume: output.volume,

@@ -2,6 +2,7 @@
 import { isIPv4 } from 'node:net';
 import type { MdnsService } from '../mdns.ts';
 import { type OutputEndpoint, PreparationError } from '../output-admission.ts';
+import type { SpeakerAbilities } from '../speakers.ts';
 
 export type AirplayControl =
   | { cmd: 'volume'; volume: number }
@@ -44,6 +45,23 @@ export interface AirplayDriver {
   start(profile: Readonly<AirplayProfile>, input: AirplayInput): Promise<void>;
 }
 export type AirplaySpawn = (event: HelperEventFn) => AirplayDriver;
+
+/** Bridge input format, not the ALAC packet encoding or an AAC promise. */
+export function airplayAbilities(
+  profile: Readonly<AirplayProfile>,
+): SpeakerAbilities {
+  return {
+    volume: true,
+    seek: true,
+    pin: profile.requiresAuth,
+    password: false, // Credential input is not implemented yet.
+    formats: ['pcm'],
+  };
+}
+
+export function passwordRequiredFromTxt(txt: Record<string, string>): boolean {
+  return txt.pw !== undefined && txt.pw !== 'false';
+}
 
 export function airplayOutputId(host: string): string {
   let hash = 0xcbf29ce484222325n;
@@ -114,7 +132,7 @@ export function profileFromService(
   service: MdnsService,
   requestedHost = service.address,
 ): AirplayProfile {
-  if (service.txt.pw !== undefined && service.txt.pw !== 'false') {
+  if (passwordRequiredFromTxt(service.txt)) {
     throw new PreparationError(
       'unsupported',
       'receiver password is unsupported',

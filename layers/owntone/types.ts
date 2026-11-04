@@ -247,6 +247,7 @@ export interface OutputRow {
   needsAuthKey?: boolean;
   /** TXT `sf` bit 9 — OwnTone `requires_auth` on the wire. */
   requiresAuth?: boolean;
+  hasPassword?: boolean;
 }
 
 export interface ArtistRow {

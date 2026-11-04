@@ -28,8 +28,24 @@ function strategy(value: unknown) {
 }
 
 /** Public facts only. No profiles, transports, permits or lifecycle commands. */
+export interface SpeakerAbilities {
+  volume: boolean;
+  seek: boolean;
+  pin: boolean;
+  password: boolean;
+  formats: string[];
+}
+
+export interface SpeakerSessionView {
+  connection: 'disconnected' | 'connecting' | 'connected' | 'failed';
+  authentication: 'none' | 'authentication_required';
+  error?: { code: string; message: string };
+}
+
 export interface SpeakerAdapterView {
   preparation: PreparationView;
+  abilities?: SpeakerAbilities | null;
+  session?: SpeakerSessionView;
 }
 
 export interface SpeakerView {
@@ -45,7 +61,8 @@ export interface SpeakerView {
   connectionStrategy: Output['connectionStrategy'];
   adopted: boolean;
   discovered: boolean;
-  state: SpeakerAdapterView;
+  abilities: SpeakerAbilities | null;
+  state: { preparation: PreparationView } & SpeakerSessionView;
 }
 
 /** An offline ignore marker retains identity only, never old protocol facts. */
@@ -81,20 +98,30 @@ export function createSpeakers(deps: {
     connectionStrategy?: Output['connectionStrategy'];
   }, source?: CommandSource): Promise<Output | null>;
 }) {
-  const view = (row: Output): SpeakerView => ({
-    ...(deps.outputs.ignored().includes(row.id) ? { ignored: true } : {}),
-    id: row.id,
-    name: row.name,
-    protocol: row.type,
-    ...(row.host === undefined ? {} : { address: row.host }),
-    ...(row.port === undefined ? {} : { port: row.port }),
-    ...(row.model === undefined ? {} : { model: row.model }),
-    selected: row.selected,
-    volume: row.volume,
-    connectionStrategy: row.connectionStrategy,
-    ...deps.outputs.lifetime(row.id),
-    state: structuredClone(deps.adapterView(row.id)),
-  });
+  const view = (row: Output): SpeakerView => {
+    const adapter = deps.adapterView(row.id);
+    return ({
+      ...(deps.outputs.ignored().includes(row.id) ? { ignored: true } : {}),
+      id: row.id,
+      name: row.name,
+      protocol: row.type,
+      ...(row.host === undefined ? {} : { address: row.host }),
+      ...(row.port === undefined ? {} : { port: row.port }),
+      ...(row.model === undefined ? {} : { model: row.model }),
+      selected: row.selected,
+      volume: row.volume,
+      connectionStrategy: row.connectionStrategy,
+      ...deps.outputs.lifetime(row.id),
+      abilities: structuredClone(adapter.abilities ?? null),
+      state: structuredClone({
+        preparation: adapter.preparation,
+        ...(adapter.session ?? {
+          connection: 'disconnected',
+          authentication: 'none',
+        }),
+      }),
+    });
+  };
   const requireRow = (id: string, includeIgnored = false) => {
     const row = deps.outputs.get(id, { includeIgnored });
     if (!row) throw new SpeakerError('not_found', 'Speaker not found');

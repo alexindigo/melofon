@@ -508,7 +508,17 @@ export interface SpeakerView {
   selected: boolean;
   volume: number;
   connectionStrategy: 'melofon' | 'owntone' | 'audiostation';
+  abilities: {
+    volume: boolean;
+    seek: boolean;
+    pin: boolean;
+    password: boolean;
+    formats: string[];
+  } | null;
   state: {
+    connection: 'disconnected' | 'connecting' | 'connected' | 'failed';
+    authentication: 'none' | 'authentication_required';
+    error?: { code: string; message: string };
     preparation: {
       state: 'unresolved' | 'preparing' | 'ready' | 'failed';
       targetRevision: number;

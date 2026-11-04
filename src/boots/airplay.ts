@@ -269,6 +269,14 @@ export function createAirplayBoot(
         log.event('content_failed', { output: id, generation: session, error });
         const e = epoch(id);
         e.contentError = true;
+        devices.sessionChanged(id, {
+          connection: 'failed',
+          authentication: 'none',
+          error: {
+            code: 'content_failed',
+            message: 'Audio source could not be decoded',
+          },
+        });
         cancelRetry(id);
         grants.delete(id);
         void retire(id, r, 'content');
@@ -320,6 +328,12 @@ export function createAirplayBoot(
     r.connected = false;
     r.transport = null;
     runtimes.delete(id);
+    if (reason !== 'failed' && reason !== 'content') {
+      devices.sessionChanged(id, {
+        connection: 'disconnected',
+        authentication: 'none',
+      });
+    }
     if (!t) return Promise.resolve(true);
     log.event('session_retire', {
       output: id,
@@ -337,6 +351,14 @@ export function createAirplayBoot(
         blocked.add(id);
         grants.delete(id);
         cancelRetry(id);
+        devices.sessionChanged(id, {
+          connection: 'failed',
+          authentication: 'none',
+          error: {
+            code: 'retirement_failed',
+            message: 'Speaker session could not be released',
+          },
+        });
         log.event('retirement_failed', {
           output: id,
           generation: r.session - 1,
@@ -401,6 +423,11 @@ export function createAirplayBoot(
     const e = epoch(id);
     e.failed = true;
     void retire(id, r, 'failed');
+    devices.sessionChanged(id, {
+      connection: 'failed',
+      authentication: 'none',
+      error: { code: 'transport_failed', message: 'Speaker connection failed' },
+    });
     const view = playback.playerView();
     if (intent === 'play' && view.state === 'play' && !usable()) {
       // Acquire authority BEFORE synchronous internal Pause notification.
@@ -478,6 +505,10 @@ export function createAirplayBoot(
       grants.delete(id);
       if (!prepared.ok) {
         e.failed = true;
+        devices.sessionChanged(id, {
+          connection: 'disconnected',
+          authentication: 'none',
+        });
         log.event('preparation_failed', { output: id, error: prepared.error });
         if (!usable() && playback.playerView().state === 'play') {
           lease = {
@@ -536,6 +567,10 @@ export function createAirplayBoot(
         }, {
           publish(transport) {
             r.transport = transport;
+            devices.sessionChanged(id, {
+              connection: 'connecting',
+              authentication: 'none',
+            });
           },
           onEvent({ event, value }) {
             if (!own()) return;
@@ -543,9 +578,20 @@ export function createAirplayBoot(
               sessionFailed(id, r, 'helper event');
             } else if (event === 'state' && value === 'password') {
               outputs.update(id, { needsAuthKey: true }, ownedSource);
+              devices.sessionChanged(id, {
+                connection: 'connecting',
+                authentication: 'authentication_required',
+              });
             } else if (event === 'state' && value === 'connected') {
               const wasConnected = r.connected;
               r.connected = true;
+              devices.sessionChanged(id, {
+                connection: 'connected',
+                authentication: 'none',
+              });
+              if (outputs.get(id)?.needsAuthKey) {
+                outputs.update(id, { needsAuthKey: false }, ownedSource);
+              }
               const latest = playback.playerView();
               r.progress = latest.itemProgressMs;
               r.at = performance.now();

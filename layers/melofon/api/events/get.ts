@@ -114,7 +114,7 @@ export default async function (request: HatRequest, context: HatContext) {
     ) return;
     const target = audience === 'admins' ? adminPending : pending;
     for (const name of names) {
-      merge(target, name, ids?.[name] ?? []);
+      merge(target, name === 'outputs' ? 'speakers' : name, ids?.[name] ?? []);
     }
     if (hasPending()) schedule();
   });

@@ -49,6 +49,7 @@ async function setup() {
         },
       });
       admission = createOutputAdmission({
+        changed: () => f.notify!.emit(['outputs'], undefined, 'all'),
         now: () => clock,
         endpoint: (id) => {
           const row = outputs.get(id);
@@ -60,6 +61,7 @@ async function setup() {
       devices = createAirplayDevices({
         outputs,
         admission,
+        changed: () => f.notify!.emit(['outputs'], undefined, 'all'),
         resolver: {
           resolve() {
             lookups++;
@@ -90,7 +92,7 @@ async function setup() {
         outputs,
         speakers: createSpeakers({
           outputs,
-          adapterView: (id) => ({ preparation: admission.describe(id) }),
+          adapterView: devices.describe,
         }),
       };
     },
@@ -193,7 +195,16 @@ Deno.test('speaker HTTP reads project discovered facts and failures while OwnTon
       connectionStrategy: 'melofon',
       adopted: false,
       discovered: true,
+      abilities: {
+        volume: true,
+        seek: true,
+        pin: false,
+        password: false,
+        formats: ['pcm'],
+      },
       state: {
+        connection: 'disconnected',
+        authentication: 'none',
         preparation: {
           state: 'ready',
           targetRevision: 1,
@@ -236,10 +247,12 @@ Deno.test('speaker HTTP reads project discovered facts and failures while OwnTon
       (await t.read(credential)).speakers[0].state.preparation.state,
       'unresolved',
     );
+    assertEquals((await t.read(credential)).speakers[0].abilities, null);
     t.announce('up', { ...service, txt: { ...service.txt, pw: 'true' } });
     const failed = (await t.read(credential)).speakers[0].state.preparation;
     assertEquals(failed.state, 'failed');
     assertEquals(failed.error.code, 'unsupported');
+    assertEquals((await (await t.own()).json()).outputs[0].has_password, true);
     assert(!('source' in failed));
     t.announce('down');
     assertEquals(await t.read(credential), { speakers: [] });
