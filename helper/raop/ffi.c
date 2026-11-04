@@ -158,6 +158,13 @@ struct raop_handle
   int events_tail;                 /* next read */
   pthread_mutex_t events_lock;
 
+  /* Latest credential state plus one leased snapshot. Fixed-size owned storage
+   * avoids allocation failure at export; revisions never use the state ring. */
+  pthread_mutex_t credential_lock;
+  uint64_t credential_revision, credential_pending, credential_leased;
+  int credential_kind, credential_lease_kind;
+  char credential_key[129], credential_lease_key[129];
+
   /* Commands queued by the API onto the loop thread. */
   cmd *cmds_head;
   cmd *cmds_tail;
@@ -244,6 +251,35 @@ raop_ffi_on_state(uint64_t device_id, enum output_device_state state)
         break;
       }
   pthread_mutex_unlock(&rt.lock);
+}
+
+/* stubs.c routes pairing saves here; never a diagnostic/control event. */
+int
+raop_ffi_credential_changed(uint64_t device_id, const char *key)
+{
+  if (key) {
+    if (strnlen(key, 129) != 128) return -1;
+    for (size_t i = 0; i < 128; i++)
+      if (!((key[i] >= '0' && key[i] <= '9') ||
+            (key[i] >= 'a' && key[i] <= 'f') ||
+            (key[i] >= 'A' && key[i] <= 'F'))) return -1;
+  }
+  int result = -1;
+  pthread_mutex_lock(&rt.lock);
+  for (raop_t *h = rt.handles_list; h; h = h->next) if (h->id == device_id) {
+    pthread_mutex_lock(&h->credential_lock);
+    if (h->credential_revision != UINT64_MAX) {
+      h->credential_pending = ++h->credential_revision;
+      h->credential_kind = key ? 1 : 2;
+      explicit_bzero(h->credential_key, sizeof(h->credential_key));
+      if (key) memcpy(h->credential_key, key, 128);
+      result = 0;
+    }
+    pthread_mutex_unlock(&h->credential_lock);
+    break;
+  }
+  pthread_mutex_unlock(&rt.lock);
+  return result;
 }
 
 /* stubs.c routes outputs_device_get() here. */
@@ -555,6 +591,9 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             event_free(h->resume_event);
             pthread_mutex_destroy(&h->events_lock);
             pthread_mutex_destroy(&h->cmds_lock);
+            explicit_bzero(h->credential_key, sizeof(h->credential_key));
+            explicit_bzero(h->credential_lease_key, sizeof(h->credential_lease_key));
+            pthread_mutex_destroy(&h->credential_lock);
             free(h);
             pthread_mutex_lock(&c->sync->lock);
             c->sync->result = 0;
@@ -767,10 +806,14 @@ raop_new(void)
 
   pthread_mutex_init(&h->events_lock, NULL);
   pthread_mutex_init(&h->cmds_lock, NULL);
+  pthread_mutex_init(&h->credential_lock, NULL);
   h->state = OUTPUT_STATE_STOPPED;
 
   if (runtime_acquire() < 0)
     {
+      pthread_mutex_destroy(&h->events_lock);
+      pthread_mutex_destroy(&h->cmds_lock);
+      pthread_mutex_destroy(&h->credential_lock);
       free(h);
       return NULL;
     }
@@ -779,6 +822,9 @@ raop_new(void)
   if (!h->player)
     {
       runtime_release();
+      pthread_mutex_destroy(&h->events_lock);
+      pthread_mutex_destroy(&h->cmds_lock);
+      pthread_mutex_destroy(&h->credential_lock);
       free(h);
       return NULL;
     }
@@ -786,6 +832,7 @@ raop_new(void)
   if (!h->resume_event) {
     raop_player_free(h->player); runtime_release();
     pthread_mutex_destroy(&h->events_lock); pthread_mutex_destroy(&h->cmds_lock);
+    pthread_mutex_destroy(&h->credential_lock);
     free(h); return NULL;
   }
 
@@ -959,6 +1006,50 @@ raop_poll(raop_t *h, char *buf, size_t cap)
   pthread_mutex_unlock(&h->events_lock);
 
   return (int)len;
+}
+
+int
+raop_credential_poll(raop_t *h, uint64_t *revision, char *key, size_t cap)
+{
+  if (!h || !revision) return -1;
+  pthread_mutex_lock(&h->credential_lock);
+  int kind = h->credential_leased ? h->credential_lease_kind : h->credential_kind;
+  if (!h->credential_leased && !h->credential_pending) {
+    pthread_mutex_unlock(&h->credential_lock); return 0;
+  }
+  if (kind == 1 && (!key || cap < 129)) {
+    pthread_mutex_unlock(&h->credential_lock); return -2;
+  }
+  if (!h->credential_leased) {
+    h->credential_leased = h->credential_pending;
+    h->credential_lease_kind = kind;
+    memcpy(h->credential_lease_key, h->credential_key, 129);
+  }
+  *revision = h->credential_leased;
+  if (key && cap) {
+    key[0] = 0;
+    if (kind == 1) memcpy(key, h->credential_lease_key, 129);
+  }
+  pthread_mutex_unlock(&h->credential_lock);
+  return kind;
+}
+
+int
+raop_credential_ack(raop_t *h, uint64_t revision)
+{
+  if (!h || !revision) return -1;
+  pthread_mutex_lock(&h->credential_lock);
+  if (h->credential_leased != revision) {
+    pthread_mutex_unlock(&h->credential_lock); return 0;
+  }
+  if (h->credential_pending == revision) {
+    h->credential_pending = 0;
+    explicit_bzero(h->credential_key, sizeof(h->credential_key));
+  }
+  h->credential_leased = 0;
+  explicit_bzero(h->credential_lease_key, sizeof(h->credential_lease_key));
+  pthread_mutex_unlock(&h->credential_lock);
+  return 1;
 }
 
 /* Teardown (if needed), free, and release the shared runtime. Returns 0

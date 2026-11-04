@@ -82,6 +82,20 @@ int raop_pin(raop_t *h, const char *pin);
  * events), -1 on error. */
 int raop_poll(raop_t *h, char *buf, size_t cap);
 
+/* Private pairing state, independent of the lossy state/diagnostic rings.
+ * 0=empty, 1=128-byte hex key (+ NUL), 2=clear tombstone, -1=invalid,
+ * -2=key buffer too small (nothing consumed). revision is nonzero and strictly
+ * increasing per handle. Poll leases a snapshot; repeated polls return that
+ * exact snapshot until ack. Updates while leased retain the latest newer state
+ * for the next poll. This is a state mailbox, not an event history.
+ * Never log its bytes. NULL key is used only with a clear tombstone.
+ * Caller must serialize poll/ack with free; no calls after free begins. */
+int raop_credential_poll(raop_t *h, uint64_t *revision, char *key, size_t cap);
+/* 1=exact leased revision acknowledged, 0=stale/unknown revision, -1=invalid.
+ * Ack only after the private consumer accepts the state (durably for adopted
+ * speakers). Teardown retains unacked state; explicit free erases/cancels it. */
+int raop_credential_ack(raop_t *h, uint64_t revision);
+
 /* Teardown (if needed), destroy all device-local native sessions/control
  * sockets/queued callbacks, free, and release the shared runtime. Returns 0
  * only after local connection destruction (not remote ACK/peer availability),

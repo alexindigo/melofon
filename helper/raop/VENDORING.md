@@ -99,9 +99,42 @@ after native local release. Native discovery/config strings are not used. Invali
 lengths, NULs and non-hex fruit keys reject the entire command without truncation.
 The local `outputs/raop.c` patch removes digest Authorization debug output;
 `MELOFON_RAOP_DEBUG` must never expose credentials or digest responses. Pair-key
-export and invalidation acknowledgement are a separate ABI, not this start input.
+export and invalidation acknowledgement use a separate ABI, not this start input.
 Existing native key invalidation/replacement paths also erase the old owned key
-before freeing it; no credential notification/export is added here.
+before freeing it.
+
+## Pairing credential export
+
+`db_speaker_save` copies into `raop_ffi_credential_changed`, not a pretend database
+write. Success means the handle owns a copy, not that core has persisted it. The
+dedicated `raop_credential_poll` / `raop_credential_ack` ABI transfers private state
+with a monotonically increasing per-handle revision and explicit clear tombstones.
+It never uses the state or diagnostic ring, foreign-thread JS callbacks or SQL.
+
+Each mutex-protected mailbox holds the latest state plus one leased snapshot.
+Poll retains the exact leased revision until its acknowledgement; newer updates
+coalesce into the latest state and cannot overwrite that lease. An old ack never
+erases a newer update or tombstone. An undersized buffer consumes nothing. Key
+storage is fixed at 129 bytes (128 fruit hex bytes plus NUL), erased on replacement,
+ack and explicit handle free. Teardown alone retains unacknowledged state. Callers
+serialize polling/ack with free; close explicitly cancels that handle's mailbox.
+
+All three native key-invalidation paths use one erase-and-export helper. Failed
+verification responses (200 with invalid verification data, 401 or 403) and
+locally malformed keys clear; missing network responses and server errors do not
+revoke credentials. Successful setup checks allocation/export before stopped.
+The TS drain has one asynchronous receipt in flight, acknowledges only after the
+private consumer resolves, retries rejection without logging its error, and
+fences late acknowledgements before native free. It registers output keys for
+central redaction before consumer code. Stable-id binding, durable core receipt
+and explicit pairing operation integration are the S16 consumer of this seam.
+
+`test/probe_pairing_export.c` is compiled only by the Deno native test. It includes
+the actual bridge/backend to drive the real stub export and all three native
+invalidation paths; it is not a product test backdoor. The test proves full-key
+copy, exact ack, coalescing, tombstones, small-buffer retention, delayed/failing
+private receipt, close/forget races and absence from debug diagnostics. This is
+bridge plumbing, not a cryptographic PIN receiver or Apple TV acceptance.
 
 ## Shared logging ingress
 

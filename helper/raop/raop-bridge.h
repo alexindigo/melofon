@@ -9,4 +9,8 @@ int raop_release_device(uint64_t id, void (*done)(uint64_t, int));
 /* Loop-thread effective-feed discontinuity: discard partial raw ALAC input,
  * retaining peer sessions, RTP clocks and already encoded retransmit packets. */
 void raop_discard_pending_input(void);
+/* Copy pairing state into the owning handle's reliable mailbox. NULL is an
+ * explicit invalidation, never ordinary device cleanup. No SQL or diagnostics.
+ * Returns 0 only when copied; callable from the native producer thread. */
+int raop_ffi_credential_changed(uint64_t id, const char *key);
 #endif

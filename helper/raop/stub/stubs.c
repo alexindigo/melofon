@@ -30,6 +30,7 @@
 #include "misc.h"
 #include "outputs.h"
 #include "db.h"
+#include "../raop-bridge.h"
 
 /* ------------------------------- logger ---------------------------------- */
 
@@ -347,8 +348,7 @@ db_queue_fetch_byitemid(uint32_t item_id)
 int
 db_speaker_save(struct output_device *device)
 {
-  (void)device;
-  return 0;
+  return device ? raop_ffi_credential_changed(device->id, device->auth_key) : -1;
 }
 
 void

@@ -54,7 +54,18 @@ export interface AirplayCredentials {
   password: string | null;
   pairingKey: string | null;
 }
-export type AirplaySpawn = (event: HelperEventFn) => AirplayDriver;
+/** Private, acknowledged pairing-state receipt. Resolve only after accepting the
+ * state; reject to retry the same revision. Never send through HelperEventFn.
+ * The consumer must also fence its stable speaker/credential lifetime. */
+export type PairingCredentialConsumer = (change: {
+  revision: bigint;
+  key: string | null;
+  isCurrent(): boolean;
+}) => Promise<void>;
+export type AirplaySpawn = (
+  event: HelperEventFn,
+  credential?: PairingCredentialConsumer,
+) => AirplayDriver;
 
 /** Bridge input format, not the ALAC packet encoding or an AAC promise. */
 export function airplayAbilities(

@@ -26,6 +26,7 @@ import type {
   AirplayProfile,
   AirplayTransport,
   HelperEventFn,
+  PairingCredentialConsumer,
 } from './airplay-profile.ts';
 import { appLogger, type EventFacts, type Log, scopedLog } from '../logging.ts';
 
@@ -63,6 +64,11 @@ const SYMBOLS = {
   raop_teardown: { parameters: ['pointer'], result: 'i32' },
   raop_pin: { parameters: ['pointer', 'buffer'], result: 'i32' },
   raop_poll: { parameters: ['pointer', 'buffer', 'usize'], result: 'i32' },
+  raop_credential_poll: {
+    parameters: ['pointer', 'buffer', 'buffer', 'usize'],
+    result: 'i32',
+  },
+  raop_credential_ack: { parameters: ['pointer', 'u64'], result: 'i32' },
   // -1 = the native free could not be queued; the handle is leaked by design
   // and close() must report failure, not retirement success (ffi.h).
   raop_free: { parameters: ['pointer'], result: 'i32', nonblocking: true },
@@ -180,13 +186,18 @@ class FfiTransport implements AirplayTransport {
   private readonly pollTimer: ReturnType<typeof setInterval>;
   private closed = false;
   private closePromise: Promise<void> | null = null;
+  private credentialPending = false;
   /** PCM write generation (plan atv3-session-recycle): bumped synchronously
    * before every FLUSH/TEARDOWN/close, so a pcm() call already parked in
    * backpressure from BEFORE the discontinuity abandons its remaining
    * bytes instead of letting an old chunk cross into the new state. */
   private writeGen = 0;
 
-  constructor(lib: RaopLibrary, onEvent: HelperEventFn) {
+  constructor(
+    lib: RaopLibrary,
+    onEvent: HelperEventFn,
+    private readonly onCredential?: PairingCredentialConsumer,
+  ) {
     this.lib = lib;
     this.onEvent = onEvent;
     const handle = lib.symbols.raop_new();
@@ -198,7 +209,57 @@ class FfiTransport implements AirplayTransport {
     activeHandles++;
     // Events arrive at state-change rates; a light interval is plenty (and
     // avoids UnsafeCallback entirely — we poll).
-    this.pollTimer = setInterval(() => this.drainEvents(), 25);
+    this.pollTimer = setInterval(() => {
+      void this.drainCredential();
+      this.drainEvents();
+    }, 25);
+  }
+
+  private async drainCredential(): Promise<void> {
+    if (this.closed || this.credentialPending || !this.onCredential) return;
+    this.credentialPending = true;
+    const bytes = new Uint8Array(129);
+    const revision = new BigUint64Array(1);
+    try {
+      const kind = this.lib.symbols.raop_credential_poll(
+        this.handle,
+        revision,
+        bytes,
+        BigInt(bytes.length),
+      );
+      if (kind === 0) return;
+      if (kind !== 1 && kind !== 2) {
+        throw new Error('RAOP credential copy failed');
+      }
+      const key = kind === 2 ? null : decode.decode(bytes.subarray(0, 128));
+      if (key !== null) {
+        appLogger().registerSecrets([key]);
+        if (!/^[0-9a-fA-F]{128}$/.test(key) || bytes[128] !== 0) {
+          throw new Error('Invalid RAOP credential output');
+        }
+      }
+      await this.onCredential({
+        revision: revision[0],
+        key,
+        isCurrent: () => !this.closed,
+      });
+      // close fences synchronously, before its asynchronous native free. Never
+      // touch that pointer from a late private consumer completion.
+      if (!this.closed) {
+        if (
+          this.lib.symbols.raop_credential_ack(this.handle, revision[0]) !== 1
+        ) {
+          throw new Error('RAOP credential acknowledgement failed');
+        }
+      }
+    } catch {
+      // Retain the lease for retry. Arbitrary consumer errors may contain the
+      // key; neither those errors nor the credential become diagnostic events.
+    } finally {
+      bytes.fill(0);
+      revision.fill(0n);
+      this.credentialPending = false;
+    }
   }
 
   private drainEvents() {
@@ -395,6 +456,7 @@ class FfiTransport implements AirplayTransport {
  * startup error, not a surprise at play time. */
 export function createFfiSpawn(log: Log = scopedLog('raop-native')): (
   onEvent: HelperEventFn,
+  onCredential?: PairingCredentialConsumer,
 ) => AirplayDriver {
   let lib: RaopLibrary | null = null;
   try {
@@ -402,13 +464,13 @@ export function createFfiSpawn(log: Log = scopedLog('raop-native')): (
   } catch (err) {
     log.event('ffi_load_failed', { error: err });
   }
-  return (onEvent) => {
+  return (onEvent, onCredential) => {
     if (lib === null) {
       throw new Error(
         'RAOP library not available (see startup log; build helper/raop)',
       );
     }
-    const transport = new FfiTransport(lib, onEvent);
+    const transport = new FfiTransport(lib, onEvent, onCredential);
     return {
       transport,
       start: (profile, input, credentials) =>

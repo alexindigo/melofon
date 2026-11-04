@@ -4215,6 +4215,19 @@ raop_pair_request_send(int step, struct raop_session *rs, void (*cb)(struct evrt
 }
 
 static void
+raop_pair_key_clear(struct output_device *device, struct evrtsp_request *req)
+{
+  /* No response / server outage is not evidence of a revoked key. NULL is
+   * reserved here for locally malformed key input, not a network callback. */
+  if (req && req->response_code != RTSP_OK &&
+      req->response_code != 401 && req->response_code != 403) return;
+  if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
+  free(device->auth_key);
+  device->auth_key = NULL;
+  db_speaker_save(device);
+}
+
+static void
 raop_cb_pair_verify_step2(struct evrtsp_request *req, void *arg)
 {
   struct raop_session *rs = arg;
@@ -4232,9 +4245,7 @@ raop_cb_pair_verify_step2(struct evrtsp_request *req, void *arg)
 	goto error;
 
       // Clear auth_key, the device did not accept it
-      if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
-      free(device->auth_key);
-      device->auth_key = NULL;
+      if (req) raop_pair_key_clear(device, req);
       goto error;
     }
 
@@ -4266,9 +4277,7 @@ raop_cb_pair_verify_step1(struct evrtsp_request *req, void *arg)
 	goto error;
 
       // Clear auth_key, the device did not accept it
-      if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
-      free(device->auth_key);
-      device->auth_key = NULL;
+      if (req) raop_pair_key_clear(device, req);
       goto error;
     }
 
@@ -4301,9 +4310,7 @@ raop_pair_verify(struct raop_session *rs)
     {
       DPRINTF(E_LOG, L_RAOP, "Verification authorization key invalid, resetting\n");
 
-      if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
-      free(device->auth_key);
-      device->auth_key = NULL;
+      raop_pair_key_clear(device, NULL);
       goto error;
     }
 
@@ -4344,12 +4351,14 @@ raop_cb_pair_setup_step3(struct evrtsp_request *req, void *arg)
   if (!device)
     goto out;
 
+  char *key_copy = strdup(authorization_key);
+  if (!key_copy) goto out;
   if (device->auth_key) explicit_bzero(device->auth_key, strlen(device->auth_key));
   free(device->auth_key);
-  device->auth_key = strdup(authorization_key);
+  device->auth_key = key_copy;
 
-  // A blocking db call... :-~
-  db_speaker_save(device);
+  // Copy to the bridge mailbox; core acknowledges its private receipt separately.
+  if (db_speaker_save(device) < 0) goto out;
 
   // No longer RAOP_STATE_PASSWORD
   rs->state = RAOP_STATE_STOPPED;
