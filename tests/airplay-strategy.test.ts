@@ -249,6 +249,124 @@ Deno.test('boot close awaits late PCM acquisition and returns its unstarted iter
   }
 });
 
+Deno.test('source election precedes acquisition: two connected outputs open only one decoder', async () => {
+  let release!: (stream: AsyncIterable<Uint8Array>) => void;
+  const held = new Promise<AsyncIterable<Uint8Array>>((resolve) =>
+    release = resolve
+  );
+  let acquisitions = 0, returns = 0;
+  const stream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => Promise.resolve({ done: true as const, value: undefined }),
+        return() {
+          returns++;
+          return Promise.resolve({ done: true as const, value: undefined });
+        },
+      };
+    },
+  };
+  const s = setup([], false, {
+    decode: () => {
+      acquisitions++;
+      return held;
+    },
+  });
+  try {
+    s.register('1');
+    s.register('2');
+    s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 2);
+    for (const t of s.transports) t.event('state', 'connected');
+    await until(() => acquisitions > 0);
+    assertEquals(
+      acquisitions,
+      1,
+      'election happens before the first PCM/feed token',
+    );
+    s.playback.pause();
+    release(stream);
+    await s.close();
+    assertEquals(
+      returns,
+      1,
+      'the canceled acquisition is released without next',
+    );
+    assertEquals(s.transports.reduce((n, t) => n + t.pcmEntered, 0), 0);
+  } finally {
+    release(stream);
+    await s.close();
+  }
+});
+
+Deno.test('one shared source failure retires both outputs without reopening or speaker retries', async () => {
+  let fail!: (error: Error) => void;
+  let acquisitions = 0;
+  const held = new Promise<AsyncIterable<Uint8Array>>((_, reject) =>
+    fail = reject
+  );
+  const s = setup([0], false, {
+    decode: () => {
+      acquisitions++;
+      return held;
+    },
+  });
+  try {
+    s.register('1');
+    s.register('2');
+    s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 2);
+    for (const t of s.transports) t.event('state', 'connected');
+    assertEquals(acquisitions, 1);
+    fail(new Error('shared source failed'));
+    await until(() => s.transports.every((t) => t.closed));
+    await sleep(30);
+    assertEquals(acquisitions, 1);
+    assertEquals(
+      s.transports.length,
+      2,
+      'content failure is not speaker recovery',
+    );
+    assertEquals(s.playback.playerView().state, 'pause');
+    assertEquals(s.playback.queueView().items.length, 1);
+  } finally {
+    fail?.(new Error('cleanup'));
+    await s.close();
+  }
+});
+
+Deno.test('failed feed release cannot elect a peer or reopen the shared source', async () => {
+  const s = setup([]);
+  try {
+    s.register('1');
+    s.register('2', 'owntone');
+    s.playback.queueAdd([song()], { play: true });
+    await until(() => s.transports.length === 2);
+    const [a, b] = s.transports;
+    a.event('state', 'connected');
+    await until(() => a.ownsSharedFeed());
+    b.event('state', 'connected');
+    a.close = () => Promise.reject(new Error('native release not proven'));
+    s.outputs.update('1', { selected: false });
+    await sleep(30);
+    s.playback.seek({ positionMs: 60000 });
+    await sleep(30);
+    assertEquals(
+      s.decoded.length,
+      1,
+      'no source open through a poisoned native feed',
+    );
+    assertEquals(b.pcmEntered, 0);
+    assertEquals(
+      s.playback.playerView().state,
+      'play',
+      'retirement failure does not invent intent',
+    );
+  } finally {
+    await s.close();
+  }
+});
+
 Deno.test('forget awaits retirement, fences late events and pauses the last target at its bookmark', async () => {
   const s = setup();
   let api: Awaited<ReturnType<typeof apiFixture>> | undefined;
@@ -631,7 +749,7 @@ Deno.test('OwnTone idle hold expires at ten seconds without repeated events exte
     await s.close();
   }
 });
-Deno.test('finite dropping peer is repumped from current position after actual feed loss, both iteration orders', async () => {
+Deno.test('finite source transfers to a peer from current position after feed loss, both iteration orders', async () => {
   for (const reverse of [false, true]) {
     const s = setup([0], true);
     try {
@@ -649,8 +767,14 @@ Deno.test('finite dropping peer is repumped from current position after actual f
       a.event('state', 'connected');
       await until(() => a.ownsSharedFeed());
       b.event('state', 'connected');
-      await until(() => b.dropped === 2);
+      await until(() => a.writes.length === 2);
       await sleep(20);
+      assertEquals(
+        s.decoded.length,
+        1,
+        'one source even after its nonempty EOF',
+      );
+      assertEquals(b.dropped, 0, 'no redundant peer decoder');
       assertEquals(b.writes.length, 0);
       const before = s.decoded.length;
       s.outputs.update('1', { selected: false });
@@ -797,7 +921,7 @@ Deno.test('switch during Play waits for transition; switch during OwnTone hold r
   }
 });
 
-Deno.test('old entered peer PCM released exactly after feed close cannot claim token before fresh pump', async () => {
+Deno.test('canceled owner PCM cannot claim a free token when acquisition precedes the first write', async () => {
   const s = setup([0], true);
   let release!: () => void;
   try {
@@ -806,15 +930,25 @@ Deno.test('old entered peer PCM released exactly after feed close cannot claim t
     s.playback.queueAdd([song()], { play: true });
     await until(() => s.transports.length === 2);
     const [a, b] = s.transports;
+    a.pcmGate = new Promise((resolve) => release = resolve);
     a.event('state', 'connected');
-    await until(() => a.ownsSharedFeed());
-    b.pcmGate = new Promise((resolve) => release = resolve);
+    await until(() => a.pcmEntered === 1);
     b.event('state', 'connected');
-    await until(() => b.pcmEntered === 1);
+    assertEquals(
+      b.pcmEntered,
+      0,
+      'peer never enters PCM before ownership transfer',
+    );
+    assertEquals(s.decoded.length, 1);
     const oldTag = s.decoded.length;
     a.afterClose = async () => {
       release();
       await sleep(0);
+      assertEquals(
+        a.writes.length,
+        0,
+        'canceled write cannot acquire the token',
+      );
       assertEquals(b.writes.length, 0);
     };
     s.outputs.update('1', { selected: false });
@@ -849,7 +983,7 @@ Deno.test('reverse snapshot order: all retirement barriers precede sibling trans
       a.event('state', 'connected');
       await until(() => a.ownsSharedFeed());
       b.event('state', 'connected');
-      await until(() => b.dropped > 0);
+      assertEquals(b.pcmEntered, 0, 'only the elected source writes');
       a.closeGate = new Promise((resolve) => release = resolve);
       const before = b.pcmEntered;
       s.playback.seek({ positionMs: 60000 });

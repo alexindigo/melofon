@@ -652,8 +652,13 @@ Deno.test('catalog events do not move sessions: another device registering leave
     spawned[0].onEvent('state', 'connected');
     spawned[1].onEvent('state', 'connected');
     await until(
-      'PCM on both',
-      () => spawned[0].pcmBytes() > 0 && spawned[1].pcmBytes() > 0,
+      'PCM from the elected source',
+      () => spawned[0].pcmBytes() > 0,
+    );
+    assertEquals(
+      spawned[1].pcmBytes(),
+      0,
+      'peer never opens a duplicate source',
     );
 
     // The first link dies. The second is live → no pause (hub keeps playing).

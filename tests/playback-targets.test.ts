@@ -441,11 +441,12 @@ Deno.test('later transport and auth failures pause only when no healthy peer rem
     await t.ok(`/queue/items/add?uris=${t.uri}&playback=start`, 'POST');
     await until(() => t.sessions.length === 2);
     for (const session of t.sessions) session.event('state', 'connected');
-    await until(() => t.sessions.every((session) => session.writes > 0));
+    await until(() => t.sessions[0].writes > 0);
+    assertEquals(t.sessions[1].writes, 0, 'one shared source writer');
     t.sessions[0].event('state', 'password');
     assertEquals(t.playback.playerView().state, 'play');
-    const healthyWrites = t.sessions[1].writes;
-    await until(() => t.sessions[1].writes > healthyWrites);
+    const sourceWrites = t.sessions[0].writes;
+    await until(() => t.sessions[0].writes > sourceWrites);
     t.sessions[1].event('state', 'failed');
     assertEquals(t.playback.playerView().state, 'pause');
     const bookmark = t.playback.playerView().itemProgressMs;

@@ -265,7 +265,8 @@ for (const choice of ['melofon', 'owntone', 'audiostation'] as const) {
       await until(() => s.transports.length === 2);
       const peer = s.transports[1];
       peer.event('state', 'connected');
-      await until(() => peer.bytes.length > 0);
+      assertEquals(s.starts.length, 1, 'peer shares the elected source');
+      assertEquals(peer.bytes.length, 0, 'no redundant peer writer');
       const before = peer.bytes.length;
       s.transports[0].event('state', 'failed');
       await until(() => s.transports[0].closed && peer.bytes.length > before);

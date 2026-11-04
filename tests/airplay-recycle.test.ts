@@ -3,7 +3,7 @@
 //
 // Part A (deterministic, boot level): the shared-feed handoff. Feed-fake
 // transports model raop-ffi.ts's election — the first pcm writer is THE
-// FEED, every other handle accepts-and-drops, the token releases only when
+// FEED, peers never open a source, the token releases only when
 // the feed's close() PROVES cleanup — and count EFFECTIVE accepted bytes,
 // not method calls. Matrix: retiring the feed and the non-feed, reverse
 // registration order, two concurrent retirements, resume before/after the
@@ -282,8 +282,7 @@ Deno.test('feed handoff: retiring the feed holds the peer’s re-pump until the 
     a1.onEvent('state', 'connected');
     await until('A pumps (feed)', () => a1.acceptedBytes > 0);
     b.onEvent('state', 'connected');
-    await until('B pumps (dropped)', () => b.droppedBytes > 0);
-    assertEquals(b.acceptedBytes, 0, 'B is the accept-and-drop peer');
+    assertEquals(b.totalBytes(), 0, 'B shares the source without decoding');
 
     const gate = closeGate();
     a1.closeGate = gate.gate; // A's close cannot complete until released
@@ -299,7 +298,11 @@ Deno.test('feed handoff: retiring the feed holds the peer’s re-pump until the 
     await until('A replacement', () => transportFor(spawned, HOST_A) !== a1);
     const a2 = transportFor(spawned, HOST_A);
     a2.onEvent('state', 'connected');
-    await until('A2 pumps (dropped)', () => a2.droppedBytes > 0);
+    assertEquals(
+      a2.totalBytes(),
+      0,
+      'replacement joins native fan-out without decoding',
+    );
     assertEquals(a2.acceptedBytes, 0, 'the replacement is the non-feed');
   } finally {
     await close();
@@ -319,7 +322,7 @@ Deno.test('feed handoff: reverse ownership — a surviving feed is never re-elec
     b.onEvent('state', 'connected');
     await until('B pumps (feed)', () => b.acceptedBytes > 0);
     a1.onEvent('state', 'connected');
-    await until('A pumps (dropped)', () => a1.droppedBytes > 0);
+    assertEquals(a1.totalBytes(), 0, 'peer shares the source without decoding');
 
     // A's session dies (a peer-ONLY event — B has no transition of its own).
     const gate = closeGate();
@@ -363,7 +366,7 @@ Deno.test('feed handoff: reverse ownership — a surviving feed is never re-elec
     );
     const a2 = transportFor(spawned, HOST_A);
     a2.onEvent('state', 'connected');
-    await until('A2 dropped', () => a2.droppedBytes > 0);
+    assertEquals(a2.totalBytes(), 0, 'replacement has no duplicate decoder');
     assertEquals(a2.acceptedBytes, 0, 'B never stopped being the feed');
   } finally {
     await close();
@@ -424,10 +427,8 @@ Deno.test('feed handoff: two concurrent retirements hold the peer until BOTH fin
     await until('A feed', () => a.acceptedBytes > 0);
     c.onEvent('state', 'connected');
     b.onEvent('state', 'connected');
-    await until(
-      'everyone pumping',
-      () => c.droppedBytes > 0 && b.droppedBytes > 0,
-    );
+    assertEquals(c.totalBytes(), 0, 'C joins without a decoder');
+    assertEquals(b.totalBytes(), 0, 'B joins without a decoder');
 
     const gate = closeGate();
     a.closeGate = gate.gate; // the SLOW close, test-controlled
@@ -513,7 +514,7 @@ Deno.test('feed handoff: deselecting a held peer cancels its pending pump', asyn
     a1.onEvent('state', 'connected');
     await until('A feed', () => a1.acceptedBytes > 0);
     b.onEvent('state', 'connected');
-    await until('B dropped', () => b.droppedBytes > 0);
+    assertEquals(b.totalBytes(), 0, 'peer never opens a source');
 
     const gate = closeGate();
     a1.closeGate = gate.gate;
