@@ -626,9 +626,10 @@ that pending action. Session failures include a safe `state.error`.
 
 `abilities` is null until fresh supported receiver facts are available and
 becomes null again when they expire. AirPlay reports volume and source seek,
-PIN when receiver verification requires it, and the bridge input format `pcm`,
-not AAC or the ALAC wire encoding. Password input remains unsupported at this
-stage. These facts do not imply connection or audio delivery. Clients refetch
+PIN when receiver verification requires it, password input when the receiver
+advertises password protection, and the bridge input format `pcm`, not AAC or
+the ALAC wire encoding. Set or clear passwords with the password route above.
+These facts do not imply connection or audio delivery. Clients refetch
 on `/api/v1/events` `speakers` invalidations, including fact expiry; OwnTone
 keeps its `outputs` notification and snake_case auth fields. Reading or
 publishing status never creates a playback demand or renews retry authority.
@@ -657,8 +658,10 @@ target-specific unicast DNS-SD lookup independently of automatic browsing.
 completion and supported UDP/44100-Hz/16-bit/stereo configuration are required.
 Missing receiver facts never become guessed metadata/auth/encryption settings;
 a received optional key's absence can use its documented protocol default.
-Password-required receivers remain unsupported and cannot receive an admitted
-session. Preparation failures follow the existing finite recovery policy.
+Password-required receivers can be prepared; the session uses the privately
+stored password. Missing or rejected credentials surface as an authentication
+challenge in speaker state. Preparation failures follow the existing finite
+recovery policy.
 
 ### Wi-Fi / Ethernet source changes
 
