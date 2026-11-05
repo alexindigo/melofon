@@ -2,7 +2,7 @@
 // through EOF/cancellation. No route reads or mutates the cache filesystem.
 import { fail, notFound } from '#opensubsonic/envelope.ts';
 import { integerParam, requiredParam } from '#opensubsonic/params.ts';
-import { hlsFailure, hlsOptions } from '#opensubsonic/hls.ts';
+import { hlsCore, hlsFailure, hlsOptions } from '#opensubsonic/hls.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
@@ -22,7 +22,11 @@ export default async (_request: HatRequest, context: HatContext) => {
   if (option instanceof Response) return option;
   const root = context.app.cfg.dataDir;
   if (!root) return hlsFailure(context);
-  const view = await context.app.media.hls(song.path, `${root}/hls`, option);
+  const view = await hlsCore(
+    context,
+    () => context.app.media.hls(song.path, `${root}/hls`, option),
+  );
+  if (view instanceof Response) return view;
   if (!view) return hlsFailure(context);
   try {
     const stream = await view.segment(segmentIndex);

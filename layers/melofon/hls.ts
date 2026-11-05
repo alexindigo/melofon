@@ -1,4 +1,4 @@
-import { fail } from './errors.ts';
+import { core, fail } from './errors.ts';
 import type { HatContext, HatRequest, HlsOptions, HlsView } from './types.ts';
 import { getVideo } from './video.ts';
 
@@ -94,7 +94,9 @@ export async function withHls<T>(
 ): Promise<T> {
   const root = context.app.cfg.dataDir;
   if (!root) fail(500, 'internal_error', 'Unable to prepare HLS video');
-  const view = await context.app.media.hls(path, `${root}/hls`, option);
+  const view = await core(() =>
+    context.app.media.hls(path, `${root}/hls`, option)
+  );
   if (!view) fail(500, 'internal_error', 'Unable to prepare HLS video');
   try {
     return await consume(view);
@@ -106,9 +108,16 @@ export async function withHls<T>(
 export async function hlsPlaylist(request: HatRequest, context: HatContext) {
   const options = hlsOptions(request);
   const song = await hlsVideo(context, request.params.id, options);
+  const root = context.app.cfg.dataDir;
+  if (!root) fail(500, 'internal_error', 'Unable to prepare HLS video');
+  const views = await core(() =>
+    context.app.media.hlsRenditions(song.path, `${root}/hls`, options)
+  );
+  if (!views) fail(500, 'internal_error', 'Unable to prepare HLS video');
   const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
-  for (const option of options) {
-    await withHls(context, song.path, option, (view) => {
+  try {
+    for (const [index, option] of options.entries()) {
+      const view = views[index];
       const query = hlsQuery(option);
       if (options.length > 1) {
         lines.push(
@@ -131,7 +140,9 @@ export async function hlsPlaylist(request: HatRequest, context: HatContext) {
         }
         if (view.complete) lines.push('#EXT-X-ENDLIST');
       }
-    });
+    }
+  } finally {
+    for (const view of views) await view.release();
   }
   return new Response(lines.join('\n') + '\n', {
     headers: {

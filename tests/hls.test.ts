@@ -146,7 +146,7 @@ Deno.test('several bitRate params answer a variant playlist', async () => {
   try {
     const res = await app(
       new Request(
-        `http://x/rest/hls.m3u8?id=${videoId}&bitRate=1000@480x360&bitRate=2000&${AUTH}`,
+        `http://x/rest/hls.m3u8?id=${videoId}&bitRate=1000@160x120&bitRate=2000&${AUTH}`,
       ),
     );
     assertEquals(res.status, 200);
@@ -154,7 +154,7 @@ Deno.test('several bitRate params answer a variant playlist', async () => {
     const lines = body.split('\n');
     assert(
       lines.some((l) =>
-        /^#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=\d+,RESOLUTION=480x360$/
+        /^#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=\d+,RESOLUTION=160x120$/
           .test(l)
       ),
     );
@@ -165,7 +165,7 @@ Deno.test('several bitRate params answer a variant playlist', async () => {
     assert(rung !== undefined, `no rung URL in:\n${body}`);
     assert(
       new URL(rung, 'http://x/rest/hls.m3u8').searchParams.get('bitRate') ===
-        '1000@480x360',
+        '1000@160x120',
     );
     assert(rung!.includes('u=admin'));
     assert(

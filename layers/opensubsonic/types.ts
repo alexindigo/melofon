@@ -396,6 +396,21 @@ export interface HatContext {
       ): Promise<Response>;
     };
     media: {
+      hlsRenditions(
+        path: string,
+        cacheRoot: string,
+        options: import('./hls.ts').HlsOptions[],
+      ): Promise<
+        {
+          width: number;
+          height: number;
+          bandwidth: number;
+          complete: boolean;
+          segments: { duration: number }[];
+          segment(index: number): Promise<ReadableStream<Uint8Array> | null>;
+          release(): Promise<void>;
+        }[] | null
+      >;
       hls(path: string, cacheRoot: string, options?: {
         kbps?: number;
         width?: number;

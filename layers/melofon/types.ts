@@ -69,6 +69,11 @@ export interface HatContext {
         root: string,
         options?: HlsOptions,
       ): Promise<HlsView | null>;
+      hlsRenditions(
+        path: string,
+        root: string,
+        options: HlsOptions[],
+      ): Promise<HlsView[] | null>;
     };
     publicAddress: {
       prefix(): Promise<string>;

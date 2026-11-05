@@ -178,6 +178,13 @@ video's indexed audio facts. Unknown/repeated parameters (except master
 `bitRate`), conflicting sizes, invalid dimensions and unknown audio tracks fail
 with 400; audio-only and unknown ids return 404.
 
+Core admits a complete HLS ladder before encoding any rung, for both native
+and OpenSubsonic requests. Owner settings `media.hls.maxRenditions` (8),
+`media.hls.maxDimension` (4096 pixels per dimension) and `media.hls.maxKbps`
+(100000 kbps) bound requests. Explicit dimensions must not exceed the source.
+Excessive requests are rejected, never clamped; native errors are 400
+`invalid_field`, and OpenSubsonic admission errors are XML code 0.
+
 Follow playlist-relative links as returned, including
 `hls/segments/{index}.ts`. Every playlist and segment request needs its own
 cookie or Bearer authentication; URLs contain only rendition/track choices.

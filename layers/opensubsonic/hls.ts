@@ -51,6 +51,19 @@ export function hlsFailure(context: HatContext): Response {
     'Unable to prepare HLS video',
   );
 }
+/** Pinned Endpoints/hls.md:28 requires XML even with f=json. Navidrome
+ * 18205366 server/subsonic/api.go:302-303 maps invalid parameters to code 0. */
+export async function hlsCore<T>(
+  context: HatContext,
+  operation: () => Promise<T>,
+): Promise<T | Response> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!(error instanceof Error) || error.name !== 'HlsError') throw error;
+    return hlsFailure(context);
+  }
+}
 export function hlsQuery(params: URLSearchParams, options: HlsOptions): string {
   const q = new URLSearchParams();
   for (const key of ['u', 'p', 't', 's', 'v', 'c']) {

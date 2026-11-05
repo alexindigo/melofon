@@ -510,8 +510,8 @@ Deno.test('API HLS: shared bounded cache releases playlist views and segment EOF
       assertEquals(t.counts().views, 0, 'route already released its view');
       await t.f.state.set('media.hlsCacheMegabytes', '0');
       const other = await t.media.hls(t.video.path, `${t.dir}/hls`, {
-        width: 162,
-        height: 122,
+        width: 158,
+        height: 118,
       });
       assert(other);
       // Await VOD before pruning to avoid leaving the background encoder alive.
@@ -519,8 +519,8 @@ Deno.test('API HLS: shared bounded cache releases playlist views and segment EOF
       let last = other;
       while (!last.complete) {
         const next = await t.media.hls(t.video.path, `${t.dir}/hls`, {
-          width: 162,
-          height: 122,
+          width: 158,
+          height: 118,
         });
         assert(next);
         last = next;

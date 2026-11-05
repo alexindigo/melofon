@@ -2,7 +2,13 @@
 // audioTrack, mpegurl success and XML preparation errors. Core owns outputs.
 import { notFound } from '#opensubsonic/envelope.ts';
 import { requiredParam } from '#opensubsonic/params.ts';
-import { hlsFailure, hlsOptions, hlsQuery } from '#opensubsonic/hls.ts';
+import {
+  hlsCore,
+  hlsFailure,
+  type HlsOptions,
+  hlsOptions,
+  hlsQuery,
+} from '#opensubsonic/hls.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
@@ -12,7 +18,7 @@ export default async (_request: HatRequest, context: HatContext) => {
   const song = await context.app.library.getSong(id);
   if (!song?.isVideo) return notFound(context);
   const rungs = [...params.getAll('bitRate'), ...params.getAll('maxBitRate')];
-  const options = [];
+  const options: HlsOptions[] = [];
   for (const raw of rungs.length ? rungs : [undefined]) {
     const option = hlsOptions(context, raw);
     if (option instanceof Response) return option;
@@ -22,11 +28,16 @@ export default async (_request: HatRequest, context: HatContext) => {
   }
   const root = context.app.cfg.dataDir;
   if (!root) return hlsFailure(context);
+  const views = await hlsCore(
+    context,
+    () => context.app.media.hlsRenditions(song.path, `${root}/hls`, options),
+  );
+  if (views instanceof Response) return views;
+  if (!views) return hlsFailure(context);
   const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
-  for (const option of options) {
-    const view = await context.app.media.hls(song.path, `${root}/hls`, option);
-    if (!view) return hlsFailure(context);
-    try {
+  try {
+    for (const [index, option] of options.entries()) {
+      const view = views[index];
       const query = `id=${encodeURIComponent(id)}&${hlsQuery(params, option)}`;
       if (options.length > 1) {
         lines.push(
@@ -51,9 +62,9 @@ export default async (_request: HatRequest, context: HatContext) => {
         }
         if (view.complete) lines.push('#EXT-X-ENDLIST');
       }
-    } finally {
-      await view.release();
     }
+  } finally {
+    for (const view of views) await view.release();
   }
   return new Response(lines.join('\n') + '\n', {
     headers: {

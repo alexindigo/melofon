@@ -10,6 +10,9 @@ export interface HlsOptions {
   audioTrack?: number;
 }
 export interface HlsSettings {
+  maxRenditions: number;
+  maxDimension: number;
+  maxKbps: number;
   segmentSeconds: number;
   audioKbps: number;
   videoKbps: number;
@@ -45,6 +48,9 @@ interface Entry {
 }
 
 const DEFAULTS = {
+  maxRenditions: 8,
+  maxDimension: 4096,
+  maxKbps: 100000,
   segmentSeconds: 10,
   audioKbps: 128,
   videoKbps: 2000,
@@ -62,9 +68,49 @@ const DEFAULTS = {
   ],
 };
 
+export class HlsError extends Error {
+  readonly code = 'invalid_field';
+  constructor(message: string) {
+    super(message);
+    this.name = 'HlsError';
+  }
+}
+
+/** One output geometry policy for admission and the native encoder. */
+export function hlsDimensions(
+  source: HlsFacts,
+  options: HlsOptions,
+  config: HlsSettings,
+): HlsFacts {
+  let { width, height } = source;
+  if (options.width !== undefined && options.height !== undefined) {
+    if (options.width > width || options.height > height) {
+      throw new HlsError('HLS dimensions exceed the source');
+    }
+    width = options.width;
+    height = options.height;
+  } else if (options.kbps !== undefined) {
+    const ladder = config.ladder.map((rung) => rung.split(/[@x]/).map(Number))
+      .sort((a, b) => a[0] - b[0]);
+    const box = ladder.find((rung) => rung[0] >= options.kbps!) ??
+      ladder.at(-1);
+    if (box) {
+      const ratio = Math.min(1, box[1] / width, box[2] / height);
+      width = Math.max(2, Math.floor(width * ratio / 2) * 2);
+      height = Math.max(2, Math.floor(height * ratio / 2) * 2);
+    }
+  }
+  if (width > config.maxDimension || height > config.maxDimension) {
+    throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
+  }
+  return { width, height };
+}
+
 export function createHlsCache(
   produce: Producer,
   state?: Pick<State, 'declare' | 'getTyped'>,
+  inspect: (path: string) => Promise<HlsFacts | null> = () =>
+    Promise.resolve(null),
 ) {
   state?.declare('media.hlsCacheMegabytes', {
     type: 'number',
@@ -77,6 +123,9 @@ export function createHlsCache(
       'audioKbps',
       'videoKbps',
       'threads',
+      'maxRenditions',
+      'maxDimension',
+      'maxKbps',
     ] as const
   ) {
     state?.declare(`media.hls.${name}`, {
@@ -191,22 +240,12 @@ export function createHlsCache(
       total -= output.bytes;
     }
   }
-  return async (
+  const acquire = async (
     path: string,
     root: string,
-    options: HlsOptions = {},
+    options: HlsOptions,
+    config: HlsSettings,
   ): Promise<HlsView | null> => {
-    if (
-      Object.values(options).some((value) =>
-        value !== undefined && (!Number.isSafeInteger(value) || value < 0)
-      ) ||
-      options.kbps === 0 ||
-      (options.width === undefined) !== (options.height === undefined) ||
-      (options.width !== undefined &&
-        (options.width < 2 || options.height! < 2 || options.width % 2 ||
-          options.height! % 2))
-    ) return null;
-    const config = await settings();
     const stat = await Deno.stat(path).catch(() => null);
     if (!stat) return null;
     const signature = JSON.stringify([
@@ -376,5 +415,64 @@ export function createHlsCache(
       await release();
       return null;
     }
+  };
+
+  async function hlsRenditions(
+    path: string,
+    root: string,
+    requested: HlsOptions[],
+  ): Promise<HlsView[] | null> {
+    const config = await settings();
+    // Snapshot the whole request before source inspection or producer admission. Hats
+    // cannot start an earlier valid rung before a later rung has been checked.
+    if (!requested.length || requested.length > config.maxRenditions) {
+      throw new HlsError('HLS rendition count exceeds media.hls.maxRenditions');
+    }
+    const options = requested.map((option) => ({ ...option }));
+    for (const option of options) {
+      if (
+        Object.values(option).some((value) =>
+          value !== undefined && (!Number.isSafeInteger(value) || value < 0)
+        ) || option.kbps === 0 ||
+        (option.width === undefined) !== (option.height === undefined) ||
+        (option.width !== undefined &&
+          (option.width < 2 || option.height! < 2 || option.width % 2 ||
+            option.height! % 2))
+      ) throw new HlsError('Invalid HLS rendition or audio track');
+      if (
+        (option.kbps ?? config.videoKbps) > config.maxKbps ||
+        config.audioKbps > config.maxKbps
+      ) {
+        throw new HlsError('HLS bitrate exceeds media.hls.maxKbps');
+      }
+      if (
+        (option.width ?? 0) > config.maxDimension ||
+        (option.height ?? 0) > config.maxDimension
+      ) {
+        throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
+      }
+    }
+    const source = await inspect(path);
+    if (!source) return null;
+    for (const option of options) hlsDimensions(source, option, config);
+    const views: HlsView[] = [];
+    try {
+      for (const option of options) {
+        const view = await acquire(path, root, option, config);
+        if (!view) return null;
+        views.push(view);
+      }
+      return views;
+    } finally {
+      if (views.length !== options.length) {
+        for (const view of views) await view.release();
+      }
+    }
+  }
+  return {
+    hlsRenditions,
+    async hls(path: string, root: string, options: HlsOptions = {}) {
+      return (await hlsRenditions(path, root, [options]))?.[0] ?? null;
+    },
   };
 }

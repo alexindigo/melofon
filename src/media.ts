@@ -65,6 +65,7 @@ import { type Log, scopedLog } from './logging.ts';
 import type { State } from './state.ts';
 import {
   createHlsCache,
+  hlsDimensions,
   type HlsFacts,
   type HlsOptions,
   type HlsSettings,
@@ -176,6 +177,13 @@ export interface Media {
     cacheRoot: string,
     options?: HlsOptions,
   ): Promise<HlsView | null>;
+  /** Admit the complete ladder before starting any output. Invalid options
+   * throw HlsError; unreadable/unsupported sources still return null. */
+  hlsRenditions(
+    path: string,
+    cacheRoot: string,
+    options: HlsOptions[],
+  ): Promise<HlsView[] | null>;
   /** Audio track of `path` decoded to raw interleaved PCM — 44100 Hz,
    * 16-bit, stereo, the RAOP default quality (raop.c). Boots stream the
    * chunks to their sink; each chunk is one decoded frame's bytes (a copy,
@@ -591,7 +599,17 @@ export function createMedia(
       await state?.getTyped(`media.transcode.${format}.bitRateKbps`) ??
         TRANSCODE_PROFILES[format].bitRateKbps,
     );
-  const hls = createHlsCache(encodeHls, state);
+  const hls = createHlsCache(encodeHls, state, async (path) => {
+    try {
+      await using input = await Demuxer.open(path);
+      const video = input.video();
+      return video
+        ? { width: video.codecpar.width, height: video.codecpar.height }
+        : null;
+    } catch {
+      return null;
+    }
+  });
 
   async function encodeHls(
     path: string,
@@ -611,22 +629,11 @@ export function createMedia(
             s.codecpar.codecType === AVMEDIA_TYPE_AUDIO,
         );
       if (!video || (options.audioTrack !== undefined && !audio)) return null;
-      let width = video.codecpar.width, height = video.codecpar.height;
-      if (options.width !== undefined && options.height !== undefined) {
-        width = options.width;
-        height = options.height;
-      } else if (options.kbps !== undefined) {
-        const ladder = config.ladder.map((rung) =>
-          rung.split(/[@x]/).map(Number)
-        ).sort((a, b) => a[0] - b[0]);
-        const box = ladder.find((rung) => rung[0] >= options.kbps!) ??
-          ladder.at(-1);
-        if (box) {
-          const ratio = Math.min(1, box[1] / width, box[2] / height);
-          width = Math.max(2, Math.floor(width * ratio / 2) * 2);
-          height = Math.max(2, Math.floor(height * ratio / 2) * 2);
-        }
-      }
+      const { width, height } = hlsDimensions(
+        { width: video.codecpar.width, height: video.codecpar.height },
+        options,
+        config,
+      );
       const facts = { width, height };
       const encode = options.kbps !== undefined ||
         width !== video.codecpar.width || height !== video.codecpar.height ||
@@ -770,7 +777,7 @@ export function createMedia(
   }
 
   return {
-    hls,
+    ...hls,
     async captions(path, index, format) {
       try {
         await using input = await Demuxer.open(path);
