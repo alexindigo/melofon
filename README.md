@@ -93,8 +93,11 @@ entered URL. `radio.playlistProbeBytes` (512) bounds wrapper-prefix inspection;
 `radio.sourceRequestsPerMinute` (600) bounds request frequency through the net
 owner. Final audio retains its inspection bytes and streams under the net
 owner's pending-read idle budget, without the resolution lifetime/byte caps.
-This is a core byte-source facility; queue admission and playback integration
-follow separately.
+The server composes this resolver with ICY stripping and core-fed decoding for
+station and URL queue sources. One elected AirPlay pump opens the source for all
+selected receivers; pause, stop, next and output handoff cancel its network and
+decoder lifetime. Public URL admission, finite URL preparation, live title
+publication and source reconnect policy follow in separate stage-2 items.
 
 Core media can decode owned compressed byte streams without giving FFmpeg a URL.
 It probes and replays a bounded prefix, ignores MIME hints, and accepts direct

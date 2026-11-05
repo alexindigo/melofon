@@ -1,6 +1,10 @@
 // AirPlay lifecycle: engine/operator state survives temporary connections.
 // One scheduler, per-output intent epochs, proven local-release barriers.
 import type { Media } from '../media.ts';
+import {
+  createPlaybackSource,
+  type PlaybackSources,
+} from '../playback-source.ts';
 import { type Log, scopedLog } from '../logging.ts';
 import { queueDisplay } from '../queue-source.ts';
 import type { Notify } from '../notify.ts';
@@ -25,6 +29,7 @@ export interface AirplayBootDeps {
   outputs: Outputs;
   playback: Playback;
   media: Media;
+  sources?: PlaybackSources;
   notify: Notify;
   devices: AirplayDevices;
   state?: State;
@@ -109,6 +114,7 @@ export function createAirplayBoot(
   close(): Promise<void>;
 } {
   const { outputs, playback, media, notify } = deps;
+  const sources = deps.sources ?? createPlaybackSource({ media });
   // Keep the existing permissive off/list parser (including clamping) at its owner.
   deps.state?.declare(AIRPLAY_RETRY_KEY, {
     type: 'string',
@@ -430,7 +436,10 @@ export function createAirplayBoot(
     const authority = { id, runtime: r, generation, lease: sourceLease };
     source = authority;
     r.entry = view.current.id;
-    const facts = view.current.facts, startMs = view.itemProgressMs;
+    const current = view.current, startMs = view.itemProgressMs;
+    const path = current.facts.kind === 'song'
+      ? current.facts.song.path
+      : undefined;
     const owns = () =>
       source === authority && !sourceLease.signal.aborted && !closed &&
       runtimes.get(id) === r &&
@@ -439,14 +448,10 @@ export function createAirplayBoot(
     const pumping = (async () => {
       let bytes = 0;
       try {
-        if (facts.kind !== 'song') {
-          throw new Error('Web source playback is not available');
-        }
-        const path = facts.song.path;
-        const stream = await media.decodePcm(
-          path,
-          startMs > 0 ? { startMs } : undefined,
-        );
+        const stream = await sources.open(current, {
+          signal: sourceLease.signal,
+          startMs,
+        });
         if (!stream) {
           if (!owns()) return;
           throw new Error('no decodable audio');
@@ -458,7 +463,7 @@ export function createAirplayBoot(
             const chunk of { [Symbol.asyncIterator]: () => iterator }
           ) {
             if (!owns()) return;
-            if (DEBUG && bytes === 0) {
+            if (DEBUG && path !== undefined && bytes === 0) {
               log.event('pump_first', {
                 output: id,
                 generation: session,
@@ -484,7 +489,7 @@ export function createAirplayBoot(
         }
         if (!owns()) return;
         if (!bytes) throw new Error('empty decoder stream');
-        if (DEBUG) {
+        if (DEBUG && path !== undefined) {
           log.event('pump_end', {
             output: id,
             generation: session,

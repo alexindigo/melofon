@@ -18,6 +18,8 @@ import { createListens } from './listens.ts';
 import { createIdentity } from './identity.ts';
 import { createPlaylists } from './playlists.ts';
 import { createRadio } from './radio.ts';
+import { createRadioSource } from './radio-source.ts';
+import { createPlaybackSource } from './playback-source.ts';
 import { createShares } from './shares.ts';
 import { createPodcasts } from './podcasts.ts';
 import { createNetwork } from './lookups/net.ts';
@@ -123,6 +125,10 @@ export async function startServer(options: {
     notify,
   });
   const network = createNetwork({ state });
+  const playbackSources = createPlaybackSource({
+    media,
+    radio: createRadioSource({ network, state }),
+  });
   const podcasts = await createPodcasts({
     store,
     state,
@@ -400,6 +406,7 @@ export async function startServer(options: {
     outputs,
     playback,
     media,
+    sources: playbackSources,
     notify,
     state,
     devices: airplay,
