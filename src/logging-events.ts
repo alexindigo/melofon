@@ -75,6 +75,10 @@ export interface EventFacts {
   lookup_plugin_log: { plugin: string; payload: unknown };
   lookup_failed: { plugin: string } & ErrorFacts;
   podcast_failed: ErrorFacts;
+  radio_artwork_unavailable: {
+    station: string;
+    reason: 'missing' | 'unreadable' | 'too_large' | 'incomplete';
+  };
   restore_complete: {
     queued: number;
     state: string;
@@ -309,6 +313,12 @@ export const events: Record<EventId, EventDefinition> = {
     'error',
     'Podcast operation failed',
     'error',
+  ),
+  radio_artwork_unavailable: definition(
+    'radio',
+    'warn',
+    'Uploaded artwork unavailable; trying fallback',
+    'station reason',
   ),
   scan_fingerprint_failed: definition(
     'scan',

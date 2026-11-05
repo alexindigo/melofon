@@ -11,6 +11,17 @@ interface Reference {
   byteLength: number;
 }
 
+/** Expected loss of readable source bytes, distinct from invalid references,
+ * unsafe storage and unexpected I/O faults. Messages never expose core paths. */
+export class ImageFileUnavailable extends Error {
+  constructor(
+    label: string,
+    readonly reason: 'missing' | 'unreadable' | 'too_large' | 'incomplete',
+  ) {
+    super(`Cannot access ${label} storage`);
+  }
+}
+
 const owned = (name: string) =>
   /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.(image|part)$/.test(name);
 
@@ -36,7 +47,8 @@ export function createImageFiles(
   async function safe<T>(operation: () => Promise<T>): Promise<T> {
     try {
       return await operation();
-    } catch {
+    } catch (error) {
+      if (error instanceof ImageFileUnavailable) throw error;
       // The scoped API must not leak core paths through filesystem errors.
       throw new Error(`Cannot access ${label} storage`);
     }
@@ -117,16 +129,29 @@ export function createImageFiles(
     read(payload: string, maxBytes: number) {
       return safe(async () => {
         const ref = reference(payload);
-        const path = join(await directory(), ref.file);
-        const stat = await Deno.lstat(path);
-        if (!stat.isFile || stat.isSymlink || ref.byteLength > maxBytes) {
-          throw new Error('Invalid or oversized hat image file');
+        try {
+          const path = join(await directory(), ref.file);
+          const stat = await Deno.lstat(path);
+          if (!stat.isFile || stat.isSymlink) {
+            throw new Error('Invalid hat image file');
+          }
+          if (ref.byteLength > maxBytes) {
+            throw new ImageFileUnavailable(label, 'too_large');
+          }
+          const value = await readImage(path, ref.byteLength);
+          if (!value || value.byteLength !== ref.byteLength) {
+            throw new ImageFileUnavailable(label, 'incomplete');
+          }
+          return { value, contentType: ref.contentType };
+        } catch (error) {
+          if (error instanceof Deno.errors.NotFound) {
+            throw new ImageFileUnavailable(label, 'missing');
+          }
+          if (error instanceof Deno.errors.PermissionDenied) {
+            throw new ImageFileUnavailable(label, 'unreadable');
+          }
+          throw error;
         }
-        const value = await readImage(path, ref.byteLength);
-        if (!value || value.byteLength !== ref.byteLength) {
-          throw new Error('Incomplete hat image file');
-        }
-        return { value, contentType: ref.contentType };
       });
     },
     retire: (payload: string) => safe(() => remove(reference(payload).file)),

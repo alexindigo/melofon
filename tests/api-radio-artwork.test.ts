@@ -8,6 +8,7 @@ import { imageHeader } from '../src/image-header.ts';
 import { imagePixels } from '../src/media.ts';
 import { apiFixture, error } from './helpers/api.ts';
 import { pixelPng } from './helpers/pixel-image.ts';
+import { captureLogs } from './helpers/logging.ts';
 
 function source(red: number) {
   return pixelPng(
@@ -24,6 +25,7 @@ async function fixture() {
   let radio!: ReturnType<typeof createRadio>;
   let artwork!: ReturnType<typeof createArtwork>;
   const events: { types: string[]; audience: unknown }[] = [];
+  const logs = captureLogs();
   const open = () =>
     apiFixture({
       storeDir: `${root}/data`,
@@ -35,6 +37,7 @@ async function fixture() {
           dataDir: f.cfg.dataDir,
           state: f.state,
           notify: f.notify,
+          log: logs.log.scope('radio'),
         });
         artwork = createArtwork(createLibrary(f.store), {
           state: f.state,
@@ -56,6 +59,7 @@ async function fixture() {
     root,
     station,
     events,
+    logs,
     get f() {
       return f;
     },
@@ -427,6 +431,170 @@ function radioUrl(id: string, version?: string) {
     version ? `?v=${version}` : ''
   }`;
 }
+
+Deno.test('radio artwork HTTP: unavailable uploads fall back in lists, details and image delivery, then recover', async () => {
+  const t = await fixture();
+  try {
+    const cookie = (await t.f.login()).credential;
+    const bearer = (await t.f.login('bearer')).credential;
+    const other = await t.radio.create({ ...t.station, name: 'Other' });
+    assert(!('invalid' in other));
+    const fallback = await t.f.get(radioUrl(t.station.id), cookie);
+    assertEquals(fallback.status, 200);
+    const tile = new Uint8Array(await fallback.arrayBuffer());
+    const tileEtag = fallback.headers.get('etag');
+    const bytes = pixelPng(
+      128,
+      128,
+      crypto.getRandomValues(new Uint8Array(65536)),
+    );
+    assert(bytes.length > tile.length);
+    const response = await t.write('PUT', cookie, bytes);
+    assertEquals(response.status, 200, await response.clone().text());
+    const upload = (await response.json()).artwork;
+    assertEquals(upload.sourceKind, 'radio-upload');
+    const payload = (await t.f.store.radio.artwork(t.station.id))!;
+    const path = `${t.root}/data/radio-images/${JSON.parse(payload).file}`;
+    for (const reason of ['missing', 'unreadable', 'too_large', 'incomplete']) {
+      // Permission refusal is exercised by the normal non-root guest run.
+      if (reason === 'unreadable' && Deno.uid() === 0) continue;
+      if (reason === 'missing') await Deno.rename(path, `${path}.saved`);
+      if (reason === 'unreadable') await Deno.chmod(path, 0o000);
+      if (reason === 'too_large') {
+        // The tile fits this policy; the valid upload no longer does.
+        await t.f.state.set(
+          'artwork.maxSourceMegabytes',
+          String(tile.length / 1048576),
+        );
+      }
+      if (reason === 'incomplete') {
+        await Deno.writeFile(path, source(200).slice(0, 33));
+      }
+      const before = t.logs.records().length;
+      try {
+        const list = await t.f.get('/api/v1/radio-stations', cookie);
+        assertEquals(list.status, 200, await list.clone().text());
+        const rows = (await list.json()).radioStations;
+        assertEquals(rows.length, 2);
+        const row = rows.find((r: { id: string }) => r.id === t.station.id);
+        assert(row.artwork);
+        const detail = await t.f.get(
+          `/api/v1/radio-stations/${t.station.id}`,
+          bearer,
+        );
+        assertEquals(detail.status, 200, await detail.clone().text());
+        assertEquals(
+          (await detail.json()).radioStation.artwork.url,
+          row.artwork.url,
+        );
+        const image = await t.f.get(upload.url, bearer, {
+          'If-None-Match': `"${upload.sourceHash}"`,
+        });
+        assertEquals(image.status, 200);
+        assertEquals(image.headers.get('cache-control'), 'private, no-cache');
+        assertEquals(image.headers.get('etag'), tileEtag);
+        assertEquals(new Uint8Array(await image.arrayBuffer()), tile);
+        const diagnostics = t.logs.records().slice(before);
+        assert(diagnostics.length >= 3);
+        assert(
+          diagnostics.every((r) =>
+            r.event === 'radio_artwork_unavailable' && r.reason === reason &&
+            r.station === t.station.id && r.level === 'warn'
+          ),
+        );
+        assert(!JSON.stringify(diagnostics).includes(t.root));
+        assertEquals(await t.f.store.radio.artwork(t.station.id), payload);
+      } finally {
+        if (reason === 'missing') await Deno.rename(`${path}.saved`, path);
+        if (reason === 'unreadable') await Deno.chmod(path, 0o600);
+        if (reason === 'too_large') {
+          await t.f.state.set('artwork.maxSourceMegabytes', '20');
+        }
+        if (reason === 'incomplete') await Deno.writeFile(path, bytes);
+      }
+      const restored = await t.f.get(upload.url, cookie);
+      assertEquals(restored.status, 200);
+      assertEquals(new Uint8Array(await restored.arrayBuffer()), bytes);
+    }
+    await t.f.state.set('artwork.maxSourceMegabytes', '0');
+    const missing = await t.f.get('/api/v1/radio-stations', bearer);
+    assertEquals(missing.status, 200);
+    assert(
+      (await missing.json()).radioStations.every((r: { artwork: unknown }) =>
+        r.artwork === null
+      ),
+    );
+    await t.f.state.set('artwork.maxSourceMegabytes', '20');
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('radio artwork HTTP: invalid references, unsafe storage and store faults remain errors', async () => {
+  const t = await fixture();
+  try {
+    const key = (await t.f.login('bearer')).credential;
+    await uploaded(await t.write('PUT', key, source(200)));
+    const payload = (await t.f.store.radio.artwork(t.station.id))!;
+    const directory = `${t.root}/data/radio-images`;
+    const path = `${directory}/${JSON.parse(payload).file}`;
+    const assertFault = async () => {
+      for (
+        const url of [
+          '/api/v1/radio-stations',
+          `/api/v1/radio-stations/${t.station.id}`,
+          radioUrl(t.station.id),
+        ]
+      ) {
+        await error(await t.f.get(url, key), 500, 'internal_error');
+      }
+    };
+    for (
+      const invalid of [
+        '{',
+        JSON.stringify({
+          file: '../../outside',
+          contentType: 'image/png',
+          byteLength: 1,
+        }),
+      ]
+    ) {
+      await t.f.store.radio.setArtwork(t.station.id, invalid);
+      try {
+        await assertFault();
+      } finally {
+        await t.f.store.radio.setArtwork(t.station.id, payload);
+      }
+    }
+    await Deno.rename(path, `${path}.saved`);
+    await Deno.symlink(`${path}.saved`, path);
+    try {
+      await assertFault();
+    } finally {
+      await Deno.remove(path);
+      await Deno.rename(`${path}.saved`, path);
+    }
+    await Deno.rename(directory, `${directory}-saved`);
+    await Deno.writeTextFile(directory, 'not a directory');
+    try {
+      await assertFault();
+    } finally {
+      await Deno.remove(directory);
+      await Deno.rename(`${directory}-saved`, directory);
+    }
+    const read = t.f.store.radio.artwork;
+    t.f.store.radio.artwork = () =>
+      Promise.reject(new TypeError('fixture store fault'));
+    try {
+      await assertFault();
+    } finally {
+      t.f.store.radio.artwork = read;
+    }
+    assertEquals(t.logs.records(), []);
+  } finally {
+    await t.close();
+  }
+});
 
 // Independent upstream glyph vectors (Unifont 18.0.01), not renderer output.
 // Compare the entire decoded HTTP tile with the expected glyph mask at 5x.

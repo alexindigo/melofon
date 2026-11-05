@@ -70,7 +70,8 @@ export function artworkFacts(context: HatContext) {
     return null;
   }
   return async (ref: ArtworkRef) => {
-    // Core resolves existence/visibility before any private-store read.
+    // Core resolves existence/visibility and expected source unavailability
+    // before any private-store read. Unexpected owner faults must still surface.
     const result = await context.app.artwork.describe(ref, {
       username: context.state.user.username,
     });

@@ -562,8 +562,9 @@ Deno.test('HTTP hat image publication failures preserve old bytes and hide inter
     await c.write({ key: 'same', record: record(image) });
     const saved = await c.read('key=same');
     const original = await names();
-    // Failure before file publication: actual filesystem refuses a new file.
-    await Deno.chmod(files, 0o500);
+    // Failure before file publication, including as root: storage is obstructed.
+    await Deno.rename(files, `${files}-saved`);
+    await Deno.writeTextFile(files, 'not a directory');
     try {
       const result = await c.write(
         { key: 'same', record: record(next) },
@@ -573,10 +574,12 @@ Deno.test('HTTP hat image publication failures preserve old bytes and hide inter
       );
       assertEquals(result, { error: 'Cannot access hat image storage' });
       assert(!JSON.stringify(result).includes(dir));
-      assertEquals(await c.read('key=same'), saved);
     } finally {
-      await Deno.chmod(files, 0o700);
+      await Deno.remove(files);
+      await Deno.rename(`${files}-saved`, files);
     }
+    assertEquals(await names(), original);
+    assertEquals(await c.read('key=same'), saved);
     // Failure after durable file publication, before committing its reference.
     fail = true;
     await c.write({ key: 'same', record: record(next) }, '', false, 400);

@@ -2,10 +2,11 @@
 import type { Store } from './store/index.ts';
 import type { StationInput, StationRow } from './store/radio.ts';
 import type { State } from './state.ts';
-import { createImageFiles } from './image-files.ts';
+import { createImageFiles, ImageFileUnavailable } from './image-files.ts';
 import { imageHeader, withinPixels } from './image-header.ts';
 import { imagePixels } from './media.ts';
 import type { Notify } from './notify.ts';
+import { type Log, scopedLog } from './logging.ts';
 
 export type StationResult = StationRow | { invalid: string };
 
@@ -31,7 +32,9 @@ export function createRadio(store: Store, options: {
   dataDir?: string;
   state?: Pick<State, 'declare' | 'getTyped'>;
   notify?: Notify;
+  log?: Log;
 } = {}) {
+  const log = options.log ?? scopedLog('radio');
   const defaults: Record<string, number> = {
     maxArtworkBytes: 20971520,
     maxArtworkPixels: 64000000,
@@ -72,8 +75,17 @@ export function createRadio(store: Store, options: {
         const payload = await store.radio.artwork(id);
         if (payload === undefined) return 'unknown' as const;
         if (payload === null || !files) return null;
-        const image = await files.read(payload, maxBytes);
-        return { bytes: image.value, format: image.contentType };
+        try {
+          const image = await files.read(payload, maxBytes);
+          return { bytes: image.value, format: image.contentType };
+        } catch (error) {
+          if (!(error instanceof ImageFileUnavailable)) throw error;
+          log.event('radio_artwork_unavailable', {
+            station: id,
+            reason: error.reason,
+          });
+          return null;
+        }
       });
     },
     async putArtwork(id: string, bytes: Uint8Array) {
