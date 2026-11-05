@@ -72,6 +72,7 @@ interface RuntimePin {
 }
 interface Runtime {
   transport: AirplayTransport | null;
+  activationCurrent?: () => boolean;
   session: number;
   pump: number;
   connected: boolean;
@@ -587,7 +588,12 @@ export function createAirplayBoot(
           : 'none',
       });
     }
-    if (!t) return Promise.resolve(true);
+    if (!t) {
+      // A runtime can be awaiting credential acquisition before publication.
+      // Its removal still has to replan the current intent's pending grant.
+      reconcile();
+      return Promise.resolve(true);
+    }
     log.event('session_retire', {
       output: id,
       generation: r.session - 1,
@@ -763,6 +769,7 @@ export function createAirplayBoot(
       generations.set(id, session);
       const r: Runtime = {
         transport: null,
+        activationCurrent: current,
         session,
         pump: 0,
         connected: false,
@@ -783,6 +790,17 @@ export function createAirplayBoot(
       const own = () =>
         !closed && runtimes.get(id) === r && r.session === session &&
         r.transport !== null;
+      const activationFailed = (why: string, error: unknown) => {
+        if (runtimes.get(id) !== r) return;
+        if (!current()) {
+          // Superseding intent revokes the captured activation authority. It
+          // is not a receiver failure and cannot pause or spend output retries.
+          // Retire the obsolete runtime before reconciling the current grant.
+          void retire(id, r, 'superseded activation');
+          return;
+        }
+        sessionFailed(id, r, why, error);
+      };
       try {
         log.event('session_start', {
           output: id,
@@ -866,11 +884,12 @@ export function createAirplayBoot(
             }
           },
         });
+        if (result.ok) r.activationCurrent = undefined;
         if (!result.ok && runtimes.get(id) === r) {
-          sessionFailed(id, r, 'activation', result.error);
+          activationFailed('activation', result.error);
         }
       } catch (error) {
-        sessionFailed(id, r, 'spawn', error);
+        activationFailed('spawn', error);
       }
     })().catch((error) =>
       log.event('preparation_error', { output: id, error })
@@ -887,7 +906,7 @@ export function createAirplayBoot(
           lease.outputs.get(id) === epoch(id).generation)
     ) return;
     r.strategy = choice;
-    if (CONNECTION_STRATEGIES[choice].idle === 'retire') {
+    if (!r.transport || CONNECTION_STRATEGIES[choice].idle === 'retire') {
       void retire(id, r, 'idle');
       return;
     }
@@ -986,6 +1005,13 @@ export function createAirplayBoot(
       // synchronous notification. Its continuation binds the new source run;
       // reconciliation must not mistake that intermediate view for a seek.
       if (resuming.get(id)?.runtime === r) continue;
+      if (r.activationCurrent && !r.activationCurrent()) {
+        // An in-flight activation cannot absorb a newer grant: admission still
+        // checks the old demand. Preserve the new grant and release the old
+        // runtime before starting its replacement, for every strategy.
+        retirements.push([id, r, 'superseded activation']);
+        continue;
+      }
       if (grants.get(id)?.kind === 'explicit') grants.delete(id);
       if (r.held) {
         actions.push(() => {

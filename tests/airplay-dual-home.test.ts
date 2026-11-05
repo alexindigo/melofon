@@ -14,6 +14,7 @@ import type { NowPlaying } from '../src/nowplaying.ts';
 import type { Media } from '../src/media.ts';
 import type { State } from '../src/state.ts';
 import type { ConnectionStrategy } from '../src/connection-strategy.ts';
+import { captureLogs } from './helpers/logging.ts';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(predicate: () => boolean) {
@@ -49,7 +50,11 @@ class Transport {
     this.closed = true;
   }
 }
-function fixture(choice: ConnectionStrategy, retry = '0,0') {
+function fixture(
+  choice: ConnectionStrategy,
+  retry = '0,0',
+  parkActivation = false,
+) {
   const notify = createNotify(), outputs = createOutputs({ notify });
   const playback = createPlayback({
     notify,
@@ -67,6 +72,23 @@ function fixture(choice: ConnectionStrategy, retry = '0,0') {
       return transport;
     }),
   );
+  const capture = captureLogs();
+  let activationWaiting = false;
+  let releaseActivation!: () => void;
+  const activationGate = new Promise<void>((done) => releaseActivation = done);
+  if (parkActivation) {
+    const activate = devices.protocol.activate;
+    let first = true;
+    devices.protocol.activate = async (...args) => {
+      if (first) {
+        first = false;
+        activationWaiting = true;
+        await activationGate;
+        activationWaiting = false;
+      }
+      return activate(...args);
+    };
+  }
   const media = {
     decodePcm(_path: string, options?: { startMs?: number }) {
       starts.push(options?.startMs ?? 0);
@@ -93,6 +115,7 @@ function fixture(choice: ConnectionStrategy, retry = '0,0') {
     devices,
     media,
     state,
+    log: capture.log,
   });
   const register = (id = '1') =>
     outputs.register({
@@ -115,6 +138,10 @@ function fixture(choice: ConnectionStrategy, retry = '0,0') {
     transports,
     starts,
     register,
+    song,
+    capture,
+    activationWaiting: () => activationWaiting,
+    releaseActivation,
     async play(connect = true) {
       register();
       playback.queueAdd([song], { play: true });
@@ -125,6 +152,7 @@ function fixture(choice: ConnectionStrategy, retry = '0,0') {
       await until(() => transports[0].bytes.length > 0);
     },
     async close() {
+      releaseActivation();
       await boot.close();
       devices.close();
       playback.close();
@@ -133,6 +161,50 @@ function fixture(choice: ConnectionStrategy, retry = '0,0') {
 }
 
 for (const choice of ['melofon', 'owntone', 'audiostation'] as const) {
+  for (
+    const action of ['seek', 'next', 'pause', 'stop', 'queueClear'] as const
+  ) {
+    Deno.test(`dual-home ${choice}: ${action} supersedes unpublished activation without output failure`, async () => {
+      const s = fixture(choice, 'off', true);
+      try {
+        s.register();
+        await s.playback.queueAdd([s.song, s.song], { play: true });
+        await until(s.activationWaiting);
+        const firstId = s.playback.playerView().current!.id;
+        if (action === 'seek') await s.playback.seek({ positionMs: 60000 });
+        else await s.playback[action]();
+        s.releaseActivation();
+        await until(() => !s.activationWaiting());
+        await sleep(20);
+        const view = s.playback.playerView();
+        assertEquals(
+          view.state,
+          action === 'seek' || action === 'next'
+            ? 'play'
+            : action === 'pause'
+            ? 'pause'
+            : 'stop',
+        );
+        assertEquals(
+          s.capture.records().filter((r) =>
+            r.event === 'session_failed' || r.event === 'retry_scheduled'
+          ).length,
+          0,
+          'supersession is not a failed output or a spent retry',
+        );
+        if (action === 'seek' || action === 'next') {
+          await until(() => s.transports.length === 1);
+          s.transports[0].event('state', 'connected');
+          await until(() => s.transports[0].bytes.length > 0);
+          assertEquals(view.current!.id === firstId, action === 'seek');
+          if (action === 'seek') assert(s.starts[0] >= 60000);
+          assertEquals(s.playback.playerView().state, 'play');
+        } else assertEquals(s.transports.length, 0);
+      } finally {
+        await s.close();
+      }
+    });
+  }
   Deno.test(`dual-home ${choice}: connecting generation honors a seek before CONNECTED`, async () => {
     const s = fixture(choice, 'off');
     try {
