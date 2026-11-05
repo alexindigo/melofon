@@ -2,7 +2,7 @@
 // The boot elects one caller; networking and native decoding keep their owners.
 import { separateIcy } from './icy.ts';
 import type { Media } from './media.ts';
-import type { QueueMedia } from './queue-source.ts';
+import type { QueueMedia, SourceMetadata } from './queue-source.ts';
 import type { createRadioSource } from './radio-source.ts';
 import type { State } from './state.ts';
 
@@ -167,7 +167,11 @@ export function createPlaybackSource(deps: {
     },
     async open(
       media: QueueMedia,
-      options: { signal: AbortSignal; startMs: number },
+      options: {
+        signal: AbortSignal;
+        startMs: number;
+        onMetadata?: (metadata: SourceMetadata) => void;
+      },
     ): Promise<AsyncIterable<Uint8Array> | null> {
       options.signal.throwIfAborted();
       if (media.facts.kind === 'song') {
@@ -186,11 +190,15 @@ export function createPlaybackSource(deps: {
       try {
         const lease = await session.open();
         options.signal.throwIfAborted();
+        const title = lease.response.headers.get('icy-name');
+        if (title && media.reference.kind === 'url') {
+          options.onMetadata?.({ title });
+        }
         return await deps.media.decodeInputPcm({
           body: separateIcy(
             lease.response.body!,
             lease.response.headers,
-            () => {},
+            (metadata) => options.onMetadata?.(metadata),
           ),
           close: () => session.close(),
         }, {

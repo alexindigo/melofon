@@ -299,6 +299,15 @@ reveals the tile again. Generated images are disposable cache data.
 
 ### Now-playing expiry
 
+Live radio keeps its station name separate from the raw ICY `StreamTitle`.
+The existing household `GET /api/v1/now-playing` exposes it as
+`media.streamTitle`. OwnTone clients re-fetch `/api/queue` after a `queue`
+notification: the station stays in `title`, the on-air song goes in `album`,
+and the first `" - "` separates an optional `artist`. Unsplit text stays whole.
+Zero metadata blocks retain the title; an explicit empty title clears it.
+Repeated facts do not invalidate views. Closing or replacing the source clears
+its broadcast facts; stale callbacks cannot change the next source's views.
+
 Apps explicitly report playback; fetching media does not report a play.
 Signed-in clients can read the household view at `GET /api/v1/now-playing`
 and re-fetch when `/api/v1/events` sends a `nowPlaying` invalidation.

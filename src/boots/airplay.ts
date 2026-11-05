@@ -451,6 +451,9 @@ export function createAirplayBoot(
         const stream = await sources.open(current, {
           signal: sourceLease.signal,
           startMs,
+          onMetadata: (metadata) => {
+            if (owns()) playback.reportSourceMetadata(sourceLease, metadata);
+          },
         });
         if (!stream) {
           if (!owns()) return;

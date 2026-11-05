@@ -21,6 +21,12 @@ export interface WebPlaybackFacts {
   streamUrl: string | null;
 }
 
+/** Source observations, not display labels or catalog metadata. Omitted fields
+ * leave the prior fact alone; an empty string is an explicit broadcast update. */
+export type SourceMetadata = Partial<
+  Pick<WebPlaybackFacts, 'title' | 'streamTitle' | 'streamUrl'>
+>;
+
 export type QueueMedia =
   | {
     reference: Extract<QueueReference, { kind: 'song' }>;

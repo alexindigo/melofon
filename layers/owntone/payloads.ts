@@ -236,16 +236,28 @@ export function queueItemPayload(
         : slash >= 0 && slash < uri.length - 1
         ? uri.slice(slash + 1)
         : uri);
+    // OwnTone http.c:476-493 and inputs/http.c:292-294: retain the
+    // station as title; interpret the first " - " only here in the hat.
+    const split = facts.streamTitle?.indexOf(' - ') ?? -1;
+    const album = facts.streamTitle === null
+      ? null
+      : split < 0
+      ? facts.streamTitle
+      : facts.streamTitle.slice(split + 3);
+    const artist = split < 0
+      ? facts.artistName
+      : facts.streamTitle!.slice(0, split);
     // OwnTone httpd_jsonapi.c:2253-2287: nonpersistent items have no track_id
     // and replay their remote path instead of manufacturing a library URI.
     return {
       id: entry.id,
       position,
       title,
-      ...(facts.artistName === null ? {} : {
-        artist: facts.artistName,
-        artist_sort: facts.artistName,
+      ...(artist === null ? {} : {
+        artist,
+        artist_sort: artist,
       }),
+      ...(album === null ? {} : { album, album_sort: album }),
       length_ms: facts.durationMs ?? 0,
       media_kind: 'music',
       data_kind: 'http',

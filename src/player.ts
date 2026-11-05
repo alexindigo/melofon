@@ -23,6 +23,7 @@ import {
   type QueueMedia,
   type QueueReference,
   type QueueSnapshot,
+  type SourceMetadata,
 } from './queue-source.ts';
 export type { QueueEntry } from './queue-source.ts';
 import type { Notify } from './notify.ts';
@@ -262,6 +263,7 @@ export interface Player {
   /** Accepted PCM duration, reported after the sink write resolves. */
   sourceAudio(source: PlaybackSource, durationMs: number): void;
   sourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
+  sourceMetadata(source: PlaybackSource, metadata: SourceMetadata): boolean;
   canAdvanceEnded(): boolean;
   /** No-op on an empty queue (state stays 'stop'). `fromPosition` starts
    * the queue item at that 0-based index (OwnTone playback_from_position),
@@ -469,6 +471,21 @@ export function createPlayer(options: {
   const cancelSource = () => {
     const old = source;
     source = null;
+    if (old) {
+      items = items.map((entry) => {
+        if (
+          entry.id !== old.token.entryId || entry.facts.kind !== 'web' ||
+          entry.reference.kind === 'song' ||
+          entry.facts.streamTitle === null && entry.facts.streamUrl === null
+        ) return entry;
+        version++;
+        return {
+          id: entry.id,
+          reference: entry.reference,
+          facts: { ...entry.facts, streamTitle: null, streamUrl: null },
+        };
+      });
+    }
     old?.controller.abort();
   };
   const discontinuity = () => {
@@ -639,6 +656,38 @@ export function createPlayer(options: {
         currentEntry()?.id !== token.entryId
       ) return false;
       source.outcome = outcome;
+      return true;
+    },
+    sourceMetadata(token, metadata) {
+      const entry = currentEntry();
+      if (
+        source?.token !== token || source.outcome || state !== 'play' ||
+        entry?.id !== token.entryId || entry.facts.kind !== 'web' ||
+        entry.reference.kind === 'song'
+      ) return false;
+      const facts = { ...entry.facts };
+      // Only direct URLs learn their station name from the stream header.
+      if (entry.reference.kind === 'url' && metadata.title !== undefined) {
+        facts.title = metadata.title;
+      }
+      if (metadata.streamTitle !== undefined) {
+        facts.streamTitle = metadata.streamTitle;
+      }
+      if (metadata.streamUrl !== undefined) {
+        facts.streamUrl = metadata.streamUrl;
+      }
+      if (
+        facts.title === entry.facts.title &&
+        facts.streamTitle === entry.facts.streamTitle &&
+        facts.streamUrl === entry.facts.streamUrl
+      ) return false;
+      const updated: QueueEntry = {
+        id: entry.id,
+        reference: entry.reference,
+        facts,
+      };
+      items = items.map((item) => item === entry ? updated : item);
+      version++;
       return true;
     },
     canAdvanceEnded,

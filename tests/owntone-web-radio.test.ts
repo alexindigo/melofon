@@ -2,7 +2,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { apiFixture } from './helpers/api.ts';
 import { speakerMedia, until } from './helpers/speaker-consumer.ts';
-import { httpRadio } from './helpers/http-radio.ts';
+import { httpRadio, icyBlock } from './helpers/http-radio.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
@@ -408,5 +408,198 @@ Deno.test('HA-shaped HTTP finite URL adds deliver complete native receiver audio
     await t.close();
     receiver.close();
     await server.close();
+  }
+});
+
+Deno.test('live ICY titles invalidate OwnTone WS queue reads while station identity and raw native facts stay distinct', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'on-air-' });
+  const pcm = await speakerMedia(dir);
+  const wav = await Deno.readFile(`${dir}/media/signal.wav`);
+  new DataView(wav.buffer).setUint32(4, 0xffffffff, true);
+  new DataView(wav.buffer).setUint32(40, 0xffffffff, true);
+  const channels: { send?: (text: string | null) => void }[] = [];
+  const server = httpRadio((_request, signal) => {
+    const channel: typeof channels[number] = {};
+    channels.push(channel);
+    return {
+      headers: {
+        'content-type': 'audio/wav',
+        'icy-metaint': '65536',
+        'icy-name': 'Wire station',
+      },
+      body: (async function* () {
+        let text: string | null = "StreamTitle='Artist A - Title A - Part 2';";
+        let at = 0;
+        while (!signal.aborted) {
+          yield wav.subarray(at, at + 65536);
+          at += 65536;
+          const block = text === null ? new Uint8Array([0]) : icyBlock(text);
+          yield block.subarray(0, 1);
+          yield block.subarray(1);
+          text = await new Promise<string | null>((done) => {
+            channel.send = done;
+            if (signal.aborted) done(null);
+            else {signal.addEventListener('abort', () => done(null), {
+                once: true,
+              });}
+          });
+          channel.send = undefined;
+        }
+      })(),
+    };
+  });
+  const receiver = await startFakeRaop({ captureAudio: true });
+  const t = await fixture(receiver.port);
+  const ws = new WebSocket(`ws://melofon.home:${t.f.extraPorts[0]}/`, [
+    'notify',
+  ]);
+  const frames: string[][] = [];
+  const snapshots: {
+    version: number;
+    items: { title: string; album?: string; artist?: string }[];
+  }[] = [];
+  const reads: Promise<
+    {
+      version: number;
+      items: { title: string; album?: string; artist?: string }[];
+    }
+  >[] = [];
+  try {
+    ws.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)).notify as string[];
+      frames.push(frame);
+      if (frame.includes('queue')) {
+        reads.push(
+          t.own('/queue').then((queue) => {
+            snapshots.push(queue);
+            return queue;
+          }),
+        );
+      }
+    };
+    await until(() => ws.readyState === WebSocket.OPEN);
+    ws.send(JSON.stringify({ notify: ['queue', 'player'] }));
+    for (let attempt = 0; frames.length === 0; attempt++) {
+      assert(attempt < 30);
+      await t.own('/player/pause', 'PUT');
+      await new Promise((done) => setTimeout(done, 10));
+    }
+    const login = await t.f.login('bearer');
+    const native = async () => {
+      const response = await t.f.get('/api/v1/now-playing', login.credential);
+      assertEquals(response.status, 200);
+      return (await response.json()).nowPlaying[0].media;
+    };
+    const station = await t.radio.create({
+      name: 'Saved station',
+      streamUrl: `${server.origin}/live`,
+      homePageUrl: null,
+    });
+    assert(!('invalid' in station));
+    await t.playback.queueAddReferences([{ kind: 'station', id: station.id }], {
+      play: true,
+    });
+    const streamTitle = () => {
+      const facts = t.playback.playerView().current?.facts;
+      return facts?.kind === 'web' ? facts.streamTitle : null;
+    };
+    await until(() => streamTitle() === 'Artist A - Title A - Part 2');
+    await until(() =>
+      snapshots.some((q) =>
+        q.items[0]?.album === 'Title A - Part 2' &&
+        q.items[0]?.artist === 'Artist A'
+      )
+    );
+    assertEquals((await native()).streamTitle, 'Artist A - Title A - Part 2');
+    assertEquals((await native()).title, 'Saved station');
+    const send = async (text: string | null) => {
+      await until(() => !!channels.at(-1)?.send);
+      const channel = channels.at(-1)!;
+      const done = channel.send!;
+      channel.send = undefined;
+      done(text);
+      await until(() => !!channels.at(-1)?.send);
+    };
+    const version = (await t.own('/queue')).version;
+    const events = t.f.notifications.length;
+    await send(null);
+    await send("StreamTitle='Artist A - Title A - Part 2';");
+    assertEquals(
+      (await t.own('/queue')).version,
+      version,
+      'zero blocks and duplicates do not invalidate',
+    );
+    assertEquals(t.f.notifications.length, events);
+    const before = snapshots.length;
+    await send(
+      "StreamTitle='Unsplit B';StreamUrl='https://example.test/cover.jpg';",
+    );
+    await until(() =>
+      snapshots.slice(before).some((q) => q.items[0]?.album === 'Unsplit B')
+    );
+    const changed = snapshots.findLast((q) =>
+      q.items[0]?.album === 'Unsplit B'
+    )!;
+    assertEquals(
+      changed.version,
+      version + 1,
+      'zero and duplicate frames were consumed before B without a revision',
+    );
+    assertEquals(t.f.notifications.length, events + 1);
+    assertEquals(changed.items[0].title, 'Saved station');
+    assertEquals(changed.items[0].album, 'Unsplit B');
+    assert(!('artist' in changed.items[0]));
+    assertEquals((await native()).streamTitle, 'Unsplit B');
+    const facts = t.playback.playerView().current!.facts;
+    assert(facts.kind === 'web');
+    assertEquals(facts.streamUrl, 'https://example.test/cover.jpg');
+    await send("StreamTitle='';");
+    await until(() => streamTitle() === '');
+    assertEquals((await t.own('/queue')).items[0].album, '');
+    assertEquals((await native()).streamTitle, '');
+    await send("StreamTitle='Artist C - Title C';");
+    await until(() => streamTitle() === 'Artist C - Title C');
+    await until(() => receiver.sessions[0]?.audioPayloads.length >= 10);
+    const received = decodeReceiverAudio(
+      receiver.sessions[0].sdp,
+      receiver.sessions[0].audioPayloads.slice(0, 10),
+    );
+    assertEquals(
+      received,
+      pcm.subarray(0, received.length),
+      'metadata never enters receiver PCM',
+    );
+    await t.own('/player/pause', 'PUT');
+    assert(!('album' in (await t.own('/queue')).items[0]));
+    assertEquals((await native()).streamTitle, null);
+    await t.own('/player/play', 'PUT');
+    await until(() => channels.length === 2);
+    await until(() => streamTitle() === 'Artist A - Title A - Part 2');
+    assertEquals((await t.own('/queue')).items[0].title, 'Saved station');
+    await t.own('/player/stop', 'PUT');
+    assert(!('album' in (await t.own('/queue')).items[0]));
+    // URL inspection must not publish on-air facts; playback learns icy-name.
+    await t.add(`${server.origin}/direct`, {
+      clear: 'true',
+      playback: 'start',
+    });
+    await until(() => channels.length === 4);
+    await until(() => streamTitle() === 'Artist A - Title A - Part 2');
+    assertEquals((await t.own('/queue')).items[0].title, 'Wire station');
+    assertEquals((await native()).title, 'Wire station');
+    await t.add(t.songUri);
+    await t.own('/player/next', 'PUT');
+    const next = await t.own('/queue');
+    assert(!('album' in next.items[0]));
+    assertEquals(next.items[1].data_kind, 'file');
+    assertEquals((await t.own('/player')).item_id, next.items[1].id);
+  } finally {
+    ws.close();
+    await until(() => ws.readyState === WebSocket.CLOSED);
+    await Promise.all(reads);
+    await t.close();
+    receiver.close();
+    await server.close();
+    await Deno.remove(dir, { recursive: true });
   }
 });

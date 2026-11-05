@@ -76,6 +76,125 @@ function fixture(options: {
   };
 }
 
+Deno.test('broadcast facts follow the private source lease across reopen, discontinuities and terminal callbacks', async () => {
+  const f = fixture();
+  try {
+    await f.playback.queueAddSources([web('live', null), web('live', null)], {
+      play: true,
+    });
+    let token = f.open();
+    const initial = f.playback.queueView();
+    const command = f.playback.lastCommand();
+    assert(
+      f.playback.reportSourceMetadata(token, {
+        streamTitle: ' raw - title ',
+        streamUrl: 'image',
+      }),
+    );
+    assertEquals(
+      f.playback.lastCommand(),
+      command,
+      'observations are not user commands',
+    );
+    assertEquals(f.playback.queueView().version, initial.version + 1);
+    assertEquals(
+      initial.items[0].facts,
+      web('live', null).facts,
+      'old view remains a snapshot',
+    );
+    assertEquals(f.events.at(-1), ['queue', 'nowPlaying']);
+    const writes = f.states.length, events = f.events.length;
+    assertEquals(
+      f.playback.reportSourceMetadata(token, { streamTitle: ' raw - title ' }),
+      false,
+    );
+    assertEquals(
+      f.playback.reportSourceMetadata({ ...token }, { streamTitle: 'forged' }),
+      false,
+    );
+    assertEquals(f.states.length, writes);
+    assertEquals(f.events.length, events);
+    for (
+      const action of ['reopen', 'pause', 'stop', 'next', 'clear'] as const
+    ) {
+      f.playback.cancelSource(token);
+      const cleared = f.playback.queueView();
+      const old = cleared.items[0].facts;
+      assert(old.kind === 'web');
+      assertEquals(old.streamTitle, null);
+      assertEquals(old.streamUrl, null);
+      assertEquals(
+        f.playback.reportSourceMetadata(token, { streamTitle: 'stale' }),
+        false,
+      );
+      if (action === 'clear') {
+        f.playback.queueClear();
+        break;
+      }
+      if (action !== 'reopen') {
+        const current = f.open();
+        assert(
+          f.playback.reportSourceMetadata(current, {
+            streamTitle: 'before transition',
+          }),
+        );
+        await f.playback[action]();
+        assert(current.signal.aborted);
+        assertEquals(
+          f.playback.reportSourceMetadata(current, { streamTitle: 'late' }),
+          false,
+        );
+        assert(
+          f.playback.queueView().items.every((item) =>
+            item.facts.kind === 'web' && item.facts.streamTitle === null
+          ),
+        );
+        await f.playback.play();
+      }
+      token = f.open();
+      assert(f.playback.reportSourceMetadata(token, { streamTitle: '' }));
+    }
+    await f.playback.queueAddSources([web()], { play: true });
+    const beforeSeek = f.open();
+    assert(
+      f.playback.reportSourceMetadata(beforeSeek, {
+        streamTitle: 'before seek',
+      }),
+    );
+    await f.playback.seek({ positionMs: 0 });
+    assertEquals(
+      f.playback.reportSourceMetadata(beforeSeek, { streamTitle: 'late seek' }),
+      false,
+    );
+    const beforeReplay = f.open();
+    assert(
+      f.playback.reportSourceMetadata(beforeReplay, {
+        streamTitle: 'before replay',
+      }),
+    );
+    await f.playback.previous();
+    assertEquals(
+      f.playback.reportSourceMetadata(beforeReplay, {
+        streamTitle: 'late replay',
+      }),
+      false,
+    );
+    const finite = f.open();
+    assert(f.playback.reportSourceOutcome(finite, 'eof'));
+    assertEquals(
+      f.playback.reportSourceMetadata(finite, { streamTitle: 'after EOF' }),
+      false,
+    );
+    await f.playback.close();
+    assertEquals(
+      f.playback.reportSourceMetadata(finite, { streamTitle: 'after close' }),
+      false,
+    );
+  } finally {
+    await f.playback.close();
+  }
+});
+
 Deno.test('source lease starts at the commanded offset despite acquisition delay, and uses progress only after delivery', async () => {
   const f = fixture();
   try {

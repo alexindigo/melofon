@@ -31,6 +31,7 @@ import {
   queueCapabilities,
   type QueueMedia,
   type QueueReference,
+  type SourceMetadata,
 } from './queue-source.ts';
 import type {
   CommandSource,
@@ -165,6 +166,11 @@ export interface Playback {
   cancelSource(source: PlaybackSource): void;
   sourceAudio(source: PlaybackSource, durationMs: number): void;
   reportSourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
+  /** Raw facts from the currently elected lease; no commands or hat labels. */
+  reportSourceMetadata(
+    source: PlaybackSource,
+    metadata: SourceMetadata,
+  ): boolean;
 
   /** Boot-time restore (main.ts): delegates to player.restore and records
    * it with source internal:restore. Refreshed activation facts can invalidate
@@ -227,10 +233,19 @@ export function createPlayback(deps: {
   let commander: string | null = null;
   let serverPresent = hasServerRow();
   let announcedCommander: string | null = commander;
+  let announcedQueueVersion = player.queue().version;
   // Engine events keep their existing vocabulary. The aggregate additionally
   // changes on clock/current transitions and on external attribution changes,
   // including commands (volume/options/queue edits) without a player event.
   const emit = (types: string[]) => {
+    const version = player.queue().version;
+    if (version !== announcedQueueVersion) {
+      announcedQueueVersion = version;
+      if (!types.includes('queue')) {
+        flushQueue();
+        types = [...types, 'queue'];
+      }
+    }
     const present = hasServerRow();
     const changed = (types.includes('player') && (present || serverPresent)) ||
       (present && commander !== announcedCommander);
@@ -555,8 +570,23 @@ export function createPlayback(deps: {
       if (source) openedSource = source;
       return source;
     },
-    cancelSource: (source) => player.cancelSource(source),
+    cancelSource(source) {
+      const version = player.queue().version;
+      player.cancelSource(source);
+      if (player.queue().version !== version) {
+        flushQueue();
+        emit(['queue', 'nowPlaying']);
+      }
+    },
     sourceAudio: (source, durationMs) => player.sourceAudio(source, durationMs),
+    reportSourceMetadata(source, metadata) {
+      if (closed || closing || !player.sourceMetadata(source, metadata)) {
+        return false;
+      }
+      flushQueue();
+      emit(['queue', 'nowPlaying']);
+      return true;
+    },
     reportSourceOutcome(source, outcome) {
       if (closed || !player.sourceOutcome(source, outcome)) return false;
       const view = player.status();
@@ -942,6 +972,7 @@ export function createPlayback(deps: {
         );
         serverPresent = hasServerRow();
         announcedCommander = commander;
+        announcedQueueVersion = player.queue().version;
         if (restored.queueChanged) flushQueue();
       };
       if (
