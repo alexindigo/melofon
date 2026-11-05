@@ -348,6 +348,107 @@ Deno.test('OwnTone core folders: absolute paths, independent directories, bounde
   }
 });
 
+Deno.test('Core folder addresses: native and OwnTone listings contain only openable paths with exact pages', async () => {
+  const f = await coreBrowseFixture(true);
+  try {
+    const path = `${f.root}/Music`;
+    await Deno.mkdir(path);
+    const libraries = createLibraries(f.store);
+    const music = await libraries.add('Music', path);
+    const eligible = ['a', 'a/X:Y', 'a/1:ok', 'a/Z:more/deep', 'z'];
+    const rejected = [
+      'a\\b',
+      'X:Y',
+      'c:drive',
+      'bad\nname',
+      'bad\u007fname',
+      'a/b\\c',
+      'a/bad\tname',
+    ];
+    for (const folder of [...eligible, ...rejected]) {
+      await Deno.mkdir(`${path}/${folder}`, { recursive: true });
+      await tagged(`${path}/${folder}/song.mp3`, {});
+    }
+    // Only folder addresses are constrained, not immediate media basenames.
+    await tagged(`${path}/root\\song.mp3`, {});
+    await tagged(`${path}/Q:song.mp3`, {});
+    await createScan(f.store).run();
+    const own = (relative: string) =>
+      f.own(`/api/library/files?${new URLSearchParams({
+        directory: relative ? `${path}/${relative}` : path,
+      })}`);
+    const expected = new Map([
+      ['', ['a', 'z']],
+      ['a', ['a/1:ok', 'a/X:Y', 'a/Z:more']],
+      ['a/1:ok', []],
+      ['a/X:Y', []],
+      ['a/Z:more', ['a/Z:more/deep']],
+      ['a/Z:more/deep', []],
+      ['z', []],
+    ]);
+    for (const use of ['cookie', 'bearer'] as const) {
+      const { credential } = await f.login(
+        use,
+        'listener',
+        'password-listener',
+      );
+      const native = async (relative: string, offset = 0, limit = 50) => {
+        const response = await f.get(
+          `/api/v1/folders?${new URLSearchParams({
+            library: music.id,
+            path: relative,
+            folderOffset: String(offset),
+            folderLimit: String(limit),
+          })}`,
+          credential,
+        );
+        assertEquals(response.status, 200, await response.clone().text());
+        return response.json();
+      };
+      for (const [relative, children] of expected) {
+        const page = await native(relative);
+        assertEquals(page.folder.path, relative);
+        assertEquals(
+          page.folders.folders.map((r: { path: string }) => r.path),
+          children,
+        );
+        assertEquals(page.folders.total, children.length);
+        const ownPage = await own(relative);
+        assertEquals(
+          ownPage.directories,
+          children.map((p) => ({ path: `${path}/${p}` })),
+        );
+        assertEquals(ownPage.tracks.total, page.songs.total);
+        assert(page.songs.total > 0 || children.length > 0);
+        for (let offset = 0; offset <= children.length; offset++) {
+          const bounded = await native(relative, offset, 1);
+          assertEquals(bounded.folders.total, children.length);
+          assertEquals(
+            bounded.folders.folders,
+            page.folders.folders.slice(offset, offset + 1),
+          );
+        }
+      }
+      const root = await native('');
+      assertEquals(root.songs.total, 2);
+      for (const relative of rejected) {
+        const response = await f.get(
+          `/api/v1/folders?${new URLSearchParams({
+            library: music.id,
+            path: relative,
+          })}`,
+          credential,
+        );
+        assertEquals(response.status, 400);
+        assertEquals((await response.json()).code, 'invalid_field');
+        assertEquals((await own(relative)).directories, []);
+      }
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('OwnTone core statistics: placeholder population and live removal agree with native HTTP without catalog walks', async () => {
   const f = await coreBrowseFixture();
   try {

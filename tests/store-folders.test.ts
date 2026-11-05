@@ -152,6 +152,72 @@ Deno.test('store.folders: root and scoped facts, both totals/pages and revision 
   }
 });
 
+Deno.test('core.folders: indexed ancestry and opening agree on every forbidden control and legacy path', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-folder-contract-' });
+  const store = await openStore(dir);
+  try {
+    await store.catalog.addLibrary({
+      id: 'lib',
+      name: 'Music',
+      path: '/music',
+    });
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+    const valid = ['a', 'a/X:Y', 'a/1:ok', "quote'%_", '日本語'];
+    const invalid = [
+      '.',
+      '..',
+      '/bad',
+      'a/',
+      'a/.',
+      'a/..',
+      'a//b',
+      'a\\b',
+      'a/b\\c',
+      'X:Y',
+      'z:drive',
+    ];
+    const entries = [
+      ...valid.map((path) => ({ path, sql: quote(path) })),
+      ...invalid.map((path) => ({ path, sql: quote(path) })),
+      ...[...Array.from({ length: 32 }, (_, i) => i), 127].flatMap((code) =>
+        ['', 'a/'].map((prefix) => ({
+          path: `${prefix}bad${String.fromCharCode(code)}name`,
+          sql: `${quote(prefix + 'bad')} || chr(${code}) || 'name'`,
+        }))
+      ),
+    ];
+    for (const [i, entry] of entries.entries()) {
+      await rawSql(store).run(`INSERT INTO files (id, path, library_id) VALUES
+        ('file-${i}', '/music/' || ${entry.sql} || '/song.mp3', 'lib')`);
+    }
+    const folders = createFolders(store);
+    const read = (path: string) =>
+      folders.browse({ ...options, libraryId: 'lib', path });
+    const root = await read('');
+    assertEquals(root.folders.rows.map((r) => r.path), [
+      'a',
+      "quote'%_",
+      '日本語',
+    ]);
+    assertEquals(root.folders.total, 3);
+    assertEquals((await read('a')).folders.rows.map((r) => r.path), [
+      'a/1:ok',
+      'a/X:Y',
+    ]);
+    for (const path of valid) assertEquals((await read(path)).songs.total, 1);
+    for (const { path } of entries.slice(valid.length)) {
+      await assertRejects(
+        async () => await read(path),
+        LibraryError,
+        'Invalid folder path',
+      );
+    }
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('core.folders: canonical relative addresses and safe integer paging are required before store reads', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-folder-input-' });
   const store = await openStore(dir);

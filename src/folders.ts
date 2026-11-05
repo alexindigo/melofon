@@ -1,6 +1,7 @@
 import type { Store } from './store/index.ts';
 import type { FolderPageOptions } from './store/folders.ts';
 import { LibraryError } from './library-errors.ts';
+import { isFolderPath } from './folder-path.ts';
 export type {
   FolderPageOptions,
   FolderPages,
@@ -14,15 +15,7 @@ export function createFolders(store: Store) {
     browse(options: FolderPageOptions) {
       const path = options.path ?? '';
       if (
-        typeof path !== 'string' || path.includes('\\') ||
-        Array.from(path).some((c) =>
-          c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127
-        ) ||
-        /^[a-z]:/i.test(path) ||
-        (path !== '' &&
-          path.split('/').some((part) =>
-            !part || part === '.' || part === '..'
-          )) ||
+        !isFolderPath(path) ||
         (options.libraryId === undefined && path !== '')
       ) {
         throw new LibraryError('invalid_field', 'Invalid folder path');

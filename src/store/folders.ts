@@ -5,6 +5,7 @@ import { catalogRevision } from './catalog-revision.ts';
 import { catalogSongRows, type SongRow } from './catalog.ts';
 import { sortKeySql } from './catalog-sql.ts';
 import { LibraryError } from '../library-errors.ts';
+import { invalidFolderPathPattern } from '../folder-path.ts';
 
 export interface FolderRow {
   libraryId: string;
@@ -59,14 +60,19 @@ export function createFoldersStore(engine: Engine) {
           ? '/'
           : `${library.path.replace(/\/+$/, '')}/`;
         // starts_with, rather than LIKE: %, _ and quotes in real names are literal.
-        // Exclude inconsistent legacy rows outside their source or with dot segments.
+        // Only canonical directory ancestry can produce navigable addresses.
+        // Replace only the media basename with a valid segment: folder rules
+        // must not restrict song names, and every directory separator stays intact.
         const relative = `substring(f.path, ${Array.from(root).length + 1})`;
+        const ancestry = `regexp_replace(${relative}, '[^/]*$', '_')`;
         const indexed = `SELECT f.id, ${relative} AS rel FROM files f
           WHERE f.library_id = ${esc(opts.libraryId)} AND starts_with(f.path, ${
           esc(root)
         })
           AND ${relative} <> ''
-          AND NOT regexp_matches(${relative}, '(^|/)[.]{1,2}(/|$)|//')`;
+          AND NOT regexp_matches(${ancestry}, ${
+          esc(invalidFolderPathPattern)
+        })`;
         const prefix = path === '' ? '' : `${path}/`;
         const descendants = `SELECT id, substring(rel, ${
           Array.from(prefix).length + 1
