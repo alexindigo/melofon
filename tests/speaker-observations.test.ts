@@ -64,6 +64,7 @@ async function fixture(dir: string) {
         outputs,
         speakers: createSpeakers({
           outputs,
+          registerAddress: devices.registerAddress,
           adapterView: (id) => ({
             preparation: devices.admission.describe(id),
           }),
@@ -272,3 +273,73 @@ Deno.test('manual and environment address configuration is adopted even offline;
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+for (const entry of ['discovery', 'address'] as const) {
+  Deno.test(`invalid saved hosts cannot interrupt ${entry} matching or hide a valid alias`, async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'speaker-legacy-host-' });
+    try {
+      const store = await openStore(dir);
+      for (
+        const [id, host] of [['77', 'living_room.local'], ['88', '192.0.2.10.']]
+      ) {
+        await store.speakers.saveAdopted({
+          id,
+          host,
+          name: 'Saved receiver',
+          type: 'AirPlay',
+          selected: false,
+          volume: 43,
+          connectionStrategy: 'melofon',
+        });
+      }
+      await store.close();
+      const t = await fixture(dir);
+      try {
+        if (entry === 'discovery') {
+          t.announce('down');
+          t.announce('up');
+          const row = (await t.read()).find((r: { id: string }) =>
+            r.id === '88'
+          );
+          assertEquals(row.discovered, true);
+          assertEquals(row.state.preparation.state, 'ready');
+          t.announce('down');
+          assertEquals(
+            (await t.read()).find((r: { id: string }) => r.id === '88')
+              .discovered,
+            false,
+          );
+          t.announce('up');
+          assertEquals((await t.read()).length, 2);
+        } else {
+          const { credential } = await t.f.login('cookie');
+          for (let i = 0; i < 2; i++) {
+            const response = await t.f.json('/api/v1/speakers', 'POST', {
+              protocol: 'AirPlay',
+              address: '192.0.2.10',
+            }, credential);
+            assertEquals(response.status, 201);
+            assertEquals((await response.json()).speaker.id, '88');
+          }
+          const invalid = await t.f.json('/api/v1/speakers', 'POST', {
+            protocol: 'AirPlay',
+            address: 'invalid_host.local',
+          }, credential);
+          assertEquals(invalid.status, 400);
+          await invalid.text();
+          assertEquals((await t.read()).length, 2);
+        }
+        const legacy = (await t.read()).find((r: { id: string }) =>
+          r.id === '77'
+        );
+        assertEquals(legacy.address, 'living_room.local');
+        assertEquals(legacy.adopted, true);
+        assertEquals(legacy.discovered, false);
+      } finally {
+        await t.close();
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}

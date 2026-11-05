@@ -19,6 +19,19 @@ export function normalizeAirplayAddress(value: string): string {
   return host;
 }
 
+/** Stored legacy endpoints can predate validation; they are not match evidence. */
+export function sameAirplayAddress(
+  a: string | undefined,
+  b: string | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return false;
+  try {
+    return normalizeAirplayAddress(a) === normalizeAirplayAddress(b);
+  } catch {
+    return false;
+  }
+}
+
 /** Stable RAOP instance identity, shared by target lookup and browsing. */
 export function airplayInstance(
   name: string,

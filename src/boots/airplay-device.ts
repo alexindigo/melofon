@@ -8,7 +8,11 @@ import { createMdnsResolver, type MdnsResolver } from '../mdns-resolver.ts';
 import type { MdnsService } from '../mdns.ts';
 import type { SpeakerAdapterView, SpeakerSessionView } from '../speakers.ts';
 import type { SpeakerCredentials } from '../speaker-credentials.ts';
-import { airplayInstance, normalizeAirplayAddress } from './airplay-address.ts';
+import {
+  airplayInstance,
+  normalizeAirplayAddress,
+  sameAirplayAddress,
+} from './airplay-address.ts';
 import { createFfiSpawn } from './raop-ffi.ts';
 import {
   airplayAbilities,
@@ -312,9 +316,7 @@ export function createAirplayDevices(deps: {
       if (known) return known.id;
       const provisional = rows.find((o) =>
         o.receiverIdentity === undefined &&
-        o.host !== undefined &&
-        normalizeAirplayAddress(o.host) ===
-          normalizeAirplayAddress(service.address) &&
+        sameAirplayAddress(o.host, service.address) &&
         (o.port === undefined || o.port === service.port)
       );
       return provisional?.id ?? parsed.id;
@@ -364,8 +366,7 @@ export function createAirplayDevices(deps: {
       const host = normalizeAirplayAddress(input.host);
       const receiverRevisions = new Map(configurationRevisions);
       const candidates = outputs.list({ includeIgnored: true }).filter((o) =>
-        o.type === 'AirPlay' && o.host !== undefined &&
-        normalizeAirplayAddress(o.host) === host
+        o.type === 'AirPlay' && sameAirplayAddress(o.host, host)
       );
       const existing = candidates.find((o) => o.port === input.port) ??
         (input.port === undefined && candidates.length === 1
