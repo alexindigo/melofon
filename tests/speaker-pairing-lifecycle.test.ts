@@ -288,3 +288,141 @@ for (const scenario of ['demand', 'challenge', 'timer', 'send'] as const) {
     },
   });
 }
+
+Deno.test('OwnTone PIN HTTP preserves every typed refusal and propagates unexpected failures', async () => {
+  const outputs = createOutputs();
+  outputs.register({
+    id: '1',
+    name: 'Receiver',
+    type: 'AirPlay',
+    selected: false,
+    volume: 50,
+  });
+  const admission = createOutputAdmission({ endpoint: () => null });
+  const value = pin();
+  let failure: unknown, submitted = false;
+  const f = await apiFixture({
+    hats: {
+      layersRoot: 'layers',
+      extraPorts: 1,
+      env: ([port]) => ({ MELOFON_LISTEN_owntone: `${port},${port}` }),
+    },
+    services: () =>
+      Promise.resolve({
+        outputs,
+        speakers: createSpeakers({
+          outputs,
+          adapterView: (id) => ({ preparation: admission.describe(id) }),
+          submitPin: (_id, input) => {
+            if (failure !== undefined) return Promise.reject(failure);
+            submitted = input === value;
+            return Promise.resolve({ state: 'pairing', saved: false });
+          },
+        }),
+      }),
+  });
+  const url = `http://melofon.home:${f.extraPorts[0]}/api/outputs/1`;
+  const send = () =>
+    fetch(url, {
+      method: 'PUT',
+      signal: AbortSignal.timeout(5000),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: value, selected: true, volume: 37 }),
+    });
+  const refusals = {
+    not_found: 400,
+    invalid_field: 400,
+    unknown_field: 400,
+    unsupported_protocol: 400,
+    not_adopted: 400,
+    already_adopted: 400,
+    speaker_in_use: 400,
+    speaker_busy: 400,
+    pairing_required: 400,
+    pairing_unavailable: 400,
+    persistence_failed: 400,
+  } satisfies Record<SpeakerError['code'], number>;
+  try {
+    for (const code of Object.keys(refusals) as SpeakerError['code'][]) {
+      failure = new SpeakerError(code, 'Safe speaker refusal');
+      const response = await send();
+      assertEquals(response.status, refusals[code]);
+      assertEquals(await response.text(), '');
+    }
+    for (
+      const unexpected of [
+        new Error('Settings unavailable'),
+        Object.assign(new Error('Dependency failed'), {
+          code: 'invalid_field',
+        }),
+        'Unexpected rejection',
+        { name: 'SpeakerError', code: 'pairing_required' },
+      ]
+    ) {
+      failure = unexpected;
+      const response = await send();
+      assertEquals(response.status, 500);
+      await response.text();
+    }
+    assertEquals(outputs.get('1')!.selected, false);
+    assertEquals(outputs.get('1')!.volume, 50);
+    failure = undefined;
+    const accepted = await send();
+    assertEquals(accepted.status, 204);
+    assertEquals(await accepted.text(), '');
+    assert(submitted, 'PIN reaches the core lifecycle port unchanged');
+    const read = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    assertEquals(read.status, 200);
+    const output = await read.json();
+    assertEquals(output.selected, true);
+    assertEquals(output.volume, 37);
+  } finally {
+    admission.close();
+    await f.close();
+  }
+});
+
+Deno.test({
+  name:
+    'OwnTone PIN settings rejection is HTTP 500 and retry reaches the native fake receiver',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const dir = await Deno.makeTempDir({ prefix: 'owntone-pin-settings-' });
+    await speakerMedia(dir);
+    const fake = await startFakeRaop();
+    const service = receiver(1, fake.port, { sf: '200' });
+    let t: Awaited<ReturnType<typeof speakerConsumer>> | undefined;
+    try {
+      t = await speakerConsumer(dir, [service]);
+      t.discover(service);
+      await t.play('1');
+      await until(() =>
+        t!.devices.describe('1').session?.authentication ===
+          'authentication_required'
+      );
+      const get = t.f.state.getTyped;
+      let failures = 1;
+      t.f.state.getTyped = (key) =>
+        key === 'airplay.pairingSeconds' && failures-- > 0
+          ? Promise.reject(new Error('Settings unavailable'))
+          : get(key);
+      const body = { pin: pin() };
+      const rejected = await t.ownResponse('/outputs/1', 'PUT', body);
+      assertEquals(rejected.status, 500);
+      await rejected.text();
+      const accepted = await t.ownResponse('/outputs/1', 'PUT', body);
+      assertEquals(accepted.status, 204);
+      assertEquals(await accepted.text(), '');
+      await until(() =>
+        fake.sessions.length >= 2 &&
+        fake.sessions[1].requests.some((r) => r.method === 'POST')
+      );
+      assert(fake.sessions.every((s) => s.audioPackets === 0));
+    } finally {
+      await t?.close();
+      fake.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

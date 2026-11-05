@@ -19,7 +19,10 @@ export default async (request: HatRequest, context: HatContext) => {
   if (typeof body.pin === 'string') {
     try {
       await context.app.speakers.submitPin(id, { pin: body.pin });
-    } catch {
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'SpeakerError') {
+        throw error;
+      }
       return badRequest();
     }
   }
