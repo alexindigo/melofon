@@ -96,14 +96,29 @@ owner's pending-read idle budget, without the resolution lifetime/byte caps.
 The server composes this resolver with ICY stripping and core-fed decoding for
 station and URL queue sources. One elected AirPlay pump opens the source for all
 selected receivers; pause, stop, next and output handoff cancel its network and
-decoder lifetime. Public URL admission, finite URL preparation, live title
-publication and source reconnect policy follow in separate stage-2 items.
+decoder lifetime. Public URL admission, live title publication and source
+reconnect policy follow in separate stage-2 items.
+
+Core URL queue additions prepare facts before changing or publishing the queue.
+`playback.source.prepareBytes` (1048576 bytes, at most 16777216) bounds the
+retained audio prefix; native size-aware probing can need one additional prefix
+copy. `playback.source.prepareTimeoutMs` (2000 ms) bounds the
+body inspection and, separately, native inspection/decoding. Resolution also has
+the radio owner's existing deadline. A completed bounded read gets its actual
+decoded PCM duration; otherwise available container/stream duration is used,
+including native size/bitrate facts when Content-Length is present.
+ICY sources and usable audio without a determinable length are live-like, with
+null duration and no-op seek. This does not promise unknown-length announcements
+have a finite length. Real HTTP, format and audio failures preserve the old
+queue. Inspection releases its connection and decoder; playback opens a fresh
+source. No prepared files or audio cache survive the operation or restart.
 
 Core media can decode owned compressed byte streams without giving FFmpeg a URL.
 It probes and replays a bounded prefix, ignores MIME hints, and accepts direct
 MP3, AAC, WAV, FLAC, Ogg and forward-readable MOV/MP4 containers. Playlists and
-secondary network/file resources are not opened by FFmpeg. These inputs cannot
-seek; containers requiring backward reads need finite preparation. Non-seekable
+secondary network/file resources are not opened by FFmpeg. Finite inputs resume
+or seek by decoding forward and discarding PCM up to the requested sample;
+containers requiring backward compressed reads remain unsupported. Non-seekable
 MP3 decoding follows FFmpeg's streaming padding behavior rather than promising
 seekable-file gapless trimming.
 

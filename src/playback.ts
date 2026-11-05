@@ -140,7 +140,8 @@ export interface Playback {
     opts?: QueueAddOptions,
     source?: CommandSource,
   ): QueueEntry[] | Promise<QueueEntry[]>;
-  /** Already resolved core media, not a public URL admission API. */
+  /** Resolved core media. The composed source owner prepares URL facts before
+   * publication; hats still resolve/admit their protocol's reference grammar. */
   queueAddSources(
     media: QueueMedia[],
     opts?: QueueAddOptions,
@@ -159,8 +160,8 @@ export interface Playback {
   reportSourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
 
   /** Boot-time restore (main.ts): delegates to player.restore and records
-   * it with source internal:restore. Emits and persists nothing — the
-   * values came from the store. */
+   * it with source internal:restore. Refreshed activation facts can invalidate
+   * the queue; other values came from the store. */
   restore(snapshot: RestoreSnapshot): void | Promise<void>;
 
   playerView(): PlayerStatus;
@@ -196,6 +197,10 @@ export function createPlayback(deps: {
   resolveQueueReference?: (
     reference: QueueReference,
   ) => Promise<QueueMedia | null>;
+  prepareQueueMedia?: (
+    media: QueueMedia,
+    signal: AbortSignal,
+  ) => Promise<QueueMedia>;
   log?: Log;
 }): Playback {
   const { player, nowPlaying, library, outputs, notify, persistence } = deps;
@@ -260,9 +265,13 @@ export function createPlayback(deps: {
     if (!current()) throw cancelled();
     cancelStart();
     const items = activation?.items ?? player.queue().items;
-    const needsResolution = starts && activation &&
-      deps.resolveQueueReference &&
-      items[activation.index]?.reference.kind === 'station';
+    const candidate = activation && items[activation.index];
+    const needsPreparation = (item: QueueMedia) =>
+      deps.prepareQueueMedia &&
+      item.facts.kind === 'web' && item.facts.mode === 'unknown';
+    const needsResolution = starts && activation && candidate &&
+      (deps.resolveQueueReference && candidate.reference.kind === 'station' ||
+        needsPreparation(candidate));
     if (!starts || !deps.targets && !needsResolution) return commit(() => {});
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -276,9 +285,13 @@ export function createPlayback(deps: {
         for (let visited = 0; visited < items.length; visited++) {
           if (index < 0 || index >= items.length) break;
           const item = items[index];
-          const media = item.reference.kind === 'station'
-            ? await deps.resolveQueueReference!(item.reference)
-            : item;
+          let media =
+            item.reference.kind === 'station' && deps.resolveQueueReference
+              ? await deps.resolveQueueReference!(item.reference)
+              : item;
+          if (media && needsPreparation(media)) {
+            media = await deps.prepareQueueMedia!(media, controller.signal);
+          }
           if (controller.signal.aborted) throw cancelled();
           if (media) {
             selected = { index, media };
@@ -312,6 +325,11 @@ export function createPlayback(deps: {
         emit(['queue']);
       }
       return result;
+    }).catch((error) => {
+      // Cancellation is an authority outcome, including aborts rejected by an
+      // asynchronous source owner, never a failed restore to publish afterward.
+      if (controller.signal.aborted || !current()) throw cancelled();
+      throw error;
     }).finally(() => {
       authority?.signal.removeEventListener('abort', abort);
       if (pendingStart === controller) pendingStart = undefined;
@@ -756,7 +774,38 @@ export function createPlayback(deps: {
     queueAdd(songs, opts = {}, source) {
       return addSources(songs.map(catalogMedia), opts, source);
     },
-    queueAddSources: addSources,
+    queueAddSources(media, opts, source) {
+      if (
+        !deps.prepareQueueMedia ||
+        !media.some((item) => item.facts.kind === 'web')
+      ) {
+        return addSources(media, opts, source);
+      }
+      cancelStart();
+      const controller = new AbortController();
+      pendingStart = controller;
+      return (async () => {
+        try {
+          const prepared: QueueMedia[] = [];
+          for (const item of media) {
+            prepared.push(
+              await deps.prepareQueueMedia!(item, controller.signal),
+            );
+            controller.signal.throwIfAborted();
+          }
+          if (pendingStart !== controller) {
+            throw new PlaybackError(
+              'playback_cancelled',
+              'Queue preparation cancelled',
+            );
+          }
+          pendingStart = undefined;
+          return await addSources(prepared, opts, source);
+        } finally {
+          if (pendingStart === controller) pendingStart = undefined;
+        }
+      })();
+    },
     queueClear(source) {
       cancelStart();
       player.queueClear();
@@ -815,6 +864,10 @@ export function createPlayback(deps: {
     },
 
     restore(snapshot) {
+      const index = snapshot.currentIndex ?? 0;
+      const candidate = snapshot.queue[index];
+      const prepareUrl = deps.prepareQueueMedia &&
+        candidate?.facts.kind === 'web' && candidate.facts.mode === 'unknown';
       const commit = (restored = snapshot) => {
         player.restore(restored);
         record(
@@ -828,19 +881,35 @@ export function createPlayback(deps: {
         if (restored.queueChanged) flushQueue();
       };
       if (
-        snapshot.state !== 'play' || !snapshot.queue.length || !deps.targets
+        snapshot.state !== 'play' || !snapshot.queue.length ||
+        !deps.targets && !prepareUrl
       ) {
         cancelStart();
         return commit();
       }
-      return Promise.resolve(transition(true, () => commit())).catch(
+      return Promise.resolve(transition(
+        true,
+        (activate) => {
+          commit();
+          activate();
+        },
+        undefined,
+        { index, items: snapshot.queue },
+      )).catch(
         (error) => {
           if (
             error instanceof PlaybackError &&
               error.code === 'target_unavailable' ||
             error instanceof PlaybackError && error.code === 'no_target'
           ) commit({ ...snapshot, state: 'pause' });
-          else throw error;
+          else if (prepareUrl && !(error instanceof PlaybackError)) {
+            log.event('media_failed', {
+              operation: 'prepare-restored-source',
+              path: String(candidate.id),
+              error,
+            });
+            commit({ ...snapshot, state: 'pause' });
+          } else throw error;
         },
       );
     },

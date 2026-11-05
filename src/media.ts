@@ -36,7 +36,11 @@ import {
   AVMEDIA_TYPE_VIDEO,
   type AVPixelFormat,
   avRescaleQ,
+  AVSEEK_CUR,
+  AVSEEK_END,
   AVSEEK_FLAG_BACKWARD,
+  AVSEEK_SET,
+  AVSEEK_SIZE,
   Codec,
   Decoder,
   Demuxer,
@@ -146,6 +150,8 @@ export interface CompressedInput {
 
 export interface InputPcm extends AsyncIterableIterator<Uint8Array> {
   return(): Promise<IteratorResult<Uint8Array>>;
+  /** Available container/stream duration, including native size/bitrate facts. */
+  durationMs: number | null;
   /** Settles after reader, source lease, demuxer, decoder and frames release. */
   completion: Promise<void>;
 }
@@ -157,6 +163,13 @@ export interface Media {
   fingerprint(path: string): Promise<AudioFingerprint>;
   /** Never throws: unreadable/unsupported media probes as all-null/false. */
   probe(path: string): Promise<Probe>;
+  /** Inspect a retained prefix with a known logical response size. Seeking is
+   * confined to the prefix; no native file/network subopens are permitted. */
+  probeInputDuration(
+    bytes: Uint8Array,
+    size: number,
+    signal: AbortSignal,
+  ): Promise<number | null>;
   /** Extract supported text subtitle packets, preserving their stream timing. */
   captions(
     path: string,
@@ -214,7 +227,7 @@ export interface Media {
    * unsupported input, source failure or abort, preserving source errors. */
   decodeInputPcm(
     source: CompressedInput,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; startMs?: number },
   ): Promise<InputPcm>;
 }
 
@@ -366,6 +379,29 @@ const INPUT_LIMITS = {
   bufferBytes: 1048576,
 };
 
+function coreInputOptions(probeBytes: number) {
+  return {
+    protocol_whitelist: 'NONE',
+    format_whitelist: INPUT_FORMATS.join(','),
+    enable_drefs: 0,
+    use_absolute_path: 0,
+    probesize: probeBytes,
+    analyzeduration: 0,
+  };
+}
+
+function inputDuration(input: Demuxer): number | null {
+  const audio = input.audio();
+  const seconds = input.duration > 0
+    ? input.duration
+    : audio && audio.duration !== AV_NOPTS_VALUE && audio.duration > 0n
+    ? Number(audio.duration) * audio.timeBase.num / audio.timeBase.den
+    : 0;
+  return Number.isFinite(seconds) && seconds > 0
+    ? Math.round(seconds * 1000)
+    : null;
+}
+
 function pcmDecoder(input: Demuxer): Promise<Decoder> {
   const audio = input.audio();
   if (!audio) throw new Error('Media input has no audio');
@@ -384,7 +420,10 @@ function ownedPcm(
   input: Demuxer,
   decoder: Decoder,
   owner?: { stop(): void; release(): Promise<void>; check(): void },
+  startMs = 0,
 ): InputPcm {
+  let skipBytes = Math.max(0, Math.round(startMs * PCM_RATE / 1000)) *
+    PCM_BYTES_PER_SAMPLE;
   let complete!: () => void;
   const completion = new Promise<void>((resolve) => complete = resolve);
   let closing: Promise<void> | undefined;
@@ -415,7 +454,9 @@ function ownedPcm(
             const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
             const chunk = new Uint8Array(Math.min(bytes, plane.length));
             chunk.set(plane.subarray(0, chunk.length));
-            yield chunk;
+            const skip = Math.min(skipBytes, chunk.length);
+            skipBytes -= skip;
+            if (skip < chunk.length) yield chunk.subarray(skip);
           }
         } finally {
           frame.free();
@@ -431,6 +472,7 @@ function ownedPcm(
   })();
   return {
     completion,
+    durationMs: inputDuration(input),
     [Symbol.asyncIterator]() {
       return this;
     },
@@ -948,6 +990,44 @@ export function createMedia(
 
   return {
     ...hls,
+    async probeInputDuration(bytes, size, signal) {
+      signal.throwIfAborted();
+      const probeBytes = Number(
+        await state?.getTyped('media.input.probeBytes') ??
+          INPUT_LIMITS.probeBytes,
+      );
+      const found = await Demuxer.probeFormat(
+        Buffer.from(bytes.subarray(0, probeBytes)),
+      );
+      const format = found && found.confidence > 25 &&
+        INPUT_FORMATS.find((name) => found.format.split(',').includes(name));
+      if (!format) throw new Error('Unrecognized core media input format');
+      let at = 0;
+      await using input = await Demuxer.open({
+        read(count) {
+          signal.throwIfAborted();
+          if (at === bytes.length) return null;
+          const part = Buffer.from(bytes.subarray(at, at + count));
+          at += part.length;
+          return part;
+        },
+        seek(offset, whence) {
+          signal.throwIfAborted();
+          if (whence === AVSEEK_SIZE) return BigInt(size);
+          const next = Number(offset) +
+            (whence === AVSEEK_CUR ? at : whence === AVSEEK_END ? size : 0);
+          if (
+            ![AVSEEK_SET, AVSEEK_CUR, AVSEEK_END].includes(whence) ||
+            !Number.isSafeInteger(next) || next < 0 || next > bytes.length
+          ) return -1;
+          at = next;
+          return BigInt(at);
+        },
+      }, { format, signal, options: coreInputOptions(probeBytes) });
+      signal.throwIfAborted();
+      if (!input.audio()) throw new Error('Media input has no audio');
+      return inputDuration(input);
+    },
     async decodeInputPcm(source, opts = {}) {
       const abort = new AbortController();
       const signal = abort.signal;
@@ -1073,14 +1153,7 @@ export function createMedia(
         }, {
           format,
           signal,
-          options: {
-            protocol_whitelist: 'NONE',
-            format_whitelist: INPUT_FORMATS.join(','),
-            enable_drefs: 0,
-            use_absolute_path: 0,
-            probesize: limits.probeBytes,
-            analyzeduration: 0,
-          },
+          options: coreInputOptions(limits.probeBytes),
         });
         check();
         decoder = await pcmDecoder(input);
@@ -1092,7 +1165,7 @@ export function createMedia(
             abort.abort(new DOMException('PCM input cancelled', 'AbortError')),
           release,
           check,
-        });
+        }, opts.startMs);
         // Abort also releases a successfully acquired but unconsumed iterator.
         const retire = () => {
           void stream.return().catch(() => {});

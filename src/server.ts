@@ -128,6 +128,7 @@ export async function startServer(options: {
   const playbackSources = createPlaybackSource({
     media,
     radio: createRadioSource({ network, state }),
+    state,
   });
   const podcasts = await createPodcasts({
     store,
@@ -213,6 +214,7 @@ export async function startServer(options: {
     persistence,
     targets: speakers,
     resolveQueueReference,
+    prepareQueueMedia: playbackSources.prepare,
   });
   const app = {
     store,
