@@ -45,9 +45,8 @@ async function setup() {
     services: (f) => {
       media = createMedia(undefined, f.state);
       const hls = media.hls.bind(media);
-      media.hls = async (...args) => {
-        calls++;
-        const view = await hls(...args);
+      const renditions = media.hlsRenditions.bind(media);
+      const observe = (view: Awaited<ReturnType<typeof hls>>) => {
         if (!view) return null;
         views++;
         let released = false;
@@ -61,6 +60,15 @@ async function setup() {
             }
           },
         };
+      };
+      media.hls = async (...args) => {
+        calls++;
+        return observe(await hls(...args));
+      };
+      media.hlsRenditions = async (...args) => {
+        calls++;
+        return (await renditions(...args))?.map((view) => observe(view)!) ??
+          null;
       };
       return Promise.resolve({ library: createLibrary(f.store), media });
     },
