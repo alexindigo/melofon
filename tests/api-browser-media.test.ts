@@ -267,9 +267,7 @@ for (const prefix of ['', '/music']) {
         'Page.captureScreenshot',
         { format: 'png' },
       );
-      const evidence = `${Deno.env.get('TMPDIR')}/browser-media-${
-        prefix ? 'music' : 'root'
-      }.png`;
+      const evidence = `${root}/browser-media-${prefix ? 'music' : 'root'}.png`;
       await Deno.writeFile(evidence, decodeBase64(screenshot.data));
 
       const log = await Deno.readTextFile(`${root}/requests.log`);
