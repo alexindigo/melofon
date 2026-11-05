@@ -42,6 +42,7 @@ export interface ArtworkDescriptor {
     | 'playlist'
     | 'podcast'
     | 'radio-upload'
+    | 'radio-stream'
     | 'radio-name';
   width: number | null;
   height: number | null;

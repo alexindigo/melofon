@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS radio_stations (
 );
 -- Nullable, durable core image reference. Preserve all existing station rows.
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS uploaded_artwork VARCHAR;
+ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS stream_artwork VARCHAR;
 -- Podcasts are shared server data, independent of scanned libraries.
 CREATE TABLE IF NOT EXISTS podcast_channels (
   id VARCHAR PRIMARY KEY,

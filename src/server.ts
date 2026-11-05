@@ -125,9 +125,16 @@ export async function startServer(options: {
     notify,
   });
   const network = createNetwork({ state });
+  const radio = createRadio(store, {
+    dataDir: cfg.dataDir,
+    state,
+    notify,
+    network,
+  });
   const playbackSources = createPlaybackSource({
     media,
     radio: createRadioSource({ network, state }),
+    artwork: radio,
     state,
   });
   const podcasts = await createPodcasts({
@@ -184,7 +191,6 @@ export async function startServer(options: {
     notify,
   });
   const player = createPlayer();
-  const radio = createRadio(store, { dataDir: cfg.dataDir, state, notify });
   const resolveQueueReference = createQueueResolver({
     getSong: (id) => library.getSong(id),
     getStation: (id) => radio.get(id),

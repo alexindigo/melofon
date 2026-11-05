@@ -46,6 +46,9 @@ export function createRadioStore(engine: Engine) {
     update(id: string, input: StationInput): Promise<StationRow | null> {
       return atomic(engine, async (q) => {
         await q.run(`UPDATE radio_stations SET name = ${esc(input.name)},
+          stream_artwork = CASE WHEN stream_url = ${
+          esc(input.streamUrl)
+        } THEN stream_artwork ELSE NULL END,
           stream_url = ${esc(input.streamUrl)},
           home_page_url = ${
           input.homePageUrl === null ? 'NULL' : esc(input.homePageUrl)
@@ -71,10 +74,37 @@ export function createRadioStore(engine: Engine) {
         return rows[0]?.payload;
       });
     },
+    streamArtwork(id: string): Promise<string | null | undefined> {
+      return engine.exclusive(async (q) => {
+        const rows = await q.all<{ payload: string | null }>(
+          `SELECT stream_artwork AS payload FROM radio_stations WHERE id = ${
+            esc(id)
+          }`,
+        );
+        return rows[0]?.payload;
+      });
+    },
+    setStreamArtwork(id: string, streamUrl: string, payload: string | null) {
+      return atomic(engine, async (q) => {
+        const rows = await q.all<{ previous: string | null }>(
+          `SELECT stream_artwork AS previous FROM radio_stations
+           WHERE id = ${esc(id)} AND stream_url = ${esc(streamUrl)}`,
+        );
+        if (!rows.length) return null;
+        await q.run(
+          `UPDATE radio_stations SET stream_artwork = ${
+            payload === null ? 'NULL' : esc(payload)
+          }
+          WHERE id = ${esc(id)} AND stream_url = ${esc(streamUrl)}`,
+        );
+        return rows[0];
+      });
+    },
     imagePayloads(): Promise<string[]> {
       return engine.exclusive(async (q) =>
         (await q.all<{ payload: string }>(
-          'SELECT uploaded_artwork AS payload FROM radio_stations WHERE uploaded_artwork IS NOT NULL',
+          `SELECT uploaded_artwork AS payload FROM radio_stations WHERE uploaded_artwork IS NOT NULL
+           UNION ALL SELECT stream_artwork AS payload FROM radio_stations WHERE stream_artwork IS NOT NULL`,
         )).map((row) => row.payload)
       );
     },

@@ -7,6 +7,7 @@ import { imageHeader, withinPixels } from './image-header.ts';
 import { imagePixels } from './media.ts';
 import type { Notify } from './notify.ts';
 import { type Log, scopedLog } from './logging.ts';
+import type { LookupNetwork } from './lookups/net.ts';
 
 export type StationResult = StationRow | { invalid: string };
 
@@ -33,11 +34,14 @@ export function createRadio(store: Store, options: {
   state?: Pick<State, 'declare' | 'getTyped'>;
   notify?: Notify;
   log?: Log;
+  network?: Pick<LookupNetwork, 'fetch'>;
 } = {}) {
   const log = options.log ?? scopedLog('radio');
   const defaults: Record<string, number> = {
     maxArtworkBytes: 20971520,
     maxArtworkPixels: 64000000,
+    artworkTimeoutMs: 10000,
+    artworkRequestsPerMinute: 60,
   };
   for (const [key, value] of Object.entries(defaults)) {
     options.state?.declare(`radio.${key}`, {
@@ -53,6 +57,13 @@ export function createRadio(store: Store, options: {
     : undefined;
   let tail: Promise<unknown> = Promise.resolve();
   let ready = false;
+  const streams = new Map<string, AbortController>();
+  const changed = (id: string) =>
+    options.notify?.emit(['library'], { radioStations: [id] }, 'all');
+  const revoke = (id: string) => {
+    streams.get(id)?.abort();
+    streams.delete(id);
+  };
   // One owner orders file reads, publication and retirement. No file/native work
   // occurs in a store slot, and a reader cannot race retirement of its source.
   function serial<T>(operation: () => Promise<T>): Promise<T> {
@@ -72,12 +83,19 @@ export function createRadio(store: Store, options: {
     artworkMaxBytes: () => setting('maxArtworkBytes'),
     cover(id: string, maxBytes: number) {
       return serial(async () => {
-        const payload = await store.radio.artwork(id);
-        if (payload === undefined) return 'unknown' as const;
-        if (payload === null || !files) return null;
+        const upload = await store.radio.artwork(id);
+        if (upload === undefined) return 'unknown' as const;
+        const payload = upload ?? await store.radio.streamArtwork(id);
+        if (!payload || !files) return null;
         try {
           const image = await files.read(payload, maxBytes);
-          return { bytes: image.value, format: image.contentType };
+          return {
+            bytes: image.value,
+            format: image.contentType,
+            sourceKind: upload
+              ? 'radio-upload' as const
+              : 'radio-stream' as const,
+          };
         } catch (error) {
           if (!(error instanceof ImageFileUnavailable)) throw error;
           log.event('radio_artwork_unavailable', {
@@ -87,6 +105,117 @@ export function createRadio(store: Store, options: {
           return null;
         }
       });
+    },
+    /** Only the elected source opens this capability. Metadata remains external
+     * content: the entered station host is the entire private-address grant. */
+    streamArtwork(id: string, streamUrl: string, signal: AbortSignal) {
+      revoke(id);
+      const generation = new AbortController();
+      streams.set(id, generation);
+      const lifetime = AbortSignal.any([signal, generation.signal]);
+      let request: AbortController | undefined;
+      let previous: string | null | undefined;
+      const jobs = new Set<Promise<void>>();
+      const publish = (bytes: Uint8Array | null, current: AbortSignal) =>
+        serial(async () => {
+          if (current.aborted || streams.get(id) !== generation) return;
+          const station = await store.radio.get(id);
+          if (!station || station.streamUrl !== streamUrl || current.aborted) {
+            return;
+          }
+          const maxBytes = await setting('maxArtworkBytes');
+          const maxPixels = await setting('maxArtworkPixels');
+          if (bytes) {
+            if (!withinPixels(imageHeader(bytes), maxPixels)) return;
+            try {
+              await imagePixels(bytes, 1, 1);
+            } catch {
+              return;
+            }
+          }
+          if (current.aborted || !files) return;
+          const payload = bytes
+            ? await files.save(bytes, maxBytes, maxPixels)
+            : null;
+          // Cancellation may happen during native validation or durable file I/O.
+          if (current.aborted || streams.get(id) !== generation) {
+            if (payload) await files.retire(payload);
+            return;
+          }
+          let result;
+          try {
+            result = await store.radio.setStreamArtwork(id, streamUrl, payload);
+          } catch (error) {
+            if (payload) await files.retire(payload);
+            throw error;
+          }
+          if (!result) {
+            if (payload) await files.retire(payload);
+            return;
+          }
+          if (result.previous) await files.retire(result.previous);
+          if (payload || result.previous) changed(id);
+        });
+      return {
+        observe(value: string | null | undefined) {
+          if (value === undefined || value === previous || lifetime.aborted) {
+            return;
+          }
+          previous = value;
+          request?.abort();
+          request = new AbortController();
+          const current = AbortSignal.any([lifetime, request.signal]);
+          // Every new carrier retires the old cover before acquisition. Invalid,
+          // absent or unavailable images reveal the deterministic name tile.
+          const pending = (async () => {
+            await publish(null, current);
+            if (!value || !options.network || !files || current.aborted) return;
+            let url: URL;
+            try {
+              url = new URL(value);
+              if (
+                !['http:', 'https:'].includes(url.protocol) || url.username ||
+                url.password
+              ) return;
+            } catch {
+              return;
+            }
+            const response = await options.network.fetch(
+              {
+                caller: 'core.radio-artwork',
+                hosts: (url) => ['http:', 'https:'].includes(url.protocol),
+                trustedHosts: [new URL(streamUrl).hostname],
+                ratePerMinute: await setting('artworkRequestsPerMinute'),
+                signal: current,
+              },
+              url.href,
+              {},
+              {
+                timeoutMs: await setting('artworkTimeoutMs'),
+                maxBytes: await setting('maxArtworkBytes'),
+              },
+            );
+            if (!response.ok) return;
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            const header = imageHeader(bytes);
+            const mime = response.headers.get('content-type')?.split(';')[0]
+              .trim().toLowerCase();
+            if (!header || mime !== `image/${header.format}`) return;
+            await publish(bytes, current);
+          })().catch(() => {
+            // Artwork is optional; failed external content never interrupts audio.
+            // The preceding retirement has already exposed the name fallback.
+          });
+          jobs.add(pending);
+          void pending.finally(() => jobs.delete(pending));
+          return pending;
+        },
+        async close() {
+          generation.abort();
+          if (streams.get(id) === generation) streams.delete(id);
+          await Promise.all(jobs);
+        },
+      };
     },
     async putArtwork(id: string, bytes: Uint8Array) {
       const maxBytes = await setting('maxArtworkBytes');
@@ -151,13 +280,25 @@ export function createRadio(store: Store, options: {
     ): Promise<StationResult | null> {
       const checked = validate(input);
       if ('invalid' in checked) return checked;
-      return await store.radio.update(id, checked);
+      return await serial(async () => {
+        const before = await store.radio.get(id);
+        const moved = before && before.streamUrl !== checked.streamUrl;
+        const old = moved ? await store.radio.streamArtwork(id) : null;
+        if (moved) revoke(id);
+        const updated = await store.radio.update(id, checked);
+        if (updated && old && files) await files.retire(old);
+        if (updated && old) changed(id);
+        return updated;
+      });
     },
     async delete(id: string): Promise<boolean> {
       return await serial(async () => {
+        revoke(id);
         const payload = await store.radio.artwork(id);
+        const stream = await store.radio.streamArtwork(id);
         const deleted = await store.radio.delete(id);
         if (deleted && payload && files) await files.retire(payload);
+        if (deleted && stream && files) await files.retire(stream);
         return deleted;
       });
     },

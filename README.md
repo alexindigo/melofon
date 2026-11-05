@@ -305,7 +305,20 @@ requests follow the usual Origin policy. `DELETE` removes the override.
 64000000) bound uploads. Invalid images leave the previous override intact.
 Back up `radio-images/` together with the database, just like `hat-images/`.
 
-Without an override, core renders the station name as a PNG tile on a plain,
+Without an override, a playing saved station can supply a direct image URL in
+ICY `StreamUrl`. Core downloads it through the shared network owner, validates
+its MIME, image header and decoded frame, and keeps it in `radio-images/`.
+The entered stream host can be on the LAN; metadata and redirects cannot grant
+access to a different private host. No website favicon or provider mapping is
+used. `radio.artworkTimeoutMs` defaults to 10000 and
+`radio.artworkRequestsPerMinute` to 60; the upload byte/pixel budgets also apply.
+New metadata replaces the cover; an empty, invalid or unavailable image reveals
+the fallback. Closing/reopening a source cancels pending acquisition; validated
+art survives restart until replaced, removed with its station, or invalidated by
+a stream URL edit. Uploads always win, and removing one reveals the stream image
+when available.
+
+Otherwise, core renders the station name as a PNG tile on a plain,
 stream-URL-derived background. All hats share the same source, versions and
 pixel/resize paths. `artwork.radioTileSize` defaults to 512 (64-2048 pixels);
 `artwork.radioTileCharacters` defaults to 512 graphemes. Names wrap and shrink
@@ -313,7 +326,7 @@ to fit, with an ellipsis for overflow. The bundled GNU Unifont bitmap font
 supports printable BMP Latin, Cyrillic, Greek and CJK names without system fonts
 or network services; its licence is in `src/fonts/`. Unsupported characters use
 a replacement glyph; complex-script shaping is not provided. Removing an upload
-reveals the tile again. Generated images are disposable cache data.
+reveals the next available source. Generated images are disposable cache data.
 
 ### Now-playing expiry
 

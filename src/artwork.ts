@@ -34,6 +34,7 @@ export interface ArtworkDescriptor {
     | 'playlist'
     | 'podcast'
     | 'radio-upload'
+    | 'radio-stream'
     | 'radio-name';
   /** Original dimensions, not rendition dimensions; null for unknown headers. */
   width: number | null;
@@ -196,7 +197,7 @@ export function createArtwork(library: Library, options: {
     if (kind === 'radio' || !kind && id.startsWith('radio-')) {
       const image = await options.radio?.cover(id, maxBytes);
       if (image === undefined || image === 'unknown') return 'unknown';
-      if (image) return { ...image, sourceKind: 'radio-upload' };
+      if (image) return image;
       const station = await options.radio?.get(id);
       if (!station) return 'unknown';
       const size = await setting('radioTileSize');

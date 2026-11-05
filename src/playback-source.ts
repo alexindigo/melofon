@@ -6,6 +6,7 @@ import type { QueueMedia, SourceMetadata } from './queue-source.ts';
 import type { createRadioSource } from './radio-source.ts';
 import type { State } from './state.ts';
 import type { SourceOutcome } from './player.ts';
+import type { createRadio } from './radio.ts';
 
 function responseSize(headers: Headers): number | undefined {
   const text = headers.get('content-length');
@@ -19,6 +20,7 @@ export function createPlaybackSource(deps: {
     & Pick<Media, 'decodePcm' | 'decodeInputPcm'>
     & Partial<Pick<Media, 'probeInputDuration'>>;
   radio?: ReturnType<typeof createRadioSource>;
+  artwork?: Pick<ReturnType<typeof createRadio>, 'streamArtwork'>;
   state?: Pick<State, 'declare' | 'getTyped'>;
 }) {
   const limits = {
@@ -195,8 +197,18 @@ export function createPlaybackSource(deps: {
         const lease = await session.open();
         onResponse?.();
         let active = true;
+        const artwork = media.reference.kind === 'station'
+          ? deps.artwork?.streamArtwork(
+            media.reference.id,
+            enteredUrl,
+            options.signal,
+          )
+          : undefined;
         const metadata = (facts: SourceMetadata) => {
-          if (active && !options.signal.aborted) options.onMetadata?.(facts);
+          if (active && !options.signal.aborted) {
+            options.onMetadata?.(facts);
+            artwork?.observe(facts.streamUrl);
+          }
         };
         try {
           options.signal.throwIfAborted();
@@ -208,7 +220,11 @@ export function createPlaybackSource(deps: {
               lease.response.headers,
               metadata,
             ),
-            close: () => options.retry ? lease.close() : session.close(),
+            close: async () => {
+              active = false;
+              await artwork?.close();
+              await (options.retry ? lease.close() : session.close());
+            },
           }, {
             signal: options.signal,
             startMs: finite ? options.startMs + deliveredMs : 0,
@@ -217,6 +233,7 @@ export function createPlaybackSource(deps: {
             pcm,
             close: async () => {
               active = false;
+              await artwork?.close();
               await pcm.return();
               await pcm.completion;
               await lease.close();
@@ -224,6 +241,7 @@ export function createPlaybackSource(deps: {
           };
         } catch (error) {
           active = false;
+          await artwork?.close();
           await lease.close();
           throw error;
         }
