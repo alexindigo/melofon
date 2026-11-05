@@ -96,6 +96,8 @@ export type AdvanceResult = 'none' | 'player' | 'player+queue';
 export interface PlaybackSource {
   readonly entryId: number;
   readonly generation: number;
+  /** Commanded offset on first delivery, current progress on a feed handoff. */
+  readonly startMs: number;
   readonly signal: AbortSignal;
 }
 export type SourceOutcome = 'eof' | 'transport-error' | 'decode-error';
@@ -457,6 +459,7 @@ export function createPlayer(options: {
   let startedAt = 0;
   let clock: PlayerStatus['clock'] = null;
   let generation = 0, sourceGeneration = 0;
+  let deliveredGeneration = -1;
   let source: {
     token: PlaybackSource;
     controller: AbortController;
@@ -611,6 +614,9 @@ export function createPlayer(options: {
       const token = Object.freeze({
         entryId,
         generation: ++sourceGeneration,
+        startMs: queueCapabilities(currentEntry()).seekable
+          ? deliveredGeneration === generation ? progressMs() : baseProgressMs
+          : 0,
         signal: controller.signal,
       });
       source = { token, controller, drainAt: monotonicNow() };
@@ -624,6 +630,7 @@ export function createPlayer(options: {
         source?.token !== token || source.outcome ||
         !Number.isFinite(durationMs) || durationMs <= 0
       ) return;
+      deliveredGeneration = generation;
       source.drainAt = Math.max(monotonicNow(), source.drainAt) + durationMs;
     },
     sourceOutcome(token, outcome) {

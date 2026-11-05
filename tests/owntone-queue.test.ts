@@ -236,7 +236,7 @@ Deno.test('artist uri expands to every track of that artist', async () => {
   }
 });
 
-Deno.test('genre uri expands by genre; unknown genre 404; http stays 400', async () => {
+Deno.test('genre uri expands by genre; unknown genre 404; unsupported scheme stays 400', async () => {
   const { app, close } = await setup();
   try {
     const res = await post(
@@ -260,7 +260,7 @@ Deno.test('genre uri expands by genre; unknown genre 404; http stays 400', async
     assertEquals(
       (await post(
         app,
-        '/api/queue/items/add?uris=http://10.4.20.208:8096/Items/x/Images/Primary/jpg',
+        '/api/queue/items/add?uris=ftp://melofon.home/audio',
       ))
         .status,
       400,

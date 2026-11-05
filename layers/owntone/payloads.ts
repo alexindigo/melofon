@@ -224,12 +224,24 @@ export function queueItemPayload(
 ) {
   if (entry.facts.kind === 'web') {
     const facts = entry.facts;
+    const uri = entry.reference.kind === 'url'
+      ? entry.reference.url
+      : facts.url;
+    // filescanner_playlist.c:155-176: missing title uses the raw fragment,
+    // otherwise filename_from_path (filescanner.c:392-402), not a catalog name.
+    const hash = uri.indexOf('#'), slash = uri.lastIndexOf('/');
+    const title = facts.title ??
+      (hash >= 0
+        ? uri.slice(hash + 1)
+        : slash >= 0 && slash < uri.length - 1
+        ? uri.slice(slash + 1)
+        : uri);
     // OwnTone httpd_jsonapi.c:2253-2287: nonpersistent items have no track_id
     // and replay their remote path instead of manufacturing a library URI.
     return {
       id: entry.id,
       position,
-      ...(facts.title === null ? {} : { title: facts.title }),
+      title,
       ...(facts.artistName === null ? {} : {
         artist: facts.artistName,
         artist_sort: facts.artistName,
@@ -238,7 +250,7 @@ export function queueItemPayload(
       media_kind: 'music',
       data_kind: 'http',
       path: facts.url,
-      uri: entry.reference.kind === 'url' ? entry.reference.url : facts.url,
+      uri,
     };
   }
   const song = entry.facts.song;
@@ -333,6 +345,8 @@ export async function playbackCommand<T>(
       error instanceof Error && error.name === 'PlaybackError' &&
       'code' in error
     ) {
+      if (error.code === 'invalid_reference') return badRequest();
+      if (error.code === 'missing_reference') return notFound();
       const messages: Record<string, string> = {
         no_target: 'Select a speaker before playing',
         target_unavailable: 'Selected speakers are unavailable',

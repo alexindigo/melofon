@@ -436,7 +436,7 @@ export function createAirplayBoot(
     const authority = { id, runtime: r, generation, lease: sourceLease };
     source = authority;
     r.entry = view.current.id;
-    const current = view.current, startMs = view.itemProgressMs;
+    const current = view.current, startMs = sourceLease.startMs;
     const path = current.facts.kind === 'song'
       ? current.facts.song.path
       : undefined;

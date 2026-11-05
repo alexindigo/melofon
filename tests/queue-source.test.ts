@@ -306,13 +306,13 @@ Deno.test('typed queue: finite facts drive existing duration clock without a cat
   assertEquals(player.advanceEnded(), 'none');
 });
 
-Deno.test('typed queue: OwnTone URL admission stays closed and preserves a noncatalog core queue on rejection', async () => {
+Deno.test('typed queue: OwnTone unsupported scheme preserves a noncatalog core queue on rejection', async () => {
   const t = await setup();
   try {
     await t.playback.queueAddSources([web('station')], { play: true });
     const before = t.playback.queueView();
     const query = new URLSearchParams({
-      uris: 'http://melofon.home:1234/audio',
+      uris: 'ftp://melofon.home:1234/audio',
       clear: 'true',
       playback: 'start',
     });

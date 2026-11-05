@@ -376,15 +376,12 @@ Deno.test('no PCM before the helper reports connected', async () => {
     // Handshake in flight: nothing may be pumped into the buffer yet.
     await new Promise((resolve) => setTimeout(resolve, 150));
     assertEquals(t.pcmBytes(), 0);
-    // The session connects: the track flows from the engine position.
-    const beforeConnectedMs = playback.playerView().itemProgressMs;
+    // The session connects: acquisition delay must not seek past opening audio.
     t.onEvent('state', 'connected');
-    const afterConnectedMs = playback.playerView().itemProgressMs;
     await until('remaining PCM decoded', () => decoded);
     assertEquals(decodeCalls, 1);
-    assert(startMs !== undefined);
-    assert(startMs >= beforeConnectedMs && startMs <= afterConnectedMs);
-    assert(decodedBytes > 0 && decodedBytes < FIXTURE_PCM_BYTES);
+    assertEquals(startMs ?? 0, 0);
+    assertEquals(decodedBytes, FIXTURE_PCM_BYTES);
     assertEquals(
       t.pcmBytes(),
       decodedBytes,

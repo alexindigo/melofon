@@ -1,10 +1,11 @@
 // layers/owntone/api/queue/items/add/post.ts — POST
 // /api/queue/items/add?uris=…&position=&playback=&playback_from_position=&clear=&shuffle=
 // uris: library:track|album|artist|playlist:<digits> or library:genre:<name>
-// (comma-separated). The hat translates each uri to songs (a facade's one
-// job); core's playback.queueAdd owns clear/insert/shuffle/play and emits.
+// or explicit HTTP(S) URLs (comma-separated, as httpd_jsonapi.c:2340-2349).
+// The hat expands library grammar; core resolves references, prepares web facts,
+// owns clear/insert/shuffle/play and emits.
 // expression stays unsupported (genre plays use the genre URI); unknown id
-// or genre → 404; malformed uri → 400; http/DLNA stays 400.
+// or genre -> 404; malformed uri or unsupported scheme -> 400.
 import {
   albumArtistResolver,
   artistAlbums,
@@ -20,7 +21,12 @@ import {
   queueItemPayload,
   sourceFrom,
 } from '#owntone/payloads.ts';
-import type { HatContext, HatRequest, SongRow } from '#owntone/types.ts';
+import type {
+  HatContext,
+  HatRequest,
+  QueueMediaRow,
+  SongRow,
+} from '#owntone/types.ts';
 
 const ALL = 9007199254740991; // Largest exactly representable safe integer.
 
@@ -63,14 +69,16 @@ async function songsForUri(
 export default async (request: HatRequest, context: HatContext) => {
   const uris = request.query.get('uris');
   if (uris === null) return badRequest(); // expression: not supported
-  const songs: SongRow[] = [];
+  const references: QueueMediaRow['reference'][] = [];
   for (const raw of uris.split(',')) {
     const uri = raw.trim();
     const m = /^library:(track|album|artist|playlist):(\d+)$/.exec(uri);
     if (m !== null) {
       const found = await songsForUri(context, m[1], m[2]);
       if (found === null) return notFound();
-      songs.push(...found);
+      references.push(
+        ...found.map((song) => ({ kind: 'song' as const, id: song.id })),
+      );
       continue;
     }
     const g = /^library:genre:(.+)$/.exec(uri);
@@ -80,7 +88,13 @@ export default async (request: HatRequest, context: HatContext) => {
         offset: 0,
       });
       if (found.length === 0) return notFound();
-      songs.push(...found);
+      references.push(
+        ...found.map((song) => ({ kind: 'song' as const, id: song.id })),
+      );
+      continue;
+    }
+    if (/^https?:\/\//i.test(uri)) {
+      references.push({ kind: 'url', url: uri });
       continue;
     }
     return badRequest();
@@ -95,7 +109,7 @@ export default async (request: HatRequest, context: HatContext) => {
   const shuffleParam = request.query.get('shuffle');
 
   return playbackCommand(async () => {
-    const added = await context.app.playback.queueAdd(songs, {
+    const added = await context.app.playback.queueAddReferences(references, {
       position,
       playbackFromPosition,
       play: request.query.get('playback') === 'start',

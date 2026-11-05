@@ -130,6 +130,17 @@ export interface HatContext {
         },
         source?: CommandSourceRow,
       ): QueueEntryRow[] | Promise<QueueEntryRow[]>;
+      queueAddReferences(
+        references: QueueMediaRow['reference'][],
+        opts?: {
+          position?: number;
+          playbackFromPosition?: number;
+          play?: boolean;
+          clear?: boolean;
+          shuffle?: boolean;
+        },
+        source?: CommandSourceRow,
+      ): Promise<QueueEntryRow[]>;
       queueClear(source?: CommandSourceRow): void;
       /** The last recorded engine mutation (provenance), null before any. */
       lastCommand(): LastCommandRow | null;

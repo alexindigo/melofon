@@ -206,16 +206,18 @@ Deno.test('core station and URL sources deliver exact ICY-stripped audio to two 
       await own('/player/stop', 'PUT');
       await until(() => server.closed === server.requests.length);
     }
-    // Public URL admission remains closed until finite preparation/wire work.
-    const denied = await fetch(
+    // Public URL admission now uses the same core reference/source pipeline.
+    const admitted = await fetch(
       `http://melofon.home:${f.extraPorts[0]}/api/queue/items/add?uris=${
         encodeURIComponent(`${server.origin}/audio`)
       }&clear=true&playback=start`,
       { method: 'POST', signal: AbortSignal.timeout(5000) },
     );
-    assertEquals(denied.status, 400, await denied.text());
+    assertEquals(admitted.status, 200, await admitted.text());
     assertEquals(playback!.queueView().items.length, 1);
-    assertEquals(opens, 2);
+    await until(() => opens === 3);
+    await own('/player/stop', 'PUT');
+    await until(() => server.closed === server.requests.length);
   } finally {
     await boot?.close();
     devices?.close();

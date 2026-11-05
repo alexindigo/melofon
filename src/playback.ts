@@ -27,6 +27,7 @@ import { type Log, scopedLog } from './logging.ts';
 import { PlaybackError } from './playback-errors.ts';
 import {
   catalogMedia,
+  createQueueResolver,
   queueCapabilities,
   type QueueMedia,
   type QueueReference,
@@ -147,6 +148,12 @@ export interface Playback {
     opts?: QueueAddOptions,
     source?: CommandSource,
   ): QueueEntry[] | Promise<QueueEntry[]>;
+  /** Resolve the whole reference batch and prepare URL facts before mutation. */
+  queueAddReferences(
+    references: QueueReference[],
+    opts?: QueueAddOptions,
+    source?: CommandSource,
+  ): Promise<QueueEntry[]>;
   queueClear(source?: CommandSource): void;
 
   /** The engine's clock: end-of-item transition when progress reached the
@@ -502,6 +509,45 @@ export function createPlayback(deps: {
         : undefined,
     );
   };
+  const resolveReference = deps.resolveQueueReference ?? createQueueResolver({
+    getSong: (id) => library.getSong(id),
+    getStation: () => Promise.resolve(null),
+  });
+  const prepareAdd = async (
+    resolve: (signal: AbortSignal) => Promise<QueueMedia[]>,
+    opts?: QueueAddOptions,
+    source?: CommandSource,
+  ): Promise<QueueEntry[]> => {
+    cancelStart();
+    const controller = new AbortController();
+    pendingStart = controller;
+    try {
+      const media = await resolve(controller.signal);
+      const prepared: QueueMedia[] = [];
+      for (const item of media) {
+        prepared.push(
+          deps.prepareQueueMedia
+            ? await deps.prepareQueueMedia(item, controller.signal)
+            : item,
+        );
+        controller.signal.throwIfAborted();
+      }
+      if (pendingStart !== controller) controller.abort();
+      controller.signal.throwIfAborted();
+      pendingStart = undefined;
+      return await addSources(prepared, opts, source);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new PlaybackError(
+          'playback_cancelled',
+          'Queue preparation cancelled',
+        );
+      }
+      throw error;
+    } finally {
+      if (pendingStart === controller) pendingStart = undefined;
+    }
+  };
   return {
     openSource: (entryId, generation) => {
       if (closed || closing) return null;
@@ -781,30 +827,48 @@ export function createPlayback(deps: {
       ) {
         return addSources(media, opts, source);
       }
-      cancelStart();
-      const controller = new AbortController();
-      pendingStart = controller;
-      return (async () => {
-        try {
-          const prepared: QueueMedia[] = [];
-          for (const item of media) {
-            prepared.push(
-              await deps.prepareQueueMedia!(item, controller.signal),
-            );
-            controller.signal.throwIfAborted();
+      return prepareAdd(() => Promise.resolve(media), opts, source);
+    },
+    queueAddReferences(references, opts, source) {
+      return prepareAdd(
+        async (signal) => {
+          const media: QueueMedia[] = [];
+          for (const reference of references) {
+            if (reference.kind === 'url') {
+              let url: URL;
+              try {
+                url = new URL(reference.url);
+              } catch {
+                throw new PlaybackError(
+                  'invalid_reference',
+                  'Invalid media URL',
+                );
+              }
+              if (
+                !['http:', 'https:'].includes(url.protocol) || url.username ||
+                url.password
+              ) {
+                throw new PlaybackError(
+                  'invalid_reference',
+                  'Invalid media URL',
+                );
+              }
+            }
+            const item = await resolveReference(reference);
+            signal.throwIfAborted();
+            if (!item) {
+              throw new PlaybackError(
+                'missing_reference',
+                'Media not found',
+              );
+            }
+            media.push(item);
           }
-          if (pendingStart !== controller) {
-            throw new PlaybackError(
-              'playback_cancelled',
-              'Queue preparation cancelled',
-            );
-          }
-          pendingStart = undefined;
-          return await addSources(prepared, opts, source);
-        } finally {
-          if (pendingStart === controller) pendingStart = undefined;
-        }
-      })();
+          return media;
+        },
+        opts,
+        source,
+      );
     },
     queueClear(source) {
       cancelStart();

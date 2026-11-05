@@ -314,9 +314,11 @@ async function setup() {
         calls.seek.push(args[0]);
         return playback.seek(...args);
       },
-      queueAdd: (...args: Parameters<Playback['queueAdd']>) => {
+      queueAddReferences: (
+        ...args: Parameters<Playback['queueAddReferences']>
+      ) => {
         calls.queue.push(args[1]);
-        return playback.queueAdd(...args);
+        return playback.queueAddReferences(...args);
       },
     },
     media: {

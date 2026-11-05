@@ -76,6 +76,42 @@ function fixture(options: {
   };
 }
 
+Deno.test('source lease starts at the commanded offset despite acquisition delay, and uses progress only after delivery', async () => {
+  const f = fixture();
+  try {
+    await f.playback.queueAddSources([web('finite', 10000)], { play: true });
+    f.at(1000);
+    const first = f.open();
+    assertEquals(first.startMs, 0);
+    f.playback.cancelSource(first);
+    f.at(1500);
+    const beforeDelivery = f.open();
+    assertEquals(beforeDelivery.startMs, 0);
+    f.playback.sourceAudio(beforeDelivery, 500);
+    f.playback.cancelSource(beforeDelivery);
+    f.at(2000);
+    assertEquals(f.open().startMs, 2000, 'handoff retains current progress');
+    await f.playback.seek({ positionMs: 500 });
+    f.at(3000);
+    assertEquals(
+      f.open().startMs,
+      500,
+      'seek offset excludes later acquisition delay',
+    );
+    f.playback.pause();
+    const frozen = f.playback.playerView().itemProgressMs;
+    await f.playback.play();
+    f.at(4000);
+    assertEquals(
+      f.open().startMs,
+      frozen,
+      'resume excludes speaker preparation delay',
+    );
+  } finally {
+    await f.playback.close();
+  }
+});
+
 Deno.test('live time advances without a fake length; seek is a no-op and resume opens at live edge', async () => {
   let preparations = 0;
   const f = fixture({

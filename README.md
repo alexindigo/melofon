@@ -96,8 +96,17 @@ owner's pending-read idle budget, without the resolution lifetime/byte caps.
 The server composes this resolver with ICY stripping and core-fed decoding for
 station and URL queue sources. One elected AirPlay pump opens the source for all
 selected receivers; pause, stop, next and output handoff cancel its network and
-decoder lifetime. Public URL admission, live title publication and source
-reconnect policy follow in separate stage-2 items.
+decoder lifetime. Live title publication and source reconnect policy follow in
+separate stage-2 items.
+
+OwnTone `POST /api/queue/items/add` accepts explicit HTTP(S) URLs alongside
+library URIs, including LAN announcement URLs. Core resolves the complete batch
+and prepares URL facts before applying clear, insertion or playback. Failed
+admission preserves the old queue. Remote items expose `data_kind: "http"`,
+their replayable entered URL and known duration, without a catalog `track_id`.
+The OwnTone `uris` value is comma-separated: a comma inside a URL must remain
+percent-encoded (`%2C`) after query decoding. Encode the whole `uris` query
+parameter when submitting it, including URL query strings and fragments.
 
 Core URL queue additions prepare facts before changing or publishing the queue.
 `playback.source.prepareBytes` (1048576 bytes, at most 16777216) bounds the
