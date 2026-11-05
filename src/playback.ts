@@ -25,6 +25,7 @@ import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { PlaybackError } from './playback-errors.ts';
+import { planSourceFailure } from './source-recovery.ts';
 import {
   catalogMedia,
   createQueueResolver,
@@ -165,6 +166,8 @@ export interface Playback {
   openSource(entryId: number, generation: number): PlaybackSource | null;
   cancelSource(source: PlaybackSource): void;
   sourceAudio(source: PlaybackSource, durationMs: number): void;
+  /** One bounded source retry, cancelled with the lease. Not a speaker retry. */
+  retrySource(source: PlaybackSource, reason: SourceOutcome): Promise<boolean>;
   reportSourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
   /** Raw facts from the currently elected lease; no commands or hat labels. */
   reportSourceMetadata(
@@ -214,11 +217,46 @@ export function createPlayback(deps: {
     media: QueueMedia,
     signal: AbortSignal,
   ) => Promise<QueueMedia>;
+  state?: Pick<State, 'declare' | 'getTyped'>;
   log?: Log;
 }): Playback {
   const { player, nowPlaying, library, outputs, notify, persistence } = deps;
   const log = deps.log ?? scopedLog('playback');
   let openedSource: PlaybackSource | null = null;
+  const recoverySettings = {
+    retryBackoffMs: {
+      type: 'array',
+      items: { type: 'integer', minimum: 0, maximum: 600000 },
+      default: [1000, 2000, 5000],
+      description: 'One delay per web source retry; empty disables retries',
+    },
+    retryResetAudioMs: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 3600000,
+      default: 30000,
+      description:
+        'Delivered audio in one attempt before replenishing source retries',
+    },
+  };
+  for (const [key, schema] of Object.entries(recoverySettings)) {
+    deps.state?.declare(`playback.source.${key}`, schema);
+  }
+  let recovery = { generation: -1, attempts: 0, audioMs: 0 };
+  const failedSources = new Set<number>();
+  const recoveryForRun = () => {
+    const generation = player.status().generation;
+    if (recovery.generation !== generation) {
+      recovery = { generation, attempts: 0, audioMs: 0 };
+    }
+    return recovery;
+  };
+  const ownsSource = (source: PlaybackSource) =>
+    !closed && !closing && openedSource === source && !source.signal.aborted;
+  let failedSource: PlaybackSource | null = null;
+  let failureWork:
+    | { source: PlaybackSource; promise: Promise<void> }
+    | undefined;
   const selectedSpeakers = () =>
     (outputs?.list() ?? []).filter((o) => o.selected).map(
       ({ id, name }) => ({ id, name }),
@@ -278,6 +316,7 @@ export function createPlayback(deps: {
       items?: QueueMedia[];
       direction?: number;
       wrap?: boolean;
+      excluded?: ReadonlySet<number>;
     },
   ): T | Promise<T> => {
     const current = () =>
@@ -307,10 +346,11 @@ export function createPlayback(deps: {
         for (let visited = 0; visited < items.length; visited++) {
           if (index < 0 || index >= items.length) break;
           const item = items[index];
-          let media =
-            item.reference.kind === 'station' && deps.resolveQueueReference
-              ? await deps.resolveQueueReference!(item.reference)
-              : item;
+          let media = activation.excluded?.has((item as QueueEntry).id)
+            ? null
+            : item.reference.kind === 'station' && deps.resolveQueueReference
+            ? await deps.resolveQueueReference!(item.reference)
+            : item;
           if (media && needsPreparation(media)) {
             media = await deps.prepareQueueMedia!(media, controller.signal);
           }
@@ -395,6 +435,9 @@ export function createPlayback(deps: {
     facts?: Record<string, unknown>,
   ): void => {
     const src = source ?? { kind: 'internal' as const };
+    if (intent !== 'none' && src.via !== 'source-outcome') {
+      failedSources.clear();
+    }
     if (src.kind === 'http') commander = src.user ?? null;
     last = {
       kind,
@@ -563,6 +606,85 @@ export function createPlayback(deps: {
       if (pendingStart === controller) pendingStart = undefined;
     }
   };
+  // A terminal observation is retained until its transition commits or its
+  // lease is revoked. Non-destructive commands may cancel activation preflight;
+  // the engine tick then replans against the new queue instead of stranding it.
+  const advanceFailedSource = (): Promise<void> => {
+    if (failureWork && !failureWork.source.signal.aborted) {
+      return failureWork.promise;
+    }
+    const source = failedSource;
+    if (!source || !ownsSource(source)) {
+      failedSource = null;
+      return Promise.resolve();
+    }
+    const view = player.status();
+    const plan = planSourceFailure(
+      player.queue().items,
+      view.current?.id,
+      failedSources,
+      view.repeat,
+      view.consume,
+    );
+    const commit = (activate: () => void) => {
+      if (
+        !ownsSource(source) || player.status().generation !== view.generation
+      ) return;
+      failedSource = null;
+      const result = player.advanceFailed(failedSources);
+      activate();
+      record('sourceSkip', undefined, {
+        kind: 'internal',
+        via: 'source-outcome',
+      }, player.status().state);
+      if (result === 'player+queue') flushQueue();
+      else flushState();
+      emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+    };
+    const work = { source, promise: Promise.resolve() };
+    failureWork = work;
+    work.promise = (async () => {
+      try {
+        await transition(
+          plan.index !== null,
+          commit,
+          {
+            signal: source.signal,
+            isCurrent: () => ownsSource(source),
+          },
+          plan.index === null ? undefined : {
+            index: plan.index,
+            items: plan.items,
+            wrap: view.repeat === 'all',
+            excluded: failedSources,
+          },
+        );
+      } catch (error) {
+        if (
+          error instanceof PlaybackError && error.code === 'playback_cancelled'
+        ) return;
+        if (!ownsSource(source)) return;
+        failedSource = null;
+        log.event('source_exhausted', {
+          entry: source.entryId,
+          reason: 'activation-failed',
+          attempts: recoveryForRun().attempts,
+        });
+        player.pause();
+        record(
+          'pause',
+          undefined,
+          { kind: 'internal', via: 'source-outcome' },
+          'pause',
+        );
+        flushState();
+        emit(['player']);
+      } finally {
+        if (failureWork === work) failureWork = undefined;
+      }
+    })();
+    return work.promise;
+  };
   return {
     openSource: (entryId, generation) => {
       if (closed || closing) return null;
@@ -578,7 +700,57 @@ export function createPlayback(deps: {
         emit(['queue', 'nowPlaying']);
       }
     },
-    sourceAudio: (source, durationMs) => player.sourceAudio(source, durationMs),
+    sourceAudio(source, durationMs) {
+      if (player.sourceAudio(source, durationMs)) {
+        recoveryForRun().audioMs += durationMs;
+      }
+    },
+    async retrySource(source, reason) {
+      if (
+        !ownsSource(source) || player.status().current?.facts.kind !== 'web'
+      ) return false;
+      const run = recoveryForRun();
+      const backoff =
+        await deps.state?.getTyped('playback.source.retryBackoffMs') ??
+          recoverySettings.retryBackoffMs.default;
+      const reset = Number(
+        await deps.state?.getTyped('playback.source.retryResetAudioMs') ??
+          recoverySettings.retryResetAudioMs.default,
+      );
+      if (!ownsSource(source) || recovery !== run) return false;
+      if (run.audioMs >= reset) {
+        run.attempts = 0;
+        failedSources.clear();
+      }
+      run.audioMs = 0;
+      const delays = backoff as number[];
+      if (run.attempts >= delays.length) {
+        log.event('source_exhausted', {
+          entry: source.entryId,
+          reason,
+          attempts: run.attempts,
+        });
+        return false;
+      }
+      const waitMs = delays[run.attempts++];
+      log.event('source_retry', {
+        entry: source.entryId,
+        reason,
+        attempt: run.attempts,
+        waitMs,
+      });
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          source.signal.removeEventListener('abort', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, waitMs);
+        source.signal.addEventListener('abort', finish, { once: true });
+        if (source.signal.aborted) finish();
+      });
+      return ownsSource(source) && recovery === run;
+    },
     reportSourceMetadata(source, metadata) {
       if (closed || closing || !player.sourceMetadata(source, metadata)) {
         return false;
@@ -595,6 +767,12 @@ export function createPlayback(deps: {
           view.current.facts.mode !== 'finite'
       ) {
         cancelStart();
+        if (view.current?.facts.kind === 'web') {
+          failedSources.add(view.current.id);
+          failedSource = source;
+          void advanceFailedSource();
+          return true;
+        }
         player.pause();
         record(
           'pause',
@@ -910,6 +1088,10 @@ export function createPlayback(deps: {
     },
 
     advanceEnded() {
+      if (failedSource) {
+        if (!pendingStart) return advanceFailedSource();
+        return;
+      }
       const view = player.status();
       if (pendingStart || !player.canAdvanceEnded()) return;
       const items = player.queue().items;
@@ -928,6 +1110,7 @@ export function createPlayback(deps: {
         if (player.status().generation !== view.generation) return;
         const result = player.advanceEnded();
         if (result === 'none') return;
+        failedSources.clear();
         activate();
         if (result === 'player+queue') flushQueue();
         else flushState();
@@ -1064,6 +1247,7 @@ export function createPlayback(deps: {
       closed = true;
       await expiryTask;
       await expiryWork;
+      await failureWork?.promise;
     },
   };
 }

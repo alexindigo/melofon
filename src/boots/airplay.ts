@@ -454,6 +454,7 @@ export function createAirplayBoot(
           onMetadata: (metadata) => {
             if (owns()) playback.reportSourceMetadata(sourceLease, metadata);
           },
+          retry: (reason) => playback.retrySource(sourceLease, reason),
         });
         if (!stream) {
           if (!owns()) return;
@@ -504,6 +505,12 @@ export function createAirplayBoot(
         playback.reportSourceOutcome(sourceLease, 'eof');
       } catch (error) {
         if (!owns()) return;
+        if (current.facts.kind === 'web') {
+          // The source owner exhausted its bounded retries. Healthy receiver
+          // sessions remain admitted; core alone skips/stops the failed item.
+          playback.reportSourceOutcome(sourceLease, 'decode-error');
+          return;
+        }
         log.event('content_failed', { output: id, generation: session, error });
         // A shared source failure is not a speaker failure. Fence every demand
         // before retiring any session, so a peer cannot reopen the same source.

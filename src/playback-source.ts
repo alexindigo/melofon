@@ -5,6 +5,7 @@ import type { Media } from './media.ts';
 import type { QueueMedia, SourceMetadata } from './queue-source.ts';
 import type { createRadioSource } from './radio-source.ts';
 import type { State } from './state.ts';
+import type { SourceOutcome } from './player.ts';
 
 function responseSize(headers: Headers): number | undefined {
   const text = headers.get('content-length');
@@ -171,6 +172,7 @@ export function createPlaybackSource(deps: {
         signal: AbortSignal;
         startMs: number;
         onMetadata?: (metadata: SourceMetadata) => void;
+        retry?: (reason: SourceOutcome) => Promise<boolean>;
       },
     ): Promise<AsyncIterable<Uint8Array> | null> {
       options.signal.throwIfAborted();
@@ -187,28 +189,94 @@ export function createPlaybackSource(deps: {
         ? media.reference.url
         : media.facts.url;
       const session = deps.radio.session(enteredUrl, options.signal);
-      try {
+      const finite = media.facts.mode === 'finite';
+      let deliveredMs = 0;
+      const decode = async (onResponse?: () => void) => {
         const lease = await session.open();
-        options.signal.throwIfAborted();
-        const title = lease.response.headers.get('icy-name');
-        if (title && media.reference.kind === 'url') {
-          options.onMetadata?.({ title });
+        onResponse?.();
+        let active = true;
+        const metadata = (facts: SourceMetadata) => {
+          if (active && !options.signal.aborted) options.onMetadata?.(facts);
+        };
+        try {
+          options.signal.throwIfAborted();
+          const title = lease.response.headers.get('icy-name');
+          if (title && media.reference.kind === 'url') metadata({ title });
+          const pcm = await deps.media.decodeInputPcm({
+            body: separateIcy(
+              lease.response.body!,
+              lease.response.headers,
+              metadata,
+            ),
+            close: () => options.retry ? lease.close() : session.close(),
+          }, {
+            signal: options.signal,
+            startMs: finite ? options.startMs + deliveredMs : 0,
+          });
+          return {
+            pcm,
+            close: async () => {
+              active = false;
+              await pcm.return();
+              await pcm.completion;
+              await lease.close();
+            },
+          };
+        } catch (error) {
+          active = false;
+          await lease.close();
+          throw error;
         }
-        return await deps.media.decodeInputPcm({
-          body: separateIcy(
-            lease.response.body!,
-            lease.response.headers,
-            (metadata) => options.onMetadata?.(metadata),
-          ),
-          close: () => session.close(),
-        }, {
-          signal: options.signal,
-          startMs: media.facts.mode === 'finite' ? options.startMs : 0,
-        });
-      } catch (error) {
-        await session.close();
-        throw error;
+      };
+      if (!options.retry) {
+        try {
+          return (await decode()).pcm;
+        } catch (error) {
+          await session.close();
+          throw error;
+        }
       }
+      // Acquisition stays lazy within the elected lease. Each attempt owns a
+      // fresh decoder; the session retains ordered playlist alternatives and
+      // the original trust context. It never concatenates compressed responses.
+      const iterate = async function* () {
+        try {
+          while (true) {
+            let reason: SourceOutcome = 'transport-error';
+            let failure: unknown;
+            try {
+              const attempt = await decode(() => reason = 'decode-error');
+              let chunks = 0;
+              try {
+                for await (const chunk of attempt.pcm) {
+                  chunks++;
+                  yield chunk;
+                  // The elected consumer resumes only after its sink write and
+                  // sourceAudio report. A cancelled/failed write cannot count.
+                  deliveredMs += chunk.length / 176400 * 1000;
+                }
+              } finally {
+                await attempt.close();
+              }
+              if (!chunks && deliveredMs === 0) {
+                throw new Error('Empty decoder stream');
+              }
+              if (finite || !options.retry) return;
+              reason = 'eof';
+              failure = new Error('Live source ended');
+            } catch (error) {
+              failure = error;
+            }
+            options.signal.throwIfAborted();
+            options.onMetadata?.({ streamTitle: null, streamUrl: null });
+            if (!options.retry || !await options.retry(reason)) throw failure;
+            options.signal.throwIfAborted();
+          }
+        } finally {
+          await session.close();
+        }
+      };
+      return iterate();
     },
   };
 }

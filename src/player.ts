@@ -29,6 +29,7 @@ export type { QueueEntry } from './queue-source.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { SpeakerError } from './speaker-errors.ts';
+import { planSourceFailure } from './source-recovery.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   CONNECTION_STRATEGIES,
@@ -261,7 +262,7 @@ export interface Player {
   openSource(entryId: number, generation: number): PlaybackSource | null;
   cancelSource(source: PlaybackSource): void;
   /** Accepted PCM duration, reported after the sink write resolves. */
-  sourceAudio(source: PlaybackSource, durationMs: number): void;
+  sourceAudio(source: PlaybackSource, durationMs: number): boolean;
   sourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
   sourceMetadata(source: PlaybackSource, metadata: SourceMetadata): boolean;
   canAdvanceEnded(): boolean;
@@ -304,6 +305,8 @@ export interface Player {
    * last. Catalog unknown lengths never clock-end; finite web sources can end
    * on EOF after accepted PCM plays out. Live EOF is a failure, not an end. */
   advanceEnded(): AdvanceResult;
+  /** Exhausted sources bypass repeat-single; failed occurrences cannot wrap. */
+  advanceFailed(failed: ReadonlySet<number>): AdvanceResult;
   /** Boot-time restore (plan restart-transparency): load the rehydrated
    * queue plus the persisted snapshot in one shot. main.ts decides
    * play-vs-pause per shouldAutoResume. Emits nothing and persists nothing
@@ -646,9 +649,10 @@ export function createPlayer(options: {
       if (
         source?.token !== token || source.outcome ||
         !Number.isFinite(durationMs) || durationMs <= 0
-      ) return;
+      ) return false;
       deliveredGeneration = generation;
       source.drainAt = Math.max(monotonicNow(), source.drainAt) + durationMs;
+      return true;
     },
     sourceOutcome(token, outcome) {
       if (
@@ -828,6 +832,22 @@ export function createPlayer(options: {
       }
       startAt(currentIndex! + 1);
       return 'player';
+    },
+
+    advanceFailed(failed) {
+      const plan = planSourceFailure(
+        items,
+        currentEntry()?.id,
+        failed,
+        repeat,
+        consume,
+      );
+      const changed = plan.items.length !== items.length;
+      items = plan.items;
+      if (changed) version++;
+      if (plan.index === null) doStop();
+      else startAt(plan.index);
+      return changed ? 'player+queue' : 'player';
     },
 
     restore(snapshot) {

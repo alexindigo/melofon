@@ -215,6 +215,7 @@ export async function startServer(options: {
     targets: speakers,
     resolveQueueReference,
     prepareQueueMedia: playbackSources.prepare,
+    state,
   });
   const app = {
     store,

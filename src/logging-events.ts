@@ -94,6 +94,13 @@ export interface EventFacts {
   startup_failed: ErrorFacts;
   persistence_failed: ErrorFacts;
   playback_expiry_failed: ErrorFacts;
+  source_retry: {
+    entry: number;
+    reason: string;
+    attempt: number;
+    waitMs: number;
+  };
+  source_exhausted: { entry: number; reason: string; attempts: number };
   state_listener_failed: ErrorFacts;
   notify_listener_failed: ErrorFacts;
   output_listener_failed: ErrorFacts;
@@ -380,6 +387,18 @@ export const events: Record<EventId, EventDefinition> = {
     'debug',
     'Persistence write failed',
     'error',
+  ),
+  source_retry: definition(
+    'playback',
+    'warn',
+    'Web source reconnect scheduled',
+    'entry reason attempt waitMs',
+  ),
+  source_exhausted: definition(
+    'playback',
+    'warn',
+    'Web source retries exhausted',
+    'entry reason attempts',
   ),
   state_listener_failed: definition(
     'state',

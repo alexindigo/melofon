@@ -75,6 +75,24 @@ supply their own open/read budgets. Healthy streams have no lifetime timer
 or cumulative byte cap; body failures are surfaced without hidden retries.
 Buffered lookup and file-download limits remain separate.
 
+### Web source recovery
+
+The playback owner declares `playback.source.retryBackoffMs`, an ordered array
+of retry delays (default `[1000, 2000, 5000]` milliseconds; an empty array disables
+retries), and `playback.source.retryResetAudioMs` (default 30000 milliseconds).
+A dropped live stream, including clean socket EOF, reopens a fresh decoder for
+the same queue occurrence. PLS/M3U alternatives are tried in order within that
+budget, retaining the original host trust. Only delivered audio in a stable
+attempt replenishes the budget; repeated short flaps do not. Finite sources
+complete normally on EOF; failed finite attempts resume after delivered samples.
+
+Exhaustion skips the occurrence even with repeat-one. Repeat-all skips failed
+occurrences until stable audio or successful completion makes progress; an
+all-failed queue stops. Consume removes exhausted occurrences. Pause, stop,
+next, clear and source handoff cancel pending waits and reads. Speaker recovery
+remains separate. Reconnect diagnostics contain occurrence/attempt/reason facts,
+never source URLs or their query credentials.
+
 ### Core radio playlist resolution
 
 The core radio source resolver supports ordinary PLS/M3U wrappers around

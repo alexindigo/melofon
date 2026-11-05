@@ -330,8 +330,8 @@ Deno.test('noncatalog core row never reaches the catalog decoder bridge', async 
     );
     t.spawned[0].onEvent('state', 'connected');
     await until(
-      'unsupported source paused',
-      () => t.playback.playerView().state === 'pause',
+      'unsupported source skipped and queue stopped',
+      () => t.playback.playerView().state === 'stop',
     );
     assertEquals(decodes, 0);
     assertEquals(t.spawned[0].pcmBytes(), 0);

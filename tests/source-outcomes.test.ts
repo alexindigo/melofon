@@ -407,7 +407,7 @@ for (
 }
 
 for (const reason of ['eof', 'transport-error', 'decode-error'] as const) {
-  Deno.test(`a live ${reason} is a single source failure, not a natural next`, async () => {
+  Deno.test(`an exhausted live ${reason} skips once through the source failure path`, async () => {
     const f = fixture();
     try {
       const added = await f.playback.queueAddSources([
@@ -427,8 +427,8 @@ for (const reason of ['eof', 'transport-error', 'decode-error'] as const) {
       assert(f.playback.reportSourceOutcome(token, reason));
       assertEquals(f.playback.reportSourceOutcome(token, reason), false);
       await f.playback.advanceEnded();
-      assertEquals(f.playback.playerView().state, 'pause');
-      assertEquals(f.playback.playerView().current?.id, added[0].id);
+      assertEquals(f.playback.playerView().state, 'play');
+      assertEquals(f.playback.playerView().current?.id, added[1].id);
       assertEquals(f.events.length, events + 1);
       assertEquals(f.states.length, writes + 1);
     } finally {
