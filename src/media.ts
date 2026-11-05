@@ -66,9 +66,9 @@ import type { State } from './state.ts';
 import {
   createHlsCache,
   hlsDimensions,
+  type HlsEncodingSettings,
   type HlsFacts,
   type HlsOptions,
-  type HlsSettings,
   type HlsView,
 } from './hls-cache.ts';
 import {
@@ -615,7 +615,7 @@ export function createMedia(
     path: string,
     dir: string,
     options: HlsOptions,
-    config: HlsSettings,
+    config: HlsEncodingSettings,
     publish: (facts: HlsFacts) => Promise<void>,
   ): Promise<HlsFacts | null> {
     try {

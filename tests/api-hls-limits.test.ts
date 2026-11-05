@@ -137,6 +137,42 @@ for (const hat of ['native', 'opensubsonic']) {
         }
         assert(text.includes('#EXT-X-ENDLIST'));
       }
+      const outputs = async () => {
+        const entries = [];
+        for await (const entry of Deno.readDir(`${f.cfg.dataDir}/hls`)) {
+          entries.push(entry.name);
+        }
+        return entries.sort();
+      };
+      const cached = await outputs();
+      assertEquals(cached.length, 2);
+      for (
+        const [name, value] of Object.entries({
+          maxRenditions: '3',
+          maxDimension: '640',
+          maxKbps: '800',
+        })
+      ) {
+        await f.state.set(`media.hls.${name}`, value);
+        // Join VOD even in the pre-fix run, so a failure cannot abandon encodes.
+        for (const query of ['bitRate=100@160x90', 'bitRate=400@320x180']) {
+          let text = '';
+          for (let i = 0; i < 200 && !text.includes('#EXT-X-ENDLIST'); i++) {
+            const response = await read(query);
+            assertEquals(response.status, 200);
+            text = await response.text();
+            if (!text.includes('#EXT-X-ENDLIST')) {
+              await new Promise((r) => setTimeout(r, 10));
+            }
+          }
+          assert(text.includes('#EXT-X-ENDLIST'));
+        }
+        assertEquals(
+          await outputs(),
+          cached,
+          `${name} must not invalidate accepted cached renditions`,
+        );
+      }
       // A lowered live limit must also reject a completed cache hit.
       await f.state.set('media.hls.maxKbps', '399');
       const rejected = await read('bitRate=400@320x180');

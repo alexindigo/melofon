@@ -9,10 +9,14 @@ export interface HlsOptions {
   height?: number;
   audioTrack?: number;
 }
-export interface HlsSettings {
+/** Request policy, checked before cache reuse and never passed to encoding. */
+export interface HlsAdmissionSettings {
   maxRenditions: number;
   maxDimension: number;
   maxKbps: number;
+}
+/** Output policy shared by the cache signature and its native producer. */
+export interface HlsEncodingSettings {
   segmentSeconds: number;
   audioKbps: number;
   videoKbps: number;
@@ -36,7 +40,7 @@ type Producer = (
   path: string,
   dir: string,
   options: HlsOptions,
-  settings: HlsSettings,
+  settings: HlsEncodingSettings,
   publish: (facts: HlsFacts) => Promise<void>,
 ) => Promise<HlsFacts | null>;
 interface Entry {
@@ -47,10 +51,12 @@ interface Entry {
   completion?: Promise<void>;
 }
 
-const DEFAULTS = {
+const ADMISSION_DEFAULTS: HlsAdmissionSettings = {
   maxRenditions: 8,
   maxDimension: 4096,
   maxKbps: 100000,
+};
+const ENCODING_DEFAULTS: HlsEncodingSettings = {
   segmentSeconds: 10,
   audioKbps: 128,
   videoKbps: 2000,
@@ -80,7 +86,7 @@ export class HlsError extends Error {
 export function hlsDimensions(
   source: HlsFacts,
   options: HlsOptions,
-  config: HlsSettings,
+  config: HlsEncodingSettings,
 ): HlsFacts {
   let { width, height } = source;
   if (options.width !== undefined && options.height !== undefined) {
@@ -99,9 +105,6 @@ export function hlsDimensions(
       width = Math.max(2, Math.floor(width * ratio / 2) * 2);
       height = Math.max(2, Math.floor(height * ratio / 2) * 2);
     }
-  }
-  if (width > config.maxDimension || height > config.maxDimension) {
-    throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
   }
   return { width, height };
 }
@@ -123,15 +126,19 @@ export function createHlsCache(
       'audioKbps',
       'videoKbps',
       'threads',
-      'maxRenditions',
-      'maxDimension',
-      'maxKbps',
     ] as const
   ) {
     state?.declare(`media.hls.${name}`, {
       type: 'integer',
       minimum: 1,
-      default: DEFAULTS[name],
+      default: ENCODING_DEFAULTS[name],
+    });
+  }
+  for (const [name, value] of Object.entries(ADMISSION_DEFAULTS)) {
+    state?.declare(`media.hls.${name}`, {
+      type: 'integer',
+      minimum: 1,
+      default: value,
     });
   }
   state?.declare('media.hls.preset', {
@@ -147,18 +154,18 @@ export function createHlsCache(
       'slower',
       'veryslow',
     ],
-    default: DEFAULTS.preset,
+    default: ENCODING_DEFAULTS.preset,
   });
   state?.declare('media.hls.quality', {
     type: 'integer',
     minimum: 0,
     maximum: 51,
-    default: DEFAULTS.quality,
+    default: ENCODING_DEFAULTS.quality,
   });
   state?.declare('media.hls.ladder', {
     type: 'array',
     items: { type: 'string', pattern: '^[1-9][0-9]*@[1-9][0-9]*x[1-9][0-9]*$' },
-    default: DEFAULTS.ladder,
+    default: ENCODING_DEFAULTS.ladder,
   });
   const entries = new Map<string, Entry>();
   let serial = Promise.resolve();
@@ -167,9 +174,10 @@ export function createHlsCache(
     serial = pending.then(() => {}, () => {});
     return pending;
   };
-  const settings = async (): Promise<HlsSettings> => {
-    const value = { ...DEFAULTS };
-    for (const key of Object.keys(DEFAULTS) as (keyof HlsSettings)[]) {
+  /** Load only the settings declared by this policy's typed defaults. */
+  const settings = async <T extends object>(defaults: T): Promise<T> => {
+    const value = { ...defaults };
+    for (const key of Object.keys(defaults)) {
       const v = await state?.getTyped(`media.hls.${key}`);
       if (v !== undefined) Object.assign(value, { [key]: v });
     }
@@ -244,7 +252,7 @@ export function createHlsCache(
     path: string,
     root: string,
     options: HlsOptions,
-    config: HlsSettings,
+    config: HlsEncodingSettings,
   ): Promise<HlsView | null> => {
     const stat = await Deno.stat(path).catch(() => null);
     if (!stat) return null;
@@ -422,10 +430,11 @@ export function createHlsCache(
     root: string,
     requested: HlsOptions[],
   ): Promise<HlsView[] | null> {
-    const config = await settings();
+    const admission = await settings(ADMISSION_DEFAULTS);
+    const encoding = await settings(ENCODING_DEFAULTS);
     // Snapshot the whole request before source inspection or producer admission. Hats
     // cannot start an earlier valid rung before a later rung has been checked.
-    if (!requested.length || requested.length > config.maxRenditions) {
+    if (!requested.length || requested.length > admission.maxRenditions) {
       throw new HlsError('HLS rendition count exceeds media.hls.maxRenditions');
     }
     const options = requested.map((option) => ({ ...option }));
@@ -440,25 +449,30 @@ export function createHlsCache(
             option.height! % 2))
       ) throw new HlsError('Invalid HLS rendition or audio track');
       if (
-        (option.kbps ?? config.videoKbps) > config.maxKbps ||
-        config.audioKbps > config.maxKbps
+        (option.kbps ?? encoding.videoKbps) > admission.maxKbps ||
+        encoding.audioKbps > admission.maxKbps
       ) {
         throw new HlsError('HLS bitrate exceeds media.hls.maxKbps');
       }
       if (
-        (option.width ?? 0) > config.maxDimension ||
-        (option.height ?? 0) > config.maxDimension
+        (option.width ?? 0) > admission.maxDimension ||
+        (option.height ?? 0) > admission.maxDimension
       ) {
         throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
       }
     }
     const source = await inspect(path);
     if (!source) return null;
-    for (const option of options) hlsDimensions(source, option, config);
+    for (const option of options) {
+      const { width, height } = hlsDimensions(source, option, encoding);
+      if (width > admission.maxDimension || height > admission.maxDimension) {
+        throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
+      }
+    }
     const views: HlsView[] = [];
     try {
       for (const option of options) {
-        const view = await acquire(path, root, option, config);
+        const view = await acquire(path, root, option, encoding);
         if (!view) return null;
         views.push(view);
       }
