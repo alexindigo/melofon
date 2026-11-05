@@ -599,7 +599,7 @@ export function createMedia(
       await state?.getTyped(`media.transcode.${format}.bitRateKbps`) ??
         TRANSCODE_PROFILES[format].bitRateKbps,
     );
-  const hls = createHlsCache(encodeHls, state, async (path) => {
+  const hls = createHlsCache(encodeHls, async (path) => {
     try {
       await using input = await Demuxer.open(path);
       const video = input.video();
@@ -609,7 +609,7 @@ export function createMedia(
     } catch {
       return null;
     }
-  });
+  }, state);
 
   async function encodeHls(
     path: string,

@@ -3,6 +3,16 @@ import { createHlsCache } from '../src/hls-cache.ts';
 import { openStore } from '../src/store/index.ts';
 import { createState } from '../src/state.ts';
 
+// Compile-only contract checks; invalid construction never executes.
+export function hlsInspectionTypeContract(
+  produce: Parameters<typeof createHlsCache>[0],
+) {
+  // @ts-expect-error Source inspection is required for HLS admission.
+  createHlsCache(produce);
+  // @ts-expect-error An undefined inspector cannot satisfy that dependency.
+  createHlsCache(produce, undefined);
+}
+
 Deno.test('HLS admission rejects the whole request before probing or producing any rung', async () => {
   let probes = 0, producers = 0;
   const cache = createHlsCache(
@@ -10,7 +20,6 @@ Deno.test('HLS admission rejects the whole request before probing or producing a
       producers++;
       return Promise.resolve(null);
     },
-    undefined,
     () => {
       probes++;
       return Promise.resolve({ width: 320, height: 180 });
@@ -63,8 +72,8 @@ Deno.test('HLS cache identity follows encoding settings while live admission lim
   const reopen = () =>
     createHlsCache(
       produce,
-      state,
       () => Promise.resolve({ width: 320, height: 180 }),
+      state,
     );
   let cache = reopen();
   const options = { kbps: 100, width: 160, height: 90 };
@@ -151,12 +160,12 @@ async function sourceFixture() {
         height: options.height ?? source.height,
       };
     },
-    state,
     async (path) => {
       probes++;
       const text = await Deno.readTextFile(path);
       return text === 'broken' ? null : dimensions(text);
     },
+    state,
   );
   return {
     root,

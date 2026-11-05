@@ -119,9 +119,8 @@ export function hlsDimensions(
 
 export function createHlsCache(
   produce: Producer,
+  inspect: (path: string) => Promise<HlsFacts | null>,
   state?: Pick<State, 'declare' | 'getTyped'>,
-  inspect: (path: string) => Promise<HlsFacts | null> = () =>
-    Promise.resolve(null),
 ) {
   state?.declare('media.hlsCacheMegabytes', {
     type: 'number',
