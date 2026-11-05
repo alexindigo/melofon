@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertMatch } from '@std/assert';
+import { Demuxer } from 'node-av';
 import { apiFixture, error } from './helpers/api.ts';
 import { videoFixture } from './helpers/video-fixture.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -136,6 +137,30 @@ for (const hat of ['native', 'opensubsonic']) {
           }
         }
         assert(text.includes('#EXT-X-ENDLIST'));
+      }
+      // Count real source opens only after the native producers have reached VOD.
+      const open = Demuxer.open;
+      let sourceOpens = 0;
+      Demuxer.open = (...args) => {
+        if (args[0] === video.path) sourceOpens++;
+        return Reflect.apply(open, Demuxer, args) as ReturnType<
+          typeof Demuxer.open
+        >;
+      };
+      try {
+        for (let i = 0; i < 3; i++) {
+          const response = await read('bitRate=100@160x90', true);
+          assertEquals(response.status, 200);
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          assertEquals(bytes[0], 0x47);
+        }
+        assertEquals(
+          sourceOpens,
+          0,
+          'unchanged segment requests do not reopen the source',
+        );
+      } finally {
+        Demuxer.open = open;
       }
       const outputs = async () => {
         const entries = [];

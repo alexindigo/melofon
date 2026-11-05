@@ -44,11 +44,19 @@ type Producer = (
   publish: (facts: HlsFacts) => Promise<void>,
 ) => Promise<HlsFacts | null>;
 interface Entry {
+  source: Source;
   users: number;
   running: boolean;
   failed: boolean;
   ready: Promise<HlsFacts | null>;
   completion?: Promise<void>;
+}
+interface Source {
+  path: string;
+  size: number;
+  mtime: number | undefined;
+  facts: Promise<HlsFacts | null>;
+  users: number;
 }
 
 const ADMISSION_DEFAULTS: HlsAdmissionSettings = {
@@ -168,12 +176,47 @@ export function createHlsCache(
     default: ENCODING_DEFAULTS.ladder,
   });
   const entries = new Map<string, Entry>();
+  const sources = new Map<string, Source>();
   let serial = Promise.resolve();
   const exclusive = <T>(run: () => T | Promise<T>): Promise<T> => {
     const pending = serial.then(run);
     serial = pending.then(() => {}, () => {});
     return pending;
   };
+  // Source facts have the same lifetime/budget as their rendition entries,
+  // plus the requests currently inspecting/admitting them. No independent LRU.
+  const retireSources = () => {
+    const retained = new Set(
+      [...entries.values()].map((entry) => entry.source),
+    );
+    for (const [path, source] of sources) {
+      if (!source.users && !retained.has(source)) sources.delete(path);
+    }
+  };
+  async function sourceFor(path: string): Promise<Source | null> {
+    const stat = await Deno.stat(path).catch(() => null);
+    return exclusive(() => {
+      if (!stat) {
+        sources.delete(path);
+        return null;
+      }
+      const mtime = stat.mtime?.getTime();
+      let source = sources.get(path);
+      if (!source || source.size !== stat.size || source.mtime !== mtime) {
+        source = {
+          path,
+          size: stat.size,
+          mtime,
+          // Install the shared promise before starting asynchronous inspection.
+          facts: Promise.resolve().then(() => inspect(path)),
+          users: 0,
+        };
+        sources.set(path, source);
+      }
+      source.users++;
+      return source;
+    });
+  }
   /** Load only the settings declared by this policy's typed defaults. */
   const settings = async <T extends object>(defaults: T): Promise<T> => {
     const value = { ...defaults };
@@ -247,20 +290,20 @@ export function createHlsCache(
       entries.delete(output.dir);
       total -= output.bytes;
     }
+    retireSources();
   }
   const acquire = async (
-    path: string,
+    source: Source,
     root: string,
     options: HlsOptions,
     config: HlsEncodingSettings,
   ): Promise<HlsView | null> => {
-    const stat = await Deno.stat(path).catch(() => null);
-    if (!stat) return null;
+    const { path } = source;
     const signature = JSON.stringify([
       2,
       path,
-      stat.size,
-      stat.mtime?.getTime(),
+      source.size,
+      source.mtime,
       [options.kbps, options.width, options.height, options.audioTrack],
       config,
     ]);
@@ -272,6 +315,7 @@ export function createHlsCache(
       if (!entry) {
         let resolve!: (facts: HlsFacts | null) => void;
         entry = {
+          source,
           users: 0,
           running: true,
           failed: false,
@@ -338,6 +382,10 @@ export function createHlsCache(
           current.failed = true;
           resolve(null);
         });
+      } else {
+        // A persisted rendition can outlive its earlier inspection record.
+        // Keep the current stat-matched facts alive when reusing that output.
+        entry.source = source;
       }
       entry.users++;
       return entry;
@@ -461,25 +509,34 @@ export function createHlsCache(
         throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
       }
     }
-    const source = await inspect(path);
+    const source = await sourceFor(path);
     if (!source) return null;
-    for (const option of options) {
-      const { width, height } = hlsDimensions(source, option, encoding);
-      if (width > admission.maxDimension || height > admission.maxDimension) {
-        throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
-      }
-    }
     const views: HlsView[] = [];
     try {
+      const facts = await source.facts;
+      if (!facts) return null;
       for (const option of options) {
-        const view = await acquire(path, root, option, encoding);
+        const { width, height } = hlsDimensions(facts, option, encoding);
+        if (width > admission.maxDimension || height > admission.maxDimension) {
+          throw new HlsError('HLS dimensions exceed media.hls.maxDimension');
+        }
+      }
+      for (const option of options) {
+        const view = await acquire(source, root, option, encoding);
         if (!view) return null;
         views.push(view);
       }
       return views;
     } finally {
-      if (views.length !== options.length) {
-        for (const view of views) await view.release();
+      try {
+        if (views.length !== options.length) {
+          for (const view of views) await view.release();
+        }
+      } finally {
+        await exclusive(() => {
+          source.users--;
+          retireSources();
+        });
       }
     }
   }
