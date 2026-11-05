@@ -53,6 +53,12 @@ interface Grant {
   epoch: number;
   kind: 'explicit' | 'planned' | 'retry';
 }
+interface RuntimePin {
+  timer?: ReturnType<typeof setTimeout>;
+  saved: boolean;
+  stopped: boolean;
+  current(): boolean;
+}
 interface Runtime {
   transport: AirplayTransport | null;
   session: number;
@@ -60,10 +66,7 @@ interface Runtime {
   authorizedPump: number | null;
   connected: boolean;
   authenticationRequired: boolean;
-  pairingSaved?: boolean;
-  pairingStopped?: boolean;
-  pinTimer?: ReturnType<typeof setTimeout>;
-  pinPending?: boolean;
+  pin?: RuntimePin;
   entry: number | null;
   strategy: ConnectionStrategy;
   host: string;
@@ -206,6 +209,13 @@ export function createAirplayBoot(
     const work = pairings.get(id);
     if (work) finishPairing(id, work, 'cancelled');
   };
+  // Reservation, receipt flags and timeout have one lifetime. Identity guards
+  // keep a stale async exit from releasing a later challenge's attempt.
+  const releasePin = (runtime: Runtime, work = runtime.pin) => {
+    if (!work || runtime.pin !== work) return;
+    clearTimeout(work.timer);
+    runtime.pin = undefined;
+  };
 
   const epoch = (id: string) => {
     let e = epochs.get(id);
@@ -232,6 +242,8 @@ export function createAirplayBoot(
     if (resuming.get(id)?.grant?.kind === 'retry') cancelResume(id);
   };
   const revoke = (id: string) => {
+    const runtime = runtimes.get(id);
+    if (runtime) releasePin(runtime);
     cancelResume(id);
     preparing.get(id)?.controller.abort();
     preparing.delete(id);
@@ -516,7 +528,7 @@ export function createAirplayBoot(
     }
     cancelPump(id, r);
     cancelHold(r);
-    clearTimeout(r.pinTimer);
+    releasePin(r);
     r.session++;
     r.connected = false;
     r.transport = null;
@@ -749,14 +761,15 @@ export function createAirplayBoot(
           },
           onEvent({ event, value }) {
             if (!own()) return;
+            const pin = r.pin;
             if (event === 'credential' && value === 'saved') {
-              r.pairingSaved = true;
+              if (pin?.current()) pin.saved = true;
             }
             if (event === 'state' && value === 'stopped') {
-              r.pairingStopped = true;
+              if (pin?.current()) pin.stopped = true;
             }
-            if (r.pairingSaved && r.pairingStopped) {
-              r.pairingSaved = false;
+            if (pin?.current() && pin.saved && pin.stopped) {
+              releasePin(r, pin);
               void controls.changeCredentials(id, async () => {}).catch(
                 () => {},
               );
@@ -765,6 +778,7 @@ export function createAirplayBoot(
             if (event === 'state' && value === 'failed') {
               sessionFailed(id, r, 'helper event');
             } else if (event === 'state' && value === 'password') {
+              releasePin(r);
               r.connected = false;
               r.authenticationRequired = true;
               cancelPump(id, r);
@@ -775,6 +789,7 @@ export function createAirplayBoot(
               });
               pauseWithoutPeer();
             } else if (event === 'state' && value === 'connected') {
+              releasePin(r);
               const wasConnected = r.connected;
               r.connected = true;
               devices.sessionChanged(id, {
@@ -1069,84 +1084,100 @@ export function createAirplayBoot(
         },
       };
       pairings.set(id, work);
-      publishPairing(id, work);
-      const seconds = deps.state
-        ? await deps.state.getTyped('airplay.pairingSeconds') as number
-        : 120;
-      if (!work.current()) return structuredClone(work.view);
-      work.timer = setTimeout(
-        () => finishPairing(id, work, 'failed', 'pairing_timeout'),
-        seconds * 1000,
-      );
+      let pending = false, settingsReady = false;
+      let failure = 'pairing_unavailable';
       try {
-        const prepared = await devices.protocol.prepare({
-          id,
-          targetRevision: devices.admission.describe(id).targetRevision,
-          signal: work.controller.signal,
-          isCurrent: work.current,
-        });
-        if (!work.current()) return structuredClone(work.view);
-        if (!prepared.ok || !devices.describe(id).abilities?.pin) {
-          finishPairing(id, work, 'failed', 'pairing_unavailable');
-          throw new SpeakerError(
-            'pairing_unavailable',
-            'Speaker cannot be prepared for PIN pairing',
+        await (async () => {
+          publishPairing(id, work);
+          const seconds = deps.state
+            ? await deps.state.getTyped('airplay.pairingSeconds') as number
+            : 120;
+          settingsReady = true;
+          if (!work.current()) return;
+          work.timer = setTimeout(
+            () => finishPairing(id, work, 'failed', 'pairing_timeout'),
+            seconds * 1000,
           );
-        }
-        const result = await devices.protocol.activate(prepared.value, {
-          probe: true,
-          volume: 0,
-          positionMs: 0,
-          lengthMs: 0,
-          title: '',
-          artist: '',
-        }, {
-          publish: (transport) => {
-            work.transport = transport;
-          },
-          onEvent({ event, value }) {
-            if (!work.current()) return;
-            if (event === 'credential' && value === 'unavailable') {
-              work.view = {
-                ...work.view,
-                error: {
-                  code: 'credential_unavailable',
-                  message: 'Pairing credential could not be saved',
-                },
-              };
-              publishPairing(id, work);
-            }
-            if (event === 'credential' && value === 'saved') work.saved = true;
-            if (event === 'credential' && value === 'cleared') {
-              work.saved = false;
-            }
-            if (event === 'state' && value === 'stopped') work.stopped = true;
-            if (work.saved && work.stopped) {
-              outputs.update(id, { needsAuthKey: false }, ownedSource);
-              finishPairing(id, work, 'complete');
-            } else if (event === 'state' && value === 'password') {
-              if (work.view.state === 'pairing') {
-                finishPairing(id, work, 'failed', 'pairing_rejected');
-              } else {
-                work.view = { state: 'awaiting_pin', saved: false };
-                outputs.update(id, { needsAuthKey: true }, ownedSource);
+          const prepared = await devices.protocol.prepare({
+            id,
+            targetRevision: devices.admission.describe(id).targetRevision,
+            signal: work.controller.signal,
+            isCurrent: work.current,
+          });
+          if (!work.current()) return;
+          if (!prepared.ok || !devices.describe(id).abilities?.pin) {
+            throw new SpeakerError(
+              'pairing_unavailable',
+              'Speaker cannot be prepared for PIN pairing',
+            );
+          }
+          failure = 'pairing_failed';
+          const result = await devices.protocol.activate(prepared.value, {
+            probe: true,
+            volume: 0,
+            positionMs: 0,
+            lengthMs: 0,
+            title: '',
+            artist: '',
+          }, {
+            publish: (transport) => {
+              work.transport = transport;
+            },
+            onEvent({ event, value }) {
+              if (!work.current()) return;
+              if (event === 'credential' && value === 'unavailable') {
+                work.view = {
+                  ...work.view,
+                  error: {
+                    code: 'credential_unavailable',
+                    message: 'Pairing credential could not be saved',
+                  },
+                };
                 publishPairing(id, work);
               }
-            } else if (event === 'state' && value === 'failed') {
-              finishPairing(id, work, 'failed', 'pairing_failed');
-            }
-          },
-        });
-        if (!result.ok && work.current()) {
-          finishPairing(id, work, 'failed', 'pairing_failed');
-        }
+              if (event === 'credential' && value === 'saved') {
+                work.saved = true;
+              }
+              if (event === 'credential' && value === 'cleared') {
+                work.saved = false;
+              }
+              if (event === 'state' && value === 'stopped') work.stopped = true;
+              if (work.saved && work.stopped) {
+                outputs.update(id, { needsAuthKey: false }, ownedSource);
+                finishPairing(id, work, 'complete');
+              } else if (event === 'state' && value === 'password') {
+                if (work.view.state === 'pairing') {
+                  finishPairing(id, work, 'failed', 'pairing_rejected');
+                } else {
+                  work.view = { state: 'awaiting_pin', saved: false };
+                  outputs.update(id, { needsAuthKey: true }, ownedSource);
+                  publishPairing(id, work);
+                }
+              } else if (event === 'state' && value === 'failed') {
+                finishPairing(id, work, 'failed', 'pairing_failed');
+              }
+            },
+          });
+          // Only a successfully activated operation transfers cleanup to its
+          // event/timeout owner. Every other exit finishes in the same finally.
+          pending = result.ok && work.current();
+        })();
       } catch (error) {
-        if (work.current()) finishPairing(id, work, 'failed', 'pairing_failed');
-        if (error instanceof SpeakerError) throw error;
+        if (!settingsReady || error instanceof SpeakerError) throw error;
         throw new SpeakerError(
           'pairing_unavailable',
           'Speaker pairing is unavailable',
         );
+      } finally {
+        if (!pending) {
+          const current = work.current();
+          finishPairing(
+            id,
+            work,
+            current ? 'failed' : 'cancelled',
+            current ? failure : undefined,
+          );
+        }
       }
       return structuredClone(work.view);
     },
@@ -1161,39 +1192,54 @@ export function createAirplayBoot(
         const runtime = runtimes.get(id);
         if (
           runtime?.authenticationRequired && runtime.transport &&
-          !runtime.pinPending && intent === 'play' && outputs.get(id)?.selected
+          !runtime.pin && intent === 'play' && outputs.get(id)?.selected
         ) {
-          runtime.pinPending = true;
-          runtime.pairingSaved = false;
-          runtime.pairingStopped = false;
           const demand = intentEpoch, generation = epoch(id).generation;
-          const seconds = deps.state
-            ? await deps.state.getTyped('airplay.pairingSeconds') as number
-            : 120;
-          if (
-            runtimes.get(id) !== runtime || !runtime.transport ||
-            intentEpoch !== demand || epoch(id).generation !== generation
-          ) {
-            throw new SpeakerError(
-              'pairing_required',
-              'Speaker pairing has ended',
-            );
-          }
-          runtime.pinTimer = setTimeout(() => {
-            if (runtimes.get(id) === runtime) {
-              sessionFailed(id, runtime, 'pairing timeout');
-            }
-          }, seconds * 1000);
+          const transport = runtime.transport, session = runtime.session;
+          const attempt: RuntimePin = {
+            saved: false,
+            stopped: false,
+            current: () =>
+              !closed && runtime.pin === attempt &&
+              runtimes.get(id) === runtime && runtime.transport === transport &&
+              runtime.session === session && runtime.authenticationRequired &&
+              intent === 'play' && outputs.get(id)?.selected === true &&
+              intentEpoch === demand && epoch(id).generation === generation,
+          };
+          runtime.pin = attempt;
+          let pending = false;
           try {
-            await runtime.transport.send({ cmd: 'pin', pin });
-          } catch {
-            sessionFailed(id, runtime, 'PIN submission');
-            throw new SpeakerError(
-              'pairing_unavailable',
-              'Speaker PIN could not be submitted',
-            );
+            const seconds = deps.state
+              ? await deps.state.getTyped('airplay.pairingSeconds') as number
+              : 120;
+            if (!attempt.current()) {
+              throw new SpeakerError(
+                'pairing_required',
+                'Speaker pairing has ended',
+              );
+            }
+            attempt.timer = setTimeout(() => {
+              if (attempt.current()) {
+                releasePin(runtime, attempt);
+                sessionFailed(id, runtime, 'pairing timeout');
+              }
+            }, seconds * 1000);
+            try {
+              await transport.send({ cmd: 'pin', pin });
+            } catch {
+              if (attempt.current()) {
+                sessionFailed(id, runtime, 'PIN submission');
+              }
+              throw new SpeakerError(
+                'pairing_unavailable',
+                'Speaker PIN could not be submitted',
+              );
+            }
+            pending = attempt.current();
+            return { state: 'pairing', saved: false };
+          } finally {
+            if (!pending) releasePin(runtime, attempt);
           }
-          return { state: 'pairing', saved: false };
         }
         throw new SpeakerError(
           'pairing_required',

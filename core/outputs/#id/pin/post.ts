@@ -29,17 +29,19 @@ export default async function (
     });
   }
   try {
-    await context.app.speakers.submitPin(request.params.id, { pin });
+    await context.app.speakers.submitPin(request.params.id, {
+      pin: pin.trim(),
+    });
   } catch (error) {
-    if (
-      error instanceof Error && 'code' in error && error.code === 'not_found'
-    ) {
+    if (!(error instanceof Error) || !('code' in error)) throw error;
+    if (error.code === 'not_found') {
       return Response.json({ error: 'unknown output id' }, { status: 404 });
     }
-    return Response.json(
-      { error: 'PIN requires an active pairing operation' },
-      { status: 400 },
-    );
+    return Response.json({ error: error.message }, {
+      status: error.code === 'pairing_required' || error.code === 'speaker_busy'
+        ? 409
+        : 400,
+    });
   }
   return { ok: true };
 }
