@@ -28,14 +28,24 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## Dominant color (GPL-3.0-only adaptation)
+## Dominant color (Melofon's own implementation)
 
-`dominant-color.ts` adapts Navidrome's
-`core/artwork/dominant/dominant.go`: 4-bit bins, top 64, first Oklab cluster
-within distance <0.10, largest population and rounded channel means. Packed
-RGBA follows the NRGBA path, ignoring alpha. Count ties use ascending bin index.
-Source: https://github.com/navidrome/navidrome at commit
-`18205366c8f1a7b91b209b770f5dc966e824d33e`. Navidrome is distributed under GPL
-version 3; the full text is in `dominant-color-COPYING`. Melofon's
-AGPL-3.0-or-later license is in the root `LICENSE`; section 13 covers combination
-with GPL version 3 code.
+`dominant-color.ts` is original Melofon code under the root `LICENSE`. It counts
+exact RGB colours and ranks fixed-radius Oklab neighbourhoods by pixel population,
+with packed-RGB tie-breaking and population-weighted sRGB output. No colour bins,
+top-colour cap or progressive cluster merging are used.
+Fully transparent pixels are excluded. Every pixel with nonzero alpha counts
+once with its straight RGB, without compositing; all-transparent input returns
+an empty string.
+
+`color-math.ts` implements the published sRGB-to-Oklab formulas by Bjorn Ottosson,
+using his matrices updated 2021-01-25:
+https://bottosson.github.io/posts/oklab/. Ottosson makes the conversion available
+in the public domain and alternatively under MIT:
+https://bottosson.github.io/misc/License.txt. This implementation uses the
+public-domain grant.
+
+The idea of ranking by population alone was inspired by Atmosphera's muted
+palette (`Scripts/python/src/theming/lib/palette.py`); its
+`Services/Files/FileIconColors.js` also illustrates using Oklab. These were read
+for ideas only. No code was shared or ported from Atmosphera or Navidrome.

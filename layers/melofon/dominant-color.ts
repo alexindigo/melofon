@@ -1,76 +1,96 @@
-// Adapted from Navidrome core/artwork/dominant/dominant.go (GPL-3.0-only).
-// Provenance and license information: artwork-codecs-LICENSE.md.
+import { type Oklab, oklabDistanceSquared, srgbToOklab } from './color-math.ts';
 
-type ColorBin = { index: number; r: number; g: number; b: number; n: number };
+const radius = 0.08;
 
-/**
- * Prevalent color, not average or salience, as lowercase #rrggbb; empty is ''.
- * Packed straight RGBA; alpha is deliberately ignored, including hidden RGB,
- * matching Navidrome's NRGBA thumbnail path. Never mutates the input.
+type Color = {
+  rgb: number;
+  count: number;
+  lab: Oklab;
+  population: number;
+  red: number;
+  green: number;
+  blue: number;
+};
+
+/** Packed straight RGBA; alpha-0 pixels are skipped entirely. Every other pixel
+ * counts once with its straight RGB, without backdrop compositing or alpha weights.
+ * Empty or fully transparent input returns ''.
+ * Each exact RGB is a fixed neighbourhood centre, never a moving/merged mean.
+ * For n pixels and u distinct RGBs: O(n + u + p) time, O(u) space, where p is
+ * the number of pairs in adjacent radius-sized Oklab cells (worst case u^2).
+ * Artwork facts supply at most 100 x 100 pixels; there is no colour-count cap.
  */
 export function dominantColor(rgba: Uint8Array): string {
-  if (rgba.length % 4) {
-    throw new RangeError('Dominant color requires packed RGBA');
+  if (rgba.length % 4 !== 0) {
+    throw new RangeError('Expected packed RGBA pixels');
   }
-  if (!rgba.length) return '';
-  const bins = new Map<number, ColorBin>();
+  if (rgba.length === 0) return '';
+
+  const counts = new Map<number, number>();
   for (let i = 0; i < rgba.length; i += 4) {
-    const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
-    const index = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
-    const bin = bins.get(index) ?? { index, r: 0, g: 0, b: 0, n: 0 };
-    bin.r += r;
-    bin.g += g;
-    bin.b += b;
-    bin.n++;
-    bins.set(index, bin);
+    if (rgba[i + 3] === 0) continue;
+    const rgb = (rgba[i] << 16) | (rgba[i + 1] << 8) | rgba[i + 2];
+    counts.set(rgb, (counts.get(rgb) ?? 0) + 1);
   }
-  // Deterministic bin-index ordering resolves count ties before the 64-bin cap.
-  const ranked = [...bins.values()].sort((a, b) =>
-    b.n - a.n || a.index - b.index
-  ).slice(0, 64);
-  const merged: ColorBin[] = [];
-  for (const bin of ranked) {
-    const lab = oklab(bin);
-    // First matching cluster, not the globally nearest one. Recompute means
-    // after merging so later bins compare against the accumulated cluster.
-    const cluster = merged.find((m) => {
-      const other = oklab(m);
-      return Math.hypot(
-        lab[0] - other[0],
-        lab[1] - other[1],
-        lab[2] - other[2],
-      ) < 0.10;
-    });
-    if (cluster) {
-      cluster.r += bin.r;
-      cluster.g += bin.g;
-      cluster.b += bin.b;
-      cluster.n += bin.n;
-    } else merged.push({ ...bin });
+  if (counts.size === 0) return '';
+
+  const cells = new Map<string, Color[]>();
+  const colors: Color[] = [];
+  for (const [rgb, count] of counts) {
+    const red = rgb >>> 16;
+    const green = (rgb >>> 8) & 255;
+    const blue = rgb & 255;
+    const lab = srgbToOklab(red, green, blue);
+    const color: Color = {
+      rgb,
+      count,
+      lab,
+      population: count,
+      red: red * count,
+      green: green * count,
+      blue: blue * count,
+    };
+    const [l, a, b] = lab.map((coordinate) => Math.floor(coordinate / radius));
+    // Visit each unordered pair once and add its exact pixel weights to both
+    // fixed centres. Integer sums make every permutation produce the same mean.
+    for (let dl = -1; dl <= 1; dl++) {
+      for (let da = -1; da <= 1; da++) {
+        for (let db = -1; db <= 1; db++) {
+          const neighbors = cells.get(`${l + dl},${a + da},${b + db}`);
+          if (!neighbors) continue;
+          for (const other of neighbors) {
+            if (oklabDistanceSquared(lab, other.lab) > radius * radius) {
+              continue;
+            }
+            color.population += other.count;
+            color.red += (other.rgb >>> 16) * other.count;
+            color.green += ((other.rgb >>> 8) & 255) * other.count;
+            color.blue += (other.rgb & 255) * other.count;
+            other.population += count;
+            other.red += red * count;
+            other.green += green * count;
+            other.blue += blue * count;
+          }
+        }
+      }
+    }
+    const key = `${l},${a},${b}`;
+    const cell = cells.get(key);
+    if (cell) cell.push(color);
+    else cells.set(key, [color]);
+    colors.push(color);
   }
-  let best = merged[0];
-  for (const bin of merged.slice(1)) if (bin.n > best.n) best = bin;
-  return '#' +
-    [best.r, best.g, best.b].map((v) =>
-      Math.round(v / best.n).toString(16).padStart(2, '0')
-    ).join('');
-}
 
-function srgbToLinear(v: number): number {
-  v /= 255;
-  return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
-}
-
-function oklab(bin: ColorBin): [number, number, number] {
-  const r = srgbToLinear(bin.r / bin.n);
-  const g = srgbToLinear(bin.g / bin.n);
-  const b = srgbToLinear(bin.b / bin.n);
-  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
-  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
-  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
-  return [
-    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
-    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
-    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
-  ];
+  let winner = colors[0];
+  for (const color of colors) {
+    if (
+      color.population > winner.population ||
+      (color.population === winner.population && color.rgb < winner.rgb)
+    ) winner = color;
+  }
+  return '#' + [winner.red, winner.green, winner.blue]
+    .map((sum) =>
+      Math.round(sum / winner.population).toString(16).padStart(2, '0')
+    )
+    .join('');
 }

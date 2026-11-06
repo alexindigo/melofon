@@ -196,6 +196,64 @@ Deno.test('API lazy artwork: real song/album/artist lists and details publish tr
   }
 });
 
+Deno.test('API lazy artwork: v1 facts are recomputed and only v2 facts are reused', async () => {
+  const t = await fixture();
+  try {
+    const key = (await t.f.login('bearer')).credential;
+    const path = `songs/${t.song.id}`;
+    const data = createHatData(t.f.store, t.f.cfg, t.f.state)('melofon');
+    await read(t.f, path, key);
+    const [record] = await data.list();
+    assert(record.key.startsWith('artwork-facts/v2/'));
+    const saved = await data.get(record.key);
+    assert(
+      saved?.kind === 'data' && saved.value && typeof saved.value === 'object',
+    );
+    assert(!Array.isArray(saved.value));
+    assertEquals(saved.value.algorithmVersion, 2);
+    const legacy = {
+      ...saved.value,
+      algorithmVersion: 1,
+      dominantColor: '#00ff00',
+    };
+    await t.clear();
+    const oldKey = record.key.replace('artwork-facts/v2/', 'artwork-facts/v1/');
+    await data.put(oldKey, { kind: 'data', value: legacy });
+    assertEquals(
+      (await read(t.f, path, key)).body.song.artwork.dominantColor,
+      null,
+    );
+    const fresh = await read(t.f, path, key);
+    assertEquals(fresh.body.song.artwork.dominantColor, '#ff0000');
+    assertEquals(fresh.body.song.artwork.thumbHash, red.hash);
+    assertEquals(
+      t.calls,
+      [[1, 1]],
+      'legacy namespace must not suppress decoding',
+    );
+    assertEquals(await data.get(oldKey), { kind: 'data', value: legacy });
+
+    // A v1 payload under the new key must also fail validation, then be replaced.
+    await data.put(record.key, { kind: 'data', value: legacy });
+    assertEquals(
+      (await read(t.f, path, key)).body.song.artwork.dominantColor,
+      null,
+    );
+    assertEquals(
+      (await read(t.f, path, key)).body.song.artwork.dominantColor,
+      '#ff0000',
+    );
+    assertEquals(t.calls, [[1, 1], [1, 1]]);
+    assertEquals(
+      await data.get(record.key),
+      saved,
+      'writer persists version 2',
+    );
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('API lazy artwork: source changes without scan, policy changes, original dimensions and deleted entities', async () => {
   const t = await fixture();
   try {

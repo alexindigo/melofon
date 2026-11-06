@@ -1,7 +1,13 @@
-import { assertEquals, assertNotEquals, assertThrows } from '@std/assert';
+import {
+  assertAlmostEquals,
+  assertEquals,
+  assertNotEquals,
+  assertThrows,
+} from '@std/assert';
 import { decodeBase64, encodeBase64 } from '@std/encoding/base64';
 import { rgbaToThumbHash } from '#melofon/thumbhash.ts';
 import { dominantColor } from '#melofon/dominant-color.ts';
+import { srgbToOklab } from '#melofon/color-math.ts';
 import reference from './fixtures/thumbhash-reference.json' with {
   type: 'json',
 };
@@ -83,7 +89,7 @@ Deno.test('placeholder encoders: honor subarray boundaries and return independen
   assertEquals(backing, before);
 });
 
-Deno.test('dominant color: empty, solid and exact within-bin means', () => {
+Deno.test('dominant color: empty, solid and rounded neighbourhood means', () => {
   assertEquals(dominantColor(new Uint8Array()), '');
   assertEquals(dominantColor(pixels([[51, 102, 153, 255]])), '#336699');
   assertEquals(
@@ -111,7 +117,7 @@ Deno.test('dominant color: prevalent field beats average and salient patches', (
   );
 });
 
-Deno.test('dominant color: merges gradient bins before choosing the heaviest cluster', () => {
+Deno.test('dominant color: a prevalent gradient beats a smaller solid patch', () => {
   const rgba = new Uint8Array(40 * 40 * 4);
   for (let y = 0; y < 40; y++) {
     for (let x = 0; x < 40; x++) {
@@ -121,21 +127,127 @@ Deno.test('dominant color: merges gradient bins before choosing the heaviest clu
       );
     }
   }
-  // 75% blue spanning three bins; its exact channel mean rounds 174.5 to 175.
+  // 75% nearby blues; their exact channel mean rounds 174.5 to 175.
   assertEquals(dominantColor(rgba), '#1020af');
 });
 
-Deno.test('dominant color: count ties use ascending bin index, independent of pixel order', () => {
+Deno.test('dominant color: population ties use ascending packed RGB, independent of pixel order', () => {
   const redBlue = pixels([[255, 0, 0, 255], [0, 0, 255, 255]]);
   const blueRed = pixels([[0, 0, 255, 255], [255, 0, 0, 255]]);
   assertEquals(dominantColor(redBlue), '#0000ff');
   assertEquals(dominantColor(blueRed), '#0000ff');
 });
 
-Deno.test('dominant color: alpha is ignored, including fully transparent hidden RGB', () => {
-  const rgba = pixels([[255, 0, 0, 0], [255, 0, 0, 128], [0, 0, 255, 255]]);
-  assertEquals(dominantColor(rgba), '#ff0000');
-  assertEquals(dominantColor(pixels([[51, 102, 153, 0]])), '#336699');
-  for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
-  assertEquals(dominantColor(rgba), '#ff0000');
+Deno.test('dominant color: fully transparent hidden RGB never counts', () => {
+  const coral = [255, 127, 80, 255];
+  const hiddenTeal = Array.from({ length: 9 }, () => [0, 128, 128, 0]);
+  assertEquals(dominantColor(pixels([...hiddenTeal, coral])), '#ff7f50');
+  const hiddenNearCoral = Array.from({ length: 9 }, () => [250, 120, 75, 0]);
+  assertEquals(dominantColor(pixels([coral, ...hiddenNearCoral])), '#ff7f50');
+});
+
+Deno.test('dominant color: partial alpha counts straight RGB once without compositing', () => {
+  for (const alpha of [1, 128, 254]) {
+    assertEquals(
+      dominantColor(pixels([[51, 102, 153, alpha]])),
+      '#336699',
+    );
+    assertEquals(
+      dominantColor(
+        pixels([[255, 0, 0, alpha], [255, 0, 0, alpha], [0, 0, 255, 255]]),
+      ),
+      '#ff0000',
+    );
+    assertEquals(
+      dominantColor(pixels([[128, 128, 128, alpha], [152, 152, 152, 255]])),
+      '#8c8c8c',
+    );
+  }
+});
+
+Deno.test('dominant color: all-transparent input returns an empty string', () => {
+  assertEquals(dominantColor(pixels([[51, 102, 153, 0]])), '');
+  assertEquals(dominantColor(pixels([[255, 0, 0, 0], [0, 128, 128, 0]])), '');
+});
+
+Deno.test('colour math: Oklab neutral endpoints and sRGB transfer curve', () => {
+  assertEquals(srgbToOklab(0, 0, 0), [0, 0, 0]);
+  for (const byte of [10, 11, 128, 255]) {
+    const [l, a, b] = srgbToOklab(byte, byte, byte);
+    // Equal channels have L = cube root of linear intensity. Cover both sides
+    // of the sRGB transfer breakpoint without depending on the selection policy.
+    const intensity = byte <= 10
+      ? byte / (255 * 12.92)
+      : ((byte / 255 + 0.055) / 1.055) ** 2.4;
+    assertAlmostEquals(l, Math.cbrt(intensity), 1e-7);
+    assertAlmostEquals(a, 0, 1e-7);
+    assertAlmostEquals(b, 0, 1e-7);
+  }
+  // D65 sRGB red in Oklab, rounded to six decimals.
+  const red = srgbToOklab(255, 0, 0);
+  for (const [i, expected] of [0.627955, 0.224863, 0.125846].entries()) {
+    assertAlmostEquals(red[i], expected, 1e-6);
+  }
+});
+
+Deno.test('dominant color: neighbours just inside and outside Oklab radius 0.08', () => {
+  // Neutral 128 -> 152 is about 0.07981; 128 -> 153 is about 0.08308.
+  assertEquals(
+    dominantColor(pixels([[128, 128, 128, 255], [152, 152, 152, 255]])),
+    '#8c8c8c',
+  );
+  assertEquals(
+    dominantColor(pixels([[128, 128, 128, 255], [153, 153, 153, 255]])),
+    '#808080',
+  );
+});
+
+Deno.test('dominant color: neighbourhoods do not chain or move their centres', () => {
+  // Adjacent greys are within 0.08, but no centre sees the whole chain.
+  // The two middle centres tie; 152 wins, averaging only 128, 152 and 176.
+  assertEquals(
+    dominantColor(pixels([128, 152, 176, 200].map((v) => [v, v, v, 255]))),
+    '#989898',
+  );
+});
+
+Deno.test('dominant color: weighted neighbourhoods are invariant across multi-colour permutations', () => {
+  const colors = [
+    ...Array.from({ length: 3 }, () => [128, 128, 128, 255]),
+    [152, 152, 152, 128],
+    [176, 176, 176, 1],
+    ...Array.from({ length: 4 }, () => [255, 0, 0, 255]),
+    [0, 0, 255, 255],
+  ];
+  // The middle grey sees five pixels, beating the four reds. Its neighbours'
+  // weights are 3:1:1, so (3*128 + 152 + 176)/5 rounds to 142.
+  for (let shift = 0; shift < colors.length; shift++) {
+    const rotated = [...colors.slice(shift), ...colors.slice(0, shift)];
+    for (const permutation of [rotated, rotated.toReversed()]) {
+      const rgba = pixels(permutation);
+      const before = rgba.slice();
+      assertEquals(dominantColor(rgba), '#8e8e8e');
+      assertEquals(rgba, before);
+    }
+  }
+});
+
+Deno.test('dominant color: a field of rare colours is not discarded by a top-64 cap', () => {
+  const colors: number[][] = [];
+  // 64 separate 4-bit RGB bins, two pixels each, scattered in the darker gamut.
+  for (const r of [0, 48, 96, 144]) {
+    for (const g of [0, 48, 96, 144]) {
+      for (const b of [0, 48, 96, 144]) {
+        colors.push([r, g, b, 255], [r, g, b, 255]);
+      }
+    }
+  }
+  // 80 bright bins, one pixel each, all within one fixed-centre neighbourhood.
+  // A top-64-bin shortlist would omit every one of these colours.
+  for (const r of [207, 208, 224, 240]) {
+    for (const g of [207, 208, 224, 240]) {
+      for (const b of [191, 192, 208, 224, 240]) colors.push([r, g, b, 255]);
+    }
+  }
+  assertEquals(dominantColor(pixels(colors)), '#dcdcd3');
 });

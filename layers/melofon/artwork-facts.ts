@@ -16,7 +16,7 @@ type Facts = {
 function stored(value: unknown, sourceHash: string): value is Facts {
   if (!value || typeof value !== 'object') return false;
   const facts = value as Facts;
-  return facts.algorithmVersion === 1 && facts.sourceHash === sourceHash &&
+  return facts.algorithmVersion === 2 && facts.sourceHash === sourceHash &&
     typeof facts.thumbHash === 'string' &&
     /^[A-Za-z0-9+/]+={0,2}$/.test(facts.thumbHash) &&
     typeof facts.dominantColor === 'string' &&
@@ -30,7 +30,7 @@ export function artworkFacts(context: HatContext) {
   let attempted = 0;
   const limit = context.app.state.getTyped('melofon.artworkFactsPerRequest');
   async function facts(ref: ArtworkRef, descriptor: ArtworkDescriptor) {
-    const key = `artwork-facts/v1/${descriptor.sourceHash}`;
+    const key = `artwork-facts/v2/${descriptor.sourceHash}`;
     try {
       const record = await context.app.hatData.get(key);
       if (
@@ -52,7 +52,7 @@ export function artworkFacts(context: HatContext) {
         pixels.descriptor.sourceHash !== descriptor.sourceHash
       ) return null;
       const value: Facts = {
-        algorithmVersion: 1,
+        algorithmVersion: 2,
         sourceHash: descriptor.sourceHash,
         thumbHash: encodeBase64(
           rgbaToThumbHash(pixels.width, pixels.height, pixels.rgba),
