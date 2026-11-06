@@ -1,6 +1,6 @@
 {
   "name": "melofon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Household music server: library + HTTP streamer + speaker control",
   "license": "AGPL-3.0-or-later",
   "exports": "./main.ts",
