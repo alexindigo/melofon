@@ -8,7 +8,7 @@ type Facts = {
   algorithmVersion: number;
   sourceHash: string;
   thumbHash: string;
-  dominantColor: string;
+  dominantColor: string | null;
   width: number | null;
   height: number | null;
 };
@@ -19,8 +19,9 @@ function stored(value: unknown, sourceHash: string): value is Facts {
   return facts.algorithmVersion === 2 && facts.sourceHash === sourceHash &&
     typeof facts.thumbHash === 'string' &&
     /^[A-Za-z0-9+/]+={0,2}$/.test(facts.thumbHash) &&
-    typeof facts.dominantColor === 'string' &&
-    /^#[a-f0-9]{6}$/.test(facts.dominantColor);
+    (facts.dominantColor === null ||
+      (typeof facts.dominantColor === 'string' &&
+        /^#[a-f0-9]{6}$/.test(facts.dominantColor)));
 }
 
 /** One request owns its bounded work and joins it before returning. No detached
@@ -57,7 +58,9 @@ export function artworkFacts(context: HatContext) {
         thumbHash: encodeBase64(
           rgbaToThumbHash(pixels.width, pixels.height, pixels.rgba),
         ),
-        dominantColor: dominantColor(pixels.rgba),
+        // Normalize the codec's empty result once: persisted facts and API views
+        // share null for "no colour", distinct from a cache miss for all facts.
+        dominantColor: dominantColor(pixels.rgba) || null,
         width: pixels.descriptor.width,
         height: pixels.descriptor.height,
       };

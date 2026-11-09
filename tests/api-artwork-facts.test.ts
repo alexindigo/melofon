@@ -196,6 +196,57 @@ Deno.test('API lazy artwork: real song/album/artist lists and details publish tr
   }
 });
 
+Deno.test('API lazy artwork: all-transparent images decode once and reuse v2 facts with no colour', async () => {
+  const t = await fixture();
+  try {
+    const cookie = (await t.f.login('cookie')).credential;
+    const bearer = (await t.f.login('bearer')).credential;
+    const path = `songs/${t.song.id}`;
+    await Deno.writeFile(
+      t.cover,
+      pixelPng(1, 1, new Uint8Array([0, 128, 128, 0])),
+    );
+    const first = (await read(t.f, path, cookie)).body.song.artwork;
+    assertEquals([first.thumbHash, first.dominantColor], [null, null]);
+    const second = (await read(t.f, path, bearer)).body.song.artwork;
+    assertEquals(t.calls, [[1, 1]], 'all-transparent facts must be cached');
+    assertEquals(
+      second.dominantColor,
+      null,
+      'the API must never expose an empty colour',
+    );
+    assert(typeof second.thumbHash === 'string' && second.thumbHash.length > 0);
+
+    const data = createHatData(t.f.store, t.f.cfg, t.f.state)('melofon');
+    const [record] = await data.list();
+    assert(record.key.startsWith('artwork-facts/v2/'));
+    const saved = await data.get(record.key);
+    assert(
+      saved?.kind === 'data' && saved.value && typeof saved.value === 'object',
+    );
+    assert(!Array.isArray(saved.value));
+    assertEquals(saved.value.algorithmVersion, 2);
+    assertEquals(
+      saved.value.dominantColor,
+      null,
+      'storage uses the same no-colour representation',
+    );
+
+    t.fail(true);
+    await t.f.state.set('melofon.artworkFactsPerRequest', '0');
+    const repeated = (await read(t.f, path, cookie)).body.song.artwork;
+    assertEquals(repeated, second, 'cached facts need no decode budget');
+    assertEquals(await data.get(record.key), saved);
+    assertEquals(t.calls, [[1, 1]]);
+    await t.restart();
+    const restored = (await read(t.f, path, bearer)).body.song.artwork;
+    assertEquals(restored, second, 'restart reuses persisted no-colour facts');
+    assertEquals(t.calls, [], 'restart does not decode the image again');
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('API lazy artwork: v1 facts are recomputed and only v2 facts are reused', async () => {
   const t = await fixture();
   try {
