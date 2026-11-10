@@ -16,6 +16,8 @@ import type {
 import type { PersistedPlayerState } from './store/playback.ts';
 import type { SpeakerCredentials } from './speaker-credentials.ts';
 import type { QueueSnapshot } from './queue-source.ts';
+import type { PlayerSave } from './store/players.ts';
+import type { AdoptedSpeakerSnapshot } from './store/speakers.ts';
 
 export type { PersistedPlayerState } from './store/playback.ts';
 
@@ -33,6 +35,9 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   loadPlayerState(): Promise<PersistedPlayerState | null>;
   /** Engine ports share the household write tail, never the output cache. */
   forPlayer(playerId: number): EnginePersistence;
+  /** Capture a synchronous membership publication and its induced engine pauses
+   * as one semantic store write, ordered with all other household writes. */
+  changeMemberships<T>(change: () => T): Promise<T>;
   /** Adopted output preferences only (also seeds the savedOutput cache). */
   loadOutputs(): Promise<PersistedOutput[]>;
   /** The last-known adopted row per output id, kept current by saveOutput.
@@ -48,40 +53,67 @@ export function createPersistence(
   credentials?: Pick<SpeakerCredentials, 'adopt'>,
 ): Persistence {
   let tail: Promise<void> = Promise.resolve();
+  const pendingMembershipWrites: (() => Promise<void>)[] = [];
+  const retryMembershipWrites = async () => {
+    while (pendingMembershipWrites.length) {
+      await pendingMembershipWrites[0]();
+      pendingMembershipWrites.shift();
+    }
+  };
+  const drain = () => {
+    const write = tail.then(retryMembershipWrites);
+    tail = write.catch((error) => log.event('persistence_failed', { error }));
+    return write;
+  };
   const enqueue = (write: () => Promise<void>): void => {
-    tail = tail.then(write).catch((err) => {
+    tail = tail.then(async () => {
+      await retryMembershipWrites();
+      await write();
+    }).catch((err) => {
       log.event('persistence_failed', { error: err });
     });
   };
   const outputCache = new Map<string, PersistedOutput>();
   const outputRevisions = new Map<string, number>();
   const ignored = new Set<string>();
+  let membershipChange: {
+    players: Map<number, PlayerSave>;
+    outputs: Map<string, AdoptedSpeakerSnapshot>;
+  } | undefined;
+  const savePlayer = (row: PlayerSave) => {
+    if (membershipChange) {
+      membershipChange.players.set(row.playerId, {
+        ...membershipChange.players.get(row.playerId),
+        ...row,
+      });
+    } else enqueue(() => store.players.saveChanges({ players: [row] }));
+  };
   const forPlayer = (playerId: number): EnginePersistence => {
     let active = true;
     return {
       saveQueue(snapshot, state) {
         if (!active) return;
         const copy = structuredClone(snapshot);
-        enqueue(() => store.playback.saveQueue(playerId, copy, state));
+        if (membershipChange) savePlayer({ playerId, queue: copy, state });
+        else enqueue(() => store.playback.saveQueue(playerId, copy, state));
       },
       saveState(snapshot) {
-        if (active) enqueue(() => store.playback.saveState(playerId, snapshot));
+        if (!active) return;
+        if (membershipChange) {
+          savePlayer({ playerId, state: structuredClone(snapshot) });
+        } else enqueue(() => store.playback.saveState(playerId, snapshot));
       },
       saveCommand(commandedAtMs) {
         if (active) {
-          enqueue(() =>
-            store.players.saveChanges({
-              players: [{ playerId, commandedAtMs }],
-            })
-          );
+          savePlayer({ playerId, commandedAtMs });
         }
       },
       loadQueue: () => store.playback.loadQueue(playerId),
       loadPlayerState: () => store.playback.loadPlayerState(playerId),
-      drain: () => tail,
+      drain,
       async close() {
         active = false;
-        await tail;
+        await drain();
       },
     };
   };
@@ -89,6 +121,42 @@ export function createPersistence(
 
   return {
     forPlayer,
+    async changeMemberships(change) {
+      if (membershipChange) throw new Error('Nested membership change');
+      const batch = {
+        players: new Map<number, PlayerSave>(),
+        outputs: new Map<string, AdoptedSpeakerSnapshot>(),
+      };
+      membershipChange = batch;
+      let result;
+      try {
+        result = change();
+      } finally {
+        membershipChange = undefined;
+      }
+      // Capture happens without an await: older snapshots finish first, and
+      // subsequent preference/bookmark writes necessarily follow this commit.
+      const commit = () =>
+        store.players.saveChanges({
+          players: [...batch.players.values()],
+          outputs: [...batch.outputs.values()],
+        });
+      const write = tail.then(async () => {
+        try {
+          await retryMembershipWrites();
+          await commit();
+        } catch (error) {
+          // Runtime keeps the requested intent, as with ordinary engine writes.
+          // Never let a later output snapshot commit half of a failed transfer:
+          // retry this whole transaction first, without rolling cache state back.
+          pendingMembershipWrites.push(commit);
+          throw error;
+        }
+      });
+      tail = write.catch((error) => log.event('persistence_failed', { error }));
+      await write;
+      return result;
+    },
     saveQueue: home.saveQueue,
     saveState: home.saveState,
     loadQueue: home.loadQueue,
@@ -103,7 +171,11 @@ export function createPersistence(
       );
       row = { ...row, connectionStrategy };
       outputCache.set(row.id, row);
-      enqueue(() => store.playback.saveOutput({ ...row, connectionStrategy }));
+      if (membershipChange) {
+        membershipChange.outputs.set(row.id, { ...row, connectionStrategy });
+      } else {enqueue(() =>
+          store.playback.saveOutput({ ...row, connectionStrategy })
+        );}
     },
 
     async adoptOutput(row) {
@@ -123,9 +195,10 @@ export function createPersistence(
       };
       // Reserve the credential incarnation now, before an older queued write
       // can yield to unregister/re-registration of the same speaker id.
+      const before = tail.then(retryMembershipWrites);
       const write = credentials
-        ? credentials.adopt(row.id, save, tail)
-        : tail.then(() => save([]));
+        ? credentials.adopt(row.id, save, before)
+        : before.then(() => save([]));
       // Keep the serialization tail usable, but return the original rejection
       // to the explicit configuration caller. Publish only a durable cache.
       tail = write.catch((error) => log.event('persistence_failed', { error }));
@@ -139,6 +212,7 @@ export function createPersistence(
       // Previously queued writes finish before deletion; later temporary
       // updates cannot pass the cache gate. Explicit errors reach the caller.
       const write = tail.then(async () => {
+        await retryMembershipWrites();
         await store.speakers.deleteAdopted(id);
       });
       tail = write.catch((error) => log.event('persistence_failed', { error }));
@@ -160,8 +234,20 @@ export function createPersistence(
           row.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY,
         ),
       }));
+      const memberships = new Map(
+        (await store.speakers.loadMemberships()).map((
+          row,
+        ) => [row.speakerId, row]),
+      );
       outputCache.clear();
-      for (const row of rows) outputCache.set(row.id, row);
+      for (const row of rows) {
+        const membership = memberships.get(row.id);
+        outputCache.set(row.id, {
+          ...row,
+          playerId: membership?.playerId ?? null,
+          linked: membership?.linked ?? true,
+        });
+      }
       return rows;
     },
 
@@ -171,6 +257,7 @@ export function createPersistence(
 
     async setOutputIgnored(id, value) {
       const write = tail.then(async () => {
+        await retryMembershipWrites();
         if (value) await store.speakers.saveIgnored(id);
         else await store.speakers.deleteIgnored(id);
         if (value) ignored.add(id);
@@ -180,6 +267,6 @@ export function createPersistence(
       await write;
     },
 
-    drain: () => tail,
+    drain,
   };
 }

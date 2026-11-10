@@ -16,7 +16,7 @@ export default async (request: HatRequest, context: HatContext) => {
   ) {
     return badRequest();
   }
-  return context.app.outputs.setEnabled(body.outputs, sourceFrom(request))
+  return await context.app.outputs.setEnabled(body.outputs, sourceFrom(request))
     ? noContent()
     : badRequest();
 };

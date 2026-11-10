@@ -151,6 +151,8 @@ export interface Playback {
   serverNowPlayingView(): ServerNowPlayingRow | null;
   /** The last recorded engine mutation (null before the first). */
   lastCommand(): LastCommand | null;
+  /** Flush the current bookmark at a core-owned atomic mutation boundary. */
+  checkpoint(): void;
   /** Core lifecycle; also callable with a controlled report clock in tests. */
   expireReports(): Promise<boolean>;
   startReportExpiry(state: State): Promise<void>;
@@ -1160,6 +1162,7 @@ export function createPlayback(deps: {
       );
     },
 
+    checkpoint: flushState,
     playerView: () => player.status(),
     queueView: () => player.queue(),
     lastCommand: () => last,

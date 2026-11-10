@@ -29,6 +29,7 @@ export type { QueueEntry } from './queue-source.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { SpeakerError } from './speaker-errors.ts';
+import { outputPlayerId } from './player-outputs.ts';
 import { planSourceFailure } from './source-recovery.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
@@ -393,7 +394,10 @@ export interface Outputs {
   lastCommand(): OutputCommand | null;
   /** Removes a registered output; false when the id was never registered. */
   unregister(id: string, source?: CommandSource): boolean;
-  /** Enables exactly the given ids; false when any id is unknown. */
+  /** Sets this player's members, taking requested speakers but leaving every
+   * other player's unrelated members alone. False if a target is unavailable. */
+  setMembers(playerId: number, ids: string[], source?: CommandSource): boolean;
+  /** Legacy player-1 projection of setMembers, not household-wide selection. */
   setEnabled(ids: string[], source?: CommandSource): boolean;
   toggle(id: string, source?: CommandSource): Output | null;
   /** selected/volume/needsAuthKey are state (stored, emitted); pin is a
@@ -951,6 +955,12 @@ export function createOutputs(
       ? persistence.savedOutput(id) !== undefined
       : adopted.has(id);
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
+  const owner = outputPlayerId;
+  const member = (row: Output, playerId: number | null) => {
+    if (playerId !== null && owner(row) !== playerId) row.linked = true;
+    row.playerId = playerId;
+    row.selected = playerId === 1;
+  };
   let last: OutputCommand | null = null;
   const record = (
     kind: OutputCommand['kind'],
@@ -1016,7 +1026,9 @@ export function createOutputs(
     let changed = false;
     for (const id of withdrawn) {
       const row = find(id);
-      if (row?.selected || isAdopted(id) || adopting.has(id)) continue;
+      if (row && owner(row) !== null || isAdopted(id) || adopting.has(id)) {
+        continue;
+      }
       const idx = outputs.findIndex((o) => o.id === id);
       if (idx !== -1) {
         outputs.splice(idx, 1);
@@ -1042,7 +1054,7 @@ export function createOutputs(
         if (isIgnored(id)) return;
         const row = find(id);
         if (!row) throw new SpeakerError('not_found', 'Speaker not found');
-        if (row.selected) {
+        if (owner(row) !== null) {
           throw new SpeakerError(
             'speaker_in_use',
             'Deselect the speaker before ignoring it',
@@ -1171,7 +1183,7 @@ export function createOutputs(
       discovered.delete(id);
       if (!find(id)) return;
       withdrawn.add(id);
-      if (isAdopted(id) || find(id)?.selected || adopting.has(id)) {
+      if (isAdopted(id) || owner(find(id)!) !== null || adopting.has(id)) {
         emit(['outputs']);
       } else api.unregister(id, source);
     },
@@ -1260,18 +1272,29 @@ export function createOutputs(
       emit(['outputs']);
       return true;
     },
-    setEnabled(ids, source) {
-      if (ids.some((id) => find(id) === null || blocked(id))) return false;
-      for (const o of outputs) {
-        o.selected = ids.includes(o.id);
-        if (o.playerId !== undefined) o.playerId = o.selected ? 1 : null;
+    setMembers(playerId, ids, source) {
+      if (!Number.isSafeInteger(playerId) || playerId < 1) {
+        throw new Error('Invalid player id');
       }
-      for (const o of outputs) saveRow(o);
+      if (
+        ids.some((id) => find(id) === null || blocked(id) || forgetting.has(id))
+      ) return false;
+      const affected = outputs.filter((o) =>
+        owner(o) === playerId || ids.includes(o.id)
+      );
+      // Explicit off is a lifetime command even for an already-free speaker
+      // (for example a PIN receipt still being encrypted). Preserve that
+      // cancellation signal without commanding another player's members.
+      const selection = outputs.filter((o) =>
+        owner(o) === null || owner(o) === playerId || ids.includes(o.id)
+      ).map((o) => ({ id: o.id, selected: ids.includes(o.id) }));
+      for (const o of affected) member(o, ids.includes(o.id) ? playerId : null);
+      for (const o of affected) saveRow(o);
       releaseWithdrawn();
       record(
         'setEnabled',
         source,
-        outputs.map((o) => ({ id: o.id, selected: ids.includes(o.id) })),
+        selection,
       );
       log.event('command', {
         command: 'output.setEnabled',
@@ -1281,14 +1304,14 @@ export function createOutputs(
       emit(['outputs']);
       return true;
     },
+    setEnabled(ids, source) {
+      return api.setMembers(1, ids, source);
+    },
     toggle(id, source) {
       if (blocked(id)) return null;
       const found = find(id);
       if (found === null) return null;
-      found.selected = !found.selected;
-      if (found.playerId !== undefined) {
-        found.playerId = found.selected ? 1 : null;
-      }
+      member(found, owner(found) === 1 ? null : 1);
       saveRow(found);
       releaseWithdrawn();
       record('toggle', source, [{ id, selected: found.selected }]);
@@ -1308,10 +1331,8 @@ export function createOutputs(
       const found = find(id);
       if (found === null) return null;
       if (opts.selected !== undefined) {
-        found.selected = opts.selected;
-        if (found.playerId !== undefined) {
-          found.playerId = opts.selected ? 1 : null;
-        }
+        if (opts.selected) member(found, 1);
+        else if (owner(found) === 1) member(found, null);
       }
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
       if (opts.connectionStrategy !== undefined) {

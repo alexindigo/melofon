@@ -8,8 +8,10 @@ import {
   savePlayerState,
 } from './playback.ts';
 import {
+  type AdoptedSpeakerSnapshot,
   migrateSpeakerMembership,
   saveSpeakerMembership,
+  saveSpeakerOutput,
   saveSpeakerVolume,
   type SpeakerMembership,
 } from './speakers.ts';
@@ -195,10 +197,14 @@ export function createPlayersStore(engine: Engine) {
     /** Moving speakers, copying queues and linked-volume saves share one commit. */
     saveChanges(changes: {
       players?: PlayerSave[];
+      outputs?: AdoptedSpeakerSnapshot[];
       memberships?: SpeakerMembership[];
       speakerVolumes?: { speakerId: string; volume: number }[];
     }): Promise<void> {
       return atomic(engine, async (q) => {
+        for (const row of changes.outputs ?? []) {
+          await saveSpeakerOutput(q, row, false);
+        }
         for (const row of changes.players ?? []) {
           await requirePlayer(q, row.playerId);
           if (row.queue) await savePlayerQueue(q, row.playerId, row.queue);

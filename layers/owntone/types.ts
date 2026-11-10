@@ -159,13 +159,19 @@ export interface HatContext {
     outputs: {
       list(): OutputRow[];
       get(id: string): OutputRow | null;
-      setEnabled(ids: string[], source?: CommandSourceRow): boolean;
-      toggle(id: string, source?: CommandSourceRow): OutputRow | null;
+      setEnabled(
+        ids: string[],
+        source?: CommandSourceRow,
+      ): boolean | Promise<boolean>;
+      toggle(
+        id: string,
+        source?: CommandSourceRow,
+      ): OutputRow | null | Promise<OutputRow | null>;
       update(
         id: string,
         opts: { selected?: boolean; volume?: number; pin?: string },
         source?: CommandSourceRow,
-      ): OutputRow | null;
+      ): OutputRow | null | Promise<OutputRow | null>;
     };
     library: {
       statistics(): Promise<{

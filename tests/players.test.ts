@@ -14,6 +14,7 @@ import { createSpeakers } from '../src/speakers.ts';
 import { restored } from './helpers/prepared.ts';
 import { apiFixture } from './helpers/api.ts';
 import { rawSql } from '../src/store/testing.ts';
+import { SpeakerError } from '../src/speaker-errors.ts';
 
 async function dataDir() {
   return await restored('players', async (dir) => {
@@ -37,6 +38,11 @@ async function household(
   const notify = createNotify();
   const persistence = createPersistence(store);
   const outputs = extra.outputs ?? createOutputs({ notify, persistence });
+  if (!extra.outputs) {
+    for (const row of await persistence.loadOutputs()) {
+      outputs.restore({ ...row, ...persistence.savedOutput(row.id) });
+    }
+  }
   const library = createLibrary(store);
   const nowPlaying = createNowPlaying(store);
   const reports = createPlaybackReports({
@@ -461,6 +467,411 @@ Deno.test('OwnTone HTTP services captured at load time follow the household defa
     assertEquals(h.players.get(1).playerView().consume, false);
     assertEquals(h.players.get(2).playerView().consume, true);
     assertEquals((await call('/api/player')).status, 200);
+  } finally {
+    await h.close();
+    await f.close();
+  }
+});
+
+function registerSpeaker(f: Awaited<ReturnType<typeof household>>, id: string) {
+  f.outputs.register({
+    id,
+    name: `Speaker ${id}`,
+    type: 'Test',
+    selected: false,
+    volume: 40,
+  });
+}
+
+Deno.test('membership join takes speakers, leave is owner-scoped and last-speaker loss durably pauses at the same queue spot', async () => {
+  const dir = await dataDir();
+  let store = await openStore(dir);
+  let time = 0;
+  let f = await household(store, { clock: { monotonicNow: () => time } });
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    for (const id of ['11', '12', '13']) {
+      registerSpeaker(f, id);
+      await f.outputs.adopt(id);
+    }
+    await f.players.join(1, '11');
+    await f.players.join(1, '12');
+    await f.players.join(kitchen.id, '13');
+    f.outputs.restore({ ...f.outputs.get('11')!, linked: false });
+    await f.outputs.adopt('11');
+    await f.players.join(1, '11');
+    assertEquals(
+      f.outputs.get('11')?.linked,
+      false,
+      'joining the same owner is idempotent',
+    );
+    assertEquals(f.players.freeSpeakers(), []);
+    const songs = await f.library.listSongs({ offset: 0, size: 2 });
+    const home = f.players.get(1);
+    await home.queueAdd(songs, { play: true }, { kind: 'http', user: 'alice' });
+    home.seek({ positionMs: 150 });
+    const queue = home.queueView();
+    time += 200;
+    await f.players.join(kitchen.id, '11');
+    assertEquals(
+      f.outputs.get('11')?.linked,
+      true,
+      'a new owner starts linked',
+    );
+    assertEquals(
+      home.playerView().state,
+      'play',
+      'one remaining speaker keeps playing',
+    );
+    assertEquals(f.players.members(kitchen.id).map((row) => row.id), [
+      '11',
+      '13',
+    ]);
+    await f.players.leave(1, '11');
+    assertEquals(
+      f.outputs.get('11')?.playerId,
+      kitchen.id,
+      'leaving another owner never steals or frees it',
+    );
+    await f.players.join(kitchen.id, '12');
+    assertEquals(home.playerView().state, 'pause');
+    assertEquals(home.playerView().itemProgressMs, 350);
+    assertEquals(home.queueView(), queue);
+    assertEquals((await store.playback.loadPlayerState(1))?.state, 'pause');
+    assertEquals((await store.playback.loadPlayerState(1))?.positionMs, 350);
+    assertEquals(
+      (await store.speakers.loadMemberships()).map((row) => row.playerId),
+      [kitchen.id, kitchen.id, kitchen.id],
+    );
+    await f.players.leave(kitchen.id, '12');
+    assertEquals(f.players.freeSpeakers().map((row) => row.id), ['12']);
+    await f.players.join(1, '12');
+    assertEquals(f.outputs.get('12')?.linked, true);
+    await f.close();
+    await store.close();
+    store = await openStore(dir);
+    f = await household(store, { clock: { monotonicNow: () => time } });
+    assertEquals(f.players.members(1).map((row) => row.id), ['12']);
+    assertEquals(f.players.members(kitchen.id).map((row) => row.id), [
+      '11',
+      '13',
+    ]);
+    assertEquals(f.players.get(1).queueView(), queue);
+    assertEquals(f.players.get(1).playerView().state, 'pause');
+    assertEquals(f.players.get(1).playerView().itemProgressMs, 350);
+    for (const row of f.outputs.list()) {
+      assertEquals(f.persistence.savedOutput(row.id)?.playerId, row.playerId);
+    }
+    await assertRejects(
+      () => f.players.join(999, '11'),
+      PlayerError,
+      'not found',
+    );
+    await assertRejects(
+      () => f.players.join(1, 'missing'),
+      SpeakerError,
+      'not found',
+    );
+  } finally {
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('membership publication serializes stale output snapshots, the induced pause and later preference writes', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  let entered!: () => void, release!: () => void;
+  const waiting = new Promise<void>((resolve) => entered = resolve);
+  const hold = new Promise<void>((resolve) => release = resolve);
+  let delay = false;
+  const batches: Parameters<Store['players']['saveChanges']>[0][] = [];
+  const wrapped: Store = {
+    ...store,
+    playback: {
+      ...store.playback,
+      async saveOutput(row) {
+        if (delay) {
+          delay = false;
+          entered();
+          await hold;
+        }
+        await store.playback.saveOutput(row);
+      },
+    },
+    players: {
+      ...store.players,
+      async saveChanges(changes) {
+        if (changes.outputs?.length) batches.push(structuredClone(changes));
+        await store.players.saveChanges(changes);
+      },
+    },
+  };
+  const f = await household(wrapped, { clock: { monotonicNow: () => 0 } });
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    registerSpeaker(f, '11');
+    await f.outputs.adopt('11');
+    await f.players.join(1, '11');
+    await store.speakers.saveCredential(
+      '11',
+      'pairing-key',
+      'opaque-existing-ciphertext',
+    );
+    const songs = await f.library.listSongs({ offset: 0, size: 1 });
+    await f.players.get(1).queueAdd(songs, { play: true });
+    f.players.get(1).seek({ positionMs: 200 });
+    await f.persistence.drain();
+    delay = true;
+    f.outputs.update('11', { volume: 41 });
+    await waiting;
+    const moving = f.players.join(kitchen.id, '11');
+    // Wait for the synchronous publication without releasing the older write.
+    const published = new Promise<void>((resolve) => {
+      const stop = f.notify.subscribe((types) => {
+        if (
+          types.includes('outputs') &&
+          f.outputs.get('11')?.playerId === kitchen.id
+        ) {
+          stop();
+          resolve();
+        }
+      });
+    });
+    await published;
+    assertEquals(f.players.get(1).playerView().state, 'pause');
+    assertEquals((await store.speakers.loadMemberships())[0].playerId, 1);
+    assertEquals((await store.playback.loadPlayerState(1))?.state, 'play');
+    f.outputs.update('11', { volume: 42 });
+    release();
+    await moving;
+    await f.persistence.drain();
+    const batch = batches.at(-1)!;
+    assertEquals(batch.outputs?.[0].playerId, kitchen.id);
+    assertEquals(
+      batch.players?.find((row) => row.playerId === 1)?.state?.state,
+      'pause',
+    );
+    assertEquals(
+      (await store.speakers.loadMemberships())[0].playerId,
+      kitchen.id,
+    );
+    assertEquals((await store.playback.loadPlayerState(1))?.positionMs, 200);
+    assertEquals((await store.speakers.loadAdopted())[0].volume, 42);
+    assertEquals(f.persistence.savedOutput('11')?.playerId, kitchen.id);
+    assertEquals(
+      await store.speakers.loadCredential('11', 'pairing-key'),
+      'opaque-existing-ciphertext',
+    );
+  } finally {
+    release();
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('failed membership transaction has no half durable move and an idempotent retry saves the paused bookmark', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  let fail = false;
+  const wrapped: Store = {
+    ...store,
+    players: {
+      ...store.players,
+      saveChanges(changes) {
+        return store.players.saveChanges(
+          fail && changes.outputs?.length
+            ? {
+              ...changes,
+              players: [...changes.players ?? [], {
+                playerId: 999999,
+                commandedAtMs: 1,
+              }],
+            }
+            : changes,
+        );
+      },
+    },
+  };
+  const f = await household(wrapped, { clock: { monotonicNow: () => 0 } });
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    registerSpeaker(f, '11');
+    await f.outputs.adopt('11');
+    await f.players.join(1, '11');
+    await f.players.get(1).queueAdd(
+      await f.library.listSongs({ offset: 0, size: 1 }),
+      { play: true },
+    );
+    f.players.get(1).seek({ positionMs: 123 });
+    await f.persistence.drain();
+    fail = true;
+    await assertRejects(
+      () => f.players.join(kitchen.id, '11'),
+      Error,
+      'Player not found',
+    );
+    assertEquals((await store.speakers.loadMemberships())[0].playerId, 1);
+    assertEquals((await store.playback.loadPlayerState(1))?.state, 'play');
+    assertEquals(f.players.get(1).playerView().state, 'pause');
+    await assertRejects(() => f.persistence.drain(), Error, 'Player not found');
+    fail = false;
+    f.outputs.update('11', { volume: 43 });
+    await f.persistence.drain();
+    assertEquals((await store.playback.loadPlayerState(1))?.state, 'pause');
+    assertEquals((await store.speakers.loadAdopted())[0].volume, 43);
+    await f.players.join(kitchen.id, '11');
+    assertEquals(
+      (await store.speakers.loadMemberships())[0].playerId,
+      kitchen.id,
+    );
+    assertEquals((await store.playback.loadPlayerState(1))?.state, 'pause');
+    assertEquals((await store.playback.loadPlayerState(1))?.positionMs, 123);
+  } finally {
+    fail = false;
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('temporary members of any player retain withdrawn identity, cannot be ignored in use and stay unsaved until adopted', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  const f = await household(store);
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    registerSpeaker(f, '11');
+    registerSpeaker(f, '12');
+    await f.players.join(kitchen.id, '11');
+    assertEquals(
+      f.outputs.lastCommand()?.selection,
+      [
+        { id: '11', selected: true },
+        { id: '12', selected: false },
+      ],
+      'exact membership still explicitly cancels transient use of free speakers',
+    );
+    f.outputs.withdraw('11');
+    assertEquals(f.outputs.get('11')?.playerId, kitchen.id);
+    await assertRejects(() => f.outputs.ignore('11'), SpeakerError, 'Deselect');
+    assertEquals(await store.speakers.loadMemberships(), []);
+    await f.players.join(1, '11');
+    assertEquals(f.outputs.get('11')?.playerId, 1);
+    await f.players.leave(1, '11');
+    assertEquals(
+      f.outputs.get('11'),
+      null,
+      'last control reference releases the withdrawn temporary row',
+    );
+    await f.players.join(kitchen.id, '12');
+    await f.outputs.adopt('12');
+    assertEquals(
+      (await store.speakers.loadMemberships())[0].playerId,
+      kitchen.id,
+    );
+    await f.players.delete(kitchen.id);
+    assertEquals(f.players.freeSpeakers().map((row) => row.id), ['12']);
+    assertEquals(f.persistence.savedOutput('12')?.playerId, null);
+    assertEquals((await store.speakers.loadMemberships())[0].playerId, null);
+    assertEquals(f.outputs.lifetime('12').adopted, true);
+  } finally {
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('OwnTone HTTP output set, toggle and update operate only on the live default membership', async () => {
+  let h!: Awaited<ReturnType<typeof household>>;
+  const f = await apiFixture({
+    storeDir: await dataDir(),
+    hats: {
+      layersRoot: 'layers/',
+      extraPorts: 2,
+      env: (ports) => ({ MELOFON_LISTEN_owntone: ports.join(',') }),
+    },
+    services: async ({ store }) => {
+      h = await household(store);
+      const kitchen = await h.players.create('Kitchen');
+      for (const id of ['11', '12', '13']) {
+        registerSpeaker(h, id);
+        await h.outputs.adopt(id);
+      }
+      await h.players.join(1, '11');
+      await h.players.join(kitchen.id, '12');
+      await h.players.join(kitchen.id, '13');
+      return {
+        library: h.library,
+        outputs: h.players.defaultOutputs,
+        playback: h.players.playback,
+      };
+    },
+  });
+  const call = (path: string, body?: unknown) =>
+    fetch(`http://melofon.home:${f.extraPorts[0]}/api/outputs${path}`, {
+      method: body === undefined ? 'GET' : 'PUT',
+      ...(body === undefined ? {} : {
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+  try {
+    const initial = (await (await call('')).json()).outputs;
+    assertEquals(initial.map((row: { selected: boolean }) => row.selected), [
+      true,
+      false,
+      false,
+    ]);
+    assertEquals((await call('/set', { outputs: ['11', '12'] })).status, 204);
+    assertEquals(h.players.members(2).map((row) => row.id), ['13']);
+    assertEquals((await call('/12/toggle', {})).status, 204);
+    assertEquals(h.outputs.get('12')?.playerId, null);
+    assertEquals(
+      (await call('/13', { selected: false, volume: 23 })).status,
+      204,
+    );
+    assertEquals(h.outputs.get('13')?.playerId, 2);
+    assertEquals(h.outputs.get('13')?.volume, 23);
+    const volume = await fetch(
+      `http://melofon.home:${
+        f.extraPorts[0]
+      }/api/player/volume?output_id=13&volume=24`,
+      { method: 'PUT', signal: AbortSignal.timeout(5000) },
+    );
+    assertEquals(volume.status, 204);
+    assertEquals(h.outputs.get('13')?.volume, 24);
+    assertEquals(h.outputs.get('13')?.playerId, 2);
+    assertEquals((await call('/13/toggle', {})).status, 204);
+    assertEquals(h.outputs.get('13')?.playerId, 1);
+    await h.players.setDefault(2);
+    assertEquals((await call('/set', { outputs: ['12'] })).status, 204);
+    assertEquals(h.players.members(1).map((row) => row.id), ['11', '13']);
+    assertEquals(h.players.members(2).map((row) => row.id), ['12']);
+    assertEquals((await call('/13', { selected: true })).status, 204);
+    assertEquals(h.outputs.get('13')?.playerId, 2);
+    assertEquals((await call('/13', { selected: false })).status, 204);
+    assertEquals(h.outputs.get('13')?.playerId, null);
+    const before = h.outputs.list();
+    assertEquals(
+      (await call('/set', { outputs: ['11', 'missing'] })).status,
+      400,
+    );
+    assertEquals(h.outputs.list(), before);
+    const final = (await (await call('')).json()).outputs;
+    assertEquals(final.map((row: { selected: boolean }) => row.selected), [
+      false,
+      true,
+      false,
+    ]);
+    assertEquals(Object.keys(final[0]).sort(), Object.keys(initial[0]).sort());
+    assertEquals(
+      (await f.store.speakers.loadMemberships()).map((row) => row.playerId),
+      [1, 2, null],
+    );
   } finally {
     await h.close();
     await f.close();

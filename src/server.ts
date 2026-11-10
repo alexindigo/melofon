@@ -402,7 +402,7 @@ export async function startServer(options: {
       podcasts,
       radio,
     }),
-    outputs,
+    outputs: players.defaultOutputs,
     speakers,
     notify,
     state,

@@ -26,6 +26,10 @@ export default async (request: HatRequest, context: HatContext) => {
       return badRequest();
     }
   }
-  const updated = context.app.outputs.update(id, opts, sourceFrom(request));
+  const updated = await context.app.outputs.update(
+    id,
+    opts,
+    sourceFrom(request),
+  );
   return updated === null ? badRequest() : noContent();
 };

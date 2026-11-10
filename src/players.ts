@@ -3,7 +3,13 @@
 import type { Store } from './store/index.ts';
 import type { StoredPlayer } from './store/players.ts';
 import type { EnginePersistence, Persistence } from './persistence.ts';
-import { createPlayer, type Outputs, planRestore } from './player.ts';
+import {
+  type CommandSource,
+  createPlayer,
+  type Outputs,
+  planRestore,
+} from './player.ts';
+import { SpeakerError } from './speaker-errors.ts';
 import { createPlayback, type Playback } from './playback.ts';
 import type { PlaybackReports } from './playback-reports.ts';
 import type { SpeakerPairingView } from './speakers.ts';
@@ -194,6 +200,74 @@ export async function createPlayers(deps: {
   // These functions are captured by hats at load time. Resolve the engine at
   // invocation, not when constructing the service bag. Reports never retarget.
   const current = () => defaultEngine().playback;
+  const members = (id: number) =>
+    deps.outputs.list().filter((row) => outputPlayerId(row) === id);
+  const changeMembers = (id: number, ids: string[], source?: CommandSource) => {
+    requireEngine(id);
+    return deps.persistence.changeMemberships(() => {
+      const previous = new Set(
+        deps.outputs.list().filter((row) =>
+          outputPlayerId(row) === id || ids.includes(row.id)
+        ).map(outputPlayerId).filter((id): id is number => id !== null),
+      );
+      previous.add(id);
+      if (!deps.outputs.setMembers(id, ids, source)) return false;
+      for (const owner of previous) {
+        const engine = engines.get(owner);
+        if (
+          engine && !engine.disposing && !members(owner).length &&
+          engine.playback.playerView().state === 'play'
+        ) {
+          engine.playback.pause({
+            kind: 'internal',
+            via: 'playback-target-loss',
+          });
+        }
+        if (engine && !engine.disposing) engine.playback.checkpoint();
+      }
+      return true;
+    });
+  };
+  const defaultOutputs = {
+    list: () => playerOutputs(deps.outputs, defaultEngine().row.id).list(),
+    get: (id: string) =>
+      playerOutputs(deps.outputs, defaultEngine().row.id).get(id),
+    setEnabled: (ids: string[], source?: CommandSource) =>
+      mutate(() => changeMembers(defaultEngine().row.id, ids, source)),
+    toggle: (id: string, source?: CommandSource) =>
+      mutate(async () => {
+        const owner = defaultEngine().row.id;
+        const row = deps.outputs.get(id);
+        if (!row) return null;
+        const ids = members(owner).map((row) => row.id).filter((member) =>
+          member !== id
+        );
+        if (outputPlayerId(row) !== owner) ids.push(id);
+        if (!await changeMembers(owner, ids, source)) return null;
+        return playerOutputs(deps.outputs, owner).get(id);
+      }),
+    update: (
+      id: string,
+      opts: Parameters<Outputs['update']>[1],
+      source?: CommandSource,
+    ) =>
+      mutate(async () => {
+        const owner = defaultEngine().row.id;
+        if (!deps.outputs.get(id)) return null;
+        if (opts.selected !== undefined) {
+          const ids = members(owner).map((row) => row.id).filter((member) =>
+            member !== id
+          );
+          if (opts.selected) ids.push(id);
+          if (!await changeMembers(owner, ids, source)) return null;
+        }
+        const { selected: _selected, ...preferences } = opts;
+        if (Object.keys(preferences).length) {
+          if (!deps.outputs.update(id, preferences, source)) return null;
+        }
+        return playerOutputs(deps.outputs, owner).get(id);
+      }),
+  };
   const playback: Playback = {
     reportPlaying: deps.reports.reportPlaying,
     reportStopped: deps.reports.reportStopped,
@@ -229,10 +303,51 @@ export async function createPlayers(deps: {
     queueView: () => current().queueView(),
     serverNowPlayingView: () => current().serverNowPlayingView(),
     lastCommand: () => current().lastCommand(),
+    checkpoint: () => current().checkpoint(),
     close: () => current().close(),
   };
   const registry = {
     playback,
+    defaultOutputs,
+    freeSpeakers: () =>
+      deps.outputs.list().filter((row) => outputPlayerId(row) === null),
+    members: (id: number) => {
+      requireEngine(id);
+      return members(id);
+    },
+    setSpeakers: (id: number, ids: string[], source?: CommandSource) =>
+      mutate(() => changeMembers(id, ids, source)),
+    join: (id: number, speakerId: string, source?: CommandSource) =>
+      mutate(async () => {
+        requireEngine(id);
+        if (!deps.outputs.get(speakerId)) {
+          throw new SpeakerError('not_found', 'Speaker not found');
+        }
+        if (
+          !await changeMembers(id, [
+            ...new Set([...members(id).map((row) => row.id), speakerId]),
+          ], source)
+        ) {
+          throw new SpeakerError(
+            'speaker_busy',
+            'Speaker membership is unavailable',
+          );
+        }
+      }),
+    leave: (id: number, speakerId: string, source?: CommandSource) =>
+      mutate(async () => {
+        requireEngine(id);
+        if (!deps.outputs.get(speakerId)) {
+          throw new SpeakerError('not_found', 'Speaker not found');
+        }
+        await changeMembers(
+          id,
+          members(id).map((row) => row.id).filter((member) =>
+            member !== speakerId
+          ),
+          source,
+        );
+      }),
     list: () =>
       [...engines.values()].filter((e) => !e.disposing).map((e) => ({
         ...e.row,
@@ -304,14 +419,12 @@ export async function createPlayers(deps: {
         engines.delete(id);
         // The durable delete frees members in the same transaction as the queue.
         // Publish the corresponding runtime release only after it commits.
-        for (const row of deps.outputs.list()) {
-          if (outputPlayerId(row) === id) {
-            deps.outputs.update(row.id, { selected: false }, {
-              kind: 'internal',
-              via: 'player-delete',
-            });
-          }
-        }
+        await deps.persistence.changeMemberships(() =>
+          deps.outputs.setMembers(id, [], {
+            kind: 'internal',
+            via: 'player-delete',
+          })
+        );
         changed(id);
         deps.notify.emit(['outputs', 'nowPlaying'], undefined, 'all');
         await deps.persistence.drain();

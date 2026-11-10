@@ -97,7 +97,7 @@ export async function migrateSpeakerMembership(q: Queries): Promise<void> {
   await q.run('ALTER TABLE output_state_players RENAME TO output_state');
 }
 
-async function save(
+export async function saveSpeakerOutput(
   q: Queries,
   row: AdoptedSpeakerSnapshot,
   adopted: boolean,
@@ -213,7 +213,7 @@ export function createSpeakersStore(engine: Engine) {
     ): Promise<void> {
       return atomic(engine, async (q) => {
         await q.run(`DELETE FROM speaker_ignores WHERE id = ${esc(row.id)}`);
-        await save(q, row, true);
+        await saveSpeakerOutput(q, row, true);
         for (const record of credentials) {
           await saveCredential(q, row.id, record);
         }
@@ -310,7 +310,7 @@ export function createSpeakersStore(engine: Engine) {
     // Compatibility for the old persistence port until ingress lifetimes move
     // to the speakers service. Preference saves cannot create adoption.
     saveOutput(row: AdoptedSpeakerSnapshot): Promise<void> {
-      return engine.exclusive((q) => save(q, row, false));
+      return engine.exclusive((q) => saveSpeakerOutput(q, row, false));
     },
 
     loadOutputs(): Promise<OutputSnapshot[]> {
