@@ -65,6 +65,8 @@ export interface OutputSnapshot {
   name: string;
   type: string;
   selected: boolean;
+  playerId?: number | null;
+  linked?: boolean;
   volume: number;
   model?: string;
   receiverIdentity?: string;
@@ -103,9 +105,12 @@ async function save(
   if (typeof row.selected !== 'boolean') {
     throw new Error('Constraint: selected must be boolean');
   }
-  // Compatibility is deliberately scoped to the still-single-player core.
+  const playerId = row.playerId === undefined
+    ? (row.selected ? 1 : null)
+    : row.playerId;
   if (
-    row.selected && !(await q.all('SELECT id FROM players WHERE id = 1')).length
+    playerId !== null && (!Number.isSafeInteger(playerId) || playerId < 1 ||
+      !(await q.all(`SELECT id FROM players WHERE id = ${playerId}`)).length)
   ) {
     throw new Error('Player not found');
   }
@@ -116,7 +121,7 @@ async function save(
        ${row.host === undefined ? 'NULL' : esc(row.host)},
        ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
        ${esc(row.name)}, ${esc(row.type)},
-        ${row.selected ? 1 : 'NULL'}, ${Math.trunc(row.volume)},
+         ${playerId ?? 'NULL'}, ${Math.trunc(row.volume)},
        ${row.model === undefined ? 'NULL' : esc(row.model)},
        ${esc(row.connectionStrategy)}, ${adopted},
        ${
@@ -127,8 +132,16 @@ async function save(
        port = excluded.port,
        name = excluded.name,
        type = excluded.type,
-        linked = CASE WHEN excluded.player_id = 1 AND output_state.player_id IS DISTINCT FROM 1 THEN true ELSE output_state.linked END,
-        player_id = CASE WHEN excluded.player_id = 1 THEN 1 WHEN output_state.player_id = 1 THEN NULL ELSE output_state.player_id END,
+         linked = ${
+      row.playerId === undefined
+        ? 'CASE WHEN excluded.player_id = 1 AND output_state.player_id IS DISTINCT FROM 1 THEN true ELSE output_state.linked END'
+        : String(row.linked ?? true)
+    },
+         player_id = ${
+      row.playerId === undefined
+        ? 'CASE WHEN excluded.player_id = 1 THEN 1 WHEN output_state.player_id = 1 THEN NULL ELSE output_state.player_id END'
+        : 'excluded.player_id'
+    },
        volume = excluded.volume,
        model = excluded.model,
        receiver_identity = excluded.receiver_identity,

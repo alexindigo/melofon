@@ -31,14 +31,9 @@ import { createFileSource } from './file-source.ts';
 import { createZip } from './zip.ts';
 import { createMedia } from './media.ts';
 import { createArtwork } from './artwork.ts';
-import {
-  createOutputs,
-  createPlayer,
-  type Outputs,
-  planRestore,
-} from './player.ts';
+import { createOutputs, type Outputs } from './player.ts';
 import { createPersistence } from './persistence.ts';
-import { createPlayback } from './playback.ts';
+import { createPlayers } from './players.ts';
 import {
   createPlaybackReports,
   type PlaybackReports,
@@ -194,7 +189,6 @@ export async function startServer(options: {
     state,
     notify,
   });
-  const player = createPlayer();
   const resolveQueueReference = createQueueResolver({
     getSong: (id) => library.getSong(id),
     getStation: (id) => radio.get(id),
@@ -207,51 +201,20 @@ export async function startServer(options: {
     prepare: airplay.preparePlayback,
     registerAddress: airplay.registerAddress,
     adapterView: airplay.describe,
-    retry: (id) => airplayBoot.retry(id),
+    retry: (id) => players.bootForSpeaker(id).retry(id),
     credentials,
-    changeCredentials: (id, save) => airplayBoot.changeCredentials(id, save),
-    pair: (id) => airplayBoot.pair(id),
-    submitPin: (id, pin) => airplayBoot.submitPin(id, pin),
+    changeCredentials: (id, save) =>
+      players.bootForSpeaker(id).changeCredentials(id, save),
+    pair: (id) => players.bootForSpeaker(id).pair(id),
+    submitPin: (id, pin) => players.bootForSpeaker(id).submitPin(id, pin),
   });
   const reports: PlaybackReports = createPlaybackReports({
     nowPlaying,
     library,
     sessions: authentication.sessions,
     notify,
-    serverRows: () => {
-      const row = playback.serverNowPlayingView();
-      return row ? [row] : [];
-    },
+    serverRows: () => players.serverRows(),
   });
-  const playback = createPlayback({
-    player,
-    outputs,
-    nowPlaying,
-    reports,
-    library,
-    cfg,
-    notify,
-    persistence,
-    targets: speakers,
-    resolveQueueReference,
-    prepareQueueMedia: playbackSources.prepare,
-    state,
-  });
-  const app = {
-    store,
-    cfg,
-    libraries,
-    outputs,
-    speakers,
-    playback,
-    state,
-    airplay,
-    outputAdmission,
-    identity: createIdentity(store),
-    reference: lookups.reference,
-    log: scopedLog('core'),
-  };
-  const core = await pathfinder({ roots: ['core/'], app });
 
   // Restart transparency (plan restart-transparency): restore the engine —
   // the persisted queue rehydrated via the library (missing tracks drop with
@@ -260,7 +223,16 @@ export async function startServer(options: {
   // saved place, so a stale save can't surprise the household (3am speaker).
   // Only adopted remotes are restored. Identity/preferences are not live
   // observations and never supply admission facts.
-  for (const row of savedOutputs) {
+  const memberships = new Map(
+    (await store.speakers.loadMemberships()).map((row) => [row.speakerId, row]),
+  );
+  for (const saved of savedOutputs) {
+    const membership = memberships.get(saved.id);
+    const row = {
+      ...saved,
+      playerId: membership?.playerId ?? null,
+      linked: membership?.linked ?? true,
+    };
     const existing = outputs.get(row.id);
     if (existing !== null) {
       // Keep any already registered facts, applying only saved user state.
@@ -290,6 +262,8 @@ export async function startServer(options: {
         name: row.name,
         type: row.type,
         selected: row.selected,
+        playerId: row.playerId,
+        linked: row.linked,
         volume: row.volume,
         connectionStrategy: row.connectionStrategy,
         host: row.host,
@@ -308,24 +282,54 @@ export async function startServer(options: {
     devices: airplay,
     savedOutput: (id) => persistence.savedOutput(id),
   });
-  const restoreSnapshot = await planRestore({
-    queue: await persistence.loadQueue(),
-    saved: await persistence.loadPlayerState(),
-    resolve: resolveQueueReference,
-    nowMs: Date.now(),
-    maxAgeMs: (cfg.resumeMaxAgeSec ?? 300) * 1000,
-    selectedOutputPresent: outputs.list().some((o) => o.selected),
+  const players = await createPlayers({
+    store,
+    persistence,
+    outputs,
+    reports,
+    notify,
+    maxResumeAgeMs: (cfg.resumeMaxAgeSec ?? 300) * 1000,
+    playback: {
+      nowPlaying,
+      library,
+      cfg,
+      resolveQueueReference,
+      prepareQueueMedia: playbackSources.prepare,
+      state,
+    },
+    targets: (id) => ({
+      preparePlayback: (signal) => speakers.preparePlayback(signal, id),
+      hasPlaybackTarget: () => speakers.hasPlaybackTarget(id),
+    }),
+    createBoot: (playerId, playback, outputs) =>
+      createAirplayBoot({
+        playerId,
+        outputs,
+        playback,
+        media,
+        sources: playbackSources,
+        notify,
+        state,
+        devices: airplay,
+      }),
   });
-  const restoredEngine = restoreSnapshot !== null;
-  if (restoreSnapshot !== null) {
-    await playback.restore(restoreSnapshot);
-    log.event('restore_complete', {
-      queued: restoreSnapshot.queue.length,
-      state: playback.playerView().state,
-      currentIndex: restoreSnapshot.currentIndex,
-      positionMs: restoreSnapshot.positionMs,
-    });
-  }
+  const playback = players.playback;
+  const app = {
+    store,
+    cfg,
+    libraries,
+    outputs,
+    speakers,
+    playback,
+    players,
+    state,
+    airplay,
+    outputAdmission,
+    identity: createIdentity(store),
+    reference: lookups.reference,
+    log: scopedLog('core'),
+  };
+  const core = await pathfinder({ roots: ['core/'], app });
   const playlists = createPlaylists(store);
   const settings = createSettings(store, state);
   let hats: Hats | undefined = undefined;
@@ -381,6 +385,7 @@ export async function startServer(options: {
     bookmarks: createBookmarks(store),
     nowPlaying,
     playback,
+    players,
     stream: createStream(
       media,
       cfg,
@@ -397,7 +402,6 @@ export async function startServer(options: {
       podcasts,
       radio,
     }),
-    player,
     outputs,
     speakers,
     notify,
@@ -424,29 +428,12 @@ export async function startServer(options: {
     setupMode,
   });
 
-  // Boots (plane A drives them): AirPlay 1 via the native RAOP helper.
-  const airplayBoot = createAirplayBoot({
-    outputs,
-    playback,
-    media,
-    sources: playbackSources,
-    notify,
-    state,
-    devices: airplay,
-  });
   const onUnload = () => {
     discovery.close();
     airplay.close();
   };
   addEventListener('unload', onUnload);
 
-  // The engine's clock: wall-clock progress reaching an item's length ends it
-  // (advance/replay/drop/stop per repeat/consume). Without this the engine sat
-  // at track-end in 'play' forever and HA extrapolated ("57 min of a 3 min
-  // track").
-  const engineClock = setInterval(() => {
-    void playback.advanceEnded();
-  }, 500);
   await reports.startReportExpiry(state);
 
   // MELOFON_AIRPLAY_HOST=<ip>[:port] — unicast-resolve TXT at that host, then
@@ -467,17 +454,6 @@ export async function startServer(options: {
     });
   }
 
-  // A restored engine announces itself once the boots exist: the AirPlay boot
-  // reconciles (a resumed play spawns its session — audible without a client
-  // action) and any connected hats pick up the restored state.
-  if (restoredEngine) {
-    notify.emit(
-      ['player', 'queue', 'outputs', 'volume', 'options', 'nowPlaying'],
-      undefined,
-      'all',
-    );
-  }
-
   const termination = createTermination({
     exit: options.exit,
     close: async () => {
@@ -485,16 +461,14 @@ export async function startServer(options: {
       for (const signal of ['SIGTERM', 'SIGINT'] as const) {
         Deno.removeSignalListener(signal, onSignal);
       }
-      clearInterval(engineClock);
       stopLoggingSettings();
       await lookups.close();
       await podcasts.close();
       discovery.close();
       airplay.close();
       await listens.shutdown();
-      await airplayBoot.close();
+      await players.close();
       shutdownNativeLogging();
-      await playback.close();
       await reports.close();
       await persistence.drain();
       await store.close();
@@ -511,5 +485,5 @@ export async function startServer(options: {
     Deno.addSignalListener(signal, onSignal);
   }
   await listens.ensure([cfg.listen?.port ?? 8000]);
-  return { shutdown: termination.shutdown, setupMode, hats };
+  return { shutdown: termination.shutdown, setupMode, hats, players };
 }

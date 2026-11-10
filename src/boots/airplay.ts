@@ -26,6 +26,7 @@ import { SpeakerError, type SpeakerPairingView } from '../speakers.ts';
 export { airplayOutputId } from './airplay-profile.ts';
 export type { AirplayTransport, HelperEventFn } from './airplay-profile.ts';
 export interface AirplayBootDeps {
+  playerId?: number;
   outputs: Outputs;
   playback: Playback;
   media: Media;
@@ -1112,7 +1113,7 @@ export function createAirplayBoot(
       log.event('retry_settings_failed', { error });
     });
   }
-  outputs.onCommand((id, cmd) => {
+  const unsubscribeCommands = outputs.onCommand((id, cmd) => {
     if (cmd.forget) {
       cancelPairing(id);
       revoke(id);
@@ -1125,7 +1126,14 @@ export function createAirplayBoot(
       });
     }
   });
-  const unsubscribe = notify.subscribe(() => {
+  const unsubscribe = notify.subscribe((types, keys) => {
+    if (
+      deps.playerId !== undefined &&
+      !types.some((type) =>
+        !['player', 'queue', 'volume', 'options'].includes(type) ||
+        !keys?.[type] || keys[type].includes(String(deps.playerId))
+      )
+    ) return;
     consumeCommands();
     reconcile();
   });
@@ -1418,6 +1426,7 @@ export function createAirplayBoot(
       closed = true;
       for (const id of resuming.keys()) cancelResume(id);
       unsubscribe();
+      if (typeof unsubscribeCommands === 'function') unsubscribeCommands();
       unsubscribePolicy?.();
       lease = null;
       grants.clear();

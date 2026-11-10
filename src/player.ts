@@ -144,8 +144,10 @@ export interface PlayerStateSnapshot {
 export interface PlayerPersistence {
   /** Atomically save occurrence references/allocator/revision and bookmark. */
   saveQueue(snapshot: QueueSnapshot, state: PlayerStateSnapshot): void;
-  /** Upsert the singleton player_state row (updated_at = now). */
+  /** Upsert this player's state row (updated_at = now). */
   saveState(snapshot: PlayerStateSnapshot): void;
+  /** Operator command time, separate from periodic position bookmarks. */
+  saveCommand?(atMs: number): void;
 }
 
 /** What restore() loads at boot: the rehydrated queue plus the snapshot. */
@@ -295,7 +297,11 @@ export interface Player {
    * it so it stays current. */
   queueAdd(songs: SongRow[], position?: number): QueueEntry[];
   /** Core-only additive path for resolved media; hats retain catalog admission. */
-  queueAddSources(media: QueueMedia[], position?: number): QueueEntry[];
+  queueAddSources(
+    media: QueueMedia[],
+    position?: number,
+    firstId?: number,
+  ): QueueEntry[];
   /** Clears the queue and stops playback. */
   queueClear(): void;
   /** End-of-item transition (the engine's clock — driven by the playback
@@ -319,6 +325,10 @@ export interface Output {
   name: string;
   type: string;
   selected: boolean;
+  /** Canonical membership when composed with the registry. Legacy callers
+   * without membership retain their player-1 selection projection. */
+  playerId?: number | null;
+  linked?: boolean;
   volume: number;
   /** Boot address (e.g. an AirPlay device's IP) — internal boot config,
    * never part of the OwnTone wire payload. */
@@ -408,7 +418,7 @@ export interface Outputs {
       id: string,
       cmd: { pin?: string; forget?: true; ignore?: true },
     ) => unknown,
-  ): void;
+  ): void | (() => void);
 }
 
 /** The adopted output remote (output_state row). Discovered-only devices
@@ -422,6 +432,8 @@ export interface PersistedOutput {
   name: string;
   type: string;
   selected: boolean;
+  playerId?: number | null;
+  linked?: boolean;
   volume: number;
   model?: string;
   receiverIdentity?: string;
@@ -569,7 +581,17 @@ export function createPlayer(options: {
     clock = null;
   };
 
-  const addSources = (media: QueueMedia[], position?: number) => {
+  const addSources = (
+    media: QueueMedia[],
+    position?: number,
+    firstId?: number,
+  ) => {
+    if (firstId !== undefined) {
+      if (!Number.isSafeInteger(firstId) || firstId < nextId) {
+        throw new Error('Invalid reserved queue ids');
+      }
+      nextId = firstId;
+    }
     const added = media.map((item) => ({ ...item, id: nextId++ }));
     if (position === undefined || position >= items.length) {
       items = [...items, ...added];
@@ -977,6 +999,9 @@ export function createOutputs(
     name: o.name,
     type: o.type,
     selected: o.selected,
+    ...(o.playerId === undefined
+      ? {}
+      : { playerId: o.playerId, linked: o.linked ?? true }),
     volume: o.volume,
     model: o.model,
     receiverIdentity: o.receiverIdentity,
@@ -1119,6 +1144,7 @@ export function createOutputs(
       // Revoke boot authority before publishing removal. Both command listeners
       // and the unregister notification see this incarnation as no longer usable.
       row.selected = false;
+      if (row.playerId !== undefined) row.playerId = null;
       const cancellations = [...commandListeners].map((fn) => {
         try {
           return Promise.resolve(fn(id, { forget: true }));
@@ -1161,6 +1187,19 @@ export function createOutputs(
       }
       const idx = outputs.findIndex((o) => o.id === output.id);
       const saved = persistence?.savedOutput?.(output.id);
+      const previousMember = find(output.id)?.playerId;
+      const member = output.playerId === undefined
+        ? previousMember === undefined ? saved?.playerId : previousMember
+        : output.playerId;
+      if (member !== undefined) {
+        output = {
+          ...output,
+          playerId: member,
+          selected: member === 1,
+          linked: output.linked ?? find(output.id)?.linked ?? saved?.linked ??
+            true,
+        };
+      }
       const connectionStrategy = output.connectionStrategy ??
         find(output.id)?.connectionStrategy ??
         (saved === undefined
@@ -1223,7 +1262,10 @@ export function createOutputs(
     },
     setEnabled(ids, source) {
       if (ids.some((id) => find(id) === null || blocked(id))) return false;
-      for (const o of outputs) o.selected = ids.includes(o.id);
+      for (const o of outputs) {
+        o.selected = ids.includes(o.id);
+        if (o.playerId !== undefined) o.playerId = o.selected ? 1 : null;
+      }
       for (const o of outputs) saveRow(o);
       releaseWithdrawn();
       record(
@@ -1244,6 +1286,9 @@ export function createOutputs(
       const found = find(id);
       if (found === null) return null;
       found.selected = !found.selected;
+      if (found.playerId !== undefined) {
+        found.playerId = found.selected ? 1 : null;
+      }
       saveRow(found);
       releaseWithdrawn();
       record('toggle', source, [{ id, selected: found.selected }]);
@@ -1262,7 +1307,12 @@ export function createOutputs(
       }
       const found = find(id);
       if (found === null) return null;
-      if (opts.selected !== undefined) found.selected = opts.selected;
+      if (opts.selected !== undefined) {
+        found.selected = opts.selected;
+        if (found.playerId !== undefined) {
+          found.playerId = opts.selected ? 1 : null;
+        }
+      }
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
       if (opts.connectionStrategy !== undefined) {
         found.connectionStrategy = opts.connectionStrategy;
@@ -1315,6 +1365,9 @@ export function createOutputs(
     },
     onCommand(fn) {
       commandListeners.add(fn);
+      return () => {
+        commandListeners.delete(fn);
+      };
     },
   };
   return api;

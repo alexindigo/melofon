@@ -159,6 +159,8 @@ export interface Playback {
 }
 
 export function createPlayback(deps: {
+  playerId?: number;
+  reserveQueueIds?: (count: number) => Promise<number>;
   player: Player;
   nowPlaying: NowPlaying;
   library: Pick<Library, 'getSong'>;
@@ -276,7 +278,13 @@ export function createPlayback(deps: {
       (present && commander !== announcedCommander);
     serverPresent = present;
     announcedCommander = commander;
-    notify?.emit(changed ? [...types, 'nowPlaying'] : types, undefined, 'all');
+    const engineTypes = types.filter((type) =>
+      ['player', 'queue', 'volume', 'options'].includes(type)
+    );
+    const keys = deps.playerId === undefined ? undefined : Object.fromEntries(
+      engineTypes.map((type) => [type, [String(deps.playerId)]]),
+    );
+    notify?.emit(changed ? [...types, 'nowPlaying'] : types, keys, 'all');
   };
   // Playback owns the aggregate dependency on selected target names/ids, not
   // hats or individual output call sites. Ignore volume, admission and other
@@ -307,7 +315,8 @@ export function createPlayback(deps: {
     },
   ): T | Promise<T> => {
     const current = () =>
-      !authority || !authority.signal.aborted && authority.isCurrent();
+      !closed && !closing &&
+      (!authority || !authority.signal.aborted && authority.isCurrent());
     const cancelled = () =>
       new PlaybackError('playback_cancelled', 'Playback start cancelled');
     if (!current()) throw cancelled();
@@ -434,6 +443,7 @@ export function createPlayback(deps: {
       intent,
       queueCleared,
     };
+    if (kind !== 'restore') persistence?.saveCommand?.(last.atMs);
     log.event('command', {
       command: kind,
       facts,
@@ -481,10 +491,11 @@ export function createPlayback(deps: {
       return row ? [row] : [];
     },
   });
-  const addSources = (
+  const commitAdd = (
     media: QueueMedia[],
     opts: QueueAddOptions = {},
     source?: CommandSource,
+    firstId?: number,
   ): QueueEntry[] | Promise<QueueEntry[]> => {
     const size = media.length + (opts.clear ? 0 : player.queue().items.length);
     const future = opts.clear ? [] : player.queue().items;
@@ -503,7 +514,7 @@ export function createPlayback(deps: {
       opts.play === true && size > 0,
       (activate) => {
         if (opts.clear) player.queueClear();
-        const added = player.queueAddSources(media, opts.position);
+        const added = player.queueAddSources(media, opts.position, firstId);
         if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
         if (opts.play) player.play(opts.playbackFromPosition);
         activate();
@@ -538,6 +549,34 @@ export function createPlayback(deps: {
         : undefined,
     );
   };
+  const addSources = (
+    media: QueueMedia[],
+    opts: QueueAddOptions = {},
+    source?: CommandSource,
+  ): QueueEntry[] | Promise<QueueEntry[]> => {
+    requireOpen();
+    if (!deps.reserveQueueIds || !media.length) {
+      return commitAdd(media, opts, source);
+    }
+    cancelStart();
+    const controller = new AbortController();
+    pendingStart = controller;
+    return deps.reserveQueueIds(media.length).then((firstId) => {
+      if (
+        controller.signal.aborted || pendingStart !== controller || closed ||
+        closing
+      ) {
+        throw new PlaybackError(
+          'playback_cancelled',
+          'Queue reservation cancelled',
+        );
+      }
+      pendingStart = undefined;
+      return commitAdd(media, opts, source, firstId);
+    }).finally(() => {
+      if (pendingStart === controller) pendingStart = undefined;
+    });
+  };
   const resolveReference = deps.resolveQueueReference ?? createQueueResolver({
     getSong: (id) => library.getSong(id),
     getStation: () => Promise.resolve(null),
@@ -547,6 +586,7 @@ export function createPlayback(deps: {
     opts?: QueueAddOptions,
     source?: CommandSource,
   ): Promise<QueueEntry[]> => {
+    requireOpen();
     cancelStart();
     const controller = new AbortController();
     pendingStart = controller;
@@ -656,6 +696,11 @@ export function createPlayback(deps: {
     })();
     return work.promise;
   };
+  const requireOpen = () => {
+    if (closed || closing) {
+      throw new PlaybackError('playback_cancelled', 'Player is closed');
+    }
+  };
   return {
     openSource: (entryId, generation) => {
       if (closed || closing) return null;
@@ -664,6 +709,7 @@ export function createPlayback(deps: {
       return source;
     },
     cancelSource(source) {
+      if (closed || closing) return;
       const version = player.queue().version;
       player.cancelSource(source);
       if (player.queue().version !== version) {
@@ -782,6 +828,7 @@ export function createPlayback(deps: {
       );
     },
     pause(source) {
+      requireOpen();
       cancelStart();
       player.pause();
       record('pause', undefined, source, 'pause');
@@ -789,6 +836,7 @@ export function createPlayback(deps: {
       emit(['player']);
     },
     stop(source) {
+      requireOpen();
       cancelStart();
       player.stop();
       record('stop', undefined, source, 'stop');
@@ -852,6 +900,7 @@ export function createPlayback(deps: {
       );
     },
     setShuffle(on, source) {
+      requireOpen();
       cancelStart();
       player.setShuffle(on);
       record('shuffle', `shuffle=${on}`, source, 'none', false, {
@@ -861,6 +910,7 @@ export function createPlayback(deps: {
       emit(['options']);
     },
     setConsume(on, source) {
+      requireOpen();
       cancelStart();
       player.setConsume(on);
       record('consume', `consume=${on}`, source, 'none', false, {
@@ -870,6 +920,7 @@ export function createPlayback(deps: {
       emit(['options']);
     },
     setRepeat(mode, source) {
+      requireOpen();
       cancelStart();
       player.setRepeat(mode);
       record('repeat', `repeat=${mode}`, source, 'none', false, {
@@ -879,6 +930,7 @@ export function createPlayback(deps: {
       emit(['options']);
     },
     setVolume(opts, source) {
+      requireOpen();
       if (opts.volume === undefined && opts.step === undefined) return;
       player.setVolume(opts);
       record(
@@ -897,6 +949,7 @@ export function createPlayback(deps: {
       emit(['volume']);
     },
     seek(opts, source) {
+      requireOpen();
       const view = player.status();
       const entry = view.current ?? player.queue().items[0];
       // A non-seekable source is a true no-op, including while paused/stopped:
@@ -991,6 +1044,7 @@ export function createPlayback(deps: {
       );
     },
     queueClear(source) {
+      requireOpen();
       cancelStart();
       player.queueClear();
       record('queueClear', undefined, source, 'stop', true);
@@ -1000,6 +1054,7 @@ export function createPlayback(deps: {
     },
 
     advanceEnded() {
+      if (closed || closing) return;
       if (failedSource) {
         if (!pendingStart) return advanceFailedSource();
         return;
@@ -1053,6 +1108,7 @@ export function createPlayback(deps: {
     },
 
     restore(snapshot) {
+      requireOpen();
       const index = snapshot.currentIndex ?? 0;
       const candidate = snapshot.queue[index];
       const prepareUrl = deps.prepareQueueMedia &&

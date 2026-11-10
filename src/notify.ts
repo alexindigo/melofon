@@ -25,6 +25,7 @@ const bootId = crypto.randomUUID();
 // OwnTone's event vocabulary (docs/json-api.md §Push notifications + the
 // extras their websocket.c knows: pairing/spotify/lastfm).
 const KNOWN = new Set([
+  'players',
   'player',
   'nowPlaying',
   'outputs',

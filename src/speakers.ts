@@ -7,6 +7,7 @@ import type { State } from './state.ts';
 import { SecretError } from './secrets.ts';
 import type { SpeakerCredentials } from './speaker-credentials.ts';
 import { appLogger } from './logging.ts';
+import { outputPlayerId } from './player-outputs.ts';
 export { SpeakerError } from './speaker-errors.ts';
 
 function fields(input: unknown, allowed: string[]): Record<string, unknown> {
@@ -132,7 +133,8 @@ export function createSpeakers(deps: {
     description:
       'Maximum wait for selected speaker preparation before playback',
   });
-  const selected = () => deps.outputs.list().filter((row) => row.selected);
+  const selected = (playerId: number) =>
+    deps.outputs.list().filter((row) => outputPlayerId(row) === playerId);
   const connected = (id: string) => {
     const session = deps.adapterView(id).session;
     return session?.connection === 'connected' &&
@@ -273,11 +275,11 @@ export function createSpeakers(deps: {
       return await password(id, null);
     },
     /** Ongoing sessions outlive discovery, but withdrawn idle targets cannot start. */
-    hasPlaybackTarget(): boolean {
-      return selected().some((row) => eligible(row.id));
+    hasPlaybackTarget(playerId = 1): boolean {
+      return selected(playerId).some((row) => eligible(row.id));
     },
-    async preparePlayback(signal: AbortSignal): Promise<void> {
-      const rows = selected();
+    async preparePlayback(signal: AbortSignal, playerId = 1): Promise<void> {
+      const rows = selected(playerId);
       if (!rows.length) {
         throw new PlaybackError('no_target', 'Select a speaker before playing');
       }
@@ -317,7 +319,8 @@ export function createSpeakers(deps: {
             await deps.prepare?.(row.id, controller.signal);
           const current = deps.outputs.get(row.id);
           if (
-            !ok || !current?.selected || !eligible(row.id) ||
+            !ok || !current || outputPlayerId(current) !== playerId ||
+            !eligible(row.id) ||
             JSON.stringify([current.type, current.host, current.port]) !== key
           ) throw new Error('unavailable');
           return true;

@@ -19,11 +19,20 @@ import type { QueueSnapshot } from './queue-source.ts';
 
 export type { PersistedPlayerState } from './store/playback.ts';
 
-export interface Persistence extends PlayerPersistence, OutputPersistence {
+export interface EnginePersistence extends PlayerPersistence {
   /** Ordered occurrences, durable allocator and revision, without runtime facts. */
   loadQueue(): Promise<QueueSnapshot>;
   /** The player's state row, or null when never persisted. */
   loadPlayerState(): Promise<PersistedPlayerState | null>;
+  drain(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface Persistence extends PlayerPersistence, OutputPersistence {
+  loadQueue(): Promise<QueueSnapshot>;
+  loadPlayerState(): Promise<PersistedPlayerState | null>;
+  /** Engine ports share the household write tail, never the output cache. */
+  forPlayer(playerId: number): EnginePersistence;
   /** Adopted output preferences only (also seeds the savedOutput cache). */
   loadOutputs(): Promise<PersistedOutput[]>;
   /** The last-known adopted row per output id, kept current by saveOutput.
@@ -47,20 +56,43 @@ export function createPersistence(
   const outputCache = new Map<string, PersistedOutput>();
   const outputRevisions = new Map<string, number>();
   const ignored = new Set<string>();
+  const forPlayer = (playerId: number): EnginePersistence => {
+    let active = true;
+    return {
+      saveQueue(snapshot, state) {
+        if (!active) return;
+        const copy = structuredClone(snapshot);
+        enqueue(() => store.playback.saveQueue(playerId, copy, state));
+      },
+      saveState(snapshot) {
+        if (active) enqueue(() => store.playback.saveState(playerId, snapshot));
+      },
+      saveCommand(commandedAtMs) {
+        if (active) {
+          enqueue(() =>
+            store.players.saveChanges({
+              players: [{ playerId, commandedAtMs }],
+            })
+          );
+        }
+      },
+      loadQueue: () => store.playback.loadQueue(playerId),
+      loadPlayerState: () => store.playback.loadPlayerState(playerId),
+      drain: () => tail,
+      async close() {
+        active = false;
+        await tail;
+      },
+    };
+  };
+  const home = forPlayer(1);
 
   return {
-    saveQueue(snapshot, state) {
-      const copy = structuredClone(snapshot);
-      enqueue(() => store.playback.saveQueue(1, copy, state));
-    },
-
-    saveState(snapshot) {
-      enqueue(() => store.playback.saveState(1, snapshot));
-    },
-
-    loadQueue: () => store.playback.loadQueue(1),
-
-    loadPlayerState: () => store.playback.loadPlayerState(1),
+    forPlayer,
+    saveQueue: home.saveQueue,
+    saveState: home.saveState,
+    loadQueue: home.loadQueue,
+    loadPlayerState: home.loadPlayerState,
 
     saveOutput(row) {
       // Only explicit adoption (or an adopted row loaded at boot) authorizes
