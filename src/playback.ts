@@ -31,6 +31,10 @@ import {
 export type { NowPlayingViewRow, ReportPlaying } from './playback-reports.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { PlaybackError } from './playback-errors.ts';
+import type {
+  PlaybackCapacity,
+  PlaybackReservation,
+} from './playback-capacity.ts';
 import { planSourceFailure } from './source-recovery.ts';
 import {
   catalogMedia,
@@ -162,6 +166,7 @@ export interface Playback {
 
 export function createPlayback(deps: {
   playerId?: number;
+  capacity?: PlaybackCapacity;
   reserveQueueIds?: (count: number) => Promise<number>;
   player: Player;
   nowPlaying: NowPlaying;
@@ -194,6 +199,49 @@ export function createPlayback(deps: {
   log?: Log;
 }): Playback {
   const { player, library, outputs, notify, persistence } = deps;
+  let activeReservation: PlaybackReservation | undefined;
+  const needsCapacity = () =>
+    deps.capacity &&
+    outputs?.list().some((out) =>
+      out.selected && out.type === deps.capacity!.protocol
+    );
+  const releaseInactiveCapacity = () => {
+    if (player.status().state !== 'play' || !needsCapacity()) {
+      activeReservation?.release();
+      activeReservation = undefined;
+    }
+  };
+  const reserveStart = (starts: boolean, controller?: AbortController) => {
+    const reservation = starts && needsCapacity()
+      ? deps.capacity!.reserve()
+      : undefined;
+    controller?.signal.addEventListener('abort', () => reservation?.release(), {
+      once: true,
+    });
+    return reservation;
+  };
+  const commitStart = <T>(
+    reservation: PlaybackReservation | undefined,
+    commit: () => T,
+  ): T => {
+    if (reservation && !reservation.isCurrent()) {
+      throw new PlaybackError(
+        'playback_cancelled',
+        'Playback reservation expired',
+      );
+    }
+    const result = commit();
+    if (
+      reservation?.isCurrent() && player.status().state === 'play' &&
+      needsCapacity()
+    ) {
+      const previous = activeReservation;
+      activeReservation = deps.capacity!.reserve();
+      previous?.release();
+    }
+    releaseInactiveCapacity();
+    return result;
+  };
   const log = deps.log ?? scopedLog('playback');
   let openedSource: PlaybackSource | null = null;
   const recoverySettings = {
@@ -287,6 +335,7 @@ export function createPlayback(deps: {
       engineTypes.map((type) => [type, [String(deps.playerId)]]),
     );
     notify?.emit(changed ? [...types, 'nowPlaying'] : types, keys, 'all');
+    releaseInactiveCapacity();
   };
   // Playback owns the aggregate dependency on selected target names/ids, not
   // hats or individual output call sites. Ignore volume, admission and other
@@ -331,8 +380,16 @@ export function createPlayback(deps: {
     const needsResolution = starts && activation && candidate &&
       (deps.resolveQueueReference && candidate.reference.kind === 'station' ||
         needsPreparation(candidate));
-    if (!starts || !deps.targets && !needsResolution) return commit(() => {});
+    if (!starts || !deps.targets && !needsResolution) {
+      const reservation = reserveStart(starts);
+      try {
+        return commitStart(reservation, () => commit(() => {}));
+      } finally {
+        reservation?.release();
+      }
+    }
     const controller = new AbortController();
+    const reservation = reserveStart(starts, controller);
     const abort = () => controller.abort();
     authority?.signal.addEventListener('abort', abort, { once: true });
     pendingStart = controller;
@@ -371,15 +428,16 @@ export function createPlayback(deps: {
         controller.signal.aborted || pendingStart !== controller || !current()
       ) throw cancelled();
       pendingStart = undefined;
-      const result = commit(() => {
-        if (selected === undefined) return;
-        if (selected === null) {
-          player.stop();
-          return;
-        }
-        player.replaceMedia(selected.index, selected.media);
-        if (selected.index !== activation!.index) player.play(selected.index);
-      });
+      const result = commitStart(reservation, () =>
+        commit(() => {
+          if (selected === undefined) return;
+          if (selected === null) {
+            player.stop();
+            return;
+          }
+          player.replaceMedia(selected.index, selected.media);
+          if (selected.index !== activation!.index) player.play(selected.index);
+        }));
       if (selected !== undefined) {
         flushQueue();
         emit(['queue']);
@@ -391,6 +449,7 @@ export function createPlayback(deps: {
       if (controller.signal.aborted || !current()) throw cancelled();
       throw error;
     }).finally(() => {
+      reservation?.release();
       authority?.signal.removeEventListener('abort', abort);
       if (pendingStart === controller) pendingStart = undefined;
     });
@@ -423,6 +482,7 @@ export function createPlayback(deps: {
         emit(['player']);
       }
       if (changed && hasServerRow()) invalidateNowPlaying();
+      releaseInactiveCapacity();
     });
   const record = (
     kind: string,
@@ -562,6 +622,7 @@ export function createPlayback(deps: {
     }
     cancelStart();
     const controller = new AbortController();
+    const reservation = reserveStart(opts.play === true, controller);
     pendingStart = controller;
     return deps.reserveQueueIds(media.length).then((firstId) => {
       if (
@@ -574,8 +635,13 @@ export function createPlayback(deps: {
         );
       }
       pendingStart = undefined;
-      return commitAdd(media, opts, source, firstId);
+      const added = commitAdd(media, opts, source, firstId);
+      // The transition now owns cancellation. Do not retain an earlier phase's
+      // ticket while waiting for its successor's possibly slow preparation.
+      reservation?.release();
+      return added;
     }).finally(() => {
+      reservation?.release();
       if (pendingStart === controller) pendingStart = undefined;
     });
   };
@@ -591,6 +657,7 @@ export function createPlayback(deps: {
     requireOpen();
     cancelStart();
     const controller = new AbortController();
+    const reservation = reserveStart(opts?.play === true, controller);
     pendingStart = controller;
     try {
       const media = await resolve(controller.signal);
@@ -606,7 +673,9 @@ export function createPlayback(deps: {
       if (pendingStart !== controller) controller.abort();
       controller.signal.throwIfAborted();
       pendingStart = undefined;
-      return await addSources(prepared, opts, source);
+      const added = addSources(prepared, opts, source);
+      reservation?.release();
+      return await added;
     } catch (error) {
       if (controller.signal.aborted) {
         throw new PlaybackError(
@@ -616,6 +685,7 @@ export function createPlayback(deps: {
       }
       throw error;
     } finally {
+      reservation?.release();
       if (pendingStart === controller) pendingStart = undefined;
     }
   };
@@ -706,6 +776,7 @@ export function createPlayback(deps: {
   return {
     openSource: (entryId, generation) => {
       if (closed || closing) return null;
+      if (needsCapacity() && !deps.capacity!.authority()()) return null;
       const source = player.openSource(entryId, generation);
       if (source) openedSource = source;
       return source;
@@ -1130,20 +1201,22 @@ export function createPlayback(deps: {
       };
       if (
         snapshot.state !== 'play' || !snapshot.queue.length ||
-        !deps.targets && !prepareUrl
+        !deps.targets && !prepareUrl && !needsCapacity()
       ) {
         cancelStart();
         return commit();
       }
-      return Promise.resolve(transition(
-        true,
-        (activate) => {
-          commit();
-          activate();
-        },
-        undefined,
-        { index, items: snapshot.queue },
-      )).catch(
+      return (async () => {
+        await transition(
+          true,
+          (activate) => {
+            commit();
+            activate();
+          },
+          undefined,
+          { index, items: snapshot.queue },
+        );
+      })().catch(
         (error) => {
           if (
             error instanceof PlaybackError &&
@@ -1172,6 +1245,8 @@ export function createPlayback(deps: {
 
     async close() {
       cancelStart();
+      activeReservation?.release();
+      activeReservation = undefined;
       // Revoke a parked source even if its boot is being closed separately.
       if (openedSource) player.cancelSource(openedSource);
       closing = true;

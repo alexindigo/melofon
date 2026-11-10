@@ -15,6 +15,7 @@ import type {
   PlaybackSource,
 } from '../player.ts';
 import type { Playback } from '../playback.ts';
+import type { PlaybackCapacity } from '../playback-capacity.ts';
 import type { State } from '../state.ts';
 import {
   CONNECTION_STRATEGIES,
@@ -28,6 +29,7 @@ export { airplayOutputId } from './airplay-profile.ts';
 export type { AirplayTransport, HelperEventFn } from './airplay-profile.ts';
 export interface AirplayBootDeps {
   playerId?: number;
+  capacity?: PlaybackCapacity;
   outputs: Outputs;
   playback: Playback;
   media: Media;
@@ -120,6 +122,7 @@ export function createAirplayBoot(
 } {
   const { outputs, playback, media, notify } = deps;
   const sources = deps.sources ?? createPlaybackSource({ media });
+  const capacityCurrent = () => deps.capacity?.authority() ?? (() => true);
   // Keep the existing permissive off/list parser (including clamping) at its owner.
   deps.state?.declare(AIRPLAY_RETRY_KEY, {
     type: 'string',
@@ -468,11 +471,12 @@ export function createAirplayBoot(
     if (
       closed || blocked.has(id) || runtimes.get(id) !== r || !r.connected ||
       !t || !r.authority() || !out?.selected || view.state !== 'play' ||
-      !view.current || source
+      !view.current || source || !capacityCurrent()()
     ) return;
     const sourceLease = playback.openSource(view.current.id, view.generation);
     if (!sourceLease) return;
     const generation = ++r.pump, session = r.session;
+    const streamCurrent = capacityCurrent();
     const authority = { id, runtime: r, generation, lease: sourceLease };
     source = authority;
     r.entry = view.current.id;
@@ -482,7 +486,7 @@ export function createAirplayBoot(
       : undefined;
     const owns = () =>
       source === authority && !sourceLease.signal.aborted && !closed &&
-      r.authority() &&
+      r.authority() && streamCurrent() &&
       runtimes.get(id) === r &&
       r.transport === t &&
       r.session === session && r.pump === generation;
@@ -764,6 +768,7 @@ export function createAirplayBoot(
     if (preparing.has(id)) return;
     const controller = new AbortController();
     const authority = outputAuthority(outputs, id);
+    const streamCurrent = capacityCurrent();
     const work = {
       controller,
       grant: permission,
@@ -775,6 +780,7 @@ export function createAirplayBoot(
     const current = () => {
       const row = outputs.get(id);
       return !closed && !controller.signal.aborted && authority() &&
+        streamCurrent() &&
         permission.epoch === epoch(id).generation &&
         row?.selected === true && intent === 'play' &&
         playback.playerView().state === 'play' &&
@@ -787,6 +793,7 @@ export function createAirplayBoot(
     void (async () => {
       const prepared = await devices.protocol.prepare({
         id,
+        capacity: deps.capacity,
         targetRevision: devices.admission.describe(id).targetRevision,
         signal: controller.signal,
         isCurrent: current,

@@ -3,7 +3,13 @@ import {
   createOutputAdmission,
   type OutputAdmission,
   PreparationError,
+  type PreparationRequest,
 } from '../output-admission.ts';
+import {
+  createPlaybackCapacity,
+  type PlaybackCapacity,
+} from '../playback-capacity.ts';
+import { PlaybackError } from '../playback-errors.ts';
 import { createMdnsResolver, type MdnsResolver } from '../mdns-resolver.ts';
 import type { MdnsService } from '../mdns.ts';
 import type { SpeakerAdapterView, SpeakerSessionView } from '../speakers.ts';
@@ -39,6 +45,17 @@ export function createAirplayDevices(deps: {
   changed?(): void;
 }) {
   const { outputs } = deps;
+  // The native backend has one household stream until independent streams land.
+  // Declaration lives with AirPlay; core only knows the supplied capacity port.
+  const capacity = createPlaybackCapacity({
+    protocol: 'AirPlay',
+    busy: (owner) =>
+      new PlaybackError(
+        'airplay_busy',
+        `AirPlay is busy in ${owner.name}`,
+        owner,
+      ),
+  });
   const admission = deps.admission ??
     createOutputAdmission({
       endpoint: (id) => {
@@ -188,9 +205,19 @@ export function createAirplayDevices(deps: {
   type Permit = Parameters<typeof admitted.activate>[0];
   const contexts = new WeakMap<
     Permit,
-    { id: string; authority(): boolean; current(): boolean }
+    {
+      id: string;
+      authority(): boolean;
+      current(): boolean;
+      capacity?: PlaybackCapacity;
+      capacityCurrent(): boolean;
+    }
   >();
-  const protocol: typeof admitted = {
+  const protocol: Omit<typeof admitted, 'prepare'> & {
+    prepare(
+      request: PreparationRequest & { capacity?: PlaybackCapacity },
+    ): ReturnType<typeof admitted.prepare>;
+  } = {
     ...admitted,
     async prepare(request) {
       const incarnation = outputs.revision(request.id);
@@ -198,13 +225,15 @@ export function createAirplayDevices(deps: {
         id: request.id,
         authority: outputAuthority(outputs, request.id),
         current: () => true,
+        capacity: request.capacity,
+        capacityCurrent: request.capacity?.authority() ?? (() => true),
       };
       const result = await admitted.prepare({
         ...request,
         isCurrent: () =>
           request.isCurrent() &&
           outputs.revision(request.id) === incarnation && context.authority() &&
-          context.current(),
+          context.current() && context.capacityCurrent(),
       });
       if (result.ok) contexts.set(result.value, context);
       return result;
@@ -228,7 +257,15 @@ export function createAirplayDevices(deps: {
       releases.set(context.id, released);
       void released.catch(() => {});
       let published: AirplayTransport | undefined;
+      let retained: { release(): void } | undefined;
       try {
+        if (!context.capacityCurrent()) {
+          throw new PreparationError(
+            'cancelled',
+            'Playback reservation expired',
+          );
+        }
+        retained = context.capacity?.retain();
         await previous;
         if (deps.credentials) {
           const snapshot = await deps.credentials.session(context.id, {
@@ -262,6 +299,7 @@ export function createAirplayDevices(deps: {
               closing ??= (async () => {
                 try {
                   await transport.close();
+                  retained?.release();
                   release();
                 } catch (error) {
                   failed(error);
@@ -291,6 +329,7 @@ export function createAirplayDevices(deps: {
         };
       } finally {
         if (!published) {
+          retained?.release();
           // Do not let a canceled queued attempt bypass an earlier cleanup.
           if (previous) void previous.then(release, failed);
           else release();
@@ -324,6 +363,7 @@ export function createAirplayDevices(deps: {
     }
   };
   return {
+    capacity,
     admission,
     protocol,
     async preparePlayback(id: string, signal: AbortSignal): Promise<boolean> {
