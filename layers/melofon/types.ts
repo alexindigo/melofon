@@ -621,6 +621,18 @@ export interface PlayerRow {
 }
 
 export interface PlayerPlayback {
+  play(source?: Source): void | Promise<void>;
+  pause(source?: Source): void;
+  stop(source?: Source): void;
+  next(source?: Source): void | Promise<void>;
+  previous(source?: Source): void | Promise<void>;
+  restart(source?: Source): void | Promise<void>;
+  seek(
+    options: { positionMs?: number; seekMs?: number },
+    source?: Source,
+  ): boolean | Promise<boolean>;
+  setRepeat(mode: 'off' | 'all' | 'single', source?: Source): void;
+  setConsume(on: boolean, source?: Source): void;
   playerView(): {
     state: 'play' | 'pause' | 'stop';
     repeat: 'off' | 'all' | 'single';

@@ -1,5 +1,7 @@
-import type { HatContext, PlayerRow } from './types.ts';
-import { fail } from './errors.ts';
+import type { HatContext, HatRequest, PlayerRow } from './types.ts';
+import { core, fail } from './errors.ts';
+import { fields } from './input.ts';
+import { source } from './libraries.ts';
 import { nowPlayingPayload } from './now-playing.ts';
 
 export function playerId(raw: string): number {
@@ -12,6 +14,20 @@ export function playerId(raw: string): number {
 
 export function playerSummary({ id, name, isDefault }: PlayerRow) {
   return { id, name, isDefault };
+}
+
+export async function playerCommand(
+  request: HatRequest,
+  context: HatContext,
+  command: 'play' | 'pause' | 'stop' | 'next' | 'previous' | 'restart',
+) {
+  fields(context, []);
+  await core(async () => {
+    await context.app.players.get(playerId(request.params.id))[command](
+      source(request, context),
+    );
+  });
+  return new Response(null, { status: 204 });
 }
 
 /** Encode only household-safe facts, never source paths or private provenance. */

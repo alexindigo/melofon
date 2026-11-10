@@ -320,6 +320,52 @@ Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restar
       (await server.native(`/players/${kitchen.id}`)).player.state,
       'stop',
     );
+    // Native commands reach the same physical consumer, not just an engine DTO.
+    await server.native('/players/1/stop', 'POST', {});
+    await until(() =>
+      receivers[0].sessions.every((s) => s.closedAtMs !== null)
+    );
+    assert(receivers[0].sessions.some((s) => s.teardowns > 0));
+    const stopped = (await server.native('/players/1')).player;
+    const oldSessions = receivers[0].sessions.length;
+    await server.native('/players/1/play', 'POST', {});
+    await until(() =>
+      receivers[0].sessions.slice(oldSessions).some((s) =>
+        s.audioPayloads.length >= 8
+      )
+    );
+    const resumed = receivers[0].sessions.slice(oldSessions).find((s) =>
+      s.audioPayloads.length >= 8
+    )!;
+    assert(
+      decodeReceiverAudio(resumed.sdp, resumed.audioPayloads.slice(0, 8)).some((
+        sample,
+      ) => sample !== 0),
+    );
+    const playing = (await server.native('/players/1')).player;
+    assertEquals(playing.current.entryId, stopped.current.entryId);
+    assert(playing.positionMs >= stopped.positionMs);
+    await server.native('/players/1/seek', 'POST', { positionMs: 6000 });
+    assert((await server.native('/players/1')).player.positionMs >= 6000);
+    await server.native('/players/1/restart', 'POST', {});
+    const restarted = (await server.native('/players/1')).player;
+    assertEquals(restarted.current.entryId, stopped.current.entryId);
+    assertEquals(restarted.state, 'play');
+    assert(restarted.positionMs < 3000);
+    await server.native('/players/1/pause', 'POST', {});
+    assertEquals((await server.native('/players/1')).player.state, 'pause');
+    await server.native('/players/1', 'PATCH', {
+      repeat: 'single',
+      consume: true,
+    });
+    await server.stop();
+    server = await boot(`${dir}/db`);
+    const modes = (await server.native('/players/1')).player;
+    assertEquals([modes.repeat, modes.consume, modes.state], [
+      'single',
+      true,
+      'pause',
+    ]);
   } finally {
     await server?.stop();
     dns.close();

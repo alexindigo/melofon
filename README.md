@@ -84,6 +84,16 @@ restart resets the current song while keeping play or pause. The OwnTone hat's
 previous follows its 3-second rule: restart after more than 3 seconds, previous
 otherwise.
 
+Signed-in clients send `POST /api/v1/players/{id}/{command}` with `{}` for
+`play`, `pause`, `stop`, `next`, `previous` or `restart`. Seek uses `POST
+/api/v1/players/{id}/seek` with exactly one integer millisecond field:
+`{"positionMs": 30000}` (absolute, nonnegative) or `{"seekMs": -10000}`
+(relative). Commands return 204; read `GET /api/v1/players/{id}` for state.
+`PATCH` that player with `{"repeat": "off"|"all"|"single", "consume": true|false}`
+to change either or both saved modes, optionally alongside `name`; it returns
+the updated player. Starting without a speaker returns `no_target`; another
+player holding AirPlay returns `airplay_busy` with its owning player's id/name.
+
 ### Web source recovery
 
 The playback owner declares `playback.source.retryBackoffMs`, an ordered array

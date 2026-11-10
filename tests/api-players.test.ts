@@ -149,6 +149,7 @@ async function setup() {
     dir,
     players,
     outputs,
+    persistence,
     songs,
     addSpeaker,
     read,
@@ -581,6 +582,385 @@ Deno.test('household HTTP identifies each server player while OpenSubsonic retai
       assert(!('commander' in entry));
       assert(!('kind' in entry));
     }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('player commands HTTP preserve per-player bookmarks, previous/restart semantics and authenticated provenance', async () => {
+  const t = await setup();
+  try {
+    const kitchen = await t.players.create('Kitchen');
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await t.f.login(mode, 'member', 'password-member');
+      const base = mode === 'cookie' ? '/api/v1' : '/_melofon/api/v1';
+      const id = mode === 'cookie' ? 1 : kitchen.id;
+      const path = `${base}/players/${id}`;
+      await t.addSpeaker(`speaker-${id}`);
+      await t.players.join(id, `speaker-${id}`);
+      const entries = await t.players.get(id).queueAdd(t.songs);
+      const other = t.players.get(id === 1 ? kitchen.id : 1);
+      const otherBefore = other.playerView();
+      const otherCommand = other.lastCommand();
+      const state = async () => (await t.read(path, credential)).player;
+      const command = (name: string, body: unknown = {}) =>
+        t.command(`${path}/${name}`, 'POST', credential, body);
+      await command('play');
+      assertEquals((await state()).state, 'play');
+      assertEquals((await state()).current.entryId, entries[0].id);
+      await command('seek', { positionMs: 100 });
+      assertEquals((await state()).positionMs, 100);
+      await command('seek', { seekMs: 25 });
+      assertEquals((await state()).positionMs, 125);
+      await command('seek', { seekMs: -50 });
+      assertEquals((await state()).positionMs, 75);
+      await command('pause');
+      assertEquals([(await state()).state, (await state()).positionMs], [
+        'pause',
+        75,
+      ]);
+      await command('restart');
+      assertEquals([(await state()).state, (await state()).positionMs], [
+        'pause',
+        0,
+      ]);
+      await command('play');
+      await t.command(path, 'PATCH', credential, { repeat: 'single' }, 200);
+      await command('next');
+      assertEquals((await state()).current.entryId, entries[1].id);
+      await command('seek', { positionMs: 150 });
+      await command('restart');
+      assertEquals((await state()).current.entryId, entries[1].id);
+      assertEquals([(await state()).state, (await state()).positionMs], [
+        'play',
+        0,
+      ]);
+      await command('previous');
+      assertEquals((await state()).current.entryId, entries[0].id);
+      await command('seek', { positionMs: 100 });
+      await command('previous');
+      assertEquals((await state()).current.entryId, entries[0].id);
+      assertEquals((await state()).positionMs, 0);
+      await command('seek', { positionMs: 100 });
+      await command('stop');
+      assertEquals([(await state()).state, (await state()).positionMs], [
+        'pause',
+        100,
+      ]);
+      assertEquals((await state()).current.entryId, entries[0].id);
+      assertEquals((await state()).speakers[0].id, `speaker-${id}`);
+      await command('play');
+      assertEquals([(await state()).state, (await state()).positionMs], [
+        'play',
+        100,
+      ]);
+      assertEquals((await state()).current.commander, 'member');
+      const provenance = t.players.get(id).lastCommand()!.source;
+      assertEquals(provenance.kind, 'http');
+      assertEquals(provenance.via, 'melofon');
+      assertEquals(provenance.user, 'member');
+      assertEquals(provenance.userAgent, 'Melofon API test');
+      assert(provenance.peer);
+      assertEquals(other.playerView(), otherBefore);
+      assertEquals(other.lastCommand(), otherCommand);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('player command HTTP validates bodies, methods, authentication and Origin before mutation', async () => {
+  const t = await setup();
+  try {
+    const base = '/api/v1/players/1';
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await t.f.login(mode, 'member', 'password-member');
+      const before = t.players.get(1).lastCommand();
+      for (
+        const action of [
+          'play',
+          'pause',
+          'stop',
+          'next',
+          'previous',
+          'restart',
+          'seek',
+        ]
+      ) {
+        const body = action === 'seek' ? { positionMs: 0 } : {};
+        await error(
+          await t.f.json(`${base}/${action}`, 'POST', body),
+          401,
+          'unauthenticated',
+        );
+        await error(
+          await t.f.json(
+            `${base}/${action}`,
+            'POST',
+            body,
+            credential,
+            'http://other.home',
+          ),
+          403,
+          'origin',
+        );
+        await error(
+          await t.f.json(
+            `${base}/${action}`,
+            'POST',
+            { ...body, extra: true },
+            credential,
+          ),
+          400,
+          'unknown_field',
+        );
+        await error(
+          await t.f.json(
+            `/api/v1/players/999/${action}`,
+            'POST',
+            body,
+            credential,
+          ),
+          404,
+          'not_found',
+        );
+        await error(
+          await t.f.json(
+            `/api/v1/players/01/${action}`,
+            'POST',
+            body,
+            credential,
+          ),
+          404,
+          'not_found',
+        );
+        const read = await t.f.get(`${base}/${action}`, credential);
+        assertEquals(read.status, 405);
+        await read.body?.cancel();
+      }
+      for (
+        const body of [
+          {},
+          { positionMs: 1, seekMs: 2 },
+          { positionMs: -1 },
+          { positionMs: 0.5 },
+          { positionMs: '2' },
+          { seekMs: null },
+          { seekMs: 0.5 },
+          { seekMs: 9007199254740992 },
+        ]
+      ) {
+        await error(
+          await t.f.json(`${base}/seek`, 'POST', body, credential),
+          400,
+          'invalid_field',
+        );
+      }
+      const noOrigin = await t.f.json(
+        `${base}/pause`,
+        'POST',
+        {},
+        credential,
+        null,
+      );
+      if (mode === 'cookie') await error(noOrigin, 403, 'origin');
+      else {
+        assertEquals(noOrigin.status, 204);
+        await noOrigin.body?.cancel();
+      }
+      if (mode === 'cookie') {
+        assertEquals(t.players.get(1).lastCommand(), before);
+      }
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('player modes HTTP validates the whole PATCH, persists modes per player and notifies another user', async () => {
+  const t = await setup();
+  let ws: WebSocket | undefined;
+  try {
+    const actor = await t.f.login('cookie', 'member', 'password-member');
+    const observer = await t.f.login('bearer');
+    const kitchen = await t.players.create('Kitchen');
+    const frames: { type: string; events?: Record<string, string[]> }[] = [];
+    ws = new WebSocket(t.f.origin.replace('http:', 'ws:') + '/api/v1/events', {
+      headers: {
+        Authorization: `Bearer ${observer.credential}`,
+        Origin: t.f.origin,
+      },
+    });
+    ws.onmessage = (e) => frames.push(JSON.parse(String(e.data)));
+    await waitFor(() => frames.some((f) => f.type === 'hello'));
+    const path = `/api/v1/players/${kitchen.id}`;
+    for (
+      const body of [
+        { repeat: true },
+        { repeat: 'one' },
+        { repeat: null },
+        { consume: 1 },
+        { consume: null },
+        { name: 'Changed', repeat: 'all', consume: 'yes' },
+        { repeat: 'all', shuffle: true },
+      ]
+    ) {
+      await error(
+        await t.f.json(path, 'PATCH', body, actor.credential),
+        400,
+        'shuffle' in body ? 'unknown_field' : 'invalid_field',
+      );
+    }
+    await error(
+      await t.f.json(
+        path,
+        'PATCH',
+        { name: 'Home', consume: true },
+        actor.credential,
+      ),
+      409,
+      'name_conflict',
+    );
+    assertEquals(t.players.list()[1].name, 'Kitchen');
+    assertEquals(t.players.get(kitchen.id).playerView().repeat, 'off');
+    assertEquals(t.players.get(kitchen.id).playerView().consume, false);
+    await error(
+      await t.f.json(path, 'PATCH', { repeat: 'all' }),
+      401,
+      'unauthenticated',
+    );
+    await error(
+      await t.f.json(
+        path,
+        'PATCH',
+        { repeat: 'all' },
+        actor.credential,
+        'http://other.home',
+      ),
+      403,
+      'origin',
+    );
+    for (const repeat of ['all', 'single', 'off']) {
+      const { player } = await t.command(path, 'PATCH', actor.credential, {
+        repeat,
+      }, 200);
+      assertEquals(player.repeat, repeat);
+    }
+    const { player } = await t.command(path, 'PATCH', actor.credential, {
+      name: 'Study',
+      repeat: 'single',
+      consume: true,
+    }, 200);
+    assertEquals([player.name, player.repeat, player.consume], [
+      'Study',
+      'single',
+      true,
+    ]);
+    await waitFor(() =>
+      frames.some((f) => f.events?.options?.includes(String(kitchen.id)))
+    );
+    const visible = (await t.read(path, observer.credential)).player;
+    assertEquals([visible.repeat, visible.consume], ['single', true]);
+    await t.persistence.drain();
+    const saved = await t.f.store.playback.loadPlayerState(kitchen.id);
+    assertEquals([saved?.repeat, saved?.consume], ['single', true]);
+    assertEquals(t.players.get(1).playerView().repeat, 'off');
+    assertEquals(t.players.get(1).playerView().consume, false);
+    assertEquals(
+      t.players.get(kitchen.id).lastCommand()?.source.user,
+      'member',
+    );
+    await t.command(
+      path,
+      'PATCH',
+      observer.credential,
+      { consume: false },
+      200,
+    );
+    assertEquals((await t.read(path, actor.credential)).player.consume, false);
+  } finally {
+    if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
+    if (ws) await waitFor(() => ws!.readyState === WebSocket.CLOSED);
+    await t.close();
+  }
+});
+
+Deno.test('player command HTTP returns no_target and airplay_busy without mutating either player', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'bearer',
+      'member',
+      'password-member',
+    );
+    const kitchen = await t.players.create('Kitchen');
+    const playback = t.players.get(kitchen.id);
+    await playback.queueAdd(t.songs);
+    for (
+      const [action, body] of [['play', {}], ['next', {}], ['previous', {}], [
+        'seek',
+        { positionMs: 100 },
+      ]] as const
+    ) {
+      await error(
+        await t.f.json(
+          `/api/v1/players/${kitchen.id}/${action}`,
+          'POST',
+          body,
+          credential,
+        ),
+        409,
+        'no_target',
+      );
+      assertEquals(playback.playerView().state, 'stop');
+      assertEquals(playback.playerView().current, null);
+    }
+    for (const id of [1, kitchen.id]) {
+      await t.addSpeaker(`air-${id}`, 'AirPlay');
+      await t.players.join(id, `air-${id}`);
+    }
+    await t.players.get(1).queueAdd(t.songs);
+    await t.command('/api/v1/players/1/play', 'POST', credential, {});
+    await t.command('/api/v1/players/1', 'PATCH', credential, {
+      name: 'Living room',
+    }, 200);
+    const before = playback.playerView();
+    const queue = playback.queueView();
+    const last = playback.lastCommand();
+    for (
+      const [action, body] of [['play', {}], ['next', {}], ['previous', {}], [
+        'seek',
+        { seekMs: 100 },
+      ]] as const
+    ) {
+      const response = await t.f.json(
+        `/api/v1/players/${kitchen.id}/${action}`,
+        'POST',
+        body,
+        credential,
+      );
+      assertEquals(response.status, 409);
+      assertEquals(await response.json(), {
+        code: 'airplay_busy',
+        message: 'AirPlay is busy in Living room',
+        owner: { id: 1, name: 'Living room' },
+      });
+      assertEquals(playback.playerView(), before);
+      assertEquals(playback.queueView(), queue);
+      assertEquals(playback.lastCommand(), last);
+      assertEquals(t.players.get(1).playerView().state, 'play');
+    }
+    await t.command('/api/v1/players/1/stop', 'POST', credential, {});
+    await t.command(
+      `/api/v1/players/${kitchen.id}/play`,
+      'POST',
+      credential,
+      {},
+    );
+    assertEquals(
+      (await t.read(`/api/v1/players/${kitchen.id}`, credential)).player.state,
+      'play',
+    );
   } finally {
     await t.close();
   }
