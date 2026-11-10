@@ -663,7 +663,7 @@ Deno.test('pause, stop, forget, deselect and endpoint replacement defeat retry p
         assertEquals(s.playback.playerView().state, 'pause');
       }
       if (change === 'stop') {
-        assertEquals(s.playback.playerView().state, 'stop');
+        assertEquals(s.playback.playerView().state, 'pause');
       }
     } finally {
       complete?.(receiver);
@@ -696,7 +696,7 @@ Deno.test('compound clear+play retires OwnTone held/active session before one re
     await s.close();
   }
 });
-Deno.test('OwnTone Stop retains current-null transport, quick Play reuses without another FLUSH', async () => {
+Deno.test('OwnTone Stop retains current but releases transport; Play creates a new session', async () => {
   const s = setup();
   try {
     s.register('1', 'owntone');
@@ -706,13 +706,15 @@ Deno.test('OwnTone Stop retains current-null transport, quick Play reuses withou
     t.event('state', 'connected');
     await until(() => t.writes.length > 0);
     s.playback.stop();
-    assertEquals(s.playback.playerView().current, null);
-    assert(!t.closed);
-    assertEquals(t.commands.filter((c) => c.cmd === 'flush').length, 1);
+    assert(s.playback.playerView().current !== null);
+    assertEquals(s.playback.playerView().state, 'pause');
+    await until(() => t.closed);
+    assertEquals(t.commands.filter((c) => c.cmd === 'teardown').length, 1);
     s.playback.play();
+    await until(() => s.transports.length === 2);
+    s.transports[1].event('state', 'connected');
     await until(() => s.decoded.length === 2);
-    assertEquals(s.transports.length, 1);
-    assertEquals(t.commands.filter((c) => c.cmd === 'flush').length, 1);
+    assertEquals(s.transports.length, 2);
   } finally {
     await s.close();
   }

@@ -507,7 +507,9 @@ Deno.test('household now-playing: OwnTone commands, selected speakers and comman
     await t.own('/api/player/stop');
     await t.changed();
     for (const observer of t.observers) {
-      assertEquals((await t.read(observer)).nowPlaying, []);
+      const rows = (await t.read(observer)).nowPlaying;
+      assertEquals(rows.length, 1);
+      assertEquals(rows[0].state, 'paused');
     }
   } finally {
     await t.close();

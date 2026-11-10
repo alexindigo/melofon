@@ -330,6 +330,7 @@ Deno.test({
       visible.push(await r.text());
     };
     const pair = async (admin = false) => {
+      const before = t!.playback.playerView();
       if (admin) {
         const login = await t!.f.login('cookie', 'admin', 'password-admin');
         await response(
@@ -345,7 +346,10 @@ Deno.test({
       await consumerUntil(() =>
         t!.devices.describe('1').session?.pairing?.state === 'awaiting_pin'
       );
-      assertEquals(t!.playback.playerView().state, 'stop');
+      const after = t!.playback.playerView();
+      assertEquals(after.state, before.state);
+      assertEquals(after.current?.id, before.current?.id);
+      assertEquals(after.itemProgressMs, before.itemProgressMs);
       assert(
         fake.sessions.every((s) =>
           !s.requests.some((r) =>

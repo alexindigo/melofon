@@ -640,7 +640,7 @@ Deno.test('auth recovery awaits guarded resume before PCM, and newer Pause or St
         assertEquals(session.closed, false);
       } else {
         await sleep(30);
-        assertEquals(t.playback.playerView().state, action);
+        assertEquals(t.playback.playerView().state, 'pause');
         assertEquals(session.writes, 0);
         assertEquals(session.closed, true);
       }
@@ -722,7 +722,7 @@ Deno.test('failed guarded retry resume consumes its grant without unbounded prep
       assertEquals(held.playback.lastCommand(), command, action);
       assertEquals(
         held.playback.playerView().state,
-        action === 'stop' ? 'stop' : 'pause',
+        'pause',
         action,
       );
       assertEquals(held.sessions.length, 1, action);

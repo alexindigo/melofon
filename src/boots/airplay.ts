@@ -331,7 +331,7 @@ export function createAirplayBoot(
     seenPlayback = p;
     seenOutputs = o;
     if (newP && p) {
-      if (p.queueCleared) {
+      if (p.queueCleared || p.kind === 'stop') {
         for (const id of runtimes.keys()) forceRelease.add(id);
       }
       if (p.source !== ownedSource && p.intent !== 'none') {
@@ -1034,7 +1034,7 @@ export function createAirplayBoot(
         continue;
       }
       if (forceRelease.delete(id)) {
-        if (r) retirements.push([id, r, 'queue clear']);
+        if (r) retirements.push([id, r, 'explicit release']);
         if (view.state === 'play' && intent === 'play') grant(id, 'explicit');
         continue;
       }

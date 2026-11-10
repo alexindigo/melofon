@@ -274,7 +274,9 @@ Deno.test('household aggregate reads each engine and app once over HTTP and surv
     assertEquals((await read()).map((row) => row.kind), ['server']);
     assertEquals(await rawSql(f.store).all('SELECT * FROM listens'), []);
     engines[0].stop();
-    assertEquals(await read(), []);
+    const stopped = await read();
+    assertEquals(stopped.map((row) => row.kind), ['server']);
+    assertEquals(stopped[0].state, 'paused');
     assert(subscriptions === 1 && unsubscribes === 0);
   } finally {
     await Promise.all(engines.map((engine) => engine.close()));

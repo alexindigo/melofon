@@ -261,16 +261,16 @@ Deno.test('engine: play shows on /rest; HA album select yields a real queue item
       'engine entry on /rest',
     );
 
-    // Stop: engine current gone from both views.
+    // Stop: bookmark remains paused in both views.
     await put(onHook, '/api/player/stop');
     const stopped = await (await get(onHook, '/api/player')).json();
-    assertEquals(stopped.state, 'stop');
-    assertEquals(stopped.item_id, 0);
+    assertEquals(stopped.state, 'pause');
+    assert(stopped.item_id > 0);
     assert(
-      !(await npEntry(onDefault)).some(
+      (await npEntry(onDefault)).some(
         (e: { playerName: string }) => e.playerName === 'melofon',
       ),
-      'engine entry gone after stop',
+      'engine bookmark remains after stop',
     );
   } finally {
     await close();
@@ -343,7 +343,9 @@ Deno.test('OwnTone HTTP play/pause/stop projects a server label, never the env u
     const stop = await request(ownPort, '/api/player/stop', 'PUT');
     assertEquals(stop.status, 204);
     await stop.body?.cancel();
-    assertEquals(await entries(), []);
+    const stopped = await entries();
+    assertEquals(stopped.length, 1);
+    assertEquals(stopped[0].state, 'paused');
   } finally {
     await Promise.all([rest.shutdown(), own.shutdown()]);
     await s.close();
@@ -452,6 +454,7 @@ Deno.test('core server row retains truthful clocks, selected speakers and extern
     assertEquals('commander' in app, false);
     s.playback.stop();
     assertEquals((await s.playback.nowPlayingView()).map((row) => row.kind), [
+      'server',
       'app',
     ]);
     s.playback.restore({

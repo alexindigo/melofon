@@ -260,7 +260,7 @@ Deno.test('household invalidations follow selected speaker facts and commander i
     check(() => playback.setVolume({ volume: 41 }, { kind: 'http' }), 1);
     check(() => playback.playerView(), 0); // Reading/extrapolation emits nothing.
     check(() => playback.stop(), 1);
-    check(() => outputs.register(SPEAKER), 0);
+    check(() => outputs.register(SPEAKER), 1); // Retained bookmark exposes speakers.
     check(() => playback.play(), 1);
     playback.close();
     check(() => outputs.toggle('0'), 0);

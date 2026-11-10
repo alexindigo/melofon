@@ -198,6 +198,54 @@ Deno.test('queue, state, and position survive a restart', async () => {
   }
 });
 
+Deno.test('core previous always goes back, restart preserves play/pause and stop keeps the bookmark', async () => {
+  const { playback, persistence, close } = await setup();
+  try {
+    const entries = await playback.queueAdd([song(), song()], {
+      play: true,
+      playbackFromPosition: 1,
+    });
+    await playback.seek({ positionMs: 4000 });
+    await playback.previous();
+    assertEquals(playback.playerView().current?.id, entries[0].id);
+    await playback.seek({ positionMs: 4000 });
+    await playback.restart();
+    assertEquals(playback.playerView().current?.id, entries[0].id);
+    assertEquals(playback.playerView().state, 'play');
+    assert(playback.playerView().itemProgressMs < 1000);
+    await playback.seek({ positionMs: 4000 });
+    playback.pause();
+    await playback.restart();
+    assertEquals(playback.playerView().state, 'pause');
+    assertEquals(playback.playerView().itemProgressMs, 0);
+    assertEquals(playback.lastCommand()?.kind, 'restart');
+    await playback.play();
+    await playback.seek({ positionMs: 5000 });
+    playback.stop();
+    const view = playback.playerView();
+    assertEquals(view.state, 'pause');
+    assertEquals(view.current?.id, entries[0].id);
+    assert(view.itemProgressMs >= 5000);
+    assertEquals(playback.lastCommand()?.intent, 'stop');
+    await persistence.drain();
+    const saved = await persistence.loadPlayerState();
+    assertEquals(saved?.state, 'pause');
+    assertEquals(saved?.positionMs, view.itemProgressMs);
+    await playback.play();
+    assert(playback.playerView().itemProgressMs >= view.itemProgressMs);
+    await playback.previous(); // first song restarts, never falls out of the queue
+    assertEquals(playback.playerView().current?.id, entries[0].id);
+    assert(playback.playerView().itemProgressMs < 1000);
+    playback.queueClear();
+    await playback.restart();
+    assertEquals(playback.playerView().state, 'stop');
+    assertEquals(playback.playerView().current, null);
+    await persistence.drain();
+  } finally {
+    await close();
+  }
+});
+
 Deno.test('a stale save restores paused at the saved place', async () => {
   const { dir, persistence, playback, close } = await setup();
   const songs = [song(), song()];

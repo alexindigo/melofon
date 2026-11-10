@@ -424,6 +424,8 @@ Deno.test('same-player next and seek retain ownership until actual close complet
     await until(() => f.sessions.some((s, i) => i > 0 && s.bytes > 0));
     await f.playback[0].seek({ positionMs: 10 });
     await until(() => f.sessions.filter((s) => s.bytes > 0).length >= 3);
+    await f.playback[0].restart();
+    await until(() => f.sessions.filter((s) => s.bytes > 0).length >= 4);
     const live = f.sessions.findLast((s) => !s.closed)!;
     live.closeGate = held.promise;
     f.playback[0].pause();

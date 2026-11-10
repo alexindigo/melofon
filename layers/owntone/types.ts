@@ -103,6 +103,7 @@ export interface HatContext {
       toggle(source?: CommandSourceRow): void | Promise<void>;
       next(source?: CommandSourceRow): void | Promise<void>;
       previous(source?: CommandSourceRow): void | Promise<void>;
+      restart(source?: CommandSourceRow): void | Promise<void>;
       setShuffle(on: boolean, source?: CommandSourceRow): void;
       setConsume(on: boolean, source?: CommandSourceRow): void;
       setRepeat(

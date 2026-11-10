@@ -75,6 +75,15 @@ supply their own open/read budgets. Healthy streams have no lifetime timer
 or cumulative byte cap; body failures are surfaced without hidden retries.
 Buffered lookup and file-download limits remain separate.
 
+### Player controls
+
+Player stop pauses at the current song and spot and closes speaker connections,
+so other devices can use them. Play continues at that spot, including after a
+server restart. Previous goes to the previous song (or restarts the first);
+restart resets the current song while keeping play or pause. The OwnTone hat's
+previous follows its 3-second rule: restart after more than 3 seconds, previous
+otherwise.
+
 ### Web source recovery
 
 The playback owner declares `playback.source.retryBackoffMs`, an ordered array

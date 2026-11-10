@@ -181,7 +181,7 @@ for (const choice of ['melofon', 'owntone', 'audiostation'] as const) {
           view.state,
           action === 'seek' || action === 'next'
             ? 'play'
-            : action === 'pause'
+            : action === 'pause' || action === 'stop'
             ? 'pause'
             : 'stop',
         );
@@ -297,7 +297,7 @@ for (const choice of ['melofon', 'owntone', 'audiostation'] as const) {
         assertEquals(s.transports.length, 1);
         assertEquals(
           s.playback.playerView().state,
-          cancel === 'stop' ? 'stop' : 'pause',
+          'pause',
         );
       } finally {
         release?.();
@@ -351,20 +351,22 @@ for (const choice of ['melofon', 'owntone', 'audiostation'] as const) {
   });
 }
 for (const command of ['pause', 'stop'] as const) {
-  Deno.test(`dual-home OwnTone ${command} hold: obsolete sockets release without Play or deadline extension`, async () => {
+  Deno.test(`dual-home OwnTone ${command}: obsolete sockets release without Play or deadline extension`, async () => {
     const s = fixture('owntone');
     try {
       await s.play();
       const old = s.transports[0];
       s.playback[command]();
-      assert(!old.closed, 'OwnTone is actually in its idle hold');
+      if (command === 'pause') {
+        assert(!old.closed, 'OwnTone pause is actually in its idle hold');
+      } else await until(() => old.closed);
       old.event('state', 'failed');
       await until(() => old.closed);
       await sleep(50);
       assertEquals(s.transports.length, 1);
       assertEquals(
         s.playback.playerView().state,
-        command === 'stop' ? 'stop' : 'pause',
+        'pause',
       );
     } finally {
       await s.close();

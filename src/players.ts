@@ -335,6 +335,7 @@ export async function createPlayers(deps: {
     toggle: (...args) => current().toggle(...args),
     next: (...args) => current().next(...args),
     previous: (...args) => current().previous(...args),
+    restart: (...args) => current().restart(...args),
     setShuffle: (...args) => current().setShuffle(...args),
     setConsume: (...args) => current().setConsume(...args),
     setRepeat: (...args) => current().setRepeat(...args),

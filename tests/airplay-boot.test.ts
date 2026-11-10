@@ -414,7 +414,7 @@ Deno.test('select while playing starts streaming (the HA flow)', async () => {
   }
 });
 
-Deno.test('OwnTone pause flushes, resume re-decodes, Stop holds; deselect immediately tears down', async () => {
+Deno.test('OwnTone pause flushes, resume re-decodes, Stop releases the session and keeps current', async () => {
   const { outputs, playback, spawned, close, referenceBytes } = await setup();
   try {
     registerSelected(outputs);
@@ -437,9 +437,8 @@ Deno.test('OwnTone pause flushes, resume re-decodes, Stop holds; deselect immedi
     await until('resume re-streams', () => t.pcmBytes() > before);
 
     playback.stop();
-    assertEquals(playback.playerView().current, null);
-    assert(!t.closed, 'OwnTone Stop starts its bounded quick-restart hold');
-    outputs.update(ID, { selected: false });
+    assert(playback.playerView().current !== null);
+    assertEquals(playback.playerView().state, 'pause');
     await until(
       'teardown',
       () => t.cmds().some((c) => c.cmd === 'teardown') && t.closed,

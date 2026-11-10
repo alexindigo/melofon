@@ -80,7 +80,7 @@ Deno.test({
       assert(
         (await refused.text()).includes('Select a speaker before playing'),
       );
-      assertEquals(t!.playback.playerView().state, 'stop');
+      assertEquals(t!.playback.playerView().state, 'pause');
       t!.discover(services[1]);
       await ok(await t!.write('2', 'password', 'PUT', { password }), 200);
       await ok(await t!.write('2', 'adopt'), 200);

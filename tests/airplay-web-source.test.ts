@@ -376,7 +376,7 @@ Deno.test('OwnTone pause/stop/next cancel web resolution, probe and active decod
         } else {
           assertEquals(
             playback!.playerView().state,
-            action === 'pause' ? 'pause' : 'stop',
+            'pause',
           );
         }
         await until(() => server.closed === server.requests.length);

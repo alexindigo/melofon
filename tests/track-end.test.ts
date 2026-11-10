@@ -184,7 +184,7 @@ Deno.test('no transition while paused, stopped, or length unknown', async () => 
     playback.play();
     playback.stop();
     playback.advanceEnded();
-    assertEquals(player.status().state, 'stop');
+    assertEquals(player.status().state, 'pause');
 
     // Unknown length never ends.
     const b = song(null);

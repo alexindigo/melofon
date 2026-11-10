@@ -92,6 +92,7 @@ export interface Playback {
   toggle(source?: CommandSource): void | Promise<void>;
   next(source?: CommandSource): void | Promise<void>;
   previous(source?: CommandSource): void | Promise<void>;
+  restart(source?: CommandSource): void | Promise<void>;
   setShuffle(on: boolean, source?: CommandSource): void;
   setConsume(on: boolean, source?: CommandSource): void;
   setRepeat(mode: RepeatMode, source?: CommandSource): void;
@@ -923,7 +924,9 @@ export function createPlayback(deps: {
     stop(source) {
       requireOpen();
       cancelStart();
-      player.stop();
+      // Explicit stop releases transport intent, not the bookmark. Engine stop
+      // remains the terminal operation for exhaustion and end-of-queue.
+      player.pause();
       record('stop', undefined, source, 'stop');
       flushState();
       emit(['player']);
@@ -982,6 +985,26 @@ export function createPlayback(deps: {
         },
         undefined,
         { index, direction: -1 },
+      );
+    },
+    restart(source) {
+      requireOpen();
+      const view = player.status();
+      if (!view.current) return;
+      const index = player.queue().items.findIndex((e) =>
+        e.id === view.current!.id
+      );
+      return transition(
+        view.state === 'play',
+        (activate) => {
+          player.restart();
+          activate();
+          record('restart', undefined, source, player.status().state);
+          flushState();
+          emit(['player']);
+        },
+        undefined,
+        { index },
       );
     },
     setShuffle(on, source) {

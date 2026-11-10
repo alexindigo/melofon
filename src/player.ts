@@ -274,12 +274,15 @@ export interface Player {
    * clamped into range; omitted → current (or queue head after stop). */
   play(fromPosition?: number): void;
   pause(): void;
+  /** Terminal reset for exhaustion. The public stop command preserves via pause. */
   stop(): void;
   toggle(): void;
   /** Move within the queue and start playback (OwnTone semantics); next past
    * the last item stops. */
   next(): void;
   previous(): void;
+  /** Reset the current song without changing play/pause; no current is a no-op. */
+  restart(): void;
   setShuffle(on: boolean): void;
   setConsume(on: boolean): void;
   setRepeat(mode: RepeatMode): void;
@@ -756,6 +759,13 @@ export function createPlayer(options: {
     previous() {
       if (items.length === 0) return;
       startAt(Math.max(0, (currentIndex ?? 0) - 1));
+    },
+
+    restart() {
+      if (currentIndex === null) return;
+      const paused = state === 'pause';
+      startAt(currentIndex);
+      if (paused) doPause();
     },
 
     setShuffle(on) {

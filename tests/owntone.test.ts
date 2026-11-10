@@ -460,11 +460,12 @@ Deno.test('player flow: add by track uri → play → status reports play + item
       (await (await get(onHook, '/api/player')).json()).state,
       'play',
     );
+    const beforeStop = await (await get(onHook, '/api/player')).json();
     assertEquals((await put(onHook, '/api/player/stop')).status, 204);
     status = await (await get(onHook, '/api/player')).json();
-    assertEquals(status.state, 'stop');
-    assertEquals(status.item_progress_ms, 0);
-    assertEquals(status.item_id, 0); // stopped: no current (no fallback)
+    assertEquals(status.state, 'pause');
+    assert(status.item_progress_ms >= beforeStop.item_progress_ms);
+    assertEquals(status.item_id, itemId); // explicit stop preserves the bookmark
 
     // Clear.
     assertEquals((await put(onHook, '/api/queue/clear')).status, 204);
