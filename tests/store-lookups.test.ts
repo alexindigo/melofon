@@ -80,7 +80,7 @@ Deno.test('claimNext is atomic, FIFO and per-plugin under concurrent claims and 
     const claims = await Promise.all(
       Array.from({ length: 50 }, async (_, n) => {
         const job = store.lookups.claimNext('fixture');
-        await store.playback.saveQueue(songQueue([`${n}`]));
+        await store.playback.saveQueue(1, songQueue([`${n}`]));
         return await job;
       }),
     );
@@ -89,7 +89,7 @@ Deno.test('claimNext is atomic, FIFO and per-plugin under concurrent claims and 
       new Set(claims.filter((j) => j !== null).map((j) => j!.id)).size,
       40,
     );
-    assertEquals(await store.playback.loadQueue(), songQueue(['49']));
+    assertEquals(await store.playback.loadQueue(1), songQueue(['49']));
     assertEquals((await store.lookups.claimNext('other'))?.plugin, 'other');
   });
 });

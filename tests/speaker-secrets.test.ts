@@ -438,10 +438,10 @@ Deno.test('late credential encryption cannot resurrect a forgotten or released s
     const queueReady = new Promise<void>((resolve) => queueEntered = resolve);
     const queueWait = new Promise<void>((resolve) => releaseQueue = resolve);
     const saveQueue = store.playback.saveQueue;
-    store.playback.saveQueue = async (ids) => {
+    store.playback.saveQueue = async (...args) => {
       queueEntered();
       await queueWait;
-      await saveQueue(ids);
+      await saveQueue(...args);
     };
     t.persistence.saveQueue({ items: [], nextId: 1, version: 0 }, {
       state: 'stop',

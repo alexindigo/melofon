@@ -12,6 +12,7 @@ import { createRadioStore } from './radio.ts';
 import { createSharesStore } from './shares.ts';
 import { createPodcastsStore } from './podcasts.ts';
 import { createPlaybackStore } from './playback.ts';
+import { createPlayersStore } from './players.ts';
 import { createSpeakersStore } from './speakers.ts';
 import { createCatalogStore } from './catalog.ts';
 import { createCandidatesStore } from './candidates.ts';
@@ -46,6 +47,7 @@ export interface Store {
   shares: ReturnType<typeof createSharesStore>;
   podcasts: ReturnType<typeof createPodcastsStore>;
   playback: ReturnType<typeof createPlaybackStore>;
+  players: ReturnType<typeof createPlayersStore>;
   speakers: ReturnType<typeof createSpeakersStore>;
   catalog: ReturnType<typeof createCatalogStore>;
   candidates: ReturnType<typeof createCandidatesStore>;
@@ -82,6 +84,7 @@ export async function openStore(
     shares: createSharesStore(engine),
     podcasts: createPodcastsStore(engine),
     playback: createPlaybackStore(engine, speakers),
+    players: createPlayersStore(engine),
     speakers,
     catalog: createCatalogStore(engine),
     candidates: createCandidatesStore(engine),

@@ -74,7 +74,7 @@ Deno.test('speaker migration adopts every legacy row exactly once and new prefer
       selected: false,
     });
     await rawSql(store).run(
-      "INSERT INTO output_state (id, selected, volume) VALUES ('no-endpoint', false, 17)",
+      "INSERT INTO output_state (id, player_id, volume) VALUES ('no-endpoint', NULL, 17)",
     );
     const before = await store.playback.loadOutputs();
     await rawSql(store).run('ALTER TABLE output_state DROP COLUMN adopted');
@@ -148,11 +148,19 @@ Deno.test('speaker adoption rolls back ignore removal on a real database constra
   const t = await domainFixture(createSpeakersStore);
   try {
     await t.domain.saveIgnored(speaker().id);
+    // Membership is nullable now, so use an actual volume constraint instead of
+    // the removed selected NOT NULL column to preserve the database-fault proof.
+    await t.run('DROP TABLE output_state');
+    await t.run(`CREATE TABLE output_state (
+      id VARCHAR PRIMARY KEY, host VARCHAR, port INTEGER, name VARCHAR, type VARCHAR,
+      player_id INTEGER, linked BOOLEAN NOT NULL DEFAULT true,
+      volume INTEGER NOT NULL CHECK (volume BETWEEN 0 AND 100), model VARCHAR,
+      connection_strategy VARCHAR, adopted BOOLEAN DEFAULT false, receiver_identity VARCHAR)`);
     await assertRejects(
       () =>
         t.domain.saveAdopted({
           ...speaker(),
-          selected: null as unknown as boolean,
+          volume: 101,
         }),
       Error,
       'Constraint',

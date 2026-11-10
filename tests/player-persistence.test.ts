@@ -446,8 +446,8 @@ Deno.test('output model identity survives a restart; legacy rows read unknown', 
   // re-adds the column idempotently.
   await rawSql(db).run('ALTER TABLE output_state DROP COLUMN model');
   await rawSql(db).run(
-    'INSERT INTO output_state (id, host, port, name, type, selected, volume, adopted) ' +
-      "VALUES ('legacy', '10.4.10.200', 7000, 'old-atv', 'AirPlay', false, 100, true)",
+    'INSERT INTO output_state (id, host, port, name, type, player_id, volume, adopted) ' +
+      "VALUES ('legacy', '10.4.10.200', 7000, 'old-atv', 'AirPlay', NULL, 100, true)",
   );
   await rawSql(db).run(
     'ALTER TABLE output_state ADD COLUMN IF NOT EXISTS model VARCHAR',

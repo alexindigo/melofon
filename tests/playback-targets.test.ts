@@ -578,7 +578,7 @@ Deno.test('store/server-service reopen keeps adopted selection and queue but res
     t.sessions[0].event('state', 'connected');
     await t.playback.seek({ positionMs: 500 });
     await t.drain();
-    const saved = await t.f.store.playback.loadPlayerState();
+    const saved = await t.f.store.playback.loadPlayerState(1);
     assertEquals(saved?.state, 'play');
     await t.close();
     t = undefined;

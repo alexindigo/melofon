@@ -5,6 +5,48 @@ export interface EncryptedSpeakerCredential {
   ciphertext: string;
 }
 
+export interface SpeakerMembership {
+  speakerId: string;
+  playerId: number | null;
+  linked: boolean;
+}
+
+/** Internal primitives, called only while holding the caller's transaction. */
+export async function saveSpeakerMembership(
+  q: Queries,
+  row: SpeakerMembership,
+): Promise<void> {
+  if (row.playerId !== null) {
+    if (
+      !Number.isSafeInteger(row.playerId) || row.playerId < 1 ||
+      !(await q.all(`SELECT id FROM players WHERE id = ${row.playerId}`)).length
+    ) throw new Error('Player not found');
+  }
+  const updated = await q.all(
+    `UPDATE output_state SET player_id = ${
+      row.playerId ?? 'NULL'
+    }, linked = ${row.linked}
+    WHERE id = ${esc(row.speakerId)} RETURNING id`,
+  );
+  if (!updated.length) throw new Error('Speaker not found');
+}
+
+export async function saveSpeakerVolume(
+  q: Queries,
+  id: string,
+  volume: number,
+): Promise<void> {
+  if (!Number.isInteger(volume) || volume < 0 || volume > 100) {
+    throw new Error('Invalid speaker volume');
+  }
+  const rows = await q.all(
+    `UPDATE output_state SET volume = ${volume} WHERE id = ${
+      esc(id)
+    } RETURNING id`,
+  );
+  if (!rows.length) throw new Error('Speaker not found');
+}
+
 async function saveCredential(
   q: Queries,
   id: string,
@@ -38,19 +80,43 @@ export async function migrateAdoptedSpeakers(q: Queries): Promise<void> {
   await q.run('UPDATE output_state SET adopted = true');
 }
 
+/** Define constraints before copying rows: DuckDB cannot add an index-backed
+ * constraint to a table with outstanding transactional writes/defaults. */
+export async function migrateSpeakerMembership(q: Queries): Promise<void> {
+  await q.run(`CREATE TABLE output_state_players (
+    id VARCHAR PRIMARY KEY, host VARCHAR, port INTEGER, name VARCHAR, type VARCHAR,
+    player_id INTEGER, linked BOOLEAN NOT NULL DEFAULT true, volume INTEGER NOT NULL,
+    model VARCHAR, connection_strategy VARCHAR DEFAULT 'melofon', adopted BOOLEAN DEFAULT false,
+    receiver_identity VARCHAR)`);
+  await q.run(`INSERT INTO output_state_players
+    SELECT id, host, port, name, type, CASE WHEN selected THEN 1 ELSE NULL END,
+      true, volume, model, connection_strategy, adopted, receiver_identity FROM output_state`);
+  await q.run('DROP TABLE output_state');
+  await q.run('ALTER TABLE output_state_players RENAME TO output_state');
+}
+
 async function save(
   q: Queries,
   row: AdoptedSpeakerSnapshot,
   adopted: boolean,
 ): Promise<void> {
+  if (typeof row.selected !== 'boolean') {
+    throw new Error('Constraint: selected must be boolean');
+  }
+  // Compatibility is deliberately scoped to the still-single-player core.
+  if (
+    row.selected && !(await q.all('SELECT id FROM players WHERE id = 1')).length
+  ) {
+    throw new Error('Player not found');
+  }
   await q.run(
-    `INSERT INTO output_state (id, host, port, name, type, selected,
+    `INSERT INTO output_state (id, host, port, name, type, player_id,
        volume, model, connection_strategy, adopted, receiver_identity)
      VALUES (${esc(row.id)},
        ${row.host === undefined ? 'NULL' : esc(row.host)},
        ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
        ${esc(row.name)}, ${esc(row.type)},
-       ${row.selected}, ${Math.trunc(row.volume)},
+        ${row.selected ? 1 : 'NULL'}, ${Math.trunc(row.volume)},
        ${row.model === undefined ? 'NULL' : esc(row.model)},
        ${esc(row.connectionStrategy)}, ${adopted},
        ${
@@ -61,7 +127,8 @@ async function save(
        port = excluded.port,
        name = excluded.name,
        type = excluded.type,
-       selected = excluded.selected,
+        linked = CASE WHEN excluded.player_id = 1 AND output_state.player_id IS DISTINCT FROM 1 THEN true ELSE output_state.linked END,
+        player_id = CASE WHEN excluded.player_id = 1 THEN 1 WHEN output_state.player_id = 1 THEN NULL ELSE output_state.player_id END,
        volume = excluded.volume,
        model = excluded.model,
        receiver_identity = excluded.receiver_identity,
@@ -86,7 +153,7 @@ async function load(
     receiver_identity: string | null;
     connection_strategy: string | null;
   }>(
-    `SELECT id, host, port, name, type, selected, volume, model,
+    `SELECT id, host, port, name, type, coalesce(player_id = 1, false) AS selected, volume, model,
        connection_strategy, receiver_identity FROM output_state${
       adoptedOnly ? ' WHERE adopted' : ''
     }
@@ -113,6 +180,20 @@ async function load(
 /** Sole writer for speaker configuration and independent ignore identities. */
 export function createSpeakersStore(engine: Engine) {
   return {
+    loadMemberships(): Promise<SpeakerMembership[]> {
+      return engine.exclusive(async (q) => {
+        const rows = await q.all<
+          { id: string; player_id: number | null; linked: boolean }
+        >(
+          'SELECT id, player_id, linked FROM output_state ORDER BY id',
+        );
+        return rows.map((r) => ({
+          speakerId: r.id,
+          playerId: r.player_id,
+          linked: r.linked,
+        }));
+      });
+    },
     saveAdopted(
       row: AdoptedSpeakerSnapshot,
       credentials: EncryptedSpeakerCredential[] = [],

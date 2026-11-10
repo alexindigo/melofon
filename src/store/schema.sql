@@ -309,22 +309,37 @@ ALTER TABLE state ADD COLUMN IF NOT EXISTS declared BOOLEAN DEFAULT false;
 ALTER TABLE state ADD COLUMN IF NOT EXISTS write_only BOOLEAN DEFAULT false;
 -- Restart transparency (plan restart-transparency): the server engine's queue
 -- and player state, keep-on-rescan user state. Only typed references are saved.
+CREATE SEQUENCE IF NOT EXISTS server_player_seq START 2;
+CREATE TABLE IF NOT EXISTS players (
+  id INTEGER PRIMARY KEY,
+  name VARCHAR NOT NULL,
+  name_key VARCHAR UNIQUE NOT NULL,
+  volume INTEGER NOT NULL CHECK (volume BETWEEN 0 AND 100),
+  is_default BOOLEAN NOT NULL,
+  commanded_at_ms BIGINT
+);
 CREATE TABLE IF NOT EXISTS server_queue (
-  pos INTEGER PRIMARY KEY,
+  player_id INTEGER NOT NULL,
+  pos INTEGER NOT NULL,
   entry_id BIGINT UNIQUE NOT NULL,
   reference_kind VARCHAR NOT NULL CHECK (reference_kind IN ('song', 'station', 'url')),
-  reference_value VARCHAR NOT NULL
+  reference_value VARCHAR NOT NULL,
+  PRIMARY KEY (player_id, pos)
 );
 CREATE TABLE IF NOT EXISTS server_queue_state (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  next_id BIGINT NOT NULL,
+  player_id INTEGER PRIMARY KEY,
   version BIGINT NOT NULL
 );
--- One-row table (id = 1): the last persisted engine snapshot. updated_at
+-- Entry ids are household-wide. Queue revisions belong to each player.
+CREATE TABLE IF NOT EXISTS server_queue_allocator (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  next_id BIGINT NOT NULL
+);
+-- One snapshot per player. updated_at
 -- (tz-aware, like now_playing.started_at) drives the resume-freshness
 -- window (MELOFON_RESUME_MAX_AGE_SEC).
 CREATE TABLE IF NOT EXISTS player_state (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
+  player_id INTEGER PRIMARY KEY,
   state VARCHAR NOT NULL,
   current_index INTEGER,
   position_ms BIGINT,
@@ -344,7 +359,8 @@ CREATE TABLE IF NOT EXISTS output_state (
   port INTEGER,
   name VARCHAR,
   type VARCHAR,
-  selected BOOLEAN NOT NULL,
+  player_id INTEGER,
+  linked BOOLEAN NOT NULL DEFAULT true,
   volume INTEGER NOT NULL
 );
 -- ATV3 session recycle (plan atv3-session-recycle): the raw device model

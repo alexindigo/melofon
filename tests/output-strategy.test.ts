@@ -220,7 +220,7 @@ Deno.test('strategies: migration backfills legacy Melofon, does not overwrite sa
       'ALTER TABLE output_state DROP COLUMN IF EXISTS connection_strategy',
     );
     await rawSql(s.db).run(
-      "INSERT INTO output_state (id,name,type,selected,volume,adopted) VALUES ('legacy','old','AirPlay',false,100,true)",
+      "INSERT INTO output_state (id,name,type,player_id,volume,adopted) VALUES ('legacy','old','AirPlay',NULL,100,true)",
     );
     await s.state.set(KEY, 'owntone');
     await s.db.close();

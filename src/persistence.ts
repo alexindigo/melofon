@@ -22,7 +22,7 @@ export type { PersistedPlayerState } from './store/playback.ts';
 export interface Persistence extends PlayerPersistence, OutputPersistence {
   /** Ordered occurrences, durable allocator and revision, without runtime facts. */
   loadQueue(): Promise<QueueSnapshot>;
-  /** The singleton state row, or null when never persisted. */
+  /** The player's state row, or null when never persisted. */
   loadPlayerState(): Promise<PersistedPlayerState | null>;
   /** Adopted output preferences only (also seeds the savedOutput cache). */
   loadOutputs(): Promise<PersistedOutput[]>;
@@ -51,16 +51,16 @@ export function createPersistence(
   return {
     saveQueue(snapshot, state) {
       const copy = structuredClone(snapshot);
-      enqueue(() => store.playback.saveQueue(copy, state));
+      enqueue(() => store.playback.saveQueue(1, copy, state));
     },
 
     saveState(snapshot) {
-      enqueue(() => store.playback.saveState(snapshot));
+      enqueue(() => store.playback.saveState(1, snapshot));
     },
 
-    loadQueue: () => store.playback.loadQueue(),
+    loadQueue: () => store.playback.loadQueue(1),
 
-    loadPlayerState: () => store.playback.loadPlayerState(),
+    loadPlayerState: () => store.playback.loadPlayerState(1),
 
     saveOutput(row) {
       // Only explicit adoption (or an adopted row loaded at boot) authorizes

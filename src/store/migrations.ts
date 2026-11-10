@@ -4,6 +4,7 @@ import { migrateUserNames } from './users.ts';
 import { migrateSettings } from './state.ts';
 import { migrateAdoptedSpeakers } from './speakers.ts';
 import { migrateQueueReferences } from './playback.ts';
+import { migratePlayers } from './players.ts';
 
 /** Run each release migration and its receipt in the same transaction. */
 export async function migrate(q: Queries): Promise<string[]> {
@@ -23,6 +24,9 @@ export async function migrate(q: Queries): Promise<string[]> {
   }, {
     id: 'server-queue-001',
     apply: migrateQueueReferences,
+  }, {
+    id: 'players-001',
+    apply: migratePlayers,
   }];
   for (const migration of migrations) {
     await q.run('BEGIN TRANSACTION');
