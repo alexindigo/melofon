@@ -26,8 +26,10 @@ export default async (_request: HatRequest, context: HatContext) => {
       0,
       Math.floor((Date.now() - row.reportedAtMs) / 60000),
     ),
-    playerId: row.kind === 'server' ? 0 : row.appPlayerId,
-    playerName: row.kind === 'server' ? row.label : row.client,
+    // Keep Home at 0; other server engines use negative integers, disjoint
+    // from the positive, durable app-player sequence. No wire fields change.
+    playerId: row.kind === 'server' ? 1 - row.playerId : row.appPlayerId,
+    playerName: row.kind === 'server' ? row.playerName : row.client,
     state: row.state,
     positionMs: row.positionMs,
     playbackRate: row.playbackRate,

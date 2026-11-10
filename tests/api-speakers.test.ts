@@ -191,6 +191,8 @@ Deno.test('speaker HTTP reads project discovered facts and failures while OwnTon
       port: 7000,
       model: 'AppleTV3,1',
       selected: false,
+      playerId: null,
+      linked: true,
       volume: 100,
       connectionStrategy: 'melofon',
       adopted: false,

@@ -11,6 +11,37 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
   } catch (error) {
     if (!(error instanceof Error) || !('code' in error)) throw error;
     const code = error.code;
+    if (error.name === 'PlayerError') {
+      fail(
+        code === 'not_found'
+          ? 404
+          : code === 'invalid_name'
+          ? 400
+          : code === 'closed'
+          ? 503
+          : 409,
+        String(code),
+        error.message,
+      );
+    }
+    if (error.name === 'PlaybackError') {
+      throw new HttpError(
+        code === 'airplay_busy'
+          ? 409
+          : code === 'missing_reference'
+          ? 404
+          : code === 'invalid_reference'
+          ? 400
+          : 409,
+        {
+          code,
+          message: error.message,
+          ...(code === 'airplay_busy' && 'owner' in error
+            ? { owner: error.owner }
+            : {}),
+        },
+      );
+    }
     if (error.name === 'HlsError') {
       fail(400, String(code), error.message);
     }

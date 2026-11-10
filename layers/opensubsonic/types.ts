@@ -705,6 +705,8 @@ export type NowPlayingViewRow =
     | { kind: 'app'; username: string; client: string; appPlayerId: number }
     | {
       kind: 'server';
+      playerId: number;
+      playerName: string;
       label: string;
       commander: string | null;
       speakers: { id: string; name: string }[];

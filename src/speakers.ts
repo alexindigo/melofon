@@ -76,6 +76,8 @@ export interface SpeakerView {
   port?: number;
   model?: string;
   selected: boolean;
+  playerId: number | null;
+  linked: boolean;
   volume: number;
   connectionStrategy: Output['connectionStrategy'];
   adopted: boolean;
@@ -159,6 +161,8 @@ export function createSpeakers(deps: {
       ...(row.port === undefined ? {} : { port: row.port }),
       ...(row.model === undefined ? {} : { model: row.model }),
       selected: row.selected,
+      playerId: outputPlayerId(row),
+      linked: row.linked ?? true,
       volume: row.volume,
       connectionStrategy: row.connectionStrategy,
       ...deps.outputs.lifetime(row.id),

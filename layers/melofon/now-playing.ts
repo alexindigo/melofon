@@ -15,6 +15,8 @@ export function nowPlayingPayload(row: NowPlayingViewRow) {
       : {
         kind: row.kind,
         label: row.label,
+        playerId: row.playerId,
+        playerName: row.playerName,
         commander: row.commander,
         speakers: row.speakers.map(({ id, name }) => ({ id, name })),
       }),

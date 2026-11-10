@@ -166,6 +166,7 @@ export interface Playback {
 
 export function createPlayback(deps: {
   playerId?: number;
+  playerName?: () => string;
   capacity?: PlaybackCapacity;
   reserveQueueIds?: (count: number) => Promise<number>;
   player: Player;
@@ -298,6 +299,8 @@ export function createPlayback(deps: {
       ...media,
       kind: 'server',
       entryId: id,
+      playerId: deps.playerId ?? 1,
+      playerName: deps.playerName?.() ?? 'melofon',
       label: 'melofon',
       commander,
       speakers: selectedSpeakers(),

@@ -37,6 +37,8 @@ export type NowPlayingViewRow =
     | {
       kind: 'server';
       entryId: number;
+      playerId: number;
+      playerName: string;
       label: string;
       /** External commands replace attribution; internal transitions retain it. */
       commander: string | null;

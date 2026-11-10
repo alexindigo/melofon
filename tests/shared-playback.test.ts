@@ -394,7 +394,8 @@ Deno.test('core server row retains truthful clocks, selected speakers and extern
     assertEquals(first.startedAtMs, time);
     assertEquals(first.reportedAtMs, time);
     assertEquals('username' in first, false);
-    assertEquals('playerId' in first, false);
+    assertEquals(first.playerId, 1);
+    assertEquals(first.playerName, 'melofon');
     assertEquals('source' in first, false);
 
     time += 500;

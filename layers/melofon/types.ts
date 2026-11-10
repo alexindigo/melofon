@@ -252,6 +252,17 @@ export interface HatContext {
       nowPlayingView(): Promise<NowPlayingViewRow[]>;
       reportSessionPlayback(report: SessionPlaybackReport): Promise<boolean>;
     };
+    players: {
+      list(): PlayerRow[];
+      get(id: number): PlayerPlayback;
+      create(name: string): Promise<PlayerRow>;
+      rename(id: number, name: string): Promise<void>;
+      delete(id: number): Promise<void>;
+      setDefault(id: number): Promise<void>;
+      members(id: number): { id: string; name: string; linked?: boolean }[];
+      join(id: number, speakerId: string, source?: Source): Promise<void>;
+      leave(id: number, speakerId: string, source?: Source): Promise<void>;
+    };
     stream: {
       session(
         request: Request,
@@ -527,6 +538,8 @@ export interface SpeakerView {
   port?: number;
   model?: string;
   selected: boolean;
+  playerId: number | null;
+  linked: boolean;
   volume: number;
   connectionStrategy: 'melofon' | 'owntone' | 'audiostation';
   abilities: {
@@ -593,11 +606,37 @@ export type NowPlayingViewRow =
     | { kind: 'app'; username: string; client: string; appPlayerId: number }
     | {
       kind: 'server';
+      playerId: number;
+      playerName: string;
       label: string;
       commander: string | null;
       speakers: { id: string; name: string }[];
     }
   );
+
+export interface PlayerRow {
+  id: number;
+  name: string;
+  isDefault: boolean;
+}
+
+export interface PlayerPlayback {
+  playerView(): {
+    state: 'play' | 'pause' | 'stop';
+    repeat: 'off' | 'all' | 'single';
+    consume: boolean;
+    shuffle: boolean;
+    volume: number;
+    itemLengthMs: number;
+    itemProgressMs: number;
+    capabilities: { live: boolean; seekable: boolean };
+  };
+  serverNowPlayingView():
+    | (Extract<NowPlayingViewRow, { kind: 'server' }> & {
+      entryId: number;
+    })
+    | null;
+}
 
 export interface Setting {
   key: string;

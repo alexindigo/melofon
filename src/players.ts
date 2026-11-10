@@ -147,6 +147,7 @@ export async function createPlayers(deps: {
     const playback = createPlayback({
       ...deps.playback,
       playerId: row.id,
+      playerName: () => row.name,
       player,
       outputs,
       reports: deps.reports,
@@ -434,6 +435,7 @@ export async function createPlayers(deps: {
         await deps.store.players.rename(id, name);
         engine.row.name = name;
         changed(id);
+        deps.notify.emit(['nowPlaying'], undefined, 'all');
       }),
     setDefault: (id: number) =>
       mutate(async () => {
