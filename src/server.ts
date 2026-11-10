@@ -39,6 +39,10 @@ import {
 } from './player.ts';
 import { createPersistence } from './persistence.ts';
 import { createPlayback } from './playback.ts';
+import {
+  createPlaybackReports,
+  type PlaybackReports,
+} from './playback-reports.ts';
 import { createQueueResolver } from './queue-source.ts';
 import { createNotify } from './notify.ts';
 import { createState } from './state.ts';
@@ -209,11 +213,21 @@ export async function startServer(options: {
     pair: (id) => airplayBoot.pair(id),
     submitPin: (id, pin) => airplayBoot.submitPin(id, pin),
   });
+  const reports: PlaybackReports = createPlaybackReports({
+    nowPlaying,
+    library,
+    sessions: authentication.sessions,
+    notify,
+    serverRows: () => {
+      const row = playback.serverNowPlayingView();
+      return row ? [row] : [];
+    },
+  });
   const playback = createPlayback({
     player,
     outputs,
     nowPlaying,
-    sessions: authentication.sessions,
+    reports,
     library,
     cfg,
     notify,
@@ -433,7 +447,7 @@ export async function startServer(options: {
   const engineClock = setInterval(() => {
     void playback.advanceEnded();
   }, 500);
-  await playback.startReportExpiry(state);
+  await reports.startReportExpiry(state);
 
   // MELOFON_AIRPLAY_HOST=<ip>[:port] — unicast-resolve TXT at that host, then
   // register. The CRUD twin is POST /_/outputs. Bare IP if resolve times out.
@@ -481,6 +495,7 @@ export async function startServer(options: {
       await airplayBoot.close();
       shutdownNativeLogging();
       await playback.close();
+      await reports.close();
       await persistence.drain();
       await store.close();
     },

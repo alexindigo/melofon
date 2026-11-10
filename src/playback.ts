@@ -1,9 +1,7 @@
-// src/playback.ts — app.playback: THE playback core. Two planes
-// (ARCHITECTURE §4): A, the server engine (one queue, real item ids — drives
-// boots in M6); B, client sessions (the app plays; rows in app.nowPlaying).
-// Hats parse inbound protocol into ONE command here and encode views back
-// out. They keep no playback state, never merge stores, never emit — core
-// mutates, then emits on app.notify after every successful command.
+// Engine control facade. Owns this engine's commands, source lifetime and
+// persistence; app reports and aggregate now-playing delegate to the household
+// report owner. Hats parse one command and encode the result, without keeping
+// playback state, merging stores or emitting changes themselves.
 //
 // Commands:
 //   reportPlaying / reportStopped      plane B session writes
@@ -12,7 +10,7 @@
 //   queueAdd/queueClear
 // Views:
 //   playerView()      engine only (HA/OwnTone media_player; stop ⇒ no current)
-//   queueView()       the engine queue (real queue-local ids)
+//   queueView()       this engine's queue (permanent occurrence ids)
 //   nowPlayingView()  all B sessions + the engine's current when play/pause
 import type { Library, SongRow } from './library.ts';
 import type {
@@ -23,6 +21,14 @@ import type {
 import type { Sessions } from './sessions.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
+import {
+  createPlaybackReports,
+  type NowPlayingViewRow,
+  type PlaybackReports,
+  type ReportPlaying,
+  type ServerNowPlayingRow,
+} from './playback-reports.ts';
+export type { NowPlayingViewRow, ReportPlaying } from './playback-reports.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { PlaybackError } from './playback-errors.ts';
 import { planSourceFailure } from './source-recovery.ts';
@@ -47,48 +53,6 @@ import type {
   RestoreSnapshot,
   SourceOutcome,
 } from './player.ts';
-
-export interface ReportPlaying {
-  username: string;
-  client: string;
-  trackId: string;
-  /** The stream/report minting this session — reportStopped only clears a
-   * session whose streamId is still current (an older Range completing must
-   * not clear a newer stream). */
-  streamId: string;
-  positionMs?: number;
-}
-
-interface NowPlayingFacts {
-  positionMs: number | null;
-  startedAtMs: number | null;
-  reportedAtMs: number;
-  state: 'starting' | 'playing' | 'paused';
-  playbackRate: number;
-}
-
-export type NowPlayingViewRow =
-  & NowPlayingFacts
-  & QueueMedia
-  & (
-    | {
-      kind: 'app';
-      username: string;
-      client: string;
-      appPlayerId: number;
-    }
-    | {
-      kind: 'server';
-      entryId: number;
-      label: string;
-      /** Last external commander's known username, not the seeded account.
-       * An anonymous external command replaces it with null; internal commands
-       * and natural transitions preserve it. No request diagnostics escape. */
-      commander: string | null;
-      /** Selected targets, not evidence of audible output. */
-      speakers: { id: string; name: string }[];
-    }
-  );
 
 /** A boot retains its own admission authority across asynchronous preparation.
  * Core checks it again immediately before committing the engine transition. */
@@ -183,6 +147,8 @@ export interface Playback {
   playerView(): PlayerStatus;
   queueView(): { version: number; items: QueueEntry[] };
   nowPlayingView(): Promise<NowPlayingViewRow[]>;
+  /** This engine's live aggregate input. App sessions are household-owned. */
+  serverNowPlayingView(): ServerNowPlayingRow | null;
   /** The last recorded engine mutation (null before the first). */
   lastCommand(): LastCommand | null;
   /** Core lifecycle; also callable with a controlled report clock in tests. */
@@ -195,7 +161,7 @@ export interface Playback {
 export function createPlayback(deps: {
   player: Player;
   nowPlaying: NowPlaying;
-  library: Library;
+  library: Pick<Library, 'getSong'>;
   cfg: { user?: string };
   outputs?: Pick<Outputs, 'list'>;
   /** Server composition supplies the speaker owner. Engine-only callers can
@@ -206,6 +172,9 @@ export function createPlayback(deps: {
   };
   notify?: Notify;
   sessions?: Pick<Sessions, 'onSessionsEnded'>;
+  /** Server composition owns this once. Standalone callers retain one-player
+   * behavior by allowing createPlayback to own a private report service. */
+  reports?: PlaybackReports;
   /** Restart transparency (plan restart-transparency): when present, every
    * state change flushes the engine snapshot and queue, and a 1 Hz tick
    * keeps position_ms current while playing. */
@@ -220,7 +189,7 @@ export function createPlayback(deps: {
   state?: Pick<State, 'declare' | 'getTyped'>;
   log?: Log;
 }): Playback {
-  const { player, nowPlaying, library, outputs, notify, persistence } = deps;
+  const { player, library, outputs, notify, persistence } = deps;
   const log = deps.log ?? scopedLog('playback');
   let openedSource: PlaybackSource | null = null;
   const recoverySettings = {
@@ -269,6 +238,24 @@ export function createPlayback(deps: {
   // logged with its source. Unsourced callers are internal drivers.
   let last: LastCommand | null = null;
   let commander: string | null = null;
+  const serverNowPlayingView = (): ServerNowPlayingRow | null => {
+    const status = player.status();
+    if (status.current === null || status.clock === null) return null;
+    const { id, ...media } = status.current;
+    return {
+      ...media,
+      kind: 'server',
+      entryId: id,
+      label: 'melofon',
+      commander,
+      speakers: selectedSpeakers(),
+      positionMs: status.itemProgressMs,
+      startedAtMs: status.clock.startedAtMs,
+      reportedAtMs: status.clock.reportedAtMs,
+      state: status.state === 'play' ? 'playing' : 'paused',
+      playbackRate: 1,
+    };
+  };
   let serverPresent = hasServerRow();
   let announcedCommander: string | null = commander;
   let announcedQueueVersion = player.queue().version;
@@ -483,32 +470,16 @@ export function createPlayback(deps: {
   }, 1000);
   let closed = false;
   let closing = false;
-  let expiryStarted = false;
-  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
-  let expiryTask: Promise<void> | undefined;
-  let expiryWork: Promise<boolean> | undefined;
-  // A timer and an explicit sweep share one operation, not competing removals
-  // or duplicate events. Persistence completes before the invalidation is emitted.
-  const expireReports = (): Promise<boolean> => {
-    if (closed) return Promise.resolve(false);
-    return expiryWork ??= (async () => {
-      try {
-        const changed = await nowPlaying.expire();
-        if (changed) invalidateNowPlaying();
-        return changed;
-      } finally {
-        expiryWork = undefined;
-      }
-    })();
-  };
-  // One subscription per aggregate owner. Queue after any in-flight sweep so
-  // a revoke cannot be missed by a sweep whose transaction preceded it.
-  let sessionCleanup = Promise.resolve();
-  const unsubscribeSessions = deps.sessions?.onSessionsEnded(() => {
-    sessionCleanup = sessionCleanup.then(async () => {
-      await expiryWork;
-      await expireReports();
-    }).catch((error) => log.event('playback_expiry_failed', { error }));
+  const reports = deps.reports ?? createPlaybackReports({
+    nowPlaying: deps.nowPlaying,
+    library,
+    sessions: deps.sessions,
+    notify,
+    log,
+    serverRows: () => {
+      const row = serverNowPlayingView();
+      return row ? [row] : [];
+    },
   });
   const addSources = (
     media: QueueMedia[],
@@ -785,71 +756,12 @@ export function createPlayback(deps: {
       }
       return true;
     },
-    expireReports,
-    async startReportExpiry(state) {
-      if (closed || expiryStarted) return;
-      expiryStarted = true;
-      state.declare('playback.sessionSweepSeconds', {
-        type: 'number',
-        minimum: 0.01,
-        maximum: 3600,
-        default: 1,
-      });
-      let intervalMs = 1000;
-      const cycle = async () => {
-        try {
-          intervalMs =
-            (await state.getTyped('playback.sessionSweepSeconds') as number) *
-            1000;
-          if (!closing) await expireReports();
-        } catch (error) {
-          log.event('playback_expiry_failed', { error });
-        } finally {
-          // Self-scheduling bounds work even if a store call takes longer than
-          // the cadence. Read live policy again each cycle; no per-hat timer.
-          if (!closing) {
-            expiryTimer = setTimeout(() => {
-              expiryTask = cycle();
-            }, intervalMs);
-          }
-        }
-      };
-      expiryTask = cycle();
-      await expiryTask;
-    },
-    async reportPlaying(report) {
-      // Queue the session write before an abort can queue its clear. Catalog
-      // duration is resolved by the store's session view, not awaited here.
-      await nowPlaying.set(
-        report.username,
-        report.client,
-        report.trackId,
-        report.streamId,
-        report.positionMs,
-      );
-      invalidateNowPlaying();
-    },
-
-    async reportStopped({ streamId }) {
-      // Clears only when this streamId is still the session's current one.
-      if (await nowPlaying.clearByStreamId(streamId)) invalidateNowPlaying();
-    },
-
-    async reportPlayback(report) {
-      const song = await library.getSong(report.trackId);
-      if (!song) return false;
-      await nowPlaying.report(report, song.durationMs);
-      invalidateNowPlaying();
-      return true;
-    },
-
-    async reportSessionPlayback(report) {
-      const song = await library.getSong(report.trackId);
-      if (!song) return false;
-      const changed = await nowPlaying.reportSession(report, song.durationMs);
-      if (changed) invalidateNowPlaying();
-      return changed;
-    },
+    expireReports: reports.expireReports,
+    startReportExpiry: reports.startReportExpiry,
+    reportPlaying: reports.reportPlaying,
+    reportStopped: reports.reportStopped,
+    reportPlayback: reports.reportPlayback,
+    reportSessionPlayback: reports.reportSessionPlayback,
 
     play(source, authority) {
       const view = player.status();
@@ -1196,57 +1108,18 @@ export function createPlayback(deps: {
     queueView: () => player.queue(),
     lastCommand: () => last,
 
-    async nowPlayingView() {
-      const out: NowPlayingViewRow[] = [];
-      const status = player.status();
-      if (status.current !== null && status.clock !== null) {
-        const { id, ...media } = status.current;
-        out.push({
-          ...media,
-          kind: 'server',
-          entryId: id,
-          label: 'melofon',
-          commander,
-          speakers: selectedSpeakers(),
-          positionMs: status.itemProgressMs,
-          startedAtMs: status.clock.startedAtMs,
-          reportedAtMs: status.clock.reportedAtMs,
-          state: status.state === 'play' ? 'playing' : 'paused',
-          playbackRate: 1,
-        });
-      }
-      for (const row of await nowPlaying.list()) {
-        const song = await library.getSong(row.trackId);
-        if (song === null) continue; // track vanished since the report
-        out.push({
-          kind: 'app',
-          username: row.username,
-          client: row.client,
-          ...catalogMedia(song),
-          positionMs: row.positionMs,
-          startedAtMs: row.startedAtMs,
-          reportedAtMs: row.reportedAtMs,
-          state: row.state,
-          playbackRate: row.playbackRate,
-          appPlayerId: row.playerId,
-        });
-      }
-      return out;
-    },
+    serverNowPlayingView,
+    nowPlayingView: reports.nowPlayingView,
 
     async close() {
       cancelStart();
       // Revoke a parked source even if its boot is being closed separately.
       if (openedSource) player.cancelSource(openedSource);
       closing = true;
-      unsubscribeSessions?.();
       unsubscribeOutputs?.();
-      clearTimeout(expiryTimer);
       if (tick !== null) clearInterval(tick);
-      await sessionCleanup;
+      if (deps.reports === undefined) await reports.close();
       closed = true;
-      await expiryTask;
-      await expiryWork;
       await failureWork?.promise;
     },
   };
