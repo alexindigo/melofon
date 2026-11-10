@@ -25,7 +25,7 @@ function deferred() {
 }
 
 /** Explicitly composed engine/boot consumers. Registry wiring is f04b. */
-async function fixture() {
+async function fixture(options: { eofGate?: Promise<void> } = {}) {
   const dir = await restored('playback-capacity', async (dir) => {
     const store = await openStore(dir);
     try {
@@ -172,15 +172,42 @@ async function fixture() {
     })
   );
   for (const engine of playback) await engine.queueAdd(songs);
-  const boots = playback.map((engine, index) =>
-    createAirplayBoot({
+  const sourceEnds = [new Set<number>(), new Set<number>()];
+  let eofEntered = false;
+  const boots = playback.map((engine, index) => {
+    const media = createMedia();
+    return createAirplayBoot({
       playerId: index + 1,
-      playback: engine,
+      playback: {
+        ...engine,
+        reportSourceOutcome(source, outcome) {
+          const accepted = engine.reportSourceOutcome(source, outcome);
+          if (accepted && outcome === 'eof') {
+            sourceEnds[index].add(source.entryId);
+          }
+          return accepted;
+        },
+      },
       capacity: capacities[index],
       outputs: playerOutputs(outputs, index + 1),
       devices,
       notify,
-      media: createMedia(),
+      media: options.eofGate
+        ? {
+          ...media,
+          async decodePcm(path, opts) {
+            const stream = await media.decodePcm(path, opts);
+            if (!stream) return null;
+            return (async function* () {
+              for await (const chunk of stream) yield chunk;
+              if (index === 0) {
+                eofEntered = true;
+                await options.eofGate;
+              }
+            })();
+          },
+        }
+        : media,
       retryBackoffMs: [0, 0],
       retryTimer: {
         set(callback) {
@@ -188,8 +215,8 @@ async function fixture() {
           return { cancel() {} };
         },
       },
-    })
-  );
+    });
+  });
   const web: QueueMedia = {
     reference: { kind: 'url', url: 'http://melofon.home/test.wav' },
     facts: {
@@ -223,6 +250,8 @@ async function fixture() {
     entered,
     retry,
     times,
+    sourceEnds,
+    eofEntered: () => eofEntered,
     async close() {
       for (const engine of playback) await engine.close();
       await Promise.all(boots.map((boot) => boot.close()));
@@ -562,13 +591,26 @@ Deno.test('capacity waits for every receiver connection, not just the elected PC
 });
 
 Deno.test('natural advancement retains the stream and releases it after end-of-queue cleanup', async () => {
-  const f = await fixture();
+  const held = deferred(), f = await fixture({ eofGate: held.promise });
   try {
     await f.playback[0].play();
-    await until(() => f.sessions[0]?.bytes > 0);
+    const first = f.playback[0].playerView().current!.id;
+    await until(() => f.eofEntered());
+    assert(f.sessions[0].bytes > 0);
+    // Expiring the clock is not source completion. The standalone fixture
+    // supplies its own ticks, so retry only after the actual EOF is accepted.
     f.times[0] += f.playback[0].playerView().itemLengthMs + 1;
     await f.playback[0].advanceEnded();
+    assertEquals(f.playback[0].playerView().current!.id, first);
+    assertEquals(f.sessions.length, 1);
+    assertEquals(f.sessions[0].closed, false);
+    await busy(() => f.playback[1].play());
+    held.resolve();
+    await until(() => f.sourceEnds[0].has(first));
+    await f.playback[0].advanceEnded();
     await until(() => f.sessions[1]?.bytes > 0);
+    const second = f.playback[0].playerView().current!.id;
+    await until(() => f.sourceEnds[0].has(second));
     await busy(() => f.playback[1].play());
     f.times[0] += f.playback[0].playerView().itemLengthMs + 1;
     await f.playback[0].advanceEnded();
@@ -577,6 +619,7 @@ Deno.test('natural advancement retains the stream and releases it after end-of-q
     await f.playback[1].play();
     await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
   } finally {
+    held.resolve();
     await f.close();
   }
 });

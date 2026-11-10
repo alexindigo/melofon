@@ -359,6 +359,9 @@ export async function playbackCommand<T>(
     ) {
       if (error.code === 'invalid_reference') return badRequest();
       if (error.code === 'missing_reference') return notFound();
+      if (error.code === 'airplay_busy') {
+        return new Response(error.message, { status: 500 });
+      }
       const messages: Record<string, string> = {
         no_target: 'Select a speaker before playing',
         target_unavailable: 'Selected speakers are unavailable',

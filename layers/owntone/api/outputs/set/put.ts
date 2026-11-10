@@ -1,6 +1,11 @@
 // layers/owntone/api/outputs/set/put.ts — PUT /api/outputs/set: JSON body
 // { outputs: [id, …] } enables exactly those ids.
-import { badRequest, noContent, sourceFrom } from '#owntone/payloads.ts';
+import {
+  badRequest,
+  noContent,
+  playbackCommand,
+  sourceFrom,
+} from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
 
 export default async (request: HatRequest, context: HatContext) => {
@@ -16,7 +21,12 @@ export default async (request: HatRequest, context: HatContext) => {
   ) {
     return badRequest();
   }
-  return await context.app.outputs.setEnabled(body.outputs, sourceFrom(request))
-    ? noContent()
-    : badRequest();
+  return playbackCommand(
+    () =>
+      context.app.outputs.setEnabled(
+        body.outputs as string[],
+        sourceFrom(request),
+      ),
+    (updated) => updated ? noContent() : badRequest(),
+  );
 };

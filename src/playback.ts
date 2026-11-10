@@ -483,6 +483,15 @@ export function createPlayback(deps: {
       }
       if (changed && hasServerRow()) invalidateNowPlaying();
       releaseInactiveCapacity();
+      // A playing engine can acquire its first constrained output through a
+      // membership command. Registry admission holds a ticket during this
+      // synchronous notification, but only playback retains active demand.
+      if (
+        player.status().state === 'play' && needsCapacity() &&
+        !activeReservation
+      ) {
+        activeReservation = deps.capacity!.reserve();
+      }
     });
   const record = (
     kind: string,

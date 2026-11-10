@@ -11,7 +11,12 @@ import {
 } from './player.ts';
 import { SpeakerError } from './speaker-errors.ts';
 import { createPlayback, type Playback } from './playback.ts';
+import { PlaybackError } from './playback-errors.ts';
 import type { PlaybackReports } from './playback-reports.ts';
+import type {
+  createPlaybackCapacity,
+  PlaybackCapacity,
+} from './playback-capacity.ts';
 import type { SpeakerPairingView } from './speakers.ts';
 import { outputPlayerId, playerOutputs } from './player-outputs.ts';
 import type { Notify } from './notify.ts';
@@ -57,6 +62,7 @@ export async function createPlayers(deps: {
       | 'persistence'
       | 'reserveQueueIds'
       | 'targets'
+      | 'capacity'
     >
     & {
       resolveQueueReference: NonNullable<
@@ -66,10 +72,12 @@ export async function createPlayers(deps: {
   targets?(
     playerId: number,
   ): NonNullable<Parameters<typeof createPlayback>[0]['targets']>;
+  capacity?: Pick<ReturnType<typeof createPlaybackCapacity>, 'forPlayer'>;
   createBoot?(
     playerId: number,
     playback: Playback,
     outputs: Outputs,
+    capacity?: PlaybackCapacity,
   ): PlayerBoot;
   clock?: Parameters<typeof createPlayer>[0];
   now?: () => number;
@@ -80,6 +88,7 @@ export async function createPlayers(deps: {
     playback: Playback;
     outputs: Outputs;
     persistence: EnginePersistence;
+    capacity?: PlaybackCapacity;
     boot?: PlayerBoot;
     clock?: ReturnType<typeof setInterval>;
     disposing: boolean;
@@ -131,6 +140,10 @@ export async function createPlayers(deps: {
     const persistence = deps.persistence.forPlayer(row.id);
     const outputs = playerOutputs(deps.outputs, row.id);
     const player = createPlayer(deps.clock);
+    const capacity = deps.capacity?.forPlayer(() => ({
+      id: row.id,
+      name: row.name,
+    }));
     const playback = createPlayback({
       ...deps.playback,
       playerId: row.id,
@@ -146,9 +159,17 @@ export async function createPlayers(deps: {
       },
       reserveQueueIds: (count) => deps.store.players.reserveQueueIds(count),
       targets: deps.targets?.(row.id),
+      capacity,
       notify: deps.notify,
     });
-    const engine = { row, playback, outputs, persistence, disposing: false };
+    const engine = {
+      row,
+      playback,
+      outputs,
+      persistence,
+      capacity,
+      disposing: false,
+    };
     engines.set(row.id, engine);
     return engine;
   };
@@ -157,6 +178,7 @@ export async function createPlayers(deps: {
       engine.row.id,
       engine.playback,
       engine.outputs,
+      engine.capacity,
     );
     engine.clock = setInterval(() => {
       void engine.playback.advanceEnded();
@@ -171,7 +193,12 @@ export async function createPlayers(deps: {
   };
   try {
     for (const row of await deps.store.players.list()) add(row);
-    for (const engine of engines.values()) {
+    // Command time, not periodic bookmark time, chooses a conflicting restore.
+    // Unknown/equal command times retain the stable stored player order.
+    const restoreOrder = [...engines.values()].sort((a, b) =>
+      (b.row.commandedAtMs ?? -Infinity) - (a.row.commandedAtMs ?? -Infinity)
+    );
+    for (const engine of restoreOrder) {
       const snapshot = await planRestore({
         queue: await engine.persistence.loadQueue(),
         saved: await engine.persistence.loadPlayerState(),
@@ -183,7 +210,18 @@ export async function createPlayers(deps: {
         ),
       });
       if (snapshot) {
-        await engine.playback.restore(snapshot);
+        try {
+          await engine.playback.restore(snapshot);
+        } catch (error) {
+          if (
+            !(error instanceof PlaybackError) || error.code !== 'airplay_busy'
+          ) {
+            throw error;
+          }
+          // Startup resolves competing durable intentions without commanding or
+          // pausing the winner. Explicit start paths still return the refusal.
+          await engine.playback.restore({ ...snapshot, state: 'pause' });
+        }
         log.event('restore_complete', {
           queued: snapshot.queue.length,
           state: engine.playback.playerView().state,
@@ -203,30 +241,44 @@ export async function createPlayers(deps: {
   const members = (id: number) =>
     deps.outputs.list().filter((row) => outputPlayerId(row) === id);
   const changeMembers = (id: number, ids: string[], source?: CommandSource) => {
-    requireEngine(id);
-    return deps.persistence.changeMemberships(() => {
-      const previous = new Set(
-        deps.outputs.list().filter((row) =>
-          outputPlayerId(row) === id || ids.includes(row.id)
-        ).map(outputPlayerId).filter((id): id is number => id !== null),
-      );
-      previous.add(id);
-      if (!deps.outputs.setMembers(id, ids, source)) return false;
-      for (const owner of previous) {
-        const engine = engines.get(owner);
-        if (
-          engine && !engine.disposing && !members(owner).length &&
-          engine.playback.playerView().state === 'play'
-        ) {
-          engine.playback.pause({
-            kind: 'internal',
-            via: 'playback-target-loss',
-          });
+    const engine = requireEngine(id);
+    // Admission and the transaction's capture are synchronous. Playback takes
+    // its own active demand from the outputs notification; this temporary ticket
+    // never becomes a second persistent writer of the engine's demand.
+    const reservation = engine.playback.playerView().state === 'play' &&
+        engine.capacity &&
+        ids.some((id) =>
+          deps.outputs.get(id)?.type === engine.capacity!.protocol
+        )
+      ? engine.capacity.reserve()
+      : undefined;
+    try {
+      return deps.persistence.changeMemberships(() => {
+        const previous = new Set(
+          deps.outputs.list().filter((row) =>
+            outputPlayerId(row) === id || ids.includes(row.id)
+          ).map(outputPlayerId).filter((id): id is number => id !== null),
+        );
+        previous.add(id);
+        if (!deps.outputs.setMembers(id, ids, source)) return false;
+        for (const owner of previous) {
+          const engine = engines.get(owner);
+          if (
+            engine && !engine.disposing && !members(owner).length &&
+            engine.playback.playerView().state === 'play'
+          ) {
+            engine.playback.pause({
+              kind: 'internal',
+              via: 'playback-target-loss',
+            });
+          }
+          if (engine && !engine.disposing) engine.playback.checkpoint();
         }
-        if (engine && !engine.disposing) engine.playback.checkpoint();
-      }
-      return true;
-    });
+        return true;
+      });
+    } finally {
+      reservation?.release();
+    }
   };
   const defaultOutputs = {
     list: () => playerOutputs(deps.outputs, defaultEngine().row.id).list(),

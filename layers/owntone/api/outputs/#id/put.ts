@@ -1,7 +1,12 @@
 // layers/owntone/api/outputs/#id/put.ts — PUT /api/outputs/<id>: JSON body
 // { selected?, volume?, pin? } (format/offset_ms are not implemented). pin
 // is a command passed through to the boot (device PIN entry) — never stored.
-import { badRequest, noContent, sourceFrom } from '#owntone/payloads.ts';
+import {
+  badRequest,
+  noContent,
+  playbackCommand,
+  sourceFrom,
+} from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
 
 export default async (request: HatRequest, context: HatContext) => {
@@ -26,10 +31,8 @@ export default async (request: HatRequest, context: HatContext) => {
       return badRequest();
     }
   }
-  const updated = await context.app.outputs.update(
-    id,
-    opts,
-    sourceFrom(request),
+  return playbackCommand(
+    () => context.app.outputs.update(id, opts, sourceFrom(request)),
+    (updated) => updated === null ? badRequest() : noContent(),
   );
-  return updated === null ? badRequest() : noContent();
 };

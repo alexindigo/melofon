@@ -288,6 +288,7 @@ export async function startServer(options: {
     reports,
     notify,
     maxResumeAgeMs: (cfg.resumeMaxAgeSec ?? 300) * 1000,
+    capacity: airplay.capacity,
     playback: {
       nowPlaying,
       library,
@@ -300,7 +301,7 @@ export async function startServer(options: {
       preparePlayback: (signal) => speakers.preparePlayback(signal, id),
       hasPlaybackTarget: () => speakers.hasPlaybackTarget(id),
     }),
-    createBoot: (playerId, playback, outputs) =>
+    createBoot: (playerId, playback, outputs, capacity) =>
       createAirplayBoot({
         playerId,
         outputs,
@@ -310,6 +311,7 @@ export async function startServer(options: {
         notify,
         state,
         devices: airplay,
+        capacity,
       }),
   });
   const playback = players.playback;
