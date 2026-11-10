@@ -384,6 +384,8 @@ export interface Outputs {
   forget(id: string, source?: CommandSource): Promise<void>;
   /** Fences async work across removal/re-registration, not preference edits. */
   revision(id: string): number;
+  /** Playback authority lifetime; advances on each real ownership change. */
+  membershipRevision(id: string): number;
   lifetime(id: string): { adopted: boolean; discovered: boolean };
   /** Unknown restored reachability differs from an explicit withdrawal. */
   presence(id: string): 'observed' | 'unknown' | 'gone';
@@ -945,6 +947,9 @@ export function createOutputs(
   const isIgnored = (id: string) => ignoredIds().includes(id);
   const blocked = (id: string) => isIgnored(id) || ignoring.has(id);
   const revisions = new Map<string, number>();
+  const memberships = new Map<string, number>();
+  const membershipRevision = (id: string) => memberships.get(id) ?? 0;
+  const move = (id: string) => memberships.set(id, membershipRevision(id) + 1);
   const revision = (id: string) => revisions.get(id) ?? 0;
   const bump = (id: string) => {
     revisions.set(id, revision(id) + 1);
@@ -957,6 +962,7 @@ export function createOutputs(
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
   const owner = outputPlayerId;
   const member = (row: Output, playerId: number | null) => {
+    if (owner(row) !== playerId) move(row.id);
     if (playerId !== null && owner(row) !== playerId) row.linked = true;
     row.playerId = playerId;
     row.selected = playerId === 1;
@@ -1087,6 +1093,7 @@ export function createOutputs(
   const api: Outputs = {
     ready: () => initialization,
     revision,
+    membershipRevision,
     lastCommand: () => last,
     list: (options) =>
       outputs.filter((o) => options?.includeIgnored || !isIgnored(o.id)).map((
@@ -1155,8 +1162,7 @@ export function createOutputs(
       bump(id);
       // Revoke boot authority before publishing removal. Both command listeners
       // and the unregister notification see this incarnation as no longer usable.
-      row.selected = false;
-      if (row.playerId !== undefined) row.playerId = null;
+      member(row, null);
       const cancellations = [...commandListeners].map((fn) => {
         try {
           return Promise.resolve(fn(id, { forget: true }));
@@ -1198,6 +1204,7 @@ export function createOutputs(
         );
       }
       const idx = outputs.findIndex((o) => o.id === output.id);
+      const previousOwner = find(output.id) ? owner(find(output.id)!) : null;
       const saved = persistence?.savedOutput?.(output.id);
       const previousMember = find(output.id)?.playerId;
       const member = output.playerId === undefined
@@ -1246,6 +1253,7 @@ export function createOutputs(
           ...(receiverIdentity === undefined ? {} : { receiverIdentity }),
         };
       }
+      if (owner(find(output.id)!) !== previousOwner) move(output.id);
       if (lifetime === 'observation') saveRow(find(output.id)!);
       record('register', source);
       log.event('command', {

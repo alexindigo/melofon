@@ -197,7 +197,6 @@ export async function startServer(options: {
   const speakers = createSpeakers({
     outputs,
     state,
-    playback: { pause: (source) => playback.pause(source) },
     prepare: airplay.preparePlayback,
     registerAddress: airplay.registerAddress,
     adapterView: airplay.describe,

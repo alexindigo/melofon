@@ -22,6 +22,7 @@ import {
 } from '../connection-strategy.ts';
 import type { AirplayDevices } from './airplay-device.ts';
 import type { AirplayTransport } from './airplay-profile.ts';
+import { outputAuthority, outputPlayerId } from '../player-outputs.ts';
 import { SpeakerError, type SpeakerPairingView } from '../speakers.ts';
 export { airplayOutputId } from './airplay-profile.ts';
 export type { AirplayTransport, HelperEventFn } from './airplay-profile.ts';
@@ -62,6 +63,7 @@ interface Epoch {
   contentError: boolean;
 }
 interface Grant {
+  authority(): boolean;
   epoch: number;
   kind: 'explicit' | 'planned' | 'retry';
 }
@@ -72,6 +74,7 @@ interface RuntimePin {
   current(): boolean;
 }
 interface Runtime {
+  authority(): boolean;
   transport: AirplayTransport | null;
   activationCurrent?: () => boolean;
   session: number;
@@ -145,6 +148,17 @@ export function createAirplayBoot(
     default: 'melofon',
   });
   const runtimes = new Map<string, Runtime>();
+  const canControl = (out: Output) =>
+    outputPlayerId(out) === null ||
+    outputPlayerId(out) === (deps.playerId ?? 1);
+  const requireControl = (out: Output) => {
+    if (!canControl(out)) {
+      throw new SpeakerError(
+        'speaker_busy',
+        'Speaker belongs to another player',
+      );
+    }
+  };
   const epochs = new Map<string, Epoch>();
   const generations = new Map<string, number>();
   const grants = new Map<string, Grant>();
@@ -172,7 +186,18 @@ export function createAirplayBoot(
   let feedBlocked = false;
   let intent: 'play' | 'pause' | 'stop' = playback.playerView().state;
   let intentEpoch = 0;
-  let lease: { intent: number; outputs: Map<string, number> } | null = null;
+  let lease: {
+    intent: number;
+    outputs: Map<string, { generation: number; authority(): boolean }>;
+  } | null = null;
+  const leaseEntry = (id: string, generation: number) => ({
+    generation,
+    authority: outputAuthority(outputs, id, { endpoint: false }),
+  });
+  const leasedGeneration = (id: string) => {
+    const entry = lease?.outputs.get(id);
+    return entry?.authority() ? entry.generation : undefined;
+  };
   let seenPlayback = playback.lastCommand();
   let seenOutputs = outputs.lastCommand();
   const startupIds = playback.playerView().state === 'play'
@@ -275,17 +300,25 @@ export function createAirplayBoot(
     lease?.outputs.delete(id);
   };
   const grant = (id: string, kind: Grant['kind']) => {
-    grants.set(id, { epoch: epoch(id).generation, kind });
+    grants.set(id, {
+      epoch: epoch(id).generation,
+      kind,
+      authority: outputAuthority(outputs, id),
+    });
   };
   const resetDemand = (id: string) => {
-    const resumeAuthority = lease?.intent === intentEpoch && intent === 'play';
+    const resumeAuthority = lease?.intent === intentEpoch &&
+      intent === 'play' &&
+      [...lease.outputs.values()].some((entry) => entry.authority());
     revoke(id);
     const e = epoch(id);
     e.attempts = 0;
     e.failed = false;
     e.contentError = false;
     if (intent === 'play') grant(id, 'explicit');
-    if (resumeAuthority && lease) lease.outputs.set(id, e.generation);
+    if (resumeAuthority && lease) {
+      lease.outputs.set(id, leaseEntry(id, e.generation));
+    }
   };
   const consumeCommands = () => {
     const p = playback.lastCommand();
@@ -317,8 +350,9 @@ export function createAirplayBoot(
       if (o.selection) {
         for (const request of o.selection) {
           cancelPairing(request.id);
-          if (request.selected) resetDemand(request.id);
-          else revoke(request.id);
+          if (request.selected && outputs.get(request.id)?.selected) {
+            resetDemand(request.id);
+          } else revoke(request.id);
         }
       }
     }
@@ -334,7 +368,9 @@ export function createAirplayBoot(
     lease = {
       intent: intentEpoch,
       outputs: new Map(
-        [...epochs].map(([id, value]) => [id, value.generation]),
+        [...epochs].filter(([id]) => outputs.get(id)?.selected).map((
+          [id, value],
+        ) => [id, leaseEntry(id, value.generation)]),
       ),
     };
     if (source) cancelPump(source.id, source.runtime);
@@ -346,6 +382,7 @@ export function createAirplayBoot(
     const authority = lease;
     const demand = intentEpoch, generation = epoch(id).generation;
     const incarnation = outputs.revision(id);
+    const membershipCurrent = outputAuthority(outputs, id);
     const session = r?.session, transport = r?.transport;
     const controller = new AbortController();
     const work: ResumeWork = {
@@ -357,7 +394,7 @@ export function createAirplayBoot(
         return resuming.get(id) === work && !controller.signal.aborted &&
           !closed && intent === 'play' && intentEpoch === demand &&
           epoch(id).generation === generation &&
-          outputs.revision(id) === incarnation &&
+          outputs.revision(id) === incarnation && membershipCurrent() &&
           row?.selected === true && row.type === out.type &&
           row.host === out.host && row.port === out.port &&
           !blocked.has(id) && !retiring.has(id) &&
@@ -430,7 +467,8 @@ export function createAirplayBoot(
     const out = outputs.get(id), view = playback.playerView(), t = r.transport;
     if (
       closed || blocked.has(id) || runtimes.get(id) !== r || !r.connected ||
-      !t || !out?.selected || view.state !== 'play' || !view.current || source
+      !t || !r.authority() || !out?.selected || view.state !== 'play' ||
+      !view.current || source
     ) return;
     const sourceLease = playback.openSource(view.current.id, view.generation);
     if (!sourceLease) return;
@@ -444,6 +482,7 @@ export function createAirplayBoot(
       : undefined;
     const owns = () =>
       source === authority && !sourceLease.signal.aborted && !closed &&
+      r.authority() &&
       runtimes.get(id) === r &&
       r.transport === t &&
       r.session === session && r.pump === generation;
@@ -587,7 +626,7 @@ export function createAirplayBoot(
         authentication: r.authenticationRequired
           ? 'authentication_required'
           : 'none',
-      });
+      }, r.authority);
     }
     if (!t) {
       // A runtime can be awaiting credential acquisition before publication.
@@ -619,7 +658,7 @@ export function createAirplayBoot(
             code: 'retirement_failed',
             message: 'Speaker session could not be released',
           },
-        });
+        }, r.authority);
         log.event('retirement_failed', {
           output: id,
           generation: r.session - 1,
@@ -651,6 +690,7 @@ export function createAirplayBoot(
       return;
     }
     const wait = backoff[e.attempts++], generation = e.generation;
+    const authority = outputAuthority(outputs, id, { endpoint: false });
     log.event('retry_scheduled', {
       output: id,
       generation,
@@ -661,7 +701,8 @@ export function createAirplayBoot(
     e.timer = retryTimer.set(() => {
       e.timer = undefined;
       if (
-        closed || e.generation !== generation || backoff === null ||
+        closed || !authority() || e.generation !== generation ||
+        backoff === null ||
         !outputs.get(id)?.selected || intent !== 'play' || blocked.has(id)
       ) return;
       grant(id, 'retry');
@@ -698,7 +739,8 @@ export function createAirplayBoot(
     if (resuming.has(out.id)) return;
     const id = out.id, e = epoch(id), permission = grants.get(id);
     if (
-      !permission || permission.epoch !== e.generation || blocked.has(id) ||
+      !permission || !permission.authority() ||
+      permission.epoch !== e.generation || blocked.has(id) ||
       retiring.has(id) || !out.selected || !out.host
     ) return;
     if (
@@ -713,7 +755,7 @@ export function createAirplayBoot(
       if (
         permission.kind === 'planned' || !lease ||
         lease.intent !== intentEpoch ||
-        lease.outputs.get(id) !== e.generation || intent !== 'play'
+        leasedGeneration(id) !== e.generation || intent !== 'play'
       ) return;
       resume(out, permission);
       return;
@@ -721,6 +763,7 @@ export function createAirplayBoot(
     if (!view.current) return;
     if (preparing.has(id)) return;
     const controller = new AbortController();
+    const authority = outputAuthority(outputs, id);
     const work = {
       controller,
       grant: permission,
@@ -731,7 +774,7 @@ export function createAirplayBoot(
     let activated: Runtime | undefined;
     const current = () => {
       const row = outputs.get(id);
-      return !closed && !controller.signal.aborted &&
+      return !closed && !controller.signal.aborted && authority() &&
         permission.epoch === epoch(id).generation &&
         row?.selected === true && intent === 'play' &&
         playback.playerView().state === 'play' &&
@@ -769,6 +812,7 @@ export function createAirplayBoot(
       session = (generations.get(id) ?? 0) + 1;
       generations.set(id, session);
       const r: Runtime = {
+        authority,
         transport: null,
         activationCurrent: current,
         session,
@@ -789,7 +833,8 @@ export function createAirplayBoot(
       runtimes.set(id, r);
       activated = r;
       const own = () =>
-        !closed && runtimes.get(id) === r && r.session === session &&
+        !closed && authority() && runtimes.get(id) === r &&
+        r.session === session &&
         r.transport !== null;
       const activationFailed = (why: string, error: unknown) => {
         if (runtimes.get(id) !== r) return;
@@ -872,7 +917,7 @@ export function createAirplayBoot(
               const latest = playback.playerView();
               if (
                 latest.state === 'pause' && lease?.intent === intentEpoch &&
-                lease.outputs.get(id) === epoch(id).generation &&
+                leasedGeneration(id) === epoch(id).generation &&
                 intent === 'play'
               ) {
                 resume(outputs.get(id)!, undefined, r);
@@ -904,7 +949,7 @@ export function createAirplayBoot(
       (r.authenticationRequired || resuming.has(id)) && intent === 'play' &&
       (resuming.has(id) ||
         lease?.intent === intentEpoch &&
-          lease.outputs.get(id) === epoch(id).generation)
+          leasedGeneration(id) === epoch(id).generation)
     ) return;
     r.strategy = choice;
     if (!r.transport || CONNECTION_STRATEGIES[choice].idle === 'retire') {
@@ -938,7 +983,10 @@ export function createAirplayBoot(
     }
     for (const [id, work] of preparing) {
       const row = outputs.get(id);
-      if (!row || row.host !== work.host || row.port !== work.port) {
+      if (
+        !work.grant.authority() || !row || row.host !== work.host ||
+        row.port !== work.port
+      ) {
         // Preparation authority belongs to this endpoint, not just this id.
         revoke(id);
         devices.admission.describe(id);
@@ -958,9 +1006,9 @@ export function createAirplayBoot(
       }
     }
     for (const [id, r] of runtimes) {
-      if (!known.has(id)) {
+      if (!known.has(id) || !r.authority()) {
         revoke(id);
-        retirements.push([id, r, 'unregistered']);
+        retirements.push([id, r, 'ownership or lifetime ended']);
       }
     }
     for (const out of snapshot) {
@@ -1143,6 +1191,7 @@ export function createAirplayBoot(
       consumeCommands();
       const out = outputs.get(id);
       if (!out) throw new SpeakerError('not_found', 'Speaker not found');
+      requireControl(out);
       if (
         closed || blocked.has(id) || retiring.has(id) || runtimes.has(id) ||
         preparing.has(id) || pairings.get(id)?.current()
@@ -1150,6 +1199,7 @@ export function createAirplayBoot(
         throw new SpeakerError('speaker_busy', 'Speaker is already in use');
       }
       const incarnation = outputs.revision(id);
+      const authority = outputAuthority(outputs, id);
       const endpoint = JSON.stringify([out.type, out.host, out.port]);
       const work: PairingWork = {
         controller: new AbortController(),
@@ -1160,7 +1210,7 @@ export function createAirplayBoot(
           const row = outputs.get(id);
           return !closed && pairings.get(id) === work &&
             !work.controller.signal.aborted &&
-            outputs.revision(id) === incarnation && !!row &&
+            outputs.revision(id) === incarnation && authority() && !!row &&
             JSON.stringify([row.type, row.host, row.port]) === endpoint;
         },
       };
@@ -1281,7 +1331,7 @@ export function createAirplayBoot(
             saved: false,
             stopped: false,
             current: () =>
-              !closed && runtime.pin === attempt &&
+              !closed && runtime.authority() && runtime.pin === attempt &&
               runtimes.get(id) === runtime && runtime.transport === transport &&
               runtime.session === session && runtime.authenticationRequired &&
               intent === 'play' && outputs.get(id)?.selected === true &&
@@ -1346,17 +1396,19 @@ export function createAirplayBoot(
       cancelPairing(id);
       const out = outputs.get(id);
       if (closed || !out) throw new Error('Speaker lifecycle unavailable');
+      requireControl(out);
+      const authority = outputAuthority(outputs, id);
       const incarnation = outputs.revision(id), demand = intentEpoch;
       const view = playback.playerView();
       const authorized = out.selected && intent === 'play' &&
         (view.state === 'play' || lease?.intent === intentEpoch &&
-            lease.outputs.get(id) === epoch(id).generation);
+            leasedGeneration(id) === epoch(id).generation);
       // Revoke immediately, before encryption/store awaits. A replacement is an
       // explicit credential operation, never a catalog update or a play intent.
       revoke(id);
       const generation = epoch(id).generation;
       if (authorized && lease?.intent === demand) {
-        lease.outputs.set(id, generation);
+        lease.outputs.set(id, leaseEntry(id, generation));
       }
       devices.admission.invalidate(id);
       const runtime = runtimes.get(id);
@@ -1371,13 +1423,13 @@ export function createAirplayBoot(
       consumeCommands();
       const current = outputs.get(id);
       if (
-        !closed && authorized && current?.selected &&
+        !closed && authority() && authorized && current?.selected &&
         outputs.revision(id) === incarnation && current.host === out.host &&
         current.port === out.port && intent === 'play' &&
         intentEpoch === demand &&
         epoch(id).generation === generation &&
         (playback.playerView().state === 'play' ||
-          lease?.intent === demand && lease.outputs.get(id) === generation)
+          lease?.intent === demand && leasedGeneration(id) === generation)
       ) {
         resetDemand(id);
         reconcile();
@@ -1393,11 +1445,13 @@ export function createAirplayBoot(
       }
       const out = outputs.get(id);
       if (closed || !out || out.type !== 'AirPlay') return;
+      requireControl(out);
+      const authority = outputAuthority(outputs, id);
       const e = epoch(id), view = playback.playerView();
       const failedDemand = e.failed && out.selected && intent === 'play' &&
         (view.state === 'play' ||
           (lease?.intent === intentEpoch &&
-            lease.outputs.get(id) === e.generation));
+            leasedGeneration(id) === e.generation));
       // Only the lifecycle owner can renew a demand or its resume lease.
       // Refreshing facts alone never creates either one.
       if (failedDemand) resetDemand(id);
@@ -1417,7 +1471,7 @@ export function createAirplayBoot(
         refresh: true,
         signal: controller.signal,
         isCurrent: () =>
-          !closed && outputs.get(id) !== null &&
+          !closed && authority() && outputs.get(id) !== null &&
           outputs.revision(id) === revision,
       });
     },

@@ -8,6 +8,7 @@ import { createMdnsResolver, type MdnsResolver } from '../mdns-resolver.ts';
 import type { MdnsService } from '../mdns.ts';
 import type { SpeakerAdapterView, SpeakerSessionView } from '../speakers.ts';
 import type { SpeakerCredentials } from '../speaker-credentials.ts';
+import { outputAuthority, outputPlayerId } from '../player-outputs.ts';
 import {
   airplayInstance,
   normalizeAirplayAddress,
@@ -59,6 +60,7 @@ export function createAirplayDevices(deps: {
     const row = outputs.get(id, { includeIgnored: true });
     return JSON.stringify([
       outputs.revision(id),
+      outputs.membershipRevision(id),
       row?.type,
       row?.host,
       row?.port,
@@ -83,6 +85,10 @@ export function createAirplayDevices(deps: {
   const privateInputs = new WeakMap<AirplayInput, AirplayCredentials>();
   const receipts = new WeakMap<AirplayInput, PairingCredentialConsumer>();
   const consumers = new WeakMap<AirplayTransport, PairingCredentialConsumer>();
+  // Same receiver, different membership: activation waits for proven release of
+  // the previous transport. This is not the cross-receiver stream limit (f04).
+  const releases = new Map<string, Promise<void>>();
+  const closers = new WeakMap<AirplayTransport, () => Promise<void>>();
   const receiverIdentity = (id: string, service: MdnsService) => {
     const identity = airplayInstance(service.name)?.id;
     if (!identity) {
@@ -176,20 +182,29 @@ export function createAirplayDevices(deps: {
         privateInputs.get(input),
       );
     },
-    close: (transport) => transport.close(),
+    close: (transport) =>
+      (closers.get(transport) ?? (() => transport.close()))(),
   });
   type Permit = Parameters<typeof admitted.activate>[0];
-  const contexts = new WeakMap<Permit, { id: string; current(): boolean }>();
+  const contexts = new WeakMap<
+    Permit,
+    { id: string; authority(): boolean; current(): boolean }
+  >();
   const protocol: typeof admitted = {
     ...admitted,
     async prepare(request) {
       const incarnation = outputs.revision(request.id);
-      const context = { id: request.id, current: () => true };
+      const context = {
+        id: request.id,
+        authority: outputAuthority(outputs, request.id),
+        current: () => true,
+      };
       const result = await admitted.prepare({
         ...request,
         isCurrent: () =>
           request.isCurrent() &&
-          outputs.revision(request.id) === incarnation && context.current(),
+          outputs.revision(request.id) === incarnation && context.authority() &&
+          context.current(),
       });
       if (result.ok) contexts.set(result.value, context);
       return result;
@@ -204,7 +219,17 @@ export function createAirplayDevices(deps: {
         };
       }
       const privateInput = { ...input };
+      const previous = releases.get(context.id);
+      let release!: () => void, failed!: (error: unknown) => void;
+      const released = new Promise<void>((resolve, reject) => {
+        release = resolve;
+        failed = reject;
+      });
+      releases.set(context.id, released);
+      void released.catch(() => {});
+      let published: AirplayTransport | undefined;
       try {
+        await previous;
         if (deps.credentials) {
           const snapshot = await deps.credentials.session(context.id, {
             pairing: input.probe === true,
@@ -220,7 +245,8 @@ export function createAirplayDevices(deps: {
           receipts.set(privateInput, async (change) => {
             const current = () => {
               const latest = outputs.get(context.id);
-              return change.isCurrent() && context.current() &&
+              return change.isCurrent() && context.authority() &&
+                context.current() &&
                 outputs.revision(context.id) === incarnation &&
                 latest?.host === row?.host && latest?.port === row?.port &&
                 latest?.receiverIdentity === row?.receiverIdentity;
@@ -228,7 +254,32 @@ export function createAirplayDevices(deps: {
             await snapshot.acceptPairing(change.key, current);
           });
         }
-        return await admitted.activate(permit, privateInput, lifecycle);
+        const result = await admitted.activate(permit, privateInput, {
+          onEvent: lifecycle.onEvent,
+          publish(transport) {
+            let closing: Promise<void> | undefined;
+            const close = () =>
+              closing ??= (async () => {
+                try {
+                  await transport.close();
+                  release();
+                } catch (error) {
+                  failed(error);
+                  throw error;
+                }
+              })();
+            closers.set(transport, close);
+            published = {
+              send: (command) => transport.send(command),
+              pcm: (chunk) => transport.pcm(chunk),
+              ownsSharedFeed: () => transport.ownsSharedFeed(),
+              cancelPcm: () => transport.cancelPcm(),
+              close,
+            };
+            lifecycle.publish(published);
+          },
+        });
+        return result.ok ? { ok: true, value: published! } : result;
       } catch {
         // No arbitrary dependency error (or plaintext) crosses into public state.
         return {
@@ -239,6 +290,16 @@ export function createAirplayDevices(deps: {
           ),
         };
       } finally {
+        if (!published) {
+          // Do not let a canceled queued attempt bypass an earlier cleanup.
+          if (previous) void previous.then(release, failed);
+          else release();
+        }
+        void released.then(() => {
+          if (releases.get(context.id) === released) {
+            releases.delete(context.id);
+          }
+        }, () => {});
         privateInputs.delete(privateInput);
         receipts.delete(privateInput);
       }
@@ -267,12 +328,14 @@ export function createAirplayDevices(deps: {
     protocol,
     async preparePlayback(id: string, signal: AbortSignal): Promise<boolean> {
       const revision = outputs.revision(id);
+      const owner = outputs.get(id);
+      const current = outputAuthority(outputs, id);
       const result = await protocol.prepare({
         id,
         signal,
         targetRevision: admission.describe(id).targetRevision,
         isCurrent: () =>
-          outputs.get(id)?.selected === true &&
+          owner !== null && outputPlayerId(owner) !== null && current() &&
           outputs.revision(id) === revision,
       });
       // Preparation supplies facts, not a start grant. The boot owns activation.
@@ -293,7 +356,12 @@ export function createAirplayDevices(deps: {
         ),
       };
     },
-    sessionChanged(id: string, view: SpeakerSessionView) {
+    sessionChanged(
+      id: string,
+      view: SpeakerSessionView,
+      isCurrent: () => boolean = () => true,
+    ) {
+      if (!isCurrent()) return;
       const key = sessionKey(id), previous = sessions.get(id);
       if (
         previous?.key === key &&

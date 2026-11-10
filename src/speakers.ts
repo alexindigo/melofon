@@ -7,7 +7,7 @@ import type { State } from './state.ts';
 import { SecretError } from './secrets.ts';
 import type { SpeakerCredentials } from './speaker-credentials.ts';
 import { appLogger } from './logging.ts';
-import { outputPlayerId } from './player-outputs.ts';
+import { outputAuthority, outputPlayerId } from './player-outputs.ts';
 export { SpeakerError } from './speaker-errors.ts';
 
 function fields(input: unknown, allowed: string[]): Record<string, unknown> {
@@ -100,6 +100,8 @@ export function createSpeakers(deps: {
     Outputs,
     | 'list'
     | 'get'
+    | 'revision'
+    | 'membershipRevision'
     | 'lifetime'
     | 'adopt'
     | 'update'
@@ -109,6 +111,8 @@ export function createSpeakers(deps: {
     | 'unignore'
     | 'presence'
   >;
+  /** Standalone player-1 compatibility. Registry engines observe their scoped
+   * target loss directly; never pass a live-default playback facade here. */
   playback?: { pause(source?: CommandSource): void };
   adapterView(id: string): SpeakerAdapterView;
   retry?(id: string): Promise<void>;
@@ -280,6 +284,9 @@ export function createSpeakers(deps: {
     },
     async preparePlayback(signal: AbortSignal, playerId = 1): Promise<void> {
       const rows = selected(playerId);
+      const authority = new Map(
+        rows.map((row) => [row.id, outputAuthority(deps.outputs, row.id)]),
+      );
       if (!rows.length) {
         throw new PlaybackError('no_target', 'Select a speaker before playing');
       }
@@ -319,7 +326,8 @@ export function createSpeakers(deps: {
             await deps.prepare?.(row.id, controller.signal);
           const current = deps.outputs.get(row.id);
           if (
-            !ok || !current || outputPlayerId(current) !== playerId ||
+            !ok || !authority.get(row.id)!() || !current ||
+            outputPlayerId(current) !== playerId ||
             !eligible(row.id) ||
             JSON.stringify([current.type, current.host, current.port]) !== key
           ) throw new Error('unavailable');
@@ -455,10 +463,14 @@ export function createSpeakers(deps: {
         );
       }
       const operation = deps.outputs.forget(id, source);
+      const owner = outputPlayerId(row);
       if (
-        row.selected && !deps.outputs.list().some((speaker) => speaker.selected)
+        owner !== null &&
+        !deps.outputs.list().some((speaker) =>
+          outputPlayerId(speaker) === owner
+        )
       ) {
-        deps.playback?.pause(source);
+        if (owner === 1) deps.playback?.pause(source);
       }
       try {
         await operation;
