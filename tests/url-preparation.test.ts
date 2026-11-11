@@ -5,7 +5,7 @@ import { createRadioSource } from '../src/radio-source.ts';
 import { createPlaybackSource } from '../src/playback-source.ts';
 import { createQueueResolver } from '../src/queue-source.ts';
 import { createPlayback, type Playback } from '../src/playback.ts';
-import { createPlayer, planRestore } from '../src/player.ts';
+import { createOutputs, createPlayer, planRestore } from '../src/player.ts';
 import { createLibrary } from '../src/library.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { httpRadio, type RadioReply } from './helpers/http-radio.ts';
@@ -75,6 +75,7 @@ async function fixture() {
     },
     services(f) {
       const library = createLibrary(f.store);
+      const outputs = createOutputs({ notify: f.notify });
       const source = createPlaybackSource({
         media: createMedia(),
         state: f.state,
@@ -85,6 +86,7 @@ async function fixture() {
       });
       playback = createPlayback({
         player: createPlayer(),
+        outputs,
         library,
         cfg: f.cfg,
         nowPlaying: createNowPlaying(f.store),
@@ -92,7 +94,7 @@ async function fixture() {
         prepareQueueMedia: source.prepare,
         resolveQueueReference: resolve,
       });
-      return Promise.resolve({ playback, library });
+      return Promise.resolve({ playback, library, outputs });
     },
   });
   return {

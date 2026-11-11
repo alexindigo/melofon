@@ -113,7 +113,7 @@ export interface HatContext {
       setVolume(
         opts: { volume?: number; step?: number },
         source?: CommandSourceRow,
-      ): void;
+      ): void | Promise<void>;
       seek(
         opts: { positionMs?: number; seekMs?: number },
         source?: CommandSourceRow,

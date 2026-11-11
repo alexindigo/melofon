@@ -632,7 +632,7 @@ Deno.test('native last-command: OwnTone seek, volume and selection share the rea
     for (
       const [path, kind, detail] of [
         ['seek?position_ms=75000', 'seek', 'position_ms=75000'],
-        ['volume?volume=75', 'volume', 'volume=75'],
+        ['volume?volume=75', 'volume', 'step=25'],
       ]
     ) {
       const response = await onHook(

@@ -7,6 +7,7 @@
 // The wire is OwnTone: no fields OwnTone does not have (plan
 // command-provenance-wire-fix). Provenance lives in core's lastCommand()
 // and the [cmd] log line — never in this payload.
+import { masterVolume } from '#owntone/payloads.ts';
 import type { HatContext } from '#owntone/types.ts';
 
 export default (_request: unknown, context: HatContext) => {
@@ -16,7 +17,7 @@ export default (_request: unknown, context: HatContext) => {
     repeat: view.repeat,
     consume: view.consume,
     shuffle: view.shuffle,
-    volume: view.volume,
+    volume: masterVolume(context.app.outputs.list(), view.volume),
     item_id: view.current?.id ?? 0,
     item_length_ms: view.itemLengthMs,
     item_progress_ms: view.itemProgressMs,

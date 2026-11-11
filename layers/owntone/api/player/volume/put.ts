@@ -4,6 +4,7 @@
 import {
   badRequest,
   intParam,
+  masterVolume,
   noContent,
   sourceFrom,
 } from '#owntone/payloads.ts';
@@ -24,7 +25,14 @@ export default async (request: HatRequest, context: HatContext) => {
     return updated === null ? badRequest() : noContent();
   }
   if (volume !== null) {
-    await context.app.playback.setVolume({ volume }, sourceFrom(request));
+    const master = masterVolume(
+      context.app.outputs.list(),
+      context.app.playback.playerView().volume,
+    );
+    await context.app.playback.setVolume(
+      { step: volume - master },
+      sourceFrom(request),
+    );
     return noContent();
   }
   if (step !== null) {

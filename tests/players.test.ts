@@ -1017,6 +1017,241 @@ Deno.test('temporary members of any player retain withdrawn identity, cannot be 
   }
 });
 
+async function ownToneVolumes() {
+  let h!: Awaited<ReturnType<typeof household>>;
+  const f = await apiFixture({
+    storeDir: await dataDir(),
+    hats: {
+      layersRoot: 'layers/',
+      extraPorts: 2,
+      env: (ports) => ({ MELOFON_LISTEN_owntone: ports.join(',') }),
+    },
+    services: async ({ store }) => {
+      h = await household(store);
+      await h.players.create('Kitchen');
+      for (
+        const [id, volume] of [['11', 40], ['12', 20], ['13', 90], [
+          '14',
+          100,
+        ]] as const
+      ) {
+        registerSpeaker(h, id);
+        h.outputs.update(id, { volume });
+        await h.outputs.adopt(id);
+      }
+      await h.players.setSpeakers(1, ['11', '12']);
+      await h.players.join(2, '13');
+      return {
+        library: h.library,
+        outputs: h.players.defaultOutputs,
+        playback: h.players.playback,
+      };
+    },
+  });
+  const origin = `http://melofon.home:${f.extraPorts[0]}`;
+  const read = async (path: string) => {
+    const response = await fetch(`${origin}/api${path}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    assertEquals(response.status, 200, await response.clone().text());
+    return response.json();
+  };
+  const put = async (path: string, body?: unknown, status = 204) => {
+    const response = await fetch(`${origin}/api${path}`, {
+      method: 'PUT',
+      headers: { Origin: origin, 'content-type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assertEquals(response.status, status, await response.clone().text());
+    if (status === 204) assertEquals(await response.text(), '');
+    else await response.body?.cancel();
+  };
+  return {
+    h,
+    f,
+    read,
+    put,
+    async close() {
+      await h.close();
+      await f.close();
+    },
+  };
+}
+
+Deno.test('OwnTone HTTP volume translates the loudest default member and individual output edits', async () => {
+  const t = await ownToneVolumes();
+  const { h, read, put } = t;
+  const levels = async () =>
+    (await read('/outputs')).outputs.map((row: { volume: number }) =>
+      row.volume
+    );
+  try {
+    const initial = await read('/player');
+    assertEquals(
+      initial.volume,
+      40,
+      'not the saved slider, another player or a free output',
+    );
+    assertEquals(Object.keys(initial).sort(), [
+      'consume',
+      'item_id',
+      'item_length_ms',
+      'item_progress_ms',
+      'repeat',
+      'shuffle',
+      'state',
+      'volume',
+    ]);
+    assertEquals(h.players.get(1).playerView().volume, 50);
+
+    await put('/player/volume?volume=60');
+    assertEquals(await levels(), [60, 40, 90, 100]);
+    assertEquals((await read('/player')).volume, 60);
+    assertEquals(
+      h.players.get(1).playerView().volume,
+      70,
+      'move the slider by +20, not to 60',
+    );
+    assertEquals(
+      (await t.f.store.players.list())[0].volume,
+      70,
+      'response awaits the saved slider',
+    );
+
+    await put('/player/volume?volume=50&step=5');
+    assertEquals(
+      await levels(),
+      [50, 30, 90, 100],
+      'absolute retains first-valid precedence',
+    );
+    await put('/player/volume?step=-10');
+    assertEquals(await levels(), [40, 20, 90, 100]);
+    assertEquals((await read('/player')).volume, 40);
+    assertEquals(h.players.get(1).playerView().volume, 50);
+
+    await put('/player/volume?output_id=12&volume=95');
+    assertEquals((await read('/outputs/12')).volume, 95);
+    assertEquals((await read('/player')).volume, 95);
+    await put('/player/volume?output_id=12&step=-5');
+    assertEquals(await levels(), [40, 90, 90, 100]);
+    assertEquals(
+      h.players.get(1).playerView().volume,
+      50,
+      'individual volume never moves the player',
+    );
+    await put('/outputs/12', { volume: 85 });
+    assertEquals((await read('/player')).volume, 85);
+    await put('/player/volume?output_id=13&volume=80');
+    await put('/player/volume?output_id=14&volume=99');
+    assertEquals(
+      (await read('/player')).volume,
+      85,
+      'unselected edits do not change the master',
+    );
+    assertEquals(h.outputs.get('13')?.playerId, 2);
+    assertEquals(h.players.freeSpeakers().map((row) => row.id), ['14']);
+
+    const before = h.outputs.list(), receipt = h.players.get(1).lastCommand();
+    for (
+      const query of [
+        '',
+        '?volume=no',
+        '?step=no',
+        '?output_id=999&volume=20',
+        '?output_id=11',
+      ]
+    ) {
+      await put(`/player/volume${query}`, undefined, 400);
+    }
+    assertEquals(h.outputs.list(), before);
+    assertEquals(h.players.get(1).lastCommand(), receipt);
+
+    await h.players.setDefault(2);
+    assertEquals((await read('/player')).volume, 80);
+    await put('/player/volume?volume=70');
+    assertEquals(await levels(), [40, 85, 70, 99]);
+    assertEquals((await read('/player')).volume, 70);
+    assertEquals(h.players.get(2).playerView().volume, 40);
+    assertEquals(h.players.get(1).playerView().volume, 50);
+    assertEquals(h.players.get(2).lastCommand()?.source.kind, 'http');
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('OwnTone HTTP volume preserves core link, clipping, zero and empty-player semantics', async () => {
+  const t = await ownToneVolumes();
+  const { h, read, put } = t;
+  const levels = async () =>
+    (await read('/outputs')).outputs.map((row: { volume: number }) =>
+      row.volume
+    );
+  try {
+    await h.players.setLinked(1, '12', false);
+    await put('/outputs/12', { volume: 75 });
+    assertEquals(
+      (await read('/player')).volume,
+      75,
+      'unlinked members still count toward OwnTone master',
+    );
+    await put('/player/volume?volume=85');
+    assertEquals(await levels(), [50, 75, 90, 100]);
+    assertEquals(
+      (await read('/player')).volume,
+      75,
+      'do not move an unlinked member to force the requested master',
+    );
+    assertEquals(h.players.get(1).playerView().volume, 60);
+    await put('/player/volume?volume=0');
+    assertEquals(await levels(), [0, 75, 90, 100]);
+    assertEquals(h.players.get(1).playerView().volume, 0);
+    assertEquals((await read('/player')).volume, 75);
+    await h.players.setLinked(1, '12', true);
+    await put('/player/volume?volume=0');
+    assertEquals(
+      await levels(),
+      [0, 0, 90, 100],
+      'explicit zero still silences at slider zero',
+    );
+    await put('/player/volume?volume=30');
+    assertEquals(await levels(), [30, 30, 90, 100]);
+    await put('/player/volume?output_id=11&volume=95');
+    await put('/player/volume?step=20');
+    assertEquals(
+      await levels(),
+      [100, 50, 90, 100],
+      'speaker clips, balance may break',
+    );
+    assertEquals((await read('/player')).volume, 100);
+    await put('/player/volume?volume=90');
+    assertEquals(await levels(), [90, 40, 90, 100]);
+    assertEquals(h.players.get(1).playerView().volume, 40);
+
+    await put('/outputs/set', { outputs: [] });
+    assertEquals(
+      (await read('/player')).volume,
+      40,
+      'no members uses this player, never unrelated outputs',
+    );
+    await put('/player/volume?volume=25');
+    assertEquals((await read('/player')).volume, 25);
+    assertEquals(await levels(), [90, 40, 90, 100]);
+    await put('/outputs/12', { selected: true });
+    assertEquals(
+      (await read('/player')).volume,
+      40,
+      'joining preserves the absolute speaker number',
+    );
+    assertEquals(h.players.get(1).playerView().volume, 25);
+    await put('/outputs/11/toggle', {});
+    assertEquals((await read('/player')).volume, 90);
+    assertEquals(h.players.get(1).playerView().volume, 25);
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('OwnTone HTTP output set, toggle and update operate only on the live default membership', async () => {
   let h!: Awaited<ReturnType<typeof household>>;
   const f = await apiFixture({

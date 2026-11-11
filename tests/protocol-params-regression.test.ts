@@ -751,7 +751,7 @@ Deno.test('numeric OwnTone volume/output and seek preserve first-valid precedenc
       )).status,
       204,
     );
-    assertEquals(s.calls.volume.at(-1), { volume: 9007199254740992 });
+    assertEquals(s.calls.volume.at(-1), { step: 9007199254740992 - 33 });
     assertEquals(
       (await s.ownRequest('/api/player/seek', {
         position_ms: '1.0000000000000001',

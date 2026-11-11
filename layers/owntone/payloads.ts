@@ -21,6 +21,19 @@ export function wireInt(hash: string): number {
   return Number(BigInt(`0x${hash.slice(0, 8)}`) & 0x7fffffffn);
 }
 
+/** OwnTone's master is the loudest selected output, not the saved player
+ * slider. With no members, keep the player's own level rather than borrow
+ * an unrelated player's or a free speaker's volume. */
+export function masterVolume(
+  outputs: OutputRow[],
+  playerVolume: number,
+): number {
+  const selected = outputs.filter((output) => output.selected);
+  return selected.length
+    ? selected.reduce((volume, output) => Math.max(volume, output.volume), 0)
+    : playerVolume;
+}
+
 /** Provenance for a mutating command (plan command-provenance): the
  * request's peer + user-agent + X-Melofon-Client, recorded by the core
  * as lastCommand and logged as one [cmd] line. Structural mirror of

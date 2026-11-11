@@ -93,6 +93,12 @@ the player slider or other speakers. Joining a player starts linked and keeps
 the speaker's level. On upgrade, stored speaker levels are unchanged and Home
 starts at its loudest member's level (50 without members).
 
+The OwnTone hat shows the household default player's loudest speaker as master
+volume, including unlinked members. Setting that master moves the saved player
+slider by the difference; linking and clipping still apply. With no members it
+uses the saved player level. OwnTone output volume edits change only that
+speaker, whether selected or not.
+
 Signed-in clients send `POST /api/v1/players/{id}/{command}` with `{}` for
 `play`, `pause`, `stop`, `next`, `previous` or `restart`. Seek uses `POST
 /api/v1/players/{id}/seek` with exactly one integer millisecond field:

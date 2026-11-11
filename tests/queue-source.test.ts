@@ -11,7 +11,11 @@ import { createUserService } from '../src/user.ts';
 import { createListens } from '../src/listens.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPlayback, type Playback } from '../src/playback.ts';
-import { createPlayer, type PlayerPersistence } from '../src/player.ts';
+import {
+  createOutputs,
+  createPlayer,
+  type PlayerPersistence,
+} from '../src/player.ts';
 import {
   catalogMedia,
   type QueueMedia,
@@ -74,8 +78,10 @@ async function setup(persistence?: PlayerPersistence | true, dataDir?: string) {
     services: (f) => {
       const library = createLibrary(f.store);
       durable = persistence === true ? createPersistence(f.store) : undefined;
+      const outputs = createOutputs({ notify: f.notify });
       playback = createPlayback({
         player: createPlayer(),
+        outputs,
         library,
         nowPlaying: createNowPlaying(f.store),
         cfg: f.cfg,
@@ -93,6 +99,7 @@ async function setup(persistence?: PlayerPersistence | true, dataDir?: string) {
       });
       return Promise.resolve({
         library,
+        outputs,
         playback,
         annotation: createAnnotation(f.store),
         user: createUserService(f.store, f.cfg),
