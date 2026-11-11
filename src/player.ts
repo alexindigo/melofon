@@ -308,6 +308,10 @@ export interface Player {
   ): QueueEntry[];
   /** Clears the queue and stops playback. */
   queueClear(): void;
+  /** Remove one occurrence; current advances without changing play/pause. */
+  queueRemove(entryId: number): void;
+  /** Final zero-based position, clamped to the end; current keeps its lease. */
+  queueMove(entryId: number, position: number): void;
   /** End-of-item transition (the engine's clock — driven by the playback
    * core): progress at item length means the item ENDED. repeat `single`
    * replays; `all` wraps to the head past the last item; consume drops the
@@ -836,6 +840,41 @@ export function createPlayer(options: {
       version++;
       doStop();
       // The clear also stopped playback — both reads changed.
+    },
+
+    queueRemove(entryId) {
+      const at = items.findIndex((entry) => entry.id === entryId);
+      if (at < 0) return;
+      const wasCurrent = currentIndex === at;
+      const paused = state === 'pause';
+      items = items.filter((entry) => entry.id !== entryId);
+      version++;
+      if (wasCurrent) {
+        if (at >= items.length) doStop();
+        else {
+          startAt(at);
+          if (paused) doPause();
+        }
+      } else if (currentIndex !== null && at < currentIndex) currentIndex--;
+    },
+
+    queueMove(entryId, position) {
+      const at = items.findIndex((entry) => entry.id === entryId);
+      if (at < 0) return;
+      const currentId = currentEntry()?.id;
+      const entry = items[at];
+      const future = items.filter((item) => item.id !== entryId);
+      future.splice(
+        Math.min(Math.max(0, Math.trunc(position)), future.length),
+        0,
+        entry,
+      );
+      if (future.every((item, index) => item === items[index])) return;
+      items = future;
+      currentIndex = currentId === undefined
+        ? null
+        : items.findIndex((item) => item.id === currentId);
+      version++;
     },
 
     advanceEnded() {

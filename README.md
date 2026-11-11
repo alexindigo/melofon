@@ -129,6 +129,16 @@ version; playback navigation alone changes the current anchor, not the version.
 The native hat's `melofon.queuePageRecords` and `melofon.queueMaxPageRecords`
 settings default to 50 and 500; the default page size is capped by the maximum.
 
+`PATCH /api/v1/players/{id}/queue/items/{entryId}` moves an occurrence with
+`{"position":0,"expectedVersion":12}`. Position is its final zero-based index,
+clamped to the end; moving preserves the current song, spot and source lifetime.
+`DELETE .../queue/items/{entryId}` removes one occurrence; `DELETE .../queue`
+clears and stops. Both DELETE routes accept optional `?expectedVersion=12`.
+PATCH's `expectedVersion` is optional too. A stale version returns 409
+`queue_conflict` with the current `version`, without applying the edit. Missing
+entries return 404. Removing the current song chooses its successor and keeps
+play/pause; removing the tail stops without wrapping, regardless of repeat.
+
 ### Web source recovery
 
 The playback owner declares `playback.source.retryBackoffMs`, an ordered array

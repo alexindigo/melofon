@@ -393,6 +393,40 @@ Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restar
         addedSession.audioPayloads.slice(0, 8),
       ).some((sample) => sample !== 0),
     );
+    // Removing the playing occurrence must deliver the successor's audio, not
+    // merely update the HTTP state. Duplicate media still has distinct leases.
+    const more = await server.native('/players/1/queue/items', 'POST', {
+      references: [added.items[0].reference],
+    });
+    const nextId = more.items[0].entryId;
+    const priorPayloads = addedSession.audioPayloads.length;
+    const priorFlushes = addedSession.flushes;
+    const priorSessionCount = receivers[0].sessions.length;
+    await server.native(
+      `/players/1/queue/items/${added.items[0].entryId}`,
+      'DELETE',
+    );
+    const afterRemove = (await server.native('/players/1')).player;
+    assertEquals([afterRemove.current.entryId, afterRemove.state], [
+      nextId,
+      'play',
+    ]);
+    await until(() =>
+      addedSession.flushes > priorFlushes &&
+        addedSession.audioPayloads.length >= priorPayloads + 8 ||
+      receivers[0].sessions.slice(priorSessionCount).some((s) =>
+        s.audioPayloads.length >= 8
+      )
+    );
+    const successorSession = receivers[0].sessions.at(-1)!;
+    const payloads = successorSession === addedSession
+      ? addedSession.audioPayloads.slice(priorPayloads, priorPayloads + 8)
+      : successorSession.audioPayloads.slice(0, 8);
+    assert(
+      decodeReceiverAudio(successorSession.sdp, payloads).some((sample) =>
+        sample !== 0
+      ),
+    );
   } finally {
     await server?.stop();
     dns.close();

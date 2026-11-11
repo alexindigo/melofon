@@ -25,7 +25,7 @@ import { createQueueExpansion } from '../src/queue-expansion.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createPlayer } from '../src/player.ts';
 
-async function setup() {
+async function setup(beforePrepare?: () => Promise<void>) {
   const dir = await restored('api-players', async (dir) => {
     const store = await openStore(dir);
     try {
@@ -104,7 +104,10 @@ async function setup() {
         },
         targets: (id) => ({
           hasPlaybackTarget: () => speakers.hasPlaybackTarget(id),
-          preparePlayback: (signal) => speakers.preparePlayback(signal, id),
+          preparePlayback: async (signal) => {
+            await beforePrepare?.();
+            await speakers.preparePlayback(signal, id);
+          },
         }),
       });
       return {
@@ -175,6 +178,377 @@ async function setup() {
     },
   };
 }
+
+Deno.test('queue edit HTTP moves permanent occurrences without interrupting current audio and persists final positions', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'cookie',
+      'member',
+      'password-member',
+    );
+    const home = t.players.get(1);
+    const other = await t.players.create('Kitchen');
+    await t.players.get(other.id).queueAdd([t.songs[0]]);
+    const otherBefore = t.players.get(other.id).queueView();
+    await t.addSpeaker('edit-target');
+    await t.players.join(1, 'edit-target');
+    const entries = await home.queueAdd([
+      t.songs[0],
+      t.songs[0],
+      t.songs[1],
+      t.songs[0],
+    ], { play: true });
+    await home.seek({ positionMs: 4000 });
+    const before = home.playerView();
+    const lease = home.openSource(entries[0].id, before.generation)!;
+    assert(lease);
+    const path = '/api/v1/players/1/queue/items';
+    await t.command(`${path}/${entries[0].id}`, 'PATCH', credential, {
+      position: 2,
+      expectedVersion: home.queueView().version,
+    });
+    assertEquals(home.queueView().items.map((e) => e.id), [
+      entries[1].id,
+      entries[2].id,
+      entries[0].id,
+      entries[3].id,
+    ]);
+    assertEquals(home.playerView(), before);
+    assert(!lease.signal.aborted);
+    await t.command(`${path}/${entries[3].id}`, 'PATCH', credential, {
+      position: 0,
+    });
+    await t.command(`${path}/${entries[1].id}`, 'PATCH', credential, {
+      position: 999,
+    });
+    assertEquals(home.queueView().items.map((e) => e.id), [
+      entries[3].id,
+      entries[2].id,
+      entries[0].id,
+      entries[1].id,
+    ]);
+    await t.command(`${path}/${entries[3].id}`, 'DELETE', credential);
+    await t.command(`${path}/${entries[1].id}`, 'DELETE', credential);
+    assertEquals(home.playerView(), before);
+    assert(!lease.signal.aborted);
+    assertEquals(home.lastCommand()?.source.user, 'member');
+    assertEquals(t.players.get(other.id).queueView(), otherBefore);
+    await t.persistence.drain();
+    const saved = await t.f.store.playback.loadQueue(1);
+    assertEquals(saved.items.map((e) => e.id), [entries[2].id, entries[0].id]);
+    assertEquals(saved.version, home.queueView().version);
+    const state = await t.f.store.playback.loadPlayerState(1);
+    assert(before.itemProgressMs > 0);
+    assertEquals([state!.currentIndex, state!.positionMs], [
+      1,
+      before.itemProgressMs,
+    ]);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue edit HTTP removes current into its successor preserving play or pause and stops at the end', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    const home = t.players.get(1);
+    await t.addSpeaker('remove-target');
+    await t.players.join(1, 'remove-target');
+    const path = '/api/v1/players/1';
+    for (const paused of [false, true]) {
+      const entries = await home.queueAdd(
+        [t.songs[0], t.songs[0], t.songs[1]],
+        { clear: true, play: true },
+      );
+      home.setRepeat('single');
+      home.setConsume(true);
+      await home.seek({ positionMs: 5000 });
+      if (paused) home.pause();
+      const old = home.playerView();
+      const lease = paused
+        ? null
+        : home.openSource(entries[0].id, old.generation);
+      await t.command(
+        `${path}/queue/items/${
+          entries[0].id
+        }?expectedVersion=${home.queueView().version}`,
+        'DELETE',
+        credential,
+      );
+      const state = (await t.read(path, credential)).player;
+      assertEquals([
+        state.current.entryId,
+        state.positionMs,
+        state.state,
+        state.repeat,
+        state.consume,
+      ], [entries[1].id, 0, paused ? 'pause' : 'play', 'single', true]);
+      if (lease) assert(lease.signal.aborted);
+      await t.command(
+        `${path}/queue/items/${entries[1].id}`,
+        'DELETE',
+        credential,
+      );
+      assertEquals(home.playerView().current!.id, entries[2].id);
+      await t.command(
+        `${path}/queue/items/${entries[2].id}`,
+        'DELETE',
+        credential,
+      );
+      assertEquals([
+        home.playerView().state,
+        home.playerView().current,
+        home.playerView().itemProgressMs,
+      ], ['stop', null, 0]);
+    }
+    const entries = await home.queueAdd(t.songs, { play: true });
+    await home.play();
+    await home.next();
+    await t.command(
+      `${path}/queue/items/${entries[1].id}`,
+      'DELETE',
+      credential,
+    );
+    assertEquals(
+      home.playerView().state,
+      'stop',
+      'removing the tail never wraps even under repeat',
+    );
+    assertEquals(home.queueView().items.map((e) => e.id), [entries[0].id]);
+    await t.command(`${path}/queue`, 'DELETE', credential);
+    assertEquals(home.queueView().items, []);
+    await t.persistence.drain();
+    assertEquals((await t.f.store.playback.loadQueue(1)).items, []);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue edit HTTP refuses stale versions before mutation or provenance and reports the current version', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    const home = t.players.get(1);
+    const [entry] = await home.queueAdd(t.songs);
+    const stale = home.queueView().version;
+    await home.queueAdd(t.songs);
+    const before = home.queueView();
+    const last = home.lastCommand();
+    const path = '/api/v1/players/1/queue';
+    for (
+      const [url, method, body] of [
+        [`${path}/items/${entry.id}`, 'PATCH', {
+          position: 1,
+          expectedVersion: stale,
+        }],
+        [
+          `${path}/items/${entry.id}?expectedVersion=${stale}`,
+          'DELETE',
+          undefined,
+        ],
+        [`${path}?expectedVersion=${stale}`, 'DELETE', undefined],
+      ] as const
+    ) {
+      const response = await t.f.json(url, method, body, credential);
+      assertEquals(response.status, 409);
+      assertEquals(await response.json(), {
+        code: 'queue_conflict',
+        message: 'Queue version has changed',
+        version: before.version,
+      });
+      assertEquals(home.queueView(), before);
+      assertEquals(home.lastCommand(), last);
+    }
+    await t.command(`${path}/items/${entry.id}`, 'PATCH', credential, {
+      position: 1,
+      expectedVersion: before.version,
+    });
+    await t.command(
+      `${path}?expectedVersion=${home.queueView().version}`,
+      'DELETE',
+      credential,
+    );
+    assertEquals(home.playerView().state, 'stop');
+    assert(home.queueView().version > before.version);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue edit HTTP validates ids, positions, versions, Origin and authentication without changing either player', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'bearer',
+      'member',
+      'password-member',
+    );
+    const home = t.players.get(1);
+    const [entry] = await home.queueAdd(t.songs);
+    const other = await t.players.create('Kitchen');
+    const [foreign] = await t.players.get(other.id).queueAdd(t.songs);
+    const before = home.queueView();
+    const path = '/api/v1/players/1/queue';
+    for (
+      const body of [
+        {},
+        { position: -1 },
+        { position: 1.5 },
+        { position: '1' },
+        { position: 0, expectedVersion: -1 },
+        { position: 0, expectedVersion: null },
+        { position: 0, expectedVersion: '1' },
+        { position: 0, extra: true },
+      ]
+    ) {
+      const response = await t.f.json(
+        `${path}/items/${entry.id}`,
+        'PATCH',
+        body,
+        credential,
+      );
+      assertEquals(response.status, 400, await response.clone().text());
+      await response.body?.cancel();
+    }
+    for (
+      const query of [
+        'expectedVersion=-1',
+        'expectedVersion=1.2',
+        'expectedVersion=x',
+        'expectedVersion=9007199254740992',
+        'expectedVersion=1&expectedVersion=2',
+        'extra=1',
+      ]
+    ) {
+      for (const url of [path, `${path}/items/${entry.id}`]) {
+        const response = await t.f.json(
+          `${url}?${query}`,
+          'DELETE',
+          undefined,
+          credential,
+        );
+        assertEquals(response.status, 400, await response.clone().text());
+        await response.body?.cancel();
+      }
+    }
+    for (
+      const id of [
+        '0',
+        '01',
+        '-1',
+        'bad',
+        '9007199254740992',
+        String(foreign.id),
+      ]
+    ) {
+      for (const method of ['DELETE', 'PATCH']) {
+        const response = await t.f.json(
+          `${path}/items/${id}`,
+          method,
+          method === 'PATCH' ? { position: 0 } : undefined,
+          credential,
+        );
+        assertEquals(response.status, 404, await response.clone().text());
+        await response.body?.cancel();
+      }
+    }
+    for (const url of [path, `${path}/items/${entry.id}`]) {
+      await error(
+        await t.f.json(url, 'DELETE', undefined),
+        401,
+        'unauthenticated',
+      );
+      await error(
+        await t.f.json(
+          url,
+          'DELETE',
+          undefined,
+          credential,
+          'http://other.home',
+        ),
+        403,
+        'origin',
+      );
+    }
+    assertEquals(home.queueView(), before);
+    const missing = await t.f.json(
+      '/api/v1/players/999/queue',
+      'DELETE',
+      undefined,
+      credential,
+    );
+    assertEquals(missing.status, 404);
+    await missing.body?.cancel();
+    const rebased = await t.f.json(
+      `/_melofon/api/v1/players/1/queue/items/${entry.id}`,
+      'PATCH',
+      { position: 1 },
+      credential,
+    );
+    assertEquals(rebased.status, 204);
+    await rebased.body?.cancel();
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue edit HTTP rechecks the expected version after slow successor preparation', async () => {
+  let hold = false;
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const t = await setup(async () => {
+    if (!hold) return;
+    entered.resolve();
+    await release.promise;
+  });
+  try {
+    const { credential } = await t.f.login('bearer');
+    await t.addSpeaker('slow-remove');
+    await t.players.join(1, 'slow-remove');
+    const home = t.players.get(1);
+    const resolver = createQueueResolver({
+      getSong: () => Promise.resolve(null),
+      getStation: () => Promise.resolve(null),
+    });
+    const media =
+      (await resolver({ kind: 'url', url: 'http://radio.home/live' }))!;
+    assert(media.facts.kind === 'web');
+    media.facts.mode = 'live';
+    const entries = await home.queueAddSources([media, media], { play: true });
+    const lease = home.openSource(entries[0].id, home.playerView().generation)!;
+    const expected = home.queueView().version;
+    const last = home.lastCommand();
+    hold = true;
+    const pending = t.f.json(
+      `/api/v1/players/1/queue/items/${
+        entries[0].id
+      }?expectedVersion=${expected}`,
+      'DELETE',
+      undefined,
+      credential,
+    );
+    await entered.promise;
+    assert(home.reportSourceMetadata(lease, { streamTitle: 'New broadcast' }));
+    const before = home.queueView();
+    release.resolve();
+    const response = await pending;
+    assertEquals(response.status, 409);
+    const conflict = await response.json();
+    assertEquals([conflict.code, conflict.version], [
+      'queue_conflict',
+      before.version,
+    ]);
+    assertEquals(home.queueView(), before);
+    assertEquals(home.lastCommand(), last);
+    assertEquals(home.playerView().current!.id, entries[0].id);
+    assert(!lease.signal.aborted);
+  } finally {
+    release.resolve();
+    await t.close();
+  }
+});
 
 Deno.test('queue add HTTP expands every reference in order, preserving duplicates and leaf identities', async () => {
   const t = await setup();
@@ -1314,6 +1688,32 @@ Deno.test('a second user socket sees lifecycle, keyed player queue modes volume 
         .name,
       'Study',
     );
+    const editPath = `/api/v1/players/${player.id}/queue`;
+    const first = playback.queueView().items[0].id;
+    await t.command(`${editPath}/items/${first}`, 'PATCH', actor.credential, {
+      position: 1,
+    });
+    await changed('queue', String(player.id));
+    assertEquals(
+      (await t.read(`${editPath}?view=all`, observer.credential)).items[1]
+        .entryId,
+      first,
+    );
+    await t.command(`${editPath}/items/${first}`, 'DELETE', actor.credential);
+    await waitFor(() =>
+      ['queue', 'player'].every((name) =>
+        frames.some((f) => f.events?.[name]?.includes(String(player.id)))
+      )
+    );
+    frames.length = 0;
+    await t.command(editPath, 'DELETE', actor.credential);
+    await waitFor(() =>
+      ['queue', 'player'].every((name) =>
+        frames.some((f) => f.events?.[name]?.includes(String(player.id)))
+      )
+    );
+    frames.length = 0;
+    assertEquals((await t.read(editPath, observer.credential)).total, 0);
     await t.command(
       `/api/v1/players/${player.id}/default`,
       'POST',

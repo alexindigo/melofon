@@ -28,7 +28,7 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
       throw new HttpError(
         code === 'airplay_busy'
           ? 409
-          : code === 'missing_reference'
+          : code === 'missing_reference' || code === 'missing_entry'
           ? 404
           : code === 'invalid_reference'
           ? 400
@@ -41,6 +41,9 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
             : {}),
           ...(code === 'queue_limit' && 'limit' in error
             ? { limit: error.limit }
+            : {}),
+          ...(code === 'queue_conflict' && 'version' in error
+            ? { version: error.version }
             : {}),
         },
       );

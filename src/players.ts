@@ -345,6 +345,8 @@ export async function createPlayers(deps: {
     queueAddSources: (...args) => current().queueAddSources(...args),
     queueAddReferences: (...args) => current().queueAddReferences(...args),
     queueClear: (...args) => current().queueClear(...args),
+    queueRemove: (...args) => current().queueRemove(...args),
+    queueMove: (...args) => current().queueMove(...args),
     advanceEnded: () => current().advanceEnded(),
     openSource: (...args) => current().openSource(...args),
     cancelSource: (...args) => current().cancelSource(...args),

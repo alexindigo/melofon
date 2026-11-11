@@ -621,6 +621,18 @@ export interface PlayerRow {
 }
 
 export interface PlayerPlayback {
+  queueRemove(
+    entryId: number,
+    expectedVersion?: number,
+    source?: Source,
+  ): void | Promise<void>;
+  queueMove(
+    entryId: number,
+    position: number,
+    expectedVersion?: number,
+    source?: Source,
+  ): void;
+  queueClear(source?: Source, expectedVersion?: number): void;
   queueAddReferences(
     references: PlayerQueueReference[],
     options: {

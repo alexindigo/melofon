@@ -30,7 +30,11 @@ import {
 } from './playback-reports.ts';
 export type { NowPlayingViewRow, ReportPlaying } from './playback-reports.ts';
 import { type Log, scopedLog } from './logging.ts';
-import { PlaybackError, QueueLimitError } from './playback-errors.ts';
+import {
+  PlaybackError,
+  QueueConflictError,
+  QueueLimitError,
+} from './playback-errors.ts';
 import type {
   PlaybackCapacity,
   PlaybackReservation,
@@ -130,7 +134,18 @@ export interface Playback {
     opts?: QueueAddOptions,
     source?: CommandSource,
   ): Promise<QueueEntry[]>;
-  queueClear(source?: CommandSource): void;
+  queueClear(source?: CommandSource, expectedVersion?: number): void;
+  queueRemove(
+    entryId: number,
+    expectedVersion?: number,
+    source?: CommandSource,
+  ): void | Promise<void>;
+  queueMove(
+    entryId: number,
+    position: number,
+    expectedVersion?: number,
+    source?: CommandSource,
+  ): void;
 
   /** The engine's clock: end-of-item transition when progress reached the
    * item length (main.ts drives it on an interval; tests drive it directly).
@@ -587,6 +602,23 @@ export function createPlayback(deps: {
   const flushQueue = () =>
     persistence?.saveQueue(player.queueSnapshot(), stateSnapshot());
   const flushState = () => persistence?.saveState(stateSnapshot());
+  const checkVersion = (expectedVersion?: number) => {
+    if (
+      expectedVersion !== undefined &&
+      expectedVersion !== player.queue().version
+    ) {
+      throw new QueueConflictError(player.queue().version);
+    }
+  };
+  const requireEntry = (entryId: number) => {
+    const index = player.queue().items.findIndex((entry) =>
+      entry.id === entryId
+    );
+    if (index < 0) {
+      throw new PlaybackError('missing_entry', 'Queue entry not found');
+    }
+    return index;
+  };
   // The position tick: writes only while the engine plays ("on while play,
   // off otherwise"), so a restored play needs no extra wiring. SIGKILL
   // loses at most ~1 s of position.
@@ -1242,8 +1274,59 @@ export function createPlayback(deps: {
         source,
       );
     },
-    queueClear(source) {
+    queueRemove(entryId, expectedVersion, source) {
       requireOpen();
+      checkVersion(expectedVersion);
+      const index = requireEntry(entryId);
+      const view = player.status();
+      const current = view.current?.id === entryId;
+      const future = player.queue().items.filter((entry) =>
+        entry.id !== entryId
+      );
+      return transition(
+        current && view.state === 'play' && index < future.length,
+        (activate) => {
+          // Preparation may await receiver/source facts; the observed revision
+          // is checked again at the actual mutation, before any state changes.
+          checkVersion(expectedVersion);
+          requireEntry(entryId);
+          player.queueRemove(entryId);
+          activate();
+          record(
+            'queueRemove',
+            `entryId=${entryId}`,
+            source,
+            current ? player.status().state : 'none',
+            false,
+            { entryId },
+          );
+          flushQueue();
+          emit(current ? ['queue', 'player'] : ['queue']);
+        },
+        undefined,
+        { index, items: future },
+      );
+    },
+    queueMove(entryId, position, expectedVersion, source) {
+      requireOpen();
+      checkVersion(expectedVersion);
+      requireEntry(entryId);
+      cancelStart();
+      player.queueMove(entryId, position);
+      record(
+        'queueMove',
+        `entryId=${entryId} position=${position}`,
+        source,
+        'none',
+        false,
+        { entryId, position },
+      );
+      flushQueue();
+      emit(['queue']);
+    },
+    queueClear(source, expectedVersion) {
+      requireOpen();
+      checkVersion(expectedVersion);
       cancelStart();
       player.queueClear();
       record('queueClear', undefined, source, 'stop', true);
