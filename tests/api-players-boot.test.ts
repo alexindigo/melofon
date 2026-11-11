@@ -1,4 +1,4 @@
-// Steps F/G acceptance: cold production main.ts -> HTTP -> receiver audio.
+// Steps F/G/H acceptance: cold production main.ts -> HTTP -> receiver audio.
 import { assert, assertEquals } from '@std/assert';
 import dgram from 'node:dgram';
 import { openStore } from '../src/store/index.ts';
@@ -155,6 +155,7 @@ async function boot(data: string) {
 async function advertise(
   dns: ReturnType<typeof dgram.createSocket>,
   receivers: Awaited<ReturnType<typeof startFakeRaop>>[],
+  ids = speakerIds,
 ) {
   await new Promise<void>((done, reject) => {
     dns.once('error', reject);
@@ -166,9 +167,7 @@ async function advertise(
     for (const [i, receiver] of receivers.entries()) {
       dns.send(
         airplayAnswer({
-          instance: `${
-            BigInt(speakerIds[i]).toString(16)
-          }@Room ${i}._raop._tcp.local`,
+          instance: `${BigInt(ids[i]).toString(16)}@Room ${i}._raop._tcp.local`,
           host: `room-${i}.local`,
           address: [127, 0, 0, 1],
           port: receiver.port,
@@ -793,6 +792,169 @@ Deno.test('controls cold HTTP: edit up next, resume stopped bookmark after resta
         receiver.sessions.every(
           (s) => s.closedAtMs !== null,
         )
+      )
+    );
+  } finally {
+    await server?.stop();
+    dns.close();
+    for (const receiver of receivers) receiver.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('volume cold HTTP: linked deltas, clipping and OwnTone master reach absolute receivers across restart', async () => {
+  assert(
+    (await Deno.resolveDns('melofon.home', 'A')).every((ip) =>
+      !ip.startsWith('127.')
+    ),
+  );
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-volume-boot-' });
+  const ids = [...speakerIds, '73588229207'];
+  const receivers = [
+    await startFakeRaop({ captureAudio: true }),
+    await startFakeRaop({ captureAudio: true }),
+    await startFakeRaop({ captureAudio: true }),
+  ];
+  const dns = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  let server: Awaited<ReturnType<typeof boot>> | undefined;
+  // Observe the real SET_PARAMETER consumer. The unchanged native adapter maps
+  // each absolute 0-100 number to -30..0 dB; no player multiplier belongs here.
+  const received = async (volumes: number[]) => {
+    await until(() =>
+      receivers.every((receiver, i) => {
+        const text = receiver.sessions.at(-1)?.volumeParams.at(-1);
+        return text !== undefined &&
+          Math.abs(Number(text.split(':')[1]) - (volumes[i] * 0.3 - 30)) <
+            0.001;
+      })
+    );
+  };
+  const levels = async () => {
+    const { speakers } = await server!.native('/speakers');
+    return ids.map((id) =>
+      speakers.find((speaker: { id: string }) => speaker.id === id).volume
+    );
+  };
+  const check = async (slider: number, volumes: number[]) => {
+    assertEquals((await server!.native('/players/1')).player.volume, slider);
+    assertEquals(await levels(), volumes);
+    assertEquals((await server!.own('/player')).volume, Math.max(...volumes));
+    await received(volumes);
+  };
+  try {
+    await advertise(dns, receivers, ids);
+    await speakerMedia(dir);
+    const store = await openStore(`${dir}/db`);
+    let songId = '';
+    try {
+      await createLibraries(store).add('Music', `${dir}/media`);
+      await scanLibrary(store);
+      const [song] = await createLibrary(store).listSongs({
+        offset: 0,
+        size: 1,
+      });
+      assert(song);
+      songId = song.id;
+      for (const [i, receiver] of receivers.entries()) {
+        await store.speakers.saveAdopted({
+          id: ids[i],
+          name: `Room ${i}`,
+          type: 'AirPlay',
+          host: '127.0.0.1',
+          port: receiver.port,
+          receiverIdentity: ids[i],
+          selected: true,
+          volume: 100,
+          connectionStrategy: 'owntone',
+        });
+      }
+    } finally {
+      await store.close();
+    }
+    server = await boot(`${dir}/db`);
+    await server.native('/players/1/volume', 'PUT', { volume: 40 });
+    for (const [i, volume] of [40, 20, 75].entries()) {
+      await server.native(`/speakers/${ids[i]}/volume`, 'PUT', { volume });
+    }
+    await server.native(`/players/1/speakers/${ids[2]}`, 'PATCH', {
+      linked: false,
+    });
+    await server.native('/players/1/queue/items', 'POST', {
+      references: [{ kind: 'song', id: songId }],
+      startPlaying: true,
+    });
+    await check(40, [40, 20, 75]);
+    await until(() =>
+      receivers.every((receiver) =>
+        receiver.sessions.at(-1)!.audioPayloads.length >= 8
+      )
+    );
+    for (const receiver of receivers) {
+      const session = receiver.sessions.at(-1)!;
+      assert(
+        decodeReceiverAudio(session.sdp, session.audioPayloads.slice(0, 8))
+          .some((sample) => sample !== 0),
+      );
+    }
+    await server.native('/players/1/volume', 'PUT', { volume: 60 });
+    await check(60, [60, 40, 75]);
+
+    // Leave headroom on the slider but not on the speakers. Clipping destroys
+    // their 20-point balance; a reverse gesture must not secretly restore it.
+    for (const [i, volume] of [90, 70].entries()) {
+      await server.native(`/speakers/${ids[i]}/volume`, 'PUT', { volume });
+    }
+    await check(60, [90, 70, 75]);
+    await server.native('/players/1/volume', 'PUT', { volume: 90 });
+    await check(90, [100, 100, 75]);
+    await server.native('/players/1/volume', 'PUT', { volume: 70 });
+    await check(70, [80, 80, 75]);
+
+    await server.native('/players/1/stop', 'POST', {});
+    await until(() =>
+      receivers.every((receiver) =>
+        receiver.sessions.every((session) => session.closedAtMs !== null)
+      )
+    );
+    await server.stop();
+    const sessionCounts = receivers.map((receiver) => receiver.sessions.length);
+    server = await boot(`${dir}/db`);
+    const restored = (await server.native('/players/1')).player;
+    assertEquals(restored.volume, 70);
+    assertEquals(
+      ids.map((id) =>
+        restored.speakers.find((speaker: { id: string }) => speaker.id === id)
+          .linked
+      ),
+      [true, true, false],
+    );
+    assertEquals(await levels(), [80, 80, 75]);
+    assertEquals((await server.own('/player')).volume, 80);
+    await server.native('/players/1/play', 'POST', {});
+    await until(() =>
+      receivers.every((receiver, i) =>
+        receiver.sessions.slice(sessionCounts[i]).some((session) =>
+          session.audioPayloads.length >= 8
+        )
+      )
+    );
+    await check(70, [80, 80, 75]);
+    for (const [i, receiver] of receivers.entries()) {
+      const session = receiver.sessions.slice(sessionCounts[i]).find((
+        session,
+      ) => session.audioPayloads.length >= 8)!;
+      assert(
+        decodeReceiverAudio(session.sdp, session.audioPayloads.slice(0, 8))
+          .some((sample) => sample !== 0),
+      );
+    }
+    // OwnTone translates from the loudest 80, not the saved slider's 70.
+    await server.own('/player/volume?volume=85', 'PUT');
+    await check(75, [85, 85, 75]);
+    await server.native('/players/1/stop', 'POST', {});
+    await until(() =>
+      receivers.every((receiver) =>
+        receiver.sessions.every((session) => session.closedAtMs !== null)
       )
     );
   } finally {
