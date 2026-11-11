@@ -737,8 +737,6 @@ export function createAirplayBoot(
     pauseWithoutPeer();
     if (intent === 'play') scheduleRetry(id);
   };
-  const volume = (out: Output, v: View) =>
-    out.volume >= 100 ? v.volume : Math.round(out.volume * v.volume / 100);
   const spawnSession = (out: Output) => {
     if (resuming.has(out.id)) return;
     const id = out.id, e = epoch(id), permission = grants.get(id);
@@ -834,7 +832,7 @@ export function createAirplayBoot(
         strategy: latestOut.connectionStrategy,
         host: latestOut.host!,
         port: latestOut.port ?? 7000,
-        volume: volume(latestOut, view),
+        volume: latestOut.volume,
         held: false,
       };
       runtimes.set(id, r);
@@ -1102,9 +1100,9 @@ export function createAirplayBoot(
       }
       actions.push(() => {
         if (runtimes.get(id) !== r || !r.transport) return;
-        const current = playback.playerView(), row = outputs.get(id);
+        const row = outputs.get(id);
         if (!row) return;
-        const v = volume(row, current);
+        const v = row.volume;
         if (v !== r.volume) {
           r.volume = v;
           void r.transport.send({ cmd: 'volume', volume: v }).catch((error) => {

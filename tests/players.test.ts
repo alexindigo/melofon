@@ -84,6 +84,239 @@ async function household(
   };
 }
 
+Deno.test('saved player sliders move only linked members by a capped delta and zero silences them', async () => {
+  const dir = await dataDir();
+  let store = await openStore(dir);
+  await store.players.saveChanges({ players: [{ playerId: 1, volume: 40 }] });
+  let f = await household(store);
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    const home = f.players.get(1), other = f.players.get(kitchen.id);
+    assertEquals(home.playerView().volume, 40);
+    assertEquals(other.playerView().volume, 50);
+    assertEquals(
+      await store.playback.loadPlayerState(1),
+      null,
+      'saved volume initializes without a bookmark',
+    );
+    for (
+      const [id, volume] of [['11', 40], ['12', 20], ['13', 70], [
+        '14',
+        15,
+      ]] as const
+    ) {
+      registerSpeaker(f, id);
+      f.outputs.update(id, { volume });
+      await f.outputs.adopt(id);
+    }
+    await f.players.setSpeakers(1, ['11', '12']);
+    await f.players.join(kitchen.id, '13');
+    registerSpeaker(f, 'temporary');
+    await f.players.join(1, 'temporary');
+    assertEquals(f.outputs.get('12')?.linked, true);
+    await home.setVolume({ volume: 60 }, { kind: 'http', user: 'alice' });
+    assertEquals(
+      ['11', '12', 'temporary'].map((id) => f.outputs.get(id)?.volume),
+      [60, 40, 60],
+    );
+    assertEquals(f.outputs.get('13')?.volume, 70);
+    assertEquals(f.outputs.get('14')?.volume, 15);
+    assertEquals(other.playerView().volume, 50);
+    assertEquals(f.players.list()[0].volume, 60);
+    f.outputs.update('11', { volume: 95 });
+    assertEquals(
+      home.playerView().volume,
+      60,
+      'a speaker change never moves the slider or its peers',
+    );
+    assertEquals(f.outputs.get('12')?.volume, 40);
+    await f.players.setLinked(1, '12', false);
+    await home.setVolume({ step: 20 });
+    assertEquals([
+      home.playerView().volume,
+      f.outputs.get('11')?.volume,
+      f.outputs.get('12')?.volume,
+    ], [80, 100, 40]);
+    await home.setVolume({ step: -20 });
+    assertEquals(
+      f.outputs.get('11')?.volume,
+      80,
+      'capping loses the former balance',
+    );
+    await f.players.setLinked(1, '12', true);
+    assertEquals(
+      f.outputs.get('12')?.volume,
+      40,
+      'relinking changes no speaker number',
+    );
+    await home.setVolume({ volume: -20 });
+    assertEquals(home.playerView().volume, 0);
+    assertEquals(
+      ['11', '12', 'temporary'].map((id) => f.outputs.get(id)?.volume),
+      [0, 0, 0],
+    );
+    f.outputs.update('12', { volume: 25 });
+    await f.players.setLinked(1, '12', false);
+    await home.setVolume({ volume: 0 });
+    assertEquals(
+      f.outputs.get('12')?.volume,
+      25,
+      'zero does not silence an unlinked member',
+    );
+    f.outputs.update('11', { volume: 70 });
+    await home.setVolume({ volume: 0 });
+    assertEquals(
+      f.outputs.get('11')?.volume,
+      0,
+      'reasserting zero also silences linked members',
+    );
+    await home.setVolume({ volume: 200, step: -100 });
+    assertEquals(
+      home.playerView().volume,
+      100,
+      'absolute wins, and the player itself is capped',
+    );
+    assertEquals(f.outputs.get('11')?.volume, 100);
+    assertEquals(f.outputs.get('12')?.volume, 25);
+    await home.setVolume({ volume: 37 });
+    await other.setVolume({ volume: 22 });
+    assertEquals(f.outputs.get('13')?.volume, 42);
+    await assertRejects(
+      () => f.players.setLinked(kitchen.id, '12', true),
+      SpeakerError,
+      'not found',
+    );
+    const preferences = () =>
+      f.outputs.list().filter((row) => row.id !== 'temporary').map((
+        { id, playerId, linked, volume },
+      ) => ({
+        id,
+        playerId: playerId ?? null,
+        linked: linked ?? true,
+        volume,
+      }));
+    const before = preferences();
+    const commands = (await store.players.list()).map((row) =>
+      row.commandedAtMs
+    );
+    await f.close();
+    await store.close();
+    store = await openStore(dir);
+    f = await household(store);
+    assertEquals([
+      f.players.get(1).playerView().volume,
+      f.players.get(kitchen.id).playerView().volume,
+    ], [37, 22]);
+    assertEquals(preferences(), before);
+    assertEquals(
+      f.outputs.get('temporary'),
+      null,
+      'temporary volume and membership are never adopted by a slider',
+    );
+    assertEquals(
+      f.players.get(1).queueView().items,
+      [],
+      'volume restore does not need a queue',
+    );
+    assertEquals(
+      (await store.players.list()).map((row) => row.commandedAtMs),
+      commands,
+      'restoring volume is not a command',
+    );
+    await f.players.join(kitchen.id, '12');
+    assertEquals(
+      f.outputs.get('12')?.linked,
+      true,
+      'joining a new owner resets the link',
+    );
+    assertEquals(
+      f.outputs.get('12')?.volume,
+      25,
+      'joining never changes the absolute number',
+    );
+  } finally {
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('a slider transaction rolls back player and speakers together and retries before a later speaker write', async () => {
+  const dir = await dataDir(), store = await openStore(dir);
+  await store.players.saveChanges({ players: [{ playerId: 1, volume: 40 }] });
+  let fail = false;
+  const batches: Parameters<Store['players']['saveChanges']>[0][] = [];
+  const wrapped: Store = {
+    ...store,
+    players: {
+      ...store.players,
+      saveChanges(changes) {
+        if (changes.players?.some((row) => row.volume !== undefined)) {
+          batches.push(structuredClone(changes));
+          if (fail) {
+            return store.players.saveChanges({
+              ...changes,
+              speakerVolumes: [{ speakerId: '11', volume: 101 }],
+            });
+          }
+        }
+        return store.players.saveChanges(changes);
+      },
+    },
+  };
+  const f = await household(wrapped);
+  try {
+    for (const [id, volume] of [['11', 40], ['12', 20]] as const) {
+      registerSpeaker(f, id);
+      f.outputs.update(id, { volume });
+      await f.outputs.adopt(id);
+    }
+    await f.players.setSpeakers(1, ['11', '12']);
+    fail = true;
+    await assertRejects(
+      async () =>
+        await f.players.get(1).setVolume({ volume: 60 }, {
+          kind: 'http',
+          user: 'alice',
+        }),
+      Error,
+      'Invalid speaker volume',
+    );
+    assertEquals((await store.players.list())[0].volume, 40);
+    assertEquals(
+      (await store.speakers.loadAdopted()).map((row) => row.volume),
+      [40, 20],
+    );
+    assertEquals(f.players.get(1).playerView().volume, 60);
+    assertEquals(f.outputs.list().map((row) => row.volume), [60, 40]);
+    assertEquals(batches[0].players?.map((row) => row.volume), [60]);
+    assert(batches[0].players?.[0].commandedAtMs !== undefined);
+    assertEquals(batches[0].outputs?.map((row) => row.volume), [60, 40]);
+    fail = false;
+    f.outputs.update('11', { volume: 65 });
+    await f.persistence.drain();
+    assertEquals((await store.players.list())[0].volume, 60);
+    assertEquals(
+      (await store.speakers.loadAdopted()).map((row) => row.volume),
+      [65, 40],
+    );
+    const first = f.players.get(1).setVolume({ step: -10 });
+    const second = f.players.get(1).setVolume({ step: 20 });
+    await Promise.all([first, second]);
+    assertEquals((await store.players.list())[0].volume, 70);
+    assertEquals(
+      (await store.speakers.loadAdopted()).map((row) => row.volume),
+      [75, 50],
+    );
+    assertEquals(f.persistence.savedOutput('11')?.volume, 75);
+  } finally {
+    fail = false;
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('registry engines have independent durable queues, clocks, modes and provenance with global occurrence ids', async () => {
   const dir = await dataDir();
   let store = await openStore(dir);

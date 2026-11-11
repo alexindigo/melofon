@@ -144,7 +144,7 @@ export async function createPlayers(deps: {
   const add = (row: StoredPlayer): Engine => {
     const persistence = deps.persistence.forPlayer(row.id);
     const outputs = playerOutputs(deps.outputs, row.id);
-    const player = createPlayer(deps.clock);
+    const player = createPlayer({ ...deps.clock, volume: row.volume });
     const capacity = deps.capacity?.forPlayer(() => ({
       id: row.id,
       name: row.name,
@@ -161,6 +161,10 @@ export async function createPlayers(deps: {
         saveCommand(atMs) {
           row.commandedAtMs = atMs;
           persistence.saveCommand?.(atMs);
+        },
+        saveVolume(volume) {
+          row.volume = volume;
+          persistence.saveVolume?.(volume);
         },
       },
       reserveQueueIds: (count) => deps.store.players.reserveQueueIds(count),
@@ -380,6 +384,22 @@ export async function createPlayers(deps: {
       requireEngine(id);
       return members(id);
     },
+    setLinked: (
+      id: number,
+      speakerId: string,
+      linked: boolean,
+      source?: CommandSource,
+    ) =>
+      mutate(async () => {
+        requireEngine(id);
+        const speaker = deps.outputs.get(speakerId);
+        if (!speaker || outputPlayerId(speaker) !== id) {
+          throw new SpeakerError('not_found', 'Player speaker not found');
+        }
+        await deps.persistence.changePlayers(() => {
+          deps.outputs.update(speakerId, { linked }, source);
+        });
+      }),
     setSpeakers: (id: number, ids: string[], source?: CommandSource) =>
       mutate(() => changeMembers(id, ids, source)),
     join: (id: number, speakerId: string, source?: CommandSource) =>

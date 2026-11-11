@@ -24,11 +24,11 @@ export default async (request: HatRequest, context: HatContext) => {
     return updated === null ? badRequest() : noContent();
   }
   if (volume !== null) {
-    context.app.playback.setVolume({ volume }, sourceFrom(request));
+    await context.app.playback.setVolume({ volume }, sourceFrom(request));
     return noContent();
   }
   if (step !== null) {
-    context.app.playback.setVolume({ step }, sourceFrom(request));
+    await context.app.playback.setVolume({ step }, sourceFrom(request));
     return noContent();
   }
   return badRequest();

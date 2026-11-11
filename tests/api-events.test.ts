@@ -454,7 +454,7 @@ Deno.test('events: household queue, player and speaker changes reach cookie/Bear
       );
       assertEquals(socket.frames.shift(), {
         type: 'changed',
-        events: { speakers: [], volume: [] },
+        events: { speakers: [], volume: ['1'] },
       });
     }
   } finally {

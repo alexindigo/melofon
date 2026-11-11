@@ -1,6 +1,6 @@
 // src/player.ts — app.player / app.outputs: the server-side player engine
 // (the OwnTone control plane). One restart-transparent queue,
-// play/pause/stop state, master volume, and the outputs list. The outputs
+// play/pause/stop state, player volume, and the outputs list. The outputs
 // list starts EMPTY — no dummy sink; a boot registers real outputs
 // (app.outputs.register, M6: Chromecast / AirPlay / FS) and an empty list is
 // the truth, not a placeholder. Hats (OwnTone JSON, later the Melofon UI)
@@ -110,7 +110,7 @@ export interface PlayerStatus {
   repeat: RepeatMode;
   consume: boolean;
   shuffle: boolean;
-  /** Master volume, 0–100. */
+  /** Independent saved player volume, 0-100. */
   volume: number;
   /** Entry the wire reports: the current one while playing/paused; null
    * when stopped (no queue-head fallback) or the queue is empty. */
@@ -149,6 +149,10 @@ export interface PlayerPersistence {
   saveState(snapshot: PlayerStateSnapshot): void;
   /** Operator command time, separate from periodic position bookmarks. */
   saveCommand?(atMs: number): void;
+  /** Player slider, independent of the playback bookmark and speaker levels. */
+  saveVolume?(volume: number): void;
+  /** Capture a synchronous slider/speaker publication in one durable write. */
+  changeVolume?(change: () => void): Promise<void>;
 }
 
 /** What restore() loads at boot: the rehydrated queue plus the snapshot. */
@@ -417,6 +421,7 @@ export interface Outputs {
     opts: {
       selected?: boolean;
       volume?: number;
+      linked?: boolean;
       pin?: string;
       needsAuthKey?: boolean;
       requiresAuth?: boolean;
@@ -471,6 +476,7 @@ function clampVolume(n: number): number {
 export function createPlayer(options: {
   now?: () => number;
   monotonicNow?: () => number;
+  volume?: number;
 } = {}): Player {
   const now = options.now ?? Date.now;
   const monotonicNow = options.monotonicNow ?? (() => performance.now());
@@ -481,7 +487,7 @@ export function createPlayer(options: {
   let repeat: RepeatMode = 'off';
   let consume = false;
   let shuffle = false;
-  let volume = 50;
+  let volume = clampVolume(options.volume ?? 50);
   let currentIndex: number | null = null;
   // Wall-clock progress: base is the frozen position; when playing, progress
   // is base + (now - startedAt).
@@ -1392,6 +1398,7 @@ export function createOutputs(
         else if (owner(found) === 1) member(found, null);
       }
       if (opts.volume !== undefined) found.volume = clampVolume(opts.volume);
+      if (opts.linked !== undefined) found.linked = opts.linked;
       if (opts.connectionStrategy !== undefined) {
         found.connectionStrategy = opts.connectionStrategy;
       }
@@ -1404,6 +1411,7 @@ export function createOutputs(
       );
       if (
         opts.selected !== undefined || opts.volume !== undefined ||
+        opts.linked !== undefined ||
         opts.connectionStrategy !== undefined
       ) {
         saveRow(found);
@@ -1438,7 +1446,17 @@ export function createOutputs(
         }
       }
       releaseWithdrawn();
-      emit(opts.volume === undefined ? ['outputs'] : ['outputs', 'volume']);
+      const types = opts.volume === undefined
+        ? ['outputs']
+        : ['outputs', 'volume'];
+      const playerId = owner(found);
+      notify?.emit(
+        types,
+        opts.volume !== undefined && playerId !== null
+          ? { volume: [String(playerId)] }
+          : undefined,
+        'all',
+      );
       return { ...found };
     },
     onCommand(fn) {

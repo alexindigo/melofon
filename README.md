@@ -84,6 +84,15 @@ restart resets the current song while keeping play or pause. The OwnTone hat's
 previous follows its 3-second rule: restart after more than 3 seconds, previous
 otherwise.
 
+Players keep their own saved volume. Speakers store absolute levels from 0 to
+100, and AirPlay receives those levels without a second master multiplier.
+Moving a player slider moves its linked speakers by the same amount, capped at
+0 and 100; returning from an extreme does not restore the old balance. Player
+zero silences linked speakers only. An individual speaker change does not move
+the player slider or other speakers. Joining a player starts linked and keeps
+the speaker's level. On upgrade, stored speaker levels are unchanged and Home
+starts at its loudest member's level (50 without members).
+
 Signed-in clients send `POST /api/v1/players/{id}/{command}` with `{}` for
 `play`, `pause`, `stop`, `next`, `previous` or `restart`. Seek uses `POST
 /api/v1/players/{id}/seek` with exactly one integer millisecond field:

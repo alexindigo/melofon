@@ -296,6 +296,56 @@ Deno.test('household native AirPlay sends RTP to exactly one fake receiver on si
   }
 });
 
+Deno.test('native AirPlay receivers get absolute speaker volumes at start and after linked slider changes', async () => {
+  const receivers = [await startFakeRaop(), await startFakeRaop()];
+  const dir = await dataDir(), store = await openStore(dir);
+  const h = await household(store, [], receivers.map((r) => r.port));
+  const levels = () =>
+    receivers.map((r) => r.sessions.at(-1)?.volumeParams.at(-1));
+  const received = async (a: number, b: number) => {
+    await until(() =>
+      levels().every((text, i) =>
+        text !== undefined &&
+        Math.abs(Number(text.split(':')[1]) - [a, b][i]) < 0.001
+      )
+    );
+  };
+  try {
+    const home = h.players.get(1);
+    await home.setVolume({ volume: 40 });
+    h.outputs.update('11', { volume: 40 });
+    h.outputs.update('22', { volume: 20 });
+    await h.players.join(1, '22');
+    await home.play();
+    await received(-18, -24);
+    await until(() =>
+      receivers.every((r) => r.sessions.some((s) => s.audioPackets > 0))
+    );
+    await home.setVolume({ volume: 60 });
+    await received(-12, -18);
+    await h.players.setLinked(1, '22', false);
+    await home.setVolume({ volume: 0 });
+    // The unchanged native adapter maps absolute 0-100 to -30..0 dB.
+    await received(-30, -18);
+    h.outputs.update('11', { volume: 30 });
+    await received(-21, -18);
+    assertEquals(
+      home.playerView().volume,
+      0,
+      'zero slider never multiplies an individual absolute change',
+    );
+    await h.players.setLinked(1, '22', true);
+    await home.setVolume({ volume: 100 });
+    await received(0, 0);
+    assertEquals(h.outputs.list().map((row) => row.volume), [100, 100]);
+  } finally {
+    await h.close();
+    await store.close();
+    for (const r of receivers) r.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('household wiring refuses every competing start before queue or play-state mutation', async () => {
   const f = await fixture();
   try {

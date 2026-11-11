@@ -137,6 +137,7 @@ async function setup(
     library,
     cfg: {},
     notify,
+    outputs,
   });
   const spawned: FakeTransport[] = [];
   const decodeRequests: { path: string; startMs?: number }[] = [];
@@ -275,7 +276,7 @@ Deno.test('selected + play: start command, then the track as PCM', async () => {
     assertEquals(start.host, HOST);
     assertEquals(start.port, 7000);
     assertEquals(start.name, 'Kitchen ATV');
-    assertEquals(start.volume, 50);
+    assertEquals(start.volume, 100);
     assertEquals(start.wanted_metadata, 0);
     assertEquals(start.title, 'First Song');
     assertEquals(start.artist, 'Fixture Artist');
@@ -458,8 +459,8 @@ Deno.test('volume and pin reach the helper; password event sets needsAuthKey', a
 
     playback.setVolume({ volume: 33 });
     await until(
-      'master volume cmd',
-      () => t.cmds().some((c) => c.cmd === 'volume' && c.volume === 33),
+      'linked volume delta cmd',
+      () => t.cmds().some((c) => c.cmd === 'volume' && c.volume === 83),
     );
 
     playback.setVolume({ volume: 100 });

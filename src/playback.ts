@@ -124,7 +124,7 @@ export interface Playback {
   setVolume(
     opts: { volume?: number; step?: number },
     source?: CommandSource,
-  ): void;
+  ): void | Promise<void>;
   seek(
     opts: { positionMs?: number; seekMs?: number },
     source?: CommandSource,
@@ -232,7 +232,7 @@ export function createPlayback(deps: {
   nowPlaying: NowPlaying;
   library: Pick<Library, 'getSong'>;
   cfg: { user?: string };
-  outputs?: Pick<Outputs, 'list'>;
+  outputs?: Pick<Outputs, 'list' | 'update'>;
   /** Server composition supplies the speaker owner. Engine-only callers can
    * stay synchronous without outbound adapters. */
   targets?: {
@@ -1170,21 +1170,37 @@ export function createPlayback(deps: {
     setVolume(opts, source) {
       requireOpen();
       if (opts.volume === undefined && opts.step === undefined) return;
-      player.setVolume(opts);
-      record(
-        'volume',
-        opts.volume !== undefined
-          ? `volume=${opts.volume}`
-          : `step=${opts.step}`,
-        source,
-        'none',
-        false,
-        {
-          volume: opts.volume,
-          step: opts.volume === undefined ? opts.step : undefined,
-        },
-      );
-      emit(['volume']);
+      const change = () => {
+        const before = player.status().volume;
+        player.setVolume(opts);
+        const volume = player.status().volume;
+        const step = volume - before;
+        for (const out of outputs?.list() ?? []) {
+          if (out.selected && out.linked !== false) {
+            outputs?.update(out.id, {
+              volume: volume === 0 ? 0 : out.volume + step,
+            }, source);
+          }
+        }
+        persistence?.saveVolume?.(volume);
+        record(
+          'volume',
+          opts.volume !== undefined
+            ? `volume=${opts.volume}`
+            : `step=${opts.step}`,
+          source,
+          'none',
+          false,
+          {
+            volume: opts.volume,
+            step: opts.volume === undefined ? opts.step : undefined,
+          },
+        );
+        emit(['volume']);
+      };
+      return persistence?.changeVolume
+        ? persistence.changeVolume(change)
+        : change();
     },
     seek(opts, source) {
       requireOpen();

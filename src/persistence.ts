@@ -110,6 +110,10 @@ export function createPersistence(
           savePlayer({ playerId, commandedAtMs });
         }
       },
+      saveVolume(volume) {
+        if (active) savePlayer({ playerId, volume });
+      },
+      changeVolume: (change) => changePlayers(change),
       loadQueue: () => store.playback.loadQueue(playerId),
       loadPlayerState: () => store.playback.loadPlayerState(playerId),
       drain,
@@ -163,6 +167,8 @@ export function createPersistence(
     changePlayers,
     saveQueue: home.saveQueue,
     saveState: home.saveState,
+    saveVolume: home.saveVolume,
+    changeVolume: home.changeVolume,
     loadQueue: home.loadQueue,
     loadPlayerState: home.loadPlayerState,
 
