@@ -485,6 +485,17 @@ export function createSpeakers(deps: {
         );
       }
     },
+    async setVolume(
+      id: string,
+      volume: number,
+      source?: CommandSource,
+    ): Promise<SpeakerView> {
+      requireRow(id);
+      const adopted = deps.outputs.lifetime(id).adopted;
+      const row = deps.outputs.update(id, { volume }, source)!;
+      // Use the same preference writer and durable boundary as configuration.
+      return adopted ? await durable(() => deps.outputs.adopt(id)) : view(row);
+    },
     async configure(
       id: string,
       input: unknown,

@@ -144,6 +144,11 @@ export interface HatContext {
       pair(id: string, input: unknown): Promise<SpeakerPairingView>;
       submitPin(id: string, input: unknown): Promise<SpeakerPairingView>;
       forget(id: string, source?: Source): Promise<void>;
+      setVolume(
+        id: string,
+        volume: number,
+        source?: Source,
+      ): Promise<SpeakerView>;
       configure(
         id: string,
         input: unknown,
@@ -262,6 +267,12 @@ export interface HatContext {
       members(id: number): { id: string; name: string; linked?: boolean }[];
       join(id: number, speakerId: string, source?: Source): Promise<void>;
       leave(id: number, speakerId: string, source?: Source): Promise<void>;
+      setLinked(
+        id: number,
+        speakerId: string,
+        linked: boolean,
+        source?: Source,
+      ): Promise<void>;
       copyQueue(id: number, targetId: number, options: {
         mode: 'replace' | 'add';
         where?: 'end' | 'next' | { position: number };
@@ -672,6 +683,7 @@ export interface PlayerPlayback {
   ): boolean | Promise<boolean>;
   setRepeat(mode: 'off' | 'all' | 'single', source?: Source): void;
   setConsume(on: boolean, source?: Source): void;
+  setVolume(options: { volume: number }, source?: Source): Promise<void>;
   playerView(): {
     state: 'play' | 'pause' | 'stop';
     repeat: 'off' | 'all' | 'single';

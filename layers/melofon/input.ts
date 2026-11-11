@@ -8,6 +8,14 @@ export function fields(context: HatContext, allowed: string[]) {
   }
   return body;
 }
+export function volume(context: HatContext): number {
+  const { volume } = fields(context, ['volume']);
+  if (
+    typeof volume !== 'number' || !Number.isInteger(volume) ||
+    volume < 0 || volume > 100
+  ) fail(400, 'invalid_field', 'volume must be an integer from 0 to 100');
+  return volume;
+}
 export function text(body: Record<string, unknown>, key: string): string {
   if (typeof body[key] !== 'string') {
     fail(400, 'invalid_field', `${key} must be a string`);

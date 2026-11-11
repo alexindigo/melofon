@@ -179,6 +179,371 @@ async function setup(beforePrepare?: () => Promise<void>) {
   };
 }
 
+Deno.test('volume HTTP moves only linked members, clips and persists absolute levels for cookie and Bearer users', async () => {
+  const t = await setup();
+  try {
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await t.f.login(mode, 'member', 'password-member');
+      const base = `${mode === 'cookie' ? '' : '/_melofon'}/api/v1`;
+      const { player } = await t.command(
+        `${base}/players`,
+        'POST',
+        credential,
+        {
+          name: `Volume ${mode}`,
+        },
+        201,
+      );
+      const path = `${base}/players/${player.id}`;
+      const ids = ['a', 'b', 'unlinked', 'free', 'temporary'].map((s) =>
+        `${mode}-${s}`
+      );
+      for (const id of ids) await t.addSpeaker(id, 'Test', id !== ids[4]);
+      const speakerVolume = (id: string, volume: number) =>
+        t.command(`${base}/speakers/${id}/volume`, 'PUT', credential, {
+          volume,
+        });
+      const playerVolume = (volume: number) =>
+        t.command(`${path}/volume`, 'PUT', credential, { volume });
+      const link = (id: string, linked: boolean) =>
+        t.command(`${path}/speakers/${id}`, 'PATCH', credential, { linked });
+      const levels = async () => {
+        const list = await t.read(`${base}/speakers`, credential);
+        return ids.map((id) =>
+          list.speakers.find((s: { id: string }) => s.id === id).volume
+        );
+      };
+      await playerVolume(40);
+      for (const id of [ids[0], ids[1], ids[2], ids[4]]) {
+        await t.command(`${path}/speakers/${id}`, 'PUT', credential, {});
+      }
+      for (const [index, value] of [40, 20, 35, 15, 10].entries()) {
+        await speakerVolume(ids[index], value);
+      }
+      assertEquals((await t.read(path, credential)).player.volume, 40);
+      await link(ids[2], false);
+      await playerVolume(60);
+      assertEquals(await levels(), [60, 40, 35, 15, 30]);
+      assertEquals(t.players.get(1).playerView().volume, 50);
+      assertEquals(
+        t.players.get(player.id).lastCommand()!.source.user,
+        'member',
+      );
+      assertEquals(
+        t.players.get(player.id).lastCommand()!.source.via,
+        'melofon',
+      );
+      await speakerVolume(ids[0], 90);
+      assertEquals((await t.read(path, credential)).player.volume, 60);
+      assertEquals(await levels(), [90, 40, 35, 15, 30]);
+      await playerVolume(100);
+      assertEquals(await levels(), [100, 80, 35, 15, 70]);
+      await playerVolume(0);
+      assertEquals(await levels(), [0, 0, 35, 15, 0]);
+      await speakerVolume(ids[0], 25);
+      await playerVolume(0);
+      assertEquals(await levels(), [0, 0, 35, 15, 0]);
+      await link(ids[2], true);
+      assertEquals(await levels(), [0, 0, 35, 15, 0]);
+      await playerVolume(10);
+      assertEquals(await levels(), [10, 10, 45, 15, 10]);
+      await link(ids[1], false);
+      const detail = (await t.read(path, credential)).player;
+      assertEquals(
+        detail.speakers.find((s: { id: string }) => s.id === ids[1]).linked,
+        false,
+      );
+      assertEquals(
+        (await t.f.store.players.list()).find((p) => p.id === player.id)!
+          .volume,
+        10,
+      );
+      const saved = { outputs: await t.f.store.speakers.loadAdopted() };
+      for (const [index, value] of [10, 10, 45, 15].entries()) {
+        assertEquals(
+          saved.outputs.find((s) => s.id === ids[index])!.volume,
+          value,
+        );
+      }
+      assertEquals(
+        (await t.f.store.speakers.loadMemberships()).find((s) =>
+          s.speakerId === ids[1]
+        )!.linked,
+        false,
+      );
+      assert(
+        !saved.outputs.some((s) => s.id === ids[4]),
+        'temporary volume does not adopt',
+      );
+      await t.command(
+        `${base}/players/1/speakers/${ids[1]}`,
+        'PUT',
+        credential,
+        {},
+      );
+      assertEquals(
+        t.outputs.get(ids[1])!.linked,
+        true,
+        'joining resets linking',
+      );
+      assertEquals(t.outputs.get(ids[1])!.volume, 10);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('volume and linking HTTP validate bodies, ownership, authentication and Origin before mutation', async () => {
+  const t = await setup();
+  try {
+    const other = await t.players.create('Other');
+    for (const id of ['owned', 'foreign', 'free']) await t.addSpeaker(id);
+    await t.players.join(1, 'owned');
+    await t.players.join(other.id, 'foreign');
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await t.f.login(mode, 'member', 'password-member');
+      const routes = [
+        {
+          path: '/api/v1/players/1/volume',
+          method: 'PUT',
+          valid: { volume: 60 },
+        },
+        {
+          path: '/api/v1/speakers/owned/volume',
+          method: 'PUT',
+          valid: { volume: 60 },
+        },
+        {
+          path: '/api/v1/players/1/speakers/owned',
+          method: 'PATCH',
+          valid: { linked: false },
+        },
+      ];
+      const before = [
+        t.players.get(1).playerView(),
+        t.outputs.list(),
+        t.players.get(1).lastCommand(),
+        t.outputs.lastCommand(),
+      ];
+      for (const { path, method, valid } of routes) {
+        await error(
+          await t.f.json(path, method, valid),
+          401,
+          'unauthenticated',
+        );
+        await error(
+          await t.f.json(path, method, valid, credential, 'http://other.home'),
+          403,
+          'origin',
+        );
+        const invalid = method === 'PATCH'
+          ? [{}, { linked: null }, { linked: 0 }, { linked: 'false' }]
+          : [
+            {},
+            ...[null, '40', true, -1, 101, 1.5, 1e100].map((volume) => ({
+              volume,
+            })),
+          ];
+        for (const body of invalid) {
+          await error(
+            await t.f.json(path, method, body, credential),
+            400,
+            'invalid_field',
+          );
+        }
+        await error(
+          await t.f.json(path, method, { ...valid, extra: true }, credential),
+          400,
+          'unknown_field',
+        );
+        for (const body of [[], null, 'not an object']) {
+          const response = await t.f.json(path, method, body, credential);
+          assertEquals(response.status, 400);
+          await response.body?.cancel();
+        }
+      }
+      for (const id of ['0', '01', '-1', 'bad', '9007199254740992', '9999']) {
+        await error(
+          await t.f.json(
+            `/api/v1/players/${id}/volume`,
+            'PUT',
+            { volume: 20 },
+            credential,
+          ),
+          404,
+          'not_found',
+        );
+        await error(
+          await t.f.json(`/api/v1/players/${id}/speakers/owned`, 'PATCH', {
+            linked: false,
+          }, credential),
+          404,
+          'not_found',
+        );
+      }
+      for (const id of ['foreign', 'free', 'missing']) {
+        await error(
+          await t.f.json(`/api/v1/players/1/speakers/${id}`, 'PATCH', {
+            linked: false,
+          }, credential),
+          404,
+          'not_found',
+        );
+      }
+      await error(
+        await t.f.json(
+          '/api/v1/speakers/missing/volume',
+          'PUT',
+          { volume: 20 },
+          credential,
+        ),
+        404,
+        'not_found',
+      );
+      assertEquals([
+        t.players.get(1).playerView(),
+        t.outputs.list(),
+        t.players.get(1).lastCommand(),
+        t.outputs.lastCommand(),
+      ], before);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('volume HTTP awaits saved speaker preferences and reports persistence failures without adopting temporary speakers', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    await t.addSpeaker('saved-volume');
+    await t.addSpeaker('temporary-volume', 'Test', false);
+    const save = t.f.store.speakers.saveAdopted;
+    const saveOutput = t.f.store.playback.saveOutput;
+    t.f.store.speakers.saveAdopted = () =>
+      Promise.reject(new Error('volume write unavailable'));
+    t.f.store.playback.saveOutput = () =>
+      Promise.reject(new Error('volume write unavailable'));
+    await error(
+      await t.f.json('/api/v1/speakers/saved-volume/volume', 'PUT', {
+        volume: 27,
+      }, credential),
+      500,
+      'persistence_failed',
+    );
+    assertEquals(
+      (await t.f.store.speakers.loadAdopted()).find((s) =>
+        s.id === 'saved-volume'
+      )!.volume,
+      42,
+    );
+    await t.command(
+      '/api/v1/speakers/temporary-volume/volume',
+      'PUT',
+      credential,
+      { volume: 19 },
+    );
+    assertEquals(
+      (await t.read('/api/v1/speakers/temporary-volume', credential)).speaker
+        .volume,
+      19,
+    );
+    t.f.store.speakers.saveAdopted = save;
+    t.f.store.playback.saveOutput = saveOutput;
+    await t.command('/api/v1/speakers/saved-volume/volume', 'PUT', credential, {
+      volume: 29,
+    });
+    assertEquals(
+      (await t.f.store.speakers.loadAdopted()).find((s) =>
+        s.id === 'saved-volume'
+      )!.volume,
+      29,
+    );
+    assert(!t.outputs.lifetime('temporary-volume').adopted);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('a second user socket sees HTTP volume keys and link invalidations and refetches the resulting levels', async () => {
+  const t = await setup();
+  let ws: WebSocket | undefined;
+  try {
+    const actor = await t.f.login('cookie');
+    const observer = await t.f.login('bearer', 'member', 'password-member');
+    const player = await t.players.create('Volume socket');
+    await t.addSpeaker('socket-volume');
+    await t.players.join(player.id, 'socket-volume');
+    const frames: { type: string; events?: Record<string, string[]> }[] = [];
+    ws = new WebSocket(t.f.origin.replace('http:', 'ws:') + '/api/v1/events', {
+      headers: {
+        Authorization: `Bearer ${observer.credential}`,
+        Origin: t.f.origin,
+      },
+    });
+    ws.onmessage = (event) => frames.push(JSON.parse(String(event.data)));
+    await waitFor(() => frames.some((f) => f.type === 'hello'));
+    frames.length = 0;
+    const path = `/api/v1/players/${player.id}`;
+    const changed = async (volume: boolean) => {
+      await waitFor(() =>
+        frames.some((f) => f.events?.speakers) &&
+        (!volume ||
+          frames.some((f) => f.events?.volume?.includes(String(player.id))))
+      );
+      assert(!frames.some((f) => f.events?.volume?.includes('1')));
+      frames.length = 0;
+    };
+    await t.command(`${path}/volume`, 'PUT', actor.credential, { volume: 60 });
+    await changed(true);
+    assertEquals((await t.read(path, observer.credential)).player.volume, 60);
+    assertEquals(
+      (await t.read('/api/v1/speakers/socket-volume', observer.credential))
+        .speaker.volume,
+      52,
+    );
+    await t.command(
+      `${path}/speakers/socket-volume`,
+      'PATCH',
+      actor.credential,
+      { linked: false },
+    );
+    await changed(false);
+    assertEquals(
+      (await t.read(path, observer.credential)).player.speakers[0].linked,
+      false,
+    );
+    await t.command(
+      '/api/v1/speakers/socket-volume/volume',
+      'PUT',
+      actor.credential,
+      { volume: 22 },
+    );
+    await changed(true);
+    assertEquals(
+      (await t.read('/api/v1/speakers/socket-volume', observer.credential))
+        .speaker.volume,
+      22,
+    );
+    assertEquals((await t.read(path, observer.credential)).player.volume, 60);
+    await t.command(
+      `${path}/speakers/socket-volume`,
+      'PATCH',
+      actor.credential,
+      { linked: true },
+    );
+    await changed(false);
+    assertEquals(
+      (await t.read(path, observer.credential)).player.speakers[0].linked,
+      true,
+    );
+  } finally {
+    if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
+    if (ws) await waitFor(() => ws!.readyState === WebSocket.CLOSED);
+    await t.close();
+  }
+});
+
 Deno.test('queue copy HTTP replaces the other queue with new ids, bookmark and modes without touching the playing source', async () => {
   const t = await setup();
   try {
