@@ -19,6 +19,18 @@
       "default": 500,
       "description": "Maximum number of records per native catalog page"
     },
+    "melofon.queuePageRecords": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 50,
+      "description": "Default number of entries per native player queue page, capped by queueMaxPageRecords"
+    },
+    "melofon.queueMaxPageRecords": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 500,
+      "description": "Maximum number of entries per native player queue page"
+    },
     "melofon.logPageRecords": {
       "type": "integer",
       "minimum": 1,

@@ -355,6 +355,7 @@ export async function createPlayers(deps: {
     restore: (...args) => current().restore(...args),
     playerView: () => current().playerView(),
     queueView: () => current().queueView(),
+    queuePageView: (options) => current().queuePageView(options),
     serverNowPlayingView: () => current().serverNowPlayingView(),
     lastCommand: () => current().lastCommand(),
     checkpoint: () => current().checkpoint(),

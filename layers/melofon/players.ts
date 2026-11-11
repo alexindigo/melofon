@@ -38,6 +38,7 @@ export function playerPayload(context: HatContext, id: number) {
   const current = playback.serverNowPlayingView();
   return {
     ...playerSummary(row),
+    queueVersion: playback.queueView().version,
     state: status.state,
     repeat: status.repeat,
     consume: status.consume,

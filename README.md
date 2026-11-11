@@ -94,6 +94,20 @@ to change either or both saved modes, optionally alongside `name`; it returns
 the updated player. Starting without a speaker returns `no_target`; another
 player holding AirPlay returns `airplay_busy` with its owning player's id/name.
 
+Player state includes `queueVersion`. `GET /api/v1/players/{id}/queue` reads
+`view=upNext` (default, includes the current song) or `view=all`, with `offset`
+(default 0) and `limit`. The response has `version`, `currentEntryId`,
+`startIndex` (whole-queue index of the view's beginning), `total` (view size),
+`view`, `offset`, `limit` and `items`. Each item has a permanent `entryId`,
+whole-queue `position`, original `reference`, and safe `song` or `media` facts.
+Without a current song, up next starts at the queue head; stop retains the
+current bookmark. Offsets count from the chosen view, not the whole queue.
+Discard previously fetched pages if `version` changes, or if `currentEntryId`
+changes while paging up next. Queue edits and media-fact changes advance the
+version; playback navigation alone changes the current anchor, not the version.
+The native hat's `melofon.queuePageRecords` and `melofon.queueMaxPageRecords`
+settings default to 50 and 500; the default page size is capped by the maximum.
+
 ### Web source recovery
 
 The playback owner declares `playback.source.retryBackoffMs`, an ordered array

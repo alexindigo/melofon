@@ -621,6 +621,18 @@ export interface PlayerRow {
 }
 
 export interface PlayerPlayback {
+  queueView(): { version: number; items: PlayerQueueEntry[] };
+  queuePageView(options: {
+    view: 'upNext' | 'all';
+    offset: number;
+    limit: number;
+  }): {
+    version: number;
+    currentEntryId: number | null;
+    startIndex: number;
+    total: number;
+    items: PlayerQueueEntry[];
+  };
   play(source?: Source): void | Promise<void>;
   pause(source?: Source): void;
   stop(source?: Source): void;
@@ -649,6 +661,19 @@ export interface PlayerPlayback {
     })
     | null;
 }
+
+export type PlayerQueueEntry =
+  & { id: number }
+  & (
+    | {
+      reference: { kind: 'song'; id: string };
+      facts: { kind: 'song'; song: SongRow };
+    }
+    | {
+      reference: { kind: 'station'; id: string } | { kind: 'url'; url: string };
+      facts: Extract<NowPlayingViewRow, { facts: { kind: 'web' } }>['facts'];
+    }
+  );
 
 export interface Setting {
   key: string;

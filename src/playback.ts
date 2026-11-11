@@ -151,6 +151,18 @@ export interface Playback {
 
   playerView(): PlayerStatus;
   queueView(): { version: number; items: QueueEntry[] };
+  /** One synchronous snapshot; offsets are relative to the selected view. */
+  queuePageView(options: {
+    view: 'upNext' | 'all';
+    offset: number;
+    limit: number;
+  }): {
+    version: number;
+    currentEntryId: number | null;
+    startIndex: number;
+    total: number;
+    items: QueueEntry[];
+  };
   nowPlayingView(): Promise<NowPlayingViewRow[]>;
   /** This engine's live aggregate input. App sessions are household-owned. */
   serverNowPlayingView(): ServerNowPlayingRow | null;
@@ -1273,6 +1285,21 @@ export function createPlayback(deps: {
     checkpoint: flushState,
     playerView: () => player.status(),
     queueView: () => player.queue(),
+    queuePageView: ({ view, offset, limit }) => {
+      const { version, items } = player.queue();
+      const currentEntryId = player.status().current?.id ?? null;
+      const currentIndex = currentEntryId === null
+        ? 0
+        : items.findIndex((entry) => entry.id === currentEntryId);
+      const startIndex = view === 'all' ? 0 : Math.max(0, currentIndex);
+      return {
+        version,
+        currentEntryId,
+        startIndex,
+        total: items.length - startIndex,
+        items: items.slice(startIndex + offset, startIndex + offset + limit),
+      };
+    },
     lastCommand: () => last,
 
     serverNowPlayingView,

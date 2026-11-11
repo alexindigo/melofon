@@ -88,7 +88,7 @@ async function setup() {
           cfg: {},
           resolveQueueReference: createQueueResolver({
             getSong: library.getSong,
-            getStation: () => Promise.resolve(null),
+            getStation: f.store.radio.get,
           }),
         },
         targets: (id) => ({
@@ -163,6 +163,323 @@ async function setup() {
     },
   };
 }
+
+Deno.test('queue HTTP pages whole and upcoming snapshots across edits with independent player versions', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'cookie',
+      'member',
+      'password-member',
+    );
+    const path = '/api/v1/players/1';
+    const kitchen = await t.players.create('Kitchen');
+    const other = t.players.get(kitchen.id);
+    await other.queueAdd([t.songs[1]]);
+    const otherBefore = await t.read(
+      `/api/v1/players/${kitchen.id}/queue`,
+      credential,
+    );
+    const home = t.players.get(1);
+    const entries = await home.queueAdd([
+      t.songs[0],
+      t.songs[1],
+      t.songs[0],
+      t.songs[1],
+    ]);
+    const ids = entries.map((entry) => entry.id);
+    assertEquals(new Set(ids).size, 4);
+    assert(!ids.includes(otherBefore.items[0].entryId));
+    const page1 = await t.read(`${path}/queue?view=all&limit=2`, credential);
+    assertEquals([
+      page1.view,
+      page1.startIndex,
+      page1.total,
+      page1.offset,
+      page1.limit,
+      page1.currentEntryId,
+    ], ['all', 0, 4, 0, 2, null]);
+    assertEquals(
+      page1.items.map((item: { entryId: number }) => item.entryId),
+      ids.slice(0, 2),
+    );
+    assertEquals(
+      page1.items.map((item: { position: number }) => item.position),
+      [0, 1],
+    );
+    assertEquals(page1.items[0].reference, { kind: 'song', id: t.songs[0].id });
+    assertEquals(page1.items[0].song.id, t.songs[0].id);
+    const page2 = await t.read(
+      `${path}/queue?view=all&offset=2&limit=2`,
+      credential,
+    );
+    assertEquals(page2.version, page1.version);
+    assertEquals(
+      page2.items.map((item: { entryId: number }) => item.entryId),
+      ids.slice(2),
+    );
+    assertEquals(
+      (await t.read(path, credential)).player.queueVersion,
+      page1.version,
+    );
+    const added = await home.queueAdd([t.songs[0]], { position: 1 });
+    const edited = await t.read(
+      `${path}/queue?view=all&offset=2&limit=2`,
+      credential,
+    );
+    assert(edited.version > page1.version);
+    assertEquals(edited.total, 5);
+    assertEquals(
+      edited.items.map((item: { entryId: number }) => item.entryId),
+      ids.slice(1, 3),
+    );
+    assertEquals(
+      (await t.read(path, credential)).player.queueVersion,
+      edited.version,
+    );
+    assertEquals(
+      await t.read(`/api/v1/players/${kitchen.id}/queue`, credential),
+      otherBefore,
+    );
+    const all = await t.read(`${path}/queue?view=all`, credential);
+    assertEquals(all.items.map((item: { entryId: number }) => item.entryId), [
+      ids[0],
+      added[0].id,
+      ...ids.slice(1),
+    ]);
+    for (const offset of [5, 999, 9007199254740991]) {
+      const beyond = await t.read(`${path}/queue?offset=${offset}`, credential);
+      assertEquals([beyond.total, beyond.items, beyond.version], [
+        5,
+        [],
+        edited.version,
+      ]);
+    }
+    await t.persistence.drain();
+    assertEquals(
+      (await t.f.store.playback.loadQueue(1)).version,
+      edited.version,
+    );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue HTTP up next includes current across navigation pause stop exhaustion and clear', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'bearer',
+      'member',
+      'password-member',
+    );
+    const path = '/_melofon/api/v1/players/1';
+    const empty = await t.read(`${path}/queue`, credential);
+    assertEquals([
+      empty.view,
+      empty.total,
+      empty.startIndex,
+      empty.currentEntryId,
+      empty.items,
+    ], ['upNext', 0, 0, null, []]);
+    const home = t.players.get(1);
+    const entries = await home.queueAdd([t.songs[0], t.songs[1], t.songs[0]]);
+    await t.addSpeaker('queue');
+    await t.players.join(1, 'queue');
+    await t.command(`${path}/play`, 'POST', credential, {});
+    const first = await t.read(`${path}/queue?limit=1`, credential);
+    assertEquals(first.items[0].entryId, entries[0].id);
+    await t.command(`${path}/next`, 'POST', credential, {});
+    const next = await t.read(`${path}/queue?limit=1`, credential);
+    assertEquals([
+      next.version,
+      next.currentEntryId,
+      next.startIndex,
+      next.total,
+    ], [first.version, entries[1].id, 1, 2]);
+    assertEquals(next.items[0].entryId, entries[1].id);
+    const page2 = await t.read(`${path}/queue?offset=1&limit=1`, credential);
+    assertEquals([page2.items[0].entryId, page2.items[0].position], [
+      entries[2].id,
+      2,
+    ]);
+    const all = await t.read(`${path}/queue?view=all`, credential);
+    assertEquals([all.total, all.startIndex, all.currentEntryId], [
+      3,
+      0,
+      entries[1].id,
+    ]);
+    for (const command of ['pause', 'stop', 'restart']) {
+      await t.command(`${path}/${command}`, 'POST', credential, {});
+      assertEquals(await t.read(`${path}/queue?limit=1`, credential), next);
+    }
+    await t.command(
+      path,
+      'PATCH',
+      credential,
+      { repeat: 'all', consume: true },
+      200,
+    );
+    assertEquals(
+      (await t.read(`${path}/queue`, credential)).version,
+      first.version,
+    );
+    await t.command(`${path}/next`, 'POST', credential, {});
+    await t.command(`${path}/next`, 'POST', credential, {});
+    const exhausted = await t.read(`${path}/queue`, credential);
+    assertEquals([
+      exhausted.total,
+      exhausted.startIndex,
+      exhausted.currentEntryId,
+    ], [3, 0, null]);
+    assertEquals(exhausted.version, first.version);
+    home.queueClear();
+    const cleared = await t.read(`${path}/queue`, credential);
+    assertEquals([cleared.total, cleared.items, cleared.currentEntryId], [
+      0,
+      [],
+      null,
+    ]);
+    assert(cleared.version > exhausted.version);
+    assertEquals(
+      (await t.read(path, credential)).player.queueVersion,
+      cleared.version,
+    );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue HTTP encodes original web references and refreshed facts without private source details', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'cookie',
+      'member',
+      'password-member',
+    );
+    const path = '/api/v1/players/1';
+    const home = t.players.get(1);
+    const facts = {
+      kind: 'web' as const,
+      url: 'http://private-source.home/resolved',
+      title: 'Radio',
+      artistName: null,
+      durationMs: null,
+      mode: 'live' as const,
+      seekable: false,
+      streamTitle: 'On air',
+      streamUrl: 'http://private-source.home/metadata',
+    };
+    const station = await t.f.store.radio.create({
+      name: 'Radio',
+      streamUrl: facts.url,
+      homePageUrl: null,
+    });
+    const entries = await home.queueAddSources([
+      { reference: { kind: 'station', id: station.id }, facts },
+      { reference: { kind: 'url', url: 'http://entered.home/radio' }, facts },
+    ]);
+    await t.addSpeaker('radio');
+    await t.players.join(1, 'radio');
+    const before = await t.read(`${path}/queue`, credential);
+    assertEquals(
+      before.items.map((item: { reference: unknown }) => item.reference),
+      [
+        { kind: 'station', id: station.id },
+        { kind: 'url', url: 'http://entered.home/radio' },
+      ],
+    );
+    assertEquals(before.items[0].media, {
+      kind: 'web',
+      title: 'Radio',
+      artistName: null,
+      durationMs: null,
+      mode: 'live',
+      seekable: false,
+      streamTitle: 'On air',
+    });
+    assert(!JSON.stringify(before).includes('private-source'));
+    assert(!JSON.stringify(before).includes('path'));
+    await t.command(`${path}/play`, 'POST', credential, {});
+    const activated = await t.read(`${path}/queue`, credential);
+    const status = home.playerView();
+    const token = home.openSource(entries[0].id, status.generation)!;
+    assert(token);
+    assert(home.reportSourceMetadata(token, { streamTitle: 'New title' }));
+    const after = await t.read(`${path}/queue`, credential);
+    assert(after.version > activated.version);
+    assertEquals(after.items[0].entryId, entries[0].id);
+    assertEquals(after.items[0].media.streamTitle, 'New title');
+    assertEquals(
+      (await t.read(path, credential)).player.queueVersion,
+      after.version,
+    );
+    home.cancelSource(token);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue HTTP validates paging and settings and requires auth but not Origin on reads', async () => {
+  const t = await setup();
+  try {
+    await t.players.get(1).queueAdd([t.songs[0], t.songs[1], t.songs[0]]);
+    await t.f.state.set('melofon.queueMaxPageRecords', '2');
+    await t.f.state.set('melofon.queuePageRecords', '3');
+    for (const mode of ['cookie', 'bearer'] as const) {
+      const { credential } = await t.f.login(mode, 'member', 'password-member');
+      const path = `${
+        mode === 'cookie' ? '' : '/_melofon'
+      }/api/v1/players/1/queue`;
+      const page = await t.read(path, credential);
+      assertEquals([page.limit, page.items.length, page.total], [2, 2, 3]);
+      const read = await t.f.get(path, credential);
+      assertEquals(read.status, 200);
+      await read.body?.cancel();
+      for (
+        const query of [
+          'view=bad',
+          'view=',
+          'view=all&view=upNext',
+          'offset=-1',
+          'offset=1.5',
+          'offset=1e1',
+          'offset=',
+          'offset=9007199254740992',
+          'offset=0&offset=1',
+          'limit=0',
+          'limit=-1',
+          'limit=1.5',
+          'limit=3',
+          'limit=',
+          'limit=1&limit=2',
+          'unknown=1',
+        ]
+      ) {
+        await error(
+          await t.f.get(`${path}?${query}`, credential),
+          400,
+          'invalid_field',
+        );
+      }
+      for (const id of ['0', '01', '-1', '1.5', '9007199254740992', '99999']) {
+        await error(
+          await t.f.get(`/api/v1/players/${id}/queue`, credential),
+          404,
+          'not_found',
+        );
+      }
+    }
+    await error(
+      await t.f.get('/api/v1/players/1/queue'),
+      401,
+      'unauthenticated',
+    );
+  } finally {
+    await t.close();
+  }
+});
 
 Deno.test('players HTTP lifecycle is shared by cookie and Bearer users on non-loopback plain HTTP', async () => {
   const t = await setup();
