@@ -262,6 +262,12 @@ export interface HatContext {
       members(id: number): { id: string; name: string; linked?: boolean }[];
       join(id: number, speakerId: string, source?: Source): Promise<void>;
       leave(id: number, speakerId: string, source?: Source): Promise<void>;
+      copyQueue(id: number, targetId: number, options: {
+        mode: 'replace' | 'add';
+        where?: 'end' | 'next' | { position: number };
+        startPlaying?: boolean;
+        expectedVersion?: number;
+      }, source?: Source): Promise<void>;
     };
     stream: {
       session(

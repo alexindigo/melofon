@@ -7,6 +7,7 @@ import { core, fail } from '#melofon/errors.ts';
 import { fields } from '#melofon/input.ts';
 import { source } from '#melofon/libraries.ts';
 import { playerId, queueEntryPayload } from '#melofon/players.ts';
+import { queueDestination } from '#melofon/queue-edit.ts';
 
 function reference(value: unknown): PlayerQueueReference {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -56,20 +57,11 @@ export default async function (request: HatRequest, context: HatContext) {
       fail(400, 'invalid_field', `${key} must be a boolean`);
     }
   }
-  const where = body.where === undefined ? 'end' : body.where;
-  if (where !== 'end' && where !== 'next') {
-    if (
-      !where || typeof where !== 'object' || Array.isArray(where) ||
-      Object.keys(where).length !== 1 || !('position' in where) ||
-      !Number.isSafeInteger(where.position) || Number(where.position) < 0
-    ) {
-      fail(400, 'invalid_field', 'Invalid queue destination');
-    }
-  }
+  const where = queueDestination(body.where);
   return await core(async () => {
     const playback = context.app.players.get(playerId(request.params.id));
     const added = await playback.queueAddReferences(references, {
-      where: where as 'end' | 'next' | { position: number },
+      where,
       clear: body.clear as boolean | undefined,
       startPlaying: body.startPlaying as boolean | undefined,
     }, source(request, context));

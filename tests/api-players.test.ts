@@ -179,6 +179,635 @@ async function setup(beforePrepare?: () => Promise<void>) {
   };
 }
 
+Deno.test('queue copy HTTP replaces the other queue with new ids, bookmark and modes without touching the playing source', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'cookie',
+      'member',
+      'password-member',
+    );
+    const home = t.players.get(1);
+    const kitchen = await t.players.create('Kitchen');
+    const target = t.players.get(kitchen.id);
+    await t.addSpeaker('copy-source');
+    await t.players.join(1, 'copy-source');
+    const entries = await home.queueAdd([t.songs[0], t.songs[1], t.songs[0]], {
+      play: true,
+    });
+    await home.next();
+    await home.seek({ positionMs: 300 });
+    home.setRepeat('single');
+    home.setConsume(true);
+    target.setShuffle(true);
+    target.setVolume({ volume: 31 });
+    await target.queueAdd([t.songs[0]]);
+    const before = home.playerView();
+    const queue = home.queueView();
+    const lease = home.openSource(before.current!.id, before.generation)!;
+    const version = target.queueView().version;
+    await t.command(
+      '/api/v1/players/1/queue/copy/replace',
+      'POST',
+      credential,
+      {
+        targetPlayerId: kitchen.id,
+        expectedVersion: version,
+      },
+    );
+    const copied = await t.read(
+      `/api/v1/players/${kitchen.id}/queue?view=all`,
+      credential,
+    );
+    const state =
+      (await t.read(`/api/v1/players/${kitchen.id}`, credential)).player;
+    assertEquals(
+      copied.items.map((e: { reference: unknown }) => e.reference),
+      queue.items.map((e) => e.reference),
+    );
+    assertEquals(
+      new Set([
+        ...entries.map((e) => e.id),
+        ...copied.items.map((e: { entryId: number }) => e.entryId),
+      ]).size,
+      6,
+    );
+    assert(copied.version > version);
+    assertEquals([
+      state.current.entryId,
+      state.positionMs,
+      state.repeat,
+      state.consume,
+      state.state,
+      state.shuffle,
+    ], [
+      copied.items[1].entryId,
+      before.itemProgressMs,
+      'single',
+      true,
+      'pause',
+      true,
+    ]);
+    assertEquals(target.playerView().volume, 31);
+    assertEquals(home.playerView(), before);
+    assertEquals(home.queueView(), queue);
+    assert(!lease.signal.aborted);
+    for (const playback of [home, target]) {
+      assertEquals(playback.lastCommand()!.kind, 'queueCopy');
+      assertEquals(playback.lastCommand()!.source.user, 'member');
+      assertEquals(playback.serverNowPlayingView()!.commander, 'member');
+    }
+    await t.persistence.drain();
+    assertEquals(
+      (await t.f.store.playback.loadQueue(1)).items.map((e) => e.id),
+      entries.map((e) => e.id),
+    );
+    const saved = await t.f.store.playback.loadQueue(kitchen.id);
+    const bookmark = await t.f.store.playback.loadPlayerState(kitchen.id);
+    assertEquals(
+      saved.items.map((e) => e.id),
+      copied.items.map((e: { entryId: number }) => e.entryId),
+    );
+    assertEquals([
+      bookmark!.currentIndex,
+      bookmark!.positionMs,
+      bookmark!.repeat,
+      bookmark!.consume,
+    ], [1, before.itemProgressMs, 'single', true]);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue copy HTTP replace preserves destination play or pause, starts on request and handles stopped and empty sources', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    const home = t.players.get(1);
+    const kitchen = await t.players.create('Kitchen');
+    const target = t.players.get(kitchen.id);
+    for (
+      const [id, name] of [[1, 'copy-from'], [kitchen.id, 'copy-to']] as const
+    ) {
+      await t.addSpeaker(name);
+      await t.players.join(id, name);
+    }
+    await home.queueAdd(t.songs, { play: true });
+    await home.next();
+    await home.seek({ positionMs: 200 });
+    home.pause();
+    await target.queueAdd(t.songs, { play: true });
+    const path = '/api/v1/players/1/queue/copy/replace';
+    for (
+      const [paused, startPlaying] of [[false, false], [true, false], [
+        true,
+        true,
+      ]]
+    ) {
+      if (paused) target.pause();
+      const old = target.playerView();
+      const lease = paused
+        ? null
+        : target.openSource(old.current!.id, old.generation);
+      await t.command(path, 'POST', credential, {
+        targetPlayerId: kitchen.id,
+        startPlaying,
+      });
+      const state =
+        (await t.read(`/api/v1/players/${kitchen.id}`, credential)).player;
+      assertEquals([state.state, state.positionMs, state.current.song.id], [
+        startPlaying || !paused ? 'play' : 'pause',
+        200,
+        t.songs[1].id,
+      ]);
+      if (lease) assert(lease.signal.aborted);
+      assertEquals(home.playerView().state, 'pause');
+    }
+    home.queueClear();
+    await home.queueAdd(t.songs);
+    await t.command(path, 'POST', credential, { targetPlayerId: kitchen.id });
+    assertEquals([
+      target.playerView().state,
+      target.playerView().current!.reference,
+    ], ['play', { kind: 'song', id: t.songs[0].id }]);
+    target.stop();
+    await t.command(path, 'POST', credential, { targetPlayerId: kitchen.id });
+    assertEquals([target.playerView().state, target.playerView().current], [
+      'stop',
+      null,
+    ]);
+    home.queueClear();
+    await t.command(path, 'POST', credential, {
+      targetPlayerId: kitchen.id,
+      startPlaying: true,
+    });
+    assertEquals(target.queueView().items, []);
+    assertEquals([target.playerView().state, target.playerView().current], [
+      'stop',
+      null,
+    ]);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue copy HTTP adds the whole ordered queue at end, next or position preserving destination state unless starting', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'bearer',
+      'member',
+      'password-member',
+    );
+    const home = t.players.get(1);
+    const kitchen = await t.players.create('Kitchen');
+    const target = t.players.get(kitchen.id);
+    await home.queueAddSources([
+      {
+        reference: { kind: 'url', url: 'http://radio.home/live' },
+        facts: {
+          kind: 'web',
+          url: 'http://radio.home/live',
+          mode: 'live',
+          seekable: false,
+          title: 'Radio',
+          artistName: null,
+          durationMs: null,
+          streamTitle: null,
+          streamUrl: null,
+        },
+      },
+    ]);
+    await home.queueAdd([t.songs[1], t.songs[1]]);
+    home.setRepeat('single');
+    home.setConsume(true);
+    const sourceQueue = home.queueView();
+    const sourceState = home.playerView();
+    await t.addSpeaker('copy-add');
+    await t.players.join(kitchen.id, 'copy-add');
+    const path = '/api/v1/players/1/queue/copy/add';
+    for (
+      const [where, at] of [['end', 2], ['next', 1], [{ position: 0 }, 0], [{
+        position: 999,
+      }, 2]] as const
+    ) {
+      const old = await target.queueAdd(t.songs, { clear: true, play: true });
+      const state = target.playerView();
+      const lease = target.openSource(state.current!.id, state.generation)!;
+      await t.command(path, 'POST', credential, {
+        targetPlayerId: kitchen.id,
+        where,
+      });
+      const queue = await t.read(
+        `/api/v1/players/${kitchen.id}/queue?view=all`,
+        credential,
+      );
+      const expected = [
+        ...old.slice(0, at),
+        ...sourceQueue.items,
+        ...old.slice(at),
+      ];
+      assertEquals(
+        queue.items.map((e: { reference: unknown }) => e.reference),
+        expected.map((e) => e.reference),
+      );
+      assertEquals(target.playerView(), state);
+      assert(!lease.signal.aborted);
+      assertEquals([target.playerView().repeat, target.playerView().consume], [
+        'off',
+        false,
+      ]);
+      assertEquals(
+        new Set(queue.items.map((e: { entryId: number }) => e.entryId)).size,
+        5,
+      );
+    }
+    await t.command(path, 'POST', credential, {
+      targetPlayerId: kitchen.id,
+      where: { position: 2 },
+      startPlaying: true,
+    });
+    const addedState =
+      (await t.read(`/api/v1/players/${kitchen.id}`, credential)).player;
+    assertEquals([
+      addedState.state,
+      addedState.current.media.kind,
+      addedState.positionMs,
+    ], ['play', 'web', 0]);
+    assertEquals(
+      target.playerView().current!.id,
+      target.queueView().items[2].id,
+    );
+    assertEquals(home.queueView(), sourceQueue);
+    assertEquals(home.playerView(), sourceState);
+    await t.persistence.drain();
+    assertEquals(
+      (await t.f.store.playback.loadQueue(kitchen.id)).items.length,
+      8,
+    );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue copy HTTP refuses limit, stale version, no target and busy AirPlay before either player changes', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    const home = t.players.get(1);
+    const kitchen = await t.players.create('Kitchen');
+    const target = t.players.get(kitchen.id);
+    await home.queueAdd(t.songs);
+    await target.queueAdd(t.songs);
+    await t.f.state.set('playback.queueLimit', '3');
+    const unchanged = async (
+      mode: string,
+      body: Record<string, unknown>,
+      code: string,
+    ) => {
+      const before = [
+        home.queueView(),
+        target.queueView(),
+        home.playerView(),
+        target.playerView(),
+        home.lastCommand(),
+        target.lastCommand(),
+      ];
+      const response = await t.f.json(
+        `/api/v1/players/1/queue/copy/${mode}`,
+        'POST',
+        { targetPlayerId: kitchen.id, ...body },
+        credential,
+      );
+      assertEquals(response.status, 409);
+      const reply = await response.json();
+      assertEquals(reply.code, code);
+      if (code === 'queue_limit') assertEquals(reply.limit, 3);
+      if (code === 'queue_conflict') {
+        assertEquals(reply.version, target.queueView().version);
+      }
+      if (code === 'airplay_busy') {
+        assertEquals(reply.owner, { id: 1, name: 'Home' });
+      }
+      assertEquals([
+        home.queueView(),
+        target.queueView(),
+        home.playerView(),
+        target.playerView(),
+        home.lastCommand(),
+        target.lastCommand(),
+      ], before);
+    };
+    await unchanged('add', {}, 'queue_limit');
+    await unchanged('replace', { expectedVersion: 999 }, 'queue_conflict');
+    await unchanged('replace', { startPlaying: true }, 'no_target');
+    await t.f.state.set('playback.queueLimit', '10');
+    for (
+      const [id, name] of [[1, 'air-from'], [kitchen.id, 'air-to']] as const
+    ) {
+      await t.addSpeaker(name, 'AirPlay');
+      await t.players.join(id, name);
+    }
+    await home.play();
+    const old = home.playerView();
+    const lease = home.openSource(old.current!.id, old.generation)!;
+    for (const mode of ['replace', 'add']) {
+      await unchanged(mode, { startPlaying: true }, 'airplay_busy');
+    }
+    assert(!lease.signal.aborted);
+    await t.command(
+      '/api/v1/players/1/queue/copy/replace',
+      'POST',
+      credential,
+      { targetPlayerId: kitchen.id },
+    );
+    assertEquals(home.playerView(), old);
+    assertEquals(target.playerView().state, 'pause');
+    assert(!lease.signal.aborted);
+    await home.queueAdd(t.songs);
+    await t.f.state.set('playback.queueLimit', '3');
+    await unchanged('replace', {}, 'queue_limit');
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue copy HTTP validates both actions, authentication, Origin and target identity without mutation', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    const kitchen = await t.players.create('Kitchen');
+    const home = t.players.get(1);
+    const target = t.players.get(kitchen.id);
+    await home.queueAdd(t.songs);
+    const before = [
+      home.queueView(),
+      target.queueView(),
+      home.lastCommand(),
+      target.lastCommand(),
+    ];
+    for (const mode of ['replace', 'add']) {
+      const path = `/api/v1/players/1/queue/copy/${mode}`;
+      for (
+        const body of [
+          {},
+          { targetPlayerId: '2' },
+          { targetPlayerId: 0 },
+          { targetPlayerId: 2.5 },
+          { targetPlayerId: null },
+          { targetPlayerId: kitchen.id, startPlaying: 1 },
+          { targetPlayerId: kitchen.id, expectedVersion: -1 },
+          { targetPlayerId: kitchen.id, expectedVersion: '1' },
+          { targetPlayerId: kitchen.id, extra: true },
+        ]
+      ) {
+        const response = await t.f.json(path, 'POST', body, credential);
+        assertEquals(response.status, 400, await response.clone().text());
+        await response.body?.cancel();
+      }
+      await error(
+        await t.f.json(path, 'POST', { targetPlayerId: 1 }, credential),
+        400,
+        'same_player',
+      );
+      await error(
+        await t.f.json(path, 'POST', { targetPlayerId: 999 }, credential),
+        404,
+        'not_found',
+      );
+      await error(
+        await t.f.json(path.replace('/1/', '/999/'), 'POST', {
+          targetPlayerId: kitchen.id,
+        }, credential),
+        404,
+        'not_found',
+      );
+      await error(
+        await t.f.json(path, 'POST', { targetPlayerId: kitchen.id }),
+        401,
+        'unauthenticated',
+      );
+      const foreign = await t.f.json(
+        path,
+        'POST',
+        { targetPlayerId: kitchen.id },
+        credential,
+        'http://foreign.home',
+      );
+      assertEquals(foreign.status, 403);
+      await foreign.body?.cancel();
+    }
+    for (
+      const where of ['bad', -1, { position: -1 }, { position: '0' }, {
+        position: 1,
+        extra: true,
+      }]
+    ) {
+      const response = await t.f.json(
+        '/api/v1/players/1/queue/copy/add',
+        'POST',
+        { targetPlayerId: kitchen.id, where },
+        credential,
+      );
+      assertEquals(response.status, 400);
+      await response.body?.cancel();
+    }
+    const response = await t.f.json(
+      '/api/v1/players/1/queue/copy/replace',
+      'POST',
+      { targetPlayerId: kitchen.id, where: 'end' },
+      credential,
+    );
+    await error(response, 400, 'unknown_field');
+    assertEquals([
+      home.queueView(),
+      target.queueView(),
+      home.lastCommand(),
+      target.lastCommand(),
+    ], before);
+    const copied = await t.f.json(
+      '/_melofon/api/v1/players/1/queue/copy/add',
+      'POST',
+      { targetPlayerId: kitchen.id },
+      credential,
+    );
+    assertEquals(copied.status, 204, await copied.text());
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue copy HTTP snapshots source without cancelling it and rejects stale destination after slow preparation', async () => {
+  let release!: () => void, entered!: () => void;
+  let barrier: Promise<void> | undefined;
+  const t = await setup(async () => {
+    if (barrier) {
+      entered();
+      await barrier;
+    }
+  });
+  try {
+    const { credential } = await t.f.login('bearer');
+    const kitchen = await t.players.create('Kitchen');
+    const home = t.players.get(1), target = t.players.get(kitchen.id);
+    await t.addSpeaker('snapshot-from');
+    await t.players.join(1, 'snapshot-from');
+    await t.addSpeaker('snapshot-to');
+    await t.players.join(kitchen.id, 'snapshot-to');
+    const media = {
+      reference: { kind: 'url' as const, url: 'http://radio.home/live' },
+      facts: {
+        kind: 'web' as const,
+        url: 'http://radio.home/live',
+        mode: 'live' as const,
+        seekable: false,
+        title: 'Live',
+        artistName: null,
+        durationMs: null,
+        streamTitle: null,
+        streamUrl: null,
+      },
+    };
+    await home.queueAddSources([media], { play: true });
+    await target.queueAddSources([media], { play: true });
+    const oldSource = home.playerView();
+    const fromLease = home.openSource(
+      oldSource.current!.id,
+      oldSource.generation,
+    )!;
+    const oldTarget = target.playerView();
+    const toLease = target.openSource(
+      oldTarget.current!.id,
+      oldTarget.generation,
+    )!;
+    const last = [home.lastCommand(), target.lastCommand()];
+    const ready = new Promise<void>((done) => entered = done);
+    barrier = new Promise<void>((done) => release = done);
+    const response = t.f.json('/api/v1/players/1/queue/copy/replace', 'POST', {
+      targetPlayerId: kitchen.id,
+      expectedVersion: target.queueView().version,
+    }, credential);
+    await ready;
+    assert(
+      home.reportSourceMetadata(fromLease, { streamTitle: 'New source title' }),
+    );
+    assert(
+      target.reportSourceMetadata(toLease, {
+        streamTitle: 'New destination title',
+      }),
+    );
+    release();
+    barrier = undefined;
+    const conflict = await response;
+    assertEquals(conflict.status, 409);
+    assertEquals((await conflict.json()).code, 'queue_conflict');
+    assertEquals([home.lastCommand(), target.lastCommand()], last);
+    assertEquals(target.playerView().current!.id, oldTarget.current!.id);
+    assert(!fromLease.signal.aborted);
+    assert(!toLease.signal.aborted);
+    await t.command('/api/v1/players/1/queue/copy/add', 'POST', credential, {
+      targetPlayerId: kitchen.id,
+    });
+    assert(!fromLease.signal.aborted);
+    assert(!toLease.signal.aborted);
+    home.reportSourceMetadata(fromLease, { streamTitle: 'Later source title' });
+    const copied = target.queueView().items[1];
+    assert(copied.facts.kind === 'web');
+    assertEquals(copied.facts.streamTitle, 'New source title');
+    const copying = new Promise<void>((done) => entered = done);
+    barrier = new Promise<void>((done) => release = done);
+    const success = t.f.json('/api/v1/players/1/queue/copy/replace', 'POST', {
+      targetPlayerId: kitchen.id,
+    }, credential);
+    await copying;
+    assert(
+      home.reportSourceMetadata(fromLease, {
+        streamTitle: 'Changed during copy',
+      }),
+    );
+    release();
+    barrier = undefined;
+    const done = await success;
+    assertEquals(done.status, 204, await done.text());
+    const detached = target.queueView().items[0];
+    assert(detached.facts.kind === 'web');
+    assertEquals(detached.facts.streamTitle, 'Later source title');
+    assert(!fromLease.signal.aborted);
+    assert(toLease.signal.aborted);
+  } finally {
+    release?.();
+    await t.close();
+  }
+});
+
+Deno.test('queue copy HTTP saves both command receipts and destination bookmark/queue in one retryable transaction', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    const kitchen = await t.players.create('Kitchen');
+    const home = t.players.get(1), target = t.players.get(kitchen.id);
+    await home.queueAdd(t.songs);
+    await target.queueAdd([t.songs[0]]);
+    await t.persistence.drain();
+    const savedBefore = await t.f.store.playback.loadQueue(kitchen.id);
+    const commandsBefore = (await t.f.store.players.list()).map((p) =>
+      p.commandedAtMs
+    );
+    const saveChanges = t.f.store.players.saveChanges;
+    const batches: Parameters<typeof saveChanges>[0][] = [];
+    let failOnce = true;
+    t.f.store.players.saveChanges = async (changes) => {
+      batches.push(structuredClone(changes));
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('copy transaction write unavailable');
+      }
+      await saveChanges(changes);
+    };
+    const response = await t.f.json(
+      '/api/v1/players/1/queue/copy/replace',
+      'POST',
+      { targetPlayerId: kitchen.id },
+      credential,
+    );
+    assertEquals(response.status, 500);
+    await response.body?.cancel();
+    const failedSave = await t.f.store.playback.loadQueue(kitchen.id);
+    assertEquals(failedSave.items, savedBefore.items);
+    assertEquals(failedSave.version, savedBefore.version);
+    // Household ids are reserved before publication and never reused, even
+    // when the later multi-player transaction must be retried.
+    assertEquals(
+      failedSave.nextId,
+      Math.max(...target.queueView().items.map((e) => e.id)) + 1,
+    );
+    assert(failedSave.nextId > savedBefore.nextId);
+    assertEquals(
+      (await t.f.store.players.list()).map((p) => p.commandedAtMs),
+      commandsBefore,
+    );
+    assertEquals(batches.length, 1);
+    const batch = batches[0].players!;
+    assertEquals(batch.map((p) => p.playerId).sort(), [1, kitchen.id]);
+    assert(batch.every((p) => p.commandedAtMs !== undefined && p.state));
+    assert(batch.find((p) => p.playerId === kitchen.id)!.queue);
+    assertEquals(batch.find((p) => p.playerId === 1)!.queue, undefined);
+    await t.persistence.drain();
+    assertEquals(batches.length, 2);
+    assertEquals(batches[1], batches[0]);
+    assertEquals(
+      (await t.f.store.playback.loadQueue(kitchen.id)).items.map((e) => e.id),
+      target.queueView().items.map((e) => e.id),
+    );
+    assertEquals((await t.f.store.players.list()).map((p) => p.commandedAtMs), [
+      home.lastCommand()!.atMs,
+      target.lastCommand()!.atMs,
+    ]);
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('queue edit HTTP moves permanent occurrences without interrupting current audio and persists final positions', async () => {
   const t = await setup();
   try {
@@ -1714,6 +2343,21 @@ Deno.test('a second user socket sees lifecycle, keyed player queue modes volume 
     );
     frames.length = 0;
     assertEquals((await t.read(editPath, observer.credential)).total, 0);
+    for (const mode of ['replace', 'add']) {
+      await t.command(`${editPath}/copy/${mode}`, 'POST', actor.credential, {
+        targetPlayerId: 1,
+      });
+      await waitFor(() =>
+        frames.some((f) => f.events?.player?.includes(String(player.id))) &&
+        frames.some((f) => f.events?.queue?.includes('1')) &&
+        (mode === 'add' || frames.some((f) => f.events?.player?.includes('1')))
+      );
+      frames.length = 0;
+      assertEquals(
+        (await t.read('/api/v1/players/1/queue', observer.credential)).total,
+        0,
+      );
+    }
     await t.command(
       `/api/v1/players/${player.id}/default`,
       'POST',

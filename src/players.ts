@@ -10,7 +10,11 @@ import {
   planRestore,
 } from './player.ts';
 import { SpeakerError } from './speaker-errors.ts';
-import { createPlayback, type Playback } from './playback.ts';
+import {
+  createPlayback,
+  type Playback,
+  type QueueCopyOptions,
+} from './playback.ts';
 import { PlaybackError } from './playback-errors.ts';
 import type { PlaybackReports } from './playback-reports.ts';
 import type {
@@ -27,6 +31,7 @@ export class PlayerError extends Error {
     public readonly code:
       | 'not_found'
       | 'invalid_name'
+      | 'same_player'
       | 'name_conflict'
       | 'last_player'
       | 'default_player'
@@ -347,6 +352,9 @@ export async function createPlayers(deps: {
     queueClear: (...args) => current().queueClear(...args),
     queueRemove: (...args) => current().queueRemove(...args),
     queueMove: (...args) => current().queueMove(...args),
+    queueCopyView: () => current().queueCopyView(),
+    queueCopied: (...args) => current().queueCopied(...args),
+    queueImport: (...args) => current().queueImport(...args),
     advanceEnded: () => current().advanceEnded(),
     openSource: (...args) => current().openSource(...args),
     cancelSource: (...args) => current().cancelSource(...args),
@@ -410,6 +418,24 @@ export async function createPlayers(deps: {
         ...e.row,
       })),
     get: (id: number) => requireEngine(id).playback,
+    copyQueue: (
+      id: number,
+      targetId: number,
+      opts: QueueCopyOptions,
+      source?: CommandSource,
+    ) =>
+      mutate(async () => {
+        const from = requireEngine(id).playback;
+        const to = requireEngine(targetId).playback;
+        if (id === targetId) {
+          throw new PlayerError('same_player', 'Choose another player');
+        }
+        await to.queueImport(from.queueCopyView(), opts, source, (change) =>
+          deps.persistence.changePlayers(() => {
+            change();
+            from.queueCopied(targetId, source);
+          }));
+      }),
     defaultId: () => defaultEngine().row.id,
     serverRows: () =>
       [...engines.values()].filter((e) => !e.disposing).flatMap((engine) => {

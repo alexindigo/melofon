@@ -82,6 +82,22 @@ export interface QueueAddOptions {
   shuffle?: boolean;
 }
 
+/** Detached queue and bookmark facts, never source ids, clocks or live leases. */
+export interface QueueCopySnapshot {
+  items: QueueMedia[];
+  currentIndex: number | null;
+  positionMs: number;
+  repeat: RepeatMode;
+  consume: boolean;
+}
+
+export interface QueueCopyOptions {
+  mode: 'replace' | 'add';
+  where?: QueueAddOptions['where'];
+  startPlaying?: boolean;
+  expectedVersion?: number;
+}
+
 export interface Playback {
   reportPlaying(report: ReportPlaying): Promise<void>;
   reportStopped(opts: { streamId: string }): Promise<void>;
@@ -146,6 +162,16 @@ export interface Playback {
     expectedVersion?: number,
     source?: CommandSource,
   ): void;
+  queueCopyView(): QueueCopySnapshot;
+  /** Source-side receipt only: does not cancel or change playback/queue. */
+  queueCopied(targetId: number, source?: CommandSource): void;
+  /** Registry supplies the atomic publication, including the source receipt. */
+  queueImport(
+    snapshot: QueueCopySnapshot,
+    opts: QueueCopyOptions,
+    source: CommandSource | undefined,
+    publish: (change: () => void) => Promise<void>,
+  ): Promise<void>;
 
   /** The engine's clock: end-of-item transition when progress reached the
    * item length (main.ts drives it on an interval; tests drive it directly).
@@ -1333,6 +1359,128 @@ export function createPlayback(deps: {
       flushQueue();
       // The clear also stopped the engine — both reads changed.
       emit(['queue', 'player']);
+    },
+
+    queueCopyView() {
+      const view = player.status();
+      const items = player.queue().items;
+      return structuredClone({
+        items: items.map((entry) => {
+          const { id: _id, ...media } = entry;
+          return media;
+        }),
+        currentIndex: view.current
+          ? items.findIndex((entry) => entry.id === view.current!.id)
+          : null,
+        positionMs: view.itemProgressMs,
+        repeat: view.repeat,
+        consume: view.consume,
+      });
+    },
+    queueCopied(targetId, source) {
+      requireOpen();
+      record('queueCopy', `targetId=${targetId}`, source);
+      flushState();
+      emit(['player']);
+    },
+    async queueImport(snapshot, opts, source, publish) {
+      requireOpen();
+      checkVersion(opts.expectedVersion);
+      cancelStart();
+      const controller = new AbortController();
+      const replace = opts.mode === 'replace';
+      const starts = snapshot.items.length > 0 &&
+        (opts.startPlaying === true ||
+          replace && player.status().state === 'play');
+      const reservation = reserveStart(starts, controller);
+      pendingStart = controller;
+      try {
+        const limit = await queueLimit();
+        controller.signal.throwIfAborted();
+        checkSize(snapshot.items.length, { clear: replace }, limit);
+        const firstId = snapshot.items.length && deps.reserveQueueIds
+          ? await deps.reserveQueueIds(snapshot.items.length)
+          : undefined;
+        controller.signal.throwIfAborted();
+        if (pendingStart !== controller) controller.abort();
+        controller.signal.throwIfAborted();
+        checkVersion(opts.expectedVersion);
+        const previous = player.status();
+        const future = replace ? [] : player.queue().items;
+        const currentIndex = future.findIndex((entry) =>
+          entry.id === previous.current?.id
+        );
+        const position = opts.where === 'next'
+          ? currentIndex + 1
+          : typeof opts.where === 'object'
+          ? opts.where.position
+          : future.length;
+        const at = Math.min(Math.max(0, Math.trunc(position)), future.length);
+        const items = [
+          ...future.slice(0, at),
+          ...snapshot.items,
+          ...future.slice(at),
+        ];
+        const index = replace ? snapshot.currentIndex ?? 0 : at;
+        pendingStart = undefined;
+        const work = transition(
+          starts,
+          (activate) => {
+            checkVersion(opts.expectedVersion);
+            checkSize(snapshot.items.length, { clear: replace }, limit);
+            return publish(() => {
+              if (replace) player.queueClear();
+              const added = snapshot.items.length
+                ? player.queueAddSources(snapshot.items, at, firstId)
+                : [];
+              if (replace) {
+                player.restore({
+                  queue: added,
+                  version: player.queue().version,
+                  currentIndex: snapshot.currentIndex ?? (starts ? 0 : null),
+                  positionMs: snapshot.positionMs,
+                  state: starts
+                    ? 'play'
+                    : snapshot.currentIndex === null
+                    ? 'stop'
+                    : 'pause',
+                  repeat: snapshot.repeat,
+                  consume: snapshot.consume,
+                  shuffle: previous.shuffle,
+                });
+              } else if (opts.startPlaying && added.length) player.play(at);
+              activate();
+              record(
+                'queueCopy',
+                `mode=${opts.mode}`,
+                source,
+                replace || opts.startPlaying ? player.status().state : 'none',
+                replace,
+              );
+              flushQueue();
+              emit(
+                replace
+                  ? ['queue', 'player', 'options']
+                  : opts.startPlaying
+                  ? ['queue', 'player']
+                  : ['queue'],
+              );
+            });
+          },
+          undefined,
+          { index, items },
+        );
+        reservation?.release();
+        await work;
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new PlaybackError('playback_cancelled', 'Queue copy cancelled');
+        }
+        throw error;
+      } finally {
+        reservation?.release();
+        if (pendingStart === controller) pendingStart = undefined;
+      }
     },
 
     advanceEnded() {

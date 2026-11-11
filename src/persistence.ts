@@ -38,6 +38,8 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   /** Capture a synchronous membership publication and its induced engine pauses
    * as one semantic store write, ordered with all other household writes. */
   changeMemberships<T>(change: () => T): Promise<T>;
+  /** Capture a synchronous multi-player command in the same household transaction. */
+  changePlayers<T>(change: () => T): Promise<T>;
   /** Adopted output preferences only (also seeds the savedOutput cache). */
   loadOutputs(): Promise<PersistedOutput[]>;
   /** The last-known adopted row per output id, kept current by saveOutput.
@@ -119,44 +121,46 @@ export function createPersistence(
   };
   const home = forPlayer(1);
 
+  const changePlayers = async <T>(change: () => T): Promise<T> => {
+    if (membershipChange) throw new Error('Nested membership change');
+    const batch = {
+      players: new Map<number, PlayerSave>(),
+      outputs: new Map<string, AdoptedSpeakerSnapshot>(),
+    };
+    membershipChange = batch;
+    let result;
+    try {
+      result = change();
+    } finally {
+      membershipChange = undefined;
+    }
+    // Capture happens without an await: older snapshots finish first, and
+    // subsequent preference/bookmark writes necessarily follow this commit.
+    const commit = () =>
+      store.players.saveChanges({
+        players: [...batch.players.values()],
+        outputs: [...batch.outputs.values()],
+      });
+    const write = tail.then(async () => {
+      try {
+        await retryMembershipWrites();
+        await commit();
+      } catch (error) {
+        // Runtime keeps the requested intent, as with ordinary engine writes.
+        // Never let a later output snapshot commit half of a failed transfer:
+        // retry this whole transaction first, without rolling cache state back.
+        pendingMembershipWrites.push(commit);
+        throw error;
+      }
+    });
+    tail = write.catch((error) => log.event('persistence_failed', { error }));
+    await write;
+    return result;
+  };
   return {
     forPlayer,
-    async changeMemberships(change) {
-      if (membershipChange) throw new Error('Nested membership change');
-      const batch = {
-        players: new Map<number, PlayerSave>(),
-        outputs: new Map<string, AdoptedSpeakerSnapshot>(),
-      };
-      membershipChange = batch;
-      let result;
-      try {
-        result = change();
-      } finally {
-        membershipChange = undefined;
-      }
-      // Capture happens without an await: older snapshots finish first, and
-      // subsequent preference/bookmark writes necessarily follow this commit.
-      const commit = () =>
-        store.players.saveChanges({
-          players: [...batch.players.values()],
-          outputs: [...batch.outputs.values()],
-        });
-      const write = tail.then(async () => {
-        try {
-          await retryMembershipWrites();
-          await commit();
-        } catch (error) {
-          // Runtime keeps the requested intent, as with ordinary engine writes.
-          // Never let a later output snapshot commit half of a failed transfer:
-          // retry this whole transaction first, without rolling cache state back.
-          pendingMembershipWrites.push(commit);
-          throw error;
-        }
-      });
-      tail = write.catch((error) => log.event('persistence_failed', { error }));
-      await write;
-      return result;
-    },
+    changeMemberships: changePlayers,
+    changePlayers,
     saveQueue: home.saveQueue,
     saveState: home.saveState,
     loadQueue: home.loadQueue,

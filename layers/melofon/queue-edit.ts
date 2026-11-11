@@ -2,6 +2,21 @@ import type { HatRequest } from './types.ts';
 import { fail } from './errors.ts';
 import { browseInteger, browseQuery } from './browse.ts';
 
+export function queueDestination(
+  value: unknown,
+): 'end' | 'next' | { position: number } {
+  if (value === undefined || value === 'end') return 'end';
+  if (value === 'next') return 'next';
+  if (
+    !value || typeof value !== 'object' || Array.isArray(value) ||
+    Object.keys(value).length !== 1 || !('position' in value) ||
+    !Number.isSafeInteger(value.position) || Number(value.position) < 0
+  ) {
+    fail(400, 'invalid_field', 'Invalid queue destination');
+  }
+  return { position: Number(value.position) };
+}
+
 export function entryId(raw: string): number {
   const id = Number(raw);
   if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(id)) {

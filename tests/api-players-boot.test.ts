@@ -427,6 +427,71 @@ Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restar
         sample !== 0
       ),
     );
+    // Both copy forms leave Home's live lease and receiver stream alone.
+    const sourceQueue = await server.native('/players/1/queue?view=all');
+    const copyPayloads = successorSession.audioPayloads.length;
+    const copyFlushes = successorSession.flushes;
+    for (const mode of ['replace', 'add']) {
+      await server.native(`/players/1/queue/copy/${mode}`, 'POST', {
+        targetPlayerId: kitchen.id,
+      });
+      assertEquals(
+        await server.native('/players/1/queue?view=all'),
+        sourceQueue,
+      );
+      assertEquals((await server.native('/players/1')).player.state, 'play');
+    }
+    const kitchenQueue = await server.native(
+      `/players/${kitchen.id}/queue?view=all`,
+    );
+    assertEquals(kitchenQueue.total, sourceQueue.total * 2);
+    assert(
+      kitchenQueue.items.every((item: { entryId: number }) =>
+        item.entryId !== nextId
+      ),
+    );
+    assertEquals(
+      (await server.native(`/players/${kitchen.id}`)).player.state,
+      'pause',
+    );
+    await until(() =>
+      successorSession.audioPayloads.length >= copyPayloads + 8
+    );
+    assertEquals(successorSession.flushes, copyFlushes);
+    assert(
+      decodeReceiverAudio(
+        successorSession.sdp,
+        successorSession.audioPayloads.slice(copyPayloads, copyPayloads + 8),
+      ).some((sample) => sample !== 0),
+    );
+    await server.native('/players/1/stop', 'POST', {});
+    await until(() =>
+      receivers[0].sessions.every((s) => s.closedAtMs !== null)
+    );
+    const kitchenSessions = receivers[1].sessions.length;
+    await server.native('/players/1/queue/copy/replace', 'POST', {
+      targetPlayerId: kitchen.id,
+      startPlaying: true,
+    });
+    await until(() =>
+      receivers[1].sessions.slice(kitchenSessions).some((s) =>
+        s.audioPayloads.length >= 8
+      )
+    );
+    const copiedAudio = receivers[1].sessions.slice(kitchenSessions).find((s) =>
+      s.audioPayloads.length >= 8
+    )!;
+    assert(
+      decodeReceiverAudio(
+        copiedAudio.sdp,
+        copiedAudio.audioPayloads.slice(0, 8),
+      ).some((sample) => sample !== 0),
+    );
+    assertEquals((await server.native('/players/1')).player.state, 'pause');
+    assertEquals(
+      (await server.native(`/players/${kitchen.id}`)).player.state,
+      'play',
+    );
   } finally {
     await server?.stop();
     dns.close();

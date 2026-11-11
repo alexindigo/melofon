@@ -15,7 +15,7 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
       fail(
         code === 'not_found'
           ? 404
-          : code === 'invalid_name'
+          : code === 'invalid_name' || code === 'same_player'
           ? 400
           : code === 'closed'
           ? 503
