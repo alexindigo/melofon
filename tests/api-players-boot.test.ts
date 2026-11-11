@@ -1,6 +1,4 @@
-// Step F acceptance: released storage -> cold main.ts -> HTTP -> receiver audio.
-// Simultaneous fixed-player starts are covered by playback-capacity.test.ts and
-// household-capacity.test.ts; their HTTP counterpart belongs to Step G/g07.
+// Steps F/G acceptance: cold production main.ts -> HTTP -> receiver audio.
 import { assert, assertEquals } from '@std/assert';
 import dgram from 'node:dgram';
 import { openStore } from '../src/store/index.ts';
@@ -95,13 +93,13 @@ async function boot(data: string) {
     }
     assert(status?.success, (await logs).join('\n'));
   };
-  const json = async (
+  const request = (
     base: string,
     path: string,
     method = 'GET',
     body?: unknown,
-  ) => {
-    const response = await fetch(`${base}${path}`, {
+  ) =>
+    fetch(`${base}${path}`, {
       method,
       headers: {
         Origin: base,
@@ -113,12 +111,21 @@ async function boot(data: string) {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(10000),
     });
+  const json = async (
+    base: string,
+    path: string,
+    method = 'GET',
+    body?: unknown,
+  ) => {
+    const response = await request(base, path, method, body);
     const text = await response.text();
     assert(response.ok, `${method} ${path}: ${response.status} ${text}`);
     return text ? JSON.parse(text) : undefined;
   };
   const native = (path: string, method = 'GET', body?: unknown) =>
     json(origin, `/api/v1${path}`, method, body);
+  const nativeResponse = (path: string, method = 'GET', body?: unknown) =>
+    request(origin, `/api/v1${path}`, method, body);
   const own = (path: string, method = 'GET', body?: unknown) =>
     json(ownOrigin, `/api${path}`, method, body);
   try {
@@ -136,13 +143,44 @@ async function boot(data: string) {
       username: 'admin',
       password,
       use: 'bearer',
-      deviceName: 'Step F acceptance',
+      deviceName: 'Players acceptance',
     })).key;
-    return { native, own, stop };
+    return { native, nativeResponse, own, stop };
   } catch (error) {
     await stop();
     throw error;
   }
+}
+
+async function advertise(
+  dns: ReturnType<typeof dgram.createSocket>,
+  receivers: Awaited<ReturnType<typeof startFakeRaop>>[],
+) {
+  await new Promise<void>((done, reject) => {
+    dns.once('error', reject);
+    dns.bind(5353, '127.0.0.1', done);
+  });
+  dns.on('message', (message, peer) => {
+    const questions = dnsQuestions(message);
+    if (!questions || (message[2] & 0x80) !== 0) return;
+    for (const [i, receiver] of receivers.entries()) {
+      dns.send(
+        airplayAnswer({
+          instance: `${
+            BigInt(speakerIds[i]).toString(16)
+          }@Room ${i}._raop._tcp.local`,
+          host: `room-${i}.local`,
+          address: [127, 0, 0, 1],
+          port: receiver.port,
+          txt: ['tp=UDP', 'am=AppleTV3,1', 'sr=44100', 'ss=16', 'ch=2'],
+          id: new DataView(message.buffer, message.byteOffset).getUint16(0),
+          questions,
+        }),
+        peer.port,
+        peer.address,
+      );
+    }
+  });
 }
 
 Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restart and OwnTone still plays Home', async () => {
@@ -161,31 +199,7 @@ Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restar
   const dns = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   let server: Awaited<ReturnType<typeof boot>> | undefined;
   try {
-    await new Promise<void>((done, reject) => {
-      dns.once('error', reject);
-      dns.bind(5353, '127.0.0.1', done);
-    });
-    dns.on('message', (message, peer) => {
-      const questions = dnsQuestions(message);
-      if (!questions || (message[2] & 0x80) !== 0) return;
-      for (const [i, receiver] of receivers.entries()) {
-        dns.send(
-          airplayAnswer({
-            instance: `${
-              BigInt(speakerIds[i]).toString(16)
-            }@Room ${i}._raop._tcp.local`,
-            host: `room-${i}.local`,
-            address: [127, 0, 0, 1],
-            port: receiver.port,
-            txt: ['tp=UDP', 'am=AppleTV3,1', 'sr=44100', 'ss=16', 'ch=2'],
-            id: new DataView(message.buffer, message.byteOffset).getUint16(0),
-            questions,
-          }),
-          peer.port,
-          peer.address,
-        );
-      }
-    });
+    await advertise(dns, receivers);
     await speakerMedia(dir);
     const store = await openStore(`${dir}/db`);
     try {
@@ -491,6 +505,295 @@ Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restar
     assertEquals(
       (await server.native(`/players/${kitchen.id}`)).player.state,
       'play',
+    );
+  } finally {
+    await server?.stop();
+    dns.close();
+    for (const receiver of receivers) receiver.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('controls cold HTTP: edit up next, resume stopped bookmark after restart, copy without interruption and race AirPlay starts', async () => {
+  assert(
+    (await Deno.resolveDns('melofon.home', 'A')).every((ip) =>
+      !ip.startsWith('127.')
+    ),
+  );
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-controls-boot-' });
+  const receivers = [
+    await startFakeRaop({ captureAudio: true }),
+    await startFakeRaop({ captureAudio: true }),
+  ];
+  const dns = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  let server: Awaited<ReturnType<typeof boot>> | undefined;
+  try {
+    await advertise(dns, receivers);
+    await speakerMedia(dir);
+    const store = await openStore(`${dir}/db`);
+    let songId = '', albumId = '', stationId = '';
+    try {
+      await createLibraries(store).add('Music', `${dir}/media`);
+      await scanLibrary(store);
+      const [song] = await createLibrary(store).listSongs({
+        offset: 0,
+        size: 1,
+      });
+      assert(song);
+      songId = song.id;
+      assert(song.albumId, 'scanned fixture belongs to an album');
+      albumId = song.albumId;
+      stationId = (await store.radio.create({
+        name: 'Acceptance radio',
+        streamUrl: 'http://melofon.home:9/radio',
+        homePageUrl: null,
+      })).id;
+      for (const [i, receiver] of receivers.entries()) {
+        await store.speakers.saveAdopted({
+          id: speakerIds[i],
+          name: `Room ${i}`,
+          type: 'AirPlay',
+          host: '127.0.0.1',
+          port: receiver.port,
+          receiverIdentity: speakerIds[i],
+          selected: true,
+          volume: 100,
+          connectionStrategy: 'owntone',
+        });
+      }
+    } finally {
+      await store.close();
+    }
+    server = await boot(`${dir}/db`);
+    const home = '/players/1';
+    const { player: kitchen } = await server.native('/players', 'POST', {
+      name: 'Kitchen',
+    });
+    const destination = `/players/${kitchen.id}`;
+    await server.native(`${destination}/speakers/${speakerIds[1]}`, 'PUT', {});
+    const initial = await server.native(`${home}/queue/items`, 'POST', {
+      references: [{ kind: 'song', id: songId }, { kind: 'song', id: songId }],
+      startPlaying: true,
+    });
+    await server.native(`${home}/next`, 'POST', {});
+    const currentId = initial.items[1].entryId;
+    const album = await server.native(`${home}/queue/items`, 'POST', {
+      references: [{ kind: 'album', id: albumId }],
+      where: 'next',
+    });
+    const station = await server.native(`${home}/queue/items`, 'POST', {
+      references: [{ kind: 'station', id: stationId }],
+      where: 'end',
+    });
+    assertEquals(album.count, 1);
+    assertEquals(station.count, 1);
+    const first = await server.native(`${home}/queue?limit=2`);
+    const second = await server.native(`${home}/queue?limit=2&offset=2`);
+    assertEquals([first.startIndex, first.total, first.currentEntryId], [
+      1,
+      3,
+      currentId,
+    ]);
+    assertEquals([second.version, second.currentEntryId], [
+      first.version,
+      currentId,
+    ]);
+    assertEquals(
+      [...first.items, ...second.items].map(
+        (item: { entryId: number }) => item.entryId,
+      ),
+      [currentId, album.items[0].entryId, station.items[0].entryId],
+    );
+    assertEquals(second.items[0].reference, { kind: 'station', id: stationId });
+    assertEquals(
+      (await server.native(home)).player.queueVersion,
+      first.version,
+    );
+
+    await server.native(
+      `${home}/queue/items/${album.items[0].entryId}`,
+      'PATCH',
+      {
+        position: 0,
+        expectedVersion: first.version,
+      },
+    );
+    const moved = await server.native(`${home}/queue?view=all`);
+    assert(moved.version > first.version);
+    assertEquals(moved.items.map((item: { entryId: number }) => item.entryId), [
+      album.items[0].entryId,
+      initial.items[0].entryId,
+      currentId,
+      station.items[0].entryId,
+    ]);
+    const stale = await server.nativeResponse(
+      `${home}/queue/items/${
+        initial.items[0].entryId
+      }?expectedVersion=${first.version}`,
+      'DELETE',
+    );
+    assertEquals(stale.status, 409);
+    const conflict = await stale.json();
+    assertEquals([conflict.code, conflict.version], [
+      'queue_conflict',
+      moved.version,
+    ]);
+    assertEquals(await server.native(`${home}/queue?view=all`), moved);
+    await server.native(
+      `${home}/queue/items/${
+        initial.items[0].entryId
+      }?expectedVersion=${moved.version}`,
+      'DELETE',
+    );
+    const edited = await server.native(`${home}/queue?view=all`);
+    assert(edited.version > moved.version);
+    assertEquals(
+      edited.items.map((item: { entryId: number }) => item.entryId),
+      [
+        album.items[0].entryId,
+        currentId,
+        station.items[0].entryId,
+      ],
+    );
+
+    await server.native(`${home}/seek`, 'POST', { positionMs: 7000 });
+    await until(() =>
+      receivers[0].sessions.some((s) => s.audioPayloads.length >= 8)
+    );
+    await server.native(`${home}/stop`, 'POST', {});
+    const stopped = (await server.native(home)).player;
+    assertEquals([stopped.state, stopped.current.entryId], [
+      'pause',
+      currentId,
+    ]);
+    assert(stopped.positionMs >= 7000);
+    await until(() =>
+      receivers[0].sessions.every((s) => s.closedAtMs !== null)
+    );
+    assert(receivers[0].sessions.some((s) => s.teardowns > 0));
+    await server.stop();
+    server = await boot(`${dir}/db`);
+    const restored = (await server.native(home)).player;
+    assertEquals([
+      restored.state,
+      restored.current.entryId,
+      restored.positionMs,
+    ], [
+      'pause',
+      currentId,
+      stopped.positionMs,
+    ]);
+    assertEquals(await server.native(`${home}/queue?view=all`), edited);
+    const beforeResume = receivers[0].sessions.length;
+    const resumedAt = performance.now();
+    await server.native(`${home}/play`, 'POST', {});
+    await until(() =>
+      receivers[0].sessions.slice(beforeResume).some((s) =>
+        s.audioPayloads.length >= 8
+      )
+    );
+    const resumed = receivers[0].sessions.slice(beforeResume).find((s) =>
+      s.audioPayloads.length >= 8
+    )!;
+    assert(
+      decodeReceiverAudio(resumed.sdp, resumed.audioPayloads.slice(0, 8)).some(
+        (sample) => sample !== 0,
+      ),
+    );
+    const playing = (await server.native(home)).player;
+    assertEquals([playing.state, playing.current.entryId], ['play', currentId]);
+    assert(playing.positionMs >= stopped.positionMs);
+    assert(
+      playing.positionMs <=
+        stopped.positionMs + performance.now() - resumedAt + 1000,
+    );
+
+    // Each copy must reach its destination without restarting Home's transport.
+    for (const mode of ['replace', 'add']) {
+      const packets = resumed.audioPayloads.length;
+      const flushes = resumed.flushes;
+      const sessions = receivers[0].sessions.length;
+      await server.native(`${home}/queue/copy/${mode}`, 'POST', {
+        targetPlayerId: kitchen.id,
+      });
+      const copied = await server.native(`${destination}/queue?view=all`);
+      assertEquals(
+        copied.items.map((item: { reference: unknown }) => item.reference),
+        Array.from(
+          { length: mode === 'replace' ? 1 : 2 },
+          () =>
+            edited.items.map((item: { reference: unknown }) => item.reference),
+        ).flat(),
+      );
+      assertEquals(await server.native(`${home}/queue?view=all`), edited);
+      assertEquals((await server.native(home)).player.state, 'play');
+      assertEquals((await server.native(destination)).player.state, 'pause');
+      await until(() => resumed.audioPayloads.length >= packets + 8);
+      assertEquals([
+        receivers[0].sessions.length,
+        resumed.flushes,
+        resumed.closedAtMs,
+      ], [
+        sessions,
+        flushes,
+        null,
+      ]);
+      assert(
+        decodeReceiverAudio(
+          resumed.sdp,
+          resumed.audioPayloads.slice(packets, packets + 8),
+        )
+          .some((sample) => sample !== 0),
+      );
+    }
+
+    // Same-turn HTTP requests cross the real production start/admission boundary.
+    await server.native(`${home}/stop`, 'POST', {});
+    await until(() =>
+      receivers[0].sessions.every((s) => s.closedAtMs !== null)
+    );
+    const sessionCounts = receivers.map((receiver) => receiver.sessions.length);
+    const paths = [home, destination];
+    const starts = await Promise.all(
+      paths.map((path) => server!.nativeResponse(`${path}/play`, 'POST', {})),
+    );
+    assertEquals(starts.map((response) => response.status).sort(), [204, 409]);
+    const winner = starts.findIndex((response) => response.status === 204);
+    const loser = 1 - winner;
+    await starts[winner].body?.cancel();
+    const busy = await starts[loser].json();
+    assertEquals(busy.code, 'airplay_busy');
+    assertEquals(busy.owner, {
+      id: winner === 0 ? 1 : kitchen.id,
+      name: winner === 0 ? 'Home' : 'Kitchen',
+    });
+    await until(() =>
+      receivers[winner].sessions.slice(sessionCounts[winner]).some(
+        (s) => s.audioPayloads.length >= 8,
+      )
+    );
+    const winningSession = receivers[winner].sessions.slice(
+      sessionCounts[winner],
+    ).find(
+      (s) => s.audioPayloads.length >= 8,
+    )!;
+    assert(
+      decodeReceiverAudio(
+        winningSession.sdp,
+        winningSession.audioPayloads.slice(0, 8),
+      )
+        .some((sample) => sample !== 0),
+    );
+    assertEquals(receivers[loser].sessions.length, sessionCounts[loser]);
+    assertEquals((await server.native(paths[winner])).player.state, 'play');
+    assertEquals((await server.native(paths[loser])).player.state, 'pause');
+    await server.native(`${paths[winner]}/stop`, 'POST', {});
+    await until(() =>
+      receivers.every((receiver) =>
+        receiver.sessions.every(
+          (s) => s.closedAtMs !== null,
+        )
+      )
     );
   } finally {
     await server?.stop();
