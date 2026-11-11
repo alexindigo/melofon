@@ -63,8 +63,9 @@ async function setup() {
   await playlists.create('admin', 'Mix', [fixtureAlbum!.songs[0].id]);
   const notify = createNotify();
   const player = createPlayer();
+  const state = createState(store);
   const bag = {
-    state: createState(store),
+    state,
     cfg,
     libraries,
     library,
@@ -77,6 +78,7 @@ async function setup() {
       library,
       cfg,
       notify,
+      state,
     }),
     notify,
     binds: createBinds(() => layers, {}),
@@ -90,6 +92,7 @@ async function setup() {
   });
   return {
     app,
+    state,
     close: async () => {
       await db.close();
       await Deno.remove(dir, { recursive: true });
@@ -101,6 +104,58 @@ const get = (app: (r: Request) => Promise<Response>, path: string) =>
   app(new Request(`http://x${path}`));
 const post = (app: (r: Request) => Promise<Response>, path: string) =>
   app(new Request(`http://x${path}`, { method: 'POST' }));
+
+Deno.test('OwnTone queue add keeps its wire reply and refuses overflow without clear, playback or shuffle changes', async () => {
+  const { app, state, close } = await setup();
+  const server = Deno.serve(
+    { hostname: '0.0.0.0', port: 0, onListen() {} },
+    app,
+  );
+  const base = `http://melofon.home:${server.addr.port}`;
+  const json = async (path: string, method = 'GET') => {
+    const response = await fetch(`${base}${path}`, { method });
+    assertEquals(response.status, 200);
+    return await response.json();
+  };
+  try {
+    const artists = await json('/api/library/artists');
+    const artist = artists.items.find((a: { name: string }) =>
+      a.name === 'Fixture Artist'
+    );
+    const albumList = await json('/api/library/albums');
+    const tracks = await json(
+      `/api/library/albums/${albumList.items[0].id}/tracks`,
+    );
+    const uri = `library:track:${tracks.items[0].id}`;
+    await state.set('playback.queueLimit', '2');
+    const added = await json(`/api/queue/items/add?uris=${uri},${uri}`, 'POST');
+    assertEquals(Object.keys(added).sort(), ['count', 'items', 'version']);
+    assertEquals(added.count, 2);
+    const before = await json('/api/queue');
+    const player = await json('/api/player');
+    for (
+      const query of [
+        `uris=${uri}`,
+        `uris=${artist.uri}&clear=true&playback=start&shuffle=true`,
+      ]
+    ) {
+      const refusal = await fetch(`${base}/api/queue/items/add?${query}`, {
+        method: 'POST',
+      });
+      assertEquals(refusal.status, 500);
+      assertEquals(await refusal.text(), 'Queue limit is 2 entries');
+      assertEquals(await json('/api/queue'), before);
+      assertEquals(await json('/api/player'), player);
+    }
+    assertEquals(
+      (await json(`/api/queue/items/add?uris=${uri}&clear=true`, 'POST')).count,
+      1,
+    );
+  } finally {
+    await server.shutdown();
+    await close();
+  }
+});
 
 for (const position of [undefined, 3, 10, 25]) {
   Deno.test(`add reply matches queue entries at position ${position ?? 'omitted'} with clear/shuffle/playback`, async () => {

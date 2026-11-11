@@ -366,6 +366,33 @@ Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restar
       true,
       'pause',
     ]);
+    // Core expands a native collection and starts its first new occurrence all
+    // the way through production composition to decoded receiver audio.
+    const sessionsBeforeAdd = receivers[0].sessions.length;
+    const added = await server.native('/players/1/queue/items', 'POST', {
+      references: [{ kind: 'album', id: modes.current.song.albumId }],
+      clear: true,
+      where: 'next',
+      startPlaying: true,
+    });
+    assert(added.count > 0);
+    const addedState = (await server.native('/players/1')).player;
+    assertEquals(addedState.current.entryId, added.items[0].entryId);
+    assertEquals(addedState.state, 'play');
+    await until(() =>
+      receivers[0].sessions.slice(sessionsBeforeAdd).some((s) =>
+        s.audioPayloads.length >= 8
+      )
+    );
+    const addedSession = receivers[0].sessions.slice(sessionsBeforeAdd).find((
+      s,
+    ) => s.audioPayloads.length >= 8)!;
+    assert(
+      decodeReceiverAudio(
+        addedSession.sdp,
+        addedSession.audioPayloads.slice(0, 8),
+      ).some((sample) => sample !== 0),
+    );
   } finally {
     await server?.stop();
     dns.close();

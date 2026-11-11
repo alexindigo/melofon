@@ -366,6 +366,7 @@ export async function playbackCommand<T>(
         no_target: 'Select a speaker before playing',
         target_unavailable: 'Selected speakers are unavailable',
         playback_cancelled: 'Playback start cancelled',
+        queue_limit: error.message,
       };
       const message = messages[String(error.code)];
       if (message) return new Response(message, { status: 500 });

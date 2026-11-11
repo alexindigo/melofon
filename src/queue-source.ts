@@ -7,6 +7,14 @@ export type QueueReference =
   | { kind: 'station'; id: string }
   | { kind: 'url'; url: string };
 
+/** Collection references are commands, not durable occurrence identities. */
+export type QueueAddReference =
+  | QueueReference
+  | { kind: 'album'; id: string }
+  | { kind: 'artist'; id: string }
+  | { kind: 'playlist'; id: string }
+  | { kind: 'folder'; libraryId: string; path: string };
+
 export interface WebPlaybackFacts {
   kind: 'web';
   /** Resolved playback address; the reference retains the entered identity. */

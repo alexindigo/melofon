@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { apiFixture, error } from './helpers/api.ts';
 import { restored } from './helpers/prepared.ts';
 import { openStore } from '../src/store/index.ts';
@@ -19,6 +19,11 @@ import { createQueueResolver } from '../src/queue-source.ts';
 import { createUserService } from '../src/user.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
+import { createPlaylists } from '../src/playlists.ts';
+import { createFolders } from '../src/folders.ts';
+import { createQueueExpansion } from '../src/queue-expansion.ts';
+import { createPlayback } from '../src/playback.ts';
+import { createPlayer } from '../src/player.ts';
 
 async function setup() {
   const dir = await restored('api-players', async (dir) => {
@@ -86,6 +91,12 @@ async function setup() {
           library,
           nowPlaying,
           cfg: {},
+          state: f.state,
+          expandQueueReference: createQueueExpansion({
+            library,
+            playlists: createPlaylists(f.store),
+            folders: createFolders(f.store),
+          }),
           resolveQueueReference: createQueueResolver({
             getSong: library.getSong,
             getStation: f.store.radio.get,
@@ -100,6 +111,7 @@ async function setup() {
         players,
         speakers,
         library,
+        playlists: createPlaylists(f.store),
         playback: players.playback,
         user: createUserService(f.store, f.cfg),
         annotation: createAnnotation(f.store),
@@ -163,6 +175,520 @@ async function setup() {
     },
   };
 }
+
+Deno.test('queue add HTTP expands every reference in order, preserving duplicates and leaf identities', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'cookie',
+      'member',
+      'password-member',
+    );
+    const library = createLibrary(t.f.store);
+    const playlists = createPlaylists(t.f.store);
+    const album = (await library.getAlbum(t.songs[0].albumId!))!;
+    const artistId = (await library.listArtists())[0].id;
+    const artistAlbums = await library.albumsByArtist(artistId);
+    const artistSongs = (await Promise.all(artistAlbums.map((a) =>
+      library.getAlbum(a.id)
+    )))
+      .flatMap((a) => a!.songs.map((s) => s.id));
+    const own = await playlists.create('member', 'My queue', [
+      t.songs[1].id,
+      t.songs[0].id,
+      t.songs[1].id,
+    ]);
+    const station = await t.f.store.radio.create({
+      name: 'Local station',
+      streamUrl: 'http://melofon.home/radio',
+      homePageUrl: null,
+    });
+    const root = (await createLibraries(t.f.store).list())[0];
+    const folder = {
+      kind: 'folder',
+      libraryId: root.id,
+      path: 'Fixture Artist/Fixture Album',
+    };
+    const folderSongs = (await createFolders(t.f.store).browse({
+      ...folder,
+      folders: { offset: 0, limit: 10 },
+      songs: { offset: 0, limit: 10 },
+    })).songs.rows;
+    const cases = [
+      { reference: { kind: 'song', id: t.songs[0].id }, ids: [t.songs[0].id] },
+      {
+        reference: { kind: 'album', id: album.album.id },
+        ids: album.songs.map((s) => s.id),
+      },
+      { reference: { kind: 'artist', id: artistId }, ids: artistSongs },
+      { reference: folder, ids: folderSongs.map((s) => s.id) },
+      { reference: { kind: 'playlist', id: own.id }, ids: own.trackIds },
+    ];
+    for (const { reference, ids } of cases) {
+      const result = await t.command(
+        '/api/v1/players/1/queue/items',
+        'POST',
+        credential,
+        { references: [reference], clear: true },
+        200,
+      );
+      assertEquals(result.count, ids.length);
+      assertEquals(
+        result.items.map((e: { reference: unknown }) => e.reference),
+        ids.map((id) => ({ kind: 'song', id })),
+      );
+      const page = await t.read('/api/v1/players/1/queue?view=all', credential);
+      assertEquals(page.items, result.items);
+      assertEquals(page.version, result.version);
+    }
+    const url = 'http://melofon.home/announcement';
+    const result = await t.command(
+      '/api/v1/players/1/queue/items',
+      'POST',
+      credential,
+      {
+        clear: true,
+        references: [
+          { kind: 'song', id: t.songs[0].id },
+          { kind: 'station', id: station.id },
+          { kind: 'url', url },
+          { kind: 'song', id: t.songs[0].id },
+        ],
+      },
+      200,
+    );
+    assertEquals(result.count, 4);
+    assertEquals(
+      result.items.map((e: { reference: { kind: string } }) =>
+        e.reference.kind
+      ),
+      ['song', 'station', 'url', 'song'],
+    );
+    assertEquals(
+      new Set(result.items.map((e: { entryId: number }) => e.entryId)).size,
+      4,
+    );
+    assertEquals(result.items[1].media.title, 'Local station');
+    assertEquals(result.items[2].reference, { kind: 'url', url });
+    const home = t.players.get(1);
+    assertEquals(home.lastCommand()?.source.user, 'member');
+    assertEquals(home.lastCommand()?.source.via, 'melofon');
+    await t.persistence.drain();
+    assertEquals(
+      (await t.f.store.playback.loadQueue(1)).items.map((e) => e.reference),
+      result.items.map((e: { reference: unknown }) => e.reference),
+    );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue add HTTP resolves end, next and positions on the server and starts the first added song', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'bearer',
+      'member',
+      'password-member',
+    );
+    const path = '/api/v1/players/1';
+    const home = t.players.get(1);
+    const other = await t.players.create('Kitchen');
+    await t.players.get(other.id).queueAdd([t.songs[1]]);
+    const otherBefore = t.players.get(other.id).queueView();
+    await t.addSpeaker('add-target');
+    await t.players.join(1, 'add-target');
+    const add = (body: unknown) =>
+      t.command(`${path}/queue/items`, 'POST', credential, body, 200);
+    const refs = (index: number) => [{ kind: 'song', id: t.songs[index].id }];
+    await add({ references: [...refs(0), ...refs(1)], startPlaying: true });
+    const original = home.playerView().current!.id;
+    const next = await add({ references: refs(1), where: 'next' });
+    assertEquals(next.items[0].position, 1);
+    assertEquals(home.playerView().current!.id, original);
+    assertEquals(home.playerView().state, 'play');
+    const inserted = await add({ references: refs(0), where: { position: 0 } });
+    assertEquals(inserted.items[0].position, 0);
+    assertEquals(home.playerView().current!.id, original);
+    const end = await add({
+      references: refs(1),
+      where: { position: 999 },
+      startPlaying: true,
+    });
+    assertEquals(end.items[0].position, 4);
+    assertEquals(home.playerView().current!.id, end.items[0].entryId);
+    await t.command(`${path}/pause`, 'POST', credential, {});
+    const append = await add({ references: refs(0), where: 'end' });
+    assertEquals(append.items[0].position, 5);
+    assertEquals(home.playerView().state, 'pause');
+    assertEquals(home.playerView().current!.id, end.items[0].entryId);
+    const fresh = await add({
+      references: [...refs(1), ...refs(0)],
+      where: 'next',
+      clear: true,
+      startPlaying: true,
+    });
+    assertEquals(fresh.items.map((e: { position: number }) => e.position), [
+      0,
+      1,
+    ]);
+    assertEquals(home.playerView().current!.id, fresh.items[0].entryId);
+    assertEquals(home.playerView().state, 'play');
+    assertEquals(t.players.get(other.id).queueView(), otherBefore);
+    await t.command(`${path}/stop`, 'POST', credential, {});
+    home.queueClear();
+    const noCurrent = await add({ references: refs(0), where: 'next' });
+    assertEquals(noCurrent.items[0].position, 0);
+    assertEquals(home.playerView().state, 'stop');
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue add HTTP uses caller playlist visibility and refuses entire unresolved batches before clear or play', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'bearer',
+      'member',
+      'password-member',
+    );
+    const playlists = createPlaylists(t.f.store);
+    const privateList = await playlists.create('admin', 'Private', [
+      t.songs[1].id,
+    ]);
+    const publicList = await playlists.create('admin', 'Public', [
+      t.songs[1].id,
+    ], true);
+    const home = t.players.get(1);
+    await home.queueAdd(t.songs);
+    const before = home.queueView();
+    const last = home.lastCommand();
+    const failReferences = [
+      { kind: 'playlist', id: privateList.id },
+      ...['song', 'album', 'artist', 'playlist', 'station'].map((kind) => ({
+        kind,
+        id: 'missing',
+      })),
+      {
+        kind: 'folder',
+        libraryId: (await createLibraries(t.f.store).list())[0].id,
+        path: 'missing',
+      },
+    ];
+    for (const reference of failReferences) {
+      const response = await t.f.json('/api/v1/players/1/queue/items', 'POST', {
+        references: [{ kind: 'song', id: t.songs[0].id }, reference],
+        clear: true,
+        startPlaying: true,
+      }, credential);
+      assertEquals(response.status, 404, await response.clone().text());
+      await response.body?.cancel();
+      assertEquals(home.queueView(), before);
+      assertEquals(home.lastCommand(), last);
+    }
+    const result = await t.command(
+      '/api/v1/players/1/queue/items',
+      'POST',
+      credential,
+      {
+        references: [{ kind: 'playlist', id: publicList.id }],
+        clear: true,
+      },
+      200,
+    );
+    assertEquals(result.items[0].reference.id, t.songs[1].id);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue add HTTP recursively expands canonical folders without filesystem path access', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('cookie');
+    const root = (await createLibraries(t.f.store).list())[0];
+    const all = await createLibrary(t.f.store).listSongs({
+      offset: 0,
+      size: 100,
+    });
+    const result = await t.command(
+      '/api/v1/players/1/queue/items',
+      'POST',
+      credential,
+      {
+        references: [{ kind: 'folder', libraryId: root.id, path: '' }],
+      },
+      200,
+    );
+    assertEquals(result.count, all.length);
+    assertEquals(
+      result.items.map((e: { reference: { id: string } }) => e.reference.id)
+        .sort(),
+      all.map((s) => s.id).sort(),
+    );
+    const before = t.players.get(1).queueView();
+    for (
+      const path of [
+        '../',
+        '/etc',
+        'Fixture Artist/../Various Artists',
+        'Fixture Artist//Fixture Album',
+        'C:\\Music',
+      ]
+    ) {
+      await error(
+        await t.f.json('/api/v1/players/1/queue/items', 'POST', {
+          references: [{ kind: 'folder', libraryId: root.id, path }],
+          clear: true,
+        }, credential),
+        400,
+        'invalid_field',
+      );
+      assertEquals(t.players.get(1).queueView(), before);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue add HTTP enforces a live per-player limit atomically on every core add port and clear-first sizing', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login('bearer');
+    assertEquals(await t.f.state.getTyped('playback.queueLimit'), 8192);
+    await t.f.state.set('playback.queueLimit', '3');
+    const path = '/api/v1/players/1/queue/items';
+    const ref = { kind: 'song', id: t.songs[0].id };
+    const add = (body: unknown) =>
+      t.command(path, 'POST', credential, body, 200);
+    await add({ references: [ref, ref] });
+    const home = t.players.get(1);
+    const before = home.queueView();
+    const last = home.lastCommand();
+    const response = await t.f.json(
+      path,
+      'POST',
+      { references: [ref, ref] },
+      credential,
+    );
+    assertEquals(response.status, 409);
+    const refusal = await response.json();
+    assertEquals([refusal.code, refusal.limit], ['queue_limit', 3]);
+    assertEquals(home.queueView(), before);
+    assertEquals(home.lastCommand(), last);
+    await assertRejects(
+      async () => {
+        await home.queueAdd(t.songs);
+      },
+      Error,
+      'Queue limit',
+    );
+    await assertRejects(
+      async () => {
+        await home.queueAddSources(before.items);
+      },
+      Error,
+      'Queue limit',
+    );
+    const tooMany = await t.f.json(path, 'POST', {
+      references: [ref, ref, ref, ref],
+      clear: true,
+      startPlaying: true,
+    }, credential);
+    assertEquals((await tooMany.json()).code, 'queue_limit');
+    assertEquals(home.queueView(), before);
+    const exact = await add({ references: [ref, ref, ref], clear: true });
+    assertEquals(exact.count, 3);
+    assertEquals(
+      (await t.read('/api/v1/players/1/queue?view=all', credential)).total,
+      3,
+    );
+    const kitchen = await t.players.create('Kitchen');
+    assertEquals(
+      (await t.command(
+        `/api/v1/players/${kitchen.id}/queue/items`,
+        'POST',
+        credential,
+        { references: [ref, ref, ref] },
+        200,
+      )).count,
+      3,
+    );
+    await t.f.state.set('playback.queueLimit', '4');
+    assertEquals((await add({ references: [ref] })).count, 1);
+    await t.persistence.drain();
+    assertEquals((await t.f.store.playback.loadQueue(1)).items.length, 4);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue limit defaults to exactly 8192 even without a settings adapter', async () => {
+  const t = await setup();
+  const playback = createPlayback({
+    player: createPlayer(),
+    library: createLibrary(t.f.store),
+    nowPlaying: createNowPlaying(t.f.store),
+    cfg: {},
+  });
+  try {
+    await playback.queueAdd(Array.from({ length: 8192 }, () => t.songs[0]));
+    assertEquals(playback.queueView().items.length, 8192);
+    await assertRejects(
+      async () => {
+        await playback.queueAdd(t.songs.slice(0, 1));
+      },
+      Error,
+      '8192',
+    );
+    assertEquals(playback.queueView().items.length, 8192);
+  } finally {
+    await playback.close();
+    await t.close();
+  }
+});
+
+Deno.test('queue add HTTP start refusals preserve both queues and provenance', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'bearer',
+      'member',
+      'password-member',
+    );
+    const home = t.players.get(1);
+    await home.queueAdd(t.songs);
+    const body = {
+      references: [{ kind: 'song', id: t.songs[1].id }],
+      clear: true,
+      startPlaying: true,
+    };
+    const before = home.queueView();
+    await error(
+      await t.f.json('/api/v1/players/1/queue/items', 'POST', body, credential),
+      409,
+      'no_target',
+    );
+    assertEquals(home.queueView(), before);
+    await t.addSpeaker('add-home-airplay', 'AirPlay');
+    await t.players.join(1, 'add-home-airplay');
+    await home.play();
+    const kitchen = await t.players.create('Kitchen');
+    await t.addSpeaker('add-kitchen-airplay', 'AirPlay');
+    await t.players.join(kitchen.id, 'add-kitchen-airplay');
+    const other = t.players.get(kitchen.id);
+    await other.queueAdd(t.songs);
+    const otherBefore = other.queueView();
+    const last = other.lastCommand();
+    const response = await t.f.json(
+      `/api/v1/players/${kitchen.id}/queue/items`,
+      'POST',
+      body,
+      credential,
+    );
+    assertEquals(response.status, 409);
+    const refusal = await response.json();
+    assertEquals(refusal.code, 'airplay_busy');
+    assertEquals(refusal.owner, { id: 1, name: 'Home' });
+    assertEquals(other.queueView(), otherBefore);
+    assertEquals(other.lastCommand(), last);
+    assertEquals(home.queueView(), before);
+    assertEquals(home.playerView().state, 'play');
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('queue add HTTP validates complete input and keeps auth, Origin and rebased routes', async () => {
+  const t = await setup();
+  try {
+    const { credential } = await t.f.login(
+      'cookie',
+      'member',
+      'password-member',
+    );
+    const path = '/api/v1/players/1/queue/items';
+    const ref = { kind: 'song', id: t.songs[0].id };
+    const invalid = [
+      {},
+      { references: [] },
+      { references: [null] },
+      { references: 'song' },
+      { references: [{ ...ref, extra: true }] },
+      { references: [{ kind: 'query', id: 'x' }] },
+      { references: [{ kind: 'song', id: 1 }] },
+      { references: [{ kind: 'song', id: '' }] },
+      { references: [ref], where: null },
+      { references: [ref], where: 'bad' },
+      ...[-1, 1.5, 9007199254740992, '1'].map((position) => ({
+        references: [ref],
+        where: { position },
+      })),
+      { references: [ref], where: { position: 1, extra: 2 } },
+      { references: [ref], clear: 'true' },
+      { references: [ref], startPlaying: 1 },
+      { references: [ref], user: 'admin' },
+    ];
+    for (const body of invalid) {
+      const response = await t.f.json(path, 'POST', body, credential);
+      assertEquals(response.status, 400, await response.clone().text());
+      await response.body?.cancel();
+      assertEquals(t.players.get(1).queueView().items.length, 0);
+    }
+    for (
+      const url of [
+        'file:///etc/passwd',
+        'ftp://melofon.home/a',
+        'not a url',
+        'http://user:pass@melofon.home/a',
+      ]
+    ) {
+      await error(
+        await t.f.json(path, 'POST', {
+          references: [{ kind: 'url', url }],
+          clear: true,
+        }, credential),
+        400,
+        'invalid_reference',
+      );
+    }
+    await error(
+      await t.f.json(path, 'POST', { references: [ref] }),
+      401,
+      'unauthenticated',
+    );
+    await error(
+      await t.f.json(path, 'POST', { references: [ref] }, credential, null),
+      403,
+      'origin',
+    );
+    const foreign = await t.f.json(
+      path,
+      'POST',
+      { references: [ref] },
+      credential,
+      'http://other.home',
+    );
+    assertEquals(foreign.status, 403);
+    await foreign.body?.cancel();
+    await error(
+      await t.f.json('/api/v1/players/999/queue/items', 'POST', {
+        references: [ref],
+      }, credential),
+      404,
+      'not_found',
+    );
+    assertEquals(
+      (await t.command(`/_melofon${path}`, 'POST', credential, {
+        references: [ref],
+      }, 200)).count,
+      1,
+    );
+  } finally {
+    await t.close();
+  }
+});
 
 Deno.test('queue HTTP pages whole and upcoming snapshots across edits with independent player versions', async () => {
   const t = await setup();

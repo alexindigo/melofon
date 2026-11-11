@@ -94,6 +94,27 @@ to change either or both saved modes, optionally alongside `name`; it returns
 the updated player. Starting without a speaker returns `no_target`; another
 player holding AirPlay returns `airplay_busy` with its owning player's id/name.
 
+`POST /api/v1/players/{id}/queue/items` adds a batch with a body such as
+`{"references":[{"kind":"album","id":"..."}],"where":"next","startPlaying":true}`.
+References accept `song`, `album`, `artist`, `playlist` or `station` with `id`,
+`folder` with `libraryId` and canonical library-relative `path` (empty for the
+root), or `url` with an HTTP(S) `url`. Artists expand their albums in catalog
+order; folders include indexed descendants, songs first then subfolders in
+name order. Playlists use the caller's existing visibility, keeping duplicates.
+Saved entries retain song/station/URL references, not collection references.
+
+`where` defaults to `"end"`; `"next"` inserts after the current entry (at the
+head without one), and `{"position":0}` inserts at a zero-based position,
+clamped to the end. Optional `clear:true` clears first, so positions apply to
+the new queue. Optional `startPlaying:true` starts the first added entry;
+otherwise the current entry, spot and play/pause stay unchanged unless cleared.
+The response contains `version`, `count` and added `items` in the queue-read
+shape. Core resolves and prepares the batch before mutation; unavailable media,
+start refusal and overflow leave the queue untouched. `playback.queueLimit`
+defaults to 8192 entries per player; overflow returns 409 `queue_limit` with
+`limit`, never a partial addition. OwnTone retains its existing add wire shape
+and legacy playback-position semantics, subject to the same core queue limit.
+
 Player state includes `queueVersion`. `GET /api/v1/players/{id}/queue` reads
 `view=upNext` (default, includes the current song) or `view=all`, with `offset`
 (default 0) and `limit`. The response has `version`, `currentEntryId`,

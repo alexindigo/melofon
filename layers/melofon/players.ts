@@ -1,8 +1,13 @@
-import type { HatContext, HatRequest, PlayerRow } from './types.ts';
+import type {
+  HatContext,
+  HatRequest,
+  PlayerQueueEntry,
+  PlayerRow,
+} from './types.ts';
 import { core, fail } from './errors.ts';
 import { fields } from './input.ts';
 import { source } from './libraries.ts';
-import { nowPlayingPayload } from './now-playing.ts';
+import { nowPlayingPayload, queueMediaPayload } from './now-playing.ts';
 
 export function playerId(raw: string): number {
   const id = Number(raw);
@@ -14,6 +19,17 @@ export function playerId(raw: string): number {
 
 export function playerSummary({ id, name, isDefault }: PlayerRow) {
   return { id, name, isDefault };
+}
+
+export function queueEntryPayload(entry: PlayerQueueEntry, position: number) {
+  return {
+    entryId: entry.id,
+    position,
+    reference: entry.reference.kind === 'url'
+      ? { kind: 'url', url: entry.reference.url }
+      : { kind: entry.reference.kind, id: entry.reference.id },
+    ...queueMediaPayload(entry),
+  };
 }
 
 export async function playerCommand(

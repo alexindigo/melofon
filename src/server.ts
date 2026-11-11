@@ -17,6 +17,7 @@ import { createAnnotation } from './annotation.ts';
 import { createListens } from './listens.ts';
 import { createIdentity } from './identity.ts';
 import { createPlaylists } from './playlists.ts';
+import { createQueueExpansion } from './queue-expansion.ts';
 import { createRadio } from './radio.ts';
 import { createRadioSource } from './radio-source.ts';
 import { createPlaybackSource } from './playback-source.ts';
@@ -294,6 +295,11 @@ export async function startServer(options: {
       library,
       cfg,
       resolveQueueReference,
+      expandQueueReference: createQueueExpansion({
+        library,
+        playlists: createPlaylists(store),
+        folders: createFolders(store),
+      }),
       prepareQueueMedia: playbackSources.prepare,
       state,
     },

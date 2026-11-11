@@ -30,7 +30,7 @@ import {
 } from './playback-reports.ts';
 export type { NowPlayingViewRow, ReportPlaying } from './playback-reports.ts';
 import { type Log, scopedLog } from './logging.ts';
-import { PlaybackError } from './playback-errors.ts';
+import { PlaybackError, QueueLimitError } from './playback-errors.ts';
 import type {
   PlaybackCapacity,
   PlaybackReservation,
@@ -39,6 +39,7 @@ import { planSourceFailure } from './source-recovery.ts';
 import {
   catalogMedia,
   createQueueResolver,
+  type QueueAddReference,
   queueCapabilities,
   type QueueMedia,
   type QueueReference,
@@ -66,6 +67,10 @@ export interface PlaybackAuthority {
 }
 
 export interface QueueAddOptions {
+  /** Core resolves destinations against the queue at the mutation boundary. */
+  where?: 'end' | 'next' | { position: number };
+  /** Start the first added occurrence; legacy play/from options stay unchanged. */
+  startPlaying?: boolean;
   position?: number;
   playbackFromPosition?: number;
   play?: boolean;
@@ -121,7 +126,7 @@ export interface Playback {
   ): QueueEntry[] | Promise<QueueEntry[]>;
   /** Resolve the whole reference batch and prepare URL facts before mutation. */
   queueAddReferences(
-    references: QueueReference[],
+    references: QueueAddReference[],
     opts?: QueueAddOptions,
     source?: CommandSource,
   ): Promise<QueueEntry[]>;
@@ -205,6 +210,11 @@ export function createPlayback(deps: {
   resolveQueueReference?: (
     reference: QueueReference,
   ) => Promise<QueueMedia | null>;
+  expandQueueReference?: (
+    reference: QueueAddReference,
+    username: string | undefined,
+    limit: number,
+  ) => Promise<QueueReference[]>;
   prepareQueueMedia?: (
     media: QueueMedia,
     signal: AbortSignal,
@@ -257,6 +267,24 @@ export function createPlayback(deps: {
     return result;
   };
   const log = deps.log ?? scopedLog('playback');
+  const defaultQueueLimit = 8192;
+  deps.state?.declare('playback.queueLimit', {
+    type: 'integer',
+    minimum: 1,
+    maximum: 9007199254740990,
+    default: defaultQueueLimit,
+    description:
+      'Maximum queue entries per server player; additions are atomic',
+  });
+  const queueLimit = async () =>
+    Number(
+      await deps.state?.getTyped('playback.queueLimit') ?? defaultQueueLimit,
+    );
+  const checkSize = (count: number, opts: QueueAddOptions, limit: number) => {
+    if (count + (opts.clear ? 0 : player.queue().items.length) > limit) {
+      throw new QueueLimitError(limit);
+    }
+  };
   let openedSource: PlaybackSource | null = null;
   const recoverySettings = {
     retryBackoffMs: {
@@ -583,13 +611,33 @@ export function createPlayback(deps: {
     opts: QueueAddOptions = {},
     source?: CommandSource,
     firstId?: number,
+    limit = defaultQueueLimit,
   ): QueueEntry[] | Promise<QueueEntry[]> => {
+    checkSize(media.length, opts, limit);
     const size = media.length + (opts.clear ? 0 : player.queue().items.length);
     const future = opts.clear ? [] : player.queue().items;
+    const currentIndex = future.findIndex((entry) =>
+      entry.id === player.status().current?.id
+    );
+    const position = opts.where === 'next'
+      ? currentIndex + 1
+      : typeof opts.where === 'object'
+      ? opts.where.position
+      : opts.where === 'end'
+      ? future.length
+      : opts.position;
     const at = Math.min(
-      Math.max(0, Math.trunc(opts.position ?? future.length)),
+      Math.max(0, Math.trunc(position ?? future.length)),
       future.length,
     );
+    opts = {
+      ...opts,
+      position: opts.where === undefined ? opts.position : at,
+      play: opts.startPlaying && media.length > 0 || opts.play,
+      playbackFromPosition: opts.startPlaying && media.length
+        ? at
+        : opts.playbackFromPosition,
+    };
     const items = [...future.slice(0, at), ...media, ...future.slice(at)];
     const oldCurrent = player.status().current;
     const index = opts.playbackFromPosition !== undefined
@@ -600,8 +648,9 @@ export function createPlayback(deps: {
     return transition(
       opts.play === true && size > 0,
       (activate) => {
+        checkSize(media.length, opts, limit);
         if (opts.clear) player.queueClear();
-        const added = player.queueAddSources(media, opts.position, firstId);
+        const added = player.queueAddSources(media, at, firstId);
         if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
         if (opts.play) player.play(opts.playbackFromPosition);
         activate();
@@ -640,14 +689,19 @@ export function createPlayback(deps: {
     media: QueueMedia[],
     opts: QueueAddOptions = {},
     source?: CommandSource,
+    limit = defaultQueueLimit,
   ): QueueEntry[] | Promise<QueueEntry[]> => {
     requireOpen();
+    checkSize(media.length, opts, limit);
     if (!deps.reserveQueueIds || !media.length) {
-      return commitAdd(media, opts, source);
+      return commitAdd(media, opts, source, undefined, limit);
     }
     cancelStart();
     const controller = new AbortController();
-    const reservation = reserveStart(opts.play === true, controller);
+    const reservation = reserveStart(
+      opts.startPlaying === true || opts.play === true,
+      controller,
+    );
     pendingStart = controller;
     return deps.reserveQueueIds(media.length).then((firstId) => {
       if (
@@ -660,7 +714,7 @@ export function createPlayback(deps: {
         );
       }
       pendingStart = undefined;
-      const added = commitAdd(media, opts, source, firstId);
+      const added = commitAdd(media, opts, source, firstId, limit);
       // The transition now owns cancellation. Do not retain an earlier phase's
       // ticket while waiting for its successor's possibly slow preparation.
       reservation?.release();
@@ -675,17 +729,23 @@ export function createPlayback(deps: {
     getStation: () => Promise.resolve(null),
   });
   const prepareAdd = async (
-    resolve: (signal: AbortSignal) => Promise<QueueMedia[]>,
+    resolve: (signal: AbortSignal, limit: number) => Promise<QueueMedia[]>,
     opts?: QueueAddOptions,
     source?: CommandSource,
   ): Promise<QueueEntry[]> => {
     requireOpen();
     cancelStart();
     const controller = new AbortController();
-    const reservation = reserveStart(opts?.play === true, controller);
+    const reservation = reserveStart(
+      opts?.startPlaying === true || opts?.play === true,
+      controller,
+    );
     pendingStart = controller;
     try {
-      const media = await resolve(controller.signal);
+      const limit = await queueLimit();
+      controller.signal.throwIfAborted();
+      const media = await resolve(controller.signal, limit);
+      checkSize(media.length, opts ?? {}, limit);
       const prepared: QueueMedia[] = [];
       for (const item of media) {
         prepared.push(
@@ -698,7 +758,7 @@ export function createPlayback(deps: {
       if (pendingStart !== controller) controller.abort();
       controller.signal.throwIfAborted();
       pendingStart = undefined;
-      const added = addSources(prepared, opts, source);
+      const added = addSources(prepared, opts, source, limit);
       reservation?.release();
       return await added;
     } catch (error) {
@@ -1111,12 +1171,19 @@ export function createPlayback(deps: {
       );
     },
     queueAdd(songs, opts = {}, source) {
+      if (deps.state) {
+        return prepareAdd(
+          () => Promise.resolve(songs.map(catalogMedia)),
+          opts,
+          source,
+        );
+      }
       return addSources(songs.map(catalogMedia), opts, source);
     },
     queueAddSources(media, opts, source) {
       if (
-        !deps.prepareQueueMedia ||
-        !media.some((item) => item.facts.kind === 'web')
+        !deps.state && (!deps.prepareQueueMedia ||
+          !media.some((item) => item.facts.kind === 'web'))
       ) {
         return addSources(media, opts, source);
       }
@@ -1124,38 +1191,50 @@ export function createPlayback(deps: {
     },
     queueAddReferences(references, opts, source) {
       return prepareAdd(
-        async (signal) => {
+        async (signal, limit) => {
           const media: QueueMedia[] = [];
-          for (const reference of references) {
-            if (reference.kind === 'url') {
-              let url: URL;
-              try {
-                url = new URL(reference.url);
-              } catch {
+          for (const input of references) {
+            const expanded = deps.expandQueueReference
+              ? await deps.expandQueueReference(input, source?.user, limit)
+              : input.kind === 'song' || input.kind === 'station' ||
+                  input.kind === 'url'
+              ? [input]
+              : [];
+            if (!expanded.length && !deps.expandQueueReference) {
+              throw new PlaybackError('missing_reference', 'Media not found');
+            }
+            checkSize(media.length + expanded.length, opts ?? {}, limit);
+            for (const reference of expanded) {
+              if (reference.kind === 'url') {
+                let url: URL;
+                try {
+                  url = new URL(reference.url);
+                } catch {
+                  throw new PlaybackError(
+                    'invalid_reference',
+                    'Invalid media URL',
+                  );
+                }
+                if (
+                  !['http:', 'https:'].includes(url.protocol) || url.username ||
+                  url.password
+                ) {
+                  throw new PlaybackError(
+                    'invalid_reference',
+                    'Invalid media URL',
+                  );
+                }
+              }
+              const item = await resolveReference(reference);
+              signal.throwIfAborted();
+              if (!item) {
                 throw new PlaybackError(
-                  'invalid_reference',
-                  'Invalid media URL',
+                  'missing_reference',
+                  'Media not found',
                 );
               }
-              if (
-                !['http:', 'https:'].includes(url.protocol) || url.username ||
-                url.password
-              ) {
-                throw new PlaybackError(
-                  'invalid_reference',
-                  'Invalid media URL',
-                );
-              }
+              media.push(item);
             }
-            const item = await resolveReference(reference);
-            signal.throwIfAborted();
-            if (!item) {
-              throw new PlaybackError(
-                'missing_reference',
-                'Media not found',
-              );
-            }
-            media.push(item);
           }
           return media;
         },

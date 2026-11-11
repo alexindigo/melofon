@@ -39,6 +39,9 @@ export async function core<T>(operation: () => Promise<T>): Promise<T> {
           ...(code === 'airplay_busy' && 'owner' in error
             ? { owner: error.owner }
             : {}),
+          ...(code === 'queue_limit' && 'limit' in error
+            ? { limit: error.limit }
+            : {}),
         },
       );
     }

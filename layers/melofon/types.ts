@@ -621,6 +621,15 @@ export interface PlayerRow {
 }
 
 export interface PlayerPlayback {
+  queueAddReferences(
+    references: PlayerQueueReference[],
+    options: {
+      where?: 'end' | 'next' | { position: number };
+      clear?: boolean;
+      startPlaying?: boolean;
+    },
+    source?: Source,
+  ): Promise<PlayerQueueEntry[]>;
   queueView(): { version: number; items: PlayerQueueEntry[] };
   queuePageView(options: {
     view: 'upNext' | 'all';
@@ -661,6 +670,15 @@ export interface PlayerPlayback {
     })
     | null;
 }
+
+export type PlayerQueueReference =
+  | { kind: 'song'; id: string }
+  | { kind: 'station'; id: string }
+  | { kind: 'album'; id: string }
+  | { kind: 'artist'; id: string }
+  | { kind: 'playlist'; id: string }
+  | { kind: 'folder'; libraryId: string; path: string }
+  | { kind: 'url'; url: string };
 
 export type PlayerQueueEntry =
   & { id: number }
