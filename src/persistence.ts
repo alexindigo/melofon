@@ -38,7 +38,8 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   /** Capture a synchronous membership publication and its induced engine pauses
    * as one semantic store write, ordered with all other household writes. */
   changeMemberships<T>(change: () => T): Promise<T>;
-  /** Capture a synchronous multi-player command in the same household transaction. */
+  /** Capture a synchronous multi-player command in the same household transaction.
+   * Once published, the command succeeds even if its queued save must retry. */
   changePlayers<T>(change: () => T): Promise<T>;
   /** Adopted output preferences only (also seeds the savedOutput cache). */
   loadOutputs(): Promise<PersistedOutput[]>;
@@ -160,7 +161,22 @@ export function createPersistence(
   return {
     forPlayer,
     changeMemberships: changePlayers,
-    changePlayers,
+    async changePlayers<T>(change: () => T): Promise<T> {
+      let published: { result: T } | undefined;
+      try {
+        return await changePlayers(() => {
+          const result = change();
+          published = { result };
+          return result;
+        });
+      } catch (error) {
+        // The capture owner logs failed saves and retains the identical batch
+        // ahead of later writes. Only a failed publication rejects a command;
+        // reporting its later save failure would invite a duplicate command.
+        if (!published) throw error;
+        return published.result;
+      }
+    },
     saveQueue: home.saveQueue,
     saveState: home.saveState,
     loadQueue: home.loadQueue,

@@ -740,71 +740,102 @@ Deno.test('queue copy HTTP snapshots source without cancelling it and rejects st
   }
 });
 
-Deno.test('queue copy HTTP saves both command receipts and destination bookmark/queue in one retryable transaction', async () => {
-  const t = await setup();
-  try {
-    const { credential } = await t.f.login('bearer');
-    const kitchen = await t.players.create('Kitchen');
-    const home = t.players.get(1), target = t.players.get(kitchen.id);
-    await home.queueAdd(t.songs);
-    await target.queueAdd([t.songs[0]]);
-    await t.persistence.drain();
-    const savedBefore = await t.f.store.playback.loadQueue(kitchen.id);
-    const commandsBefore = (await t.f.store.players.list()).map((p) =>
-      p.commandedAtMs
-    );
-    const saveChanges = t.f.store.players.saveChanges;
-    const batches: Parameters<typeof saveChanges>[0][] = [];
-    let failOnce = true;
-    t.f.store.players.saveChanges = async (changes) => {
-      batches.push(structuredClone(changes));
-      if (failOnce) {
-        failOnce = false;
-        throw new Error('copy transaction write unavailable');
-      }
-      await saveChanges(changes);
-    };
-    const response = await t.f.json(
-      '/api/v1/players/1/queue/copy/replace',
-      'POST',
-      { targetPlayerId: kitchen.id },
-      credential,
-    );
-    assertEquals(response.status, 500);
-    await response.body?.cancel();
-    const failedSave = await t.f.store.playback.loadQueue(kitchen.id);
-    assertEquals(failedSave.items, savedBefore.items);
-    assertEquals(failedSave.version, savedBefore.version);
-    // Household ids are reserved before publication and never reused, even
-    // when the later multi-player transaction must be retried.
-    assertEquals(
-      failedSave.nextId,
-      Math.max(...target.queueView().items.map((e) => e.id)) + 1,
-    );
-    assert(failedSave.nextId > savedBefore.nextId);
-    assertEquals(
-      (await t.f.store.players.list()).map((p) => p.commandedAtMs),
-      commandsBefore,
-    );
-    assertEquals(batches.length, 1);
-    const batch = batches[0].players!;
-    assertEquals(batch.map((p) => p.playerId).sort(), [1, kitchen.id]);
-    assert(batch.every((p) => p.commandedAtMs !== undefined && p.state));
-    assert(batch.find((p) => p.playerId === kitchen.id)!.queue);
-    assertEquals(batch.find((p) => p.playerId === 1)!.queue, undefined);
-    await t.persistence.drain();
-    assertEquals(batches.length, 2);
-    assertEquals(batches[1], batches[0]);
-    assertEquals(
-      (await t.f.store.playback.loadQueue(kitchen.id)).items.map((e) => e.id),
-      target.queueView().items.map((e) => e.id),
-    );
-    assertEquals((await t.f.store.players.list()).map((p) => p.commandedAtMs), [
-      home.lastCommand()!.atMs,
-      target.lastCommand()!.atMs,
-    ]);
-  } finally {
-    await t.close();
+Deno.test('queue copy HTTP acknowledges applied changes and retries both command receipts and destination bookmark/queue atomically', async () => {
+  for (const mode of ['replace', 'add'] as const) {
+    const t = await setup();
+    try {
+      await assertRejects(
+        () =>
+          t.persistence.changePlayers(() => {
+            throw new Error('publication refused before applying');
+          }),
+        Error,
+        'publication refused before applying',
+      );
+      const { credential } = await t.f.login('bearer');
+      const kitchen = await t.players.create('Kitchen');
+      const home = t.players.get(1), target = t.players.get(kitchen.id);
+      await home.queueAdd(t.songs);
+      await target.queueAdd([t.songs[0]]);
+      await t.persistence.drain();
+      const savedBefore = await t.f.store.playback.loadQueue(kitchen.id);
+      const commandsBefore = (await t.f.store.players.list()).map((p) =>
+        p.commandedAtMs
+      );
+      const saveChanges = t.f.store.players.saveChanges;
+      const batches: Parameters<typeof saveChanges>[0][] = [];
+      let failOnce = true;
+      t.f.store.players.saveChanges = async (changes) => {
+        batches.push(structuredClone(changes));
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('copy transaction write unavailable');
+        }
+        await saveChanges(changes);
+      };
+      const response = await t.f.json(
+        `/api/v1/players/1/queue/copy/${mode}`,
+        'POST',
+        { targetPlayerId: kitchen.id },
+        credential,
+      );
+      assertEquals(response.status, 204);
+      await response.body?.cancel();
+      const applied = await t.read(
+        `/api/v1/players/${kitchen.id}/queue?view=all`,
+        credential,
+      );
+      assertEquals(
+        applied.items.map((entry: { reference: unknown }) => entry.reference),
+        [
+          ...(mode === 'add' ? [{ kind: 'song', id: t.songs[0].id }] : []),
+          ...t.songs.map((song) => ({ kind: 'song', id: song.id })),
+        ],
+      );
+      const failedSave = await t.f.store.playback.loadQueue(kitchen.id);
+      assertEquals(failedSave.items, savedBefore.items);
+      assertEquals(failedSave.version, savedBefore.version);
+      // Household ids are reserved before publication and never reused, even
+      // when the later multi-player transaction must be retried.
+      assertEquals(
+        failedSave.nextId,
+        Math.max(...target.queueView().items.map((e) => e.id)) + 1,
+      );
+      assert(failedSave.nextId > savedBefore.nextId);
+      assertEquals(
+        (await t.f.store.players.list()).map((p) => p.commandedAtMs),
+        commandsBefore,
+      );
+      assertEquals(batches.length, 1);
+      const batch = batches[0].players!;
+      assertEquals(batch.map((p) => p.playerId).sort(), [1, kitchen.id]);
+      assert(batch.every((p) => p.commandedAtMs !== undefined && p.state));
+      assert(batch.find((p) => p.playerId === kitchen.id)!.queue);
+      assertEquals(batch.find((p) => p.playerId === 1)!.queue, undefined);
+      await t.persistence.drain();
+      assertEquals(batches.length, 2);
+      assertEquals(batches[1], batches[0]);
+      assertEquals(
+        (await t.f.store.playback.loadQueue(kitchen.id)).items.map((e) => e.id),
+        target.queueView().items.map((e) => e.id),
+      );
+      assertEquals(
+        (await t.f.store.players.list()).map((p) => p.commandedAtMs),
+        [
+          home.lastCommand()!.atMs,
+          target.lastCommand()!.atMs,
+        ],
+      );
+      assertEquals(
+        (await t.read(
+          `/api/v1/players/${kitchen.id}/queue?view=all`,
+          credential,
+        )).items,
+        applied.items,
+      );
+    } finally {
+      await t.close();
+    }
   }
 });
 
