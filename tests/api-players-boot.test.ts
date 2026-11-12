@@ -810,12 +810,8 @@ Deno.test('volume cold HTTP: linked deltas, clipping and OwnTone master reach ab
   );
   const dir = await Deno.makeTempDir({ prefix: 'melofon-volume-boot-' });
   const ids = [...speakerIds, '73588229207'];
-  const receivers = [
-    await startFakeRaop({ captureAudio: true }),
-    await startFakeRaop({ captureAudio: true }),
-    await startFakeRaop({ captureAudio: true }),
-  ];
-  const dns = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  const receivers: Awaited<ReturnType<typeof startFakeRaop>>[] = [];
+  let dns: ReturnType<typeof dgram.createSocket> | undefined;
   let server: Awaited<ReturnType<typeof boot>> | undefined;
   // Observe the real SET_PARAMETER consumer. The unchanged native adapter maps
   // each absolute 0-100 number to -30..0 dB; no player multiplier belongs here.
@@ -842,6 +838,10 @@ Deno.test('volume cold HTTP: linked deltas, clipping and OwnTone master reach ab
     await received(volumes);
   };
   try {
+    for (const _id of ids) {
+      receivers.push(await startFakeRaop({ captureAudio: true }));
+    }
+    dns = dgram.createSocket({ type: 'udp4', reuseAddr: true });
     await advertise(dns, receivers, ids);
     await speakerMedia(dir);
     const store = await openStore(`${dir}/db`);
@@ -959,7 +959,7 @@ Deno.test('volume cold HTTP: linked deltas, clipping and OwnTone master reach ab
     );
   } finally {
     await server?.stop();
-    dns.close();
+    dns?.close();
     for (const receiver of receivers) receiver.close();
     await Deno.remove(dir, { recursive: true });
   }
