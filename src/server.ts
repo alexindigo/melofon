@@ -479,21 +479,34 @@ export async function startServer(options: {
       for (const signal of ['SIGTERM', 'SIGINT'] as const) {
         Deno.removeSignalListener(signal, onSignal);
       }
-      stopLoggingSettings();
-      await lookups.close();
-      await podcasts.close();
-      discovery.close();
-      airplay.close();
-      await listens.shutdown();
-      await artworkBackground.close();
-      try {
-        await players.close();
-        shutdownNativeLogging();
-        await reports.close();
-      } finally {
-        await persistence.close();
+      const errors: unknown[] = [];
+      // Preserve dependency order, but a failed release cannot strand the
+      // remaining owners or allow their work to outlive the store connection.
+      for (
+        const release of [
+          stopLoggingSettings,
+          () => lookups.close(),
+          () => podcasts.close(),
+          () => discovery.close(),
+          () => airplay.close(),
+          () => listens.shutdown(),
+          () => artworkBackground.close(),
+          () => players.close(),
+          shutdownNativeLogging,
+          () => reports.close(),
+          () => persistence.close(),
+          () => store.close(),
+        ]
+      ) {
+        try {
+          await release();
+        } catch (error) {
+          errors.push(error);
+        }
       }
-      await store.close();
+      if (errors.length) {
+        throw new AggregateError(errors, 'Server shutdown failed');
+      }
     },
   });
   const onSignal = () => {

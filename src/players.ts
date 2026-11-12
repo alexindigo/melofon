@@ -571,7 +571,15 @@ export async function createPlayers(deps: {
       closed = true;
       closeWork = (async () => {
         await tail;
-        await Promise.all([...engines.values()].map(dispose));
+        const results = await Promise.allSettled(
+          [...engines.values()].map(dispose),
+        );
+        const errors = results.flatMap((result) =>
+          result.status === 'rejected' ? [result.reason] : []
+        );
+        if (errors.length) {
+          throw new AggregateError(errors, 'Player registry close failed');
+        }
         engines.clear();
       })();
       return closeWork;

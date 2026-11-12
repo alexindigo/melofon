@@ -627,6 +627,59 @@ Deno.test('restore and target preparation use the owning player, not any househo
   }
 });
 
+Deno.test('registry close waits for every engine release before propagating a disposal failure', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failure = new Error('Home boot close failed');
+  const f = await household(store, {
+    createBoot(id) {
+      return {
+        retry: () => Promise.resolve(),
+        changeCredentials: (_id, save) => save(),
+        pair: () => Promise.resolve({ state: 'complete', saved: false }),
+        submitPin: () => Promise.resolve({ state: 'complete', saved: false }),
+        async close() {
+          if (id === 1) throw failure;
+          entered.resolve();
+          await release.promise;
+        },
+      };
+    },
+  });
+  let closing: Promise<void> | undefined;
+  try {
+    await f.players.create('Kitchen');
+    let settled = false;
+    closing = f.players.close();
+    void closing.then(() => settled = true, () => settled = true);
+    await entered.promise;
+    // Let Home finish its persistence release while Kitchen still owns its boot.
+    await f.persistence.drain();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(
+      settled,
+      false,
+      'shared owners must outlive every engine release',
+    );
+    release.resolve();
+    await assertRejects(
+      () => closing!,
+      AggregateError,
+      'Player registry close failed',
+    );
+    assertEquals(f.players.list(), []);
+  } finally {
+    release.resolve();
+    await closing?.catch(() => {});
+    await f.reports.close();
+    await f.persistence.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('registry drives each engine end clock and drains clocks and subscriptions on close', async () => {
   const dir = await dataDir();
   const store = await openStore(dir);

@@ -53,7 +53,8 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   drain(): Promise<void>;
   /** Unsaved published batches, without exposing private failure details. */
   health(): { pendingWrites: number };
-  /** Stop the household retry owner and drain before closing the store. */
+  /** Reject new publications and stop automatic retries, then drain accepted
+   * writes. A failed attempt retains them for a later close or drain. */
   close(): Promise<void>;
 }
 
@@ -73,6 +74,9 @@ export function createPersistence(
   let tail: Promise<void> = Promise.resolve();
   let closed = false;
   let closeWork: Promise<void> | undefined;
+  const requireOpen = () => {
+    if (closed) throw new Error('Persistence is closed');
+  };
   let retryTimer: { cancel(): void } | undefined;
   let retryEpoch = 0;
   let retryAttempt = 0;
@@ -102,6 +106,8 @@ export function createPersistence(
     if (key === retryKey) policyWork = loadPolicy();
   });
   let policyWork = state ? loadPolicy() : Promise.resolve();
+  // Includes published batches still waiting to enter the retry queue on tail.
+  let acceptedWrites = 0;
   const pendingWrites: (() => Promise<void>)[] = [];
   const cancelRetry = () => {
     retryEpoch++;
@@ -123,6 +129,7 @@ export function createPersistence(
     while (pendingWrites.length) {
       await pendingWrites[0]();
       pendingWrites.shift();
+      acceptedWrites--;
       retryAttempt = 0;
     }
   };
@@ -136,7 +143,8 @@ export function createPersistence(
     return write;
   };
   const enqueue = (write: () => Promise<void>): void => {
-    if (closed) return;
+    requireOpen();
+    acceptedWrites++;
     const work = tail.then(async () => {
       // Published intent succeeds independently of storage. Retain every whole
       // batch behind its predecessors; this owner wakes itself when idle.
@@ -153,6 +161,7 @@ export function createPersistence(
     outputs: Map<string, AdoptedSpeakerSnapshot>;
   } | undefined;
   const savePlayer = (row: PlayerSave, save = enqueue) => {
+    requireOpen();
     if (membershipChange) {
       membershipChange.players.set(row.playerId, {
         ...membershipChange.players.get(row.playerId),
@@ -212,6 +221,7 @@ export function createPersistence(
   const home = forPlayer(1);
 
   const changePlayers = async <T>(change: () => T): Promise<T> => {
+    requireOpen();
     if (membershipChange) throw new Error('Nested membership change');
     const batch = {
       players: new Map<number, PlayerSave>(),
@@ -249,6 +259,7 @@ export function createPersistence(
     loadPlayerState: home.loadPlayerState,
 
     saveOutput(row) {
+      requireOpen();
       // Only explicit adoption (or an adopted row loaded at boot) authorizes
       // preferences to reach disk. A temporary selection cannot mint a row.
       if (!outputCache.has(row.id)) return;
@@ -265,7 +276,7 @@ export function createPersistence(
     },
 
     async adoptOutput(row) {
-      if (closed) throw new Error('Persistence is closed');
+      requireOpen();
       const revision = outputRevisions.get(row.id);
       const connectionStrategy = requireConnectionStrategy(
         row.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY,
@@ -293,6 +304,7 @@ export function createPersistence(
     },
 
     async deleteOutput(id) {
+      requireOpen();
       outputRevisions.set(id, (outputRevisions.get(id) ?? 0) + 1);
       outputCache.delete(id);
       // Previously queued writes finish before deletion; later temporary
@@ -336,7 +348,7 @@ export function createPersistence(
     ignoredOutputs: () => [...ignored],
 
     async setOutputIgnored(id, value) {
-      if (closed) throw new Error('Persistence is closed');
+      requireOpen();
       const write = tail.then(async () => {
         await retryWrites();
         if (value) await store.speakers.saveIgnored(id);
@@ -349,13 +361,20 @@ export function createPersistence(
     },
 
     drain,
-    health: () => ({ pendingWrites: pendingWrites.length }),
+    health: () => ({ pendingWrites: acceptedWrites }),
     close() {
       if (closeWork) return closeWork;
-      closed = true;
-      cancelRetry();
-      unsubscribe?.();
-      closeWork = policyWork.then(drain);
+      if (!closed) {
+        closed = true;
+        cancelRetry();
+        unsubscribe?.();
+      }
+      closeWork = policyWork.then(drain).catch((error) => {
+        // Admission stays closed, but retained writes still belong to us.
+        // Share each in-flight attempt; only a failed attempt may be retried.
+        closeWork = undefined;
+        throw error;
+      });
       return closeWork;
     },
   };
