@@ -573,7 +573,7 @@ export async function createLookupRunner(options: {
       signal.throwIfAborted();
       authority.signal.throwIfAborted();
       await store.candidates.addCandidates(candidates);
-      if (candidates.length) {
+      if (candidates.some((candidate) => candidate.kind === 'cover')) {
         options.notify?.emit(['library'], undefined, 'all');
       }
       await store.lookups.finish(job.id, { state: 'done' });

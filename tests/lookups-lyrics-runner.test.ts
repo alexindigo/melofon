@@ -3,6 +3,7 @@ import { openStore } from '../src/store/index.ts';
 import { createState } from '../src/state.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
+import { createNotify } from '../src/notify.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createLookupRunner } from '../src/lookups/runner.ts';
 import { createLookupNetwork } from '../src/lookups/net.ts';
@@ -20,6 +21,7 @@ async function setup(requires: string[] = []) {
   await Deno.mkdir(root);
   const store = await openStore(dataDir);
   const state = createState(store);
+  const notify = createNotify();
   const libraries = createLibraries(store);
   const libraryId = (await libraries.add('Music', root)).id;
   await lyricsLookupPlugin(builtin, 'lyrics-fixture', requires);
@@ -33,6 +35,7 @@ async function setup(requires: string[] = []) {
     state,
     libraries,
     libraryId,
+    notify,
     library: createLibrary(store),
     async start(network?: ReturnType<typeof createLookupNetwork>) {
       runner = await createLookupRunner({
@@ -41,6 +44,7 @@ async function setup(requires: string[] = []) {
         dataDir,
         builtin,
         network,
+        notify,
       });
       return runner;
     },
@@ -65,6 +69,10 @@ Deno.test('lyrics runner: discovered song jobs persist whole variants, provenanc
     const song = await f.song();
     const before = await Deno.readFile(song.path);
     const runner = await f.start();
+    const artworkChanges: string[][] = [];
+    f.notify.subscribe((types) => {
+      if (types.includes('library')) artworkChanges.push(types);
+    });
     const [plugin] = await runner.list();
     assertEquals(plugin.id, 'lyrics-fixture');
     assertEquals(plugin.capabilities[0].provides, ['track.lyrics']);
@@ -85,6 +93,12 @@ Deno.test('lyrics runner: discovered song jobs persist whole variants, provenanc
       entries: lookupLyrics,
     });
     assertEquals(candidate.details.ids, { fixture: 'external-song' });
+    assertEquals(
+      artworkChanges,
+      [],
+      'lyrics acquisition does not refresh artwork',
+    );
+    assertEquals(await f.library.lyricsBySongId(song.id), lookupLyrics);
     assertEquals(
       candidate.imageHash,
       await imageHash(new TextEncoder().encode(JSON.stringify(lookupLyrics))),

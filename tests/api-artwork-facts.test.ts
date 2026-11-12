@@ -16,6 +16,7 @@ import { scanLibrary } from '../src/scan.ts';
 import { apiFixture, error } from './helpers/api.ts';
 import { pixelPng } from './helpers/pixel-image.ts';
 import { tagged } from './helpers/tagged.ts';
+import { waitForWorkerSignal } from './helpers/artwork-worker.ts';
 import reference from './fixtures/thumbhash-reference.json' with {
   type: 'json',
 };
@@ -28,6 +29,7 @@ async function fixture(
     background?: boolean;
     workerUrl?: URL;
     onComputing?: () => void;
+    workerGate?: Int32Array;
     podcasts?: boolean;
   } = {},
 ) {
@@ -72,6 +74,15 @@ async function fixture(
             return await imagePixels(bytes, width, height);
           },
         });
+        if (options.workerGate) {
+          const pixels = artwork.pixels;
+          artwork.pixels = async (...args) => {
+            const result = await pixels(...args);
+            return result.kind === 'pixels' && result.width === 100
+              ? { ...result, gate: options.workerGate!.buffer }
+              : result;
+          };
+        }
         if (options.background !== false) {
           background = createArtworkBackground({
             artwork,
@@ -471,7 +482,14 @@ Deno.test('API core artwork: uploaded radio covers, generated tiles and private 
 Deno.test('API core artwork: adversarial 100x100 computation does not block another HTTP response', async () => {
   let observe = false;
   const entered = Promise.withResolvers<void>();
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  const release = () => {
+    Atomics.store(gate, 0, 1);
+    Atomics.notify(gate, 0);
+  };
   const t = await fixture({
+    workerUrl: new URL('./fixtures/artwork-gated-worker.ts', import.meta.url),
+    workerGate: gate,
     onComputing: () => {
       if (observe) entered.resolve();
     },
@@ -501,7 +519,7 @@ Deno.test('API core artwork: adversarial 100x100 computation does not block anot
       return save(...args);
     };
     t.background!.refresh();
-    await entered.promise;
+    await waitForWorkerSignal(entered.promise, 'computation start');
     const other = await t.f.get('/api/v1/me', key);
     assertEquals(other.status, 200);
     await other.json();
@@ -510,7 +528,9 @@ Deno.test('API core artwork: adversarial 100x100 computation does not block anot
       false,
       'the other HTTP response must complete during the real Worker computation',
     );
+    release();
     await t.idle();
+    assertEquals(completed, true);
     const actual =
       (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
     assertEquals({
@@ -518,6 +538,7 @@ Deno.test('API core artwork: adversarial 100x100 computation does not block anot
       dominantColor: actual.dominantColor,
     }, expected);
   } finally {
+    release();
     await t.close();
   }
 });
