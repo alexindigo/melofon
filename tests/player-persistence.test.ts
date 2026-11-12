@@ -552,14 +552,15 @@ Deno.test('a failed published save stays pending for retry; a broken logger is h
       logger.event(id, facts);
     },
   };
+  const persistence = createPersistence(store, log);
   try {
-    const persistence = createPersistence(store, log);
     await db.close();
     persistence.saveQueue(songQueue(['a', 'b']), stopped);
     await assertRejects(() => persistence.drain());
     assertEquals(persistence.health(), { pendingWrites: 1 });
     assertEquals(events.filter((id) => id === 'persistence_failed').length, 2);
   } finally {
+    await persistence.close().catch(() => {});
     await Deno.remove(dir, { recursive: true });
   }
 });
