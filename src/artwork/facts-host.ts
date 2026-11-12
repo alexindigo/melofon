@@ -34,8 +34,21 @@ export function createArtworkFactsHost(
     reject?.(error);
   }
   function start(seconds: number) {
-    const current = new Worker(workerUrl, { type: 'module' });
+    const current = new Worker(
+      new URL('./facts-bootstrap.ts', import.meta.url),
+      {
+        type: 'module',
+      },
+    );
     worker = current;
+    // Failure ownership outlives each startup/computation message handler,
+    // including asynchronous failures while the reusable Worker is idle.
+    current.addEventListener('message', (event) => {
+      if (event.data?.error) {
+        event.stopImmediatePropagation();
+        retire(new Error(event.data.error));
+      }
+    });
     ready = new Promise<void>((resolve, reject) => {
       const finish = (error?: Error) => {
         clearTimeout(timer);
@@ -59,6 +72,7 @@ export function createArtworkFactsHost(
         if (data?.ready === true) finish();
         else retire(new Error('Invalid artwork Worker startup'));
       };
+      current.postMessage({ module: workerUrl.href });
     });
     return ready;
   }
@@ -96,7 +110,6 @@ export function createArtworkFactsHost(
               onComputing?.();
               return;
             }
-            if (data?.error) return retire(new Error(data.error));
             const value = data?.value;
             if (
               typeof value?.thumbHash !== 'string' ||

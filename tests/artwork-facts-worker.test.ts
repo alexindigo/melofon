@@ -4,7 +4,10 @@ import { createArtworkFactsHost } from '../src/artwork/facts-host.ts';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { authFixture } from './helpers/authentication.ts';
-import { waitForWorkerSignal } from './helpers/artwork-worker.ts';
+import {
+  artworkStateFixture as stateFixture,
+  waitForWorkerSignal,
+} from './helpers/artwork-worker.ts';
 import reference from './fixtures/thumbhash-reference.json' with {
   type: 'json',
 };
@@ -12,21 +15,6 @@ import reference from './fixtures/thumbhash-reference.json' with {
 const source = { width: 1, height: 1, rgba: new Uint8Array([255, 0, 0, 255]) };
 const worker = (code: string) =>
   new URL(`data:application/javascript,${encodeURIComponent(code)}`);
-
-function stateFixture() {
-  const values = new Map<string, number>();
-  return {
-    declare(key: string, schema: unknown) {
-      if (!values.has(key)) {
-        values.set(key, (schema as { default: number }).default);
-      }
-    },
-    getTyped: (key: string) => Promise.resolve(values.get(key)),
-    set(key: string, value: string) {
-      values.set(key, Number(value));
-    },
-  };
-}
 
 Deno.test('Artwork Worker: exact existing ThumbHash vectors and recovery after a failed computation', async () => {
   const state = stateFixture();
@@ -126,21 +114,31 @@ Deno.test('Artwork Worker: transition waits fail on a missing signal and clear t
 });
 
 Deno.test('Artwork Worker: uncaught errors and invalid results settle instead of hanging', async () => {
-  const state = stateFixture();
-  for (
-    const code of [
-      'throw new Error("fixture startup error");',
-      'postMessage({ready:true}); onmessage = () => { throw new Error("fixture compute error"); };',
-      'postMessage({ready:true}); onmessage = () => postMessage({value:{thumbHash:42}});',
-    ]
-  ) {
-    const host = createArtworkFactsHost(state, worker(code));
-    try {
-      await assertRejects(() => host.compute(source));
-    } finally {
-      host.close();
-    }
-  }
+  // Deno prints terminal Worker errors before the parent's onerror callback.
+  // Capture at the process boundary so even a regression cannot corrupt this
+  // test's reporter output, then assert that the owner prevented that output.
+  const output = await new Deno.Command(Deno.execPath(), {
+    args: [
+      'run',
+      '--frozen',
+      '--cached-only',
+      '--node-modules-dir=manual',
+      '--allow-read',
+      new URL('./fixtures/artwork-worker-errors.ts', import.meta.url).pathname,
+    ],
+    stdout: 'piped',
+    stderr: 'piped',
+    signal: AbortSignal.timeout(30_000),
+  }).output();
+  const stderr = new TextDecoder().decode(output.stderr);
+  assertEquals(output.code, 0, stderr);
+  assertEquals(stderr, '', 'Worker failures must not escape to runtime stderr');
+  assertEquals(JSON.parse(new TextDecoder().decode(output.stdout)), [
+    'Error: fixture startup error',
+    'Error: fixture compute error',
+    'Error: fixture async error',
+    'Invalid artwork Worker result',
+  ]);
 });
 
 Deno.test('Artwork migration: drops only old native global facts and preserves other private data on upgrade', async () => {
