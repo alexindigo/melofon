@@ -28,6 +28,8 @@ export interface EnginePersistence extends PlayerPersistence {
   loadPlayerState(): Promise<PersistedPlayerState | null>;
   drain(): Promise<void>;
   close(): Promise<void>;
+  /** Successful deletion makes any queued snapshots obsolete, unlike shutdown. */
+  retire(): void;
 }
 
 export interface Persistence extends PlayerPersistence, OutputPersistence {
@@ -48,6 +50,8 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   savedOutput(id: string): PersistedOutput | undefined;
   /** Await every queued write (tests: before closing/reopening the db). */
   drain(): Promise<void>;
+  /** Unsaved published batches, without exposing private failure details. */
+  health(): { pendingWrites: number };
 }
 
 export function createPersistence(
@@ -56,22 +60,24 @@ export function createPersistence(
   credentials?: Pick<SpeakerCredentials, 'adopt'>,
 ): Persistence {
   let tail: Promise<void> = Promise.resolve();
-  const pendingMembershipWrites: (() => Promise<void>)[] = [];
-  const retryMembershipWrites = async () => {
-    while (pendingMembershipWrites.length) {
-      await pendingMembershipWrites[0]();
-      pendingMembershipWrites.shift();
+  const pendingWrites: (() => Promise<void>)[] = [];
+  const retryWrites = async () => {
+    while (pendingWrites.length) {
+      await pendingWrites[0]();
+      pendingWrites.shift();
     }
   };
   const drain = () => {
-    const write = tail.then(retryMembershipWrites);
+    const write = tail.then(retryWrites);
     tail = write.catch((error) => log.event('persistence_failed', { error }));
     return write;
   };
   const enqueue = (write: () => Promise<void>): void => {
     tail = tail.then(async () => {
-      await retryMembershipWrites();
-      await write();
+      // Published intent succeeds independently of storage. Retain every whole
+      // batch behind its predecessors until a write or drain can retry it.
+      pendingWrites.push(write);
+      await retryWrites();
     }).catch((err) => {
       log.event('persistence_failed', { error: err });
     });
@@ -83,32 +89,44 @@ export function createPersistence(
     players: Map<number, PlayerSave>;
     outputs: Map<string, AdoptedSpeakerSnapshot>;
   } | undefined;
-  const savePlayer = (row: PlayerSave) => {
+  const savePlayer = (row: PlayerSave, save = enqueue) => {
     if (membershipChange) {
       membershipChange.players.set(row.playerId, {
         ...membershipChange.players.get(row.playerId),
         ...row,
       });
-    } else enqueue(() => store.players.saveChanges({ players: [row] }));
+    } else save(() => store.players.saveChanges({ players: [row] }));
   };
   const forPlayer = (playerId: number): EnginePersistence => {
     let active = true;
+    let retired = false;
+    const save = (write: () => Promise<void>) =>
+      enqueue(async () => {
+        if (retired) return;
+        try {
+          await write();
+        } catch (error) {
+          // A write queued behind the successful durable delete may already be
+          // inside the store lane. It no longer has a player to persist or retry.
+          if (!retired) throw error;
+        }
+      });
     return {
       saveQueue(snapshot, state) {
         if (!active) return;
         const copy = structuredClone(snapshot);
         if (membershipChange) savePlayer({ playerId, queue: copy, state });
-        else enqueue(() => store.playback.saveQueue(playerId, copy, state));
+        else save(() => store.playback.saveQueue(playerId, copy, state));
       },
       saveState(snapshot) {
         if (!active) return;
         if (membershipChange) {
           savePlayer({ playerId, state: structuredClone(snapshot) });
-        } else enqueue(() => store.playback.saveState(playerId, snapshot));
+        } else save(() => store.playback.saveState(playerId, snapshot));
       },
       saveCommand(commandedAtMs) {
         if (active) {
-          savePlayer({ playerId, commandedAtMs });
+          savePlayer({ playerId, commandedAtMs }, save);
         }
       },
       loadQueue: () => store.playback.loadQueue(playerId),
@@ -117,6 +135,10 @@ export function createPersistence(
       async close() {
         active = false;
         await drain();
+      },
+      retire() {
+        active = false;
+        retired = true;
       },
     };
   };
@@ -142,41 +164,16 @@ export function createPersistence(
         players: [...batch.players.values()],
         outputs: [...batch.outputs.values()],
       });
-    const write = tail.then(async () => {
-      try {
-        await retryMembershipWrites();
-        await commit();
-      } catch (error) {
-        // Runtime keeps the requested intent, as with ordinary engine writes.
-        // Never let a later output snapshot commit half of a failed transfer:
-        // retry this whole transaction first, without rolling cache state back.
-        pendingMembershipWrites.push(commit);
-        throw error;
-      }
-    });
-    tail = write.catch((error) => log.event('persistence_failed', { error }));
-    await write;
+    enqueue(commit);
+    // The change is already published. A durable failure is logged and stays
+    // in the ordered queue, not returned as a retryable command failure.
+    await tail;
     return result;
   };
   return {
     forPlayer,
     changeMemberships: changePlayers,
-    async changePlayers<T>(change: () => T): Promise<T> {
-      let published: { result: T } | undefined;
-      try {
-        return await changePlayers(() => {
-          const result = change();
-          published = { result };
-          return result;
-        });
-      } catch (error) {
-        // The capture owner logs failed saves and retains the identical batch
-        // ahead of later writes. Only a failed publication rejects a command;
-        // reporting its later save failure would invite a duplicate command.
-        if (!published) throw error;
-        return published.result;
-      }
-    },
+    changePlayers,
     saveQueue: home.saveQueue,
     saveState: home.saveState,
     loadQueue: home.loadQueue,
@@ -215,7 +212,7 @@ export function createPersistence(
       };
       // Reserve the credential incarnation now, before an older queued write
       // can yield to unregister/re-registration of the same speaker id.
-      const before = tail.then(retryMembershipWrites);
+      const before = tail.then(retryWrites);
       const write = credentials
         ? credentials.adopt(row.id, save, before)
         : before.then(() => save([]));
@@ -226,22 +223,15 @@ export function createPersistence(
     },
 
     async deleteOutput(id) {
-      const previous = outputCache.get(id);
       outputRevisions.set(id, (outputRevisions.get(id) ?? 0) + 1);
       outputCache.delete(id);
       // Previously queued writes finish before deletion; later temporary
-      // updates cannot pass the cache gate. Explicit errors reach the caller.
-      const write = tail.then(async () => {
-        await retryMembershipWrites();
+      // updates cannot pass the cache gate. Forget is already published: retain
+      // the whole credential/configuration delete for retry, never restore it.
+      enqueue(async () => {
         await store.speakers.deleteAdopted(id);
       });
-      tail = write.catch((error) => log.event('persistence_failed', { error }));
-      try {
-        await write;
-      } catch (error) {
-        if (previous) outputCache.set(id, previous);
-        throw error;
-      }
+      await tail;
     },
 
     async loadOutputs() {
@@ -277,7 +267,7 @@ export function createPersistence(
 
     async setOutputIgnored(id, value) {
       const write = tail.then(async () => {
-        await retryMembershipWrites();
+        await retryWrites();
         if (value) await store.speakers.saveIgnored(id);
         else await store.speakers.deleteIgnored(id);
         if (value) ignored.add(id);
@@ -288,5 +278,6 @@ export function createPersistence(
     },
 
     drain,
+    health: () => ({ pendingWrites: pendingWrites.length }),
   };
 }

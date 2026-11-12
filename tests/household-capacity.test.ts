@@ -329,6 +329,12 @@ Deno.test('household wiring refuses every competing start before queue or play-s
 
 Deno.test('joining AirPlay to a second playing player refuses before either membership or bookmark changes', async () => {
   const f = await fixture();
+  const playbackState = async (id: number) => {
+    const row = await f.store.playback.loadPlayerState(id);
+    if (!row) return row;
+    const { updatedAtMs: _updatedAtMs, ...playback } = row;
+    return playback;
+  };
   try {
     await independentPlayer(f, 2);
     await f.players.get(1).play();
@@ -337,8 +343,8 @@ Deno.test('joining AirPlay to a second playing player refuses before either memb
     const before = f.outputs.list(),
       memberships = await f.store.speakers.loadMemberships();
     const states = [
-      await f.store.playback.loadPlayerState(1),
-      await f.store.playback.loadPlayerState(2),
+      await playbackState(1),
+      await playbackState(2),
     ];
     const last = f.outputs.lastCommand(),
       commands = await f.store.players.list();
@@ -352,11 +358,12 @@ Deno.test('joining AirPlay to a second playing player refuses before either memb
     assertEquals(changes, 0);
     assertEquals(f.outputs.list(), before);
     assertEquals(f.outputs.lastCommand(), last);
+    await f.persistence.drain();
     assertEquals(await f.store.speakers.loadMemberships(), memberships);
     assertEquals(await f.store.players.list(), commands);
     assertEquals([
-      await f.store.playback.loadPlayerState(1),
-      await f.store.playback.loadPlayerState(2),
+      await playbackState(1),
+      await playbackState(2),
     ], states);
     assertEquals([1, 2].map((id) => f.players.get(id).playerView().state), [
       'play',
@@ -501,6 +508,7 @@ Deno.test('OwnTone playback routes report the owning player without changing eit
   try {
     await h.players.get(2).play();
     await until(() => h.sessions[0]?.bytes > 0);
+    await h.persistence.drain();
     for (
       const path of [
         'play',
@@ -571,6 +579,7 @@ Deno.test('every OwnTone membership route refuses busy before transfer or prefer
       assertEquals(response.status, 500, path);
       assertEquals(await response.text(), 'AirPlay is busy in Kitchen');
       assertEquals(h.outputs.list(), before);
+      await h.persistence.drain();
       assertEquals(await f.store.speakers.loadMemberships(), saved);
       assertEquals([1, 2].map((id) => h.players.get(id).playerView().state), [
         'play',

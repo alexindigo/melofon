@@ -75,6 +75,7 @@ async function fixture(dir?: string) {
       await f.state.getTyped('airplay.mdns');
       return {
         outputs,
+        persistence,
         airplay: devices,
         outputAdmission: devices.admission,
         speakers: createSpeakers({
@@ -641,32 +642,62 @@ Deno.test('forget defeats a late address lookup even when the same receiver is r
   }
 });
 
-Deno.test('speaker HTTP forget reports delete failure safely and permits a durable retry', async () => {
+Deno.test('speaker HTTP forget succeeds after publication and exposes its whole durable delete retry through health', async () => {
   const t = await fixture();
+  const remove = t.f.store.speakers.deleteAdopted;
   try {
     t.announce();
     const id = (await t.read())[0].id;
     await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
     t.outputs.update(id, { selected: true });
     await t.persistence.drain();
-    const remove = t.f.store.speakers.deleteAdopted;
-    t.f.store.speakers.deleteAdopted = () =>
-      Promise.reject(new Error('private delete fault'));
-    const failure = await error(
-      await t.write(`/${id}`, 'DELETE', undefined),
-      500,
-      'persistence_failed',
+    await t.f.store.speakers.saveCredential(id, 'password', 'opaque-password');
+    await t.f.store.speakers.saveCredential(
+      id,
+      'pairing-key',
+      'opaque-pairing',
     );
-    assert(!JSON.stringify(failure).includes('private delete fault'));
-    assertEquals((await t.read())[0].adopted, true);
-    assertEquals((await t.read())[0].selected, false);
+    let attempts = 0;
+    t.f.store.speakers.deleteAdopted = () => {
+      attempts++;
+      return Promise.reject(new Error('private delete fault'));
+    };
+    // Decision 31: publication is command success; saving retries independently.
+    const forgotten = await t.write(`/${id}`, 'DELETE', undefined);
+    assertEquals(forgotten.status, 204, await forgotten.text());
+    assertEquals(await t.read(), []);
+    assertEquals(t.persistence.savedOutput(id), undefined);
+    const health = await t.f.request('/_/health');
+    assertEquals(health.status, 503);
+    assertEquals(await health.json(), {
+      ok: false,
+      persistence: { pendingWrites: 1 },
+    });
     assertEquals((await t.f.store.speakers.loadAdopted()).length, 1);
+    assertEquals(
+      await t.f.store.speakers.loadCredential(id, 'password'),
+      'opaque-password',
+    );
+    assertEquals(
+      await t.f.store.speakers.loadCredential(id, 'pairing-key'),
+      'opaque-pairing',
+    );
+    assertEquals(attempts, 1);
     t.f.store.speakers.deleteAdopted = remove;
-    const deleted = await t.write(`/${id}`, 'DELETE', undefined);
-    assertEquals(deleted.status, 204, await deleted.text());
+    await t.persistence.drain();
+    assertEquals(await t.read(), []);
     assertEquals(t.persistence.savedOutput(id), undefined);
     assertEquals(await t.f.store.playback.loadOutputs(), []);
+    assertEquals(await t.f.store.speakers.loadCredential(id, 'password'), null);
+    assertEquals(
+      await t.f.store.speakers.loadCredential(id, 'pairing-key'),
+      null,
+    );
+    const recovered = await t.f.request('/_/health');
+    assertEquals(recovered.status, 200);
+    assertEquals(await recovered.json(), { ok: true });
   } finally {
+    t.f.store.speakers.deleteAdopted = remove;
     await t.close();
   }
 });

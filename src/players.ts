@@ -405,13 +405,20 @@ export async function createPlayers(deps: {
         if (!deps.outputs.get(speakerId)) {
           throw new SpeakerError('not_found', 'Speaker not found');
         }
-        await changeMembers(
-          id,
-          members(id).map((row) => row.id).filter((member) =>
-            member !== speakerId
-          ),
-          source,
-        );
+        if (
+          !await changeMembers(
+            id,
+            members(id).map((row) => row.id).filter((member) =>
+              member !== speakerId
+            ),
+            source,
+          )
+        ) {
+          throw new SpeakerError(
+            'speaker_busy',
+            'Speaker membership is unavailable',
+          );
+        }
       }),
     list: () =>
       [...engines.values()].filter((e) => !e.disposing).map((e) => ({
@@ -497,9 +504,10 @@ export async function createPlayers(deps: {
             'Cannot delete the default player',
           );
         }
-        await dispose(engine);
         await deps.persistence.drain();
         await deps.store.players.delete(id);
+        engine.persistence.retire();
+        await dispose(engine);
         engines.delete(id);
         // The durable delete frees members in the same transaction as the queue.
         // Publish the corresponding runtime release only after it commits.

@@ -458,6 +458,7 @@ export interface PersistedOutput {
 export interface OutputPersistence {
   saveOutput(row: PersistedOutput): void;
   adoptOutput?(row: PersistedOutput): Promise<void>;
+  /** Forget is already published; the owner retains and reports failed saves. */
   deleteOutput?(id: string): Promise<void>;
   savedOutput?(id: string): PersistedOutput | undefined;
   ignoredOutputs?(): string[];
@@ -1209,26 +1210,23 @@ export function createOutputs(
       }
       forgetting.add(id);
       bump(id);
-      // Revoke boot authority before publishing removal. Both command listeners
-      // and the unregister notification see this incarnation as no longer usable.
+      // Publish at once. Cleanup retains its own resource authority, while the
+      // persistence owner retries the whole durable delete independently.
       member(row, null);
       const cancellations = [...commandListeners].map((fn) => {
         try {
-          return Promise.resolve(fn(id, { forget: true }));
+          return Promise.resolve(fn(id, { forget: true })).catch((error) => {
+            log.event('output_listener_failed', { error });
+          });
         } catch (error) {
-          return Promise.reject(error);
+          log.event('output_listener_failed', { error });
+          return Promise.resolve();
         }
       });
       api.unregister(id, source);
+      adopted.delete(id);
       try {
-        await Promise.all(cancellations);
-        await persistence?.deleteOutput?.(id);
-        adopted.delete(id);
-      } catch (error) {
-        // A failed forget is retryable, but must never resume the old session.
-        outputs.push({ ...row });
-        saveRow(row);
-        throw error;
+        await Promise.all([...cancellations, persistence?.deleteOutput?.(id)]);
       } finally {
         forgetting.delete(id);
         emit(['outputs']);

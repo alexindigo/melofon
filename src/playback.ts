@@ -703,39 +703,45 @@ export function createPlayback(deps: {
       : oldCurrent && !opts.clear
       ? items.indexOf(oldCurrent)
       : 0;
+    const commit = (activate: () => void) => {
+      checkSize(media.length, opts, limit);
+      if (opts.clear) player.queueClear();
+      const added = player.queueAddSources(media, at, firstId);
+      if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
+      if (opts.play) player.play(opts.playbackFromPosition);
+      activate();
+      record(
+        'queueAdd',
+        `songs=${media.length}` + (opts.clear ? ' clear' : '') +
+          (opts.play ? ' play' : '') +
+          (opts.position !== undefined ? ` position=${opts.position}` : ''),
+        source,
+        opts.play ? 'play' : opts.clear ? 'stop' : 'none',
+        opts.clear === true,
+        {
+          songs: media.length,
+          clear: opts.clear,
+          play: opts.play,
+          position: opts.position,
+          playbackFromPosition: opts.playbackFromPosition,
+          shuffle: opts.shuffle,
+        },
+      );
+      flushQueue();
+      const types = ['queue'];
+      if (opts.clear || opts.play) types.push('player');
+      if (opts.shuffle !== undefined) types.push('options');
+      emit(types);
+      return added;
+    };
+    // Queue-only publication is not a playback start and cannot revoke one.
+    if (!opts.play) {
+      if (opts.clear) cancelStart();
+      return commit(() => {});
+    }
     return transition(
-      opts.play === true && size > 0,
-      (activate) => {
-        checkSize(media.length, opts, limit);
-        if (opts.clear) player.queueClear();
-        const added = player.queueAddSources(media, at, firstId);
-        if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
-        if (opts.play) player.play(opts.playbackFromPosition);
-        activate();
-        record(
-          'queueAdd',
-          `songs=${media.length}` + (opts.clear ? ' clear' : '') +
-            (opts.play ? ' play' : '') +
-            (opts.position !== undefined ? ` position=${opts.position}` : ''),
-          source,
-          opts.play ? 'play' : opts.clear ? 'stop' : 'none',
-          opts.clear === true,
-          {
-            songs: media.length,
-            clear: opts.clear,
-            play: opts.play,
-            position: opts.position,
-            playbackFromPosition: opts.playbackFromPosition,
-            shuffle: opts.shuffle,
-          },
-        );
-        flushQueue();
-        const types = ['queue'];
-        if (opts.clear || opts.play) types.push('player');
-        if (opts.shuffle !== undefined) types.push('options');
-        emit(types);
-        return added;
-      },
+      size > 0,
+      commit,
       undefined,
       opts.clear || opts.playbackFromPosition !== undefined ||
         player.status().state !== 'play'
@@ -743,93 +749,115 @@ export function createPlayback(deps: {
         : undefined,
     );
   };
-  const addSources = (
-    media: QueueMedia[],
-    opts: QueueAddOptions = {},
-    source?: CommandSource,
-    limit = defaultQueueLimit,
-  ): QueueEntry[] | Promise<QueueEntry[]> => {
-    requireOpen();
-    checkSize(media.length, opts, limit);
-    if (!deps.reserveQueueIds || !media.length) {
-      return commitAdd(media, opts, source, undefined, limit);
-    }
-    cancelStart();
-    const controller = new AbortController();
-    const reservation = reserveStart(
-      opts.startPlaying === true || opts.play === true,
-      controller,
-    );
-    pendingStart = controller;
-    return deps.reserveQueueIds(media.length).then((firstId) => {
-      if (
-        controller.signal.aborted || pendingStart !== controller || closed ||
-        closing
-      ) {
-        throw new PlaybackError(
-          'playback_cancelled',
-          'Queue reservation cancelled',
-        );
-      }
-      pendingStart = undefined;
-      const added = commitAdd(media, opts, source, firstId, limit);
-      // The transition now owns cancellation. Do not retain an earlier phase's
-      // ticket while waiting for its successor's possibly slow preparation.
-      reservation?.release();
-      return added;
-    }).finally(() => {
-      reservation?.release();
-      if (pendingStart === controller) pendingStart = undefined;
-    });
-  };
   const resolveReference = deps.resolveQueueReference ?? createQueueResolver({
     getSong: (id) => library.getSong(id),
     getStation: () => Promise.resolve(null),
   });
-  const prepareAdd = async (
-    resolve: (signal: AbortSignal, limit: number) => Promise<QueueMedia[]>,
-    opts?: QueueAddOptions,
+  // One ordered mutation lane spans resolution, preparation and allocation.
+  // Only add-and-play borrows pendingStart; ordinary adds have their own
+  // lifetime, revoked by destructive queue clear/restore or engine disposal.
+  let additionTail: Promise<void> | undefined;
+  const additions = new Set<AbortController>();
+  const cancelAdditions = () => {
+    for (const controller of additions) controller.abort();
+  };
+  const add = (
+    resolve: (
+      signal: AbortSignal,
+      limit: number,
+    ) => QueueMedia[] | Promise<QueueMedia[]>,
+    opts: QueueAddOptions = {},
     source?: CommandSource,
-  ): Promise<QueueEntry[]> => {
+    prepare = false,
+  ): QueueEntry[] | Promise<QueueEntry[]> => {
     requireOpen();
-    cancelStart();
     const controller = new AbortController();
-    const reservation = reserveStart(
-      opts?.startPlaying === true || opts?.play === true,
-      controller,
-    );
-    pendingStart = controller;
-    try {
-      const limit = await queueLimit();
-      controller.signal.throwIfAborted();
-      const media = await resolve(controller.signal, limit);
-      checkSize(media.length, opts ?? {}, limit);
-      const prepared: QueueMedia[] = [];
-      for (const item of media) {
-        prepared.push(
-          deps.prepareQueueMedia
-            ? await deps.prepareQueueMedia(item, controller.signal)
-            : item,
+    const starts = opts.startPlaying === true || opts.play === true;
+    if (starts) cancelStart();
+    const reservation = reserveStart(starts, controller);
+    if (starts) pendingStart = controller;
+    let limit = defaultQueueLimit;
+    additions.add(controller);
+    const check = () => {
+      if (controller.signal.aborted || closed || closing) {
+        throw new PlaybackError(
+          'playback_cancelled',
+          'Queue addition cancelled',
         );
-        controller.signal.throwIfAborted();
       }
-      if (pendingStart !== controller) controller.abort();
-      controller.signal.throwIfAborted();
-      pendingStart = undefined;
-      const added = addSources(prepared, opts, source, limit);
+    };
+    const finish = () => {
+      additions.delete(controller);
       reservation?.release();
-      return await added;
-    } catch (error) {
+      if (pendingStart === controller) pendingStart = undefined;
+    };
+    const failed = (error: unknown): never => {
       if (controller.signal.aborted) {
         throw new PlaybackError(
           'playback_cancelled',
-          'Queue preparation cancelled',
+          'Queue addition cancelled',
         );
       }
       throw error;
-    } finally {
-      reservation?.release();
-      if (pendingStart === controller) pendingStart = undefined;
+    };
+    const allocate = (media: QueueMedia[]) => {
+      check();
+      const commit = (firstId?: number) => {
+        check();
+        additions.delete(controller);
+        if (pendingStart === controller) pendingStart = undefined;
+        const result = commitAdd(media, opts, source, firstId, limit);
+        // The transition has acquired its own cancellation and demand now.
+        reservation?.release();
+        return result;
+      };
+      return deps.reserveQueueIds && media.length
+        ? deps.reserveQueueIds(media.length).then(commit)
+        : commit();
+    };
+    const prepared = (media: QueueMedia[]) => {
+      check();
+      checkSize(media.length, opts, limit);
+      if (!prepare || !deps.prepareQueueMedia) return allocate(media);
+      return (async () => {
+        const batch: QueueMedia[] = [];
+        for (const item of media) {
+          batch.push(await deps.prepareQueueMedia!(item, controller.signal));
+          check();
+        }
+        return allocate(batch);
+      })();
+    };
+    const run = () => {
+      check();
+      const resolved = () => {
+        check();
+        const media = resolve(controller.signal, limit);
+        return media instanceof Promise
+          ? media.then(prepared)
+          : prepared(media);
+      };
+      if (!deps.state) return resolved();
+      return queueLimit().then((value) => {
+        limit = value;
+        return resolved();
+      });
+    };
+    try {
+      const result = additionTail ? additionTail.then(run) : run();
+      if (!(result instanceof Promise)) {
+        finish();
+        return result;
+      }
+      const work = result.catch(failed).finally(finish);
+      const settled = work.then(() => {}, () => {}).finally(() => {
+        if (additionTail === settled) additionTail = undefined;
+      });
+      additionTail = settled;
+      return work;
+    } catch (error) {
+      finish();
+      return failed(error);
     }
   };
   // A terminal observation is retained until its transition commits or its
@@ -1229,26 +1257,18 @@ export function createPlayback(deps: {
       );
     },
     queueAdd(songs, opts = {}, source) {
-      if (deps.state) {
-        return prepareAdd(
-          () => Promise.resolve(songs.map(catalogMedia)),
-          opts,
-          source,
-        );
-      }
-      return addSources(songs.map(catalogMedia), opts, source);
+      return add(() => songs.map(catalogMedia), opts, source, !!deps.state);
     },
     queueAddSources(media, opts, source) {
-      if (
-        !deps.state && (!deps.prepareQueueMedia ||
-          !media.some((item) => item.facts.kind === 'web'))
-      ) {
-        return addSources(media, opts, source);
-      }
-      return prepareAdd(() => Promise.resolve(media), opts, source);
+      return add(
+        () => media,
+        opts,
+        source,
+        !!deps.state || media.some((item) => item.facts.kind === 'web'),
+      );
     },
-    queueAddReferences(references, opts, source) {
-      return prepareAdd(
+    async queueAddReferences(references, opts, source) {
+      return await add(
         async (signal, limit) => {
           const media: QueueMedia[] = [];
           for (const input of references) {
@@ -1298,6 +1318,7 @@ export function createPlayback(deps: {
         },
         opts,
         source,
+        true,
       );
     },
     queueRemove(entryId, expectedVersion, source) {
@@ -1354,6 +1375,7 @@ export function createPlayback(deps: {
       requireOpen();
       checkVersion(expectedVersion);
       cancelStart();
+      cancelAdditions();
       player.queueClear();
       record('queueClear', undefined, source, 'stop', true);
       flushQueue();
@@ -1539,6 +1561,7 @@ export function createPlayback(deps: {
 
     restore(snapshot) {
       requireOpen();
+      cancelAdditions();
       const index = snapshot.currentIndex ?? 0;
       const candidate = snapshot.queue[index];
       const prepareUrl = deps.prepareQueueMedia &&
@@ -1617,6 +1640,7 @@ export function createPlayback(deps: {
 
     async close() {
       cancelStart();
+      cancelAdditions();
       activeReservation?.release();
       activeReservation = undefined;
       // Revoke a parked source even if its boot is being closed separately.
