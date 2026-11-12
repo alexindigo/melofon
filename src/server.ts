@@ -198,6 +198,7 @@ export async function startServer(options: {
   const speakers = createSpeakers({
     outputs,
     state,
+    changePreferences: persistence.changePlayers,
     prepare: airplay.preparePlayback,
     registerAddress: airplay.registerAddress,
     adapterView: airplay.describe,
@@ -323,6 +324,7 @@ export async function startServer(options: {
   const playback = players.playback;
   const app = {
     store,
+    persistence,
     cfg,
     libraries,
     outputs,

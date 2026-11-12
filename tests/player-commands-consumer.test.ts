@@ -16,7 +16,9 @@ Deno.test('OwnTone previous uses 3 seconds; stop releases the receiver and resum
     await speakerMedia(dir);
     client = await speakerConsumer(dir, [service]);
     client.discover(service);
-    assertEquals((await client.write('501', 'adopt')).status, 200);
+    const adopted = await client.write('501', 'adopt');
+    assertEquals(adopted.status, 200);
+    await adopted.text();
     await client.play('501');
     await until(() => raop.sessions.some((s) => s.audioPayloads.length >= 8));
     const song = client.playback.queueView().items[0];

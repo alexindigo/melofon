@@ -120,6 +120,8 @@ export function createSpeakers(deps: {
   retry?(id: string): Promise<void>;
   credentials?: Pick<SpeakerCredentials, 'set'>;
   changeCredentials?(id: string, save: () => Promise<void>): Promise<void>;
+  /** Reuse household publication and retained whole-batch saving for preferences. */
+  changePreferences?<T>(change: () => T): Promise<T>;
   pair?(id: string): Promise<SpeakerPairingView>;
   submitPin?(id: string, pin: string): Promise<SpeakerPairingView>;
   state?: State;
@@ -492,9 +494,12 @@ export function createSpeakers(deps: {
     ): Promise<SpeakerView> {
       requireRow(id);
       const adopted = deps.outputs.lifetime(id).adopted;
-      const row = deps.outputs.update(id, { volume }, source)!;
-      // Use the same preference writer and durable boundary as configuration.
-      return adopted ? await durable(() => deps.outputs.adopt(id)) : view(row);
+      const change = () => view(deps.outputs.update(id, { volume }, source)!);
+      // The output writer publishes once. Do not re-adopt an existing speaker
+      // or turn a failed save into a failed command after its level has changed.
+      return adopted && deps.changePreferences
+        ? await deps.changePreferences(change)
+        : change();
     },
     async configure(
       id: string,

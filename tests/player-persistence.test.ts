@@ -4,7 +4,7 @@
 // freshness window with the environment still matching, else pauses at the
 // saved place; missing tracks drop and the current index remaps; the 1 Hz
 // tick keeps position_ms current while playing and stops when paused.
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
@@ -579,7 +579,7 @@ Deno.test('unregister keeps the persisted row (last-seen state)', async () => {
   }
 });
 
-Deno.test('a failed save is drained and counted once; a broken logger is harmless', async () => {
+Deno.test('a failed published save stays pending for retry; a broken logger is harmless', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-persist-' });
   const store = await openStore(dir);
   const db = store;
@@ -604,8 +604,9 @@ Deno.test('a failed save is drained and counted once; a broken logger is harmles
     const persistence = createPersistence(store, log);
     await db.close();
     persistence.saveQueue(songQueue(['a', 'b']), stopped);
-    await persistence.drain();
-    assertEquals(events.filter((id) => id === 'persistence_failed').length, 1);
+    await assertRejects(() => persistence.drain());
+    assertEquals(persistence.health(), { pendingWrites: 1 });
+    assertEquals(events.filter((id) => id === 'persistence_failed').length, 2);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }

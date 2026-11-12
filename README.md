@@ -148,13 +148,18 @@ settings default to 50 and 500; the default page size is capped by the maximum.
 copy into another player with `{"targetPlayerId":2}`; both return 204. The
 source keeps its queue, modes, position and playback. Replace copies the whole
 queue, current song, spot, repeat and consume; the destination keeps playing
-or stays paused (an unstarted player is paused at the copied spot). Add copies
+or stays paused (an unstarted player is paused at the copied spot). If the source
+has no current song and playback does not start, the destination stops instead.
+Add copies
 the whole queue in order, accepting the same `where` choices as adding media.
 Both accept `startPlaying:true` and optional destination `expectedVersion`.
 Replace starts at the copied spot; add starts the first added entry. Copied
 occurrences have new ids. Empty replace clears/stops; empty add adds nothing.
 Volume, shuffle and speaker membership stay with their players. Limit, stale
 version, no-speaker and AirPlay-busy refusals leave both players unchanged.
+An applied command succeeds even if saving fails afterward; the server logs
+the failure and retries the same whole transaction rather than asking the
+client to apply the command again.
 
 `PATCH /api/v1/players/{id}/queue/items/{entryId}` moves an occurrence with
 `{"position":0,"expectedVersion":12}`. Position is its final zero-based index,

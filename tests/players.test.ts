@@ -15,6 +15,7 @@ import { restored } from './helpers/prepared.ts';
 import { apiFixture } from './helpers/api.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { SpeakerError } from '../src/speaker-errors.ts';
+import { outputAuthority } from '../src/player-outputs.ts';
 
 async function dataDir() {
   return await restored('players', async (dir) => {
@@ -241,7 +242,7 @@ Deno.test('saved player sliders move only linked members by a capped delta and z
   }
 });
 
-Deno.test('a slider transaction rolls back player and speakers together and retries before a later speaker write', async () => {
+Deno.test('a published slider succeeds while its saved batch rolls back and retries before a later speaker write', async () => {
   const dir = await dataDir(), store = await openStore(dir);
   await store.players.saveChanges({ players: [{ playerId: 1, volume: 40 }] });
   let fail = false;
@@ -273,15 +274,11 @@ Deno.test('a slider transaction rolls back player and speakers together and retr
     }
     await f.players.setSpeakers(1, ['11', '12']);
     fail = true;
-    await assertRejects(
-      async () =>
-        await f.players.get(1).setVolume({ volume: 60 }, {
-          kind: 'http',
-          user: 'alice',
-        }),
-      Error,
-      'Invalid speaker volume',
-    );
+    await f.players.get(1).setVolume({ volume: 60 }, {
+      kind: 'http',
+      user: 'alice',
+    });
+    assertEquals(f.persistence.health(), { pendingWrites: 1 });
     assertEquals((await store.players.list())[0].volume, 40);
     assertEquals(
       (await store.speakers.loadAdopted()).map((row) => row.volume),
@@ -295,6 +292,8 @@ Deno.test('a slider transaction rolls back player and speakers together and retr
     fail = false;
     f.outputs.update('11', { volume: 65 });
     await f.persistence.drain();
+    assertEquals(f.persistence.health(), { pendingWrites: 0 });
+    assertEquals(batches[1], batches[0]);
     assertEquals((await store.players.list())[0].volume, 60);
     assertEquals(
       (await store.speakers.loadAdopted()).map((row) => row.volume),
@@ -716,6 +715,328 @@ function registerSpeaker(f: Awaited<ReturnType<typeof household>>, id: string) {
   });
 }
 
+Deno.test('ordinary writes blocked by repeated membership failures remain ordered and durable', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  let fail = false;
+  const f = await household({
+    ...store,
+    players: {
+      ...store.players,
+      saveChanges(changes) {
+        if (fail && changes.outputs?.length) {
+          return Promise.reject(new Error('membership unavailable'));
+        }
+        return store.players.saveChanges(changes);
+      },
+    },
+  }, { clock: { monotonicNow: () => 0 } });
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    registerSpeaker(f, '11');
+    await f.outputs.adopt('11');
+    await f.players.join(1, '11');
+    fail = true;
+    await f.players.join(kitchen.id, '11');
+    assertEquals(f.outputs.get('11')?.playerId, kitchen.id);
+    f.outputs.update('11', { volume: 43 });
+    const other = f.players.get(kitchen.id);
+    await other.queueAdd(await f.library.listSongs({ offset: 0, size: 1 }));
+    other.setRepeat('all');
+    await assertRejects(() => f.persistence.drain());
+    assertEquals((await store.speakers.loadMemberships())[0].playerId, 1);
+    fail = false;
+    await f.persistence.drain();
+    assertEquals(
+      (await store.speakers.loadMemberships())[0].playerId,
+      kitchen.id,
+    );
+    assertEquals((await store.speakers.loadAdopted())[0].volume, 43);
+    assertEquals((await store.playback.loadQueue(kitchen.id)).items.length, 1);
+    assertEquals(
+      (await store.playback.loadPlayerState(kitchen.id))?.repeat,
+      'all',
+    );
+    assertEquals(
+      (await store.players.list())[1].commandedAtMs,
+      other.lastCommand()!.atMs,
+    );
+  } finally {
+    fail = false;
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('HTTP membership succeeds after publication while health exposes and clears its pending whole-batch save', async () => {
+  let h!: Awaited<ReturnType<typeof household>>;
+  let fail = false;
+  const f = await apiFixture({
+    storeDir: await dataDir(),
+    services: async ({ store }) => {
+      h = await household({
+        ...store,
+        players: {
+          ...store.players,
+          saveChanges(changes) {
+            if (fail && changes.outputs?.length) {
+              return Promise.reject(new Error('private save failure'));
+            }
+            return store.players.saveChanges(changes);
+          },
+        },
+      });
+      await h.players.create('Kitchen');
+      registerSpeaker(h, '11');
+      await h.outputs.adopt('11');
+      await h.players.join(1, '11');
+      return { players: h.players, persistence: h.persistence };
+    },
+  });
+  try {
+    const { credential } = await f.login('bearer');
+    fail = true;
+    const joined = await f.json(
+      '/api/v1/players/2/speakers/11',
+      'PUT',
+      {},
+      credential,
+    );
+    assertEquals(joined.status, 204);
+    assertEquals(h.outputs.get('11')?.playerId, 2);
+    assertEquals((await f.store.speakers.loadMemberships())[0].playerId, 1);
+    const degraded = await f.request('/_/health');
+    assertEquals(degraded.status, 503);
+    assertEquals(await degraded.json(), {
+      ok: false,
+      persistence: { pendingWrites: 1 },
+    });
+    fail = false;
+    await h.persistence.drain();
+    const healthy = await f.request('/_/health');
+    assertEquals(healthy.status, 200);
+    assertEquals(await healthy.json(), { ok: true });
+    assertEquals((await f.store.speakers.loadMemberships())[0].playerId, 2);
+  } finally {
+    fail = false;
+    await h.close();
+    await f.close();
+  }
+});
+
+for (const phase of ['cancellation', 'deletion'] as const) {
+  Deno.test(`published speaker forget succeeds despite ${phase} failure without restoring membership or authority`, async () => {
+    const dir = await dataDir();
+    const store = await openStore(dir);
+    let fail = true;
+    const f = await household({
+      ...store,
+      speakers: {
+        ...store.speakers,
+        deleteAdopted(id) {
+          if (fail && phase === 'deletion') {
+            return Promise.reject(new Error('forget unavailable'));
+          }
+          return store.speakers.deleteAdopted(id);
+        },
+      },
+    });
+    const stop = f.outputs.onCommand(() => {
+      if (fail && phase === 'cancellation') {
+        throw new Error('forget unavailable');
+      }
+    });
+    try {
+      const kitchen = await f.players.create('Kitchen');
+      registerSpeaker(f, '11');
+      await f.outputs.adopt('11');
+      await f.players.join(kitchen.id, '11');
+      f.outputs.restore({ ...f.outputs.get('11')!, linked: false });
+      await f.outputs.adopt('11');
+      const authority = outputAuthority(f.outputs, '11');
+      const forgotten = f.outputs.forget('11').then(
+        () => undefined,
+        (error) => error,
+      );
+      assertEquals(f.outputs.get('11'), null, 'forget publishes synchronously');
+      assertEquals(await forgotten, undefined);
+      assertEquals(f.persistence.savedOutput('11'), undefined);
+      if (phase === 'deletion') {
+        await assertRejects(
+          () => f.persistence.drain(),
+          Error,
+          'forget unavailable',
+        );
+        assertEquals(f.persistence.health(), { pendingWrites: 1 });
+        assertEquals(await store.speakers.loadMemberships(), [{
+          speakerId: '11',
+          playerId: kitchen.id,
+          linked: false,
+        }]);
+      }
+      assertEquals(
+        authority(),
+        false,
+        'published forget never restores the old session grant',
+      );
+      fail = false;
+      await f.persistence.drain();
+      assertEquals(f.outputs.get('11'), null);
+      assertEquals(await store.speakers.loadMemberships(), []);
+      assertEquals(f.persistence.health(), { pendingWrites: 0 });
+    } finally {
+      stop?.();
+      fail = false;
+      await f.close();
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
+
+Deno.test('leave reports a rejected membership publication instead of success', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  const f = await household(store);
+  try {
+    for (const id of ['11', '12']) {
+      registerSpeaker(f, id);
+      await f.outputs.adopt(id);
+      await f.players.join(1, id);
+    }
+    const setMembers = f.outputs.setMembers;
+    f.outputs.setMembers = () => false;
+    try {
+      const error = await assertRejects(
+        () => f.players.leave(1, '11'),
+        SpeakerError,
+      );
+      assertEquals(error.code, 'speaker_busy');
+      assertEquals(f.players.members(1).map((row) => row.id), ['11', '12']);
+      assertEquals(
+        (await store.speakers.loadMemberships()).map((row) => row.playerId),
+        [1, 1],
+      );
+    } finally {
+      f.outputs.setMembers = setMembers;
+    }
+    await f.players.leave(1, '11');
+    assertEquals(f.players.members(1).map((row) => row.id), ['12']);
+  } finally {
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('durable player deletion failure leaves its engine and boot usable for retry', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  let fail = true;
+  const closed: number[] = [];
+  const f = await household({
+    ...store,
+    players: {
+      ...store.players,
+      delete(id) {
+        if (fail) return Promise.reject(new Error('delete unavailable'));
+        return store.players.delete(id);
+      },
+    },
+  }, {
+    clock: { monotonicNow: () => 0 },
+    createBoot(id) {
+      return {
+        retry: () => Promise.resolve(),
+        changeCredentials: (_id, save) => save(),
+        pair: () => Promise.resolve({ state: 'complete', saved: false }),
+        submitPin: () => Promise.resolve({ state: 'complete', saved: false }),
+        close: () => {
+          closed.push(id);
+          return Promise.resolve();
+        },
+      };
+    },
+  });
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    const engine = f.players.get(kitchen.id);
+    const songs = await f.library.listSongs({ offset: 0, size: 1 });
+    await engine.queueAdd(songs, { play: true });
+    await assertRejects(
+      () => f.players.delete(kitchen.id),
+      Error,
+      'delete unavailable',
+    );
+    assertEquals(f.players.list().map((row) => row.id), [1, kitchen.id]);
+    assertEquals(f.players.get(kitchen.id), engine);
+    assertEquals(closed, []);
+    engine.pause();
+    await engine.queueAdd(songs);
+    await f.persistence.drain();
+    assertEquals((await store.playback.loadQueue(kitchen.id)).items.length, 2);
+    assertEquals(
+      (await store.playback.loadPlayerState(kitchen.id))?.state,
+      'pause',
+    );
+    fail = false;
+    await f.players.delete(kitchen.id);
+    assertEquals(closed, [kitchen.id]);
+    assertEquals(f.players.list().map((row) => row.id), [1]);
+    assertEquals((await store.players.list()).map((row) => row.id), [1]);
+    assertThrows(() => engine.pause(), Error, 'closed');
+  } finally {
+    fail = false;
+    await f.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('queue writes concurrent with durable player deletion cannot poison household persistence', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  let entered!: () => void, release!: () => void;
+  const deleting = new Promise<void>((resolve) => entered = resolve);
+  const hold = new Promise<void>((resolve) => release = resolve);
+  const f = await household({
+    ...store,
+    players: {
+      ...store.players,
+      async delete(id) {
+        await store.players.delete(id);
+        entered();
+        await hold;
+      },
+    },
+  });
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    const engine = f.players.get(kitchen.id);
+    const songs = await f.library.listSongs({ offset: 0, size: 1 });
+    await engine.queueAdd(songs);
+    const pending = f.players.delete(kitchen.id);
+    await deleting;
+    engine.setRepeat('all');
+    release();
+    await pending;
+    await f.players.get(1).queueAdd(songs);
+    await f.persistence.drain();
+    assertEquals(f.persistence.health(), { pendingWrites: 0 });
+    assertEquals((await store.playback.loadQueue(1)).items.length, 1);
+    assertEquals((await store.players.list()).map((row) => row.id), [1]);
+  } finally {
+    release?.();
+    try {
+      await f.close();
+    } finally {
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+});
+
 Deno.test('membership join takes speakers, leave is owner-scoped and last-speaker loss durably pauses at the same queue spot', async () => {
   const dir = await dataDir();
   let store = await openStore(dir);
@@ -905,7 +1226,7 @@ Deno.test('membership publication serializes stale output snapshots, the induced
   }
 });
 
-Deno.test('failed membership transaction has no half durable move and an idempotent retry saves the paused bookmark', async () => {
+Deno.test('failed membership save succeeds after publication and retries its whole paused bookmark batch', async () => {
   const dir = await dataDir();
   const store = await openStore(dir);
   let fail = false;
@@ -941,11 +1262,7 @@ Deno.test('failed membership transaction has no half durable move and an idempot
     f.players.get(1).seek({ positionMs: 123 });
     await f.persistence.drain();
     fail = true;
-    await assertRejects(
-      () => f.players.join(kitchen.id, '11'),
-      Error,
-      'Player not found',
-    );
+    await f.players.join(kitchen.id, '11');
     assertEquals((await store.speakers.loadMemberships())[0].playerId, 1);
     assertEquals((await store.playback.loadPlayerState(1))?.state, 'play');
     assertEquals(f.players.get(1).playerView().state, 'pause');

@@ -271,6 +271,116 @@ async function busy(command: () => unknown) {
   assertEquals(error.message, 'AirPlay is busy in Player 1');
 }
 
+for (const kind of ['songs', 'sources', 'references'] as const) {
+  Deno.test(`ordinary ${kind} additions keep request order across slow preparation and playback commands`, async () => {
+    const f = await fixture(), held = deferred();
+    try {
+      const engine = f.playback[0];
+      const before = engine.queueView();
+      const phase = kind === 'songs'
+        ? 'ids'
+        : kind === 'sources'
+        ? 'media'
+        : 'resolve';
+      const entered = f.entered[0].filter((step) => step === phase).length;
+      f[
+        kind === 'songs'
+          ? 'idGates'
+          : kind === 'sources'
+          ? 'mediaGates'
+          : 'resolveGates'
+      ][0] = held.promise;
+      const first = kind === 'songs'
+        ? engine.queueAdd([f.songs[0]])
+        : kind === 'sources'
+        ? engine.queueAddSources([f.web])
+        : engine.queueAddReferences([{ kind: 'song', id: f.songs[0].id }]);
+      const firstResult = Promise.resolve(first).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      await until(() =>
+        f.entered[0].filter((step) => step === phase).length > entered
+      );
+      const secondResult = Promise.resolve(engine.queueAdd([f.songs[1]])).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      engine.setRepeat('all');
+      engine.pause();
+      held.resolve();
+      const results = await Promise.all([firstResult, secondResult]);
+      assert(
+        results.every((result) => 'value' in result),
+        JSON.stringify(results),
+      );
+      const queue = engine.queueView();
+      assertEquals(queue.items.slice(0, 2), before.items);
+      assertEquals(queue.items.slice(2).map((entry) => entry.reference), [
+        kind === 'sources'
+          ? f.web.reference
+          : { kind: 'song', id: f.songs[0].id },
+        { kind: 'song', id: f.songs[1].id },
+      ]);
+      assert(queue.items[2].id < queue.items[3].id);
+      assertEquals(queue.version, before.version + 2);
+      assertEquals(engine.playerView().repeat, 'all');
+      assertEquals(f.sessions, []);
+    } finally {
+      held.resolve();
+      await f.close();
+    }
+  });
+}
+
+Deno.test('queue clear revokes slow ordinary allocation without publishing a stale append', async () => {
+  const f = await fixture(), held = deferred();
+  try {
+    const engine = f.playback[0];
+    f.idGates[0] = held.promise;
+    const pending = Promise.resolve(engine.queueAdd(f.songs)).then(
+      () => null,
+      (error) => error,
+    );
+    engine.queueClear();
+    const cleared = engine.queueView();
+    held.resolve();
+    const error = await pending;
+    assert(error instanceof PlaybackError);
+    assertEquals(error.code, 'playback_cancelled');
+    assertEquals(engine.queueView(), cleared);
+  } finally {
+    held.resolve();
+    await f.close();
+  }
+});
+
+Deno.test('pause cancels a queued add-and-play without canceling the ordinary append before it', async () => {
+  const f = await fixture(), held = deferred();
+  try {
+    const engine = f.playback[0];
+    f.idGates[0] = held.promise;
+    const first = Promise.resolve(engine.queueAdd([f.songs[0]])).then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
+    const second = Promise.resolve(
+      engine.queueAdd([f.songs[1]], { play: true }),
+    ).then(() => null, (error) => error);
+    engine.pause();
+    held.resolve();
+    assert('value' in await first);
+    const error = await second;
+    assert(error instanceof PlaybackError);
+    assertEquals(error.code, 'playback_cancelled');
+    assertEquals(engine.queueView().items.length, 3);
+    assertEquals(f.sessions, []);
+  } finally {
+    held.resolve();
+    await f.close();
+  }
+});
+
 Deno.test('capacity reserves before target preparation; simultaneous starts have one PCM winner', async () => {
   const f = await fixture(), held = deferred();
   try {
@@ -335,6 +445,7 @@ for (const preparation of ['resolve', 'media', 'ids'] as const) {
   Deno.test(`add-and-play reserves before slow ${preparation} work and releases on cancellation`, async () => {
     const f = await fixture(), held = deferred();
     try {
+      const queue = f.playback[0].queueView();
       f[
         preparation === 'resolve'
           ? 'resolveGates'
@@ -359,8 +470,8 @@ for (const preparation of ['resolve', 'media', 'ids'] as const) {
       held.resolve();
       await canceled;
       assertEquals(
-        f.playback[0].queueView().items.length,
-        2,
+        f.playback[0].queueView(),
+        queue,
         'refused/canceled additions do not clear the queue',
       );
       assertEquals(f.sessions.map((s) => s.port), [7002]);
@@ -475,6 +586,26 @@ Deno.test('failed transport cleanup keeps shared-stream occupancy blocking other
     await until(() =>
       f.devices.describe('11').session?.connection === 'failed'
     );
+    await busy(() => f.playback[1].play());
+    await f.boots[0].close();
+    await busy(() => f.playback[1].play());
+    assertEquals(f.sessions.length, 1);
+    assertEquals(f.sessions[0].closed, false);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('published forget succeeds while failed transport cleanup retains shared-stream occupancy', async () => {
+  const f = await fixture();
+  try {
+    await f.outputs.adopt('11');
+    await f.playback[0].play();
+    await until(() => f.sessions[0]?.bytes > 0);
+    f.sessions[0].closeFails = true;
+    await f.outputs.forget('11');
+    assertEquals(f.outputs.get('11'), null);
+    assertEquals(f.playback[0].playerView().state, 'pause');
     await busy(() => f.playback[1].play());
     await f.boots[0].close();
     await busy(() => f.playback[1].play());
@@ -663,6 +794,7 @@ for (const phase of ['ids', 'target'] as const) {
     const f = await fixture(), held = deferred();
     let pending: Promise<unknown> | undefined;
     try {
+      const queue = f.playback[0].queueView();
       const before = f.entered[0].filter((step) => step === phase).length;
       f[phase === 'ids' ? 'idGates' : 'targetGates'][0] = held.promise;
       pending = f.playback[0].queueAddReferences([
@@ -678,7 +810,7 @@ for (const phase of ['ids', 'target'] as const) {
       const error = await pending;
       assert(error instanceof PlaybackError);
       assertEquals(error.code, 'playback_cancelled');
-      assertEquals(f.playback[0].queueView().items.length, 2);
+      assertEquals(f.playback[0].queueView(), queue);
       assertEquals(f.sessions.map((session) => session.port), [7002]);
     } finally {
       held.resolve();

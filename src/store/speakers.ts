@@ -115,13 +115,15 @@ export async function saveSpeakerOutput(
     throw new Error('Player not found');
   }
   await q.run(
-    `INSERT INTO output_state (id, host, port, name, type, player_id,
+    `INSERT INTO output_state (id, host, port, name, type, player_id, linked,
        volume, model, connection_strategy, adopted, receiver_identity)
      VALUES (${esc(row.id)},
        ${row.host === undefined ? 'NULL' : esc(row.host)},
        ${row.port === undefined ? 'NULL' : Math.trunc(row.port)},
        ${esc(row.name)}, ${esc(row.type)},
-         ${playerId ?? 'NULL'}, ${Math.trunc(row.volume)},
+          ${playerId ?? 'NULL'}, ${row.linked ?? true}, ${
+      Math.trunc(row.volume)
+    },
        ${row.model === undefined ? 'NULL' : esc(row.model)},
        ${esc(row.connectionStrategy)}, ${adopted},
        ${
