@@ -427,7 +427,8 @@ export function createPlayback(deps: {
   // output facts which do not appear in this view. Drop the subscription on close.
   let speakers = JSON.stringify(selectedSpeakers());
   let pendingStart: AbortController | undefined;
-  const cancelStart = () => {
+  const cancelStart = (expected = pendingStart) => {
+    if (pendingStart !== expected) return;
     pendingStart?.abort();
     pendingStart = undefined;
   };
@@ -457,6 +458,7 @@ export function createPlayback(deps: {
       new PlaybackError('playback_cancelled', 'Playback start cancelled');
     if (!current()) throw cancelled();
     cancelStart();
+    const before = player.queue().items;
     const items = activation?.items ?? player.queue().items;
     const candidate = activation && items[activation.index];
     const needsPreparation = (item: QueueMedia) =>
@@ -479,7 +481,10 @@ export function createPlayback(deps: {
     authority?.signal.addEventListener('abort', abort, { once: true });
     pendingStart = controller;
     const prepare = async () => {
-      let selected: { index: number; media: QueueMedia } | null | undefined;
+      let selected:
+        | { index: number; media: QueueMedia; entryId?: number }
+        | null
+        | undefined;
       if (needsResolution) {
         selected = null;
         let index = activation.index;
@@ -496,7 +501,7 @@ export function createPlayback(deps: {
           }
           if (controller.signal.aborted) throw cancelled();
           if (media) {
-            selected = { index, media };
+            selected = { index, media, entryId: (item as QueueEntry).id };
             break;
           }
           index += activation.direction ?? 1;
@@ -512,6 +517,20 @@ export function createPlayback(deps: {
       if (
         controller.signal.aborted || pendingStart !== controller || !current()
       ) throw cancelled();
+      // A preparation plan refers to occurrences, not reusable ordinals. Queue
+      // additions may publish during this await without cancelling the start.
+      // Validate the original anchor before the command mutates anything; future
+      // queues (consume/add/restore) are installed synchronously by commit.
+      const planned = selected ?? candidate;
+      const entryId = planned &&
+        ('entryId' in planned ? planned.entryId : (planned as QueueEntry).id);
+      const originalIndex = before.findIndex((entry) => entry.id === entryId);
+      if (
+        originalIndex >= 0 &&
+        player.queue().items[originalIndex]?.id !== entryId
+      ) {
+        throw cancelled();
+      }
       pendingStart = undefined;
       const result = commitStart(reservation, () =>
         commit(() => {
@@ -519,6 +538,12 @@ export function createPlayback(deps: {
           if (selected === null) {
             player.stop();
             return;
+          }
+          if (
+            selected.entryId !== undefined &&
+            player.queue().items[selected.index]?.id !== selected.entryId
+          ) {
+            throw cancelled();
           }
           player.replaceMedia(selected.index, selected.media);
           if (selected.index !== activation!.index) player.play(selected.index);
@@ -670,6 +695,7 @@ export function createPlayback(deps: {
     source?: CommandSource,
     firstId?: number,
     limit = defaultQueueLimit,
+    replacedStart?: AbortController,
   ): QueueEntry[] | Promise<QueueEntry[]> => {
     checkSize(media.length, opts, limit);
     const size = media.length + (opts.clear ? 0 : player.queue().items.length);
@@ -696,7 +722,14 @@ export function createPlayback(deps: {
         ? at
         : opts.playbackFromPosition,
     };
-    const items = [...future.slice(0, at), ...media, ...future.slice(at)];
+    // Incoming occurrences are copied as media and receive fresh ids at commit.
+    // Only entries already in the destination carry occurrence identity in the
+    // activation plan; a source id must never be mistaken for a destination id.
+    const items = [
+      ...future.slice(0, at),
+      ...media.map((item) => ({ ...item, id: undefined })),
+      ...future.slice(at),
+    ];
     const oldCurrent = player.status().current;
     const index = opts.playbackFromPosition !== undefined
       ? Math.min(Math.max(0, Math.trunc(opts.playbackFromPosition)), size - 1)
@@ -734,9 +767,10 @@ export function createPlayback(deps: {
       emit(types);
       return added;
     };
-    // Queue-only publication is not a playback start and cannot revoke one.
+    // A clear-only replacement revokes only the start present at submission,
+    // never a later command waiting behind this addition's slow work.
     if (!opts.play) {
-      if (opts.clear) cancelStart();
+      if (opts.clear && replacedStart) cancelStart(replacedStart);
       return commit(() => {});
     }
     return transition(
@@ -771,6 +805,7 @@ export function createPlayback(deps: {
     prepare = false,
   ): QueueEntry[] | Promise<QueueEntry[]> => {
     requireOpen();
+    const replacedStart = pendingStart;
     const controller = new AbortController();
     const starts = opts.startPlaying === true || opts.play === true;
     if (starts) cancelStart();
@@ -806,7 +841,14 @@ export function createPlayback(deps: {
         check();
         additions.delete(controller);
         if (pendingStart === controller) pendingStart = undefined;
-        const result = commitAdd(media, opts, source, firstId, limit);
+        const result = commitAdd(
+          media,
+          opts,
+          source,
+          firstId,
+          limit,
+          replacedStart,
+        );
         // The transition has acquired its own cancellation and demand now.
         reservation?.release();
         return result;

@@ -197,9 +197,25 @@ export async function createPlayers(deps: {
   const dispose = async (engine: Engine) => {
     engine.disposing = true;
     clearInterval(engine.clock);
-    await engine.playback.close();
-    await engine.boot?.close();
-    await engine.persistence.close();
+    const errors: unknown[] = [];
+    // Every owned release runs even when an earlier one fails. In particular,
+    // unrelated household persistence cannot strand this engine's boot/clock.
+    for (
+      const release of [
+        () => engine.playback.close(),
+        () => engine.boot?.close(),
+        () => engine.persistence.close(),
+      ]
+    ) {
+      try {
+        await release();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length) {
+      throw new AggregateError(errors, 'Player disposal failed');
+    }
   };
   try {
     for (const row of await deps.store.players.list()) add(row);
@@ -527,19 +543,28 @@ export async function createPlayers(deps: {
         await deps.persistence.drain();
         await deps.store.players.delete(id);
         engine.persistence.retire();
-        await dispose(engine);
-        engines.delete(id);
-        // The durable delete frees members in the same transaction as the queue.
-        // Publish the corresponding runtime release only after it commits.
-        await deps.persistence.changeMemberships(() =>
-          deps.outputs.setMembers(id, [], {
-            kind: 'internal',
-            via: 'player-delete',
-          })
+        try {
+          await dispose(engine);
+        } catch (error) {
+          // Deletion is already published durably. Do not invite a duplicate
+          // command because cleanup or another player's save failed (decision 31).
+          log.event('persistence_failed', { error });
+        } finally {
+          engines.delete(id);
+          // Always mirror the committed delete in runtime ownership, even if
+          // disposal failed. The household owner retains any unsaved batch.
+          await deps.persistence.changeMemberships(() =>
+            deps.outputs.setMembers(id, [], {
+              kind: 'internal',
+              via: 'player-delete',
+            })
+          );
+          changed(id);
+          deps.notify.emit(['outputs', 'nowPlaying'], undefined, 'all');
+        }
+        await deps.persistence.drain().catch((error) =>
+          log.event('persistence_failed', { error })
         );
-        changed(id);
-        deps.notify.emit(['outputs', 'nowPlaying'], undefined, 'all');
-        await deps.persistence.drain();
       }),
     close(): Promise<void> {
       if (closeWork) return closeWork;
