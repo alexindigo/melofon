@@ -763,6 +763,49 @@ Deno.test('durable player deletion failure leaves its engine and boot usable for
   }
 });
 
+Deno.test('queue writes concurrent with durable player deletion cannot poison household persistence', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  let entered!: () => void, release!: () => void;
+  const deleting = new Promise<void>((resolve) => entered = resolve);
+  const hold = new Promise<void>((resolve) => release = resolve);
+  const f = await household({
+    ...store,
+    players: {
+      ...store.players,
+      async delete(id) {
+        await store.players.delete(id);
+        entered();
+        await hold;
+      },
+    },
+  });
+  try {
+    const kitchen = await f.players.create('Kitchen');
+    const engine = f.players.get(kitchen.id);
+    const songs = await f.library.listSongs({ offset: 0, size: 1 });
+    await engine.queueAdd(songs);
+    const pending = f.players.delete(kitchen.id);
+    await deleting;
+    engine.setRepeat('all');
+    release();
+    await pending;
+    await f.players.get(1).queueAdd(songs);
+    await f.persistence.drain();
+    assertEquals(f.persistence.health(), { pendingWrites: 0 });
+    assertEquals((await store.playback.loadQueue(1)).items.length, 1);
+    assertEquals((await store.players.list()).map((row) => row.id), [1]);
+  } finally {
+    release?.();
+    try {
+      await f.close();
+    } finally {
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+});
+
 Deno.test('membership join takes speakers, leave is owner-scoped and last-speaker loss durably pauses at the same queue spot', async () => {
   const dir = await dataDir();
   let store = await openStore(dir);

@@ -28,6 +28,8 @@ export interface EnginePersistence extends PlayerPersistence {
   loadPlayerState(): Promise<PersistedPlayerState | null>;
   drain(): Promise<void>;
   close(): Promise<void>;
+  /** Successful deletion makes any queued snapshots obsolete, unlike shutdown. */
+  retire(): void;
 }
 
 export interface Persistence extends PlayerPersistence, OutputPersistence {
@@ -84,32 +86,44 @@ export function createPersistence(
     players: Map<number, PlayerSave>;
     outputs: Map<string, AdoptedSpeakerSnapshot>;
   } | undefined;
-  const savePlayer = (row: PlayerSave) => {
+  const savePlayer = (row: PlayerSave, save = enqueue) => {
     if (membershipChange) {
       membershipChange.players.set(row.playerId, {
         ...membershipChange.players.get(row.playerId),
         ...row,
       });
-    } else enqueue(() => store.players.saveChanges({ players: [row] }));
+    } else save(() => store.players.saveChanges({ players: [row] }));
   };
   const forPlayer = (playerId: number): EnginePersistence => {
     let active = true;
+    let retired = false;
+    const save = (write: () => Promise<void>) =>
+      enqueue(async () => {
+        if (retired) return;
+        try {
+          await write();
+        } catch (error) {
+          // A write queued behind the successful durable delete may already be
+          // inside the store lane. It no longer has a player to persist or retry.
+          if (!retired) throw error;
+        }
+      });
     return {
       saveQueue(snapshot, state) {
         if (!active) return;
         const copy = structuredClone(snapshot);
         if (membershipChange) savePlayer({ playerId, queue: copy, state });
-        else enqueue(() => store.playback.saveQueue(playerId, copy, state));
+        else save(() => store.playback.saveQueue(playerId, copy, state));
       },
       saveState(snapshot) {
         if (!active) return;
         if (membershipChange) {
           savePlayer({ playerId, state: structuredClone(snapshot) });
-        } else enqueue(() => store.playback.saveState(playerId, snapshot));
+        } else save(() => store.playback.saveState(playerId, snapshot));
       },
       saveCommand(commandedAtMs) {
         if (active) {
-          savePlayer({ playerId, commandedAtMs });
+          savePlayer({ playerId, commandedAtMs }, save);
         }
       },
       loadQueue: () => store.playback.loadQueue(playerId),
@@ -118,6 +132,10 @@ export function createPersistence(
       async close() {
         active = false;
         await drain();
+      },
+      retire() {
+        active = false;
+        retired = true;
       },
     };
   };

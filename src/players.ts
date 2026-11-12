@@ -476,6 +476,7 @@ export async function createPlayers(deps: {
         }
         await deps.persistence.drain();
         await deps.store.players.delete(id);
+        engine.persistence.retire();
         await dispose(engine);
         engines.delete(id);
         // The durable delete frees members in the same transaction as the queue.

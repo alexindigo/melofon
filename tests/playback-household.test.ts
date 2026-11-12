@@ -204,6 +204,8 @@ Deno.test('household aggregate reads each engine and app once over HTTP and surv
       for (let i = 0; i < 2; i++) {
         engines.push(createPlayback({
           player: createPlayer(),
+          playerId: i + 1,
+          playerName: () => i === 0 ? 'Home' : 'Kitchen',
           nowPlaying,
           library,
           sessions,
@@ -241,6 +243,8 @@ Deno.test('household aggregate reads each engine and app once over HTTP and surv
       const rows = (await response.json()).nowPlaying as {
         kind: string;
         state: string;
+        playerId: number;
+        playerName: string;
         song: { id: string };
       }[];
       assertEquals(
@@ -252,6 +256,13 @@ Deno.test('household aggregate reads each engine and app once over HTTP and surv
     };
     const rows = await read();
     assertEquals(rows.map((row) => row.kind), ['server', 'server', 'app']);
+    assertEquals(
+      rows.slice(0, 2).map((row) => [row.playerId, row.playerName]),
+      [
+        [1, 'Home'],
+        [2, 'Kitchen'],
+      ],
+    );
     assertEquals(rows.slice(0, 2).map((row) => row.state), [
       'playing',
       'paused',
@@ -260,7 +271,12 @@ Deno.test('household aggregate reads each engine and app once over HTTP and surv
     const removed = engines.shift()!;
     await removed.close();
     assertEquals(unsubscribes, 0);
-    assertEquals((await read()).map((row) => row.kind), ['server', 'app']);
+    const remaining = await read();
+    assertEquals(remaining.map((row) => row.kind), ['server', 'app']);
+    assertEquals([remaining[0].playerId, remaining[0].playerName], [
+      2,
+      'Kitchen',
+    ]);
     const revoked = await f.json(
       `/api/v1/me/sessions/${app.body.session.id}`,
       'DELETE',
