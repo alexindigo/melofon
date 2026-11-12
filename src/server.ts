@@ -66,12 +66,31 @@ import { shutdownNativeLogging } from './boots/raop-ffi.ts';
 import { createSetup } from './setup.ts';
 import { createTermination } from './restart.ts';
 import type { Log } from './logging.ts';
+import { acquireHeartbeat } from './heartbeat.ts';
 
-export async function startServer(options: {
+interface ServerOptions {
   env?: Record<string, string>;
   exit?: (code: number) => void;
   setupLog?: Log;
-} = {}) {
+}
+
+export async function startServer(options: ServerOptions = {}) {
+  const heartbeat = acquireHeartbeat();
+  try {
+    return await startServerRuntime({
+      ...options,
+      exit(code) {
+        heartbeat[Symbol.dispose]();
+        (options.exit ?? Deno.exit)(code);
+      },
+    });
+  } catch (error) {
+    heartbeat[Symbol.dispose]();
+    throw error;
+  }
+}
+
+async function startServerRuntime(options: ServerOptions) {
   const log = scopedLog('server');
 
   const env = options.env ?? Deno.env.toObject();

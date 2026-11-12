@@ -67,6 +67,7 @@ import { Buffer } from 'node:buffer';
 import { extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { type Log, scopedLog } from './logging.ts';
+import { acquireHeartbeat } from './heartbeat.ts';
 import type { State } from './state.ts';
 import {
   createHlsCache,
@@ -422,6 +423,7 @@ function ownedPcm(
   owner?: { stop(): void; release(): Promise<void>; check(): void },
   startMs = 0,
 ): InputPcm {
+  const heartbeat = acquireHeartbeat();
   let skipBytes = Math.max(0, Math.round(startMs * PCM_RATE / 1000)) *
     PCM_BYTES_PER_SAMPLE;
   let complete!: () => void;
@@ -430,14 +432,15 @@ function ownedPcm(
   const close = () =>
     closing ??= (async () => {
       try {
-        await owner?.release();
-      } finally {
-        decoder[Symbol.dispose]();
         try {
-          await input.close();
+          await owner?.release();
         } finally {
-          complete();
+          decoder[Symbol.dispose]();
+          await input.close();
         }
+      } finally {
+        heartbeat[Symbol.dispose]();
+        complete();
       }
     })();
   const iterator = (async function* () {
@@ -572,6 +575,7 @@ export async function encodeImagePixels(
   width: number,
   height: number,
 ): Promise<Uint8Array> {
+  using _heartbeat = acquireHeartbeat();
   if (
     !Number.isSafeInteger(width) || !Number.isSafeInteger(height) ||
     width < 1 || height < 1 || pixels.length !== width * height * 4
@@ -592,6 +596,7 @@ export async function imagePixels(
   width: number,
   height: number,
 ): Promise<Uint8Array> {
+  using _heartbeat = acquireHeartbeat();
   await using input = await Demuxer.open(Buffer.from(bytes));
   const stream = input.video();
   if (!stream) throw new Error('Image has no video stream');
@@ -626,6 +631,7 @@ export async function resizeImage(
   format: 'png' | 'jpeg',
   quality: number,
 ): Promise<Uint8Array> {
+  using _heartbeat = acquireHeartbeat();
   await using input = await Demuxer.open(Buffer.from(bytes));
   const stream = input.video();
   if (!stream) throw new Error('Image has no video stream');
@@ -652,6 +658,7 @@ export async function playlistImage(
   images: Uint8Array[],
   tileSize: number,
 ): Promise<Uint8Array> {
+  using _heartbeat = acquireHeartbeat();
   const tiles: Frame[] = [];
   try {
     for (const bytes of images) {
@@ -734,6 +741,7 @@ export async function animatedImage(
   size: number,
   quality: number,
 ): Promise<Uint8Array> {
+  using _heartbeat = acquireHeartbeat();
   const codec = Codec.findEncoderByName(FF_ENCODER_LIBWEBP_ANIM);
   if (!codec) throw new Error('No animated WebP encoder');
   await using input = await Demuxer.open(Buffer.from(bytes));
@@ -805,6 +813,7 @@ export function createMedia(
         TRANSCODE_PROFILES[format].bitRateKbps,
     );
   const hls = createHlsCache(encodeHls, async (path) => {
+    using _heartbeat = acquireHeartbeat();
     try {
       await using input = await Demuxer.open(path);
       const video = input.video();
@@ -830,6 +839,7 @@ export function createMedia(
     config: HlsEncodingSettings,
     publish: (facts: HlsFacts) => Promise<void>,
   ): Promise<HlsFacts | null> {
+    using _heartbeat = acquireHeartbeat();
     try {
       await using input = await Demuxer.open(path);
       const video = input.video();
@@ -991,6 +1001,7 @@ export function createMedia(
   return {
     ...hls,
     async probeInputDuration(bytes, size, signal) {
+      using _heartbeat = acquireHeartbeat();
       signal.throwIfAborted();
       const probeBytes = Number(
         await state?.getTyped('media.input.probeBytes') ??
@@ -1029,6 +1040,7 @@ export function createMedia(
       return inputDuration(input);
     },
     async decodeInputPcm(source, opts = {}) {
+      using _heartbeat = acquireHeartbeat();
       const abort = new AbortController();
       const signal = abort.signal;
       let reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -1189,6 +1201,7 @@ export function createMedia(
       }
     },
     async captions(path, index, format) {
+      using _heartbeat = acquireHeartbeat();
       try {
         await using input = await Demuxer.open(path);
         const stream = input.streams.find((s) => s.index === index);
@@ -1232,6 +1245,7 @@ export function createMedia(
       }
     },
     async describeAudio(path) {
+      using _heartbeat = acquireHeartbeat();
       try {
         await using input = await Demuxer.open(path);
         const audio = input.audio();
@@ -1269,6 +1283,7 @@ export function createMedia(
     },
 
     async audioProfiles() {
+      using _heartbeat = acquireHeartbeat();
       const profiles: AudioProfile[] = [];
       for (const [format, profile] of Object.entries(TRANSCODE_PROFILES)) {
         const codec = Codec.findEncoderByName(profile.encoder);
@@ -1289,6 +1304,7 @@ export function createMedia(
     },
 
     async fingerprint(path) {
+      using _heartbeat = acquireHeartbeat();
       const input = await Demuxer.open(path);
       try {
         const audio = input.audio(0);
@@ -1340,6 +1356,7 @@ export function createMedia(
     },
 
     async probe(path) {
+      using _heartbeat = acquireHeartbeat();
       let input;
       try {
         input = await Demuxer.open(path);
@@ -1389,6 +1406,7 @@ export function createMedia(
     },
 
     async transcodeAudio(path, format, opts = {}) {
+      using _heartbeat = acquireHeartbeat();
       const profile = TRANSCODE_PROFILES[format];
       if (profile === undefined) return null; // no such target (e.g. flac)
       const bitRateKbps = Math.min(
@@ -1520,6 +1538,7 @@ export function createMedia(
       }
 
       const run = async () => {
+        using _heartbeat = acquireHeartbeat();
         const filters = [
           ...(trimStart > 0
             ? [`atrim=start=${trimStart}`, 'asetpts=PTS-STARTPTS']
@@ -1575,6 +1594,7 @@ export function createMedia(
     },
 
     async decodePcm(path, opts = {}) {
+      using _heartbeat = acquireHeartbeat();
       let input: Demuxer;
       try {
         input = await Demuxer.open(path);
