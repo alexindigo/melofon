@@ -4,7 +4,7 @@
 c07 test VM by the unmodified official `js/thumbhash.js` from
 https://github.com/evanw/thumbhash at
 `a652ce6ed691242f459f468f0a8756cda3b90a82` (MIT, Copyright (c) 2023 Evan Wallace).
-The full permission notice is in `layers/melofon/artwork-codecs-LICENSE.md`.
+The full permission notice is in `src/artwork/artwork-codecs-LICENSE.md`.
 No production port was imported during vector generation. Both RGBA and hashes
 are standard padded base64. Tests need no network or reference implementation.
 

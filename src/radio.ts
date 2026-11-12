@@ -272,7 +272,9 @@ export function createRadio(store: Store, options: {
     ): Promise<StationResult> {
       const checked = validate(input);
       if ('invalid' in checked) return checked;
-      return await store.radio.create(checked);
+      const result = await store.radio.create(checked);
+      changed(result.id);
+      return result;
     },
     async update(
       id: string,
@@ -287,7 +289,7 @@ export function createRadio(store: Store, options: {
         if (moved) revoke(id);
         const updated = await store.radio.update(id, checked);
         if (updated && old && files) await files.retire(old);
-        if (updated && old) changed(id);
+        if (updated) changed(id);
         return updated;
       });
     },

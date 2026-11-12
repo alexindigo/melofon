@@ -110,3 +110,10 @@ export function createHatDataStore(engine: Engine) {
       ),
   };
 }
+
+/** Obsolete native previews are derived data, not user records or image files. */
+export async function retireArtworkFacts(q: Queries): Promise<void> {
+  await q.run(`DELETE FROM hat_records WHERE hat = 'melofon'
+    AND owner_scope = '' AND kind = 'data'
+    AND (starts_with(key, 'artwork-facts/v1/') OR starts_with(key, 'artwork-facts/v2/'))`);
+}

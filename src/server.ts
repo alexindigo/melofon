@@ -32,6 +32,7 @@ import { createFileSource } from './file-source.ts';
 import { createZip } from './zip.ts';
 import { createMedia } from './media.ts';
 import { createArtwork } from './artwork.ts';
+import { createArtworkBackground } from './artwork/background.ts';
 import { createOutputs, type Outputs } from './player.ts';
 import { createPersistence } from './persistence.ts';
 import { createPlayers } from './players.ts';
@@ -143,6 +144,7 @@ export async function startServer(options: {
     network,
     media,
     dataDir: cfg.dataDir,
+    notify,
   });
   const lookups = await createLookupRunner({
     store,
@@ -339,7 +341,21 @@ export async function startServer(options: {
     log: scopedLog('core'),
   };
   const core = await pathfinder({ roots: ['core/'], app });
-  const playlists = createPlaylists(store);
+  const playlists = createPlaylists(store, notify);
+  const artwork = createArtwork(library, {
+    facts: store.artwork,
+    state,
+    dataDir: cfg.dataDir,
+    playlists,
+    podcasts,
+    radio,
+  });
+  const artworkBackground = createArtworkBackground({
+    artwork,
+    store,
+    state,
+    notify,
+  });
   const settings = createSettings(store, state);
   let hats: Hats | undefined = undefined;
   const bag = {
@@ -403,14 +419,7 @@ export async function startServer(options: {
       authentication.sessions,
     ),
     zip: createZip(),
-    artwork: createArtwork(library, {
-      facts: store.artwork,
-      state,
-      dataDir: cfg.dataDir,
-      playlists,
-      podcasts,
-      radio,
-    }),
+    artwork,
     outputs: players.defaultOutputs,
     speakers,
     notify,
@@ -476,6 +485,7 @@ export async function startServer(options: {
       discovery.close();
       airplay.close();
       await listens.shutdown();
+      await artworkBackground.close();
       try {
         await players.close();
         shutdownNativeLogging();

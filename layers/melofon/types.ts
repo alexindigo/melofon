@@ -47,6 +47,8 @@ export interface ArtworkDescriptor {
   width: number | null;
   height: number | null;
   mime: string;
+  thumbHash?: string | null;
+  dominantColor?: string | null;
 }
 export type ArtworkDescription = { kind: 'unknown' | 'missing' } | {
   kind: 'image';

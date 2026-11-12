@@ -1,6 +1,7 @@
 // src/playlists.ts — app.playlists owns visibility and edit/delete policy.
 // The store keeps occurrences and resolves visible indices atomically.
 import type { Store } from './store/index.ts';
+import type { Notify } from './notify.ts';
 import type {
   PlaylistPage,
   PlaylistPageOptions,
@@ -46,7 +47,13 @@ export interface Playlists {
   delete(username: string, id: string): Promise<boolean | 'forbidden'>;
 }
 
-export function createPlaylists(store: Store): Playlists {
+export function createPlaylists(store: Store, notify?: Notify): Playlists {
+  async function changed(username: string, id: string) {
+    const owner = notify && await store.users.idForName(username);
+    if (owner) {
+      notify!.emit(['library'], { playlists: [id] }, { userId: owner });
+    }
+  }
   async function get(username: string, id: string) {
     const user = await store.users.profile(username);
     if (user === null) return null;
@@ -90,17 +97,34 @@ export function createPlaylists(store: Store): Playlists {
       );
     },
     get,
-    create: (username, name, trackIds, public_) =>
-      store.playlists.create(username, name, trackIds, public_),
+    async create(username, name, trackIds, public_) {
+      const result = await store.playlists.create(
+        username,
+        name,
+        trackIds,
+        public_,
+      );
+      await changed(username, result.id);
+      return result;
+    },
     async setTracks(username, id, trackIds, public_) {
       const row = await writable(username, id);
       if (row === null || row === 'forbidden') return row;
-      return await store.playlists.setTracks(username, id, trackIds, public_);
+      const result = await store.playlists.setTracks(
+        username,
+        id,
+        trackIds,
+        public_,
+      );
+      if (result) await changed(username, id);
+      return result;
     },
     async update(username, id, opts) {
       const row = await writable(username, id);
       if (row === null || row === 'forbidden') return row;
-      return await store.playlists.update(username, id, opts);
+      const result = await store.playlists.update(username, id, opts);
+      if (result) await changed(username, id);
+      return result;
     },
     async delete(username, id) {
       const row = await get(username, id);

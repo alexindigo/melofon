@@ -13,6 +13,7 @@ import { createPodcastFiles } from './podcast-files.ts';
 import { imageHeader } from './image-header.ts';
 import { declareImageDownload, imageExtension } from './images.ts';
 import type { PodcastEpisode } from './store/podcasts.ts';
+import type { Notify } from './notify.ts';
 
 export interface PodcastClock {
   now(): number;
@@ -27,6 +28,7 @@ export async function createPodcasts(
     media?: Pick<Media, 'probe'>;
     network?: LookupNetwork;
     clock?: PodcastClock;
+    notify?: Notify;
   },
 ) {
   const { store, state } = options;
@@ -278,6 +280,7 @@ export async function createPodcasts(
         imageExtension(header.format),
       );
       await store.podcasts.image(id, path, row.imageUrl);
+      options.notify?.emit(['library'], { podcasts: [id] }, 'all');
     } catch (error) {
       scheduledError(error);
     }

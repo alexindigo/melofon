@@ -5,9 +5,9 @@ import {
   assertThrows,
 } from '@std/assert';
 import { decodeBase64, encodeBase64 } from '@std/encoding/base64';
-import { rgbaToThumbHash } from '#melofon/thumbhash.ts';
-import { dominantColor } from '#melofon/dominant-color.ts';
-import { srgbToOklab } from '#melofon/color-math.ts';
+import { rgbaToThumbHash } from '../src/artwork/thumbhash.ts';
+import { dominantColor } from '../src/artwork/dominant-color.ts';
+import { srgbToOklab } from '../src/artwork/color-math.ts';
 import reference from './fixtures/thumbhash-reference.json' with {
   type: 'json',
 };

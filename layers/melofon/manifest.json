@@ -1,12 +1,6 @@
 {
   "api": "/api/v1",
   "settings": {
-    "melofon.artworkFactsPerRequest": {
-      "type": "integer",
-      "minimum": 0,
-      "default": 8,
-      "description": "Maximum missing artwork placeholders computed per native response; zero pauses computation"
-    },
     "melofon.browsePageRecords": {
       "type": "integer",
       "minimum": 1,
