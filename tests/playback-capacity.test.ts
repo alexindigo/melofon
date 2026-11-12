@@ -899,3 +899,25 @@ for (const command of ['play', 'next'] as const) {
     }
   });
 }
+
+Deno.test('add-and-play assigns a new identity to prepared media copied from an occurrence', async () => {
+  const f = await fixture();
+  try {
+    // This checks queue/activation identity, not decoding the fixture's URL.
+    // Leave preparation active but stop its background source consumer so a
+    // missing test URL cannot exhaust the queue before identity readback.
+    await f.boots[0].close();
+    const copied = { ...f.web, id: f.playback[0].queueView().items[0].id };
+    const [added] = await f.playback[0].queueAddSources([copied], {
+      clear: true,
+      play: true,
+    });
+    assert(added.id !== copied.id);
+    assertEquals(f.playback[0].queueView().items.map((item) => item.id), [
+      added.id,
+    ]);
+    assertEquals(f.playback[0].playerView().current?.id, added.id);
+  } finally {
+    await f.close();
+  }
+});

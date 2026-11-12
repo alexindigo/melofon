@@ -603,7 +603,14 @@ export function createPlayback(deps: {
       Math.max(0, Math.trunc(opts.position ?? future.length)),
       future.length,
     );
-    const items = [...future.slice(0, at), ...media, ...future.slice(at)];
+    // Incoming occurrences are copied as media and receive fresh ids at commit.
+    // Only entries already in the destination carry occurrence identity in the
+    // activation plan; a source id must never be mistaken for a destination id.
+    const items = [
+      ...future.slice(0, at),
+      ...media.map((item) => ({ ...item, id: undefined })),
+      ...future.slice(at),
+    ];
     const oldCurrent = player.status().current;
     const index = opts.playbackFromPosition !== undefined
       ? Math.min(Math.max(0, Math.trunc(opts.playbackFromPosition)), size - 1)
