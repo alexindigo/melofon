@@ -1,8 +1,9 @@
 import type { State } from '../state.ts';
 import type { ArtworkPreview } from '../store/artwork.ts';
 
-/** One reusable sequential Worker. Both startup and computation are bounded;
- * retirement rejects the current call before terminating its Worker. */
+/** One reusable sequential Worker; overlapping calls reject as busy.
+ * Both startup and computation are bounded; retirement rejects the current call
+ * before terminating its Worker. */
 export function createArtworkFactsHost(
   state: Pick<State, 'declare' | 'getTyped'>,
   workerUrl = new URL('./facts-worker.ts', import.meta.url),
@@ -24,6 +25,7 @@ export function createArtworkFactsHost(
   let worker: Worker | undefined;
   let ready: Promise<void> | undefined;
   let rejectPending: ((error: Error) => void) | undefined;
+  let inFlight = false;
   let closed = false;
   function retire(error: Error) {
     const reject = rejectPending;
@@ -81,14 +83,16 @@ export function createArtworkFactsHost(
       pixels: { width: number; height: number; rgba: Uint8Array },
     ): Promise<ArtworkPreview> {
       if (closed) throw new Error('Artwork Worker closed');
-      const startup = Number(
-        await state.getTyped('artwork.facts.startupSeconds'),
-      );
-      const seconds = Number(
-        await state.getTyped('artwork.facts.computeSeconds'),
-      );
-      if (closed) throw new Error('Artwork Worker closed');
+      if (inFlight) throw new Error('Artwork Worker busy');
+      inFlight = true;
       try {
+        const startup = Number(
+          await state.getTyped('artwork.facts.startupSeconds'),
+        );
+        const seconds = Number(
+          await state.getTyped('artwork.facts.computeSeconds'),
+        );
+        if (closed) throw new Error('Artwork Worker closed');
         await (ready ?? start(startup));
         if (closed || !worker) throw new Error('Artwork Worker closed');
         const current = worker;
@@ -131,6 +135,8 @@ export function createArtworkFactsHost(
       } catch (error) {
         retire(new Error(String(error)));
         throw error;
+      } finally {
+        inFlight = false;
       }
     },
     close() {

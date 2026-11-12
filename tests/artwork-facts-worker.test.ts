@@ -35,6 +35,94 @@ Deno.test('Artwork Worker: exact existing ThumbHash vectors and recovery after a
   }
 });
 
+Deno.test('Artwork Worker: overlapping calls are refused without stealing the active result', async () => {
+  const state = stateFixture();
+  const settings = Promise.withResolvers<void>();
+  const computing = Promise.withResolvers<void>();
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  let firstRead = true;
+  const host = createArtworkFactsHost(
+    {
+      ...state,
+      async getTyped(key: string) {
+        if (firstRead) {
+          firstRead = false;
+          await settings.promise;
+        }
+        return await state.getTyped(key);
+      },
+    },
+    new URL('./fixtures/artwork-gated-worker.ts', import.meta.url),
+    () => computing.resolve(),
+  );
+  const black = reference.vectors.find((v) => v.name === 'one-black')!;
+  const other = {
+    width: black.w,
+    height: black.h,
+    rgba: decodeBase64(black.rgba),
+  };
+  const pixels = { ...source, gate: gate.buffer };
+  const pending = host.compute(pixels);
+  const settled = pending.catch(() => {});
+  try {
+    // The first call owns the host before even its initial settings read ends.
+    await assertRejects(
+      () => host.compute(other),
+      Error,
+      'Artwork Worker busy',
+    );
+    settings.resolve();
+    await waitForWorkerSignal(computing.promise, 'computation start');
+    await assertRejects(
+      () => host.compute(other),
+      Error,
+      'Artwork Worker busy',
+    );
+    Atomics.store(gate, 0, 1);
+    Atomics.notify(gate, 0);
+    assertEquals(await pending, {
+      thumbHash: reference.vectors.find((v) => v.name === 'one-red')!.hash,
+      dominantColor: '#ff0000',
+    });
+    // A refused caller can retry once the active call has released ownership.
+    assertEquals(await host.compute(other), {
+      thumbHash: black.hash,
+      dominantColor: '#000000',
+    });
+  } finally {
+    settings.resolve();
+    Atomics.store(gate, 0, 1);
+    Atomics.notify(gate, 0);
+    host.close();
+    await settled;
+  }
+});
+
+Deno.test('Artwork Worker: failed settings acquisition releases call ownership', async () => {
+  const state = stateFixture();
+  let failRead = true;
+  const host = createArtworkFactsHost({
+    ...state,
+    getTyped(key: string) {
+      if (failRead) {
+        failRead = false;
+        return Promise.reject(new Error('fixture settings failure'));
+      }
+      return state.getTyped(key);
+    },
+  });
+  try {
+    await assertRejects(
+      () => host.compute(source),
+      Error,
+      'fixture settings failure',
+    );
+    assertEquals((await host.compute(source)).dominantColor, '#ff0000');
+  } finally {
+    host.close();
+  }
+});
+
 Deno.test('Artwork Worker: startup and active-call timeouts settle and terminate their Worker', async () => {
   for (
     const [setting, code, error] of [
