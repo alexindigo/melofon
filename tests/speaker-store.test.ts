@@ -18,6 +18,32 @@ function speaker(id = "speaker'") {
   };
 }
 
+Deno.test('first speaker inserts preserve explicit unlinked membership across reopen', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'melofon-speaker-linked-' });
+  let store = await openStore(dir);
+  try {
+    await store.speakers.saveAdopted({
+      ...speaker('adopted'),
+      playerId: 1,
+      linked: false,
+    });
+    await store.speakers.saveOutput({
+      ...speaker('preference'),
+      playerId: null,
+      linked: false,
+    });
+    await store.close();
+    store = await openStore(dir);
+    assertEquals(await store.speakers.loadMemberships(), [
+      { speakerId: 'adopted', playerId: 1, linked: false },
+      { speakerId: 'preference', playerId: null, linked: false },
+    ]);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('speaker store adopted save/update/delete is durable and ignores are independent identities', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-speaker-store-' });
   let store = await openStore(dir);

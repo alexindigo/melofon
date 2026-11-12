@@ -317,6 +317,7 @@ export async function startServer(options: {
   const playback = players.playback;
   const app = {
     store,
+    persistence,
     cfg,
     libraries,
     outputs,

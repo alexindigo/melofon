@@ -483,6 +483,26 @@ Deno.test('failed transport cleanup keeps shared-stream occupancy blocking other
   }
 });
 
+Deno.test('published forget succeeds while failed transport cleanup retains shared-stream occupancy', async () => {
+  const f = await fixture();
+  try {
+    await f.outputs.adopt('11');
+    await f.playback[0].play();
+    await until(() => f.sessions[0]?.bytes > 0);
+    f.sessions[0].closeFails = true;
+    await f.outputs.forget('11');
+    assertEquals(f.outputs.get('11'), null);
+    assertEquals(f.playback[0].playerView().state, 'pause');
+    await busy(() => f.playback[1].play());
+    await f.boots[0].close();
+    await busy(() => f.playback[1].play());
+    assertEquals(f.sessions.length, 1);
+    assertEquals(f.sessions[0].closed, false);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('held idle transport remains busy until its connection is released', async () => {
   const f = await fixture();
   try {
