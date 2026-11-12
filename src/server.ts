@@ -92,11 +92,11 @@ export async function startServer(options: {
         : null;
     },
   });
-  const persistence = createPersistence(store, undefined, credentials);
   await seedFirstUser(store, cfg);
   const setupMode = await store.users.adminCount() === 0;
   const notify = createNotify();
   const state = createState(store, undefined, notify);
+  const persistence = createPersistence(store, undefined, credentials, state);
   const publicAddress = createPublicAddress(state);
   if (env.MELOFON_BASE_URL !== undefined) {
     await state.seedIfUnset('server.baseUrl', env.MELOFON_BASE_URL);
@@ -475,10 +475,13 @@ export async function startServer(options: {
       discovery.close();
       airplay.close();
       await listens.shutdown();
-      await players.close();
-      shutdownNativeLogging();
-      await reports.close();
-      await persistence.drain();
+      try {
+        await players.close();
+        shutdownNativeLogging();
+        await reports.close();
+      } finally {
+        await persistence.close();
+      }
       await store.close();
     },
   });

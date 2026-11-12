@@ -18,6 +18,7 @@ import type { SpeakerCredentials } from './speaker-credentials.ts';
 import type { QueueSnapshot } from './queue-source.ts';
 import type { PlayerSave } from './store/players.ts';
 import type { AdoptedSpeakerSnapshot } from './store/speakers.ts';
+import type { State } from './state.ts';
 
 export type { PersistedPlayerState } from './store/playback.ts';
 
@@ -52,35 +53,97 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   drain(): Promise<void>;
   /** Unsaved published batches, without exposing private failure details. */
   health(): { pendingWrites: number };
+  /** Stop the household retry owner and drain before closing the store. */
+  close(): Promise<void>;
 }
 
 export function createPersistence(
   store: Store,
   log: Log = scopedLog('persistence'),
   credentials?: Pick<SpeakerCredentials, 'adopt'>,
+  state?: Pick<State, 'declare' | 'getTyped' | 'onChange'>,
+  timer = {
+    set(callback: () => void, delay: number): { cancel(): void } {
+      const handle = setTimeout(callback, delay);
+      Deno.unrefTimer(handle);
+      return { cancel: () => clearTimeout(handle) };
+    },
+  },
 ): Persistence {
   let tail: Promise<void> = Promise.resolve();
+  let closed = false;
+  let closeWork: Promise<void> | undefined;
+  let retryTimer: { cancel(): void } | undefined;
+  let retryEpoch = 0;
+  let retryAttempt = 0;
+  const retryKey = 'persistence.retryBackoffMs';
+  const retryDefault = [1000, 2000, 5000, 30000];
+  let backoff = retryDefault;
+  state?.declare(retryKey, {
+    type: 'array',
+    items: { type: 'integer', minimum: 1, maximum: 600000 },
+    default: retryDefault,
+    description:
+      'Published save retry delays in ms; repeat the last delay until saved; empty uses defaults',
+  });
+  let policyRevision = 0;
+  const loadPolicy = async () => {
+    const revision = ++policyRevision;
+    try {
+      const delays = await state?.getTyped(retryKey);
+      if (!closed && revision === policyRevision && Array.isArray(delays)) {
+        backoff = delays.length ? delays as number[] : retryDefault;
+      }
+    } catch (error) {
+      log.event('persistence_failed', { error });
+    }
+  };
+  const unsubscribe = state?.onChange((key) => {
+    if (key === retryKey) policyWork = loadPolicy();
+  });
+  let policyWork = state ? loadPolicy() : Promise.resolve();
   const pendingWrites: (() => Promise<void>)[] = [];
+  const cancelRetry = () => {
+    retryEpoch++;
+    retryTimer?.cancel();
+    retryTimer = undefined;
+  };
+  const scheduleRetry = () => {
+    if (closed || retryTimer !== undefined || !pendingWrites.length) return;
+    const delay = backoff[Math.min(retryAttempt++, backoff.length - 1)];
+    const epoch = ++retryEpoch;
+    retryTimer = timer.set(() => {
+      if (epoch !== retryEpoch || closed) return;
+      retryTimer = undefined;
+      void drain().catch(() => {});
+    }, delay);
+  };
   const retryWrites = async () => {
+    cancelRetry();
     while (pendingWrites.length) {
       await pendingWrites[0]();
       pendingWrites.shift();
+      retryAttempt = 0;
     }
+  };
+  const observe = (write: Promise<void>) => {
+    tail = write.catch((error) => log.event('persistence_failed', { error }))
+      .finally(scheduleRetry);
   };
   const drain = () => {
     const write = tail.then(retryWrites);
-    tail = write.catch((error) => log.event('persistence_failed', { error }));
+    observe(write);
     return write;
   };
   const enqueue = (write: () => Promise<void>): void => {
-    tail = tail.then(async () => {
+    if (closed) return;
+    const work = tail.then(async () => {
       // Published intent succeeds independently of storage. Retain every whole
-      // batch behind its predecessors until a write or drain can retry it.
+      // batch behind its predecessors; this owner wakes itself when idle.
       pendingWrites.push(write);
       await retryWrites();
-    }).catch((err) => {
-      log.event('persistence_failed', { error: err });
     });
+    observe(work);
   };
   const outputCache = new Map<string, PersistedOutput>();
   const outputRevisions = new Map<string, number>();
@@ -196,6 +259,7 @@ export function createPersistence(
     },
 
     async adoptOutput(row) {
+      if (closed) throw new Error('Persistence is closed');
       const revision = outputRevisions.get(row.id);
       const connectionStrategy = requireConnectionStrategy(
         row.connectionStrategy ?? DEFAULT_CONNECTION_STRATEGY,
@@ -218,7 +282,7 @@ export function createPersistence(
         : before.then(() => save([]));
       // Keep the serialization tail usable, but return the original rejection
       // to the explicit configuration caller. Publish only a durable cache.
-      tail = write.catch((error) => log.event('persistence_failed', { error }));
+      observe(write);
       await write;
     },
 
@@ -266,6 +330,7 @@ export function createPersistence(
     ignoredOutputs: () => [...ignored],
 
     async setOutputIgnored(id, value) {
+      if (closed) throw new Error('Persistence is closed');
       const write = tail.then(async () => {
         await retryWrites();
         if (value) await store.speakers.saveIgnored(id);
@@ -273,11 +338,19 @@ export function createPersistence(
         if (value) ignored.add(id);
         else ignored.delete(id);
       });
-      tail = write.catch((error) => log.event('persistence_failed', { error }));
+      observe(write);
       await write;
     },
 
     drain,
     health: () => ({ pendingWrites: pendingWrites.length }),
+    close() {
+      if (closeWork) return closeWork;
+      closed = true;
+      cancelRetry();
+      unsubscribe?.();
+      closeWork = policyWork.then(drain);
+      return closeWork;
+    },
   };
 }

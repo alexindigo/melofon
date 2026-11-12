@@ -819,3 +819,107 @@ for (const phase of ['ids', 'target'] as const) {
     }
   });
 }
+
+Deno.test('older clear-only addition cannot cancel a newer queued add-and-play', async () => {
+  const f = await fixture(), held = deferred();
+  let older: Promise<unknown> | undefined, newer: Promise<unknown> | undefined;
+  try {
+    const before = f.entered[0].filter((step) => step === 'ids').length;
+    f.idGates[0] = held.promise;
+    older = Promise.resolve(
+      f.playback[0].queueAdd([f.songs[0]], { clear: true }),
+    );
+    await until(() =>
+      f.entered[0].filter((step) => step === 'ids').length > before
+    );
+    newer = Promise.resolve(f.playback[0].queueAdd([f.songs[1]], {
+      play: true,
+      playbackFromPosition: 1,
+    })).then(() => undefined, (error) => error);
+    held.resolve();
+    await older;
+    assertEquals(await newer, undefined);
+    assertEquals(
+      f.playback[0].queueView().items.map((item) => item.reference),
+      f.songs.map((song) => ({ kind: 'song' as const, id: song.id })),
+    );
+    assertEquals(f.playback[0].playerView().current?.reference, {
+      kind: 'song',
+      id: f.songs[1].id,
+    });
+    await until(() => f.sessions[0]?.bytes > 0);
+    assertEquals(f.sessions[0].port, 7001);
+  } finally {
+    held.resolve();
+    await Promise.allSettled([older, newer]);
+    await f.close();
+  }
+});
+
+for (const command of ['play', 'next'] as const) {
+  Deno.test(`${command} preparation cannot overwrite an occurrence shifted by a queue-only insertion`, async () => {
+    const f = await fixture(), held = deferred();
+    let pending: Promise<unknown> | undefined;
+    try {
+      await f.playback[0].queueAddSources([{
+        ...f.web,
+        reference: { kind: 'station', id: 'station' },
+      }], { clear: true });
+      const stationId = f.playback[0].queueView().items[0].id;
+      const before = f.entered[0].filter((step) => step === 'resolve').length;
+      f.resolveGates[0] = held.promise;
+      pending = Promise.resolve(f.playback[0][command]()).then(
+        () => undefined,
+        (error) => error,
+      );
+      await until(() =>
+        f.entered[0].filter((step) => step === 'resolve').length > before
+      );
+      const [inserted] = await f.playback[0].queueAdd([f.songs[0]], {
+        position: 0,
+      });
+      const snapshot = f.playback[0].queueView();
+      held.resolve();
+      const error = await pending;
+      assert(error instanceof PlaybackError);
+      assertEquals(error.code, 'playback_cancelled');
+      assertEquals(f.playback[0].queueView(), snapshot);
+      assertEquals(snapshot.items.map((item) => item.id), [
+        inserted.id,
+        stationId,
+      ]);
+      assertEquals(snapshot.items[1].reference, {
+        kind: 'station',
+        id: 'station',
+      });
+      assertEquals(f.playback[0].playerView().state, 'stop');
+      assertEquals(f.sessions.length, 0);
+    } finally {
+      held.resolve();
+      await pending;
+      await f.close();
+    }
+  });
+}
+
+Deno.test('add-and-play assigns a new identity to prepared media copied from an occurrence', async () => {
+  const f = await fixture();
+  try {
+    // This checks queue/activation identity, not decoding the fixture's URL.
+    // Leave preparation active but stop its background source consumer so a
+    // missing test URL cannot exhaust the queue before identity readback.
+    await f.boots[0].close();
+    const copied = { ...f.web, id: f.playback[0].queueView().items[0].id };
+    const [added] = await f.playback[0].queueAddSources([copied], {
+      clear: true,
+      play: true,
+    });
+    assert(added.id !== copied.id);
+    assertEquals(f.playback[0].queueView().items.map((item) => item.id), [
+      added.id,
+    ]);
+    assertEquals(f.playback[0].playerView().current?.id, added.id);
+  } finally {
+    await f.close();
+  }
+});
