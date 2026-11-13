@@ -9,6 +9,7 @@ import { upgradeNowPlaying } from './nowplaying.ts';
 import { upgradeHatData } from './hat-data.ts';
 import { migrate } from './migrations.ts';
 import { initializeCatalogRevision } from './catalog-revision.ts';
+import { acquireHeartbeat } from '../heartbeat.ts';
 
 // Debug spans behind MELOFON_DEBUG_LOG_REQUEST (plans/diag-request-trace):
 // [db] begin/end for run + runAndReadAll — sql truncated to the verb plus
@@ -109,6 +110,20 @@ export async function openEngine(
   dataDir: string,
   opts: { debugLogQueries?: boolean; log?: Log } = {},
 ): Promise<Engine> {
+  const heartbeat = acquireHeartbeat();
+  try {
+    return await openNativeEngine(dataDir, opts, heartbeat);
+  } catch (error) {
+    heartbeat[Symbol.dispose]();
+    throw error;
+  }
+}
+
+async function openNativeEngine(
+  dataDir: string,
+  opts: { debugLogQueries?: boolean; log?: Log },
+  heartbeat: Disposable,
+): Promise<Engine> {
   await Deno.mkdir(dataDir, { recursive: true });
   const instance = await duckdb.DuckDBInstance.create(
     `${dataDir}/melofon.duckdb`,
@@ -186,7 +201,11 @@ export async function openEngine(
     try {
       conn.closeSync();
     } finally {
-      instance.closeSync();
+      try {
+        instance.closeSync();
+      } finally {
+        heartbeat[Symbol.dispose]();
+      }
     }
   }
 

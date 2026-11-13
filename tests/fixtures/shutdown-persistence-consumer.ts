@@ -3,9 +3,11 @@ import { startServer } from '../../src/server.ts';
 import { openStore } from '../../src/store/index.ts';
 import { appLogger, createLogger, installLogger } from '../../src/logging.ts';
 import { reservePorts } from '../helpers/ports.ts';
+import { observeHeartbeat } from '../helpers/heartbeat.ts';
 
 const mode = Deno.args[0];
 Deno.test(mode, async () => {
+  using observed = observeHeartbeat();
   const dir = await Deno.makeTempDir({ prefix: 'melofon-shutdown-retry-' });
   const previousLogger = appLogger();
   const logger = createLogger({ sinks: { stdout() {}, stderr() {} } });
@@ -25,6 +27,7 @@ Deno.test(mode, async () => {
   const server = await startServer({
     exit(code) {
       assert(storeClosed, 'the real store must close before exit');
+      assertEquals(observed.active.size, 0);
       exited.resolve(code);
     },
     env: {
@@ -43,6 +46,7 @@ Deno.test(mode, async () => {
       const save = store.players.saveChanges;
       store.players.saveChanges = async (batch) => {
         if (armed) {
+          observed.assertActive();
           attempts.push(JSON.stringify(batch));
           if (!household || ++householdAttempts <= 2 || !recover) {
             throw new Error('shutdown storage offline');
@@ -57,8 +61,10 @@ Deno.test(mode, async () => {
       };
       const close = store.close;
       store.close = async () => {
+        observed.assertActive();
         beforeClose = (await store.players.list())[0].volume;
         await close();
+        observed.assertActive();
         storeClosed = true;
       };
       return store;
@@ -93,6 +99,7 @@ Deno.test(mode, async () => {
         false,
         'retained batches drain before store close',
       );
+      observed.assertActive();
       release.resolve();
     }
     if (shutdown) {
