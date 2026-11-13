@@ -72,13 +72,14 @@ export async function startServer(options: {
   env?: Record<string, string>;
   exit?: (code: number) => void;
   setupLog?: Log;
+  openStore?: typeof openStore;
 } = {}) {
   const log = scopedLog('server');
 
   const env = options.env ?? Deno.env.toObject();
   const cfg = loadConfig((name) => env[name]);
   const startedAt = new Date().toISOString();
-  const store = await openStore(cfg.dataDir, {
+  const store = await (options.openStore ?? openStore)(cfg.dataDir, {
     debugLogQueries: cfg.debugLogRequests,
   });
   const credentials = createSpeakerCredentials({

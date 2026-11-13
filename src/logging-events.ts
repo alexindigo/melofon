@@ -94,6 +94,11 @@ export interface EventFacts {
   server_failed: { port: number } & ErrorFacts;
   startup_failed: ErrorFacts;
   persistence_failed: ErrorFacts;
+  persistence_shutdown_failed: ErrorFacts & {
+    attempts: number;
+    pendingWrites: number;
+    batches: string[];
+  };
   playback_expiry_failed: ErrorFacts;
   source_retry: {
     entry: number;
@@ -394,6 +399,12 @@ export const events: Record<EventId, EventDefinition> = {
     'debug',
     'Persistence write failed',
     'error',
+  ),
+  persistence_shutdown_failed: definition(
+    'persistence',
+    'fatal',
+    'Shutdown could not save accepted writes; these batches will be lost on exit',
+    'attempts pendingWrites batches error',
   ),
   source_retry: definition(
     'playback',

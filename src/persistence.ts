@@ -53,8 +53,9 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   drain(): Promise<void>;
   /** Unsaved published batches, without exposing private failure details. */
   health(): { pendingWrites: number };
-  /** Reject new publications and stop automatic retries, then drain accepted
-   * writes. A failed attempt retains them for a later close or drain. */
+  /** Reject publications and stop automatic retries, then drain accepted writes
+   * with bounded shutdown retries. Exhaustion logs the batches lost on exit;
+   * they remain retained for an explicit later close or drain. */
   close(): Promise<void>;
 }
 
@@ -83,6 +84,8 @@ export function createPersistence(
   const retryKey = 'persistence.retryBackoffMs';
   const retryDefault = [1000, 2000, 5000, 30000];
   let backoff = retryDefault;
+  const shutdownRetryKey = 'persistence.shutdownRetries';
+  let shutdownRetries = 2;
   state?.declare(retryKey, {
     type: 'array',
     items: { type: 'integer', minimum: 1, maximum: 600000 },
@@ -90,25 +93,38 @@ export function createPersistence(
     description:
       'Published save retry delays in ms; repeat the last delay until saved; empty uses defaults',
   });
+  state?.declare(shutdownRetryKey, {
+    type: 'integer',
+    minimum: 0,
+    default: shutdownRetries,
+    description:
+      'Extra attempts to save retained batches before shutdown; uses the retry backoff without repeating indefinitely',
+  });
   let policyRevision = 0;
   const loadPolicy = async () => {
     const revision = ++policyRevision;
     try {
-      const delays = await state?.getTyped(retryKey);
-      if (!closed && revision === policyRevision && Array.isArray(delays)) {
-        backoff = delays.length ? delays as number[] : retryDefault;
+      const [delays, retries] = await Promise.all([
+        state?.getTyped(retryKey),
+        state?.getTyped(shutdownRetryKey),
+      ]);
+      if (revision === policyRevision) {
+        if (Array.isArray(delays)) {
+          backoff = delays.length ? delays as number[] : retryDefault;
+        }
+        if (typeof retries === 'number') shutdownRetries = retries;
       }
     } catch (error) {
       log.event('persistence_failed', { error });
     }
   };
   const unsubscribe = state?.onChange((key) => {
-    if (key === retryKey) policyWork = loadPolicy();
+    if (key === retryKey || key === shutdownRetryKey) policyWork = loadPolicy();
   });
   let policyWork = state ? loadPolicy() : Promise.resolve();
   // Includes published batches still waiting to enter the retry queue on tail.
   let acceptedWrites = 0;
-  const pendingWrites: (() => Promise<void>)[] = [];
+  const pendingWrites: { save(): Promise<void>; target: string }[] = [];
   const cancelRetry = () => {
     retryEpoch++;
     retryTimer?.cancel();
@@ -127,7 +143,7 @@ export function createPersistence(
   const retryWrites = async () => {
     cancelRetry();
     while (pendingWrites.length) {
-      await pendingWrites[0]();
+      await pendingWrites[0].save();
       pendingWrites.shift();
       acceptedWrites--;
       retryAttempt = 0;
@@ -142,13 +158,13 @@ export function createPersistence(
     observe(write);
     return write;
   };
-  const enqueue = (write: () => Promise<void>): void => {
+  const enqueue = (write: () => Promise<void>, target: string): void => {
     requireOpen();
     acceptedWrites++;
     const work = tail.then(async () => {
       // Published intent succeeds independently of storage. Retain every whole
       // batch behind its predecessors; this owner wakes itself when idle.
-      pendingWrites.push(write);
+      pendingWrites.push({ save: write, target });
       await retryWrites();
     });
     observe(work);
@@ -160,6 +176,10 @@ export function createPersistence(
     players: Map<number, PlayerSave>;
     outputs: Map<string, AdoptedSpeakerSnapshot>;
   } | undefined;
+  const playerTarget = (row: PlayerSave) =>
+    `${row.playerId}(${
+      Object.keys(row).filter((key) => key !== 'playerId').sort().join(',')
+    })`;
   const savePlayer = (row: PlayerSave, save = enqueue) => {
     requireOpen();
     if (membershipChange) {
@@ -167,12 +187,17 @@ export function createPersistence(
         ...membershipChange.players.get(row.playerId),
         ...row,
       });
-    } else save(() => store.players.saveChanges({ players: [row] }));
+    } else {
+      save(
+        () => store.players.saveChanges({ players: [row] }),
+        `player:${playerTarget(row)}`,
+      );
+    }
   };
   const forPlayer = (playerId: number): EnginePersistence => {
     let active = true;
     let retired = false;
-    const save = (write: () => Promise<void>) =>
+    const save = (write: () => Promise<void>, target: string) =>
       enqueue(async () => {
         if (retired) return;
         try {
@@ -182,19 +207,29 @@ export function createPersistence(
           // inside the store lane. It no longer has a player to persist or retry.
           if (!retired) throw error;
         }
-      });
+      }, target);
     return {
       saveQueue(snapshot, state) {
         if (!active) return;
         const copy = structuredClone(snapshot);
         if (membershipChange) savePlayer({ playerId, queue: copy, state });
-        else save(() => store.playback.saveQueue(playerId, copy, state));
+        else {
+          save(
+            () => store.playback.saveQueue(playerId, copy, state),
+            `player:${playerId}:queue`,
+          );
+        }
       },
       saveState(snapshot) {
         if (!active) return;
         if (membershipChange) {
           savePlayer({ playerId, state: structuredClone(snapshot) });
-        } else save(() => store.playback.saveState(playerId, snapshot));
+        } else {
+          save(
+            () => store.playback.saveState(playerId, snapshot),
+            `player:${playerId}:state`,
+          );
+        }
       },
       saveCommand(commandedAtMs) {
         if (active) {
@@ -241,7 +276,12 @@ export function createPersistence(
         players: [...batch.players.values()],
         outputs: [...batch.outputs.values()],
       });
-    enqueue(commit);
+    enqueue(
+      commit,
+      `players:${
+        [...batch.players.values()].map(playerTarget).join(',')
+      } speakers:${[...batch.outputs.keys()].join(',')}`,
+    );
     // The change is already published. A durable failure is logged and stays
     // in the ordered queue, not returned as a retryable command failure.
     await tail;
@@ -270,9 +310,12 @@ export function createPersistence(
       outputCache.set(row.id, row);
       if (membershipChange) {
         membershipChange.outputs.set(row.id, { ...row, connectionStrategy });
-      } else {enqueue(() =>
-          store.playback.saveOutput({ ...row, connectionStrategy })
-        );}
+      } else {
+        enqueue(
+          () => store.playback.saveOutput({ ...row, connectionStrategy }),
+          `speaker:${row.id}:preferences`,
+        );
+      }
     },
 
     async adoptOutput(row) {
@@ -312,7 +355,7 @@ export function createPersistence(
       // the whole credential/configuration delete for retry, never restore it.
       enqueue(async () => {
         await store.speakers.deleteAdopted(id);
-      });
+      }, `speaker:${id}:forget`);
       await tail;
     },
 
@@ -369,7 +412,28 @@ export function createPersistence(
         cancelRetry();
         unsubscribe?.();
       }
-      closeWork = policyWork.then(drain).catch((error) => {
+      closeWork = policyWork.then(async () => {
+        // Only this household owner can retry every accepted batch in order.
+        // The caller keeps the store open until these finite attempts settle.
+        for (let attempt = 0; attempt <= shutdownRetries; attempt++) {
+          try {
+            await drain();
+            return;
+          } catch (error) {
+            if (attempt >= shutdownRetries) {
+              log.event('persistence_shutdown_failed', {
+                error,
+                attempts: attempt + 1,
+                pendingWrites: acceptedWrites,
+                batches: pendingWrites.map((write) => write.target),
+              });
+              throw error;
+            }
+            const delay = backoff[Math.min(attempt, backoff.length - 1)];
+            await new Promise<void>((resolve) => setTimeout(resolve, delay));
+          }
+        }
+      }).catch((error) => {
         // Admission stays closed, but retained writes still belong to us.
         // Share each in-flight attempt; only a failed attempt may be retried.
         closeWork = undefined;

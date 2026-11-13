@@ -189,6 +189,7 @@ Deno.test('household retry owner caps backoff, serializes attempts and closes be
   const dir = await Deno.makeTempDir({ prefix: 'persistence-retry-' });
   const store = await openStore(dir);
   let fail = true, calls = 0, active = 0, maximum = 0;
+  const declared: string[] = [];
   const wakeups: { fire(): void; delay: number; cancelled: boolean }[] = [];
   const persistence = createPersistence(
     {
@@ -211,9 +212,10 @@ Deno.test('household retry owner caps backoff, serializes attempts and closes be
     undefined,
     {
       declare(key) {
-        assertEquals(key, 'persistence.retryBackoffMs');
+        declared.push(key);
       },
-      getTyped: () => Promise.resolve([3, 7]),
+      getTyped: (key) =>
+        Promise.resolve(key === 'persistence.retryBackoffMs' ? [3, 7] : 2),
       onChange: () => () => {},
     },
     {
@@ -225,6 +227,10 @@ Deno.test('household retry owner caps backoff, serializes attempts and closes be
     },
   );
   try {
+    assertEquals(declared, [
+      'persistence.retryBackoffMs',
+      'persistence.shutdownRetries',
+    ]);
     persistence.saveState({ ...stopped, repeat: 'all' });
     await until(() => wakeups.length === 1);
     for (let i = 0; i < 3; i++) {
