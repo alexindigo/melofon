@@ -168,6 +168,9 @@ export async function requireUserId(
 
 export function createUsersStore(engine: Engine) {
   return {
+    idForName(username: string): Promise<string | null> {
+      return engine.exclusive((q) => userIdForName(q, username));
+    },
     profile(username: string): Promise<UserProfile | null> {
       return engine.exclusive(async (q) =>
         (await q.all<UserProfile>(

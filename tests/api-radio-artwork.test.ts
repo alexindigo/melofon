@@ -261,7 +261,9 @@ Deno.test('radio artwork HTTP: upload, shared pixels/legacy delivery, replacemen
         e.audience === 'all'
       ),
     );
-    assertEquals(t.events.filter((e) => e.types.includes('library')).length, 3);
+    // Creation and station-name changes also publish owner changes now that
+    // core discovers generated artwork without a read triggering computation.
+    assertEquals(t.events.filter((e) => e.types.includes('library')).length, 5);
   } finally {
     await t.close();
   }

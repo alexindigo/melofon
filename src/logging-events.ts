@@ -75,6 +75,7 @@ export interface EventFacts {
   lookup_plugin_log: { plugin: string; payload: unknown };
   lookup_failed: { plugin: string } & ErrorFacts;
   podcast_failed: ErrorFacts;
+  artwork_facts_failed: { sourceHash?: string } & ErrorFacts;
   radio_artwork_unavailable: {
     station: string;
     reason: 'missing' | 'unreadable' | 'too_large' | 'incomplete';
@@ -320,6 +321,12 @@ export const events: Record<EventId, EventDefinition> = {
     'error',
     'Podcast operation failed',
     'error',
+  ),
+  artwork_facts_failed: definition(
+    'artwork',
+    'warn',
+    'Artwork facts unavailable',
+    'sourceHash error',
   ),
   radio_artwork_unavailable: definition(
     'radio',

@@ -1,15 +1,22 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
-import { decodeBase64 } from '@std/encoding/base64';
+import { decodeBase64, encodeBase64 } from '@std/encoding/base64';
 import { createArtwork } from '../src/artwork.ts';
-import { createHatData } from '../src/hat-data.ts';
+import { createArtworkBackground } from '../src/artwork/background.ts';
+import { dominantColor } from '../src/artwork/dominant-color.ts';
+import { rgbaToThumbHash } from '../src/artwork/thumbhash.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createFolders } from '../src/folders.ts';
+import { createPlaylists } from '../src/playlists.ts';
+import { createRadio } from '../src/radio.ts';
+import { createPodcasts, type Podcasts } from '../src/podcasts.ts';
 import { imagePixels } from '../src/media.ts';
+import { imageHash } from '../src/images.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { apiFixture, error } from './helpers/api.ts';
 import { pixelPng } from './helpers/pixel-image.ts';
 import { tagged } from './helpers/tagged.ts';
+import { waitForWorkerSignal } from './helpers/artwork-worker.ts';
 import reference from './fixtures/thumbhash-reference.json' with {
   type: 'json',
 };
@@ -17,17 +24,76 @@ import reference from './fixtures/thumbhash-reference.json' with {
 const red = reference.vectors.find((v) => v.name === 'one-red')!;
 const black = reference.vectors.find((v) => v.name === 'one-black')!;
 
-async function fixture() {
+async function fixture(
+  options: {
+    background?: boolean;
+    workerUrl?: URL;
+    onComputing?: () => void;
+    workerGate?: Int32Array;
+    podcasts?: boolean;
+  } = {},
+) {
   const root = await Deno.makeTempDir({ prefix: 'melofon-artwork-facts-' });
   const source = pixelPng(red.w, red.h, decodeBase64(red.rgba));
   const cover = `${root}/music/Artist/Album/cover.png`;
   let calls: number[][] = [];
-  let failure = false;
+  const logs: string[] = [];
+  let background: ReturnType<typeof createArtworkBackground> | undefined;
+  let radio!: ReturnType<typeof createRadio>;
+  let playlists!: ReturnType<typeof createPlaylists>;
+  let podcasts: Podcasts | undefined;
   const open = (initial: boolean) =>
     apiFixture({
       storeDir: `${root}/data`,
       services: async (f) => {
         const libraries = createLibraries(f.store);
+        const library = createLibrary(f.store);
+        radio = createRadio(f.store, {
+          state: f.state,
+          dataDir: f.cfg.dataDir,
+          notify: f.notify,
+        });
+        playlists = createPlaylists(f.store, f.notify);
+        if (options.podcasts) {
+          podcasts = await createPodcasts({
+            store: f.store,
+            state: f.state,
+            dataDir: f.cfg.dataDir,
+            notify: f.notify,
+          });
+        }
+        const artwork = createArtwork(library, {
+          state: f.state,
+          dataDir: f.cfg.dataDir,
+          facts: f.store.artwork,
+          radio,
+          playlists,
+          podcasts,
+          pixels: async (bytes, width, height) => {
+            calls.push([width, height]);
+            return await imagePixels(bytes, width, height);
+          },
+        });
+        if (options.workerGate) {
+          const pixels = artwork.pixels;
+          artwork.pixels = async (...args) => {
+            const result = await pixels(...args);
+            return result.kind === 'pixels' && result.width === 100
+              ? { ...result, gate: options.workerGate!.buffer }
+              : result;
+          };
+        }
+        if (options.background !== false) {
+          background = createArtworkBackground({
+            artwork,
+            store: f.store,
+            state: f.state,
+            notify: f.notify!,
+            workerUrl: options.workerUrl,
+            onComputing: options.onComputing,
+            log: { event: (id) => logs.push(id) },
+          });
+        }
         if (initial) {
           for (const album of ['Album', 'Copy', 'Missing']) {
             await Deno.mkdir(`${root}/music/Artist/${album}`, {
@@ -48,23 +114,18 @@ async function fixture() {
           }
           await Deno.writeFile(`${root}/music/Artist/artist.png`, source);
           await libraries.add('Music', `${root}/music`);
-          await scanLibrary(f.store);
+          await scanLibrary(f.store, undefined, undefined, undefined, {
+            notify: f.notify,
+          });
         }
-        const library = createLibrary(f.store);
         return {
           library,
           libraries,
           folders: createFolders(f.store),
-          artwork: createArtwork(library, {
-            state: f.state,
-            dataDir: f.cfg.dataDir,
-            facts: f.store.artwork,
-            pixels: async (bytes, width, height) => {
-              calls.push([width, height]);
-              if (failure) throw new Error('fixture decode failure');
-              return await imagePixels(bytes, width, height);
-            },
-          }),
+          artwork,
+          radio,
+          playlists,
+          podcasts,
         };
       },
     });
@@ -80,23 +141,42 @@ async function fixture() {
     cover,
     song,
     songs,
+    logs,
+    get radio() {
+      return radio;
+    },
+    get playlists() {
+      return playlists;
+    },
     get calls() {
       return calls;
     },
-    fail(value: boolean) {
-      failure = value;
+    get podcasts() {
+      return podcasts;
     },
-    async clear() {
-      const data = createHatData(f.store, f.cfg, f.state)('melofon');
-      for (const record of await data.list()) await data.remove(record.key);
-      calls = [];
+    get background() {
+      return background;
+    },
+    async idle() {
+      await background?.idle();
+    },
+    async rescan() {
+      await scanLibrary(f.store, undefined, undefined, undefined, {
+        notify: f.notify,
+      });
+      await background?.idle();
     },
     async restart() {
+      await podcasts?.close();
+      await background?.close();
       await f.close();
-      f = await open(false);
       calls = [];
+      f = await open(false);
+      await background?.idle();
     },
     async close() {
+      await podcasts?.close();
+      await background?.close();
       await f.close();
       await Deno.remove(root, { recursive: true });
     },
@@ -119,38 +199,20 @@ async function read(
   return { body: await response.json(), etag: response.headers.get('etag')! };
 }
 
-Deno.test('API lazy artwork: real song/album/artist lists and details publish trusted facts on the next read', async () => {
+Deno.test('API core artwork: scan computes before any browse request; lists, details and image responses reuse facts', async () => {
   const t = await fixture();
   try {
-    const ips = await Deno.resolveDns('melofon.home', 'A');
-    assert(ips.length > 0 && ips.every((ip) => !ip.startsWith('127.')));
+    await t.idle();
+    assertEquals(
+      t.calls,
+      [[1, 1]],
+      'identical artwork computes once across all references',
+    );
     const cookie = (await t.f.login('cookie')).credential;
     const bearer = (await t.f.login('bearer')).credential;
-    for (const [index, kind] of ['songs', 'albums', 'artists'].entries()) {
-      await t.clear();
+    for (const kind of ['songs', 'albums', 'artists']) {
       const first = await read(t.f, kind, cookie);
-      const rows = first.body[kind];
-      assert(rows.some((r: { artwork: unknown }) => r.artwork !== null));
-      for (const row of rows) {
-        if (row.artwork) {
-          assertEquals([row.artwork.thumbHash, row.artwork.dominantColor], [
-            null,
-            null,
-          ]);
-        }
-      }
-      assertEquals(
-        t.calls,
-        [[1, 1]],
-        'identical source images decode once per reply',
-      );
-      const second = await read(t.f, kind, bearer, first.etag);
-      assertNotEquals(
-        second.etag,
-        first.etag,
-        'readiness is part of the representation',
-      );
-      for (const row of second.body[kind]) {
+      for (const row of first.body[kind]) {
         if (!row.artwork) continue;
         assertEquals([
           row.artwork.thumbHash,
@@ -158,215 +220,167 @@ Deno.test('API lazy artwork: real song/album/artist lists and details publish tr
           row.artwork.width,
           row.artwork.height,
         ], [red.hash, '#ff0000', 1, 1]);
-        assert(row.artwork.url.includes(`?v=${row.artwork.version}`));
-        const image = await t.f.get(row.artwork.url, cookie);
+        const image = await t.f.get(row.artwork.url, bearer);
+        assertEquals(image.status, 200);
         assertEquals(new Uint8Array(await image.arrayBuffer()), t.source);
+        assertEquals(
+          (await read(t.f, `${kind}/${row.id}`, bearer)).body[kind.slice(0, -1)]
+            .artwork,
+          row.artwork,
+        );
       }
-      assertEquals(t.calls.length, 1);
       const repeated = await t.f.get(`/api/v1/${kind}`, bearer, {
-        'If-None-Match': second.etag,
+        'If-None-Match': first.etag,
       });
       assertEquals(repeated.status, 304);
-      assertEquals(await repeated.text(), '');
-      const selected = second.body[kind].find((r: { artwork: unknown }) =>
-        r.artwork !== null
-      );
-      await t.clear();
-      const path = `${kind}/${selected.id}`;
-      const a = await read(t.f, path, index % 2 ? bearer : cookie);
-      const b = await read(t.f, path, bearer, a.etag);
-      const entity = kind.slice(0, -1);
-      assertEquals(a.body[entity].artwork.thumbHash, null);
-      assertEquals(b.body[entity].artwork.thumbHash, red.hash);
+      await repeated.text();
     }
-    const records = await t.f.store.hatData.list('melofon', '');
-    assertEquals(records.length, 1);
-    assertEquals(records[0].kind, 'data');
-    await t.restart();
-    const after = await read(t.f, 'songs', bearer);
-    assertEquals(
-      after.body.songs.find((s: { id: string }) => s.id === t.song.id).artwork
-        .thumbHash,
-      red.hash,
-    );
-    assertEquals(t.calls, [], 'restart reuses persisted facts');
+    const search = (await read(t.f, 'search?query=Album', cookie)).body;
+    assertEquals(search.songs.songs[0].artwork.thumbHash, red.hash);
+    assertEquals(search.albums.albums[0].artwork.thumbHash, red.hash);
+    const folder = (await read(
+      t.f,
+      `folders?library=${t.song.libraryId}&path=Artist%2FAlbum`,
+      bearer,
+    )).body;
+    assertEquals(folder.songs.songs[0].artwork.thumbHash, red.hash);
+    assertEquals(t.calls, [[1, 1]], 'requests never compute');
+    assertEquals(await t.f.store.hatData.list('melofon', ''), []);
     assert(t.f.peers.every((ip) => ip !== '127.0.0.1' && ip !== '::1'));
+    await error(
+      await t.f.get(`/api/v1/songs/${t.song.id}`),
+      401,
+      'unauthenticated',
+    );
   } finally {
     await t.close();
   }
 });
 
-Deno.test('API lazy artwork: all-transparent images decode once and reuse v2 facts with no colour', async () => {
+Deno.test('API core artwork: requests neither compute nor queue missing facts', async () => {
+  const t = await fixture({ background: false });
+  try {
+    const key = (await t.f.login('bearer')).credential;
+    for (let n = 0; n < 3; n++) {
+      const row = (await read(t.f, `songs/${t.song.id}`, key)).body.song;
+      assertEquals([row.artwork.thumbHash, row.artwork.dominantColor], [
+        null,
+        null,
+      ]);
+    }
+    assertEquals(t.calls, []);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('API core artwork: concurrent requests share one background computation and readiness changes validators', async () => {
+  let release!: () => void;
+  const started = Promise.withResolvers<void>();
+  const t = await fixture({ onComputing: () => started.resolve() });
+  try {
+    await t.idle();
+    const key = (await t.f.login('bearer')).credential;
+    const original = t.f.store.artwork.savePreview;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    t.f.store.artwork.savePreview = async (...args) => {
+      await blocked;
+      await original(...args);
+    };
+    await Deno.writeFile(t.cover, pixelPng(1, 1, decodeBase64(black.rgba)));
+    t.background!.refresh();
+    const before = await Promise.all(
+      Array.from({ length: 8 }, () => read(t.f, `songs/${t.song.id}`, key)),
+    );
+    for (const result of before) {
+      assertEquals(result.body.song.artwork.thumbHash, null);
+    }
+    release();
+    await t.idle();
+    const after = await read(t.f, `songs/${t.song.id}`, key, before[0].etag);
+    assertNotEquals(after.etag, before[0].etag);
+    assertEquals(after.body.song.artwork.thumbHash, black.hash);
+    assertEquals(t.calls, [[1, 1], [1, 1]]);
+  } finally {
+    release?.();
+    await t.close();
+  }
+});
+
+Deno.test('API core artwork: restart retains core facts, including transparent no-colour results', async () => {
   const t = await fixture();
   try {
-    const cookie = (await t.f.login('cookie')).credential;
-    const bearer = (await t.f.login('bearer')).credential;
-    const path = `songs/${t.song.id}`;
+    await t.idle();
     await Deno.writeFile(
       t.cover,
       pixelPng(1, 1, new Uint8Array([0, 128, 128, 0])),
     );
-    const first = (await read(t.f, path, cookie)).body.song.artwork;
-    assertEquals([first.thumbHash, first.dominantColor], [null, null]);
-    const second = (await read(t.f, path, bearer)).body.song.artwork;
-    assertEquals(t.calls, [[1, 1]], 'all-transparent facts must be cached');
-    assertEquals(
-      second.dominantColor,
-      null,
-      'the API must never expose an empty colour',
-    );
-    assert(typeof second.thumbHash === 'string' && second.thumbHash.length > 0);
-
-    const data = createHatData(t.f.store, t.f.cfg, t.f.state)('melofon');
-    const [record] = await data.list();
-    assert(record.key.startsWith('artwork-facts/v2/'));
-    const saved = await data.get(record.key);
-    assert(
-      saved?.kind === 'data' && saved.value && typeof saved.value === 'object',
-    );
-    assert(!Array.isArray(saved.value));
-    assertEquals(saved.value.algorithmVersion, 2);
-    assertEquals(
-      saved.value.dominantColor,
-      null,
-      'storage uses the same no-colour representation',
-    );
-
-    t.fail(true);
-    await t.f.state.set('melofon.artworkFactsPerRequest', '0');
-    const repeated = (await read(t.f, path, cookie)).body.song.artwork;
-    assertEquals(repeated, second, 'cached facts need no decode budget');
-    assertEquals(await data.get(record.key), saved);
-    assertEquals(t.calls, [[1, 1]]);
+    await t.rescan();
+    const key = (await t.f.login('bearer')).credential;
+    const before =
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    assertEquals(before.dominantColor, null);
+    assert(typeof before.thumbHash === 'string');
     await t.restart();
-    const restored = (await read(t.f, path, bearer)).body.song.artwork;
-    assertEquals(restored, second, 'restart reuses persisted no-colour facts');
-    assertEquals(t.calls, [], 'restart does not decode the image again');
+    assertEquals(t.calls, []);
+    assertEquals(
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork,
+      before,
+    );
+    assertEquals(await t.f.store.hatData.list('melofon', ''), []);
   } finally {
     await t.close();
   }
 });
 
-Deno.test('API lazy artwork: v1 facts are recomputed and only v2 facts are reused', async () => {
+Deno.test('API core artwork: rescan discovers changed sources, dimensions and pixel admission without requests', async () => {
   const t = await fixture();
   try {
+    await t.idle();
     const key = (await t.f.login('bearer')).credential;
-    const path = `songs/${t.song.id}`;
-    const data = createHatData(t.f.store, t.f.cfg, t.f.state)('melofon');
-    await read(t.f, path, key);
-    const [record] = await data.list();
-    assert(record.key.startsWith('artwork-facts/v2/'));
-    const saved = await data.get(record.key);
-    assert(
-      saved?.kind === 'data' && saved.value && typeof saved.value === 'object',
-    );
-    assert(!Array.isArray(saved.value));
-    assertEquals(saved.value.algorithmVersion, 2);
-    const legacy = {
-      ...saved.value,
-      algorithmVersion: 1,
-      dominantColor: '#00ff00',
-    };
-    await t.clear();
-    const oldKey = record.key.replace('artwork-facts/v2/', 'artwork-facts/v1/');
-    await data.put(oldKey, { kind: 'data', value: legacy });
-    assertEquals(
-      (await read(t.f, path, key)).body.song.artwork.dominantColor,
-      null,
-    );
-    const fresh = await read(t.f, path, key);
-    assertEquals(fresh.body.song.artwork.dominantColor, '#ff0000');
-    assertEquals(fresh.body.song.artwork.thumbHash, red.hash);
-    assertEquals(
-      t.calls,
-      [[1, 1]],
-      'legacy namespace must not suppress decoding',
-    );
-    assertEquals(await data.get(oldKey), { kind: 'data', value: legacy });
-
-    // A v1 payload under the new key must also fail validation, then be replaced.
-    await data.put(record.key, { kind: 'data', value: legacy });
-    assertEquals(
-      (await read(t.f, path, key)).body.song.artwork.dominantColor,
-      null,
-    );
-    assertEquals(
-      (await read(t.f, path, key)).body.song.artwork.dominantColor,
-      '#ff0000',
-    );
-    assertEquals(t.calls, [[1, 1], [1, 1]]);
-    assertEquals(
-      await data.get(record.key),
-      saved,
-      'writer persists version 2',
-    );
-  } finally {
-    await t.close();
-  }
-});
-
-Deno.test('API lazy artwork: source changes without scan, policy changes, original dimensions and deleted entities', async () => {
-  const t = await fixture();
-  try {
-    const key = (await t.f.login('bearer')).credential;
-    const path = `songs/${t.song.id}`;
-    await read(t.f, path, key);
-    const old = await read(t.f, path, key);
-    const revision =
-      (await createLibrary(t.f.store).getSongSnapshot(t.song.id)).revision;
-    await Deno.writeFile(t.cover, pixelPng(1, 1, decodeBase64(black.rgba)));
-    const miss = await read(t.f, path, key, old.etag);
-    assertEquals(miss.body.song.artwork.thumbHash, null);
-    assertNotEquals(
-      miss.body.song.artwork.version,
-      old.body.song.artwork.version,
-    );
-    const changed = await read(t.f, path, key, miss.etag);
-    assertEquals([
-      changed.body.song.artwork.thumbHash,
-      changed.body.song.artwork.dominantColor,
-    ], [black.hash, '#000000']);
-    assertEquals(
-      (await createLibrary(t.f.store).getSongSnapshot(t.song.id)).revision,
-      revision,
-    );
-    const count = t.calls.length;
-    await t.f.state.set('artwork.jpegQuality', '40');
-    const policy = await read(t.f, path, key, changed.etag);
-    assertNotEquals(
-      policy.body.song.artwork.version,
-      changed.body.song.artwork.version,
-    );
-    assertEquals(policy.body.song.artwork.thumbHash, black.hash);
-    assertEquals(
-      t.calls.length,
-      count,
-      'rendition settings do not invalidate source-keyed codecs',
-    );
-    const large = new Uint8Array(
-      Array.from({ length: 137 * 71 }, () => [255, 0, 0, 255]).flat(),
-    );
-    await Deno.writeFile(t.cover, pixelPng(137, 71, large));
-    await read(t.f, path, key);
-    const scaled = (await read(t.f, path, key)).body.song.artwork;
-    assertEquals([scaled.width, scaled.height, scaled.dominantColor], [
-      137,
-      71,
-      '#ff0000',
-    ]);
-    assertEquals(t.calls.at(-1), [100, 51]);
-    assert(typeof scaled.thumbHash === 'string');
-    await t.f.state.set('server.baseUrl', `${t.f.origin}/music`);
-    const prefixed = await t.f.get(`/music/api/v1/${path}`, key);
-    assert(
-      (await prefixed.json()).song.artwork.url.startsWith(
-        '/music/api/v1/artwork/',
+    const before =
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    await t.f.state.set('artwork.maxPixels', '1');
+    await t.idle();
+    await Deno.writeFile(
+      t.cover,
+      pixelPng(
+        137,
+        71,
+        new Uint8Array(
+          Array.from({ length: 137 * 71 }, () => [0, 0, 0, 255]).flat(),
+        ),
       ),
     );
+    await t.rescan();
+    const missing =
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    assertEquals([missing.width, missing.height, missing.thumbHash], [
+      137,
+      71,
+      null,
+    ]);
+    await t.f.state.set('artwork.maxPixels', '64000000');
+    await t.idle();
+    const after =
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    assertEquals(after.dominantColor, '#000000');
+    assertNotEquals(before.version, after.version);
+    assertEquals(t.calls.at(-1), [100, 51]);
+    const count = t.calls.length;
+    await t.f.state.set('artwork.jpegQuality', '40');
+    await t.idle();
+    const policy =
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    assertNotEquals(policy.version, after.version);
+    assertEquals(policy.thumbHash, after.thumbHash);
+    assertEquals(t.calls.length, count);
     await Deno.remove(t.song.path);
-    await scanLibrary(t.f.store);
+    await t.rescan();
     await error(
-      await t.f.get(`/music/api/v1/${path}`, key, { 'If-None-Match': '*' }),
+      await t.f.get(`/api/v1/songs/${t.song.id}`, key),
       404,
       'not_found',
     );
@@ -375,151 +389,230 @@ Deno.test('API lazy artwork: source changes without scan, policy changes, origin
   }
 });
 
-Deno.test('API lazy artwork: bounded distinct misses and decoder failures remain retryable', async () => {
+Deno.test('API core artwork: Worker failure logs and leaves null; later owner changes retry', async () => {
+  const t = await fixture({
+    workerUrl: new URL(
+      'data:application/javascript,throw new Error("fixture worker failure")',
+    ),
+  });
+  try {
+    await t.idle();
+    assert(t.logs.includes('artwork_facts_failed'));
+    const key = (await t.f.login('bearer')).credential;
+    const row = (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    assertEquals([row.thumbHash, row.dominantColor], [null, null]);
+    const count = t.calls.length;
+    await read(t.f, 'songs', key);
+    assertEquals(t.calls.length, count, 'requests do not retry failed Workers');
+    t.background!.refresh();
+    await t.idle();
+    assertEquals(t.calls.length, count + 1);
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('API core artwork: failed persistence remains retryable without poisoning the cache', async () => {
   const t = await fixture();
   try {
-    const key = (await t.f.login('cookie')).credential;
-    await Deno.writeFile(
-      `${t.root}/music/Artist/Copy/cover.png`,
+    await t.idle();
+    const original = t.f.store.artwork.savePreview;
+    t.f.store.artwork.savePreview = () =>
+      Promise.reject(new Error('fixture storage failure'));
+    await Deno.writeFile(t.cover, pixelPng(1, 1, decodeBase64(black.rgba)));
+    await t.rescan();
+    const key = (await t.f.login('bearer')).credential;
+    assertEquals(
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork.thumbHash,
+      null,
+    );
+    t.f.store.artwork.savePreview = original;
+    t.background!.refresh();
+    await t.idle();
+    assertEquals(
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork.thumbHash,
+      black.hash,
+    );
+  } finally {
+    await t.close();
+  }
+});
+
+Deno.test('API core artwork: uploaded radio covers, generated tiles and private playlists compute at owner changes', async () => {
+  const t = await fixture();
+  try {
+    await t.idle();
+    const station = await t.radio.create({
+      name: 'Test station',
+      streamUrl: 'http://radio.home/live',
+      homePageUrl: null,
+    });
+    assert(!('invalid' in station));
+    const list = await t.playlists.create('admin', 'Private', [t.song.id]);
+    await t.idle();
+    const key = (await t.f.login('bearer')).credential;
+    const generated =
+      (await read(t.f, 'radio-stations', key)).body.radioStations[0].artwork;
+    assert(typeof generated.thumbHash === 'string');
+    const playlistResponse = await t.f.get(`/api/v1/playlists/${list.id}`, key);
+    assertEquals(playlistResponse.status, 200);
+    assertEquals(
+      playlistResponse.headers.get('cache-control'),
+      'private, no-store',
+    );
+    const playlist = (await playlistResponse.json()).playlist;
+    assert(typeof playlist.artwork.thumbHash === 'string');
+    await t.radio.putArtwork(
+      station.id,
       pixelPng(1, 1, decodeBase64(black.rgba)),
     );
-    await t.f.state.set('melofon.artworkFactsPerRequest', '1');
-    t.fail(true);
-    await read(t.f, 'songs', key);
-    assertEquals(
-      t.calls.length,
-      1,
-      'budget counts failed attempts, including concurrent row projections',
-    );
-    assertEquals(await t.f.store.hatData.list('melofon', ''), []);
-    t.fail(false);
-    await read(t.f, 'songs', key);
-    assertEquals(t.calls.length, 2);
-    const partial = await read(t.f, 'songs', key);
-    assertEquals(
-      partial.body.songs.filter((
-        s: { artwork: { thumbHash: string | null } | null },
-      ) => s.artwork?.thumbHash).length,
-      1,
-    );
-    const complete = await read(t.f, 'songs', key, partial.etag);
-    assertEquals(
-      complete.body.songs.filter((
-        s: { artwork: { thumbHash: string | null } | null },
-      ) => s.artwork?.thumbHash).length,
-      2,
-    );
-    assertEquals(t.calls.length, 3);
-    assertEquals(
-      complete.body.songs.find((s: { title: string }) => s.title === 'Missing')
-        .artwork,
-      null,
-    );
-    await t.clear();
-    await t.f.state.set('melofon.artworkFactsPerRequest', '0');
-    await read(t.f, 'songs', key);
-    assertEquals(t.calls.length, 0);
-    await t.f.state.set('melofon.artworkFactsPerRequest', '8');
-    await t.f.state.set('artwork.maxPixels', '1');
-    await Deno.writeFile(
-      t.cover,
-      pixelPng(2, 1, new Uint8Array([255, 0, 0, 255, 255, 0, 0, 255])),
-    );
-    const path = `songs/${t.song.id}`;
-    await read(t.f, path, key);
-    assertEquals(
-      t.calls.length,
-      0,
-      'core rejects over-budget pixels before native admission',
-    );
-    await t.f.state.set('artwork.maxPixels', '64000000');
-    await read(t.f, path, key);
-    assertEquals(t.calls.length, 1);
-    assert((await read(t.f, path, key)).body.song.artwork.thumbHash);
+    await t.idle();
+    const uploaded =
+      (await read(t.f, 'radio-stations', key)).body.radioStations[0].artwork;
+    assertEquals([uploaded.thumbHash, uploaded.dominantColor], [
+      black.hash,
+      '#000000',
+    ]);
+    assertNotEquals(uploaded.version, generated.version);
   } finally {
     await t.close();
   }
 });
 
-Deno.test('API lazy artwork: a source race cannot publish mismatched pixels under the old hash', async () => {
-  const t = await fixture();
+Deno.test('API core artwork: adversarial 100x100 computation does not block another HTTP response', async () => {
+  let observe = false;
+  const entered = Promise.withResolvers<void>();
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  const release = () => {
+    Atomics.store(gate, 0, 1);
+    Atomics.notify(gate, 0);
+  };
+  const t = await fixture({
+    workerUrl: new URL('./fixtures/artwork-gated-worker.ts', import.meta.url),
+    workerGate: gate,
+    onComputing: () => {
+      if (observe) entered.resolve();
+    },
+  });
   try {
+    await t.idle();
     const key = (await t.f.login('bearer')).credential;
-    const path = `songs/${t.song.id}`;
-    // Change the source after describe but before pixels resolves its snapshot.
-    const data = createHatData(t.f.store, t.f.cfg, t.f.state)('melofon');
-    const originalGet = t.f.store.hatData.get;
-    let replaced = false;
-    t.f.store.hatData.get = async (...args) => {
-      if (!replaced) {
-        replaced = true;
-        await Deno.writeFile(t.cover, pixelPng(1, 1, decodeBase64(black.rgba)));
+    const rgba = new Uint8Array(100 * 100 * 4);
+    let seed = 123456789;
+    for (let i = 0; i < rgba.length; i += 4) {
+      for (let j = 0; j < 3; j++) {
+        seed = (Math.imul(seed, 1664525) + 1013904223) | 0;
+        rgba[i + j] = seed >>> 24;
       }
-      return originalGet(...args);
-    };
-    try {
-      const first = await read(t.f, path, key);
-      assertEquals(first.body.song.artwork.thumbHash, null);
-      assertEquals(await data.list(), []);
-    } finally {
-      t.f.store.hatData.get = originalGet;
+      rgba[i + 3] = 255;
     }
-    await read(t.f, path, key);
-    const next = await read(t.f, path, key);
-    assertEquals(next.body.song.artwork.thumbHash, black.hash);
-    assertEquals((await data.list()).length, 1);
+    const expected = {
+      thumbHash: encodeBase64(rgbaToThumbHash(100, 100, rgba)),
+      dominantColor: dominantColor(rgba) || null,
+    };
+    await Deno.writeFile(t.cover, pixelPng(100, 100, rgba));
+    observe = true;
+    let completed = false;
+    const save = t.f.store.artwork.savePreview;
+    t.f.store.artwork.savePreview = (...args) => {
+      completed = true;
+      return save(...args);
+    };
+    t.background!.refresh();
+    await waitForWorkerSignal(entered.promise, 'computation start');
+    const other = await t.f.get('/api/v1/me', key);
+    assertEquals(other.status, 200);
+    await other.json();
+    assertEquals(
+      completed,
+      false,
+      'the other HTTP response must complete during the real Worker computation',
+    );
+    release();
+    await t.idle();
+    assertEquals(completed, true);
+    const actual =
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    assertEquals({
+      thumbHash: actual.thumbHash,
+      dominantColor: actual.dominantColor,
+    }, expected);
   } finally {
+    release();
     await t.close();
   }
 });
 
-Deno.test('API lazy artwork: failed persistence retries, and shared nested browse projections see saved facts', async () => {
+Deno.test('API core artwork: podcast cover acquisition computes facts before the first native read', async () => {
+  const t = await fixture({ podcasts: true });
+  const podcastCover = pixelPng(1, 1, decodeBase64(black.rgba));
+  const server = Deno.serve(
+    { hostname: '0.0.0.0', port: 0, onListen() {} },
+    (request): Response => {
+      if (new URL(request.url).pathname === '/cover.png') {
+        return new Response(podcastCover, {
+          headers: { 'content-type': 'image/png' },
+        });
+      }
+      return new Response(
+        `<rss version="2.0"><channel><title>Artwork podcast</title><image><url>http://melofon.home:${server.addr.port}/cover.png</url></image></channel></rss>`,
+      );
+    },
+  );
+  try {
+    await t.idle();
+    const channel = await t.podcasts!.addChannel(
+      `http://melofon.home:${server.addr.port}/feed`,
+    );
+    assertEquals(channel.status, 'completed');
+    await t.podcasts!.idle();
+    await t.idle();
+    const key = (await t.f.login('bearer')).credential;
+    const response = await t.f.get(`/api/v1/podcasts/${channel.id}`, key);
+    assertEquals(response.status, 200);
+    const body = await response.json();
+    assertEquals([
+      body.podcast.artwork.thumbHash,
+      body.podcast.artwork.dominantColor,
+    ], [black.hash, '#000000']);
+  } finally {
+    await server.shutdown();
+    await t.close();
+  }
+});
+
+Deno.test('API core artwork: a source race cannot persist new pixels under an old source hash', async () => {
   const t = await fixture();
   try {
-    const key = (await t.f.login('bearer')).credential;
-    const path = `songs/${t.song.id}`;
-    const originalPut = t.f.store.hatData.put;
-    t.f.store.hatData.put = () =>
-      Promise.reject(new Error('fixture storage failure'));
-    try {
-      assertEquals(
-        (await read(t.f, path, key)).body.song.artwork.thumbHash,
-        null,
-      );
-      assertEquals(await t.f.store.hatData.list('melofon', ''), []);
-    } finally {
-      t.f.store.hatData.put = originalPut;
-    }
+    await t.idle();
+    const blackImage = pixelPng(1, 1, decodeBase64(black.rgba));
+    const oldHash = await imageHash(blackImage);
+    const greenImage = pixelPng(1, 1, new Uint8Array([0, 255, 0, 255]));
+    const preview = t.f.store.artwork.preview;
+    let replaced = false;
+    t.f.store.artwork.preview = async (hash) => {
+      if (hash === oldHash && !replaced) {
+        replaced = true;
+        await Deno.writeFile(t.cover, greenImage);
+      }
+      return await preview(hash);
+    };
+    await Deno.writeFile(t.cover, blackImage);
+    t.background!.refresh();
+    await t.idle();
+    assert(replaced);
     assertEquals(
-      (await read(t.f, path, key)).body.song.artwork.thumbHash,
+      await preview(oldHash),
       null,
+      'mismatched snapshot was not saved',
     );
+    const key = (await t.f.login('bearer')).credential;
+    const actual =
+      (await read(t.f, `songs/${t.song.id}`, key)).body.song.artwork;
+    assertEquals(actual.dominantColor, '#00ff00');
     assertEquals(
-      (await read(t.f, path, key)).body.song.artwork.thumbHash,
-      red.hash,
-    );
-    assertEquals(t.calls.length, 2);
-    const search = (await read(t.f, 'search?query=Album', key)).body;
-    assertEquals(search.songs.songs[0].artwork.thumbHash, red.hash);
-    assertEquals(search.albums.albums[0].artwork.thumbHash, red.hash);
-    const membership =
-      (await read(t.f, `artists/${t.song.artistId}/albums`, key)).body;
-    assert(
-      membership.albums.filter((a: { artwork: unknown }) => a.artwork).every((
-        a: { artwork: { thumbHash: string } },
-      ) => a.artwork.thumbHash === red.hash),
-    );
-    const folder = (await read(
-      t.f,
-      `folders?library=${t.song.libraryId}&path=Artist%2FAlbum`,
-      key,
-    )).body;
-    assertEquals(folder.songs.songs[0].artwork.thumbHash, red.hash);
-    assertEquals(t.calls.length, 2);
-    await error(
-      await t.f.get(`/api/v1/${path}`, undefined, { 'If-None-Match': '*' }),
-      401,
-      'unauthenticated',
+      actual.thumbHash,
+      encodeBase64(rgbaToThumbHash(1, 1, new Uint8Array([0, 255, 0, 255]))),
     );
   } finally {
     await t.close();

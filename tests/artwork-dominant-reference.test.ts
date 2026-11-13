@@ -1,6 +1,9 @@
 import { assertEquals } from '@std/assert';
-import { dominantColor } from '#melofon/dominant-color.ts';
-import { oklabDistanceSquared, srgbToOklab } from '#melofon/color-math.ts';
+import { dominantColor } from '../src/artwork/dominant-color.ts';
+import {
+  oklabDistanceSquared,
+  srgbToOklab,
+} from '../src/artwork/color-math.ts';
 
 // Deliberately no spatial index, pruning or shared accumulation with production.
 // Every distinct RGB is evaluated against every fixed centre.

@@ -5,6 +5,7 @@ import { migrateSettings } from './state.ts';
 import { migrateAdoptedSpeakers } from './speakers.ts';
 import { migrateQueueReferences } from './playback.ts';
 import { migratePlayers } from './players.ts';
+import { retireArtworkFacts } from './hat-data.ts';
 
 /** Run each release migration and its receipt in the same transaction. */
 export async function migrate(q: Queries): Promise<string[]> {
@@ -27,6 +28,9 @@ export async function migrate(q: Queries): Promise<string[]> {
   }, {
     id: 'players-001',
     apply: migratePlayers,
+  }, {
+    id: 'artwork-facts-001',
+    apply: retireArtworkFacts,
   }];
   for (const migration of migrations) {
     await q.run('BEGIN TRANSACTION');

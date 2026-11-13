@@ -1,7 +1,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { decodeBase64 } from '@std/encoding/base64';
 import { createArtwork } from '../src/artwork.ts';
-import { createHatData } from '../src/hat-data.ts';
+import { createArtworkBackground } from '../src/artwork/background.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
 import { createPlaylists } from '../src/playlists.ts';
@@ -31,6 +31,7 @@ async function fixture() {
   let podcasts!: Podcasts;
   let playlists!: ReturnType<typeof createPlaylists>;
   let radio!: ReturnType<typeof createRadio>;
+  let background!: ReturnType<typeof createArtworkBackground>;
   let seeded = false;
   let channelId = '';
   let missingChannelId = '';
@@ -41,10 +42,11 @@ async function fixture() {
       services: async (f) => {
         const library = createLibrary(f.store);
         const libraries = createLibraries(f.store);
-        playlists = createPlaylists(f.store);
+        playlists = createPlaylists(f.store, f.notify);
         radio = createRadio(f.store, {
           dataDir: f.cfg.dataDir,
           state: f.state,
+          notify: f.notify,
         });
         if (!seeded) {
           for (const name of ['Red', 'Black', 'Missing']) {
@@ -106,6 +108,21 @@ async function fixture() {
           store: f.store,
           state: f.state,
           dataDir: f.cfg.dataDir,
+          notify: f.notify,
+        });
+        const artwork = createArtwork(library, {
+          playlists,
+          podcasts,
+          radio,
+          state: f.state,
+          dataDir: f.cfg.dataDir,
+          facts: f.store.artwork,
+        });
+        background = createArtworkBackground({
+          artwork,
+          store: f.store,
+          state: f.state,
+          notify: f.notify!,
         });
         return {
           library,
@@ -113,14 +130,7 @@ async function fixture() {
           playlists,
           podcasts,
           radio,
-          artwork: createArtwork(library, {
-            playlists,
-            podcasts,
-            radio,
-            state: f.state,
-            dataDir: f.cfg.dataDir,
-            facts: f.store.artwork,
-          }),
+          artwork,
         };
       },
     });
@@ -138,6 +148,7 @@ async function fixture() {
     homePageUrl: null,
   });
   assert(!('invalid' in station));
+  await background.idle();
   const episode = (await podcasts.episodes(channelId))[0];
   return {
     root,
@@ -164,17 +175,17 @@ async function fixture() {
     get radio() {
       return radio;
     },
-    async clear() {
-      const data = createHatData(f.store, f.cfg, f.state)('melofon');
-      for (const row of await data.list()) await data.remove(row.key);
-    },
+    idle: () => background.idle(),
     async restart() {
       await podcasts.close();
+      await background.close();
       await f.close();
       f = await open();
+      await background.idle();
     },
     async close() {
       await podcasts.close();
+      await background.close();
       await f.close();
       await Deno.remove(root, { recursive: true });
     },
@@ -224,7 +235,7 @@ async function image(t: Fixture, art: Art, key: string) {
   return { bytes, pixels };
 }
 
-Deno.test('phase C artwork matrix: six native kinds, lazy list facts, versioned HTTP 200/304 and station name pixels', async () => {
+Deno.test('phase C artwork matrix: six native kinds, core-computed list facts, versioned HTTP 200/304 and station name pixels', async () => {
   const t = await fixture();
   try {
     assert(
@@ -249,25 +260,23 @@ Deno.test('phase C artwork matrix: six native kinds, lazy list facts, versioned 
         401,
         'unauthenticated',
       );
-      await t.clear();
       const first = await read(t, path, cookie);
       const listKey = path === 'radio-stations' ? 'radioStations' : path;
       const initial = (first.body[listKey] as Entity[]).find((row) =>
         row.id === id
       )!;
       assert(initial.artwork);
-      assertEquals([initial.artwork.thumbHash, initial.artwork.dominantColor], [
-        null,
-        null,
-      ]);
-      const second = await read(t, path, bearer, first.etag ?? undefined);
-      const entity = (second.body[listKey] as Entity[]).find((row) =>
-        row.id === id
-      )!;
+      const entity = initial;
       assert(entity.artwork);
       assert(entity.artwork.thumbHash);
       assert(/^#[0-9a-f]{6}$/.test(entity.artwork.dominantColor!));
-      if (first.etag) assertNotEquals(second.etag, first.etag);
+      if (first.etag) {
+        const repeated = await t.f.get(`/api/v1/${path}`, bearer, {
+          'If-None-Match': first.etag,
+        });
+        assertEquals(repeated.status, 304);
+        assertEquals(await repeated.text(), '');
+      }
       const detail = await read(t, `${path}/${id}`, cookie);
       assertEquals(detail.body[field].artwork, entity.artwork);
       const a = await image(t, entity.artwork, cookie);
@@ -344,7 +353,7 @@ Deno.test('phase C artwork matrix: six native kinds, lazy list facts, versioned 
     assertEquals(
       membership.find((row: Entity) => row.id === t.playlist.id).artwork
         .thumbHash,
-      null,
+      redGridHash,
     );
     const nextMembership =
       (await read(t, `songs/${t.song.id}/playlists`, bearer)).body.playlists;
@@ -376,6 +385,7 @@ Deno.test('native entity artwork: playlist edits/privacy, podcast replacement, r
     const initial = await playlist();
     await image(t, initial, reader);
     await t.playlists.setTracks('admin', t.playlist.id, [t.other.id], true);
+    await t.idle();
     const edited = await playlist();
     assertNotEquals(edited.version, initial.version);
     const changed = await image(t, edited, reader);
@@ -412,6 +422,10 @@ Deno.test('native entity artwork: playlist edits/privacy, podcast replacement, r
       path,
       'https://unused.test/black.png',
     );
+    // Fixture acquisition bypasses the podcast downloader; emit its same
+    // committed owner-change notification before observing background facts.
+    t.f.notify!.emit(['library'], { podcasts: [t.channelId] }, 'all');
+    await t.idle();
     const after = await read(
       t,
       `podcasts/${t.channelId}`,

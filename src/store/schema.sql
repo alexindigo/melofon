@@ -536,6 +536,12 @@ CREATE TABLE IF NOT EXISTS artwork_sources (
   signature VARCHAR NOT NULL,
   facts JSON
 );
+CREATE TABLE IF NOT EXISTS artwork_previews (
+  source_hash VARCHAR PRIMARY KEY,
+  algorithm_version INTEGER NOT NULL,
+  thumb_hash VARCHAR NOT NULL,
+  dominant_color VARCHAR
+);
 
 -- Kept hat-private records. Empty owner_scope is explicitly hat-global.
 -- CREATE IF NOT EXISTS applies on existing installs as well as fresh ones.

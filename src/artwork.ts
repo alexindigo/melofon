@@ -40,6 +40,8 @@ export interface ArtworkDescriptor {
   width: number | null;
   height: number | null;
   mime: string;
+  thumbHash?: string | null;
+  dominantColor?: string | null;
 }
 export type ArtworkDescription = { kind: 'unknown' | 'missing' } | {
   kind: 'image';
@@ -400,6 +402,7 @@ export function createArtwork(library: Library, options: {
     const header = imageHeader(source.bytes);
     const sourceHash = source.facts?.sourceHash ??
       await imageHash(source.bytes);
+    const preview = await options.facts?.preview(sourceHash);
     return {
       kind: 'image',
       bytes: source.bytes,
@@ -413,6 +416,8 @@ export function createArtwork(library: Library, options: {
         width: source.facts ? source.facts.width : header?.width ?? null,
         height: source.facts ? source.facts.height : header?.height ?? null,
         mime: source.format,
+        thumbHash: preview?.thumbHash ?? null,
+        dominantColor: preview?.dominantColor ?? null,
       },
     };
   }

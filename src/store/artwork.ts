@@ -1,6 +1,11 @@
 import { type Engine, esc } from './engine.ts';
 
-/** Disposable source facts, never scanner-owned catalog or hat placeholder data. */
+export interface ArtworkPreview {
+  thumbHash: string;
+  dominantColor: string | null;
+}
+
+/** Disposable source facts, independent of scanner-owned catalog records. */
 export interface ArtworkSourceFacts {
   sourceHash: string;
   width: number | null;
@@ -10,6 +15,45 @@ export interface ArtworkSourceFacts {
 }
 export function createArtworkStore(engine: Engine) {
   return {
+    preview(sourceHash: string): Promise<ArtworkPreview | null> {
+      return engine.exclusive(async (q) =>
+        (await q.all<ArtworkPreview>(
+          `SELECT thumb_hash AS thumbHash, dominant_color AS dominantColor
+           FROM artwork_previews WHERE source_hash = ${esc(sourceHash)}
+           AND algorithm_version = 2`,
+        ))[0] ?? null
+      );
+    },
+    savePreview(sourceHash: string, value: ArtworkPreview): Promise<void> {
+      return engine.exclusive((q) =>
+        q.run(
+          `INSERT INTO artwork_previews VALUES (${esc(sourceHash)}, 2,
+          ${esc(value.thumbHash)}, ${
+            value.dominantColor === null ? 'NULL' : esc(value.dominantColor)
+          })
+         ON CONFLICT (source_hash) DO UPDATE SET algorithm_version = 2,
+          thumb_hash = excluded.thumb_hash, dominant_color = excluded.dominant_color`,
+        )
+      );
+    },
+    /** Internal discovery inventory, including private playlists under their owner. */
+    references(): Promise<{
+      kind: 'song' | 'album' | 'artist' | 'playlist' | 'podcast' | 'radio';
+      id: string;
+      username: string | null;
+    }[]> {
+      return engine.exclusive((q) =>
+        q.all(
+          `SELECT 'song' AS kind, id, NULL::VARCHAR AS username FROM files
+         UNION ALL SELECT 'album', id, NULL FROM albums
+         UNION ALL SELECT 'artist', id, NULL FROM artists
+         UNION ALL SELECT 'radio', id, NULL FROM radio_stations
+         UNION ALL SELECT 'podcast', id, NULL FROM podcast_channels
+         UNION ALL SELECT 'playlist', p.id, u.name FROM playlists p
+           JOIN users u ON u.id = p.user_id`,
+        )
+      );
+    },
     get(key: string): Promise<
       {
         signature: string;

@@ -427,6 +427,7 @@ export async function createLookupRunner(options: {
         await unify(job, signal);
         signal.throwIfAborted();
         await store.lookups.finish(job.id, { state: 'done' });
+        options.notify?.emit(['library'], undefined, 'all');
         return;
       }
       const facts = job.entityType === 'album'
@@ -572,6 +573,9 @@ export async function createLookupRunner(options: {
       signal.throwIfAborted();
       authority.signal.throwIfAborted();
       await store.candidates.addCandidates(candidates);
+      if (candidates.some((candidate) => candidate.kind === 'cover')) {
+        options.notify?.emit(['library'], undefined, 'all');
+      }
       await store.lookups.finish(job.id, { state: 'done' });
     } catch (error) {
       log.event('lookup_failed', { plugin: job.plugin, error });

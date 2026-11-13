@@ -37,6 +37,7 @@ async function setup(
       dir: string;
       image: Uint8Array;
       scan: ReturnType<typeof createScan>;
+      notify: ReturnType<typeof createNotify>;
       start: () => Promise<Runner>;
       hits: string[];
       onImage: (fn: () => Promise<void>) => void;
@@ -81,6 +82,7 @@ async function setup(
       dir,
       image,
       scan,
+      notify,
       hits,
       onImage(fn) {
         beforeImage = fn;
@@ -183,12 +185,18 @@ Deno.test('runner dedupes identical facts, queues changed facts and supports exp
   });
 });
 Deno.test('runner downloads images through approved RPC networking; artwork consumer sees shared hash bytes', async () => {
-  await setup(async ({ store, root, scan, start, image, hits }) => {
+  await setup(async ({ store, root, scan, start, image, hits, notify }) => {
     await pictured(`${root}/A/song.mp3`, undefined, { TALB: 'A' });
     await pictured(`${root}/B/song.mp3`, undefined, { TALB: 'B' });
-    await start();
     await scan.run();
+    const artworkChanges: string[][] = [];
+    notify.subscribe((types) => {
+      if (types.includes('library')) artworkChanges.push(types);
+    });
+    const runner = await start();
+    await runner.afterScan();
     await eventually(async () => (await stats(store)).done === 2);
+    assertEquals(artworkChanges, [['library'], ['library']]);
     const artwork = createArtwork(createLibrary(store));
     for (const album of await albums(store)) {
       const [candidate] = await store.candidates.candidatesFor(
