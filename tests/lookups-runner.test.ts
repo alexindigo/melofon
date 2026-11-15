@@ -1,4 +1,9 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import { openStore, type Store } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { createState, type State } from '../src/state.ts';
@@ -17,6 +22,102 @@ import { discoverLookups } from '../src/lookups/manifest.ts';
 import { candidateImagePath, imageHash } from '../src/images.ts';
 import { eventually, lookupPlugin } from './helpers/lookup.ts';
 import { pictured } from './helpers/pictured.ts';
+import { LookupHost } from '../src/lookups/host.ts';
+import { waitForWorkerSignal } from './helpers/artwork-worker.ts';
+
+for (const phase of ['resetActive', 'purgeDone', 'purgeOrphans'] as const) {
+  Deno.test(`runner ${phase} failure joins configured hosts even when a sibling release fails`, async () => {
+    const dir = await Deno.makeTempDir();
+    const store = await openStore(`${dir}/data`);
+    const state = createState(store);
+    const entered = Promise.withResolvers<void>();
+    const fail = Promise.withResolvers<void>();
+    const firstFailed = Promise.withResolvers<void>();
+    const siblingEntered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const ready = new Set<string>();
+    const acquired = new Set<LookupHost>();
+    const start = LookupHost.prototype.start;
+    const stop = LookupHost.prototype.stop;
+    const failure = new Error(`${phase} startup failure`);
+    const owner = phase === 'purgeOrphans' ? store.reference : store.lookups;
+    const method = phase === 'purgeOrphans' ? 'purgeOrphans' : phase;
+    Object.assign(owner, {
+      [method]: async () => {
+        entered.resolve();
+        await fail.promise;
+        throw failure;
+      },
+    });
+    LookupHost.prototype.start = function () {
+      acquired.add(this);
+      return start.call(this);
+    };
+    LookupHost.prototype.stop = async function () {
+      if (this.plugin.id === 'first') {
+        await stop.call(this);
+        firstFailed.resolve();
+        throw new Error('first host release failed');
+      }
+      siblingEntered.resolve();
+      await release.promise;
+      await stop.call(this);
+    };
+    let settled = false;
+    let runner: Runner | undefined;
+    const starting = (async () => {
+      await lookupPlugin(`${dir}/lookups`, undefined, 'first');
+      await lookupPlugin(`${dir}/lookups`, undefined, 'second');
+      runner = await createLookupRunner({
+        store,
+        state,
+        dataDir: `${dir}/data`,
+        builtin: `${dir}/lookups`,
+        log: {
+          event(event, facts) {
+            const data = facts as { state?: string; plugin?: string };
+            if (event === 'lookup_lifecycle' && data.state === 'ready') {
+              ready.add(String(data.plugin));
+            }
+          },
+        },
+      });
+    })().finally(() => settled = true);
+    const rejected = assertRejects(() => starting, AggregateError, 'rollback');
+    void rejected.catch(() => {});
+    try {
+      await entered.promise;
+      await state.set('lookups.plugin.first.settings.behavior', 'changed');
+      await state.set('lookups.plugin.second.settings.behavior', 'changed');
+      await eventually(() => ready.size === 2);
+      fail.resolve();
+      await waitForWorkerSignal(
+        firstFailed.promise,
+        'first rollback failure',
+        2000,
+      );
+      await siblingEntered.promise;
+      assertEquals(settled, false, 'failed release cannot skip a held sibling');
+      release.resolve();
+      const error = await rejected;
+      assertEquals(error.errors[0], failure);
+      assertEquals(acquired.size, 2);
+      for (const host of acquired) assertEquals(host.generation, undefined);
+      await state.set('lookups.plugin.first.settings.behavior', 'later');
+      for (const host of acquired) assertEquals(host.state, 'disabled');
+    } finally {
+      fail.resolve();
+      release.resolve();
+      LookupHost.prototype.start = start;
+      LookupHost.prototype.stop = stop;
+      await starting.catch(() => {});
+      await runner?.close();
+      await Promise.all([...acquired].map((host) => stop.call(host)));
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
 
 const code =
   `const counts = new Map(); export default { async cover(item, ctx) {
@@ -111,6 +212,33 @@ async function setup(
 const albums = (store: Store) =>
   store.catalog.listAlbums({ sort: 'name', size: 100, offset: 0 });
 const stats = (store: Store) => store.lookups.stats('fixture');
+
+Deno.test('runner concurrent close shares settlement through host cleanup', async () => {
+  await setup(async ({ start }) => {
+    const runner = await start();
+    const host = runner.hosts[0];
+    const stop = host.stop.bind(host);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    host.stop = async () => {
+      entered.resolve();
+      await release.promise;
+      await stop();
+    };
+    const closing = runner.close();
+    try {
+      assertStrictEquals(runner.close(), closing);
+      await entered.promise;
+      assertEquals(host.state === 'disabled', false);
+      release.resolve();
+      await closing;
+      assertEquals(host.generation, undefined);
+    } finally {
+      release.resolve();
+      await closing;
+    }
+  });
+});
 
 Deno.test('successful scans fan out only missing covers, checking every track and read-only libraries', async () => {
   await setup(async ({ store, state, root, dir, image, scan, start }) => {

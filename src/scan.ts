@@ -390,7 +390,7 @@ export async function scanLibrary(
           let metadata: SongMetadata;
           let pictures: Omit<LocalVersion, 'origin'>[] = [];
           try {
-            const meta = await tagReader.read(abs);
+            const meta = await tagReader.read(abs, options.signal);
             metadata = metadataFromTags(meta);
             // Garbage bytes can resolve with an empty format rather than throw.
             if (

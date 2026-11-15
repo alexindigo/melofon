@@ -2,7 +2,7 @@ import { assertEquals, assertNotEquals, assertRejects } from '@std/assert';
 import { createArtworkFactsHost } from '../src/artwork/facts-host.ts';
 import { createTagReader } from '../src/scan-tags.ts';
 import type { State } from '../src/state.ts';
-import { LookupHost } from '../src/lookups/host.ts';
+import { LookupHost, LookupRevoked } from '../src/lookups/host.ts';
 import { discoverLookups } from '../src/lookups/manifest.ts';
 import { createLookupNetwork } from '../src/lookups/net.ts';
 import {
@@ -19,6 +19,31 @@ function closeHost(
 ) {
   return host.close ? host.close() : host[Symbol.dispose]!();
 }
+
+Deno.test('lookup call cannot adopt a changed configuration after fulfilled readiness', async () => {
+  const dir = await Deno.makeTempDir();
+  await lookupPlugin(`${dir}/lookups`);
+  const host = new LookupHost(
+    (await discoverLookups(`${dir}/lookups`, `${dir}/data`))[0],
+    createLookupNetwork(),
+  );
+  const call = () =>
+    host.call(host.plugin.manifest!.capabilities[0], {}, {
+      timeoutMs: 10000,
+      maxBytes: 1024,
+    });
+  try {
+    await host.start();
+    const pending = call();
+    const changed = host.configure(true, [], { behavior: 'changed' });
+    await assertRejects(() => pending, LookupRevoked, 'configuration changed');
+    await changed;
+    assertEquals(await call(), { candidates: [] });
+  } finally {
+    await host.stop();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 for (const kind of ['artwork', 'tags'] as const) {
   Deno.test(`${kind} Worker ignores a previous call's late failure without stealing its successor`, async () => {

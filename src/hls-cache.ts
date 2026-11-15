@@ -185,6 +185,12 @@ export function createHlsCache(
     serial = pending.then(() => {}, () => {});
     return pending;
   };
+  // View and segment leases share cleanup admission. Late release still drops
+  // its reference, but prune cannot enter settings after this owner is closed.
+  const settleLease = (run: () => Promise<void>) => {
+    const release = () => exclusive(run);
+    return operations.closed ? release() : operations.run(release);
+  };
   // Source facts have the same lifetime/budget as their rendition entries,
   // plus the requests currently inspecting/admitting them. No independent LRU.
   const retireSources = () => {
@@ -405,7 +411,7 @@ export function createHlsCache(
     });
     let released = false;
     const releaseLease = () =>
-      exclusive(async () => {
+      settleLease(async () => {
         if (released) return;
         released = true;
         entry.users--;
@@ -415,8 +421,7 @@ export function createHlsCache(
         }
         await prune(root);
       });
-    const release = () =>
-      operations.closed ? releaseLease() : operations.run(releaseLease);
+    const release = releaseLease;
     try {
       const facts = await entry.ready;
       signal.throwIfAborted();
@@ -450,7 +455,7 @@ export function createHlsCache(
           const finish = async () => {
             if (done) return;
             done = true;
-            await exclusive(async () => {
+            await settleLease(async () => {
               entry.users--;
               await prune(root);
             });

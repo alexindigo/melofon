@@ -418,11 +418,15 @@ export class LookupHost {
           typeof item.id === 'string'
         ? item.id
         : '';
+      const revision = this.revision;
       await this.start();
       if (operation.signal.aborted || !this.enabled) {
         throw new LookupRevoked('Plugin disabled');
       }
-      const slot = this.slot!;
+      const slot = this.slot;
+      if (revision !== this.revision || !slot) {
+        throw new LookupRevoked('Lookup configuration changed');
+      }
       if (slot.call) throw new Error('Lookup intake is full');
       const controller = new AbortController();
       const signal = AbortSignal.any([
