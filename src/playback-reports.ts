@@ -11,6 +11,7 @@ import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { catalogMedia, type QueueMedia } from './queue-source.ts';
+import { createOperationScope } from './operations.ts';
 
 export interface ReportPlaying {
   username: string;
@@ -75,16 +76,15 @@ export function createPlaybackReports(deps: {
   const { nowPlaying, library } = deps;
   const log = deps.log ?? scopedLog('playback');
   const invalidate = () => deps.notify?.emit(['nowPlaying'], undefined, 'all');
-  let closed = false;
-  let closing = false;
+  const operations = createOperationScope('Playback reports');
   let expiryStarted = false;
   let expiryTimer: ReturnType<typeof setTimeout> | undefined;
-  let expiryTask: Promise<void> | undefined;
   let expiryWork: Promise<boolean> | undefined;
-  let closeWork: Promise<void> | undefined;
-  const expireReports = (): Promise<boolean> => {
-    if (closed) return Promise.resolve(false);
-    return expiryWork ??= (async () => {
+  // Queued session cleanup and timer cycles already have an admitted parent.
+  // They may finish their sweep during close without reopening public intake.
+  const sweep = (owned: boolean): Promise<boolean> => {
+    if (expiryWork) return expiryWork;
+    const work = async () => {
       try {
         const changed = await nowPlaying.expire();
         if (changed) invalidate();
@@ -92,105 +92,125 @@ export function createPlaybackReports(deps: {
       } finally {
         expiryWork = undefined;
       }
-    })();
+    };
+    return expiryWork = owned ? operations.run(work) : work();
   };
+  const expireReports = () =>
+    operations.closed ? Promise.resolve(false) : sweep(true);
   // Revoke follows any sweep already in flight. Only committed removal emits.
   let sessionCleanup = Promise.resolve();
   const unsubscribeSessions = deps.sessions?.onSessionsEnded(() => {
-    sessionCleanup = sessionCleanup.then(async () => {
-      await expiryWork;
-      await expireReports();
-    }).catch((error) => log.event('playback_expiry_failed', { error }));
+    if (operations.closed) return;
+    const previous = sessionCleanup;
+    sessionCleanup = operations.run(async () => {
+      try {
+        await previous;
+        await expiryWork;
+        await sweep(false);
+      } catch (error) {
+        log.event('playback_expiry_failed', { error });
+      }
+    });
   });
+  let intervalMs = 1000;
+  const cycle = (state: State) =>
+    operations.run(async () => {
+      try {
+        intervalMs =
+          (await state.getTyped('playback.sessionSweepSeconds') as number) *
+          1000;
+        if (!operations.closed) await sweep(false);
+      } catch (error) {
+        log.event('playback_expiry_failed', { error });
+      } finally {
+        if (!operations.closed) {
+          expiryTimer = setTimeout(() => {
+            void cycle(state);
+          }, intervalMs);
+        }
+      }
+    });
   return {
     expireReports,
-    async startReportExpiry(state) {
-      if (closed || expiryStarted) return;
-      expiryStarted = true;
-      state.declare('playback.sessionSweepSeconds', {
-        type: 'number',
-        minimum: 0.01,
-        maximum: 3600,
-        default: 1,
-      });
-      let intervalMs = 1000;
-      const cycle = async () => {
-        try {
-          intervalMs =
-            (await state.getTyped('playback.sessionSweepSeconds') as number) *
-            1000;
-          if (!closing) await expireReports();
-        } catch (error) {
-          log.event('playback_expiry_failed', { error });
-        } finally {
-          if (!closing) {
-            expiryTimer = setTimeout(() => {
-              expiryTask = cycle();
-            }, intervalMs);
-          }
-        }
-      };
-      expiryTask = cycle();
-      await expiryTask;
-    },
-    async reportPlaying(report) {
-      // Queue before an abort can queue its clear, retaining stream ordering.
-      await nowPlaying.set(
-        report.username,
-        report.client,
-        report.trackId,
-        report.streamId,
-        report.positionMs,
-      );
-      invalidate();
-    },
-    async reportStopped({ streamId }) {
-      if (await nowPlaying.clearByStreamId(streamId)) invalidate();
-    },
-    async reportPlayback(report) {
-      const song = await library.getSong(report.trackId);
-      if (!song) return false;
-      await nowPlaying.report(report, song.durationMs);
-      invalidate();
-      return true;
-    },
-    async reportSessionPlayback(report) {
-      const song = await library.getSong(report.trackId);
-      if (!song) return false;
-      const changed = await nowPlaying.reportSession(report, song.durationMs);
-      if (changed) invalidate();
-      return changed;
-    },
-    async nowPlayingView() {
-      const out: NowPlayingViewRow[] = [...deps.serverRows()];
-      for (const row of await nowPlaying.list()) {
-        const song = await library.getSong(row.trackId);
-        if (song === null) continue;
-        out.push({
-          kind: 'app',
-          username: row.username,
-          client: row.client,
-          ...catalogMedia(song),
-          positionMs: row.positionMs,
-          startedAtMs: row.startedAtMs,
-          reportedAtMs: row.reportedAtMs,
-          state: row.state,
-          playbackRate: row.playbackRate,
-          appPlayerId: row.playerId,
+    startReportExpiry: (state) =>
+      operations.run(async () => {
+        if (expiryStarted) return;
+        expiryStarted = true;
+        state.declare('playback.sessionSweepSeconds', {
+          type: 'number',
+          minimum: 0.01,
+          maximum: 3600,
+          default: 1,
         });
-      }
-      return out;
-    },
+        await cycle(state);
+      }),
+    reportPlaying: (report) =>
+      operations.run(async () => {
+        // Queue before an abort can queue its clear, retaining stream ordering.
+        await nowPlaying.set(
+          report.username,
+          report.client,
+          report.trackId,
+          report.streamId,
+          report.positionMs,
+        );
+        invalidate();
+      }),
+    reportStopped: ({ streamId }) =>
+      operations.run(async () => {
+        if (await nowPlaying.clearByStreamId(streamId)) invalidate();
+      }),
+    reportPlayback: (report) =>
+      operations.run(async ({ signal }) => {
+        const song = await library.getSong(report.trackId);
+        signal.throwIfAborted();
+        if (!song) return false;
+        await nowPlaying.report(report, song.durationMs);
+        invalidate();
+        return true;
+      }),
+    reportSessionPlayback: (report) =>
+      operations.run(async ({ signal }) => {
+        const song = await library.getSong(report.trackId);
+        signal.throwIfAborted();
+        if (!song) return false;
+        const changed = await nowPlaying.reportSession(report, song.durationMs);
+        if (changed) invalidate();
+        return changed;
+      }),
+    nowPlayingView: () =>
+      operations.run(async ({ signal }) => {
+        const out: NowPlayingViewRow[] = [...deps.serverRows()];
+        for (const row of await nowPlaying.list()) {
+          signal.throwIfAborted();
+          const song = await library.getSong(row.trackId);
+          signal.throwIfAborted();
+          if (song === null) continue;
+          out.push({
+            kind: 'app',
+            username: row.username,
+            client: row.client,
+            ...catalogMedia(song),
+            positionMs: row.positionMs,
+            startedAtMs: row.startedAtMs,
+            reportedAtMs: row.reportedAtMs,
+            state: row.state,
+            playbackRate: row.playbackRate,
+            appPlayerId: row.playerId,
+          });
+        }
+        return out;
+      }),
     close() {
-      return closeWork ??= (async () => {
-        closing = true;
+      const alreadyClosed = operations.closed;
+      const settled = operations.close();
+      // Unsubscribing and clearing timers are synchronous; all accepted work,
+      // including queued session cleanup and settings reads, is in the scope.
+      if (!alreadyClosed) {
         unsubscribeSessions?.();
         clearTimeout(expiryTimer);
-        await sessionCleanup;
-        closed = true;
-        await expiryTask;
-        await expiryWork;
-      })();
+      }
+      return settled;
     },
   };
 }

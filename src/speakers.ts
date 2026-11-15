@@ -8,6 +8,7 @@ import { SecretError } from './secrets.ts';
 import type { SpeakerCredentials } from './speaker-credentials.ts';
 import { appLogger } from './logging.ts';
 import { outputAuthority, outputPlayerId } from './player-outputs.ts';
+import { createOperationScope } from './operations.ts';
 export { SpeakerError } from './speaker-errors.ts';
 
 function fields(input: unknown, allowed: string[]): Record<string, unknown> {
@@ -304,6 +305,7 @@ export function createSpeakers(deps: {
         );
       }
       const controller = new AbortController();
+      const attempts = createOperationScope('Speaker preflight');
       const cancel = () => controller.abort();
       signal.addEventListener('abort', cancel, { once: true });
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -326,19 +328,27 @@ export function createSpeakers(deps: {
         timer = setTimeout(cancel, seconds * 1000);
         // One ready peer suffices. Slower/failed peers remain independently visible
         // and the boot decides their later sessions, never this catalog preflight.
-        const prepared = Promise.any(candidates.map(async (row) => {
-          const key = JSON.stringify([row.type, row.host, row.port]);
-          const ok = connected(row.id) ||
-            await deps.prepare?.(row.id, controller.signal);
-          const current = deps.outputs.get(row.id);
-          if (
-            !ok || !authority.get(row.id)!() || !current ||
-            outputPlayerId(current) !== playerId ||
-            !eligible(row.id) ||
-            JSON.stringify([current.type, current.host, current.port]) !== key
-          ) throw new Error('unavailable');
-          return true;
-        })).catch(() => false);
+        const prepared = Promise.any(
+          candidates.map((row) =>
+            attempts.run(async ({ signal: owned }) => {
+              const key = JSON.stringify([row.type, row.host, row.port]);
+              const ok = connected(row.id) ||
+                await deps.prepare?.(
+                  row.id,
+                  AbortSignal.any([owned, controller.signal]),
+                );
+              const current = deps.outputs.get(row.id);
+              if (
+                !ok || !authority.get(row.id)!() || !current ||
+                outputPlayerId(current) !== playerId ||
+                !eligible(row.id) ||
+                JSON.stringify([current.type, current.host, current.port]) !==
+                  key
+              ) throw new Error('unavailable');
+              return true;
+            })
+          ),
+        ).catch(() => false);
         const ok = await Promise.race([prepared, aborted]);
         if (signal.aborted) {
           throw new PlaybackError(
@@ -356,6 +366,14 @@ export function createSpeakers(deps: {
         clearTimeout(timer);
         signal.removeEventListener('abort', cancel);
         controller.abort();
+        await attempts.close();
+      }
+      // The parent may revoke the winner while losing peers finish cleanup.
+      if (signal.aborted) {
+        throw new PlaybackError(
+          'playback_cancelled',
+          'Playback start cancelled',
+        );
       }
     },
     list(options?: { includeIgnored?: boolean }): SpeakerListEntry[] {

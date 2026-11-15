@@ -30,6 +30,7 @@ import {
 } from './playback-reports.ts';
 export type { NowPlayingViewRow, ReportPlaying } from './playback-reports.ts';
 import { type Log, scopedLog } from './logging.ts';
+import { createOperationScope } from './operations.ts';
 import {
   PlaybackError,
   QueueConflictError,
@@ -264,6 +265,8 @@ export function createPlayback(deps: {
   log?: Log;
 }): Playback {
   const { player, library, outputs, notify, persistence } = deps;
+  const operations = createOperationScope('Player');
+  let closeWork: Promise<void> | undefined;
   let activeReservation: PlaybackReservation | undefined;
   const needsCapacity = () =>
     deps.capacity &&
@@ -356,7 +359,7 @@ export function createPlayback(deps: {
     return recovery;
   };
   const ownsSource = (source: PlaybackSource) =>
-    !closed && !closing && openedSource === source && !source.signal.aborted;
+    !operations.closed && openedSource === source && !source.signal.aborted;
   let failedSource: PlaybackSource | null = null;
   let failureWork:
     | { source: PlaybackSource; promise: Promise<void> }
@@ -450,120 +453,125 @@ export function createPlayback(deps: {
       wrap?: boolean;
       excluded?: ReadonlySet<number>;
     },
-  ): T | Promise<T> => {
-    const current = () =>
-      !closed && !closing &&
-      (!authority || !authority.signal.aborted && authority.isCurrent());
-    const cancelled = () =>
-      new PlaybackError('playback_cancelled', 'Playback start cancelled');
-    if (!current()) throw cancelled();
-    cancelStart();
-    const before = player.queue().items;
-    const items = activation?.items ?? player.queue().items;
-    const candidate = activation && items[activation.index];
-    const needsPreparation = (item: QueueMedia) =>
-      deps.prepareQueueMedia &&
-      item.facts.kind === 'web' && item.facts.mode === 'unknown';
-    const needsResolution = starts && activation && candidate &&
-      (deps.resolveQueueReference && candidate.reference.kind === 'station' ||
-        needsPreparation(candidate));
-    if (!starts || !deps.targets && !needsResolution) {
-      const reservation = reserveStart(starts);
-      try {
-        return commitStart(reservation, () => commit(() => {}));
-      } finally {
-        reservation?.release();
-      }
-    }
-    const controller = new AbortController();
-    const reservation = reserveStart(starts, controller);
-    const abort = () => controller.abort();
-    authority?.signal.addEventListener('abort', abort, { once: true });
-    pendingStart = controller;
-    const prepare = async () => {
-      let selected:
-        | { index: number; media: QueueMedia; entryId?: number }
-        | null
-        | undefined;
-      if (needsResolution) {
-        selected = null;
-        let index = activation.index;
-        for (let visited = 0; visited < items.length; visited++) {
-          if (index < 0 || index >= items.length) break;
-          const item = items[index];
-          let media = activation.excluded?.has((item as QueueEntry).id)
-            ? null
-            : item.reference.kind === 'station' && deps.resolveQueueReference
-            ? await deps.resolveQueueReference!(item.reference)
-            : item;
-          if (media && needsPreparation(media)) {
-            media = await deps.prepareQueueMedia!(media, controller.signal);
-          }
-          if (controller.signal.aborted) throw cancelled();
-          if (media) {
-            selected = { index, media, entryId: (item as QueueEntry).id };
-            break;
-          }
-          index += activation.direction ?? 1;
-          if (activation.wrap) index = (index + items.length) % items.length;
+  ): T | Promise<T> =>
+    operations.runImmediate((operation) => {
+      const current = () =>
+        !operations.closed &&
+        (!authority || !authority.signal.aborted && authority.isCurrent());
+      const cancelled = () =>
+        new PlaybackError('playback_cancelled', 'Playback start cancelled');
+      if (!current()) throw cancelled();
+      cancelStart();
+      const before = player.queue().items;
+      const items = activation?.items ?? player.queue().items;
+      const candidate = activation && items[activation.index];
+      const needsPreparation = (item: QueueMedia) =>
+        deps.prepareQueueMedia &&
+        item.facts.kind === 'web' && item.facts.mode === 'unknown';
+      const needsResolution = starts && activation && candidate &&
+        (deps.resolveQueueReference && candidate.reference.kind === 'station' ||
+          needsPreparation(candidate));
+      if (!starts || !deps.targets && !needsResolution) {
+        const reservation = reserveStart(starts);
+        try {
+          return commitStart(reservation, () => commit(() => {}));
+        } finally {
+          reservation?.release();
         }
       }
-      if (selected !== null) {
-        await deps.targets?.preparePlayback(controller.signal);
-      }
-      return selected;
-    };
-    return prepare().then((selected) => {
-      if (
-        controller.signal.aborted || pendingStart !== controller || !current()
-      ) throw cancelled();
-      // A preparation plan refers to occurrences, not reusable ordinals. Queue
-      // additions may publish during this await without cancelling the start.
-      // Validate the original anchor before the command mutates anything; future
-      // queues (consume/add/restore) are installed synchronously by commit.
-      const planned = selected ?? candidate;
-      const entryId = planned &&
-        ('entryId' in planned ? planned.entryId : (planned as QueueEntry).id);
-      const originalIndex = before.findIndex((entry) => entry.id === entryId);
-      if (
-        originalIndex >= 0 &&
-        player.queue().items[originalIndex]?.id !== entryId
-      ) {
-        throw cancelled();
-      }
-      pendingStart = undefined;
-      const result = commitStart(reservation, () =>
-        commit(() => {
-          if (selected === undefined) return;
-          if (selected === null) {
-            player.stop();
-            return;
+      const controller = new AbortController();
+      const reservation = reserveStart(starts, controller);
+      const abort = () => controller.abort();
+      operation.signal.addEventListener('abort', abort, { once: true });
+      authority?.signal.addEventListener('abort', abort, { once: true });
+      pendingStart = controller;
+      const prepare = async () => {
+        let selected:
+          | { index: number; media: QueueMedia; entryId?: number }
+          | null
+          | undefined;
+        if (needsResolution) {
+          selected = null;
+          let index = activation.index;
+          for (let visited = 0; visited < items.length; visited++) {
+            if (index < 0 || index >= items.length) break;
+            const item = items[index];
+            let media = activation.excluded?.has((item as QueueEntry).id)
+              ? null
+              : item.reference.kind === 'station' && deps.resolveQueueReference
+              ? await deps.resolveQueueReference!(item.reference)
+              : item;
+            if (media && needsPreparation(media)) {
+              media = await deps.prepareQueueMedia!(media, controller.signal);
+            }
+            if (controller.signal.aborted) throw cancelled();
+            if (media) {
+              selected = { index, media, entryId: (item as QueueEntry).id };
+              break;
+            }
+            index += activation.direction ?? 1;
+            if (activation.wrap) index = (index + items.length) % items.length;
           }
-          if (
-            selected.entryId !== undefined &&
-            player.queue().items[selected.index]?.id !== selected.entryId
-          ) {
-            throw cancelled();
-          }
-          player.replaceMedia(selected.index, selected.media);
-          if (selected.index !== activation!.index) player.play(selected.index);
-        }));
-      if (selected !== undefined) {
-        flushQueue();
-        emit(['queue']);
-      }
-      return result;
-    }).catch((error) => {
-      // Cancellation is an authority outcome, including aborts rejected by an
-      // asynchronous source owner, never a failed restore to publish afterward.
-      if (controller.signal.aborted || !current()) throw cancelled();
-      throw error;
-    }).finally(() => {
-      reservation?.release();
-      authority?.signal.removeEventListener('abort', abort);
-      if (pendingStart === controller) pendingStart = undefined;
+        }
+        if (selected !== null) {
+          await deps.targets?.preparePlayback(controller.signal);
+        }
+        return selected;
+      };
+      return prepare().then((selected) => {
+        if (
+          controller.signal.aborted || pendingStart !== controller || !current()
+        ) throw cancelled();
+        // A preparation plan refers to occurrences, not reusable ordinals. Queue
+        // additions may publish during this await without cancelling the start.
+        // Validate the original anchor before the command mutates anything; future
+        // queues (consume/add/restore) are installed synchronously by commit.
+        const planned = selected ?? candidate;
+        const entryId = planned &&
+          ('entryId' in planned ? planned.entryId : (planned as QueueEntry).id);
+        const originalIndex = before.findIndex((entry) => entry.id === entryId);
+        if (
+          originalIndex >= 0 &&
+          player.queue().items[originalIndex]?.id !== entryId
+        ) {
+          throw cancelled();
+        }
+        pendingStart = undefined;
+        const result = commitStart(reservation, () =>
+          commit(() => {
+            if (selected === undefined) return;
+            if (selected === null) {
+              player.stop();
+              return;
+            }
+            if (
+              selected.entryId !== undefined &&
+              player.queue().items[selected.index]?.id !== selected.entryId
+            ) {
+              throw cancelled();
+            }
+            player.replaceMedia(selected.index, selected.media);
+            if (selected.index !== activation!.index) {
+              player.play(selected.index);
+            }
+          }));
+        if (selected !== undefined) {
+          flushQueue();
+          emit(['queue']);
+        }
+        return result;
+      }).catch((error) => {
+        // Cancellation is an authority outcome, including aborts rejected by an
+        // asynchronous source owner, never a failed restore to publish afterward.
+        if (controller.signal.aborted || !current()) throw cancelled();
+        throw error;
+      }).finally(() => {
+        reservation?.release();
+        authority?.signal.removeEventListener('abort', abort);
+        operation.signal.removeEventListener('abort', abort);
+        if (pendingStart === controller) pendingStart = undefined;
+      });
     });
-  };
   const unsubscribeOutputs = outputs &&
     notify?.subscribe((types, _keys, audience) => {
       if (audience !== 'all' || !types.includes('outputs')) return;
@@ -676,8 +684,6 @@ export function createPlayback(deps: {
   const tick = persistence === undefined ? null : setInterval(() => {
     if (player.status().state === 'play') flushState();
   }, 1000);
-  let closed = false;
-  let closing = false;
   const reports = deps.reports ?? createPlaybackReports({
     nowPlaying: deps.nowPlaying,
     library,
@@ -803,105 +809,109 @@ export function createPlayback(deps: {
     opts: QueueAddOptions = {},
     source?: CommandSource,
     prepare = false,
-  ): QueueEntry[] | Promise<QueueEntry[]> => {
-    requireOpen();
-    const replacedStart = pendingStart;
-    const controller = new AbortController();
-    const starts = opts.startPlaying === true || opts.play === true;
-    if (starts) cancelStart();
-    const reservation = reserveStart(starts, controller);
-    if (starts) pendingStart = controller;
-    let limit = defaultQueueLimit;
-    additions.add(controller);
-    const check = () => {
-      if (controller.signal.aborted || closed || closing) {
-        throw new PlaybackError(
-          'playback_cancelled',
-          'Queue addition cancelled',
-        );
-      }
-    };
-    const finish = () => {
-      additions.delete(controller);
-      reservation?.release();
-      if (pendingStart === controller) pendingStart = undefined;
-    };
-    const failed = (error: unknown): never => {
-      if (controller.signal.aborted) {
-        throw new PlaybackError(
-          'playback_cancelled',
-          'Queue addition cancelled',
-        );
-      }
-      throw error;
-    };
-    const allocate = (media: QueueMedia[]) => {
-      check();
-      const commit = (firstId?: number) => {
-        check();
-        additions.delete(controller);
-        if (pendingStart === controller) pendingStart = undefined;
-        const result = commitAdd(
-          media,
-          opts,
-          source,
-          firstId,
-          limit,
-          replacedStart,
-        );
-        // The transition has acquired its own cancellation and demand now.
-        reservation?.release();
-        return result;
-      };
-      return deps.reserveQueueIds && media.length
-        ? deps.reserveQueueIds(media.length).then(commit)
-        : commit();
-    };
-    const prepared = (media: QueueMedia[]) => {
-      check();
-      checkSize(media.length, opts, limit);
-      if (!prepare || !deps.prepareQueueMedia) return allocate(media);
-      return (async () => {
-        const batch: QueueMedia[] = [];
-        for (const item of media) {
-          batch.push(await deps.prepareQueueMedia!(item, controller.signal));
-          check();
+  ): QueueEntry[] | Promise<QueueEntry[]> =>
+    operations.runImmediate((operation) => {
+      requireOpen();
+      const replacedStart = pendingStart;
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      operation.signal.addEventListener('abort', abort, { once: true });
+      const starts = opts.startPlaying === true || opts.play === true;
+      if (starts) cancelStart();
+      const reservation = reserveStart(starts, controller);
+      if (starts) pendingStart = controller;
+      let limit = defaultQueueLimit;
+      additions.add(controller);
+      const check = () => {
+        if (controller.signal.aborted || operations.closed) {
+          throw new PlaybackError(
+            'playback_cancelled',
+            'Queue addition cancelled',
+          );
         }
-        return allocate(batch);
-      })();
-    };
-    const run = () => {
-      check();
-      const resolved = () => {
-        check();
-        const media = resolve(controller.signal, limit);
-        return media instanceof Promise
-          ? media.then(prepared)
-          : prepared(media);
       };
-      if (!deps.state) return resolved();
-      return queueLimit().then((value) => {
-        limit = value;
-        return resolved();
-      });
-    };
-    try {
-      const result = additionTail ? additionTail.then(run) : run();
-      if (!(result instanceof Promise)) {
+      const finish = () => {
+        operation.signal.removeEventListener('abort', abort);
+        additions.delete(controller);
+        reservation?.release();
+        if (pendingStart === controller) pendingStart = undefined;
+      };
+      const failed = (error: unknown): never => {
+        if (controller.signal.aborted) {
+          throw new PlaybackError(
+            'playback_cancelled',
+            'Queue addition cancelled',
+          );
+        }
+        throw error;
+      };
+      const allocate = (media: QueueMedia[]) => {
+        check();
+        const commit = (firstId?: number) => {
+          check();
+          additions.delete(controller);
+          if (pendingStart === controller) pendingStart = undefined;
+          const result = commitAdd(
+            media,
+            opts,
+            source,
+            firstId,
+            limit,
+            replacedStart,
+          );
+          // The transition has acquired its own cancellation and demand now.
+          reservation?.release();
+          return result;
+        };
+        return deps.reserveQueueIds && media.length
+          ? deps.reserveQueueIds(media.length).then(commit)
+          : commit();
+      };
+      const prepared = (media: QueueMedia[]) => {
+        check();
+        checkSize(media.length, opts, limit);
+        if (!prepare || !deps.prepareQueueMedia) return allocate(media);
+        return (async () => {
+          const batch: QueueMedia[] = [];
+          for (const item of media) {
+            batch.push(await deps.prepareQueueMedia!(item, controller.signal));
+            check();
+          }
+          return allocate(batch);
+        })();
+      };
+      const run = () => {
+        check();
+        const resolved = () => {
+          check();
+          const media = resolve(controller.signal, limit);
+          return media instanceof Promise
+            ? media.then(prepared)
+            : prepared(media);
+        };
+        if (!deps.state) return resolved();
+        return queueLimit().then((value) => {
+          limit = value;
+          return resolved();
+        });
+      };
+      try {
+        const result = additionTail ? additionTail.then(run) : run();
+        if (!(result instanceof Promise)) {
+          finish();
+          return result;
+        }
+        const work = result.catch(failed).finally(finish);
+        const settled = work.then(() => {}, () => {}).finally(() => {
+          if (additionTail === settled) additionTail = undefined;
+        });
+        additionTail = settled;
+        return work;
+      } catch (error) {
         finish();
-        return result;
+        return failed(error);
       }
-      const work = result.catch(failed).finally(finish);
-      const settled = work.then(() => {}, () => {}).finally(() => {
-        if (additionTail === settled) additionTail = undefined;
-      });
-      additionTail = settled;
-      return work;
-    } catch (error) {
-      finish();
-      return failed(error);
-    }
-  };
+    });
   // A terminal observation is retained until its transition commits or its
   // lease is revoked. Non-destructive commands may cancel activation preflight;
   // the engine tick then replans against the new queue instead of stranding it.
@@ -939,7 +949,7 @@ export function createPlayback(deps: {
     };
     const work = { source, promise: Promise.resolve() };
     failureWork = work;
-    work.promise = (async () => {
+    work.promise = operations.run(async () => {
       try {
         await transition(
           plan.index !== null,
@@ -978,24 +988,24 @@ export function createPlayback(deps: {
       } finally {
         if (failureWork === work) failureWork = undefined;
       }
-    })();
+    });
     return work.promise;
   };
   const requireOpen = () => {
-    if (closed || closing) {
+    if (operations.closed) {
       throw new PlaybackError('playback_cancelled', 'Player is closed');
     }
   };
   return {
     openSource: (entryId, generation) => {
-      if (closed || closing) return null;
+      if (operations.closed) return null;
       if (needsCapacity() && !deps.capacity!.authority()()) return null;
       const source = player.openSource(entryId, generation);
       if (source) openedSource = source;
       return source;
     },
     cancelSource(source) {
-      if (closed || closing) return;
+      if (operations.closed) return;
       const version = player.queue().version;
       player.cancelSource(source);
       if (player.queue().version !== version) {
@@ -1004,58 +1014,60 @@ export function createPlayback(deps: {
       }
     },
     sourceAudio(source, durationMs) {
+      if (operations.closed) return;
       if (player.sourceAudio(source, durationMs)) {
         recoveryForRun().audioMs += durationMs;
       }
     },
-    async retrySource(source, reason) {
-      if (
-        !ownsSource(source) || player.status().current?.facts.kind !== 'web'
-      ) return false;
-      const run = recoveryForRun();
-      const backoff =
-        await deps.state?.getTyped('playback.source.retryBackoffMs') ??
-          recoverySettings.retryBackoffMs.default;
-      const reset = Number(
-        await deps.state?.getTyped('playback.source.retryResetAudioMs') ??
-          recoverySettings.retryResetAudioMs.default,
-      );
-      if (!ownsSource(source) || recovery !== run) return false;
-      if (run.audioMs >= reset) {
-        run.attempts = 0;
-        failedSources.clear();
-      }
-      run.audioMs = 0;
-      const delays = backoff as number[];
-      if (run.attempts >= delays.length) {
-        log.event('source_exhausted', {
+    retrySource: (source, reason) =>
+      operations.run(async () => {
+        if (
+          !ownsSource(source) || player.status().current?.facts.kind !== 'web'
+        ) return false;
+        const run = recoveryForRun();
+        const backoff =
+          await deps.state?.getTyped('playback.source.retryBackoffMs') ??
+            recoverySettings.retryBackoffMs.default;
+        const reset = Number(
+          await deps.state?.getTyped('playback.source.retryResetAudioMs') ??
+            recoverySettings.retryResetAudioMs.default,
+        );
+        if (!ownsSource(source) || recovery !== run) return false;
+        if (run.audioMs >= reset) {
+          run.attempts = 0;
+          failedSources.clear();
+        }
+        run.audioMs = 0;
+        const delays = backoff as number[];
+        if (run.attempts >= delays.length) {
+          log.event('source_exhausted', {
+            entry: source.entryId,
+            reason,
+            attempts: run.attempts,
+          });
+          return false;
+        }
+        const waitMs = delays[run.attempts++];
+        log.event('source_retry', {
           entry: source.entryId,
           reason,
-          attempts: run.attempts,
+          attempt: run.attempts,
+          waitMs,
         });
-        return false;
-      }
-      const waitMs = delays[run.attempts++];
-      log.event('source_retry', {
-        entry: source.entryId,
-        reason,
-        attempt: run.attempts,
-        waitMs,
-      });
-      await new Promise<void>((resolve) => {
-        const finish = () => {
-          clearTimeout(timer);
-          source.signal.removeEventListener('abort', finish);
-          resolve();
-        };
-        const timer = setTimeout(finish, waitMs);
-        source.signal.addEventListener('abort', finish, { once: true });
-        if (source.signal.aborted) finish();
-      });
-      return ownsSource(source) && recovery === run;
-    },
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            clearTimeout(timer);
+            source.signal.removeEventListener('abort', finish);
+            resolve();
+          };
+          const timer = setTimeout(finish, waitMs);
+          source.signal.addEventListener('abort', finish, { once: true });
+          if (source.signal.aborted) finish();
+        });
+        return ownsSource(source) && recovery === run;
+      }),
     reportSourceMetadata(source, metadata) {
-      if (closed || closing || !player.sourceMetadata(source, metadata)) {
+      if (operations.closed || !player.sourceMetadata(source, metadata)) {
         return false;
       }
       flushQueue();
@@ -1063,7 +1075,9 @@ export function createPlayback(deps: {
       return true;
     },
     reportSourceOutcome(source, outcome) {
-      if (closed || !player.sourceOutcome(source, outcome)) return false;
+      if (operations.closed || !player.sourceOutcome(source, outcome)) {
+        return false;
+      }
       const view = player.status();
       if (
         outcome !== 'eof' || view.current?.facts.kind === 'web' &&
@@ -1237,41 +1251,43 @@ export function createPlayback(deps: {
       flushState();
       emit(['options']);
     },
-    setVolume(opts, source) {
-      requireOpen();
-      if (opts.volume === undefined && opts.step === undefined) return;
-      const change = () => {
-        const before = player.status().volume;
-        player.setVolume(opts);
-        const volume = player.status().volume;
-        const step = volume - before;
-        for (const out of outputs?.list() ?? []) {
-          if (out.selected && out.linked !== false) {
-            outputs?.update(out.id, {
-              volume: volume === 0 ? 0 : out.volume + step,
-            }, source);
+    setVolume: (opts, source) =>
+      operations.runImmediate(() => {
+        requireOpen();
+        if (opts.volume === undefined && opts.step === undefined) return;
+        const change = () => {
+          requireOpen();
+          const before = player.status().volume;
+          player.setVolume(opts);
+          const volume = player.status().volume;
+          const step = volume - before;
+          for (const out of outputs?.list() ?? []) {
+            if (out.selected && out.linked !== false) {
+              outputs?.update(out.id, {
+                volume: volume === 0 ? 0 : out.volume + step,
+              }, source);
+            }
           }
-        }
-        persistence?.saveVolume?.(volume);
-        record(
-          'volume',
-          opts.volume !== undefined
-            ? `volume=${opts.volume}`
-            : `step=${opts.step}`,
-          source,
-          'none',
-          false,
-          {
-            volume: opts.volume,
-            step: opts.volume === undefined ? opts.step : undefined,
-          },
-        );
-        emit(['volume']);
-      };
-      return persistence?.changeVolume
-        ? persistence.changeVolume(change)
-        : change();
-    },
+          persistence?.saveVolume?.(volume);
+          record(
+            'volume',
+            opts.volume !== undefined
+              ? `volume=${opts.volume}`
+              : `step=${opts.step}`,
+            source,
+            'none',
+            false,
+            {
+              volume: opts.volume,
+              step: opts.volume === undefined ? opts.step : undefined,
+            },
+          );
+          emit(['volume']);
+        };
+        return persistence?.changeVolume
+          ? persistence.changeVolume(change)
+          : change();
+      }),
     seek(opts, source) {
       requireOpen();
       const view = player.status();
@@ -1463,215 +1479,231 @@ export function createPlayback(deps: {
       flushState();
       emit(['player']);
     },
-    async queueImport(snapshot, opts, source, publish) {
-      requireOpen();
-      checkVersion(opts.expectedVersion);
-      cancelStart();
-      const controller = new AbortController();
-      const replace = opts.mode === 'replace';
-      const starts = snapshot.items.length > 0 &&
-        (opts.startPlaying === true ||
-          replace && player.status().state === 'play');
-      const reservation = reserveStart(starts, controller);
-      pendingStart = controller;
-      try {
-        const limit = await queueLimit();
-        controller.signal.throwIfAborted();
-        checkSize(snapshot.items.length, { clear: replace }, limit);
-        const firstId = snapshot.items.length && deps.reserveQueueIds
-          ? await deps.reserveQueueIds(snapshot.items.length)
-          : undefined;
-        controller.signal.throwIfAborted();
-        if (pendingStart !== controller) controller.abort();
-        controller.signal.throwIfAborted();
+    queueImport: (snapshot, opts, source, publish) =>
+      operations.run(async (operation) => {
+        requireOpen();
         checkVersion(opts.expectedVersion);
-        const previous = player.status();
-        const future = replace ? [] : player.queue().items;
-        const currentIndex = future.findIndex((entry) =>
-          entry.id === previous.current?.id
-        );
-        const position = opts.where === 'next'
-          ? currentIndex + 1
-          : typeof opts.where === 'object'
-          ? opts.where.position
-          : future.length;
-        const at = Math.min(Math.max(0, Math.trunc(position)), future.length);
-        const items = [
-          ...future.slice(0, at),
-          ...snapshot.items,
-          ...future.slice(at),
-        ];
-        const index = replace ? snapshot.currentIndex ?? 0 : at;
-        pendingStart = undefined;
-        const work = transition(
-          starts,
-          (activate) => {
-            checkVersion(opts.expectedVersion);
-            checkSize(snapshot.items.length, { clear: replace }, limit);
-            return publish(() => {
-              if (replace) player.queueClear();
-              const added = snapshot.items.length
-                ? player.queueAddSources(snapshot.items, at, firstId)
-                : [];
-              if (replace) {
-                player.restore({
-                  queue: added,
-                  version: player.queue().version,
-                  currentIndex: snapshot.currentIndex ?? (starts ? 0 : null),
-                  positionMs: snapshot.positionMs,
-                  state: starts
-                    ? 'play'
-                    : snapshot.currentIndex === null
-                    ? 'stop'
-                    : 'pause',
-                  repeat: snapshot.repeat,
-                  consume: snapshot.consume,
-                  shuffle: previous.shuffle,
-                });
-              } else if (opts.startPlaying && added.length) player.play(at);
-              activate();
-              record(
-                'queueCopy',
-                `mode=${opts.mode}`,
-                source,
-                replace || opts.startPlaying ? player.status().state : 'none',
-                replace,
-              );
-              flushQueue();
-              emit(
-                replace
-                  ? ['queue', 'player', 'options']
-                  : opts.startPlaying
-                  ? ['queue', 'player']
-                  : ['queue'],
-              );
-            });
-          },
-          undefined,
-          { index, items },
-        );
-        reservation?.release();
-        await work;
-      } catch (error) {
-        if (controller.signal.aborted) {
-          throw new PlaybackError('playback_cancelled', 'Queue copy cancelled');
+        cancelStart();
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        operation.signal.addEventListener('abort', abort, { once: true });
+        const replace = opts.mode === 'replace';
+        const starts = snapshot.items.length > 0 &&
+          (opts.startPlaying === true ||
+            replace && player.status().state === 'play');
+        const reservation = reserveStart(starts, controller);
+        pendingStart = controller;
+        try {
+          const limit = await queueLimit();
+          controller.signal.throwIfAborted();
+          checkSize(snapshot.items.length, { clear: replace }, limit);
+          const firstId = snapshot.items.length && deps.reserveQueueIds
+            ? await deps.reserveQueueIds(snapshot.items.length)
+            : undefined;
+          controller.signal.throwIfAborted();
+          if (pendingStart !== controller) controller.abort();
+          controller.signal.throwIfAborted();
+          checkVersion(opts.expectedVersion);
+          const previous = player.status();
+          const future = replace ? [] : player.queue().items;
+          const currentIndex = future.findIndex((entry) =>
+            entry.id === previous.current?.id
+          );
+          const position = opts.where === 'next'
+            ? currentIndex + 1
+            : typeof opts.where === 'object'
+            ? opts.where.position
+            : future.length;
+          const at = Math.min(Math.max(0, Math.trunc(position)), future.length);
+          const items = [
+            ...future.slice(0, at),
+            ...snapshot.items,
+            ...future.slice(at),
+          ];
+          const index = replace ? snapshot.currentIndex ?? 0 : at;
+          pendingStart = undefined;
+          const work = transition(
+            starts,
+            (activate) => {
+              checkVersion(opts.expectedVersion);
+              checkSize(snapshot.items.length, { clear: replace }, limit);
+              return publish(() => {
+                requireOpen();
+                if (replace) player.queueClear();
+                const added = snapshot.items.length
+                  ? player.queueAddSources(snapshot.items, at, firstId)
+                  : [];
+                if (replace) {
+                  player.restore({
+                    queue: added,
+                    version: player.queue().version,
+                    currentIndex: snapshot.currentIndex ?? (starts ? 0 : null),
+                    positionMs: snapshot.positionMs,
+                    state: starts
+                      ? 'play'
+                      : snapshot.currentIndex === null
+                      ? 'stop'
+                      : 'pause',
+                    repeat: snapshot.repeat,
+                    consume: snapshot.consume,
+                    shuffle: previous.shuffle,
+                  });
+                } else if (opts.startPlaying && added.length) player.play(at);
+                activate();
+                record(
+                  'queueCopy',
+                  `mode=${opts.mode}`,
+                  source,
+                  replace || opts.startPlaying ? player.status().state : 'none',
+                  replace,
+                );
+                flushQueue();
+                emit(
+                  replace
+                    ? ['queue', 'player', 'options']
+                    : opts.startPlaying
+                    ? ['queue', 'player']
+                    : ['queue'],
+                );
+              });
+            },
+            undefined,
+            { index, items },
+          );
+          reservation?.release();
+          await work;
+        } catch (error) {
+          if (controller.signal.aborted) {
+            throw new PlaybackError(
+              'playback_cancelled',
+              'Queue copy cancelled',
+            );
+          }
+          throw error;
+        } finally {
+          operation.signal.removeEventListener('abort', abort);
+          reservation?.release();
+          if (pendingStart === controller) pendingStart = undefined;
         }
-        throw error;
-      } finally {
-        reservation?.release();
-        if (pendingStart === controller) pendingStart = undefined;
-      }
-    },
+      }),
 
     advanceEnded() {
-      if (closed || closing) return;
-      if (failedSource) {
-        if (!pendingStart) return advanceFailedSource();
-        return;
-      }
-      const view = player.status();
-      if (pendingStart || !player.canAdvanceEnded()) return;
-      const items = player.queue().items;
-      const current = items.findIndex((e) => e.id === view.current?.id);
-      const index = view.repeat === 'single'
-        ? current
-        : view.repeat === 'all'
-        ? (current + 1) % items.length
-        : view.consume
-        ? current
-        : current + 1;
-      const future = view.consume && view.repeat === 'off'
-        ? items.filter((_, i) => i !== current)
-        : items;
-      const commit = (activate: () => void) => {
-        if (player.status().generation !== view.generation) return;
-        const result = player.advanceEnded();
-        if (result === 'none') return;
-        failedSources.clear();
-        activate();
-        if (result === 'player+queue') flushQueue();
-        else flushState();
-        emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
-      };
-      return Promise.resolve(
-        transition(true, commit, undefined, {
-          index,
-          items: future,
-          wrap: view.repeat !== 'off',
-        }),
-      ).catch((error) => {
-        // Internal transitions have no HTTP caller. Keep the bookmark/queue and
-        // publish a paused clock; an explicit newer command always wins.
-        if (
-          error instanceof PlaybackError && error.code === 'playback_cancelled'
-        ) return;
-        if (player.status().state === 'play' && !pendingStart) {
-          player.pause();
-          record('pause', undefined, {
-            kind: 'internal',
-            via: 'playback-target-loss',
-          }, 'pause');
-          flushState();
-          emit(['player']);
+      if (operations.closed) return;
+      return operations.runImmediate(() => {
+        if (failedSource) {
+          if (!pendingStart) return advanceFailedSource();
+          return;
         }
+        const view = player.status();
+        if (pendingStart || !player.canAdvanceEnded()) return;
+        const items = player.queue().items;
+        const current = items.findIndex((e) => e.id === view.current?.id);
+        const index = view.repeat === 'single'
+          ? current
+          : view.repeat === 'all'
+          ? (current + 1) % items.length
+          : view.consume
+          ? current
+          : current + 1;
+        const future = view.consume && view.repeat === 'off'
+          ? items.filter((_, i) => i !== current)
+          : items;
+        const commit = (activate: () => void) => {
+          if (player.status().generation !== view.generation) return;
+          const result = player.advanceEnded();
+          if (result === 'none') return;
+          failedSources.clear();
+          activate();
+          if (result === 'player+queue') flushQueue();
+          else flushState();
+          emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+        };
+        return Promise.resolve(
+          transition(true, commit, undefined, {
+            index,
+            items: future,
+            wrap: view.repeat !== 'off',
+          }),
+        ).catch((error) => {
+          // Internal transitions have no HTTP caller. Keep the bookmark/queue and
+          // publish a paused clock; an explicit newer command always wins.
+          if (
+            error instanceof PlaybackError &&
+            error.code === 'playback_cancelled'
+          ) return;
+          if (
+            !operations.closed && player.status().state === 'play' &&
+            !pendingStart
+          ) {
+            player.pause();
+            record('pause', undefined, {
+              kind: 'internal',
+              via: 'playback-target-loss',
+            }, 'pause');
+            flushState();
+            emit(['player']);
+          }
+        });
       });
     },
 
-    restore(snapshot) {
-      requireOpen();
-      cancelAdditions();
-      const index = snapshot.currentIndex ?? 0;
-      const candidate = snapshot.queue[index];
-      const prepareUrl = deps.prepareQueueMedia &&
-        candidate?.facts.kind === 'web' && candidate.facts.mode === 'unknown';
-      const commit = (restored = snapshot) => {
-        player.restore(restored);
-        record(
-          'restore',
-          undefined,
-          { kind: 'internal', via: 'restore' },
-          restored.state,
-        );
-        serverPresent = hasServerRow();
-        announcedCommander = commander;
-        announcedQueueVersion = player.queue().version;
-        if (restored.queueChanged) flushQueue();
-      };
-      if (
-        snapshot.state !== 'play' || !snapshot.queue.length ||
-        !deps.targets && !prepareUrl && !needsCapacity()
-      ) {
-        cancelStart();
-        return commit();
-      }
-      return (async () => {
-        await transition(
-          true,
-          (activate) => {
-            commit();
-            activate();
+    restore: (snapshot) =>
+      operations.runImmediate(() => {
+        requireOpen();
+        cancelAdditions();
+        const index = snapshot.currentIndex ?? 0;
+        const candidate = snapshot.queue[index];
+        const prepareUrl = deps.prepareQueueMedia &&
+          candidate?.facts.kind === 'web' && candidate.facts.mode === 'unknown';
+        const commit = (restored = snapshot) => {
+          player.restore(restored);
+          record(
+            'restore',
+            undefined,
+            { kind: 'internal', via: 'restore' },
+            restored.state,
+          );
+          serverPresent = hasServerRow();
+          announcedCommander = commander;
+          announcedQueueVersion = player.queue().version;
+          if (restored.queueChanged) flushQueue();
+        };
+        if (
+          snapshot.state !== 'play' || !snapshot.queue.length ||
+          !deps.targets && !prepareUrl && !needsCapacity()
+        ) {
+          cancelStart();
+          return commit();
+        }
+        return (async () => {
+          await transition(
+            true,
+            (activate) => {
+              commit();
+              activate();
+            },
+            undefined,
+            { index, items: snapshot.queue },
+          );
+        })().catch(
+          (error) => {
+            requireOpen();
+            if (
+              error instanceof PlaybackError &&
+                error.code === 'target_unavailable' ||
+              error instanceof PlaybackError && error.code === 'no_target'
+            ) commit({ ...snapshot, state: 'pause' });
+            else if (prepareUrl && !(error instanceof PlaybackError)) {
+              log.event('media_failed', {
+                operation: 'prepare-restored-source',
+                path: String(candidate.id),
+                error,
+              });
+              commit({ ...snapshot, state: 'pause' });
+            } else throw error;
           },
-          undefined,
-          { index, items: snapshot.queue },
         );
-      })().catch(
-        (error) => {
-          if (
-            error instanceof PlaybackError &&
-              error.code === 'target_unavailable' ||
-            error instanceof PlaybackError && error.code === 'no_target'
-          ) commit({ ...snapshot, state: 'pause' });
-          else if (prepareUrl && !(error instanceof PlaybackError)) {
-            log.event('media_failed', {
-              operation: 'prepare-restored-source',
-              path: String(candidate.id),
-              error,
-            });
-            commit({ ...snapshot, state: 'pause' });
-          } else throw error;
-        },
-      );
-    },
+      }),
 
     checkpoint: flushState,
     playerView: () => player.status(),
@@ -1696,19 +1728,25 @@ export function createPlayback(deps: {
     serverNowPlayingView,
     nowPlayingView: reports.nowPlayingView,
 
-    async close() {
+    close() {
+      if (closeWork) return closeWork;
+      const completion = Promise.withResolvers<void>();
+      closeWork = completion.promise;
+      // Fence intake before cancellation can synchronously reenter the player.
+      const settled = operations.close();
       cancelStart();
       cancelAdditions();
       activeReservation?.release();
       activeReservation = undefined;
       // Revoke a parked source even if its boot is being closed separately.
       if (openedSource) player.cancelSource(openedSource);
-      closing = true;
       unsubscribeOutputs?.();
       if (tick !== null) clearInterval(tick);
-      if (deps.reports === undefined) await reports.close();
-      closed = true;
-      await failureWork?.promise;
+      void Promise.all([
+        settled,
+        deps.reports === undefined ? reports.close() : undefined,
+      ]).then(() => completion.resolve(), completion.reject);
+      return closeWork;
     },
   };
 }

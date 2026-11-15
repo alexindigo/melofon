@@ -6,6 +6,7 @@ import {
   type PlaybackSources,
 } from '../playback-source.ts';
 import { type Log, scopedLog } from '../logging.ts';
+import { createOperationScope } from '../operations.ts';
 import { queueDisplay } from '../queue-source.ts';
 import type { Notify } from '../notify.ts';
 import type {
@@ -108,6 +109,7 @@ interface PairingWork {
   view: SpeakerPairingView;
   saved: boolean;
   stopped: boolean;
+  authority(): boolean;
   current(): boolean;
 }
 
@@ -121,6 +123,8 @@ export function createAirplayBoot(
   close(): Promise<void>;
 } {
   const { outputs, playback, media, notify } = deps;
+  const operations = createOperationScope('AirPlay boot');
+  let closeWork: Promise<void> | undefined;
   const sources = deps.sources ?? createPlaybackSource({ media });
   const capacityCurrent = () => deps.capacity?.authority() ?? (() => true);
   // Keep the existing permissive off/list parser (including clamping) at its owner.
@@ -173,7 +177,6 @@ export function createAirplayBoot(
   const retiring = new Map<string, Promise<boolean>>();
   const blocked = new Set<string>();
   const pendingPumps = new Map<string, Runtime>();
-  const pumps = new Set<Promise<void>>();
   // One source lifetime for the native shared stream, elected BEFORE acquisition.
   // Keep the slot through nonempty EOF: accepted PCM may still be playing out.
   let source: {
@@ -229,7 +232,9 @@ export function createAirplayBoot(
     code?: string,
   ) => {
     if (pairings.get(id) !== work || work.controller.signal.aborted) return;
-    const publish = work.current();
+    // A terminal cleanup view may publish while close is joining, but can
+    // never overwrite a successor endpoint/membership/challenge.
+    const publish = work.authority();
     work.view = {
       state,
       saved: state === 'complete' && outputs.lifetime(id).adopted,
@@ -411,43 +416,48 @@ export function createAirplayBoot(
     };
     resuming.set(id, work);
     let retry = false;
-    void (async () => {
-      await playback.play(ownedSource, {
-        signal: controller.signal,
-        isCurrent: work.isCurrent,
-      });
-      consumeCommands();
-      const view = playback.playerView();
-      if (!work.isCurrent() || view.state !== 'play' || !view.current) return;
-      if (lease === authority) lease = null;
-      if (r) {
-        requestPump(id, r);
-      }
-    })().catch((error) => {
-      if (!work.isCurrent()) return;
-      // This exact attempt is spent. Reconciliation cannot reuse its grant;
-      // only the finite retry scheduler may authorize another preparation.
-      if (permission && grants.get(id) === permission) grants.delete(id);
-      epoch(id).failed = true;
-      retry = true;
-      if (r) {
-        void retire(id, r, 'failed');
-        devices.sessionChanged(id, {
-          connection: 'failed',
-          authentication: 'none',
-          error: {
-            code: 'transport_failed',
-            message: 'Speaker could not resume playback',
-          },
+    void operations.run(async ({ signal }) => {
+      const abort = () => controller.abort();
+      signal.addEventListener('abort', abort, { once: true });
+      try {
+        await playback.play(ownedSource, {
+          signal: controller.signal,
+          isCurrent: work.isCurrent,
         });
+        consumeCommands();
+        const view = playback.playerView();
+        if (!work.isCurrent() || view.state !== 'play' || !view.current) return;
+        if (lease === authority) lease = null;
+        if (r) {
+          requestPump(id, r);
+        }
+      } catch (error) {
+        if (!work.isCurrent()) return;
+        // This exact attempt is spent. Reconciliation cannot reuse its grant;
+        // only the finite retry scheduler may authorize another preparation.
+        if (permission && grants.get(id) === permission) grants.delete(id);
+        epoch(id).failed = true;
+        retry = true;
+        if (r) {
+          void retire(id, r, 'failed');
+          devices.sessionChanged(id, {
+            connection: 'failed',
+            authentication: 'none',
+            error: {
+              code: 'transport_failed',
+              message: 'Speaker could not resume playback',
+            },
+          });
+        }
+        log.event('preparation_error', { output: id, error });
+      } finally {
+        signal.removeEventListener('abort', abort);
+        if (resuming.get(id) === work) resuming.delete(id);
+        if (
+          retry && intentEpoch === demand && epoch(id).generation === generation
+        ) scheduleRetry(id);
+        reconcile();
       }
-      log.event('preparation_error', { output: id, error });
-    }).finally(() => {
-      if (resuming.get(id) === work) resuming.delete(id);
-      if (
-        retry && intentEpoch === demand && epoch(id).generation === generation
-      ) scheduleRetry(id);
-      reconcile();
     });
   };
   const cancelPump = (id: string, r: Runtime) => {
@@ -490,7 +500,7 @@ export function createAirplayBoot(
       runtimes.get(id) === r &&
       r.transport === t &&
       r.session === session && r.pump === generation;
-    const pumping = (async () => {
+    void operations.run(async () => {
       let bytes = 0;
       try {
         const stream = await sources.open(current, {
@@ -578,9 +588,9 @@ export function createAirplayBoot(
           void retire(peerId, peer, 'content');
         }
       }
-    })();
-    pumps.add(pumping);
-    void pumping.finally(() => pumps.delete(pumping));
+    }).catch((error) =>
+      log.event('content_failed', { output: id, generation: session, error })
+    );
   };
   const drainPumps = () => {
     if (closed || collecting || retiring.size || feedBlocked) return;
@@ -788,163 +798,173 @@ export function createAirplayBoot(
         !blocked.has(id) && !retiring.has(id);
     };
     let session = 0;
-    void (async () => {
-      const prepared = await devices.protocol.prepare({
-        id,
-        capacity: deps.capacity,
-        targetRevision: devices.admission.describe(id).targetRevision,
-        signal: controller.signal,
-        isCurrent: current,
-      });
-      if (preparing.get(id) !== work || !current()) return;
-      preparing.delete(id);
-      grants.delete(id);
-      if (!prepared.ok) {
-        e.failed = true;
-        devices.sessionChanged(id, {
-          connection: 'disconnected',
-          authentication: 'none',
+    void operations.run(async ({ signal }) => {
+      const abort = () => controller.abort();
+      signal.addEventListener('abort', abort, { once: true });
+      try {
+        const prepared = await devices.protocol.prepare({
+          id,
+          capacity: deps.capacity,
+          targetRevision: devices.admission.describe(id).targetRevision,
+          signal: controller.signal,
+          isCurrent: current,
         });
-        log.event('preparation_failed', { output: id, error: prepared.error });
-        pauseWithoutPeer();
-        scheduleRetry(id);
-        return;
-      }
-      const latestOut = outputs.get(id)!;
-      view = playback.playerView();
-      if (!view.current) return;
-      e.failed = false;
-      session = (generations.get(id) ?? 0) + 1;
-      generations.set(id, session);
-      const r: Runtime = {
-        authority,
-        transport: null,
-        activationCurrent: current,
-        session,
-        pump: 0,
-        connected: false,
-        authenticationRequired: false,
-        // Retain queue identity for same-entry seeks before CONNECTED is
-        // polled. Entry changes during the handshake still absorb the latest
-        // item when the connecting generation starts its first pump.
-        entry: view.current.id,
-        playbackGeneration: view.generation,
-        strategy: latestOut.connectionStrategy,
-        host: latestOut.host!,
-        port: latestOut.port ?? 7000,
-        volume: latestOut.volume,
-        held: false,
-      };
-      runtimes.set(id, r);
-      activated = r;
-      const own = () =>
-        !closed && authority() && runtimes.get(id) === r &&
-        r.session === session &&
-        r.transport !== null;
-      const activationFailed = (why: string, error: unknown) => {
-        if (runtimes.get(id) !== r) return;
-        if (!current()) {
-          // Superseding intent revokes the captured activation authority. It
-          // is not a receiver failure and cannot pause or spend output retries.
-          // Retire the obsolete runtime before reconciling the current grant.
-          void retire(id, r, 'superseded activation');
+        if (preparing.get(id) !== work || !current()) return;
+        preparing.delete(id);
+        grants.delete(id);
+        if (!prepared.ok) {
+          e.failed = true;
+          devices.sessionChanged(id, {
+            connection: 'disconnected',
+            authentication: 'none',
+          });
+          log.event('preparation_failed', {
+            output: id,
+            error: prepared.error,
+          });
+          pauseWithoutPeer();
+          scheduleRetry(id);
           return;
         }
-        sessionFailed(id, r, why, error);
-      };
-      try {
-        log.event('session_start', {
-          output: id,
-          generation: session,
-          strategy: r.strategy,
-          grant: permission.kind,
-        });
-        const result = await devices.protocol.activate(prepared.value, {
-          volume: r.volume,
-          positionMs: 0,
-          lengthMs: view.itemLengthMs,
-          title: queueDisplay(view.current).title ?? '',
-          artist: queueDisplay(view.current).artistName ?? '',
-        }, {
-          publish(transport) {
-            r.transport = transport;
-            devices.sessionChanged(id, {
-              connection: 'connecting',
-              authentication: 'none',
-            });
-          },
-          onEvent({ event, value }) {
-            if (!own()) {
-              return;
-            }
-            const pin = r.pin;
-            if (event === 'credential' && value === 'saved') {
-              if (pin?.current()) pin.saved = true;
-            }
-            if (event === 'state' && value === 'stopped') {
-              if (pin?.current()) pin.stopped = true;
-            }
-            if (pin?.current() && pin.saved && pin.stopped) {
-              releasePin(r, pin);
-              void controls.changeCredentials(id, async () => {}).catch(
-                () => {},
-              );
-              return;
-            }
-            if (event === 'state' && value === 'failed') {
-              sessionFailed(id, r, 'helper event');
-            } else if (event === 'state' && value === 'password') {
-              releasePin(r);
-              r.connected = false;
-              r.authenticationRequired = true;
-              // The writer feeds a shared native player, not this speaker's
-              // socket. A healthy peer still consumes it while this control
-              // session handles authentication; its token releases at close.
-              if (!usable()) cancelPump(id, r);
-              outputs.update(id, { needsAuthKey: true }, ownedSource);
+        const latestOut = outputs.get(id)!;
+        view = playback.playerView();
+        if (!view.current) return;
+        e.failed = false;
+        session = (generations.get(id) ?? 0) + 1;
+        generations.set(id, session);
+        const r: Runtime = {
+          authority,
+          transport: null,
+          activationCurrent: current,
+          session,
+          pump: 0,
+          connected: false,
+          authenticationRequired: false,
+          // Retain queue identity for same-entry seeks before CONNECTED is
+          // polled. Entry changes during the handshake still absorb the latest
+          // item when the connecting generation starts its first pump.
+          entry: view.current.id,
+          playbackGeneration: view.generation,
+          strategy: latestOut.connectionStrategy,
+          host: latestOut.host!,
+          port: latestOut.port ?? 7000,
+          volume: latestOut.volume,
+          held: false,
+        };
+        runtimes.set(id, r);
+        activated = r;
+        const own = () =>
+          !closed && authority() && runtimes.get(id) === r &&
+          r.session === session &&
+          r.transport !== null;
+        const activationFailed = (why: string, error: unknown) => {
+          if (runtimes.get(id) !== r) return;
+          if (!current()) {
+            // Superseding intent revokes the captured activation authority. It
+            // is not a receiver failure and cannot pause or spend output retries.
+            // Retire the obsolete runtime before reconciling the current grant.
+            void retire(id, r, 'superseded activation');
+            return;
+          }
+          sessionFailed(id, r, why, error);
+        };
+        try {
+          log.event('session_start', {
+            output: id,
+            generation: session,
+            strategy: r.strategy,
+            grant: permission.kind,
+          });
+          const result = await devices.protocol.activate(prepared.value, {
+            volume: r.volume,
+            positionMs: 0,
+            lengthMs: view.itemLengthMs,
+            title: queueDisplay(view.current).title ?? '',
+            artist: queueDisplay(view.current).artistName ?? '',
+          }, {
+            publish(transport) {
+              r.transport = transport;
               devices.sessionChanged(id, {
                 connection: 'connecting',
-                authentication: 'authentication_required',
-              });
-              pauseWithoutPeer();
-            } else if (event === 'state' && value === 'connected') {
-              releasePin(r);
-              const wasConnected = r.connected;
-              r.connected = true;
-              devices.sessionChanged(id, {
-                connection: 'connected',
                 authentication: 'none',
               });
-              if (outputs.get(id)?.needsAuthKey) {
-                outputs.update(id, { needsAuthKey: false }, ownedSource);
-              }
-              r.authenticationRequired = false;
-              const latest = playback.playerView();
-              if (
-                latest.state === 'pause' && lease?.intent === intentEpoch &&
-                leasedGeneration(id) === epoch(id).generation &&
-                intent === 'play'
-              ) {
-                resume(outputs.get(id)!, undefined, r);
+            },
+            onEvent({ event, value }) {
+              if (!own()) {
                 return;
               }
-              if (!wasConnected && !r.held && latest.state === 'play') {
-                requestPump(id, r);
+              const pin = r.pin;
+              if (event === 'credential' && value === 'saved') {
+                if (pin?.current()) pin.saved = true;
               }
-              // Connected/FLUSH notifications never reset a demand's retry budget.
-            }
-          },
-        });
-        if (result.ok) r.activationCurrent = undefined;
-        if (!result.ok && runtimes.get(id) === r) {
-          activationFailed('activation', result.error);
+              if (event === 'state' && value === 'stopped') {
+                if (pin?.current()) pin.stopped = true;
+              }
+              if (pin?.current() && pin.saved && pin.stopped) {
+                releasePin(r, pin);
+                void controls.changeCredentials(id, async () => {}).catch(
+                  () => {},
+                );
+                return;
+              }
+              if (event === 'state' && value === 'failed') {
+                sessionFailed(id, r, 'helper event');
+              } else if (event === 'state' && value === 'password') {
+                releasePin(r);
+                r.connected = false;
+                r.authenticationRequired = true;
+                // The writer feeds a shared native player, not this speaker's
+                // socket. A healthy peer still consumes it while this control
+                // session handles authentication; its token releases at close.
+                if (!usable()) cancelPump(id, r);
+                outputs.update(id, { needsAuthKey: true }, ownedSource);
+                devices.sessionChanged(id, {
+                  connection: 'connecting',
+                  authentication: 'authentication_required',
+                });
+                pauseWithoutPeer();
+              } else if (event === 'state' && value === 'connected') {
+                releasePin(r);
+                const wasConnected = r.connected;
+                r.connected = true;
+                devices.sessionChanged(id, {
+                  connection: 'connected',
+                  authentication: 'none',
+                });
+                if (outputs.get(id)?.needsAuthKey) {
+                  outputs.update(id, { needsAuthKey: false }, ownedSource);
+                }
+                r.authenticationRequired = false;
+                const latest = playback.playerView();
+                if (
+                  latest.state === 'pause' && lease?.intent === intentEpoch &&
+                  leasedGeneration(id) === epoch(id).generation &&
+                  intent === 'play'
+                ) {
+                  resume(outputs.get(id)!, undefined, r);
+                  return;
+                }
+                if (!wasConnected && !r.held && latest.state === 'play') {
+                  requestPump(id, r);
+                }
+                // Connected/FLUSH notifications never reset a demand's retry budget.
+              }
+            },
+          });
+          if (result.ok) r.activationCurrent = undefined;
+          if (!result.ok && runtimes.get(id) === r) {
+            activationFailed('activation', result.error);
+          }
+        } catch (error) {
+          activationFailed('spawn', error);
         }
       } catch (error) {
-        activationFailed('spawn', error);
+        log.event('preparation_error', { output: id, error });
+      } finally {
+        signal.removeEventListener('abort', abort);
+        if (preparing.get(id) === work) preparing.delete(id);
       }
-    })().catch((error) =>
-      log.event('preparation_error', { output: id, error })
-    );
+    });
   };
   const idle = (id: string, r: Runtime, choice: ConnectionStrategy) => {
     // An internal no-audio pause retains the challenged control session so its
@@ -965,9 +985,11 @@ export function createAirplayBoot(
     cancelPump(id, r);
     r.held = true;
     r.deadline = performance.now() + HOLD_MS;
-    void r.transport!.send({ cmd: 'flush' }).catch((error) => {
-      if (runtimes.get(id) === r) sessionFailed(id, r, 'flush', error);
-    });
+    void operations.run(() =>
+      r.transport!.send({ cmd: 'flush' }).catch((error) => {
+        if (runtimes.get(id) === r) sessionFailed(id, r, 'flush', error);
+      })
+    );
     if (runtimes.get(id) !== r || !r.held) return;
     const session = r.session;
     r.holdTimer = setTimeout(() => {
@@ -1089,11 +1111,13 @@ export function createAirplayBoot(
         } else if (r.connected) {
           actions.push(() => {
             cancelPump(id, r);
-            void r.transport!.send({ cmd: 'flush' }).catch((error) => {
-              if (runtimes.get(id) === r) {
-                sessionFailed(id, r, 'flush', error);
-              }
-            });
+            void operations.run(() =>
+              r.transport!.send({ cmd: 'flush' }).catch((error) => {
+                if (runtimes.get(id) === r) {
+                  sessionFailed(id, r, 'flush', error);
+                }
+              })
+            );
             requestPump(id, r);
           });
         }
@@ -1105,11 +1129,13 @@ export function createAirplayBoot(
         const v = row.volume;
         if (v !== r.volume) {
           r.volume = v;
-          void r.transport.send({ cmd: 'volume', volume: v }).catch((error) => {
-            if (runtimes.get(id) === r) {
-              sessionFailed(id, r, 'volume', error);
-            }
-          });
+          void operations.run(() =>
+            r.transport!.send({ cmd: 'volume', volume: v }).catch((error) => {
+              if (runtimes.get(id) === r) {
+                sessionFailed(id, r, 'volume', error);
+              }
+            })
+          );
         }
       });
     }
@@ -1157,13 +1183,16 @@ export function createAirplayBoot(
     : undefined;
   if (deps.state && deps.retryBackoffMs === undefined) {
     const revision = policyRevision;
-    void deps.state.get(AIRPLAY_RETRY_KEY).then((value) => {
-      if (!closed && policyRevision === revision) applyPolicy(value);
-    }).catch((error) => {
-      if (closed || policyRevision !== revision) return;
-      policyReady = true;
-      backoff = null;
-      log.event('retry_settings_failed', { error });
+    void operations.run(async () => {
+      try {
+        const value = await deps.state!.get(AIRPLAY_RETRY_KEY);
+        if (!closed && policyRevision === revision) applyPolicy(value);
+      } catch (error) {
+        if (closed || policyRevision !== revision) return;
+        policyReady = true;
+        backoff = null;
+        log.event('retry_settings_failed', { error });
+      }
     });
   }
   const unsubscribeCommands = outputs.onCommand((id, cmd) => {
@@ -1192,297 +1221,311 @@ export function createAirplayBoot(
   });
   if (startupIds.length) reconcile();
   const controls = {
-    async pair(id: string): Promise<SpeakerPairingView> {
-      consumeCommands();
-      const out = outputs.get(id);
-      if (!out) throw new SpeakerError('not_found', 'Speaker not found');
-      requireControl(out);
-      if (
-        closed || blocked.has(id) || retiring.has(id) || runtimes.has(id) ||
-        preparing.has(id) || pairings.get(id)?.current()
-      ) {
-        throw new SpeakerError('speaker_busy', 'Speaker is already in use');
-      }
-      const incarnation = outputs.revision(id);
-      const authority = outputAuthority(outputs, id);
-      const endpoint = JSON.stringify([out.type, out.host, out.port]);
-      const work: PairingWork = {
-        controller: new AbortController(),
-        view: { state: 'preparing', saved: false },
-        saved: false,
-        stopped: false,
-        current: () => {
-          const row = outputs.get(id);
-          return !closed && pairings.get(id) === work &&
-            !work.controller.signal.aborted &&
-            outputs.revision(id) === incarnation && authority() && !!row &&
-            JSON.stringify([row.type, row.host, row.port]) === endpoint;
-        },
-      };
-      pairings.set(id, work);
-      let pending = false, settingsReady = false;
-      let failure = 'pairing_unavailable';
-      try {
-        await (async () => {
-          publishPairing(id, work);
-          const seconds = deps.state
-            ? await deps.state.getTyped('airplay.pairingSeconds') as number
-            : 120;
-          settingsReady = true;
-          if (!work.current()) return;
-          work.timer = setTimeout(
-            () => finishPairing(id, work, 'failed', 'pairing_timeout'),
-            seconds * 1000,
-          );
-          const prepared = await devices.protocol.prepare({
-            id,
-            targetRevision: devices.admission.describe(id).targetRevision,
-            signal: work.controller.signal,
-            isCurrent: work.current,
-          });
-          if (!work.current()) return;
-          if (!prepared.ok || !devices.describe(id).abilities?.pin) {
-            throw new SpeakerError(
-              'pairing_unavailable',
-              'Speaker cannot be prepared for PIN pairing',
-            );
-          }
-          failure = 'pairing_failed';
-          const result = await devices.protocol.activate(prepared.value, {
-            probe: true,
-            volume: 0,
-            positionMs: 0,
-            lengthMs: 0,
-            title: '',
-            artist: '',
-          }, {
-            publish: (transport) => {
-              work.transport = transport;
-            },
-            onEvent({ event, value }) {
-              if (!work.current()) return;
-              if (event === 'credential' && value === 'unavailable') {
-                work.view = {
-                  ...work.view,
-                  error: {
-                    code: 'credential_unavailable',
-                    message: 'Pairing credential could not be saved',
-                  },
-                };
-                publishPairing(id, work);
-              }
-              if (event === 'credential' && value === 'saved') {
-                work.saved = true;
-              }
-              if (event === 'credential' && value === 'cleared') {
-                work.saved = false;
-              }
-              if (event === 'state' && value === 'stopped') work.stopped = true;
-              if (work.saved && work.stopped) {
-                outputs.update(id, { needsAuthKey: false }, ownedSource);
-                finishPairing(id, work, 'complete');
-              } else if (event === 'state' && value === 'password') {
-                if (work.view.state === 'pairing') {
-                  finishPairing(id, work, 'failed', 'pairing_rejected');
-                } else {
-                  work.view = { state: 'awaiting_pin', saved: false };
-                  outputs.update(id, { needsAuthKey: true }, ownedSource);
-                  publishPairing(id, work);
-                }
-              } else if (event === 'state' && value === 'failed') {
-                finishPairing(id, work, 'failed', 'pairing_failed');
-              }
-            },
-          });
-          // Only a successfully activated operation transfers cleanup to its
-          // event/timeout owner. Every other exit finishes in the same finally.
-          pending = result.ok && work.current();
-        })();
-      } catch (error) {
-        if (!settingsReady || error instanceof SpeakerError) throw error;
-        throw new SpeakerError(
-          'pairing_unavailable',
-          'Speaker pairing is unavailable',
-        );
-      } finally {
-        if (!pending) {
-          const current = work.current();
-          finishPairing(
-            id,
-            work,
-            current ? 'failed' : 'cancelled',
-            current ? failure : undefined,
-          );
-        }
-      }
-      return structuredClone(work.view);
-    },
-    async submitPin(id: string, pin: string): Promise<SpeakerPairingView> {
-      const work = pairings.get(id);
-      if (
-        !work?.current() || !work.transport ||
-        work.view.state !== 'awaiting_pin'
-      ) {
-        // A current playback authentication challenge is the other entry path.
-        // The same private receipt/recycle owner handles its result.
-        const runtime = runtimes.get(id);
+    pair: (id: string): Promise<SpeakerPairingView> =>
+      operations.run(async ({ signal }) => {
+        consumeCommands();
+        const out = outputs.get(id);
+        if (!out) throw new SpeakerError('not_found', 'Speaker not found');
+        requireControl(out);
         if (
-          runtime?.authenticationRequired && runtime.transport &&
-          !runtime.pin && intent === 'play' && outputs.get(id)?.selected
+          closed || blocked.has(id) || retiring.has(id) || runtimes.has(id) ||
+          preparing.has(id) || pairings.get(id)?.current()
         ) {
-          const demand = intentEpoch, generation = epoch(id).generation;
-          const transport = runtime.transport, session = runtime.session;
-          const attempt: RuntimePin = {
-            saved: false,
-            stopped: false,
-            current: () =>
-              !closed && runtime.authority() && runtime.pin === attempt &&
-              runtimes.get(id) === runtime && runtime.transport === transport &&
-              runtime.session === session && runtime.authenticationRequired &&
-              intent === 'play' && outputs.get(id)?.selected === true &&
-              intentEpoch === demand && epoch(id).generation === generation,
-          };
-          runtime.pin = attempt;
-          let pending = false;
-          try {
+          throw new SpeakerError('speaker_busy', 'Speaker is already in use');
+        }
+        const incarnation = outputs.revision(id);
+        const authority = outputAuthority(outputs, id);
+        const endpoint = JSON.stringify([out.type, out.host, out.port]);
+        const work: PairingWork = {
+          controller: new AbortController(),
+          view: { state: 'preparing', saved: false },
+          saved: false,
+          stopped: false,
+          authority: () => {
+            const row = outputs.get(id);
+            return pairings.get(id) === work &&
+              !work.controller.signal.aborted &&
+              outputs.revision(id) === incarnation && authority() && !!row &&
+              JSON.stringify([row.type, row.host, row.port]) === endpoint;
+          },
+          current: () => !closed && work.authority(),
+        };
+        pairings.set(id, work);
+        const abort = () => cancelPairing(id);
+        signal.addEventListener('abort', abort, { once: true });
+        let pending = false, settingsReady = false;
+        let failure = 'pairing_unavailable';
+        try {
+          await (async () => {
+            publishPairing(id, work);
             const seconds = deps.state
               ? await deps.state.getTyped('airplay.pairingSeconds') as number
               : 120;
-            if (!attempt.current()) {
-              throw new SpeakerError(
-                'pairing_required',
-                'Speaker pairing has ended',
-              );
-            }
-            attempt.timer = setTimeout(() => {
-              if (attempt.current()) {
-                releasePin(runtime, attempt);
-                sessionFailed(id, runtime, 'pairing timeout');
-              }
-            }, seconds * 1000);
-            try {
-              await transport.send({ cmd: 'pin', pin });
-            } catch {
-              if (attempt.current()) {
-                sessionFailed(id, runtime, 'PIN submission');
-              }
+            settingsReady = true;
+            if (!work.current()) return;
+            work.timer = setTimeout(
+              () => finishPairing(id, work, 'failed', 'pairing_timeout'),
+              seconds * 1000,
+            );
+            const prepared = await devices.protocol.prepare({
+              id,
+              targetRevision: devices.admission.describe(id).targetRevision,
+              signal: work.controller.signal,
+              isCurrent: work.current,
+            });
+            if (!work.current()) return;
+            if (!prepared.ok || !devices.describe(id).abilities?.pin) {
               throw new SpeakerError(
                 'pairing_unavailable',
-                'Speaker PIN could not be submitted',
+                'Speaker cannot be prepared for PIN pairing',
               );
             }
-            pending = attempt.current();
-            return { state: 'pairing', saved: false };
-          } finally {
-            if (!pending) releasePin(runtime, attempt);
+            failure = 'pairing_failed';
+            const result = await devices.protocol.activate(prepared.value, {
+              probe: true,
+              volume: 0,
+              positionMs: 0,
+              lengthMs: 0,
+              title: '',
+              artist: '',
+            }, {
+              publish: (transport) => {
+                work.transport = transport;
+              },
+              onEvent({ event, value }) {
+                if (!work.current()) return;
+                if (event === 'credential' && value === 'unavailable') {
+                  work.view = {
+                    ...work.view,
+                    error: {
+                      code: 'credential_unavailable',
+                      message: 'Pairing credential could not be saved',
+                    },
+                  };
+                  publishPairing(id, work);
+                }
+                if (event === 'credential' && value === 'saved') {
+                  work.saved = true;
+                }
+                if (event === 'credential' && value === 'cleared') {
+                  work.saved = false;
+                }
+                if (event === 'state' && value === 'stopped') {
+                  work.stopped = true;
+                }
+                if (work.saved && work.stopped) {
+                  outputs.update(id, { needsAuthKey: false }, ownedSource);
+                  finishPairing(id, work, 'complete');
+                } else if (event === 'state' && value === 'password') {
+                  if (work.view.state === 'pairing') {
+                    finishPairing(id, work, 'failed', 'pairing_rejected');
+                  } else {
+                    work.view = { state: 'awaiting_pin', saved: false };
+                    outputs.update(id, { needsAuthKey: true }, ownedSource);
+                    publishPairing(id, work);
+                  }
+                } else if (event === 'state' && value === 'failed') {
+                  finishPairing(id, work, 'failed', 'pairing_failed');
+                }
+              },
+            });
+            // Only a successfully activated operation transfers cleanup to its
+            // event/timeout owner. Every other exit finishes in the same finally.
+            pending = result.ok && work.current();
+          })();
+        } catch (error) {
+          if (!settingsReady || error instanceof SpeakerError) throw error;
+          throw new SpeakerError(
+            'pairing_unavailable',
+            'Speaker pairing is unavailable',
+          );
+        } finally {
+          signal.removeEventListener('abort', abort);
+          if (!pending) {
+            const current = work.current();
+            finishPairing(
+              id,
+              work,
+              current ? 'failed' : 'cancelled',
+              current ? failure : undefined,
+            );
           }
         }
-        throw new SpeakerError(
-          'pairing_required',
-          'Begin pairing and wait for the PIN prompt first',
-        );
-      }
-      work.view = { state: 'pairing', saved: false };
-      work.stopped = false;
-      publishPairing(id, work);
-      try {
-        await work.transport.send({ cmd: 'pin', pin });
-      } catch {
-        finishPairing(id, work, 'failed', 'pairing_failed');
-        throw new SpeakerError(
-          'pairing_unavailable',
-          'Speaker PIN could not be submitted',
-        );
-      }
-      return structuredClone(work.view);
-    },
-    async changeCredentials(id: string, save: () => Promise<void>) {
-      consumeCommands();
-      cancelPairing(id);
-      const out = outputs.get(id);
-      if (closed || !out) throw new Error('Speaker lifecycle unavailable');
-      requireControl(out);
-      const authority = outputAuthority(outputs, id);
-      const incarnation = outputs.revision(id), demand = intentEpoch;
-      const view = playback.playerView();
-      const authorized = out.selected && intent === 'play' &&
-        (view.state === 'play' || lease?.intent === intentEpoch &&
-            leasedGeneration(id) === epoch(id).generation);
-      // Revoke immediately, before encryption/store awaits. A replacement is an
-      // explicit credential operation, never a catalog update or a play intent.
-      revoke(id);
-      const generation = epoch(id).generation;
-      if (authorized && lease?.intent === demand) {
-        lease.outputs.set(id, leaseEntry(id, generation));
-      }
-      devices.admission.invalidate(id);
-      const runtime = runtimes.get(id);
-      const released = runtime
-        ? retire(id, runtime, 'credentials')
-        : retiring.get(id) ?? Promise.resolve(true);
-      if (authorized) pauseWithoutPeer();
-      await save();
-      if (!await released) {
-        throw new Error('Speaker session could not be released');
-      }
-      consumeCommands();
-      const current = outputs.get(id);
-      if (
-        !closed && authority() && authorized && current?.selected &&
-        outputs.revision(id) === incarnation && current.host === out.host &&
-        current.port === out.port && intent === 'play' &&
-        intentEpoch === demand &&
-        epoch(id).generation === generation &&
-        (playback.playerView().state === 'play' ||
-          lease?.intent === demand && leasedGeneration(id) === generation)
-      ) {
-        resetDemand(id);
+        return structuredClone(work.view);
+      }),
+    submitPin: (id: string, pin: string): Promise<SpeakerPairingView> =>
+      operations.run(async () => {
+        const work = pairings.get(id);
+        if (
+          !work?.current() || !work.transport ||
+          work.view.state !== 'awaiting_pin'
+        ) {
+          // A current playback authentication challenge is the other entry path.
+          // The same private receipt/recycle owner handles its result.
+          const runtime = runtimes.get(id);
+          if (
+            runtime?.authenticationRequired && runtime.transport &&
+            !runtime.pin && intent === 'play' && outputs.get(id)?.selected
+          ) {
+            const demand = intentEpoch, generation = epoch(id).generation;
+            const transport = runtime.transport, session = runtime.session;
+            const attempt: RuntimePin = {
+              saved: false,
+              stopped: false,
+              current: () =>
+                !closed && runtime.authority() && runtime.pin === attempt &&
+                runtimes.get(id) === runtime &&
+                runtime.transport === transport &&
+                runtime.session === session && runtime.authenticationRequired &&
+                intent === 'play' && outputs.get(id)?.selected === true &&
+                intentEpoch === demand && epoch(id).generation === generation,
+            };
+            runtime.pin = attempt;
+            let pending = false;
+            try {
+              const seconds = deps.state
+                ? await deps.state.getTyped('airplay.pairingSeconds') as number
+                : 120;
+              if (!attempt.current()) {
+                throw new SpeakerError(
+                  'pairing_required',
+                  'Speaker pairing has ended',
+                );
+              }
+              attempt.timer = setTimeout(() => {
+                if (attempt.current()) {
+                  releasePin(runtime, attempt);
+                  sessionFailed(id, runtime, 'pairing timeout');
+                }
+              }, seconds * 1000);
+              try {
+                await transport.send({ cmd: 'pin', pin });
+              } catch {
+                if (attempt.current()) {
+                  sessionFailed(id, runtime, 'PIN submission');
+                }
+                throw new SpeakerError(
+                  'pairing_unavailable',
+                  'Speaker PIN could not be submitted',
+                );
+              }
+              pending = attempt.current();
+              return { state: 'pairing', saved: false };
+            } finally {
+              if (!pending) releasePin(runtime, attempt);
+            }
+          }
+          throw new SpeakerError(
+            'pairing_required',
+            'Begin pairing and wait for the PIN prompt first',
+          );
+        }
+        work.view = { state: 'pairing', saved: false };
+        work.stopped = false;
+        publishPairing(id, work);
+        try {
+          await work.transport.send({ cmd: 'pin', pin });
+        } catch {
+          finishPairing(id, work, 'failed', 'pairing_failed');
+          throw new SpeakerError(
+            'pairing_unavailable',
+            'Speaker PIN could not be submitted',
+          );
+        }
+        return structuredClone(work.view);
+      }),
+    changeCredentials: (id: string, save: () => Promise<void>) =>
+      operations.run(async () => {
+        consumeCommands();
+        cancelPairing(id);
+        const out = outputs.get(id);
+        if (closed || !out) throw new Error('Speaker lifecycle unavailable');
+        requireControl(out);
+        const authority = outputAuthority(outputs, id);
+        const incarnation = outputs.revision(id), demand = intentEpoch;
+        const view = playback.playerView();
+        const authorized = out.selected && intent === 'play' &&
+          (view.state === 'play' || lease?.intent === intentEpoch &&
+              leasedGeneration(id) === epoch(id).generation);
+        // Revoke immediately, before encryption/store awaits. A replacement is an
+        // explicit credential operation, never a catalog update or a play intent.
+        revoke(id);
+        const generation = epoch(id).generation;
+        if (authorized && lease?.intent === demand) {
+          lease.outputs.set(id, leaseEntry(id, generation));
+        }
+        devices.admission.invalidate(id);
+        const runtime = runtimes.get(id);
+        const released = runtime
+          ? retire(id, runtime, 'credentials')
+          : retiring.get(id) ?? Promise.resolve(true);
+        if (authorized) pauseWithoutPeer();
+        await save();
+        if (!await released) {
+          throw new Error('Speaker session could not be released');
+        }
+        consumeCommands();
+        const current = outputs.get(id);
+        if (
+          !closed && authority() && authorized && current?.selected &&
+          outputs.revision(id) === incarnation && current.host === out.host &&
+          current.port === out.port && intent === 'play' &&
+          intentEpoch === demand &&
+          epoch(id).generation === generation &&
+          (playback.playerView().state === 'play' ||
+            lease?.intent === demand && leasedGeneration(id) === generation)
+        ) {
+          resetDemand(id);
+          reconcile();
+        }
+      }),
+    retry: (id: string) =>
+      operations.run(async ({ signal }) => {
+        consumeCommands();
+        if (pairings.get(id)?.current()) {
+          throw new SpeakerError(
+            'speaker_busy',
+            'Speaker pairing is in progress',
+          );
+        }
+        const out = outputs.get(id);
+        if (closed || !out || out.type !== 'AirPlay') return;
+        requireControl(out);
+        const authority = outputAuthority(outputs, id);
+        const e = epoch(id), view = playback.playerView();
+        const failedDemand = e.failed && out.selected && intent === 'play' &&
+          (view.state === 'play' ||
+            (lease?.intent === intentEpoch &&
+              leasedGeneration(id) === e.generation));
+        // Only the lifecycle owner can renew a demand or its resume lease.
+        // Refreshing facts alone never creates either one.
+        if (failedDemand) resetDemand(id);
+        else if (preparing.has(id)) {
+          preparing.get(id)!.controller.abort();
+          preparing.delete(id);
+        }
+        devices.admission.invalidate(id);
         reconcile();
-      }
-    },
-    async retry(id: string) {
-      consumeCommands();
-      if (pairings.get(id)?.current()) {
-        throw new SpeakerError(
-          'speaker_busy',
-          'Speaker pairing is in progress',
-        );
-      }
-      const out = outputs.get(id);
-      if (closed || !out || out.type !== 'AirPlay') return;
-      requireControl(out);
-      const authority = outputAuthority(outputs, id);
-      const e = epoch(id), view = playback.playerView();
-      const failedDemand = e.failed && out.selected && intent === 'play' &&
-        (view.state === 'play' ||
-          (lease?.intent === intentEpoch &&
-            leasedGeneration(id) === e.generation));
-      // Only the lifecycle owner can renew a demand or its resume lease.
-      // Refreshing facts alone never creates either one.
-      if (failedDemand) resetDemand(id);
-      else if (preparing.has(id)) {
-        preparing.get(id)!.controller.abort();
-        preparing.delete(id);
-      }
-      devices.admission.invalidate(id);
-      reconcile();
-      if (failedDemand || preparing.has(id)) return;
-      const revision = outputs.revision(id);
-      const controller = new AbortController();
-      // Catalog-only refresh: discard the permit, including on Pause/Stop.
-      await devices.protocol.prepare({
-        id,
-        targetRevision: devices.admission.describe(id).targetRevision,
-        refresh: true,
-        signal: controller.signal,
-        isCurrent: () =>
-          !closed && authority() && outputs.get(id) !== null &&
-          outputs.revision(id) === revision,
-      });
-    },
-    async close() {
-      for (const id of pairings.keys()) cancelPairing(id);
+        if (failedDemand || preparing.has(id)) return;
+        const revision = outputs.revision(id);
+        // Catalog-only refresh: discard the permit, including on Pause/Stop.
+        await devices.protocol.prepare({
+          id,
+          targetRevision: devices.admission.describe(id).targetRevision,
+          refresh: true,
+          signal,
+          isCurrent: () =>
+            !closed && authority() && outputs.get(id) !== null &&
+            outputs.revision(id) === revision,
+        });
+      }),
+    close() {
+      if (closeWork) return closeWork;
+      const completion = Promise.withResolvers<void>();
+      closeWork = completion.promise;
       closed = true;
+      const settled = operations.close();
+      for (const id of pairings.keys()) cancelPairing(id);
       for (const id of resuming.keys()) cancelResume(id);
       unsubscribe();
       if (typeof unsubscribeCommands === 'function') unsubscribeCommands();
@@ -1493,14 +1536,17 @@ export function createAirplayBoot(
       preparing.clear();
       pendingPumps.clear();
       for (const id of epochs.keys()) cancelRetry(id);
-      const closes: Promise<unknown>[] = [...retiring.values()];
       for (const [id, r] of [...runtimes]) {
-        closes.push(
-          retire(id, r, 'boot close'),
-        );
+        void retire(id, r, 'boot close');
       }
-      await Promise.all(closes);
-      await Promise.all(pumps);
+      void (async () => {
+        // Starts can acquire a child while unwinding a canceled await. Join the
+        // admitted work first, then its remaining retirements, not a snapshot
+        // taken before those starts settle. Failed native close stays blocked.
+        await settled;
+        await Promise.all(retiring.values());
+      })().then(() => completion.resolve(), completion.reject);
+      return closeWork;
     },
   };
   return controls;

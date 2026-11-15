@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createOperationScope, type Operation } from '../src/operations.ts';
 
 Deno.test('operation scope admits synchronously, cancels every identity and joins cleanup', async () => {
@@ -81,4 +81,37 @@ Deno.test('operation scope installs close receipt before abort listener reentry'
   assertEquals(reentered, closing);
   await closing;
   await work;
+});
+
+Deno.test('operation scope immediate port preserves sync results and owns async cleanup', async () => {
+  const scope = createOperationScope('Engine');
+  const result = {};
+  assertEquals(scope.runImmediate(() => result), result);
+  const failure = new Error('synchronous refusal');
+  assertEquals(
+    assertThrows(() =>
+      scope.runImmediate(() => {
+        throw failure;
+      })
+    ),
+    failure,
+  );
+  const release = Promise.withResolvers<void>();
+  let cleaned = false;
+  const pending = scope.runImmediate(async ({ signal }) => {
+    try {
+      await release.promise;
+      signal.throwIfAborted();
+    } finally {
+      cleaned = true;
+    }
+  });
+  const rejected = assertRejects(() => Promise.resolve(pending), DOMException);
+  const close = scope.close();
+  assertEquals(cleaned, false);
+  assertThrows(() => scope.runImmediate(() => 0), Error, 'closed');
+  release.resolve();
+  await close;
+  await rejected;
+  assert(cleaned);
 });

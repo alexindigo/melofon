@@ -69,9 +69,21 @@ async function setup(storeDir?: string, retryPolicy?: string) {
         resolver: {
           resolve(_address, _port, signal) {
             lookups++;
-            return new Promise<MdnsService>((resolve) =>
-              pending.push({ resolve, signal: signal! })
-            );
+            // Match the production resolver's cooperative cancellation. Tests
+            // retain the old completion handle to attempt a stale result; the
+            // lifetime proofs separately hold non-cooperative loser cleanup.
+            return new Promise<MdnsService>((resolve, reject) => {
+              const abort = () => reject(new Error('Resolver cancelled'));
+              signal!.addEventListener('abort', abort, { once: true });
+              pending.push({
+                resolve(row) {
+                  signal!.removeEventListener('abort', abort);
+                  resolve(row);
+                },
+                signal: signal!,
+              });
+              if (signal!.aborted) abort();
+            });
           },
           close() {},
         },

@@ -593,12 +593,31 @@ Deno.test('durable id reservation cannot publish after cancellation or deletion 
   try {
     const row = await f.players.create('Kitchen');
     const engine = f.players.get(row.id);
+    const closeEntered = Promise.withResolvers<void>();
+    const close = engine.close;
+    engine.close = () => {
+      const work = close();
+      closeEntered.resolve();
+      return work;
+    };
     const songs = await f.library.listSongs({ offset: 0, size: 1 });
     const pending = Promise.resolve(engine.queueAdd(songs));
     const rejected = assertRejects(() => pending, Error, 'cancelled');
     await waiting;
-    await f.players.delete(row.id);
+    let deleted = false;
+    const deleting = f.players.delete(row.id).then(() => {
+      deleted = true;
+    });
+    await closeEntered.promise;
+    // C1 joins the admitted allocation; deletion cannot finish on abort alone.
+    for (let n = 0; n < 20; n++) await Promise.resolve();
+    assertEquals(
+      deleted,
+      false,
+      'deletion stays pending while allocation is held',
+    );
     release();
+    await deleting;
     await rejected;
     assertEquals(engine.queueView().items, []);
     const added = await f.players.get(1).queueAdd(songs);
