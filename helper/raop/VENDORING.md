@@ -90,6 +90,30 @@ covers the supported native C API: normal `FfiTransport` retains its sole feed
 token until free and constructs fresh replacement handles. It does not elect
 native feed producers or authorize competing PCM feeds.
 
+## Explicit stream ownership (additive migration surface)
+
+`ffi.h` exposes a stream-owned PCM/pacer/PTS lifetime and immutable device
+attachments, with 64-bit stream and attachment incarnations. `output_device`,
+native sessions, masters and `output_buffer` carry that stream identity.
+Master sharing, writes, CONNECTED promotion and pending-input discard match
+the addressed stream; removing one attachment never stops a healthy peer's
+pacer or clears its partial ALAC input.
+
+The compatibility device API still has device-local pacers and the existing
+TypeScript feed election until boot adoption. Both paths reserve one native
+active-stream guard before session allocation or PCM acceptance. A competing
+explicit/compatibility context returns an error, not accepted-and-dropped PCM.
+Dormant streams retain a runtime reference; native free refuses while any
+attachment is still owned, including during terminal release. The typed port
+joins its C1 producers, attempts all C3 attachment releases, then frees the
+stream on the loop. Failed native release retains storage and the guard.
+
+This is not concurrent-stream qualification: metadata/crypto/control-service
+isolation and ordered stream cancel/accept/completion remain separate work.
+`tests/raop-stream.test.ts` exercises the shipping public FFI through real UDP,
+ALAC decoding and the independent scheduled receiver model, including both
+attachment-removal orders and compatibility/explicit guard competition.
+
 ## Device credential input
 
 `raop_start_v2` adds length-delimited per-device password and restored fruit

@@ -9,8 +9,11 @@
 // → /usr/lib/melofon/ (packaging). A missing or unloadable library is a loud
 // error at boot creation — never a half-spawned thing at play time.
 //
-// One stream, many devices: raop.c is process-global (one master session
-// per quality+encrypt), so N selected outputs share it — OwnTone's synced
+// Transitional device-oriented path, retained until boot adoption: one master
+// stream, many devices. The additive createFfiStream port below has one native
+// PCM/pacer owner with immutable attachments and no receiver-writer election.
+// Both paths share the native active-stream guard. Compatibility masters match
+// per stream+quality+encrypt, so N selected outputs share OwnTone's synced
 // multi-speaker model. The boot pumps PCM per output; this module designates
 // the first writer as THE FEED and silently accepts-and-drops the other
 // handles' writes (their decode is wasted CPU, the wire stays sane). When
@@ -24,16 +27,32 @@ import type {
   AirplayDriver,
   AirplayInput,
   AirplayProfile,
+  AirplayStream,
   AirplayTransport,
   HelperEventFn,
   PairingCredentialConsumer,
 } from './airplay-profile.ts';
 import { appLogger, type EventFacts, type Log, scopedLog } from '../logging.ts';
+import { createOperationScope } from '../operations.ts';
+import { createReleaseSet, releaseOrThrow } from '../releases.ts';
 
 const SYMBOLS = {
   raop_log_consumer: { parameters: ['i32'], result: 'i32' },
   raop_log_poll: { parameters: ['buffer', 'usize'], result: 'i32' },
   raop_new: { parameters: [], result: 'pointer' },
+  raop_stream_new: { parameters: [], result: 'pointer' },
+  raop_stream_id: { parameters: ['pointer'], result: 'u64' },
+  raop_stream_attach: { parameters: ['pointer'], result: 'pointer' },
+  raop_attachment_id: { parameters: ['pointer'], result: 'u64' },
+  raop_stream_write: {
+    parameters: ['pointer', 'buffer', 'usize'],
+    result: 'i32',
+  },
+  raop_stream_free: {
+    parameters: ['pointer'],
+    result: 'i32',
+    nonblocking: true,
+  },
   raop_start_v2: {
     parameters: [
       'pointer',
@@ -124,6 +143,7 @@ let loaded: RaopLibrary | undefined;
 let logDrain: ReturnType<typeof setInterval> | undefined;
 let diagnosticLog: Log = scopedLog('raop-native');
 let activeHandles = 0;
+let activeStreams = 0;
 function startLogDrain(): void {
   if (logDrain !== undefined) return;
   logDrain = setInterval(drainLogs, 25);
@@ -147,7 +167,7 @@ function drainLogs(): void {
 export function shutdownNativeLogging(): void {
   if (!loaded) return;
   drainLogs();
-  if (activeHandles !== 0) return; // A failed free retains ownership and ingress.
+  if (activeHandles !== 0 || activeStreams !== 0) return;
   if (logDrain !== undefined) clearInterval(logDrain);
   logDrain = undefined;
   loaded.symbols.raop_log_consumer(0);
@@ -203,6 +223,7 @@ let feed: symbol | null = null;
 // ---------------------------------------------------------------------------
 
 class FfiTransport implements AirplayTransport {
+  readonly attachmentId: bigint;
   private readonly lib: RaopLibrary;
   private readonly handle: Deno.PointerObject;
   private readonly token = Symbol('raop');
@@ -221,15 +242,19 @@ class FfiTransport implements AirplayTransport {
     lib: RaopLibrary,
     onEvent: HelperEventFn,
     private readonly onCredential?: PairingCredentialConsumer,
+    private readonly stream?: Deno.PointerObject,
   ) {
     this.lib = lib;
     this.onEvent = onEvent;
-    const handle = lib.symbols.raop_new();
+    const handle = stream
+      ? lib.symbols.raop_stream_attach(stream)
+      : lib.symbols.raop_new();
     drainLogs();
     if (handle === null) {
       throw new Error('raop_new failed (out of memory or loop thread)');
     }
     this.handle = handle;
+    this.attachmentId = lib.symbols.raop_attachment_id(handle);
     activeHandles++;
     // Events arrive at state-change rates; a light interval is plenty (and
     // avoids UnsafeCallback entirely — we poll).
@@ -370,7 +395,11 @@ class FfiTransport implements AirplayTransport {
       keyBytes?.fill(0);
     }
     return rc < 0
-      ? Promise.reject(new Error('raop start enqueue failed'))
+      ? Promise.reject(
+        new Error(
+          rc === -2 ? 'RAOP active stream busy' : 'raop start enqueue failed',
+        ),
+      )
       : Promise.resolve();
   }
 
@@ -424,6 +453,9 @@ class FfiTransport implements AirplayTransport {
   }
 
   async pcm(chunk: Uint8Array): Promise<void> {
+    if (this.stream) {
+      throw new Error('PCM belongs to the RAOP stream, not its attachment');
+    }
     const gen = this.writeGen;
     if (this.closed || this.writeGen !== gen) return;
     // Feed election: the first writer owns the shared stream; every other
@@ -489,6 +521,92 @@ class FfiTransport implements AirplayTransport {
     })();
     return this.closePromise;
   }
+}
+
+/** Additive fixed-owner port. The existing boot adopts it in b02b; compatibility
+ * transports and explicit streams share the native single-active-stream guard.
+ * A failed native free retains ownership/logging and cannot become success on
+ * another close call. Attachments release before their shared stream storage. */
+export function createFfiStream(
+  log: Log = scopedLog('raop-native'),
+): AirplayStream {
+  const lib = loadLibrary(log);
+  const handle = lib.symbols.raop_stream_new();
+  if (!handle) throw new Error('raop_stream_new failed');
+  activeStreams++;
+  const id = lib.symbols.raop_stream_id(handle);
+  const operations = createOperationScope('RAOP stream');
+  const releases = createReleaseSet();
+  let closing: Promise<void> | undefined;
+  let generation = 0;
+  releases.add('stream', async () => {
+    const rc = await lib.symbols.raop_stream_free(handle);
+    if (rc < 0) {
+      throw new Error('raop_stream_free failed: native cleanup not proven');
+    }
+    activeStreams--;
+    drainLogs();
+  }, 1);
+  return {
+    id,
+    attach(onEvent, onCredential) {
+      if (operations.closed) throw new Error('RAOP stream is closed');
+      const transport = new FfiTransport(lib, onEvent, onCredential, handle);
+      releases.add(
+        `attachment:${transport.attachmentId}`,
+        () => transport.close(),
+      );
+      return {
+        id: transport.attachmentId,
+        streamId: id,
+        transport,
+        start: (profile, input, credentials) =>
+          transport.start(profile, input, credentials),
+      };
+    },
+    pcm(chunk) {
+      const current = generation;
+      return operations.run(async ({ signal }) => {
+        if (chunk.length % 4) {
+          throw new Error('RAOP PCM requires whole stereo frames');
+        }
+        let offset = 0;
+        while (offset < chunk.length) {
+          if (signal.aborted || generation !== current) {
+            throw new Error('RAOP PCM producer canceled');
+          }
+          const accepted = lib.symbols.raop_stream_write(
+            handle,
+            chunk.subarray(offset),
+            BigInt(chunk.length - offset),
+          );
+          if (accepted < 0) {
+            throw new Error(
+              accepted === -2
+                ? 'RAOP active stream busy'
+                : 'raop_stream_write failed',
+            );
+          }
+          offset += accepted;
+          if (accepted === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+      });
+    },
+    cancelPcm() {
+      generation++;
+    },
+    close() {
+      if (!closing) {
+        const settled = operations.close();
+        closing = settled.then(() =>
+          releaseOrThrow(releases, 'RAOP stream release failed')
+        ).then(() => {});
+      }
+      return closing;
+    },
+  };
 }
 
 /** The default transport factory for the AirPlay boot: FFI, in-process.

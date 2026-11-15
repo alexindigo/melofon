@@ -160,6 +160,7 @@ struct raop_extra
 
 struct raop_master_session
 {
+  uint64_t stream_id;
   struct evbuffer *input_buffer;
   uint32_t input_buffer_samples;
 
@@ -197,6 +198,7 @@ struct raop_source
 struct raop_session
 {
   uint64_t device_id;
+  uint64_t stream_id;
   int callback_id;
 
   struct raop_master_session *master_session;
@@ -2036,18 +2038,20 @@ master_session_cleanup(struct raop_master_session *rms)
 }
 
 void
-raop_discard_pending_input(void)
+raop_discard_pending_input(uint64_t stream_id)
 {
   struct raop_master_session *rms;
   for (rms = raop_master_sessions; rms; rms = rms->next)
     {
+      if (rms->stream_id != stream_id)
+        continue;
       evbuffer_drain(rms->input_buffer, evbuffer_get_length(rms->input_buffer));
       rms->input_buffer_samples = 0;
     }
 }
 
 static struct raop_master_session *
-master_session_make(struct media_quality *quality, bool encrypt)
+master_session_make(uint64_t stream_id, struct media_quality *quality, bool encrypt)
 {
   struct raop_master_session *rms;
   struct transcode_encode_setup_args encode_args = { .profile = XCODE_ALAC, .quality = quality };
@@ -2057,7 +2061,7 @@ master_session_make(struct media_quality *quality, bool encrypt)
   // First check if we already have a suitable session
   for (rms = raop_master_sessions; rms; rms = rms->next)
     {
-      if (encrypt == rms->encrypt && quality_is_equal(quality, &rms->rtp_session->quality))
+      if (stream_id == rms->stream_id && encrypt == rms->encrypt && quality_is_equal(quality, &rms->rtp_session->quality))
 	return rms;
     }
 
@@ -2101,6 +2105,7 @@ master_session_make(struct media_quality *quality, bool encrypt)
       goto error;
     }
 
+  rms->stream_id = stream_id;
   rms->encrypt = encrypt;
   rms->quality = *quality;
   rms->samples_per_packet = RAOP_SAMPLES_PER_PACKET;
@@ -2471,6 +2476,7 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
   rs->cseq = 1;
 
   rs->device_id = rd->id;
+  rs->stream_id = rd->stream_id;
   rs->callback_id = callback_id;
 
   rs->server_fd = -1;
@@ -2523,7 +2529,7 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
 	goto error;
     }
 
-  rs->master_session = master_session_make(&rd->quality, rs->encrypt);
+  rs->master_session = master_session_make(rd->stream_id, &rd->quality, rs->encrypt);
   if (!rs->master_session)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not attach a master session for device '%s'\n", rd->name);
@@ -4895,6 +4901,8 @@ raop_write(struct output_buffer *obuf)
 
   for (rms = raop_master_sessions; rms; rms = rms->next)
     {
+      if (rms->stream_id != obuf->stream_id)
+        continue;
       for (i = 0; obuf->data[i].buffer; i++)
 	{
 	  if (!quality_is_equal(&obuf->data[i].quality, &rms->rtp_session->quality))
@@ -4926,7 +4934,7 @@ raop_write(struct output_buffer *obuf)
   // initialization sync and rtp packets via packets_sync_send and packets_send)
   for (rs = raop_sessions; rs; rs = rs->next)
     {
-      if (rs->state != RAOP_STATE_CONNECTED)
+      if (rs->stream_id != obuf->stream_id || rs->state != RAOP_STATE_CONNECTED)
 	continue;
 
       // Start sending progress to keep ATV's alive

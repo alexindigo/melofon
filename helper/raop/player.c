@@ -80,6 +80,7 @@ struct raop_metadata_mirror
 
 struct raop_player
 {
+  uint64_t stream_id;
   struct event_base *evbase;     /* the runtime loop (ffi.c) */
   int timer_fd;                  /* timerfd, CLOCK_MONOTONIC */
   struct event *timer_ev;        /* EV_READ|EV_PERSIST on timer_fd */
@@ -331,6 +332,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         }
 
       memset(&obuf, 0, sizeof(obuf));
+      obuf.stream_id = p->stream_id;
       obuf.data[0].buffer = scratch;
       obuf.data[0].bufsize = n;
       obuf.data[0].samples = (int)(n / 4);
@@ -353,7 +355,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
 }
 
 struct raop_player *
-raop_player_new(struct event_base *evbase)
+raop_player_new(struct event_base *evbase, uint64_t stream_id)
 {
   struct raop_player *p;
 
@@ -361,6 +363,7 @@ raop_player_new(struct event_base *evbase)
   if (!p)
     return NULL;
 
+  p->stream_id = stream_id;
   p->evbase = evbase;
   p->pcm = evbuffer_new();
   p->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
@@ -481,7 +484,7 @@ raop_player_session_stopped(struct raop_player *p)
    * feed while a surviving peer keeps the native master alive. Non-feeding
    * handles must not disturb the effective peer's partial input. Loop-only. */
   if (p->fed_in_epoch)
-    raop_discard_pending_input();
+    raop_discard_pending_input(p->stream_id);
   p->fed_in_epoch = false;
 
   memset(&zero, 0, sizeof(zero));

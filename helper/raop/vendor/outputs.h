@@ -92,6 +92,8 @@ struct output_device
 {
   // Device id
   uint64_t id;
+  // Melofon immutable playback-stream incarnation (1 = compatibility stream).
+  uint64_t stream_id;
 
   // Name of the device, e.g. "Living Room"
   char *name;
@@ -187,6 +189,7 @@ struct output_data
 
 struct output_buffer
 {
+  uint64_t stream_id;
   struct timespec pts;
   // The array is two larger than max quality subscriptions because element 0
   // holds the original, untranscoded, data (which might not have any

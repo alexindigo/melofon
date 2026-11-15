@@ -51,6 +51,19 @@ export interface AirplayDriver {
     credentials?: AirplayCredentials,
   ): Promise<void>;
 }
+/** Explicit stream input, independent of device-control/retirement lifetimes.
+ * PCM calls are supplied serially by the stream's single source owner. Producer
+ * cancellation does not yet implement native ordered epoch cancellation. */
+export interface AirplayStream {
+  readonly id: bigint;
+  attach(
+    event: HelperEventFn,
+    credential?: PairingCredentialConsumer,
+  ): AirplayDriver & { readonly id: bigint; readonly streamId: bigint };
+  pcm(chunk: Uint8Array): Promise<void>;
+  cancelPcm(): void;
+  close(): Promise<void>;
+}
 /** Private start input, never part of normalized facts or diagnostics. */
 export interface AirplayCredentials {
   password: string | null;

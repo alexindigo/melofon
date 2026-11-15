@@ -16,6 +16,11 @@
  * OwnTone's synced multi-speaker model; the Deno side feeds PCM through a
  * single designated handle so the shared stream is never double-fed.
  *
+ * The additive explicit-stream API instead owns one player per stream and
+ * immutable device attachments. Compatibility handles retain their old pacers
+ * during the boot migration. Both routes reserve the same active-stream guard;
+ * dormant streams keep the runtime alive without activating native sessions.
+ *
  * Exported API (see also helper/raop/ffi.h):
  *   raop_t *raop_new(void);
  *   int raop_start(raop_t *, host, port, name, volume);
@@ -42,6 +47,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <limits.h>
 
 #include <event2/event.h>
 #include <event2/buffer.h>
@@ -61,7 +67,7 @@ extern struct output_definition output_raop;
  * convention: the 10 ms pacing tick (timerfd, armed at CONNECTED), the pts
  * stream clock, and the PCM read-ahead with its backpressure cap. */
 struct raop_player;
-struct raop_player *raop_player_new(struct event_base *evbase);
+struct raop_player *raop_player_new(struct event_base *evbase, uint64_t stream_id);
 void raop_player_free(struct raop_player *p);
 int raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_flush(struct raop_player *p);
@@ -152,6 +158,10 @@ struct raop_handle
 
   /* The player stand-in: PCM read-ahead, pacing tick, pts clock (player.c). */
   struct raop_player *player;
+  struct raop_stream *stream;       /* immutable; NULL = compatibility handle */
+  bool ready;                       /* loop-owned attachment readiness */
+  bool quiescing;                   /* local release fences late callbacks */
+  bool legacy_claim;                /* rt.lock; retained until proven free */
 
   /* Event ring for raop_poll. */
   char events[EVENT_RING][EVENT_LEN];
@@ -181,6 +191,16 @@ struct raop_handle
 
 typedef struct raop_handle raop_t;
 
+struct raop_stream
+{
+  uint64_t id;
+  struct raop_player *player;
+  unsigned attachments;             /* rt.lock; includes retiring handles */
+  bool closing;                     /* rt.lock; admission fence */
+  bool active;                      /* rt.lock; guard retained until free */
+  bool item_set;                    /* loop-owned first attachment item */
+};
+
 /* ------------------------------------------------------------------ runtime */
 
 static struct
@@ -196,12 +216,51 @@ static struct
   pthread_mutex_t lock;
   pthread_cond_t idle;
   uint64_t next_device_id;
+  uint64_t next_stream_id;
+  uint64_t active_stream_id;        /* 0 = none, 1 = compatibility group */
+  unsigned legacy_claims;
   raop_t *handles_list;        /* all handles (loop thread iterates) */
 } rt = {
   .lock = PTHREAD_MUTEX_INITIALIZER,
   .idle = PTHREAD_COND_INITIALIZER,
   .next_device_id = 1,
+  .next_stream_id = 2,
 };
+
+/* All admission routes, including compatibility read-ahead, share this guard.
+ * Retain it through failed close and all queued/retiring native resources. */
+static int
+stream_claim_locked(struct raop_stream *stream, raop_t *legacy)
+{
+  uint64_t id = stream ? stream->id : 1;
+  if (stream && stream->closing) return -1;
+  if (rt.active_stream_id && rt.active_stream_id != id) return -2;
+  rt.active_stream_id = id;
+  if (stream) stream->active = true;
+  else if (!legacy->legacy_claim) {
+    legacy->legacy_claim = true;
+    rt.legacy_claims++;
+  }
+  return 0;
+}
+
+/* Loop thread, rt.lock held. A device's loss does not stop the stream while
+ * any healthy attachment remains. No receiver owns or elects the pacer. */
+static void
+stream_readiness_locked(raop_t *h)
+{
+  if (!h->stream) {
+    if (h->ready) raop_player_session_started(h->player);
+    else raop_player_session_stopped(h->player);
+    return;
+  }
+  for (raop_t *peer = rt.handles_list; peer; peer = peer->next)
+    if (peer->stream == h->stream && peer->ready) {
+      raop_player_session_started(h->player);
+      return;
+    }
+  raop_player_session_stopped(h->player);
+}
 
 /* ------------------------------------------------------------ event ring */
 
@@ -245,9 +304,11 @@ raop_ffi_on_state(uint64_t device_id, enum output_device_state state)
          * during the handshake, and nothing buffered earlier is dumped
          * (Deno waits for the connected event before feeding). */
         if (state == OUTPUT_STATE_CONNECTED || state == OUTPUT_STATE_STREAMING)
-          raop_player_session_started(h->player);
-        else if (state == OUTPUT_STATE_STOPPED || state == OUTPUT_STATE_FAILED)
-          raop_player_session_stopped(h->player);
+          h->ready = !h->quiescing;
+        else if (state == OUTPUT_STATE_STOPPED || state == OUTPUT_STATE_FAILED ||
+                 state == OUTPUT_STATE_PASSWORD)
+          h->ready = false;
+        stream_readiness_locked(h);
         event_push(h, value);
         break;
       }
@@ -414,6 +475,7 @@ device_start(raop_t *h, cmd *c)
   re->supports_auth_setup = c->authsetup ? true : false;
 
   dev->id = h->id;
+  dev->stream_id = h->stream ? h->stream->id : 1;
   dev->name = strdup(c->name);
   dev->type = OUTPUT_TYPE_RAOP;
   dev->type_name = "AirPlay 1";
@@ -448,11 +510,15 @@ device_start(raop_t *h, cmd *c)
     }
 
   h->device = dev;
+  h->quiescing = false;
   h->state = OUTPUT_STATE_STARTUP;
   event_push(h, "starting");
 
-  raop_player_item_set(h->player, c->title, c->artist, c->pos_ms, c->len_ms,
-                       c->wanted_metadata);
+  if (!h->stream || !h->stream->item_set) {
+    raop_player_item_set(h->player, c->title, c->artist, c->pos_ms, c->len_ms,
+                         c->wanted_metadata);
+    if (h->stream) h->stream->item_set = true;
+  }
 
   /* OwnTone raop_device_cb (raop.c:4463). Contract test greps this. */
   helper_log_event(E_LOG, L_RAOP, "device_start", &(struct helper_log_fields){
@@ -479,11 +545,11 @@ device_released(raop_t *h)
   if (!h->device)
     return;
 
-  raop_player_session_stopped(h->player);
-
   device_free(h);
-
-  raop_player_flush(h->player);
+  if (!h->stream) {
+    raop_player_session_stopped(h->player);
+    raop_player_flush(h->player);
+  }
 
   h->state = OUTPUT_STATE_STOPPED;
   event_push(h, "stopped");
@@ -538,7 +604,11 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
       }
       if (!released && (c->type == CMD_TEARDOWN || c->type == CMD_FREE ||
                         (c->type == CMD_START && h->device))) {
-        raop_player_session_stopped(h->player);
+        pthread_mutex_lock(&rt.lock);
+        h->quiescing = true;
+        h->ready = false;
+        stream_readiness_locked(h);
+        pthread_mutex_unlock(&rt.lock);
         h->release_command = c;
         if (raop_release_device(h->id, native_released) == 0) return;
         h->release_command = NULL;
@@ -567,7 +637,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             break;
 
           case CMD_FLUSH:
-            raop_player_flush(h->player);
+            if (!h->stream) raop_player_flush(h->player);
             if (h->device && h->device->session)
               output_raop.device_flush(h->device, 0);
             break;
@@ -590,8 +660,11 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             raop_t **link;
             for (link = &rt.handles_list; *link; link = &(*link)->next)
               if (*link == h) { *link = h->next; break; }
+            if (h->stream) h->stream->attachments--;
+            if (h->legacy_claim && --rt.legacy_claims == 0)
+              rt.active_stream_id = 0;
             pthread_mutex_unlock(&rt.lock);
-            raop_player_free(h->player);
+            if (!h->stream) raop_player_free(h->player);
             event_free(h->resume_event);
             pthread_mutex_destroy(&h->events_lock);
             pthread_mutex_destroy(&h->cmds_lock);
@@ -799,8 +872,8 @@ runtime_release(void)
 
 /* -------------------------------------------------------------- public API */
 
-raop_t *
-raop_new(void)
+static raop_t *
+handle_new(struct raop_stream *stream)
 {
   raop_t *h;
 
@@ -822,7 +895,8 @@ raop_new(void)
       return NULL;
     }
 
-  h->player = raop_player_new(rt.base);
+  h->stream = stream;
+  h->player = stream ? stream->player : raop_player_new(rt.base, 1);
   if (!h->player)
     {
       runtime_release();
@@ -834,19 +908,139 @@ raop_new(void)
     }
   h->resume_event = event_new(rt.base, -1, 0, cmds_drain_cb, h);
   if (!h->resume_event) {
-    raop_player_free(h->player); runtime_release();
+    if (!stream) raop_player_free(h->player);
+    runtime_release();
     pthread_mutex_destroy(&h->events_lock); pthread_mutex_destroy(&h->cmds_lock);
     pthread_mutex_destroy(&h->credential_lock);
     free(h); return NULL;
   }
 
   pthread_mutex_lock(&rt.lock);
+  if (rt.next_device_id == UINT64_MAX) {
+    pthread_mutex_unlock(&rt.lock);
+    if (!stream) raop_player_free(h->player);
+    event_free(h->resume_event);
+    runtime_release();
+    pthread_mutex_destroy(&h->events_lock); pthread_mutex_destroy(&h->cmds_lock);
+    pthread_mutex_destroy(&h->credential_lock); free(h); return NULL;
+  }
   h->id = rt.next_device_id++;
   h->next = rt.handles_list;
   rt.handles_list = h;
   pthread_mutex_unlock(&rt.lock);
 
   return h;
+}
+
+raop_t *
+raop_new(void)
+{
+  return handle_new(NULL);
+}
+
+raop_stream_t *
+raop_stream_new(void)
+{
+  struct raop_stream *stream = calloc(1, sizeof(*stream));
+  if (!stream) return NULL;
+  if (runtime_acquire() < 0) { free(stream); return NULL; }
+  pthread_mutex_lock(&rt.lock);
+  if (rt.next_stream_id == UINT64_MAX) {
+    pthread_mutex_unlock(&rt.lock); runtime_release(); free(stream); return NULL;
+  }
+  stream->id = rt.next_stream_id++;
+  pthread_mutex_unlock(&rt.lock);
+  stream->player = raop_player_new(rt.base, stream->id);
+  if (!stream->player) { runtime_release(); free(stream); return NULL; }
+  return stream;
+}
+
+uint64_t
+raop_stream_id(raop_stream_t *stream)
+{
+  return stream ? stream->id : 0;
+}
+
+uint64_t
+raop_attachment_id(raop_t *h)
+{
+  return h ? h->id : 0;
+}
+
+raop_t *
+raop_stream_attach(raop_stream_t *stream)
+{
+  if (!stream) return NULL;
+  pthread_mutex_lock(&rt.lock);
+  if (stream->closing || stream->attachments == UINT_MAX) {
+    pthread_mutex_unlock(&rt.lock); return NULL;
+  }
+  stream->attachments++;
+  pthread_mutex_unlock(&rt.lock);
+  raop_t *h = handle_new(stream);
+  if (!h) {
+    pthread_mutex_lock(&rt.lock); stream->attachments--; pthread_mutex_unlock(&rt.lock);
+  }
+  return h;
+}
+
+int
+raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len)
+{
+  if (!stream || !pcm || len % 4) return -1;
+  if (!len) return 0;
+  pthread_mutex_lock(&rt.lock);
+  int result = stream_claim_locked(stream, NULL);
+  if (result == 0) result = raop_player_write(stream->player, pcm, len);
+  pthread_mutex_unlock(&rt.lock);
+  return result;
+}
+
+struct stream_free_work { struct raop_stream *stream; free_sync *sync; };
+
+static void
+stream_free_cb(evutil_socket_t fd, short what, void *arg)
+{
+  struct stream_free_work *work = arg;
+  struct raop_stream *stream = work->stream;
+  (void)fd; (void)what;
+  raop_player_session_stopped(stream->player);
+  raop_player_free(stream->player);
+  pthread_mutex_lock(&rt.lock);
+  if (stream->active) rt.active_stream_id = 0;
+  pthread_mutex_unlock(&rt.lock);
+  free(stream);
+  pthread_mutex_lock(&work->sync->lock);
+  work->sync->done = 1;
+  pthread_cond_signal(&work->sync->cond);
+  pthread_mutex_unlock(&work->sync->lock);
+}
+
+int
+raop_stream_free(raop_stream_t *stream)
+{
+  if (!stream) return -1;
+  pthread_mutex_lock(&rt.lock);
+  if (stream->closing || stream->attachments) {
+    int result = stream->attachments ? -2 : -1;
+    pthread_mutex_unlock(&rt.lock); return result;
+  }
+  stream->closing = true;
+  pthread_mutex_unlock(&rt.lock);
+  free_sync sync = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER };
+  struct stream_free_work work = { stream, &sync };
+  struct timeval zero = { 0, 0 };
+  pthread_mutex_lock(&sync.lock);
+  int result = event_base_once(rt.base, -1, EV_TIMEOUT, stream_free_cb, &work, &zero);
+  if (result == 0) {
+    while (!sync.done) pthread_cond_wait(&sync.cond, &sync.lock);
+  } else {
+    pthread_mutex_lock(&rt.lock); stream->closing = false; pthread_mutex_unlock(&rt.lock);
+  }
+  pthread_mutex_unlock(&sync.lock);
+  pthread_cond_destroy(&sync.cond); pthread_mutex_destroy(&sync.lock);
+  if (result == 0) runtime_release();
+  return result < 0 ? -1 : 0;
 }
 
 int
@@ -918,6 +1112,10 @@ raop_open(raop_t *h, const char *host, int port, const char *name, int volume,
   if (artist)
     snprintf(c->artist, sizeof(c->artist), "%s", artist);
 
+  pthread_mutex_lock(&rt.lock);
+  int claimed = stream_claim_locked(h->stream, h);
+  pthread_mutex_unlock(&rt.lock);
+  if (claimed < 0) { cmd_free(c); return claimed; }
   return cmd_push(h, c);
 }
 
@@ -950,10 +1148,13 @@ raop_probe_v2(raop_t *h, const char *host, int port, const char *name, int volum
 int
 raop_write(raop_t *h, const uint8_t *pcm, size_t len)
 {
-  if (!h || !pcm)
+  if (!h || !pcm || h->stream)
     return -1;
-
-  return raop_player_write(h->player, pcm, len);
+  pthread_mutex_lock(&rt.lock);
+  int result = stream_claim_locked(NULL, h);
+  if (result == 0) result = raop_player_write(h->player, pcm, len);
+  pthread_mutex_unlock(&rt.lock);
+  return result;
 }
 
 int

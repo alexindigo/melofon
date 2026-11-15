@@ -12,6 +12,28 @@ extern "C" {
 #endif
 
 typedef struct raop_handle raop_t;
+typedef struct raop_stream raop_stream_t;
+
+/* Additive explicit-stream API. A stream owns one PCM ingress/pacer/PTS clock;
+ * attachments own device control and release only. Identities are nonzero,
+ * monotonically allocated 64-bit incarnations, never RTP or reusable player ids.
+ * Dormant streams are allowed; start/probe/write reserves the one active stream
+ * BEFORE session allocation. A different stream (including the legacy group)
+ * is refused with -2 until the owner's resources are proven released.
+ * Metadata/crypto/control-service isolation is not yet multi-stream capable. */
+raop_stream_t *raop_stream_new(void);
+uint64_t raop_stream_id(raop_stream_t *stream);
+raop_t *raop_stream_attach(raop_stream_t *stream);
+uint64_t raop_attachment_id(raop_t *attachment);
+/* Whole-frame bytes accepted, 0 = bounded ingress full, -1 = invalid/closing,
+ * -2 = another stream owns the runtime. Device-oriented raop_write refuses
+ * explicit attachments: there is exactly one input port per stream. */
+int raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len);
+/* Free after every attachment has completed raop_free. Returns -2 while any
+ * attachment still owns storage (including retirement); caller may retry.
+ * 0 proves loop-thread pacer destruction; -1 retains the stream on failure.
+ * Serialize free with readers/writers; no calls after successful free. */
+int raop_stream_free(raop_stream_t *stream);
 
 /* Exclusive library-wide diagnostic consumer. Install before native init.
  * This queue is independent of raop_poll's control events and device handles.
@@ -79,8 +101,9 @@ int raop_write(raop_t *h, const uint8_t *pcm, size_t len);
 
 int raop_volume(raop_t *h, int pct);
 
-/* Drop buffered PCM and FLUSH the device (pause semantics; the stream clock
- * continues for resume). */
+/* Compatibility handle: drop its buffered PCM and FLUSH the device. Explicit
+ * attachment: FLUSH this device only, never the shared PCM/PTS owner. Ordered
+ * stream cancellation/reset is a separate contract, not attachment removal. */
 int raop_flush(raop_t *h);
 
 int raop_teardown(raop_t *h);
