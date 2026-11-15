@@ -62,6 +62,10 @@ export interface AirplayStream {
   ): AirplayDriver & { readonly id: bigint; readonly streamId: bigint };
   pcm(chunk: Uint8Array): Promise<void>;
   cancelPcm(): void;
+  /** Fence and join admitted writers, then discard local ingress/partial PCM.
+   * Later writes wait for reset; earlier queued writes are canceled. This does
+   * not await decoder acquisition or prove receiver FLUSH readiness. */
+  reset(): Promise<void>;
   close(): Promise<void>;
 }
 /** A fixed player's lazily allocated stream. Device admission holds the private
@@ -72,6 +76,8 @@ export interface AirplayPlaybackStream {
   readonly id: bigint | null;
   pcm(chunk: Uint8Array): Promise<void>;
   cancelPcm(): void;
+  /** Same writer-fenced local reset contract as AirplayStream. */
+  reset(): Promise<void>;
   close(): Promise<void>;
 }
 /** Private start input, never part of normalized facts or diagnostics. */

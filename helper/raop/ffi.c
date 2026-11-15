@@ -999,6 +999,48 @@ raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len)
 struct stream_free_work { struct raop_stream *stream; free_sync *sync; };
 
 static void
+stream_reset_cb(evutil_socket_t fd, short what, void *arg)
+{
+  struct stream_free_work *work = arg;
+  struct raop_stream *stream = work->stream;
+  (void)fd; (void)what;
+  raop_player_session_stopped(stream->player);
+  raop_player_flush(stream->player);
+  raop_discard_pending_input(stream->id);
+  pthread_mutex_lock(&rt.lock);
+  for (raop_t *h = rt.handles_list; h; h = h->next)
+    if (h->stream == stream && h->ready) {
+      raop_player_session_started(stream->player);
+      break;
+    }
+  pthread_mutex_unlock(&rt.lock);
+  pthread_mutex_lock(&work->sync->lock);
+  work->sync->done = 1;
+  pthread_cond_signal(&work->sync->cond);
+  pthread_mutex_unlock(&work->sync->lock);
+}
+
+int
+raop_stream_reset(raop_stream_t *stream)
+{
+  if (!stream) return -1;
+  pthread_mutex_lock(&rt.lock);
+  bool closing = stream->closing;
+  pthread_mutex_unlock(&rt.lock);
+  if (closing) return -1;
+  free_sync sync = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER };
+  struct stream_free_work work = { stream, &sync };
+  struct timeval zero = { 0, 0 };
+  pthread_mutex_lock(&sync.lock);
+  int result = event_base_once(rt.base, -1, EV_TIMEOUT, stream_reset_cb, &work, &zero);
+  if (result == 0)
+    while (!sync.done) pthread_cond_wait(&sync.cond, &sync.lock);
+  pthread_mutex_unlock(&sync.lock);
+  pthread_cond_destroy(&sync.cond); pthread_mutex_destroy(&sync.lock);
+  return result < 0 ? -1 : 0;
+}
+
+static void
 stream_free_cb(evutil_socket_t fd, short what, void *arg)
 {
   struct stream_free_work *work = arg;

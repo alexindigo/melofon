@@ -29,6 +29,10 @@ uint64_t raop_attachment_id(raop_t *attachment);
  * -2 = another stream owns the runtime. Device-oriented raop_write refuses
  * explicit attachments: there is exactly one input port per stream. */
 int raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len);
+/* Wait for loop-owned local ingress/partial reset. Serialize with write/reset/
+ * free: caller fences and joins admitted writers before calling and holds new
+ * input until return. This is not a receiver FLUSH acknowledgement. */
+int raop_stream_reset(raop_stream_t *stream);
 /* Free after every attachment has completed raop_free. Returns -2 while any
  * attachment still owns storage (including retirement); caller may retry.
  * 0 proves loop-thread pacer destruction; -1 retains the stream on failure.

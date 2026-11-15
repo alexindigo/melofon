@@ -147,6 +147,7 @@ export function createAirplayDevices(deps: {
       },
       pcm: (chunk: Uint8Array) => operations.run(() => acquire().pcm(chunk)),
       cancelPcm: () => native?.cancelPcm(),
+      reset: () => operations.run(() => native?.reset()),
       close() {
         if (!closing) {
           const completion = Promise.withResolvers<void>();

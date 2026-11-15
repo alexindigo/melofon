@@ -378,6 +378,190 @@ Deno.test({
   },
 });
 
+Deno.test({
+  name:
+    'RAOP stream reset: fences blocked writers and preserves queued replacement input',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    let ready = false, settled = false;
+    const attachment = stream.attach((kind, value) => {
+      if (kind === 'state' && value === 'connected') ready = true;
+    });
+    try {
+      // With no ready receiver the two-second ingress cannot drain. This write
+      // accepts a prefix then remains blocked, rather than being a mock waiter.
+      const old = stream.pcm(new Uint8Array((2 * 44100 + 1) * 4).fill(0x37));
+      const canceled = assertRejects(() => old, Error, 'producer canceled')
+        .then(() => settled = true);
+      await pause();
+      assertEquals(settled, false);
+      const reset = stream.reset();
+      const replacement = stream.pcm(pcm(704));
+      await reset;
+      assertEquals(settled, true, 'reset joins the canceled native writer');
+      await replacement;
+      await attachment.start(profile(receiver), input);
+      await until('replacement receiver ready', () => ready);
+      await rendered(receiver, pcm(704));
+      await canceled;
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+});
+
+Deno.test({
+  name:
+    'RAOP stream reset: discards active partial PCM without reopening attachments',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    let ready = false;
+    const attachment = stream.attach((kind, value) => {
+      if (kind === 'state' && value === 'connected') ready = true;
+    });
+    try {
+      await attachment.start(profile(receiver), input);
+      await until('active receiver ready', () => ready);
+      const old = pcm(441);
+      await stream.pcm(old);
+      // A full 441-frame tick has emitted 352 and retained 89 in the master.
+      await rendered(receiver, old.subarray(0, 352 * 4));
+      await stream.reset();
+      const replacement = new Uint8Array(704 * 4).fill(0x59);
+      await stream.pcm(replacement);
+      await until(
+        'replacement packets',
+        () => receiver.sessions[0].audioPackets === 3,
+      );
+      const expected = new Uint8Array((352 + 704) * 4);
+      expected.set(old.subarray(0, 352 * 4));
+      expected.set(replacement, 352 * 4);
+      const session = receiver.sessions[0];
+      assertEquals(
+        decodeReceiverAudio(session.sdp, session.audioPayloads),
+        expected,
+      );
+      assertEquals(receiver.sessions.length, 1);
+      assertEquals(session.flushes, 0, 'local reset is not receiver FLUSH');
+      assertEquals(session.teardowns, 0);
+      await libraryProof();
+      // Only the pre-reset packet has a scheduled-render assertion here. Local
+      // reset neither retracts wire packets nor proves b03's FLUSH readiness.
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+});
+
+Deno.test({
+  name: 'RAOP stream reset: consecutive resets cancel intervening queued input',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    let ready = false;
+    const attachment = stream.attach((kind, value) => {
+      if (kind === 'state' && value === 'connected') ready = true;
+    });
+    try {
+      const first = stream.reset();
+      const stale = stream.pcm(new Uint8Array(352 * 4).fill(0x71));
+      const rejected = assertRejects(() => stale, Error, 'producer canceled');
+      const second = stream.reset();
+      const replacement = stream.pcm(pcm(704));
+      await Promise.all([first, second, rejected, replacement]);
+      await attachment.start(profile(receiver), input);
+      await until('receiver ready after serialized resets', () => ready);
+      await rendered(receiver, pcm(704));
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+});
+
+Deno.test({
+  name:
+    'RAOP stream reset: dormant reset leaves another stream partial PCM and PTS intact',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const active = createFfiStream(), dormant = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    let ready = false;
+    const attachment = active.attach((kind, value) => {
+      if (kind === 'state' && value === 'connected') ready = true;
+    });
+    try {
+      await attachment.start(profile(receiver), input);
+      await until('active stream ready', () => ready);
+      const expected = pcm(704);
+      await active.pcm(expected.subarray(0, 441 * 4));
+      await until(
+        'active partial block',
+        () => receiver.sessions[0].audioPackets === 1,
+      );
+      const before = timestamps(receiver)[0];
+      await dormant.reset();
+      await assertRejects(
+        () => dormant.pcm(pcm(352)),
+        Error,
+        'active stream busy',
+      );
+      await active.pcm(expected.subarray(441 * 4));
+      await rendered(receiver, expected);
+      assertEquals(timestamps(receiver)[1], (before + 352) >>> 0);
+      await libraryProof();
+    } finally {
+      await Promise.all([active.close(), dormant.close()]);
+      receiver.close();
+    }
+  },
+});
+
+Deno.test({
+  name:
+    'RAOP stream reset: close joins admitted reset and rejects later admission',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const stream = createFfiStream();
+    const writing = stream.pcm(new Uint8Array((2 * 44100 + 1) * 4));
+    const canceled = assertRejects(() => writing, Error, 'producer canceled');
+    await pause();
+    const reset = stream.reset();
+    const closing = stream.close();
+    assertEquals(stream.close(), closing);
+    await Promise.all([reset, canceled, closing]);
+    await assertRejects(() => stream.reset(), Error, 'closed');
+    await assertRejects(() => stream.pcm(pcm(352)), Error, 'closed');
+    await libraryProof();
+  },
+});
+
 function deviceFixture(
   receivers: Receiver[],
   options: Partial<Parameters<typeof createAirplayDevices>[0]> = {},
@@ -714,6 +898,50 @@ Deno.test({
   },
 });
 
+Deno.test({
+  name:
+    'RAOP device stream reset: delegates writer fencing and preserves replacement PCM',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const f = deviceFixture([receiver]);
+    const demand = f.capacities[0].reserve();
+    const stream = f.devices.createStream(f.capacities[0]);
+    try {
+      await stream.reset();
+      assertEquals(
+        stream.id,
+        null,
+        'reset does not allocate dormant native storage',
+      );
+      const writing = stream.pcm(
+        new Uint8Array((2 * 44100 + 1) * 4).fill(0x35),
+      );
+      const canceled = assertRejects(() => writing, Error, 'producer canceled');
+      await pause();
+      const reset = stream.reset();
+      const replacement = stream.pcm(pcm(704));
+      await Promise.all([reset, canceled, replacement]);
+      await f.activate(0, stream, f.capacities[0]);
+      await rendered(receiver, pcm(704));
+      await libraryProof();
+      await stream.close();
+      await assertRejects(() => stream.reset(), Error, 'closed');
+      demand.release();
+      f.capacities[1].reserve().release();
+    } finally {
+      demand.release();
+      await stream.close();
+      f.devices.close();
+      receiver.close();
+    }
+  },
+});
+
 Deno.test('RAOP device stream: foreign or mismatched capacity binding cannot prepare', async () => {
   let allocations = 0;
   const f = deviceFixture([], {
@@ -837,6 +1065,7 @@ Deno.test('RAOP device stream: failed attachment close still releases siblings a
         },
         pcm: () => Promise.resolve(),
         cancelPcm() {},
+        reset: () => Promise.resolve(),
         close() {
           nativeAttempts++;
           return Promise.reject(new Error('native attachment retained'));
@@ -1012,6 +1241,7 @@ for (const explicit of [true, false]) {
         attach,
         pcm: () => Promise.resolve(),
         cancelPcm() {},
+        reset: () => Promise.resolve(),
         close() {
           assert(closed, 'attachment closes before native storage');
           frees++;

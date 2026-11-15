@@ -48,6 +48,11 @@ const SYMBOLS = {
     parameters: ['pointer', 'buffer', 'usize'],
     result: 'i32',
   },
+  raop_stream_reset: {
+    parameters: ['pointer'],
+    result: 'i32',
+    nonblocking: true,
+  },
   raop_stream_free: {
     parameters: ['pointer'],
     result: 'i32',
@@ -539,6 +544,8 @@ export function createFfiStream(
   const releases = createReleaseSet();
   let closing: Promise<void> | undefined;
   let generation = 0;
+  const writers = new Set<Promise<void>>();
+  let resetting: Promise<void> | undefined;
   releases.add('stream', async () => {
     const rc = await lib.symbols.raop_stream_free(handle);
     if (rc < 0) {
@@ -566,7 +573,11 @@ export function createFfiStream(
     },
     pcm(chunk) {
       const current = generation;
-      return operations.run(async ({ signal }) => {
+      const barrier = resetting;
+      const writing = operations.run(async ({ signal }) => {
+        // Capture admission before waiting: a later reset cancels queued input
+        // too. Only replacement input admitted after that reset may survive it.
+        await barrier;
         if (chunk.length % 4) {
           throw new Error('RAOP PCM requires whole stereo frames');
         }
@@ -593,9 +604,37 @@ export function createFfiStream(
           }
         }
       });
+      writers.add(writing);
+      void writing.then(
+        () => writers.delete(writing),
+        () => writers.delete(writing),
+      );
+      return writing;
     },
     cancelPcm() {
       generation++;
+    },
+    reset() {
+      // Fence at submission, not when the event-loop callback eventually runs.
+      // Join admitted native writers only; decoder acquisition/cleanup belongs
+      // to the source owner and must not hold this transport control boundary.
+      generation++;
+      const previous = resetting;
+      const admitted = [...writers];
+      const work = operations.run(async () => {
+        await previous;
+        await Promise.allSettled(admitted);
+        if (await lib.symbols.raop_stream_reset(handle) < 0) {
+          throw new Error('raop_stream_reset failed');
+        }
+      });
+      resetting = work;
+      // A failed reset remains a rejected admission barrier until close. Never
+      // accept replacement PCM after an unproven local reset.
+      void work.then(() => {
+        if (resetting === work) resetting = undefined;
+      }, () => {});
+      return work;
     },
     close() {
       if (!closing) {
