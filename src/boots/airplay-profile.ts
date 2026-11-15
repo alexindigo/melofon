@@ -64,6 +64,16 @@ export interface AirplayStream {
   cancelPcm(): void;
   close(): Promise<void>;
 }
+/** A fixed player's lazily allocated stream. Device admission holds the private
+ * attachment authority; producers cannot construct or rebind receiver handles.
+ * Closing joins admitted preparation, activation and PCM before releasing native
+ * storage and capacity. A failed close remains quarantined. */
+export interface AirplayPlaybackStream {
+  readonly id: bigint | null;
+  pcm(chunk: Uint8Array): Promise<void>;
+  cancelPcm(): void;
+  close(): Promise<void>;
+}
 /** Private start input, never part of normalized facts or diagnostics. */
 export interface AirplayCredentials {
   password: string | null;

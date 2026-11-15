@@ -1,5 +1,6 @@
 import type { CommandSource, OutputRegistration, Outputs } from '../player.ts';
 import {
+  type AdmissionResult,
   createOutputAdmission,
   type OutputAdmission,
   PreparationError,
@@ -20,15 +21,19 @@ import {
   normalizeAirplayAddress,
   sameAirplayAddress,
 } from './airplay-address.ts';
-import { createFfiSpawn } from './raop-ffi.ts';
+import { createFfiSpawn, createFfiStream } from './raop-ffi.ts';
+import { createOperationScope } from '../operations.ts';
+import { createReleaseSet, releaseOrThrow } from '../releases.ts';
 import {
   airplayAbilities,
   type AirplayCredentials,
   type AirplayDriver,
   type AirplayInput,
   airplayOutputId,
+  type AirplayPlaybackStream,
   type AirplayProfile,
   type AirplaySpawn,
+  type AirplayStream,
   type AirplayTransport,
   type PairingCredentialConsumer,
   passwordRequiredFromTxt,
@@ -41,6 +46,7 @@ export function createAirplayDevices(deps: {
   admission?: OutputAdmission;
   resolver?: MdnsResolver;
   spawn?: AirplaySpawn;
+  stream?: () => AirplayStream;
   credentials?: Pick<SpeakerCredentials, 'session'>;
   changed?(): void;
 }) {
@@ -98,6 +104,77 @@ export function createAirplayDevices(deps: {
     }
   });
   const spawn = deps.spawn ?? createFfiSpawn();
+  const streamFactory = deps.stream ?? createFfiStream;
+  const newStreamOwner = (capacity?: PlaybackCapacity) => {
+    const operations = createOperationScope('AirPlay playback stream');
+    const releases = createReleaseSet();
+    let native: AirplayStream | undefined;
+    let retained: { release(): void } | undefined;
+    let nativeReleased = false;
+    let closing: Promise<void> | undefined;
+    let attachment = 0;
+    releases.add('native', async () => {
+      await native?.close();
+      nativeReleased = true;
+    }, 1);
+    releases.add('capacity', () => {
+      // C3 attempts all phases after failures too. A failed native free is not
+      // permission to release the resource slot, even after the last device.
+      if (!nativeReleased) throw new Error('AirPlay stream release not proven');
+      retained?.release();
+    }, 2);
+    const acquire = () => {
+      if (operations.closed) {
+        throw new Error('AirPlay playback stream is closed');
+      }
+      if (!native) {
+        retained = capacity?.retain();
+        try {
+          native = streamFactory();
+        } catch (error) {
+          // No native resource was acquired. Keep the same owner reusable and
+          // release only this failed allocation's capacity retention.
+          retained?.release();
+          retained = undefined;
+          throw error;
+        }
+      }
+      return native;
+    };
+    const stream: AirplayPlaybackStream = Object.freeze({
+      get id() {
+        return native?.id ?? null;
+      },
+      pcm: (chunk: Uint8Array) => operations.run(() => acquire().pcm(chunk)),
+      cancelPcm: () => native?.cancelPcm(),
+      close() {
+        if (!closing) {
+          const completion = Promise.withResolvers<void>();
+          closing = completion.promise;
+          const settled = operations.close();
+          native?.cancelPcm();
+          void settled.then(() =>
+            releaseOrThrow(releases, 'AirPlay playback stream release failed')
+          ).then(() => completion.resolve(), completion.reject);
+        }
+        return closing;
+      },
+    });
+    return {
+      capacity,
+      operations,
+      releases,
+      stream,
+      attach: (...args: Parameters<AirplayStream['attach']>) =>
+        acquire().attach(...args),
+      register(close: () => Promise<void>) {
+        releases.add(`attachment:${++attachment}`, close);
+      },
+    };
+  };
+  type StreamOwner = ReturnType<typeof newStreamOwner>;
+  const streams = new WeakMap<AirplayPlaybackStream, StreamOwner>();
+  const streamInputs = new WeakMap<AirplayInput, StreamOwner>();
   const drivers = new WeakMap<AirplayDriver['transport'], AirplayDriver>();
   const privateInputs = new WeakMap<AirplayInput, AirplayCredentials>();
   const receipts = new WeakMap<AirplayInput, PairingCredentialConsumer>();
@@ -179,16 +256,59 @@ export function createAirplayDevices(deps: {
     },
     validate: validateAirplayProfile,
     create(onEvent) {
-      const driver = spawn(
-        (event, value) => onEvent({ event, value }),
-        async (change) => {
-          const consumer = consumers.get(driver.transport);
-          if (!consumer) throw new Error('Pairing consumer unavailable');
-          await consumer(change);
+      // Generic admission publishes before supplying start input. Publish a
+      // deferred driver, then bind exactly once to the captured stream at start;
+      // no ambient current-player slot and no change to shared admission.
+      let bound: AirplayDriver | undefined;
+      let closing: Promise<void> | undefined;
+      const transport: AirplayTransport = {
+        send: (command) =>
+          bound
+            ? bound.transport.send(command)
+            : Promise.reject(new Error('AirPlay attachment not started')),
+        pcm: (chunk) =>
+          bound
+            ? bound.transport.pcm(chunk)
+            : Promise.reject(new Error('AirPlay attachment not started')),
+        ownsSharedFeed: () => bound?.transport.ownsSharedFeed() ?? false,
+        cancelPcm: () => bound?.transport.cancelPcm(),
+        close: () => closing ??= bound?.transport.close() ?? Promise.resolve(),
+      };
+      drivers.set(transport, {
+        transport,
+        start(profile, input, credentials) {
+          if (closing || bound) {
+            return Promise.reject(new Error('AirPlay attachment already used'));
+          }
+          const owner = streamInputs.get(input);
+          const attach = owner ? owner.attach : spawn;
+          const pending: { event: string; value?: string }[] = [];
+          let constructing = true;
+          bound = attach(
+            (event, value) => {
+              // A factory may report synchronously. Publish those events only
+              // after the acquired handle is bound, so a reentrant close cannot
+              // settle before owning/releasing the newly constructed attachment.
+              if (constructing) pending.push({ event, value });
+              else onEvent({ event, value });
+            },
+            async (change) => {
+              const consumer = consumers.get(transport);
+              if (!consumer) throw new Error('Pairing consumer unavailable');
+              await consumer(change);
+            },
+          );
+          constructing = false;
+          for (const event of pending) onEvent(event);
+          if (closing) {
+            return Promise.reject(
+              new Error('AirPlay attachment closed before start'),
+            );
+          }
+          return bound.start(profile, input, credentials);
         },
-      );
-      drivers.set(driver.transport, driver);
-      return driver.transport;
+      });
+      return transport;
     },
     start(transport, config, input) {
       const receipt = receipts.get(input);
@@ -211,32 +331,62 @@ export function createAirplayDevices(deps: {
       current(): boolean;
       capacity?: PlaybackCapacity;
       capacityCurrent(): boolean;
+      stream?: StreamOwner;
     }
   >();
   const protocol: Omit<typeof admitted, 'prepare'> & {
     prepare(
-      request: PreparationRequest & { capacity?: PlaybackCapacity },
+      request: PreparationRequest & {
+        capacity?: PlaybackCapacity;
+        stream?: AirplayPlaybackStream;
+      },
     ): ReturnType<typeof admitted.prepare>;
   } = {
     ...admitted,
     async prepare(request) {
-      const incarnation = outputs.revision(request.id);
-      const context = {
-        id: request.id,
-        authority: outputAuthority(outputs, request.id),
-        current: () => true,
-        capacity: request.capacity,
-        capacityCurrent: request.capacity?.authority() ?? (() => true),
+      const stream = request.stream ? streams.get(request.stream) : undefined;
+      if (
+        request.stream && (!stream || stream.capacity !== request.capacity)
+      ) {
+        return {
+          ok: false,
+          error: new PreparationError('stale', 'foreign playback stream'),
+        };
+      }
+      const prepare = async (signal: AbortSignal) => {
+        const incarnation = outputs.revision(request.id);
+        const context = {
+          id: request.id,
+          authority: outputAuthority(outputs, request.id),
+          current: () => true,
+          capacity: request.capacity,
+          capacityCurrent: request.capacity?.authority() ?? (() => true),
+          stream,
+        };
+        const result = await admitted.prepare({
+          ...request,
+          signal,
+          isCurrent: () =>
+            request.isCurrent() &&
+            outputs.revision(request.id) === incarnation &&
+            context.authority() &&
+            context.current() && context.capacityCurrent() &&
+            !stream?.operations.closed,
+        });
+        if (result.ok) contexts.set(result.value, context);
+        return result;
       };
-      const result = await admitted.prepare({
-        ...request,
-        isCurrent: () =>
-          request.isCurrent() &&
-          outputs.revision(request.id) === incarnation && context.authority() &&
-          context.current() && context.capacityCurrent(),
-      });
-      if (result.ok) contexts.set(result.value, context);
-      return result;
+      if (!stream) return await prepare(request.signal);
+      try {
+        return await stream.operations.run(({ signal }) =>
+          prepare(AbortSignal.any([signal, request.signal]))
+        );
+      } catch {
+        return {
+          ok: false,
+          error: new PreparationError('cancelled', 'Playback stream closed'),
+        };
+      }
     },
     async activate(permit, input, lifecycle) {
       const context = contexts.get(permit);
@@ -247,100 +397,117 @@ export function createAirplayDevices(deps: {
           error: new PreparationError('stale', 'foreign or consumed permit'),
         };
       }
-      const privateInput = { ...input };
-      const previous = releases.get(context.id);
-      let release!: () => void, failed!: (error: unknown) => void;
-      const released = new Promise<void>((resolve, reject) => {
-        release = resolve;
-        failed = reject;
-      });
-      releases.set(context.id, released);
-      void released.catch(() => {});
-      let published: AirplayTransport | undefined;
-      let retained: { release(): void } | undefined;
-      try {
-        if (!context.capacityCurrent()) {
-          throw new PreparationError(
-            'cancelled',
-            'Playback reservation expired',
-          );
-        }
-        retained = context.capacity?.retain();
-        await previous;
-        if (deps.credentials) {
-          const snapshot = await deps.credentials.session(context.id, {
-            pairing: input.probe === true,
-          });
-          context.current = snapshot.isCurrent;
-          privateInputs.set(privateInput, {
-            password: snapshot.password,
-            // Explicit Pair requests a fresh PIN even when an older key exists.
-            pairingKey: input.probe ? null : snapshot.pairingKey,
-          });
-          const row = outputs.get(context.id);
-          const incarnation = outputs.revision(context.id);
-          receipts.set(privateInput, async (change) => {
-            const current = () => {
-              const latest = outputs.get(context.id);
-              return change.isCurrent() && context.authority() &&
-                context.current() &&
-                outputs.revision(context.id) === incarnation &&
-                latest?.host === row?.host && latest?.port === row?.port &&
-                latest?.receiverIdentity === row?.receiverIdentity;
-            };
-            await snapshot.acceptPairing(change.key, current);
-          });
-        }
-        const result = await admitted.activate(permit, privateInput, {
-          onEvent: lifecycle.onEvent,
-          publish(transport) {
-            let closing: Promise<void> | undefined;
-            const close = () =>
-              closing ??= (async () => {
-                try {
-                  await transport.close();
-                  retained?.release();
-                  release();
-                } catch (error) {
-                  failed(error);
-                  throw error;
-                }
-              })();
-            closers.set(transport, close);
-            published = {
-              send: (command) => transport.send(command),
-              pcm: (chunk) => transport.pcm(chunk),
-              ownsSharedFeed: () => transport.ownsSharedFeed(),
-              cancelPcm: () => transport.cancelPcm(),
-              close,
-            };
-            lifecycle.publish(published);
-          },
+      const activate = async (): Promise<AdmissionResult<AirplayTransport>> => {
+        const owner = context.stream;
+        const privateInput = { ...input };
+        if (owner) streamInputs.set(privateInput, owner);
+        const previous = releases.get(context.id);
+        let release!: () => void, failed!: (error: unknown) => void;
+        const released = new Promise<void>((resolve, reject) => {
+          release = resolve;
+          failed = reject;
         });
-        return result.ok ? { ok: true, value: published! } : result;
+        releases.set(context.id, released);
+        void released.catch(() => {});
+        let published: AirplayTransport | undefined;
+        let retained: { release(): void } | undefined;
+        try {
+          if (!context.capacityCurrent()) {
+            throw new PreparationError(
+              'cancelled',
+              'Playback reservation expired',
+            );
+          }
+          // Explicit streams retain capacity with native storage, not individual
+          // attachments. Compatibility callers keep their previous lifetime.
+          if (!owner) retained = context.capacity?.retain();
+          await previous;
+          if (deps.credentials) {
+            const snapshot = await deps.credentials.session(context.id, {
+              pairing: input.probe === true,
+            });
+            context.current = snapshot.isCurrent;
+            privateInputs.set(privateInput, {
+              password: snapshot.password,
+              // Explicit Pair requests a fresh PIN even when an older key exists.
+              pairingKey: input.probe ? null : snapshot.pairingKey,
+            });
+            const row = outputs.get(context.id);
+            const incarnation = outputs.revision(context.id);
+            receipts.set(privateInput, async (change) => {
+              const current = () => {
+                const latest = outputs.get(context.id);
+                return change.isCurrent() && context.authority() &&
+                  context.current() &&
+                  outputs.revision(context.id) === incarnation &&
+                  latest?.host === row?.host && latest?.port === row?.port &&
+                  latest?.receiverIdentity === row?.receiverIdentity;
+              };
+              await snapshot.acceptPairing(change.key, current);
+            });
+          }
+          const result = await admitted.activate(permit, privateInput, {
+            onEvent: lifecycle.onEvent,
+            publish(transport) {
+              let closing: Promise<void> | undefined;
+              const close = () =>
+                closing ??= (async () => {
+                  try {
+                    await transport.close();
+                    retained?.release();
+                    release();
+                  } catch (error) {
+                    failed(error);
+                    throw error;
+                  }
+                })();
+              closers.set(transport, close);
+              owner?.register(close);
+              published = {
+                send: (command) => transport.send(command),
+                pcm: (chunk) => transport.pcm(chunk),
+                ownsSharedFeed: () => transport.ownsSharedFeed(),
+                cancelPcm: () => transport.cancelPcm(),
+                close,
+              };
+              lifecycle.publish(published);
+            },
+          });
+          return result.ok ? { ok: true, value: published! } : result;
+        } catch {
+          // No arbitrary dependency error (or plaintext) crosses into public state.
+          return {
+            ok: false,
+            error: new PreparationError(
+              'start-failed',
+              'Speaker credentials unavailable',
+            ),
+          };
+        } finally {
+          if (!published) {
+            retained?.release();
+            // Do not let a canceled queued attempt bypass an earlier cleanup.
+            if (previous) void previous.then(release, failed);
+            else release();
+          }
+          void released.then(() => {
+            if (releases.get(context.id) === released) {
+              releases.delete(context.id);
+            }
+          }, () => {});
+          privateInputs.delete(privateInput);
+          receipts.delete(privateInput);
+          streamInputs.delete(privateInput);
+        }
+      };
+      if (!context.stream) return await activate();
+      try {
+        return await context.stream.operations.run(activate);
       } catch {
-        // No arbitrary dependency error (or plaintext) crosses into public state.
         return {
           ok: false,
-          error: new PreparationError(
-            'start-failed',
-            'Speaker credentials unavailable',
-          ),
+          error: new PreparationError('cancelled', 'Playback stream closed'),
         };
-      } finally {
-        if (!published) {
-          retained?.release();
-          // Do not let a canceled queued attempt bypass an earlier cleanup.
-          if (previous) void previous.then(release, failed);
-          else release();
-        }
-        void released.then(() => {
-          if (releases.get(context.id) === released) {
-            releases.delete(context.id);
-          }
-        }, () => {});
-        privateInputs.delete(privateInput);
-        receipts.delete(privateInput);
       }
     },
   };
@@ -366,6 +533,11 @@ export function createAirplayDevices(deps: {
     capacity,
     admission,
     protocol,
+    createStream(capacity?: PlaybackCapacity): AirplayPlaybackStream {
+      const owner = newStreamOwner(capacity);
+      streams.set(owner.stream, owner);
+      return owner.stream;
+    },
     async preparePlayback(id: string, signal: AbortSignal): Promise<boolean> {
       const revision = outputs.revision(id);
       const owner = outputs.get(id);

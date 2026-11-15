@@ -164,23 +164,26 @@ Deno.test('private credential snapshots fence replacements and registry incarnat
 });
 
 Deno.test('private adapter checks current credentials after publish and before native start', async () => {
-  let starts = 0, closes = 0;
-  const f = fixture(7000, () => ({
-    transport: {
-      send: () => Promise.resolve(),
-      pcm: () => Promise.resolve(),
-      close() {
-        closes++;
+  let acquisitions = 0, starts = 0, closes = 0;
+  const f = fixture(7000, () => {
+    acquisitions++;
+    return {
+      transport: {
+        send: () => Promise.resolve(),
+        pcm: () => Promise.resolve(),
+        close() {
+          closes++;
+          return Promise.resolve();
+        },
+        ownsSharedFeed: () => false,
+        cancelPcm() {},
+      },
+      start() {
+        starts++;
         return Promise.resolve();
       },
-      ownsSharedFeed: () => false,
-      cancelPcm() {},
-    },
-    start() {
-      starts++;
-      return Promise.resolve();
-    },
-  }));
+    };
+  });
   try {
     await f.credentials.set('1', 'password', canary());
     const permit = await f.prepare();
@@ -195,7 +198,8 @@ Deno.test('private adapter checks current credentials after publish and before n
     await replacement;
     assert(!result.ok);
     assertEquals(starts, 0);
-    assertEquals(closes, 1);
+    assertEquals(acquisitions, 0);
+    assertEquals(closes, 0);
   } finally {
     f.devices.close();
   }
