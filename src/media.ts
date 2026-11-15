@@ -163,6 +163,8 @@ export interface InputPcm extends AsyncIterableIterator<Uint8Array> {
 }
 
 export interface Media {
+  /** Stop HLS intake and cancel/join its background encoding and cleanup. */
+  close(): Promise<void>;
   /** afp/1: compressed audio packets only, excluding tags and container data.
    * Throws on I/O/demux failure. No audio or packets yields a null fingerprint.
    * pcmMd5 is FLAC's nonzero STREAMINFO checksum, never a decoded-audio hash. */
@@ -839,10 +841,12 @@ export function createMedia(
     options: HlsOptions,
     config: HlsEncodingSettings,
     publish: (facts: HlsFacts) => Promise<void>,
+    signal: AbortSignal,
   ): Promise<HlsFacts | null> {
     using _heartbeat = acquireHeartbeat();
     try {
-      await using input = await Demuxer.open(path);
+      signal.throwIfAborted();
+      await using input = await Demuxer.open(path, { signal });
       const video = input.video();
       const audio = options.audioTrack === undefined
         ? input.audio()
@@ -925,9 +929,11 @@ export function createMedia(
         frame: Frame | null,
         index: number,
       ) => {
+        signal.throwIfAborted();
         const packets = await encoder.encodeAll(frame);
         try {
           for (const packet of packets) {
+            signal.throwIfAborted();
             await output.writePacket(packet, index);
             // Interleaving can flush a video boundary on an audio write. The
             // publication boundary is the muxer's manifest, not packet flags.
@@ -943,9 +949,11 @@ export function createMedia(
         packet: Parameters<Decoder['decodeAll']>[0],
         index: number,
       ) => {
+        signal.throwIfAborted();
         const frames = await decoder.decodeAll(packet);
         try {
           for (const frame of frames) {
+            signal.throwIfAborted();
             if (index === vi) {
               using scaled = await scaleImage(
                 frame,
@@ -966,6 +974,7 @@ export function createMedia(
       for await (const packet of input.packets()) {
         if (!packet) continue;
         try {
+          signal.throwIfAborted();
           const isVideo = packet.streamIndex === video.index;
           if (!isVideo && packet.streamIndex !== audio?.index) continue;
           const index = isVideo ? vi : ai;
@@ -984,6 +993,7 @@ export function createMedia(
           packet.free();
         }
       }
+      signal.throwIfAborted();
       if (encode) {
         await decode(vd!, ve!, null, vi);
         if (ad && ae) await decode(ad, ae, null, ai);

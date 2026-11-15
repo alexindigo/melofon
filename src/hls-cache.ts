@@ -2,6 +2,7 @@
 // facts and leases, never filesystem paths or cache-admission responsibilities.
 import { createHash } from 'node:crypto';
 import type { State } from './state.ts';
+import { createOperationScope } from './operations.ts';
 
 export interface HlsOptions {
   kbps?: number;
@@ -42,6 +43,7 @@ type Producer = (
   options: HlsOptions,
   settings: HlsEncodingSettings,
   publish: (facts: HlsFacts) => Promise<void>,
+  signal: AbortSignal,
 ) => Promise<HlsFacts | null>;
 interface Entry {
   source: Source;
@@ -175,6 +177,7 @@ export function createHlsCache(
     default: ENCODING_DEFAULTS.ladder,
   });
   const entries = new Map<string, Entry>();
+  const operations = createOperationScope('HLS');
   const sources = new Map<string, Source>();
   let serial = Promise.resolve();
   const exclusive = <T>(run: () => T | Promise<T>): Promise<T> => {
@@ -250,6 +253,9 @@ export function createHlsCache(
   // Include old nested M4.6 output directories in the budget as well as current
   // hashed outputs. Directory mtimes persist recency across process restarts.
   async function prune(root: string) {
+    // Late view/read-lease release is harmless after process close and must
+    // not reenter the settings store. Admitted cleanup is joined by close.
+    if (operations.closed) return;
     const limit =
       Number(await state?.getTyped('media.hlsCacheMegabytes') ?? 2048) * 1024 *
       1024;
@@ -296,6 +302,7 @@ export function createHlsCache(
     root: string,
     options: HlsOptions,
     config: HlsEncodingSettings,
+    signal: AbortSignal,
   ): Promise<HlsView | null> => {
     const { path } = source;
     const signature = JSON.stringify([
@@ -309,6 +316,7 @@ export function createHlsCache(
     const key = createHash('sha256').update(signature).digest('hex');
     const dir = `${root}/${key}`;
     const entry = await exclusive(async () => {
+      signal.throwIfAborted();
       await Deno.mkdir(root, { recursive: true });
       let entry = entries.get(dir);
       if (!entry) {
@@ -323,19 +331,21 @@ export function createHlsCache(
         entries.set(dir, entry);
         const current = entry;
         // Install the admission entry before the asynchronous worker begins.
-        current.completion = (async () => {
+        current.completion = operations.run(async ({ signal }) => {
           try {
             try {
               const facts = JSON.parse(
                 await Deno.readTextFile(`${dir}/facts.json`),
               ) as HlsFacts;
               if ((await manifest(dir)).complete) {
+                signal.throwIfAborted();
                 resolve(facts);
                 return;
               }
             } catch {
               /* Absent/interrupted output is rebuilt, never a cache hit. */
             }
+            signal.throwIfAborted();
             await Deno.remove(dir, { recursive: true }).catch((error) => {
               if (!(error instanceof Deno.errors.NotFound)) {
                 throw error;
@@ -348,14 +358,18 @@ export function createHlsCache(
               options,
               config,
               async (facts) => {
+                signal.throwIfAborted();
                 if (announced) return;
                 try {
                   await manifest(dir);
+                  signal.throwIfAborted();
                   announced = true;
                   resolve(facts);
                 } catch { /* Not yet published. */ }
               },
+              signal,
             );
+            signal.throwIfAborted();
             if (!facts || !(await manifest(dir)).complete) {
               throw new Error('HLS encode failed');
             }
@@ -377,7 +391,7 @@ export function createHlsCache(
               await prune(root);
             });
           }
-        })().catch(() => {
+        }).catch(() => {
           current.failed = true;
           resolve(null);
         });
@@ -390,7 +404,7 @@ export function createHlsCache(
       return entry;
     });
     let released = false;
-    const release = () =>
+    const releaseLease = () =>
       exclusive(async () => {
         if (released) return;
         released = true;
@@ -401,8 +415,11 @@ export function createHlsCache(
         }
         await prune(root);
       });
+    const release = () =>
+      operations.closed ? releaseLease() : operations.run(releaseLease);
     try {
       const facts = await entry.ready;
+      signal.throwIfAborted();
       if (!facts || entry.failed) {
         await release();
         return null;
@@ -416,11 +433,13 @@ export function createHlsCache(
         return null;
       }
       await Deno.utime(dir, new Date(), new Date());
+      signal.throwIfAborted();
       return {
         ...facts,
         ...view,
         release,
         async segment(index) {
+          if (operations.closed) return null;
           const segment = view.segments[index];
           if (!segment || released) return null;
           // A separate read lease survives release of the playlist's lease.
@@ -476,9 +495,11 @@ export function createHlsCache(
     path: string,
     root: string,
     requested: HlsOptions[],
+    signal: AbortSignal,
   ): Promise<HlsView[] | null> {
     const admission = await settings(ADMISSION_DEFAULTS);
     const encoding = await settings(ENCODING_DEFAULTS);
+    signal.throwIfAborted();
     // Snapshot the whole request before source inspection or producer admission. Hats
     // cannot start an earlier valid rung before a later rung has been checked.
     if (!requested.length || requested.length > admission.maxRenditions) {
@@ -513,6 +534,7 @@ export function createHlsCache(
     const views: HlsView[] = [];
     try {
       const facts = await source.facts;
+      signal.throwIfAborted();
       if (!facts) return null;
       for (const option of options) {
         const { width, height } = hlsDimensions(facts, option, encoding);
@@ -521,7 +543,7 @@ export function createHlsCache(
         }
       }
       for (const option of options) {
-        const view = await acquire(source, root, option, encoding);
+        const view = await acquire(source, root, option, encoding, signal);
         if (!view) return null;
         views.push(view);
       }
@@ -540,9 +562,16 @@ export function createHlsCache(
     }
   }
   return {
-    hlsRenditions,
-    async hls(path: string, root: string, options: HlsOptions = {}) {
-      return (await hlsRenditions(path, root, [options]))?.[0] ?? null;
+    hlsRenditions(path: string, root: string, options: HlsOptions[]) {
+      return operations.run(({ signal }) =>
+        hlsRenditions(path, root, options, signal)
+      );
     },
+    async hls(path: string, root: string, options: HlsOptions = {}) {
+      return (await operations.run(({ signal }) =>
+        hlsRenditions(path, root, [options], signal)
+      ))?.[0] ?? null;
+    },
+    close: operations.close,
   };
 }

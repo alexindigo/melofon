@@ -44,6 +44,7 @@ import {
 } from './scan-scope.ts';
 import type { ScanMode, ScanProblem, ScanProblemKind } from './store/scan.ts';
 import { LibraryError } from './library-errors.ts';
+import { createOperationScope } from './operations.ts';
 import {
   createTagReader,
   declareTagSettings,
@@ -98,7 +99,9 @@ async function* walkMedia(
   root: string,
   unreadable: (path: string, error: unknown) => void,
   dir: string = root,
+  signal?: AbortSignal,
 ): AsyncGenerator<{ abs: string; rel: string }> {
+  signal?.throwIfAborted();
   // Catch only directory acquisition, never a consumer's file processing.
   // Buffer before yielding so partial reads cannot invalidate emitted coverage.
   const entries: Deno.DirEntry[] = [];
@@ -109,9 +112,12 @@ async function* walkMedia(
     return;
   }
   for (const entry of entries) {
+    signal?.throwIfAborted();
     const abs = join(dir, entry.name);
     if (entry.isDirectory) {
-      if (!entry.name.startsWith('.')) yield* walkMedia(root, unreadable, abs);
+      if (!entry.name.startsWith('.')) {
+        yield* walkMedia(root, unreadable, abs, signal);
+      }
     } else if (
       entry.isFile &&
       (AUDIO_EXTENSIONS.has(extOf(entry.name)) ||
@@ -138,8 +144,11 @@ export async function scanLibrary(
     startedAt?: string;
     progress?: (progress: ScanProgress) => void;
     notify?: Notify;
+    signal?: AbortSignal;
   } = {},
 ): Promise<ScanCounts> {
+  const check = () => options.signal?.throwIfAborted();
+  check();
   using tagReader = options.tagReader ??
     createTagReader(options.state ?? createState(store));
   let media_: Media | undefined = media;
@@ -174,6 +183,7 @@ export async function scanLibrary(
     elapsedMs: 0,
   };
   const report = (phase = progress.phase) => {
+    check();
     progress.phase = phase;
     progress.elapsedMs = Date.now() - Date.parse(startedAt);
     options.progress?.({ ...progress });
@@ -241,6 +251,7 @@ export async function scanLibrary(
   let skipped = 0;
 
   for (const source of sources) {
+    check();
     if (!coverage.libraries.includes(source.id)) continue;
     report('walking');
     const root = source.path.replace(/\/+$/, '') || '/';
@@ -266,9 +277,10 @@ export async function scanLibrary(
     for (const target of targets.filter((t) => t.library === source.id)) {
       for await (
         const { abs, rel } of available
-          ? walkMedia(root, unreadable, join(root, target.path))
+          ? walkMedia(root, unreadable, join(root, target.path), options.signal)
           : []
       ) {
+        check();
         try {
           if (isCoverFile(rel.slice(rel.lastIndexOf('/') + 1))) {
             try {
@@ -408,11 +420,13 @@ export async function scanLibrary(
               })),
             );
           } catch (error) {
+            check();
             log.event('scan_tags_failed', { path: abs, error });
             problem(source.id, rel, 'tags_unreadable', error);
             skipped++;
             continue; // unreadable tags — skip the file, keep scanning
           }
+          check();
           if (probe) {
             // Probe decides video-ness and backfills missing duration. An
             // audio-only .mp4 stays a song, and a streamless file is skipped.
@@ -628,6 +642,7 @@ export async function scanLibrary(
     events,
     retainedIds: [...byId.keys()],
   });
+  check();
   // This invalidates only committed catalog facts, even if later candidate
   // acquisition fails. Progress and legacy database/update events stay separate.
   options.notify?.emit(['library'], undefined, 'all');
@@ -653,6 +668,7 @@ export async function scanLibrary(
   }
   const writable = new Map<string, boolean>();
   for (const album of grouped.albums) {
+    check();
     const versions = picturesByAlbum.get(album.id);
     // Local candidates are acquired only for completely observed albums.
     // An excluded track's picture/lyrics facts are not an empty observation.
@@ -674,6 +690,7 @@ export async function scanLibrary(
         ),
       );
     }
+    check();
     await store.candidates.replaceLocal(
       album.id,
       versions.size > 1 && writable.get(album.libraryId)
@@ -682,6 +699,7 @@ export async function scanLibrary(
     );
   }
   for (const file of files) {
+    check();
     await lyrics.reconcile(
       file.id,
       sources.find((source) => source.id === file.libraryId)!,
@@ -689,6 +707,7 @@ export async function scanLibrary(
     );
   }
   for (const artist of artists.values()) {
+    check();
     if (
       preserved.some((f) =>
         f.artistId === artist.id ||
@@ -713,6 +732,7 @@ export async function scanLibrary(
         });
       }
     }
+    check();
     await store.candidates.replaceLocal(
       artist.id,
       versions.size > 1 ? [...versions.values()] : [],
@@ -773,6 +793,8 @@ export interface ScanService {
   start(
     options?: { afterCurrent?: boolean; ifRunning?: boolean },
   ): Promise<void>;
+  /** Fence intake, cancel the scan and join admitted work and cleanup. */
+  close(): Promise<void>;
 }
 
 export function createScan(
@@ -787,6 +809,7 @@ export function createScan(
   },
 ): ScanService {
   const log = opts?.log ?? scopedLog('scan');
+  const operations = createOperationScope('Scan');
   const state = opts?.state ?? createState(store);
   declareTagSettings(state);
   state.declare('scan.problemListLimit', {
@@ -821,82 +844,97 @@ export function createScan(
   };
   const launch = (initial: QueuedScan): Promise<ScanCounts> => {
     if (pending !== null) return pending;
-    const launched = Promise.resolve().then(async () => {
-      let request = initial;
-      let counts: ScanCounts | undefined;
-      for (;;) {
-        lastScanStartedMs = Date.now();
-        lastError = null;
-        active = true;
-        progress = {
-          phase: 'walking',
-          ...request,
-          librariesDone: 0,
-          librariesTotal: 0,
-          filesSeen: 0,
-          filesRead: 0,
-          problems: 0,
-          startedAt: new Date(lastScanStartedMs).toISOString(),
-          elapsedMs: 0,
-        };
-        opts?.notify?.emit(['scan'], undefined, 'admins');
-        opts?.notify?.emit(['update'], undefined, 'all');
-        let timer: ReturnType<typeof setInterval> | undefined;
-        let failure: unknown;
-        try {
-          const interval = await state.getTyped(
-            'scan.progressIntervalMs',
-          ) as number;
-          timer = setInterval(
-            () => opts?.notify?.emit(['scan'], undefined, 'admins'),
-            interval,
-          );
-          counts = await scanLibrary(store, media, log, opts?.lyrics, {
-            state,
-            tagReader: opts?.tagReader?.(),
-            selection: request.scope,
-            mode: request.mode,
-            startedAt: progress.startedAt,
-            progress: (value) => {
-              progress = value;
-            },
-            notify: opts?.notify,
-          });
-          count = counts.files;
-          lastScanMs = Date.now();
-          // Core emits after successful completion; hats just consume the event.
-          opts?.notify?.emit(['database'], undefined, 'all');
-        } catch (error) {
-          // A source changed during I/O: the store refused the stale catalog.
-          if (error instanceof LibrarySourcesChanged) {
-            enqueue({ mode: request.mode, scope: {} });
-          } else {
-            lastError = error instanceof Error ? error.message : String(error);
-            failure = error;
-          }
-        } finally {
-          clearInterval(timer);
-          active = false;
-          if (progress) progress.elapsedMs = Date.now() - lastScanStartedMs!;
+    const launched = operations.run(async ({ signal }) => {
+      try {
+        // Preserve scan's deferred launch, not a scheduling policy in the scope.
+        // The single-flight receipt is installed before traversal can begin.
+        await Promise.resolve();
+        let request = initial;
+        let counts: ScanCounts | undefined;
+        for (;;) {
+          signal.throwIfAborted();
+          lastScanStartedMs = Date.now();
+          lastError = null;
+          active = true;
+          progress = {
+            phase: 'walking',
+            ...request,
+            librariesDone: 0,
+            librariesTotal: 0,
+            filesSeen: 0,
+            filesRead: 0,
+            problems: 0,
+            startedAt: new Date(lastScanStartedMs).toISOString(),
+            elapsedMs: 0,
+          };
           opts?.notify?.emit(['scan'], undefined, 'admins');
           opts?.notify?.emit(['update'], undefined, 'all');
+          let timer: ReturnType<typeof setInterval> | undefined;
+          let failure: unknown;
+          try {
+            const interval = await state.getTyped(
+              'scan.progressIntervalMs',
+            ) as number;
+            signal.throwIfAborted();
+            timer = setInterval(
+              () => opts?.notify?.emit(['scan'], undefined, 'admins'),
+              interval,
+            );
+            counts = await scanLibrary(store, media, log, opts?.lyrics, {
+              state,
+              tagReader: opts?.tagReader?.(),
+              selection: request.scope,
+              mode: request.mode,
+              startedAt: progress.startedAt,
+              progress: (value) => {
+                progress = value;
+              },
+              notify: opts?.notify,
+              signal,
+            });
+            signal.throwIfAborted();
+            count = counts.files;
+            lastScanMs = Date.now();
+            // Core emits after successful completion; hats just consume the event.
+            opts?.notify?.emit(['database'], undefined, 'all');
+          } catch (error) {
+            if (signal.aborted) throw error;
+            // A source changed during I/O: the store refused the stale catalog.
+            if (error instanceof LibrarySourcesChanged) {
+              enqueue({ mode: request.mode, scope: {} });
+            } else {
+              lastError = error instanceof Error
+                ? error.message
+                : String(error);
+              failure = error;
+            }
+          } finally {
+            clearInterval(timer);
+            active = false;
+            if (progress) progress.elapsedMs = Date.now() - lastScanStartedMs!;
+            opts?.notify?.emit(['scan'], undefined, 'admins');
+            opts?.notify?.emit(['update'], undefined, 'all');
+          }
+          if (queued === null) {
+            pending = null;
+            if (failure) throw failure;
+            return counts!;
+          }
+          if (failure) log.event('scan_failed', { error: failure });
+          request = queued;
+          queued = null;
         }
-        if (queued === null) {
-          pending = null;
-          if (failure) throw failure;
-          return counts!;
-        }
-        if (failure) log.event('scan_failed', { error: failure });
-        request = queued;
-        queued = null;
+      } finally {
+        if (pending === launched) pending = null;
       }
-    }).finally(() => {
-      if (pending === launched) pending = null;
     });
     pending = launched;
     return launched;
   };
   const run = (input: ScanRequest = {}): Promise<ScanCounts> => {
+    if (operations.closed) {
+      return Promise.reject(new Error('Scan is closed'));
+    }
     if (pending !== null) return pending;
     const { mode = 'full', ...scope } = input;
     // Foreground callers retain their single-flight/full default contract.
@@ -904,59 +942,77 @@ export function createScan(
   };
   return {
     run,
-    async request(input = {}) {
-      const { mode = 'quick', ...scope } = input;
-      if (mode !== 'quick' && mode !== 'full') {
-        throw new LibraryError('invalid_field', 'Invalid scan mode');
-      }
-      const validated = await validateScanScope(
-        scope,
-        await store.catalog.listLibraries(),
-      );
-      const request = { scope: validated, mode };
-      if (pending !== null) enqueue(request);
-      else {void launch(request).catch((error) =>
-          log.event('scan_failed', { error })
-        );}
+    request(input = {}) {
+      return operations.run(async ({ signal }) => {
+        const { mode = 'quick', ...scope } = input;
+        if (mode !== 'quick' && mode !== 'full') {
+          throw new LibraryError('invalid_field', 'Invalid scan mode');
+        }
+        const validated = await validateScanScope(
+          scope,
+          await store.catalog.listLibraries(),
+        );
+        signal.throwIfAborted();
+        const request = { scope: validated, mode };
+        if (pending !== null) enqueue(request);
+        else {void launch(request).catch((error) =>
+            log.event('scan_failed', { error })
+          );}
+      });
     },
-    async problems(libraryId) {
-      if (
-        libraryId !== undefined &&
-        !(await store.catalog.listLibraries()).some((l) => l.id === libraryId)
-      ) {
-        throw new LibraryError('not_found', 'Library not found');
-      }
-      return store.scan.problems(
-        libraryId,
-        await state.getTyped('scan.problemListLimit') as number,
-      );
+    problems(libraryId) {
+      return operations.run(async ({ signal }) => {
+        if (
+          libraryId !== undefined &&
+          !(await store.catalog.listLibraries()).some((l) => l.id === libraryId)
+        ) {
+          throw new LibraryError('not_found', 'Library not found');
+        }
+        signal.throwIfAborted();
+        const limit = await state.getTyped('scan.problemListLimit') as number;
+        signal.throwIfAborted();
+        return store.scan.problems(
+          libraryId,
+          limit,
+        );
+      });
     },
-    async status() {
-      const folderCount = await store.catalog.libraryCount();
-      return {
-        ...structuredClone(progress ?? {}),
-        ...(active && progress
-          ? { elapsedMs: Date.now() - Date.parse(progress.startedAt) }
-          : {}),
-        scanning: active,
-        count,
-        folderCount,
-        lastScanMs,
-        lastScanStartedMs,
-        lastError,
-        queued: structuredClone(queued),
-      };
+    status() {
+      return operations.run(async () => {
+        const folderCount = await store.catalog.libraryCount();
+        return {
+          ...structuredClone(progress ?? {}),
+          ...(active && progress
+            ? { elapsedMs: Date.now() - Date.parse(progress.startedAt) }
+            : {}),
+          scanning: active,
+          count,
+          folderCount,
+          lastScanMs,
+          lastScanStartedMs,
+          lastError,
+          queued: structuredClone(queued),
+        };
+      });
     },
-    async start(options = {}) {
-      if (options.ifRunning && pending === null) return;
-      if (options.afterCurrent && pending !== null) {
-        enqueue({ mode: 'full', scope: {} });
-      }
-      try {
-        await run();
-      } catch (error) {
-        log.event('scan_failed', { error });
-      }
+    start(options = {}) {
+      return operations.run(async ({ signal }) => {
+        signal.throwIfAborted();
+        if (options.ifRunning && pending === null) return;
+        if (options.afterCurrent && pending !== null) {
+          enqueue({ mode: 'full', scope: {} });
+        }
+        try {
+          await run();
+        } catch (error) {
+          log.event('scan_failed', { error });
+        }
+      });
+    },
+    close() {
+      const closing = operations.close();
+      queued = null;
+      return closing;
     },
   };
 }

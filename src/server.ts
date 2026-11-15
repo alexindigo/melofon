@@ -157,6 +157,7 @@ async function startServerRuntime(
     notify,
   );
   const media = createMedia(undefined, state);
+  own('media', () => media.close(), 40);
   const lyrics = createLyrics(store, state);
   const outputs: Outputs = createOutputs({
     notify,
@@ -166,6 +167,7 @@ async function startServerRuntime(
   });
   await outputs.ready();
   const scan = createScan(store, media, { notify, lyrics, state });
+  own('scan', () => scan.close(), 10);
   const libraries = createLibraries(store, {
     dataDir: cfg.dataDir,
     scan,

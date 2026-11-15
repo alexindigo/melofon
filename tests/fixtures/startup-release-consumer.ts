@@ -7,6 +7,8 @@ const acquisitions = [
   'store',
   'persistence',
   'logging settings',
+  'media',
+  'scan',
   'podcasts',
   'lookups',
   'output admission',
