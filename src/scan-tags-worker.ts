@@ -5,9 +5,10 @@ import { boundedMetadata } from './lyrics-metadata.ts';
 // State the specific worker API without aliasing or redeclaring its global object.
 declare function postMessage(value: unknown): void;
 addEventListener('message', async (event) => {
+  const { path, maxBytes, call } =
+    (event as MessageEvent<{ path: string; maxBytes: number; call: string }>)
+      .data;
   try {
-    const { path, maxBytes } =
-      (event as MessageEvent<{ path: string; maxBytes: number }>).data;
     using file = await Deno.open(path, { read: true });
     const header = new Uint8Array(12);
     const length = await file.read(header) ?? 0;
@@ -26,10 +27,11 @@ addEventListener('message', async (event) => {
       throw new Error('Unrecognized media header');
     }
     const metadata = await boundedMetadata(path, maxBytes, { duration: false });
-    postMessage({ metadata });
+    postMessage({ metadata, call });
   } catch (error) {
     postMessage({
       error: error instanceof Error ? error.message : String(error),
+      call,
     });
   }
 });

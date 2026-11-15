@@ -85,7 +85,7 @@ export function createArtworkBackground(options: {
       closed = true;
       dirty = false;
       unsubscribe();
-      host.close();
+      await host.close();
       await running;
     },
   };

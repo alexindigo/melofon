@@ -162,7 +162,7 @@ Deno.test('Artwork Worker: shutdown interrupts startup and active computation wi
     for (const active of [false, true]) {
       const computing = Promise.withResolvers<void>();
       const code = active
-        ? 'postMessage({ready:true}); onmessage = () => { postMessage({started:true}); while(true) {} };'
+        ? 'postMessage({ready:true}); onmessage = ({data}) => { postMessage({started:true,call:data.call}); while(true) {} };'
         : `await fetch('http://melofon.home:${server.addr.port}/starting'); setInterval(() => {}, 1000);`;
       const host = createArtworkFactsHost(
         stateFixture(),

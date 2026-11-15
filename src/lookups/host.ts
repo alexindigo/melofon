@@ -16,6 +16,11 @@ import {
 import type { ReferenceValues } from '../reference-types.ts';
 import { parseReferenceValues } from './reference-values.ts';
 import { type LookupLyricsValue, parseLyricsValue } from './lyrics-values.ts';
+import {
+  createWorkerIntake,
+  createWorkerSession,
+  type WorkerSession,
+} from '../worker-host.ts';
 
 export type PluginState =
   | 'discovered'
@@ -130,9 +135,9 @@ export function parseResult(
 }
 interface Slot {
   worker: Worker;
+  session: WorkerSession;
   generation: string;
   authority: NetworkAuthority;
-  ready: ReturnType<typeof Promise.withResolvers<void>>;
   stopped: ReturnType<typeof Promise.withResolvers<void>>;
   initialized: boolean;
   heartbeat: number;
@@ -141,8 +146,6 @@ interface Slot {
     id: string;
     signal: AbortSignal;
     limits: { timeoutMs: number; maxBytes: number };
-    resolve: (value: unknown) => void;
-    reject: (error: Error) => void;
   };
 }
 export class LookupHost {
@@ -155,6 +158,8 @@ export class LookupHost {
   private log: Log;
   private revision = 0;
   private starting?: Promise<void>;
+  private stopping?: Promise<void>;
+  private intake = createWorkerIntake('Lookup', 'Lookup intake is full');
   constructor(
     readonly plugin: DiscoveredPlugin,
     private network: LookupNetwork,
@@ -205,9 +210,7 @@ export class LookupHost {
     this.controllers.get(slot)?.abort(error);
     this.controllers.delete(slot);
     clearInterval(slot.timer);
-    slot.ready.reject(error);
-    slot.call?.reject(error);
-    slot.worker.terminate();
+    slot.session.retire(error);
     slot.stopped.resolve();
     this.transition(this.enabled ? 'discovered' : 'disabled');
   }
@@ -217,6 +220,11 @@ export class LookupHost {
     hosts: string[],
     settings: Record<string, SettingValue | undefined>,
   ): Promise<void> {
+    if (enabled && this.intake.closed) {
+      await this.stopping;
+      this.intake = createWorkerIntake('Lookup', 'Lookup intake is full');
+      this.stopping = undefined;
+    }
     const changed = enabled !== this.enabled ||
       JSON.stringify(hosts) !== JSON.stringify(this.hosts) ||
       JSON.stringify(settings) !== JSON.stringify(this.settings);
@@ -240,36 +248,40 @@ export class LookupHost {
       return Promise.reject(new LookupRevoked('Plugin disabled'));
     }
     if (this.starting) return this.starting;
-    const task = this.startOnce().catch((error) => {
-      if (!(error instanceof LookupRevoked)) {
-        this.transition('failed', String(error));
+    const task = this.intake.track(async ({ signal }) => {
+      try {
+        await this.startOnce(signal);
+      } catch (error) {
+        if (!(error instanceof LookupRevoked)) {
+          this.transition('failed', String(error));
+        }
+        throw error;
+      } finally {
+        if (this.starting === task) this.starting = undefined;
       }
-      throw error;
-    }).finally(() => {
-      if (this.starting === task) this.starting = undefined;
     });
     this.starting = task;
     return task;
   }
-  private async startOnce(): Promise<void> {
+  private async startOnce(signal: AbortSignal): Promise<void> {
     if (!this.enabled) throw new Error('Plugin disabled');
     if (!this.plugin.manifest) {
       throw new Error(this.plugin.error ?? 'Invalid manifest');
     }
-    if (this.slot) return await this.slot.ready.promise;
+    if (this.slot) return await this.slot.session.ready;
     const manifest = this.plugin.manifest;
     const revision = this.revision;
     this.transition('starting');
     const hosts = await parentGrant(this.hosts);
     // A configure/disable while permissions were queried cannot publish stale authority.
-    if (!this.enabled || revision !== this.revision) {
+    if (!this.enabled || signal.aborted || revision !== this.revision) {
       throw new LookupRevoked('Lookup configuration changed');
     }
     const bootstrap = await Deno.readTextFile(
       new URL('./worker.ts', import.meta.url),
     );
     await validatePluginTree(this.plugin.dir);
-    if (!this.enabled || revision !== this.revision) {
+    if (!this.enabled || signal.aborted || revision !== this.revision) {
       throw new LookupRevoked('Lookup configuration changed');
     }
     const worker = new Worker(
@@ -293,10 +305,14 @@ export class LookupHost {
       },
     );
     const controller = new AbortController();
-    const ready = Promise.withResolvers<void>();
-    void ready.promise.catch(() => {});
+    const session = createWorkerSession(worker, {
+      invalidMessage: 'Invalid worker message',
+      onMessage: (data) => onMessage(data),
+      onRetire: (error) => fail(error),
+    });
     const slot: Slot = {
       worker,
+      session,
       generation: crypto.randomUUID(),
       authority: {
         plugin: manifest.id,
@@ -304,7 +320,6 @@ export class LookupHost {
         ratePerMinute: manifest.network.ratePerMinute,
         signal: controller.signal,
       },
-      ready,
       stopped: Promise.withResolvers<void>(),
       initialized: false,
       heartbeat: performance.now(),
@@ -324,25 +339,20 @@ export class LookupHost {
             : (this.options.livenessMs ?? 10000))
       ) fail(new Error('Plugin heartbeat missing'));
     }, this.options.heartbeatMs ?? 1000);
-    worker.onerror = (event) => {
-      event.preventDefault();
-      fail(new Error(event.message));
-    };
-    worker.onmessageerror = () => fail(new Error('Invalid worker message'));
-    worker.onmessage = ({ data }) => {
+    const onMessage = (data: MessageEvent['data']) => {
       if (this.slot !== slot || data?.generation !== slot.generation) return;
       if (data.type === 'ready') slot.initialized = true;
       else if (data.type === 'heartbeat') {
         slot.heartbeat = performance.now();
         if (slot.initialized && this.state === 'starting') {
           this.transition('ready');
-          ready.resolve();
+          session.markReady();
         }
       } else if (data.type === 'failed') fail(new Error(data.error));
       else if (data.type === 'stopped') slot.stopped.resolve();
       else if (data.type === 'result' && data.call === slot.call?.id) {
-        if (data.error) slot.call?.reject(new Error(data.error));
-        else slot.call?.resolve(data.result);
+        if (data.error) session.call?.reject(new Error(data.error));
+        else session.call?.resolve(data.result);
       } else if (data.type === 'log') {
         this.log.event('lookup_plugin_log', {
           plugin: manifest.id,
@@ -351,32 +361,37 @@ export class LookupHost {
       } else if (data.type === 'fetch') {
         const call = slot.call;
         if (!call || data.call !== call.id || this.state !== 'ready') return;
-        void this.network.fetch(slot.authority, data.url, {
-          ...data.init,
-          signal: call.signal,
-        }, call.limits).then(async (response) => {
-          const body = [204, 205, 304].includes(response.status)
-            ? null
-            : await response.arrayBuffer();
-          if (this.slot === slot && slot.call === call) {
-            worker.postMessage({
-              type: 'fetchResult',
-              generation: slot.generation,
-              id: data.id,
-              body,
-              init: { status: response.status, headers: [...response.headers] },
-            });
-          }
-        }).catch((error) => {
-          if (this.slot === slot && slot.call === call) {
-            worker.postMessage({
-              type: 'fetchResult',
-              generation: slot.generation,
-              id: data.id,
-              error: String(error),
-            });
-          }
-        });
+        void this.intake.track(() =>
+          this.network.fetch(slot.authority, data.url, {
+            ...data.init,
+            signal: call.signal,
+          }, call.limits).then(async (response) => {
+            const body = [204, 205, 304].includes(response.status)
+              ? null
+              : await response.arrayBuffer();
+            if (this.slot === slot && slot.call === call) {
+              worker.postMessage({
+                type: 'fetchResult',
+                generation: slot.generation,
+                id: data.id,
+                body,
+                init: {
+                  status: response.status,
+                  headers: [...response.headers],
+                },
+              });
+            }
+          }).catch((error) => {
+            if (this.slot === slot && slot.call === call) {
+              worker.postMessage({
+                type: 'fetchResult',
+                generation: slot.generation,
+                id: data.id,
+                error: String(error),
+              });
+            }
+          })
+        );
       }
     };
     worker.postMessage({
@@ -386,97 +401,120 @@ export class LookupHost {
       capabilities: manifest.capabilities.map((c) => c.id),
       heartbeatMs: this.options.heartbeatMs ?? 1000,
     });
-    return await ready.promise;
+    return await session.ready;
   }
-  async call(
+  call(
     capability: Capability,
     item: unknown,
     limits: { timeoutMs: number; maxBytes: number },
     outer?: AbortSignal,
   ): Promise<LookupResult> {
-    // Bind result admission to the submitted identity before asynchronous work.
-    const targetId = item && typeof item === 'object' && 'id' in item &&
-        typeof item.id === 'string'
-      ? item.id
-      : '';
-    await this.start();
-    const slot = this.slot!;
-    if (slot.call) throw new Error('Lookup intake is full');
-    const controller = new AbortController();
-    const signal = AbortSignal.any([
-      slot.authority.signal,
-      controller.signal,
-      ...(outer ? [outer] : []),
-    ]);
-    const timer = setTimeout(
-      () => controller.abort(new Error('Lookup job timed out')),
-      limits.timeoutMs,
-    );
-    const result = Promise.withResolvers<unknown>();
-    const id = crypto.randomUUID();
-    const abort = () => {
-      if (this.slot === slot && this.state !== 'stopping') {
-        slot.worker.postMessage({
-          type: 'abort',
-          generation: slot.generation,
-          call: id,
-          reason: String(signal.reason),
-        });
-        this.revoke(
-          String(signal.reason),
-          signal.reason instanceof LookupRevoked,
-        );
-      }
-      result.reject(signal.reason);
-    };
-    slot.call = {
-      id,
-      signal,
-      limits,
-      resolve: result.resolve,
-      reject: result.reject,
-    };
-    signal.addEventListener('abort', abort, { once: true });
-    try {
-      signal.throwIfAborted();
-      slot.worker.postMessage({
-        type: 'call',
-        generation: slot.generation,
-        call: id,
-        capability: capability.id,
-        item,
-        settings: this.settings,
-      });
-      const raw = await result.promise;
-      return parseResult(raw, capability, {
-        targetId,
-        maxBytes: limits.maxBytes,
-      });
-    } finally {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', abort);
-      slot.call = undefined;
-      controller.abort();
+    if (!this.enabled) {
+      return Promise.reject(new LookupRevoked('Plugin disabled'));
     }
+    return this.intake.run(async (operation) => {
+      // Bind result admission to the submitted identity before asynchronous work.
+      const targetId = item && typeof item === 'object' && 'id' in item &&
+          typeof item.id === 'string'
+        ? item.id
+        : '';
+      await this.start();
+      if (operation.signal.aborted || !this.enabled) {
+        throw new LookupRevoked('Plugin disabled');
+      }
+      const slot = this.slot!;
+      if (slot.call) throw new Error('Lookup intake is full');
+      const controller = new AbortController();
+      const signal = AbortSignal.any([
+        slot.authority.signal,
+        controller.signal,
+        operation.signal,
+        ...(outer ? [outer] : []),
+      ]);
+      const timer = setTimeout(
+        () => controller.abort(new Error('Lookup job timed out')),
+        limits.timeoutMs,
+      );
+      let id: string;
+      const abort = () => {
+        if (this.slot === slot && this.state !== 'stopping') {
+          slot.worker.postMessage({
+            type: 'abort',
+            generation: slot.generation,
+            call: id,
+            reason: String(signal.reason),
+          });
+          this.revoke(
+            String(signal.reason),
+            signal.reason instanceof LookupRevoked,
+          );
+        }
+        slot.session.call?.reject(signal.reason);
+      };
+      signal.addEventListener('abort', abort, { once: true });
+      try {
+        signal.throwIfAborted();
+        const raw = await slot.session.request((call) => {
+          id = call.id;
+          slot.call = { id, signal, limits };
+          slot.worker.postMessage({
+            type: 'call',
+            generation: slot.generation,
+            call: id,
+            capability: capability.id,
+            item,
+            settings: this.settings,
+          });
+        });
+        return parseResult(raw, capability, {
+          targetId,
+          maxBytes: limits.maxBytes,
+        });
+      } finally {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', abort);
+        slot.call = undefined;
+        controller.abort();
+      }
+    });
   }
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.stopping) return this.stopping;
+    const completion = Promise.withResolvers<void>();
+    this.stopping = completion.promise;
     this.enabled = false;
     this.revision++;
     const slot = this.slot;
-    if (!slot) return;
-    this.transition('stopping');
-    this.controllers.get(slot)?.abort(new LookupRevoked('Plugin stopping'));
-    slot.call?.reject(new LookupRevoked('Plugin stopping'));
-    slot.worker.postMessage({ type: 'stop', generation: slot.generation });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      slot.stopped.promise,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, this.options.stopMs ?? 100);
-      }),
-    ]);
-    clearTimeout(timer);
-    this.revoke('Plugin stopped');
+    if (slot) this.transition('stopping');
+    // Preserve the adapter's typed revocation reason before the scope aborts.
+    if (slot) {
+      this.controllers.get(slot)?.abort(new LookupRevoked('Plugin stopping'));
+    }
+    const joined = this.intake.close();
+    void this.stopOnce(slot, joined).then(
+      completion.resolve,
+      completion.reject,
+    );
+    return this.stopping;
+  }
+  private async stopOnce(
+    slot: Slot | undefined,
+    joined: Promise<void>,
+  ): Promise<void> {
+    if (slot) {
+      slot.session.call?.reject(new LookupRevoked('Plugin stopping'));
+      slot.worker.postMessage({ type: 'stop', generation: slot.generation });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        slot.stopped.promise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, this.options.stopMs ?? 100);
+        }),
+      ]);
+      clearTimeout(timer);
+      this.revoke('Plugin stopped');
+    }
+    await joined;
     this.transition('disabled');
   }
 }

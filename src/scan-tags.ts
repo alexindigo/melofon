@@ -1,5 +1,10 @@
 import type { IAudioMetadata } from 'music-metadata';
 import type { State } from './state.ts';
+import {
+  createWorkerIntake,
+  createWorkerSession,
+  type WorkerSession,
+} from './worker-host.ts';
 
 export interface TagReader extends Disposable {
   read(path: string): Promise<IAudioMetadata>;
@@ -32,91 +37,79 @@ export function declareTagSettings(state: State): void {
 export function createTagReader(
   state: State,
   workerUrl = new URL('./scan-tags-worker.ts', import.meta.url),
-): TagReader {
+): TagReader & { close(): Promise<void> } {
   declareTagSettings(state);
-  let worker: Worker | undefined;
-  let ready: Promise<void> | undefined;
-  const stop = () => {
-    worker?.terminate();
-    worker = undefined;
-    ready = undefined;
-  };
+  const intake = createWorkerIntake('Tag worker');
+  let session: WorkerSession | undefined;
   const start = (startupSeconds: number) => {
-    const created = new Worker(workerUrl, { type: 'module' });
-    worker = created;
-    ready = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        created.onmessage = null;
-        created.onerror = null;
-        reject(
-          new Error(
+    const current = createWorkerSession(
+      new Worker(workerUrl, { type: 'module' }),
+      {
+        startup: {
+          milliseconds: startupSeconds * 1000,
+          error: new Error(
             `Tag worker did not start within ${startupSeconds} seconds`,
           ),
-        );
-      }, startupSeconds * 1000);
-      created.onmessage = (event: MessageEvent<{ ready?: boolean }>) => {
-        if (!event.data?.ready) return;
-        clearTimeout(timer);
-        created.onmessage = null;
-        created.onerror = null;
-        resolve();
-      };
-      created.onerror = (event) => {
-        event.preventDefault();
-        clearTimeout(timer);
-        created.onmessage = null;
-        created.onerror = null;
-        reject(new Error(event.message));
-      };
-    });
-    return ready;
+        },
+        invalidMessage: 'Invalid tag Worker message',
+        onMessage(data, slot) {
+          if (data?.call !== undefined && data.call !== slot.call?.id) return;
+          if (data?.ready) return slot.markReady();
+          if (!slot.call || data?.call !== slot.call.id) return;
+          if (data?.error) return slot.retire(new Error(data.error));
+          slot.call?.resolve(data?.metadata);
+        },
+      },
+    );
+    session = current;
+    return current;
+  };
+  const close = () => {
+    const closing = intake.close();
+    session?.retire(new Error('Tag worker closed'));
+    return closing;
   };
   return {
-    async read(path) {
-      const seconds = await state.getTyped(
-        'scan.tagParseTimeoutSeconds',
-      ) as number;
-      const maxBytes = await state.getTyped('scan.tagParseMaxBytes') as number;
-      const startupSeconds = await state.getTyped(
-        'scan.tagWorkerStartupSeconds',
-      ) as number;
-      try {
-        await (ready ?? start(startupSeconds));
-      } catch (error) {
-        stop();
-        throw error;
-      }
-      const current = worker!;
-      return await new Promise<IAudioMetadata>((resolve, reject) => {
-        const finish = (error?: Error, metadata?: IAudioMetadata) => {
-          clearTimeout(timer);
-          current.onmessage = null;
-          current.onerror = null;
-          if (error) {
-            stop();
-            reject(error);
-          } else resolve(metadata!);
-        };
-        const timer = setTimeout(
-          () => finish(new Error(`Tag parse exceeded ${seconds} seconds`)),
-          seconds * 1000,
-        );
-        current.onmessage = (
-          event: MessageEvent<
-            { ready?: boolean; error?: string; metadata?: IAudioMetadata }
-          >,
-        ) => {
-          if (event.data.ready) return;
-          if (event.data.error) finish(new Error(event.data.error));
-          else finish(undefined, event.data.metadata);
-        };
-        current.onerror = (event) => {
-          event.preventDefault();
-          finish(new Error(event.message));
-        };
-        current.postMessage({ path, maxBytes });
+    read(path) {
+      return intake.run(async ({ signal }) => {
+        let current: WorkerSession | undefined;
+        const abort = () => current?.retire(new Error('Tag worker closed'));
+        signal.addEventListener('abort', abort, { once: true });
+        try {
+          const seconds = await state.getTyped(
+            'scan.tagParseTimeoutSeconds',
+          ) as number;
+          const maxBytes = await state.getTyped(
+            'scan.tagParseMaxBytes',
+          ) as number;
+          const startupSeconds = await state.getTyped(
+            'scan.tagWorkerStartupSeconds',
+          ) as number;
+          if (signal.aborted) throw new Error('Tag worker closed');
+          current = session && !session.retired
+            ? session
+            : start(startupSeconds);
+          await current.ready;
+          if (signal.aborted) throw new Error('Tag worker closed');
+          return await current.request<IAudioMetadata>(
+            (call) =>
+              current!.worker.postMessage({ path, maxBytes, call: call.id }),
+            {
+              milliseconds: seconds * 1000,
+              error: new Error(`Tag parse exceeded ${seconds} seconds`),
+            },
+          );
+        } catch (error) {
+          current?.retire(new Error(String(error)));
+          throw error;
+        } finally {
+          signal.removeEventListener('abort', abort);
+        }
       });
     },
-    [Symbol.dispose]: stop,
+    close,
+    [Symbol.dispose]() {
+      void close();
+    },
   };
 }

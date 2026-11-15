@@ -1,5 +1,10 @@
 import type { State } from '../state.ts';
 import type { ArtworkPreview } from '../store/artwork.ts';
+import {
+  createWorkerIntake,
+  createWorkerSession,
+  type WorkerSession,
+} from '../worker-host.ts';
 
 /** One reusable sequential Worker; overlapping calls reject as busy.
  * Both startup and computation are bounded; retirement rejects the current call
@@ -22,126 +27,94 @@ export function createArtworkFactsHost(
       default: value,
     });
   }
-  let worker: Worker | undefined;
-  let ready: Promise<void> | undefined;
-  let rejectPending: ((error: Error) => void) | undefined;
-  let inFlight = false;
-  let closed = false;
-  function retire(error: Error) {
-    const reject = rejectPending;
-    rejectPending = undefined;
-    worker?.terminate();
-    worker = undefined;
-    ready = undefined;
-    reject?.(error);
-  }
+  const intake = createWorkerIntake('Artwork Worker');
+  let session: WorkerSession | undefined;
   function start(seconds: number) {
-    const current = new Worker(
+    const worker = new Worker(
       new URL('./facts-bootstrap.ts', import.meta.url),
       {
         type: 'module',
       },
     );
-    worker = current;
-    // Failure ownership outlives each startup/computation message handler,
-    // including asynchronous failures while the reusable Worker is idle.
-    current.addEventListener('message', (event) => {
-      if (event.data?.error) {
-        event.stopImmediatePropagation();
-        retire(new Error(event.data.error));
-      }
+    let initialized = false;
+    const current = createWorkerSession(worker, {
+      startup: {
+        milliseconds: seconds * 1000,
+        error: new Error('Artwork Worker startup timed out'),
+      },
+      invalidMessage: 'Invalid artwork Worker message',
+      onMessage(data, slot) {
+        if (data?.call !== undefined && data.call !== slot.call?.id) return;
+        if (data?.error) return slot.retire(new Error(data.error));
+        if (!initialized) {
+          if (data?.ready !== true) {
+            return slot.retire(new Error('Invalid artwork Worker startup'));
+          }
+          initialized = true;
+          return slot.markReady();
+        }
+        if (!slot.call || data?.call !== slot.call.id) return;
+        if (data?.started === true) {
+          onComputing?.();
+          return;
+        }
+        const value = data?.value;
+        if (
+          typeof value?.thumbHash !== 'string' ||
+          !/^[A-Za-z0-9+/]+={0,2}$/.test(value.thumbHash) ||
+          !(value.dominantColor === null ||
+            typeof value.dominantColor === 'string' &&
+              /^#[a-f0-9]{6}$/.test(value.dominantColor))
+        ) return slot.retire(new Error('Invalid artwork Worker result'));
+        slot.call.resolve(value);
+      },
     });
-    ready = new Promise<void>((resolve, reject) => {
-      const finish = (error?: Error) => {
-        clearTimeout(timer);
-        rejectPending = undefined;
-        current.onmessage = null;
-        if (error) reject(error);
-        else resolve();
-      };
-      const timer = setTimeout(
-        () => retire(new Error('Artwork Worker startup timed out')),
-        seconds * 1000,
-      );
-      rejectPending = finish;
-      current.onerror = (event) => {
-        event.preventDefault();
-        retire(new Error(event.message));
-      };
-      current.onmessageerror = () =>
-        retire(new Error('Invalid artwork Worker message'));
-      current.onmessage = ({ data }) => {
-        if (data?.ready === true) finish();
-        else retire(new Error('Invalid artwork Worker startup'));
-      };
-      current.postMessage({ module: workerUrl.href });
-    });
-    return ready;
+    session = current;
+    try {
+      worker.postMessage({ module: workerUrl.href });
+    } catch (error) {
+      current.retire(new Error(String(error)));
+    }
+    return current;
   }
   return {
-    async compute(
+    compute(
       pixels: { width: number; height: number; rgba: Uint8Array },
     ): Promise<ArtworkPreview> {
-      if (closed) throw new Error('Artwork Worker closed');
-      if (inFlight) throw new Error('Artwork Worker busy');
-      inFlight = true;
-      try {
-        const startup = Number(
-          await state.getTyped('artwork.facts.startupSeconds'),
-        );
-        const seconds = Number(
-          await state.getTyped('artwork.facts.computeSeconds'),
-        );
-        if (closed) throw new Error('Artwork Worker closed');
-        await (ready ?? start(startup));
-        if (closed || !worker) throw new Error('Artwork Worker closed');
-        const current = worker;
-        return await new Promise<ArtworkPreview>((resolve, reject) => {
-          const finish = (error?: Error, value?: ArtworkPreview) => {
-            clearTimeout(timer);
-            current.onmessage = null;
-            rejectPending = undefined;
-            if (error) reject(error);
-            else resolve(value!);
-          };
-          const timer = setTimeout(
-            () => retire(new Error('Artwork computation timed out')),
-            seconds * 1000,
+      return intake.run(async ({ signal }) => {
+        let current: WorkerSession | undefined;
+        const abort = () => current?.retire(new Error('Artwork Worker closed'));
+        signal.addEventListener('abort', abort, { once: true });
+        try {
+          const startup = Number(
+            await state.getTyped('artwork.facts.startupSeconds'),
           );
-          rejectPending = finish;
-          current.onmessage = ({ data }) => {
-            if (data?.started === true) {
-              onComputing?.();
-              return;
-            }
-            const value = data?.value;
-            if (
-              typeof value?.thumbHash !== 'string' ||
-              !/^[A-Za-z0-9+/]+={0,2}$/.test(value.thumbHash) ||
-              !(value.dominantColor === null ||
-                typeof value.dominantColor === 'string' &&
-                  /^#[a-f0-9]{6}$/.test(value.dominantColor))
-            ) {
-              return retire(new Error('Invalid artwork Worker result'));
-            }
-            finish(undefined, value);
-          };
-          try {
-            current.postMessage(pixels);
-          } catch (error) {
-            retire(new Error(String(error)));
-          }
-        });
-      } catch (error) {
-        retire(new Error(String(error)));
-        throw error;
-      } finally {
-        inFlight = false;
-      }
+          const seconds = Number(
+            await state.getTyped('artwork.facts.computeSeconds'),
+          );
+          if (signal.aborted) throw new Error('Artwork Worker closed');
+          current = session && !session.retired ? session : start(startup);
+          await current.ready;
+          if (signal.aborted) throw new Error('Artwork Worker closed');
+          return await current.request<ArtworkPreview>(
+            (call) => current!.worker.postMessage({ ...pixels, call: call.id }),
+            {
+              milliseconds: seconds * 1000,
+              error: new Error('Artwork computation timed out'),
+            },
+          );
+        } catch (error) {
+          current?.retire(new Error(String(error)));
+          throw error;
+        } finally {
+          signal.removeEventListener('abort', abort);
+        }
+      });
     },
     close() {
-      closed = true;
-      retire(new Error('Artwork Worker closed'));
+      const closing = intake.close();
+      session?.retire(new Error('Artwork Worker closed'));
+      return closing;
     },
   };
 }

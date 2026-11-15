@@ -8,10 +8,12 @@ addEventListener('message', (event) => {
     width: number;
     height: number;
     rgba: Uint8Array;
+    call: string;
   }>;
   try {
-    postMessage({ started: true });
+    postMessage({ started: true, call: data.call });
     postMessage({
+      call: data.call,
       value: {
         thumbHash: encodeBase64(
           rgbaToThumbHash(data.width, data.height, data.rgba),
@@ -20,7 +22,7 @@ addEventListener('message', (event) => {
       },
     });
   } catch (error) {
-    postMessage({ error: String(error) });
+    postMessage({ error: String(error), call: data.call });
   }
 });
 postMessage({ ready: true });

@@ -16,7 +16,7 @@ for (
       'fixture async error',
     ],
     [
-      'postMessage({ready:true}); onmessage = () => postMessage({value:{thumbHash:42}});',
+      'postMessage({ready:true}); onmessage = ({data}) => postMessage({value:{thumbHash:42},call:data.call});',
       'Invalid artwork Worker result',
     ],
   ]
