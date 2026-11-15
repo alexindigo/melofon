@@ -457,7 +457,8 @@ export function createAirplayBoot(
         signal.removeEventListener('abort', abort);
         if (resuming.get(id) === work) resuming.delete(id);
         if (
-          retry && command.isCurrent() && intentEpoch === demand &&
+          // Retirement cancels this attempt, not the unchanged playback demand.
+          retry && intentEpoch === demand &&
           epoch(id).generation === generation
         ) scheduleRetry(id);
         reconcile();

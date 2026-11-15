@@ -1693,40 +1693,57 @@ export function createPlayback(deps: {
           if (!pendingStart) return advanceFailedSource();
           return;
         }
-        const view = player.status();
         if (pendingStart || !player.canAdvanceEnded()) return;
-        const items = player.queue().items;
-        const current = items.findIndex((e) => e.id === view.current?.id);
-        const index = view.repeat === 'single'
-          ? current
-          : view.repeat === 'all'
-          ? (current + 1) % items.length
-          : view.consume
-          ? current
-          : current + 1;
-        const future = view.consume && view.repeat === 'off'
-          ? items.filter((_, i) => i !== current)
-          : items;
-        const commit = (activate: () => void) => {
-          if (player.status().generation !== view.generation) return;
-          const result = player.advanceEnded();
-          if (result === 'none') return;
-          failedSources.clear();
-          activate();
-          if (result === 'player+queue') flushQueue();
-          else flushState();
-          emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+        const command = submitCommand();
+        const advance = (): void | Promise<void> => {
+          const view = player.status();
+          const queue = player.queue();
+          const items = queue.items;
+          const current = items.findIndex((e) => e.id === view.current?.id);
+          const index = view.repeat === 'single'
+            ? current
+            : view.repeat === 'all'
+            ? (current + 1) % items.length
+            : view.consume
+            ? current
+            : current + 1;
+          const future = view.consume && view.repeat === 'off'
+            ? items.filter((_, i) => i !== current)
+            : items;
+          let replan = false;
+          const commit = (activate: () => void) => {
+            if (player.status().generation !== view.generation) return;
+            // FIFO additions can create a destination while targets are preparing.
+            // Never let the engine advance to an occurrence absent from this plan.
+            if (player.queue().version !== queue.version) {
+              replan = true;
+              return;
+            }
+            const result = player.advanceEnded();
+            if (result === 'none') return;
+            failedSources.clear();
+            activate();
+            if (result === 'player+queue') flushQueue();
+            else flushState();
+            emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+          };
+          return Promise.resolve(
+            transition(
+              true,
+              commit,
+              undefined,
+              existingActivation(future, index, {
+                wrap: view.repeat !== 'off',
+              }),
+              command,
+            ),
+          ).then(() => {
+            if (replan && command.isCurrent() && !operations.closed) {
+              return advance();
+            }
+          });
         };
-        return Promise.resolve(
-          transition(
-            true,
-            commit,
-            undefined,
-            existingActivation(future, index, {
-              wrap: view.repeat !== 'off',
-            }),
-          ),
-        ).catch((error) => {
+        return Promise.resolve(advance()).catch((error) => {
           // Internal transitions have no HTTP caller. Keep the bookmark/queue and
           // publish a paused clock; an explicit newer command always wins.
           if (

@@ -322,6 +322,75 @@ for (const mutation of ['insert', 'move'] as const) {
   });
 }
 
+for (const outcome of ['changed', 'missing'] as const) {
+  Deno.test(`natural end resolves an appended ${outcome} station before advancing`, async () => {
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    let holding = false, time = 0;
+    const resolved: string[] = [];
+    const player = createPlayer({ monotonicNow: () => time });
+    const finite = media('finite');
+    if (finite.facts.kind === 'web') {
+      finite.facts.mode = 'finite';
+      finite.facts.durationMs = 1000;
+    }
+    const [first] = player.queueAddSources([finite]);
+    const playback = createPlayback({
+      player,
+      cfg: {},
+      library: { getSong: () => Promise.resolve(null) },
+      nowPlaying: {} as NowPlaying,
+      targets: {
+        hasPlaybackTarget: () => true,
+        async preparePlayback() {
+          if (!holding) return;
+          entered.resolve();
+          await release.promise;
+        },
+      },
+      resolveQueueReference(reference) {
+        assert(reference.kind === 'station');
+        resolved.push(reference.id);
+        return Promise.resolve(
+          reference.id === 'appended'
+            ? outcome === 'missing' ? null : media('fresh')
+            : finite,
+        );
+      },
+    });
+    let advancing: void | Promise<void>;
+    try {
+      await playback.play();
+      time = 1500;
+      holding = true;
+      advancing = playback.advanceEnded();
+      await entered.promise;
+      const [appended] = await playback.queueAddSources([media('appended')]);
+      release.resolve();
+      await advancing;
+      assert(
+        resolved.includes('appended'),
+        'new destination must be resolved before publication',
+      );
+      assertEquals(playback.queueView().items[0].id, first.id);
+      if (outcome === 'changed') {
+        assertEquals(playback.playerView().current?.id, appended.id);
+        assertEquals(
+          playback.playerView().current?.facts,
+          media('fresh').facts,
+        );
+        assertEquals(playback.playerView().state, 'play');
+      } else {
+        assertEquals(playback.playerView().state, 'stop');
+      }
+    } finally {
+      release.resolve();
+      await advancing!;
+      await playback.close();
+    }
+  });
+}
+
 Deno.test('prepared new media selects its newly minted occurrence when an earlier candidate is missing', async () => {
   const f = fixture({
     resolveQueueReference: (reference) =>
