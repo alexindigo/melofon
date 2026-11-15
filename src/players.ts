@@ -544,8 +544,7 @@ export async function createPlayers(deps: {
             'Cannot delete the default player',
           );
         }
-        await deps.persistence.drain();
-        await deps.store.players.delete(id);
+        await deps.persistence.deletePlayer(id);
         engine.persistence.retire();
         try {
           await releaseOrThrow(releases, 'Player disposal failed', undefined, [

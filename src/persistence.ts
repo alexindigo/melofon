@@ -41,6 +41,8 @@ export interface Persistence extends PlayerPersistence, OutputPersistence {
   loadPlayerState(): Promise<PersistedPlayerState | null>;
   /** Engine ports share the household write tail, never the output cache. */
   forPlayer(playerId: number): EnginePersistence;
+  /** Order durability-first deletion with every ordinary and captured save. */
+  deletePlayer(playerId: number): Promise<void>;
   /** Compatibility facade for existing captured-publication callers. */
   changeMemberships<T>(change: () => T): Promise<T>;
   /** Compatibility facade; new consumers use publishedCommands. */
@@ -184,6 +186,25 @@ export function createPersistence(
     return { attempted: tail, saved: receipt.promise };
   };
   const outputCache = new Map<string, PersistedOutput>();
+  // Changed only on the household tail. Successful deletion obsoletes player
+  // snapshots and membership references, not the rest of a published batch.
+  const deletedPlayers = new Set<number>();
+  const survivingOutput = <
+    T extends { playerId?: number | null; linked?: boolean },
+  >(row: T): T =>
+    row.playerId != null && deletedPlayers.has(row.playerId)
+      ? { ...row, playerId: null, linked: true }
+      : row;
+  const saveChanges = (changes: {
+    players: PlayerSave[];
+    outputs: AdoptedSpeakerSnapshot[];
+  }) =>
+    store.players.saveChanges({
+      players: changes.players.filter((row) =>
+        !deletedPlayers.has(row.playerId)
+      ),
+      outputs: changes.outputs.map(survivingOutput),
+    });
   const outputRevisions = new Map<string, number>();
   const ignored = new Set<string>();
   let publication: {
@@ -213,7 +234,7 @@ export function createPersistence(
     let retired = false;
     const save = (write: () => Promise<void>, target: string) =>
       enqueue(async () => {
-        if (retired) return;
+        if (retired || deletedPlayers.has(playerId)) return;
         try {
           await write();
         } catch (error) {
@@ -297,7 +318,7 @@ export function createPersistence(
         outputs: [...batch.outputs.values()],
       });
       const save = enqueue(
-        () => store.players.saveChanges(changes),
+        () => saveChanges(changes),
         `players:${changes.players.map(playerTarget).join(',')} speakers:${
           changes.outputs.map((row) => row.id).join(',')
         }`,
@@ -311,6 +332,21 @@ export function createPersistence(
     await publishedCommands.publish(change).command;
   return {
     forPlayer,
+    async deletePlayer(playerId) {
+      requireOpen();
+      const write = tail.then(async () => {
+        await retryWrites();
+        deletedPlayers.add(playerId);
+        try {
+          await store.players.delete(playerId);
+        } catch (error) {
+          deletedPlayers.delete(playerId);
+          throw error;
+        }
+      });
+      observe(write);
+      await write;
+    },
     publishedCommands,
     changeMemberships: changePlayers,
     changePlayers,
@@ -337,7 +373,10 @@ export function createPersistence(
         publication.outputs.set(row.id, { ...row, connectionStrategy });
       } else {
         enqueue(
-          () => store.playback.saveOutput({ ...row, connectionStrategy }),
+          () =>
+            store.playback.saveOutput(
+              survivingOutput({ ...row, connectionStrategy }),
+            ),
           `speaker:${row.id}:preferences`,
         );
       }
@@ -353,9 +392,10 @@ export function createPersistence(
       const save = async (
         records: Parameters<Store['speakers']['saveAdopted']>[1],
       ) => {
-        await store.speakers.saveAdopted(saved, records);
+        const current = survivingOutput(saved);
+        await store.speakers.saveAdopted(current, records);
         if (outputRevisions.get(row.id) === revision) {
-          outputCache.set(row.id, saved);
+          outputCache.set(row.id, current);
           ignored.delete(row.id);
         }
       };

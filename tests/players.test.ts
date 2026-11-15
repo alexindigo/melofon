@@ -1219,6 +1219,91 @@ Deno.test('queue writes concurrent with durable player deletion cannot poison ho
   }
 });
 
+for (const result of ['committed', 'refused'] as const) {
+  Deno.test(`captured volume during ${result} player deletion cannot block household saves`, async () => {
+    const dir = await dataDir(), store = await openStore(dir);
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    const f = await household({
+      ...store,
+      players: {
+        ...store.players,
+        async delete(id) {
+          if (result === 'committed') await store.players.delete(id);
+          entered.resolve();
+          await release.promise;
+          if (result === 'refused') throw new Error('delete refused');
+        },
+      },
+    });
+    let pending: Promise<unknown> | undefined;
+    try {
+      const kitchen = await f.players.create('Kitchen');
+      const engine = f.players.get(kitchen.id);
+      registerSpeaker(f, 'delete-volume');
+      await f.outputs.adopt('delete-volume');
+      await f.players.join(kitchen.id, 'delete-volume');
+      pending = f.players.delete(kitchen.id).then(() => null, (error) => error);
+      await entered.promise;
+      const volume = engine.setVolume({ volume: 67 });
+      const homeVolume = f.players.get(1).setVolume({ volume: 73 });
+      // Ordinary snapshots share the same deletion boundary as captured batches.
+      engine.setRepeat('all');
+      f.outputs.update('delete-volume', { volume: 58 });
+      assertEquals(
+        engine.playerView().volume,
+        67,
+        'publication remains synchronous',
+      );
+      release.resolve();
+      const error = await pending;
+      await Promise.all([volume, homeVolume]);
+      if (result === 'refused') {
+        assert(error instanceof Error);
+        assertEquals(error.message, 'delete refused');
+        assertEquals(f.players.get(kitchen.id), engine);
+      } else {
+        assertEquals(error, null);
+        assertThrows(() => f.players.get(kitchen.id), PlayerError, 'not found');
+      }
+      await f.persistence.drain();
+      assertEquals(f.persistence.health(), { pendingWrites: 0 });
+      const rows = await store.players.list();
+      assertEquals(rows.find((row) => row.id === 1)?.volume, 73);
+      assertEquals(
+        rows.find((row) => row.id === kitchen.id)?.volume,
+        result === 'refused' ? 67 : undefined,
+      );
+      assertEquals((await store.speakers.loadAdopted())[0].volume, 58);
+      if (result === 'refused') {
+        assertEquals(
+          (await store.playback.loadPlayerState(kitchen.id))?.repeat,
+          'all',
+        );
+      } else {
+        assertEquals(
+          await rawSql(store).all(
+            `SELECT * FROM player_state WHERE player_id = ${kitchen.id}`,
+          ),
+          [],
+        );
+      }
+      assertEquals(
+        (await store.speakers.loadMemberships())[0].playerId,
+        result === 'refused' ? kitchen.id : null,
+      );
+    } finally {
+      release.resolve();
+      await pending;
+      await f.players.close().catch(() => {});
+      await f.reports.close();
+      await f.persistence.close().catch(() => {});
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
+
 Deno.test('published player deletion releases runtime membership despite another player save failing during disposal', async () => {
   const dir = await dataDir();
   const store = await openStore(dir);
