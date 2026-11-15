@@ -7,7 +7,7 @@ import {
 } from './worker-host.ts';
 
 export interface TagReader extends Disposable {
-  read(path: string): Promise<IAudioMetadata>;
+  read(path: string, signal?: AbortSignal): Promise<IAudioMetadata>;
 }
 
 export function declareTagSettings(state: State): void {
@@ -70,12 +70,14 @@ export function createTagReader(
     return closing;
   };
   return {
-    read(path) {
-      return intake.run(async ({ signal }) => {
+    read(path, outer) {
+      return intake.run(async ({ signal: owned }) => {
+        const signal = outer ? AbortSignal.any([owned, outer]) : owned;
         let current: WorkerSession | undefined;
         const abort = () => current?.retire(new Error('Tag worker closed'));
         signal.addEventListener('abort', abort, { once: true });
         try {
+          if (signal.aborted) throw new Error('Tag worker closed');
           const seconds = await state.getTyped(
             'scan.tagParseTimeoutSeconds',
           ) as number;

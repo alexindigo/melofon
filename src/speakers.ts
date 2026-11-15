@@ -305,6 +305,14 @@ export function createSpeakers(deps: {
         );
       }
       const controller = new AbortController();
+      const valid = (row: Output) => {
+        const current = deps.outputs.get(row.id);
+        return authority.get(row.id)!() && current !== null &&
+          outputPlayerId(current) === playerId && eligible(row.id) &&
+          JSON.stringify([current.type, current.host, current.port]) ===
+            JSON.stringify([row.type, row.host, row.port]);
+      };
+      let winner: Output | undefined;
       const attempts = createOperationScope('Speaker preflight');
       const cancel = () => controller.abort();
       signal.addEventListener('abort', cancel, { once: true });
@@ -319,11 +327,15 @@ export function createSpeakers(deps: {
         const seconds = deps.state
           ? await deps.state.getTyped('speakers.preparationSeconds') as number
           : 5;
-        const aborted = new Promise<boolean>((resolve) => {
-          controller.signal.addEventListener('abort', () => resolve(false), {
-            once: true,
-          });
-          if (controller.signal.aborted) resolve(false);
+        const aborted = new Promise<undefined>((resolve) => {
+          controller.signal.addEventListener(
+            'abort',
+            () => resolve(undefined),
+            {
+              once: true,
+            },
+          );
+          if (controller.signal.aborted) resolve(undefined);
         });
         timer = setTimeout(cancel, seconds * 1000);
         // One ready peer suffices. Slower/failed peers remain independently visible
@@ -331,32 +343,24 @@ export function createSpeakers(deps: {
         const prepared = Promise.any(
           candidates.map((row) =>
             attempts.run(async ({ signal: owned }) => {
-              const key = JSON.stringify([row.type, row.host, row.port]);
               const ok = connected(row.id) ||
                 await deps.prepare?.(
                   row.id,
                   AbortSignal.any([owned, controller.signal]),
                 );
-              const current = deps.outputs.get(row.id);
-              if (
-                !ok || !authority.get(row.id)!() || !current ||
-                outputPlayerId(current) !== playerId ||
-                !eligible(row.id) ||
-                JSON.stringify([current.type, current.host, current.port]) !==
-                  key
-              ) throw new Error('unavailable');
-              return true;
+              if (!ok || !valid(row)) throw new Error('unavailable');
+              return row;
             })
           ),
-        ).catch(() => false);
-        const ok = await Promise.race([prepared, aborted]);
+        ).catch(() => undefined);
+        winner = await Promise.race([prepared, aborted]);
         if (signal.aborted) {
           throw new PlaybackError(
             'playback_cancelled',
             'Playback start cancelled',
           );
         }
-        if (!ok) {
+        if (!winner) {
           throw new PlaybackError(
             'target_unavailable',
             'Selected speakers could not be prepared',
@@ -373,6 +377,12 @@ export function createSpeakers(deps: {
         throw new PlaybackError(
           'playback_cancelled',
           'Playback start cancelled',
+        );
+      }
+      if (!winner || !valid(winner)) {
+        throw new PlaybackError(
+          'target_unavailable',
+          'Selected speakers could not be prepared',
         );
       }
     },

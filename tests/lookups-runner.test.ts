@@ -1,4 +1,9 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import { openStore, type Store } from '../src/store/index.ts';
 import { rawSql } from '../src/store/testing.ts';
 import { createState, type State } from '../src/state.ts';
@@ -222,7 +227,7 @@ Deno.test('runner concurrent close shares settlement through host cleanup', asyn
     };
     const closing = runner.close();
     try {
-      assertEquals(runner.close(), closing);
+      assertStrictEquals(runner.close(), closing);
       await entered.promise;
       assertEquals(host.state === 'disabled', false);
       release.resolve();
