@@ -86,6 +86,65 @@ async function household(
   };
 }
 
+Deno.test('registry startup rollback joins all engines after a sibling release fails', async () => {
+  const dir = await dataDir();
+  const store = await openStore(dir);
+  const second = await store.players.create('Second');
+  const third = await store.players.create('Third');
+  let finish!: () => void;
+  const held = new Promise<void>((resolve) => finish = resolve);
+  let entered!: () => void;
+  const disposing = new Promise<void>((resolve) => entered = resolve);
+  let siblingReleased = false;
+  let settled = false;
+  const starting = household(store, {
+    createBoot(id, playback) {
+      const close = playback.close;
+      if (id === 1) {
+        playback.close = async () => {
+          await close();
+          throw new Error('first engine release failed');
+        };
+      }
+      if (id === second.id) {
+        playback.close = async () => {
+          entered();
+          await held;
+          await close();
+          siblingReleased = true;
+        };
+      }
+      if (id === third.id) throw new Error('boot startup failed');
+      return {
+        close: () => Promise.resolve(),
+        retry: () => Promise.resolve(),
+        changeCredentials: (_id, save) => save(),
+        pair: () => Promise.resolve({ state: 'complete', saved: false }),
+        submitPin: () => Promise.resolve({ state: 'complete', saved: false }),
+      };
+    },
+  }).finally(() => settled = true);
+  const rejected = assertRejects(
+    () => starting,
+    AggregateError,
+    'Player startup rollback failed',
+  );
+  try {
+    await disposing;
+    // Let the failing sibling finish before checking the held engine is joined.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assertEquals(settled, false);
+    finish();
+    await rejected;
+    assertEquals(siblingReleased, true);
+  } finally {
+    finish();
+    await starting.catch(() => {});
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('saved player sliders move only linked members by a capped delta and zero silences them', async () => {
   const dir = await dataDir();
   let store = await openStore(dir);

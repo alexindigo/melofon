@@ -5,6 +5,7 @@ import type { PortMapping } from './binds.ts';
 import { facade } from './facade.ts';
 import { type Log, scopedLog } from './logging.ts';
 import type { PublicAddress } from './public-address.ts';
+import { createReleaseSet, releaseOrThrow } from './releases.ts';
 
 export interface ListenManager {
   list(): ListenView[];
@@ -31,9 +32,12 @@ export function createListenManager(opts: {
   publicAddress?: PublicAddress;
 }): ListenManager {
   const servers = new Map<number, Deno.HttpServer<Deno.NetAddr>>();
+  const retiring = new Set<number>();
+  const releases = createReleaseSet();
   const log = opts.log ?? scopedLog('server');
   let closed = false;
   let tail: Promise<unknown> = Promise.resolve();
+  let closing: Promise<void> | undefined;
   function serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = tail.then(fn);
     tail = result.catch(() => {});
@@ -52,12 +56,17 @@ export function createListenManager(opts: {
         ).map((layer) => layer.name),
       })),
     ensure(ports) {
+      if (closed) return Promise.reject(new Error('Listens are closed'));
       return serial(async () => {
-        if (closed) throw new Error('Listens are closed');
         const opened: number[] = [];
         try {
           for (const port of new Set(ports)) {
-            if (servers.has(port)) continue;
+            if (servers.has(port)) {
+              if (retiring.has(port)) {
+                throw new Error(`Listen ${port} still awaits release`);
+              }
+              continue;
+            }
             const kind = port === opts.defaultPort ? 'default' : 'extra';
             const server = Deno.serve(
               {
@@ -81,6 +90,12 @@ export function createListenManager(opts: {
               }),
             );
             servers.set(port, server);
+            releases.add(String(port), async () => {
+              retiring.add(port);
+              await server.shutdown();
+              servers.delete(port);
+              retiring.delete(port);
+            });
             opened.push(port);
             void server.finished.then(
               () => log.event('server_finished', { port }),
@@ -89,22 +104,21 @@ export function createListenManager(opts: {
           }
         } catch (error) {
           // Multi-port activation is all-or-nothing. Never close shared sockets.
-          await Promise.all(opened.map(async (port) => {
-            const server = servers.get(port)!;
-            servers.delete(port);
-            await server.shutdown();
-          }));
-          throw error;
+          await releaseOrThrow(
+            releases,
+            'Listen activation rollback failed',
+            { error },
+            opened.map(String),
+          );
         }
       });
     },
     shutdown() {
-      return serial(async () => {
-        closed = true;
-        await Promise.all(
-          [...servers.values()].map((server) => server.shutdown()),
-        );
-        servers.clear();
+      closed = true;
+      return closing ??= serial(async () => {
+        await releaseOrThrow(releases, 'Listen shutdown failed');
+      }).finally(() => {
+        closing = undefined;
       });
     },
   };

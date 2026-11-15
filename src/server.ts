@@ -68,32 +68,55 @@ import { createSetup } from './setup.ts';
 import { createTermination } from './restart.ts';
 import type { Log } from './logging.ts';
 import { acquireHeartbeat } from './heartbeat.ts';
+import {
+  createReleaseSet,
+  releaseOrThrow,
+  type ReleaseSet,
+} from './releases.ts';
 
 interface ServerOptions {
   env?: Record<string, string>;
   exit?: (code: number) => void;
   setupLog?: Log;
   openStore?: typeof openStore;
+  /** Test fault boundary, after ownership is registered, before the next await. */
+  acquired?: (name: string) => void;
 }
 
 export async function startServer(options: ServerOptions = {}) {
   const heartbeat = acquireHeartbeat();
+  const releases = createReleaseSet();
+  releases.add('heartbeat', () => heartbeat[Symbol.dispose](), 100);
   try {
     return await startServerRuntime({
       ...options,
-      exit(code) {
-        heartbeat[Symbol.dispose]();
-        (options.exit ?? Deno.exit)(code);
-      },
-    });
+    }, releases);
   } catch (error) {
-    heartbeat[Symbol.dispose]();
+    await releaseOrThrow(releases, 'Server startup rollback failed', { error });
     throw error;
   }
 }
 
-async function startServerRuntime(options: ServerOptions) {
+async function startServerRuntime(
+  options: ServerOptions,
+  releases: ReleaseSet,
+) {
   const log = scopedLog('server');
+  const own = (
+    name: string,
+    release: () => void | Promise<void>,
+    phase: number,
+  ) => {
+    releases.add(name, release, phase);
+    options.acquired?.(name);
+  };
+  // Registered children supply the same dependency-ordered rollback and close.
+  // Intake ends before producers; all producers settle before persistence/store.
+  const termination = createTermination({
+    exit: options.exit,
+    close: () =>
+      releaseOrThrow(releases, 'Server shutdown failed').then(() => {}),
+  });
 
   const env = options.env ?? Deno.env.toObject();
   const cfg = loadConfig((name) => env[name]);
@@ -101,6 +124,7 @@ async function startServerRuntime(options: ServerOptions) {
   const store = await (options.openStore ?? openStore)(cfg.dataDir, {
     debugLogQueries: cfg.debugLogRequests,
   });
+  own('store', () => store.close(), 90);
   const credentials = createSpeakerCredentials({
     store: store.speakers,
     secrets: createSecrets(cfg.secret),
@@ -118,11 +142,13 @@ async function startServerRuntime(options: ServerOptions) {
   const notify = createNotify();
   const state = createState(store, undefined, notify);
   const persistence = createPersistence(store, undefined, credentials, state);
+  own('persistence', () => persistence.close(), 70);
   const publicAddress = createPublicAddress(state);
   if (env.MELOFON_BASE_URL !== undefined) {
     await state.seedIfUnset('server.baseUrl', env.MELOFON_BASE_URL);
   }
   const stopLoggingSettings = await configureLogging(state);
+  own('logging settings', stopLoggingSettings, 80);
   const authentication = createAuthentication(
     store,
     cfg,
@@ -166,6 +192,7 @@ async function startServerRuntime(options: ServerOptions) {
     dataDir: cfg.dataDir,
     notify,
   });
+  own('podcasts', () => podcasts.close(), 10);
   const lookups = await createLookupRunner({
     store,
     state,
@@ -173,6 +200,7 @@ async function startServerRuntime(options: ServerOptions) {
     notify,
     network,
   });
+  own('lookups', () => lookups.close(), 10);
   const counts = await scan.run();
   log.event('scan_complete', counts);
   const mapping = createPortMapping(env);
@@ -200,12 +228,15 @@ async function startServerRuntime(options: ServerOptions) {
     },
     changed: () => notify.emit(['outputs'], undefined, 'all'),
   });
+  own('output admission', () => outputAdmission.close(), 30);
   const airplay = createAirplayDevices({
     outputs,
     credentials,
     admission: outputAdmission,
     changed: () => notify.emit(['outputs'], undefined, 'all'),
   });
+  own('airplay devices', () => airplay.close(), 30);
+  own('native logging', shutdownNativeLogging, 50);
   const library = createLibrary(store, lyrics, {
     dataDir: cfg.dataDir,
     media,
@@ -238,6 +269,7 @@ async function startServerRuntime(options: ServerOptions) {
     notify,
     serverRows: () => players.serverRows(),
   });
+  own('reports', () => reports.close(), 20);
 
   // Restart transparency (plan restart-transparency): restore the engine —
   // the persisted queue rehydrated via the library (missing tracks drop with
@@ -305,6 +337,7 @@ async function startServerRuntime(options: ServerOptions) {
     devices: airplay,
     savedOutput: (id) => persistence.savedOutput(id),
   });
+  own('discovery', () => discovery.close(), 10);
   const players = await createPlayers({
     store,
     persistence,
@@ -343,6 +376,7 @@ async function startServerRuntime(options: ServerOptions) {
         capacity,
       }),
   });
+  own('players', () => players.close(), 10);
   const playback = players.playback;
   const app = {
     store,
@@ -376,6 +410,7 @@ async function startServerRuntime(options: ServerOptions) {
     state,
     notify,
   });
+  own('artwork background', () => artworkBackground.close(), 10);
   const settings = createSettings(store, state);
   let hats: Hats | undefined = undefined;
   const bag = {
@@ -457,6 +492,7 @@ async function startServerRuntime(options: ServerOptions) {
     setupMode,
     publicAddress,
   });
+  own('listeners', () => listens.shutdown(), 0);
   hats = await createHats({
     store,
     app: bag,
@@ -471,6 +507,7 @@ async function startServerRuntime(options: ServerOptions) {
     airplay.close();
   };
   addEventListener('unload', onUnload);
+  own('unload handler', () => removeEventListener('unload', onUnload), 0);
 
   await reports.startReportExpiry(state);
 
@@ -492,43 +529,6 @@ async function startServerRuntime(options: ServerOptions) {
     });
   }
 
-  const termination = createTermination({
-    exit: options.exit,
-    close: async () => {
-      removeEventListener('unload', onUnload);
-      for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-        Deno.removeSignalListener(signal, onSignal);
-      }
-      const errors: unknown[] = [];
-      // Preserve dependency order, but a failed release cannot strand the
-      // remaining owners or allow their work to outlive the store connection.
-      for (
-        const release of [
-          stopLoggingSettings,
-          () => lookups.close(),
-          () => podcasts.close(),
-          () => discovery.close(),
-          () => airplay.close(),
-          () => listens.shutdown(),
-          () => artworkBackground.close(),
-          () => players.close(),
-          shutdownNativeLogging,
-          () => reports.close(),
-          () => persistence.close(),
-          () => store.close(),
-        ]
-      ) {
-        try {
-          await release();
-        } catch (error) {
-          errors.push(error);
-        }
-      }
-      if (errors.length) {
-        throw new AggregateError(errors, 'Server shutdown failed');
-      }
-    },
-  });
   const onSignal = () => {
     void termination.shutdown().catch(async (error) => {
       log.event('server_error', { error });
@@ -538,7 +538,9 @@ async function startServerRuntime(options: ServerOptions) {
   };
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     Deno.addSignalListener(signal, onSignal);
+    own(signal, () => Deno.removeSignalListener(signal, onSignal), 0);
   }
   await listens.ensure([cfg.listen?.port ?? 8000]);
+  options.acquired?.('serving');
   return { shutdown: termination.shutdown, setupMode, hats, players };
 }

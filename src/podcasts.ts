@@ -360,7 +360,32 @@ export async function createPodcasts(
       }).catch(scheduledError);
     }
   });
-  await serial(refreshDue);
+  async function close() {
+    closed = true;
+    clock.clearTimeout(timer);
+    unsubscribe();
+    shutdown.abort(new Error('Podcasts closed'));
+    try {
+      await tail;
+      await worker;
+    } finally {
+      // In-flight work can finish scheduling after the first timer clear.
+      clock.clearTimeout(timer);
+    }
+  }
+  try {
+    await serial(refreshDue);
+  } catch (error) {
+    try {
+      await close();
+    } catch (releaseError) {
+      throw new AggregateError(
+        [error, releaseError],
+        'Podcast startup rollback failed',
+      );
+    }
+    throw error;
+  }
   kick();
   return {
     async addChannel(input: string) {
@@ -449,17 +474,7 @@ export async function createPodcasts(
         if (current === tail && !worker) return;
       }
     },
-    async close() {
-      closed = true;
-      clock.clearTimeout(timer);
-      unsubscribe();
-      shutdown.abort(new Error('Podcasts closed'));
-      await tail;
-      await worker;
-      // In-flight work can finish scheduling after close's first timer clear.
-      // Drain the lifecycle queue before releasing its last owned timer.
-      clock.clearTimeout(timer);
-    },
+    close,
   };
 }
 export type Podcasts = Awaited<ReturnType<typeof createPodcasts>>;

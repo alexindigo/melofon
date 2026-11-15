@@ -21,6 +21,7 @@ import type { ConnectionStrategy } from '../connection-strategy.ts';
 import type { AirplayDevices } from './airplay-device.ts';
 import { profileFromService } from './airplay-profile.ts';
 import { airplayInstance } from './airplay-address.ts';
+import { createReleaseSet, releaseOrThrow } from '../releases.ts';
 export {
   devtypeFromAm,
   sessionFieldsFromTxt,
@@ -62,7 +63,7 @@ export interface AirplayDiscoveryDeps {
 export function createAirplayDiscovery(
   deps: AirplayDiscoveryDeps,
 ): {
-  close(): void;
+  close(): Promise<void>;
 } {
   const { outputs, state } = deps;
   state.declare(MDNS_KEY, {
@@ -84,6 +85,8 @@ export function createAirplayDiscovery(
   const discovered = new Set<string>();
   const signatures = new Map<string, string>();
   let closed = false;
+  const releases = createReleaseSet();
+  let closing: Promise<void> | undefined;
 
   const onService = (event: 'up' | 'down', svc: MdnsService) => {
     if (event === 'down') {
@@ -234,20 +237,24 @@ export function createAirplayDiscovery(
     discovered.clear();
   };
 
-  void state.getTyped(MDNS_KEY).then((value) => {
+  releases.add('browser', stop);
+  const starting = state.getTyped(MDNS_KEY).then((value) => {
     if (value !== 'off') start();
   });
+  releases.add('initial setting', () => starting, 1);
+  void starting.catch((error) => log.event('discovery_failed', { error }));
   const unsubscribe = state.onChange((key, value) => {
     if (key !== MDNS_KEY) return;
     if (value === 'off') stop();
     else start();
   });
+  releases.add('subscription', unsubscribe);
 
   return {
     close() {
       closed = true;
-      unsubscribe();
-      stop();
+      return closing ??= releaseOrThrow(releases, 'Discovery close failed')
+        .then(() => {});
     },
   };
 }

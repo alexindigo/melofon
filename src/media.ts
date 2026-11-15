@@ -68,6 +68,11 @@ import { extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { type Log, scopedLog } from './logging.ts';
 import { acquireHeartbeat } from './heartbeat.ts';
+import {
+  createReleaseSet,
+  releaseOrThrow,
+  type ReleaseSet,
+} from './releases.ts';
 import type { State } from './state.ts';
 import {
   createHlsCache,
@@ -418,12 +423,14 @@ function pcmDecoder(input: Demuxer): Promise<Decoder> {
 /** Acquisition ownership is outside the generator, including return-before-next.
  * Stop pending IO first, but queue native disposal behind active iteration. */
 function ownedPcm(
+  releases: ReleaseSet,
   input: Demuxer,
   decoder: Decoder,
-  owner?: { stop(): void; release(): Promise<void>; check(): void },
+  owner?: { stop(): void; check(): void },
   startMs = 0,
 ): InputPcm {
   const heartbeat = acquireHeartbeat();
+  releases.add('heartbeat', () => heartbeat[Symbol.dispose](), 3);
   let skipBytes = Math.max(0, Math.round(startMs * PCM_RATE / 1000)) *
     PCM_BYTES_PER_SAMPLE;
   let complete!: () => void;
@@ -432,14 +439,8 @@ function ownedPcm(
   const close = () =>
     closing ??= (async () => {
       try {
-        try {
-          await owner?.release();
-        } finally {
-          decoder[Symbol.dispose]();
-          await input.close();
-        }
+        await releaseOrThrow(releases, 'PCM release failed');
       } finally {
-        heartbeat[Symbol.dispose]();
         complete();
       }
     })();
@@ -1043,43 +1044,54 @@ export function createMedia(
       using _heartbeat = acquireHeartbeat();
       const abort = new AbortController();
       const signal = abort.signal;
+      const releases = createReleaseSet();
+      releases.add('source', () => source.close(), 0);
       let reader: ReadableStreamDefaultReader<Uint8Array>;
       try {
         reader = source.body.getReader();
       } catch (error) {
-        await source.close();
+        await releaseOrThrow(releases, 'PCM acquisition rollback failed', {
+          error,
+        });
         throw error;
       }
       let failure: { error: unknown } | undefined;
       let pending: Uint8Array = new Uint8Array(0);
-      let releasePromise: Promise<void> | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const release = () =>
-        releasePromise ??= (async () => {
-          clearTimeout(timer);
-          opts.signal?.removeEventListener('abort', onAbort);
-          signal.removeEventListener('abort', cancelRead);
-          try {
-            await reader.cancel();
-          } finally {
-            reader.releaseLock();
-            pending = new Uint8Array(0);
-            await source.close();
+      releases.add('reader cancellation', async () => {
+        try {
+          await reader.cancel();
+        } catch (error) {
+          // An errored stream rejects cancel with its existing read failure.
+          // That is the operation outcome, not a second failed acquisition.
+          if (
+            error !== failure?.error &&
+            (!signal.aborted || error !== signal.reason)
+          ) {
+            throw error;
           }
-        })();
+        }
+      }, -2);
+      releases.add('reader lock', () => {
+        reader.releaseLock();
+        pending = new Uint8Array(0);
+      }, -1);
       const cancelRead = () => {
         void reader.cancel(signal.reason).catch(() => {});
       };
       const onAbort = () => abort.abort(opts.signal!.reason);
       signal.addEventListener('abort', cancelRead, { once: true });
       opts.signal?.addEventListener('abort', onAbort, { once: true });
+      releases.add('source callbacks', () => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', onAbort);
+        signal.removeEventListener('abort', cancelRead);
+      }, -3);
       if (opts.signal?.aborted) onAbort();
       const check = () => {
         signal.throwIfAborted();
         if (failure) throw failure.error;
       };
-      let input: Demuxer | undefined;
-      let decoder: Decoder | undefined;
       try {
         const limits = { ...INPUT_LIMITS };
         for (const name of Object.keys(limits) as (keyof typeof limits)[]) {
@@ -1147,7 +1159,7 @@ export function createMedia(
           target = Math.min(target * 2, limits.probeBytes);
         }
         let prefix = probe.subarray(0, probed);
-        input = await Demuxer.open({
+        const input = await Demuxer.open({
           async read(size) {
             try {
               check();
@@ -1167,15 +1179,16 @@ export function createMedia(
           signal,
           options: coreInputOptions(limits.probeBytes),
         });
+        releases.add('input', () => input.close(), 2);
         check();
-        decoder = await pcmDecoder(input);
+        const decoder = await pcmDecoder(input);
+        releases.add('decoder', () => decoder[Symbol.dispose](), 1);
         check();
         opening = false;
         clearTimeout(timer);
-        const stream = ownedPcm(input, decoder, {
+        const stream = ownedPcm(releases, input, decoder, {
           stop: () =>
             abort.abort(new DOMException('PCM input cancelled', 'AbortError')),
-          release,
           check,
         }, opts.startMs);
         // Abort also releases a successfully acquired but unconsumed iterator.
@@ -1191,12 +1204,13 @@ export function createMedia(
       } catch (error) {
         const reason = signal.aborted ? signal.reason : failure?.error ?? error;
         abort.abort(reason);
-        try {
-          await release();
-        } finally {
-          decoder?.[Symbol.dispose]();
-          await input?.close();
-        }
+        // Detach callbacks before the exhaustive source/native rollback.
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', onAbort);
+        signal.removeEventListener('abort', cancelRead);
+        await releaseOrThrow(releases, 'PCM acquisition rollback failed', {
+          error: reason,
+        });
         throw reason;
       }
     },
@@ -1601,11 +1615,13 @@ export function createMedia(
       } catch {
         return null; // not a media file FFmpeg recognizes
       }
+      const releases = createReleaseSet();
+      releases.add('input', () => input.close(), 2);
       let decoder: Decoder;
       try {
         const audio = input.audio();
         if (audio === undefined) {
-          await input.close();
+          await releaseOrThrow(releases, 'PCM input release failed');
           return null; // no audio track to decode
         }
         if (opts.startMs !== undefined && opts.startMs > 0) {
@@ -1635,12 +1651,20 @@ export function createMedia(
         // Allocate only after successful seeking; a failed preflight owns
         // just the input, which the existing failure handler closes.
         decoder = await pcmDecoder(input);
+        releases.add('decoder', () => decoder[Symbol.dispose](), 1);
+        return ownedPcm(releases, input, decoder);
       } catch (err) {
         log.event('media_failed', { operation: 'decodePcm', path, error: err });
-        await input.close().catch(() => {});
+        const report = await releases.release();
+        for (const { error } of report.failed) {
+          log.event('media_failed', {
+            operation: 'decodePcm release',
+            path,
+            error,
+          });
+        }
         return null;
       }
-      return ownedPcm(input, decoder);
     },
   };
 }

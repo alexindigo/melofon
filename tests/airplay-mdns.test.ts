@@ -90,10 +90,10 @@ function setup(
   initial: Record<string, string> = {},
   saved: Record<string, { selected: boolean; volume: number; model?: string }> =
     {},
+  state = fakeState(initial),
 ) {
   const notify = createNotify();
   const outputs = createOutputs({ notify });
-  const state = fakeState(initial);
   const browsers: FakeBrowser[] = [];
   const logs: string[] = [];
   const resolved: string[] = [];
@@ -402,6 +402,24 @@ Deno.test('manual registration wins the host; discovery does not duplicate', asy
   } finally {
     discovery.close();
   }
+});
+
+Deno.test('discovery close joins its initial settings read without starting a late browser', async () => {
+  const state = fakeState();
+  let finish!: (value: string) => void;
+  state.getTyped = () => new Promise((resolve) => finish = resolve);
+  const { discovery, browsers } = setup({}, {}, state);
+  let settled = false;
+  const closing = discovery.close();
+  assertEquals(discovery.close(), closing);
+  const observed = closing.then(() => settled = true);
+  await Promise.resolve();
+  assertEquals(settled, false);
+  state.change('airplay.mdns', 'on');
+  assertEquals(browsers.length, 0);
+  finish('on');
+  await observed;
+  assertEquals(browsers.length, 0);
 });
 
 Deno.test('toggle: off unregisters discovered and closes the browser; on rebrowses', async () => {

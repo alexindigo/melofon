@@ -25,6 +25,11 @@ import type { SpeakerPairingView } from './speakers.ts';
 import { outputPlayerId, playerOutputs } from './player-outputs.ts';
 import type { Notify } from './notify.ts';
 import { scopedLog } from './logging.ts';
+import {
+  createReleaseSet,
+  releaseOrThrow,
+  type ReleaseSet,
+} from './releases.ts';
 
 export class PlayerError extends Error {
   constructor(
@@ -97,8 +102,10 @@ export async function createPlayers(deps: {
     boot?: PlayerBoot;
     clock?: ReturnType<typeof setInterval>;
     disposing: boolean;
+    releases: ReleaseSet;
   };
   const engines = new Map<number, Engine>();
+  const releases = createReleaseSet();
   const log = scopedLog('players');
   let closed = false;
   let closeWork: Promise<void> | undefined;
@@ -141,47 +148,59 @@ export async function createPlayers(deps: {
     }
     return name;
   };
-  const add = (row: StoredPlayer): Engine => {
-    const persistence = deps.persistence.forPlayer(row.id);
-    const outputs = playerOutputs(deps.outputs, row.id);
-    const player = createPlayer({ ...deps.clock, volume: row.volume });
-    const capacity = deps.capacity?.forPlayer(() => ({
-      id: row.id,
-      name: row.name,
-    }));
-    const playback = createPlayback({
-      ...deps.playback,
-      playerId: row.id,
-      playerName: () => row.name,
-      player,
-      outputs,
-      reports: deps.reports,
-      persistence: {
-        ...persistence,
-        saveCommand(atMs) {
-          row.commandedAtMs = atMs;
-          persistence.saveCommand?.(atMs);
+  const add = async (row: StoredPlayer): Promise<Engine> => {
+    const owned = createReleaseSet();
+    try {
+      const persistence = deps.persistence.forPlayer(row.id);
+      owned.add('persistence', () => persistence.close(), 2);
+      const outputs = playerOutputs(deps.outputs, row.id);
+      const player = createPlayer({ ...deps.clock, volume: row.volume });
+      const capacity = deps.capacity?.forPlayer(() => ({
+        id: row.id,
+        name: row.name,
+      }));
+      const playback = createPlayback({
+        ...deps.playback,
+        playerId: row.id,
+        playerName: () => row.name,
+        player,
+        outputs,
+        reports: deps.reports,
+        persistence: {
+          ...persistence,
+          saveCommand(atMs) {
+            row.commandedAtMs = atMs;
+            persistence.saveCommand?.(atMs);
+          },
+          saveVolume(volume) {
+            row.volume = volume;
+            persistence.saveVolume?.(volume);
+          },
         },
-        saveVolume(volume) {
-          row.volume = volume;
-          persistence.saveVolume?.(volume);
-        },
-      },
-      reserveQueueIds: (count) => deps.store.players.reserveQueueIds(count),
-      targets: deps.targets?.(row.id),
-      capacity,
-      notify: deps.notify,
-    });
-    const engine = {
-      row,
-      playback,
-      outputs,
-      persistence,
-      capacity,
-      disposing: false,
-    };
-    engines.set(row.id, engine);
-    return engine;
+        reserveQueueIds: (count) => deps.store.players.reserveQueueIds(count),
+        targets: deps.targets?.(row.id),
+        capacity,
+        notify: deps.notify,
+      });
+      owned.add('playback', () => playback.close());
+      const engine = {
+        row,
+        playback,
+        outputs,
+        persistence,
+        capacity,
+        disposing: false,
+        releases: owned,
+      };
+      engines.set(row.id, engine);
+      releases.add(String(row.id), () => dispose(engine));
+      return engine;
+    } catch (error) {
+      await releaseOrThrow(owned, 'Player acquisition rollback failed', {
+        error,
+      });
+      throw error;
+    }
   };
   const start = (engine: Engine) => {
     engine.boot = deps.createBoot?.(
@@ -190,35 +209,21 @@ export async function createPlayers(deps: {
       engine.outputs,
       engine.capacity,
     );
+    if (engine.boot) {
+      const boot = engine.boot;
+      engine.releases.add('boot', () => boot.close(), 1);
+    }
     engine.clock = setInterval(() => {
       void engine.playback.advanceEnded();
     }, 500);
+    engine.releases.add('clock', () => clearInterval(engine.clock), -1);
   };
   const dispose = async (engine: Engine) => {
     engine.disposing = true;
-    clearInterval(engine.clock);
-    const errors: unknown[] = [];
-    // Every owned release runs even when an earlier one fails. In particular,
-    // unrelated household persistence cannot strand this engine's boot/clock.
-    for (
-      const release of [
-        () => engine.playback.close(),
-        () => engine.boot?.close(),
-        () => engine.persistence.close(),
-      ]
-    ) {
-      try {
-        await release();
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    if (errors.length) {
-      throw new AggregateError(errors, 'Player disposal failed');
-    }
+    await releaseOrThrow(engine.releases, 'Player disposal failed');
   };
   try {
-    for (const row of await deps.store.players.list()) add(row);
+    for (const row of await deps.store.players.list()) await add(row);
     // Command time, not periodic bookmark time, chooses a conflicting restore.
     // Unknown/equal command times retain the stable stored player order.
     const restoreOrder = [...engines.values()].sort((a, b) =>
@@ -258,8 +263,7 @@ export async function createPlayers(deps: {
     }
     for (const engine of engines.values()) start(engine);
   } catch (error) {
-    await Promise.all([...engines.values()].map(dispose));
-    throw error;
+    await releaseOrThrow(releases, 'Player startup rollback failed', { error });
   }
   // These functions are captured by hats at load time. Resolve the engine at
   // invocation, not when constructing the service bag. Reports never retarget.
@@ -496,7 +500,7 @@ export async function createPlayers(deps: {
       mutate(async () => {
         name = nameFor(name);
         const row = await deps.store.players.create(name);
-        const engine = add(row);
+        const engine = await add(row);
         start(engine);
         changed(row.id);
         return { ...row };
@@ -544,7 +548,9 @@ export async function createPlayers(deps: {
         await deps.store.players.delete(id);
         engine.persistence.retire();
         try {
-          await dispose(engine);
+          await releaseOrThrow(releases, 'Player disposal failed', undefined, [
+            String(id),
+          ]);
         } catch (error) {
           // Deletion is already published durably. Do not invite a duplicate
           // command because cleanup or another player's save failed (decision 31).
@@ -569,17 +575,11 @@ export async function createPlayers(deps: {
     close(): Promise<void> {
       if (closeWork) return closeWork;
       closed = true;
+      // End scheduled intake before joining accepted registry operations.
+      for (const engine of engines.values()) clearInterval(engine.clock);
       closeWork = (async () => {
         await tail;
-        const results = await Promise.allSettled(
-          [...engines.values()].map(dispose),
-        );
-        const errors = results.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : []
-        );
-        if (errors.length) {
-          throw new AggregateError(errors, 'Player registry close failed');
-        }
+        await releaseOrThrow(releases, 'Player registry close failed');
         engines.clear();
       })();
       return closeWork;

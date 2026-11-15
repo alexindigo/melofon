@@ -8,6 +8,7 @@ import {
   unspecifiedAddress,
 } from '../net-address.ts';
 import { pinnedRequest } from '../net-transport.ts';
+import { createReleaseSet, releaseOrThrow } from '../releases.ts';
 
 export function matchesHost(pattern: string, host: string): boolean {
   return pattern.startsWith('*.')
@@ -104,6 +105,9 @@ async function ownResponse(
     await release();
     return { response, url, close: () => Promise.resolve() };
   }
+  const releases = createReleaseSet();
+  releases.add('response reader', () => reader.releaseLock());
+  releases.add('response transport', release, 1);
   let output: ReadableStreamDefaultController<Uint8Array>;
   let finished = false;
   let closing: Promise<void> | undefined;
@@ -118,8 +122,7 @@ async function ownResponse(
       } catch {
         /* Preserve the original body failure. */
       } finally {
-        reader.releaseLock();
-        await release();
+        await releaseOrThrow(releases, 'Response release failed');
       }
     })();
     return closing;
@@ -178,6 +181,8 @@ export function createLookupNetwork(options: {
   resolve?: (host: string) => Promise<string[]>;
   /** Test-only trust anchor; verification and hostname checks stay enabled. */
   ca?: string;
+  /** Test-only transport wrapper; address/authority checks still precede it. */
+  request?: typeof pinnedRequest;
 } = {}) {
   const log = options.log ?? scopedLog('lookups');
   const next = new Map<string, number>();
@@ -301,7 +306,9 @@ export function createLookupNetwork(options: {
           let file: Deno.FsFile | undefined;
           let partial: string | undefined;
           let transferred = false;
-          const release = async () => {
+          let failure: { error: unknown } | undefined;
+          const releases = createReleaseSet();
+          const release = async (prior?: { error: unknown }) => {
             clearTimeout(phaseTimer);
             request.abort();
             try {
@@ -309,11 +316,18 @@ export function createLookupNetwork(options: {
             } catch {
               // The original fetch/read failure (or abort reason) owns the
               // outcome; an already-errored stream cannot be cancelled again.
+            }
+            try {
+              await releaseOrThrow(releases, 'Network transfer release failed');
+            } catch (error) {
+              if (prior) {
+                throw new AggregateError(
+                  [prior.error, error],
+                  'Network transfer release failed',
+                );
+              }
+              throw error;
             } finally {
-              reader?.releaseLock();
-              file?.close();
-              if (partial) await Deno.remove(partial);
-              await transport?.close();
               log.event('lookup_request', { plugin: caller, host, status });
             }
           };
@@ -375,7 +389,7 @@ export function createLookupNetwork(options: {
             }
             signal.throwIfAborted();
             transportFailure = true;
-            transport = await pinnedRequest(
+            transport = await (options.request ?? pinnedRequest)(
               target,
               addresses[(attempt - 1) % addresses.length],
               {
@@ -386,6 +400,8 @@ export function createLookupNetwork(options: {
               options.ca,
               stream?.bufferBytes,
             );
+            const ownedTransport = transport;
+            releases.add('transport', () => ownedTransport.close(), 3);
             const response = transport.response;
             transportFailure = false;
             clearTimeout(phaseTimer);
@@ -412,6 +428,10 @@ export function createLookupNetwork(options: {
               return { response: lease.response, size: 0, lease };
             }
             reader = response.body?.getReader();
+            if (reader) {
+              const ownedReader = reader;
+              releases.add('reader lock', () => ownedReader.releaseLock());
+            }
             const chunks: Uint8Array[] = [];
             let length = 0;
             if (
@@ -423,6 +443,10 @@ export function createLookupNetwork(options: {
               if (!response.ok) throw new Error(`HTTP ${response.status}`);
               partial = `${destination}.${crypto.randomUUID()}.part`;
               file = await Deno.open(partial, { createNew: true, write: true });
+              releases.add('partial file', () => file?.close(), 1);
+              releases.add('partial path', async () => {
+                if (partial) await Deno.remove(partial);
+              }, 2);
             }
             while (reader) {
               arm(budget.idleMs, 'body idle');
@@ -475,6 +499,13 @@ export function createLookupNetwork(options: {
               size: length,
             };
           } catch (error) {
+            failure = {
+              error: signal.aborted
+                ? signal.reason
+                : request.signal.aborted
+                ? request.signal.reason
+                : error,
+            };
             // Caller cancellation/revocation is never retried. HTTP status,
             // grants, redirect policy and size caps are not transport failures.
             signal.throwIfAborted();
@@ -482,7 +513,7 @@ export function createLookupNetwork(options: {
               throw request.signal.aborted ? request.signal.reason : error;
             }
           } finally {
-            if (!transferred) await release();
+            if (!transferred) await release(failure);
           }
         }
       }

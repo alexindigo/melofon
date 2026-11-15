@@ -228,7 +228,21 @@ export async function createLookupRunner(options: {
       scheduleConfiguration(host);
     }
   });
-  await store.lookups.resetActive();
+  // Finish fallible startup store work before starting Workers or pollers.
+  // No returned lifecycle port exists yet to own rollback of those children.
+  const housekeeping = async () => {
+    await store.lookups.purgeDone(
+      Date.now() - await numeric('doneRetentionDays') * 86400000,
+    );
+    await store.reference.purgeOrphans();
+  };
+  try {
+    await store.lookups.resetActive();
+    await housekeeping();
+  } catch (error) {
+    unsubscribeState();
+    throw error;
+  }
   for (const host of hosts) scheduleConfiguration(host);
   await configuration;
 
@@ -685,13 +699,6 @@ export async function createLookupRunner(options: {
     },
   });
   const poll = setInterval(pump, 50);
-  const housekeeping = async () => {
-    await store.lookups.purgeDone(
-      Date.now() - await numeric('doneRetentionDays') * 86400000,
-    );
-    await store.reference.purgeOrphans();
-  };
-  await housekeeping();
   let cleanup = Promise.resolve();
   const daily = setInterval(() => {
     cleanup = cleanup.then(housekeeping).catch((error) =>

@@ -794,7 +794,10 @@ export function appLogger(): Logger {
   return production;
 }
 /** The logging owner declares and applies its live retention setting. */
-export async function configureLogging(state: State, logger = appLogger()) {
+export async function configureLogging(
+  state: Pick<State, 'declare' | 'onChange' | 'getTyped'>,
+  logger = appLogger(),
+) {
   state.declare('log.ringRecords', {
     type: 'integer',
     default: 1000,
@@ -807,7 +810,12 @@ export async function configureLogging(state: State, logger = appLogger()) {
   const unsubscribe = state.onChange((key, value) => {
     if (key === 'log.ringRecords') logger.setRingCapacity(Number(value));
   });
-  logger.setRingCapacity(Number(await state.getTyped('log.ringRecords')));
+  try {
+    logger.setRingCapacity(Number(await state.getTyped('log.ringRecords')));
+  } catch (error) {
+    unsubscribe();
+    throw error;
+  }
   return unsubscribe;
 }
 // Defaults resolve the installed instance at emission time, including late native callbacks.
