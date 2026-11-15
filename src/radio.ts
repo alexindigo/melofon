@@ -8,6 +8,7 @@ import { imagePixels } from './media.ts';
 import type { Notify } from './notify.ts';
 import { type Log, scopedLog } from './logging.ts';
 import type { LookupNetwork } from './lookups/net.ts';
+import { createCommandLane } from './command-authority.ts';
 
 export type StationResult = StationRow | { invalid: string };
 
@@ -57,12 +58,13 @@ export function createRadio(store: Store, options: {
     : undefined;
   let tail: Promise<unknown> = Promise.resolve();
   let ready = false;
-  const streams = new Map<string, AbortController>();
+  const streams = new Map<string, ReturnType<typeof createCommandLane>>();
   const changed = (id: string) =>
     options.notify?.emit(['library'], { radioStations: [id] }, 'all');
   const revoke = (id: string) => {
-    streams.get(id)?.abort();
-    streams.delete(id);
+    const lane = streams.get(id);
+    lane?.capture()?.cancel();
+    if (!lane?.capture() && streams.get(id) === lane) streams.delete(id);
   };
   // One owner orders file reads, publication and retirement. No file/native work
   // occurs in a store slot, and a reader cannot race retirement of its source.
@@ -109,16 +111,16 @@ export function createRadio(store: Store, options: {
     /** Only the elected source opens this capability. Metadata remains external
      * content: the entered station host is the entire private-address grant. */
     streamArtwork(id: string, streamUrl: string, signal: AbortSignal) {
-      revoke(id);
-      const generation = new AbortController();
-      streams.set(id, generation);
+      let lane = streams.get(id);
+      if (!lane) streams.set(id, lane = createCommandLane());
+      const generation = lane.submit();
       const lifetime = AbortSignal.any([signal, generation.signal]);
-      let request: AbortController | undefined;
+      const images = createCommandLane();
       let previous: string | null | undefined;
       const jobs = new Set<Promise<void>>();
       const publish = (bytes: Uint8Array | null, current: AbortSignal) =>
         serial(async () => {
-          if (current.aborted || streams.get(id) !== generation) return;
+          if (current.aborted || !generation.isCurrent()) return;
           const station = await store.radio.get(id);
           if (!station || station.streamUrl !== streamUrl || current.aborted) {
             return;
@@ -138,7 +140,7 @@ export function createRadio(store: Store, options: {
             ? await files.save(bytes, maxBytes, maxPixels)
             : null;
           // Cancellation may happen during native validation or durable file I/O.
-          if (current.aborted || streams.get(id) !== generation) {
+          if (current.aborted || !generation.isCurrent()) {
             if (payload) await files.retire(payload);
             return;
           }
@@ -162,8 +164,7 @@ export function createRadio(store: Store, options: {
             return;
           }
           previous = value;
-          request?.abort();
-          request = new AbortController();
+          const request = images.submit();
           const current = AbortSignal.any([lifetime, request.signal]);
           // Every new carrier retires the old cover before acquisition. Invalid,
           // absent or unavailable images reveal the deterministic name tile.
@@ -211,8 +212,8 @@ export function createRadio(store: Store, options: {
           return pending;
         },
         async close() {
-          generation.abort();
-          if (streams.get(id) === generation) streams.delete(id);
+          generation.cancel();
+          if (!lane.capture() && streams.get(id) === lane) streams.delete(id);
           await Promise.all(jobs);
         },
       };

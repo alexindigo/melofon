@@ -31,6 +31,7 @@ import {
 export type { NowPlayingViewRow, ReportPlaying } from './playback-reports.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { createOperationScope } from './operations.ts';
+import { type CommandHandle, createCommandLane } from './command-authority.ts';
 import {
   PlaybackError,
   QueueConflictError,
@@ -70,6 +71,31 @@ export interface PlaybackAuthority {
   signal: AbortSignal;
   isCurrent(): boolean;
 }
+
+type PlannedOccurrence =
+  | { kind: 'existing'; entryId: number; media: QueueMedia }
+  | { kind: 'new'; offset: number; media: QueueMedia };
+interface ActivationPlan {
+  entry: PlannedOccurrence | undefined;
+  items: PlannedOccurrence[];
+  direction?: number;
+  wrap?: boolean;
+  excluded?: ReadonlySet<number>;
+}
+const existingOccurrences = (entries: QueueEntry[]): PlannedOccurrence[] =>
+  entries.map(({ id, ...media }) => ({ kind: 'existing', entryId: id, media }));
+const newOccurrences = (media: QueueMedia[]): PlannedOccurrence[] =>
+  media.map((item, offset) => ({ kind: 'new', offset, media: item }));
+const existingActivation = (
+  entries: QueueEntry[],
+  index: number,
+  options: Pick<ActivationPlan, 'direction' | 'wrap' | 'excluded'> = {},
+): ActivationPlan => {
+  const items = existingOccurrences(entries);
+  return { entry: items[index], items, ...options };
+};
+type Activate = (added?: QueueEntry[]) => void;
+type PrepareNew = (media: QueueMedia[]) => QueueMedia[];
 
 export interface QueueAddOptions {
   /** Core resolves destinations against the queue at the mutation boundary. */
@@ -429,11 +455,15 @@ export function createPlayback(deps: {
   // hats or individual output call sites. Ignore volume, admission and other
   // output facts which do not appear in this view. Drop the subscription on close.
   let speakers = JSON.stringify(selectedSpeakers());
-  let pendingStart: AbortController | undefined;
-  const cancelStart = (expected = pendingStart) => {
-    if (pendingStart !== expected) return;
-    pendingStart?.abort();
+  const commands = createCommandLane();
+  let pendingStart: CommandHandle | undefined;
+  const submitCommand = () => {
     pendingStart = undefined;
+    return commands.submit();
+  };
+  const cancelStart = (expected = commands.capture()) => {
+    expected?.cancel();
+    if (pendingStart === expected) pendingStart = undefined;
   };
   const targetKey = () =>
     JSON.stringify(
@@ -444,69 +474,72 @@ export function createPlayback(deps: {
   let targets = targetKey();
   const transition = <T>(
     starts: boolean,
-    commit: (activate: () => void) => T,
+    commit: (activate: Activate, prepareNew: PrepareNew) => T,
     authority?: PlaybackAuthority,
-    activation?: {
-      index: number;
-      items?: QueueMedia[];
-      direction?: number;
-      wrap?: boolean;
-      excluded?: ReadonlySet<number>;
-    },
+    activation?: ActivationPlan,
+    submitted?: CommandHandle,
   ): T | Promise<T> =>
     operations.runImmediate((operation) => {
-      const current = () =>
+      const externalCurrent = () =>
         !operations.closed &&
         (!authority || !authority.signal.aborted && authority.isCurrent());
       const cancelled = () =>
         new PlaybackError('playback_cancelled', 'Playback start cancelled');
+      if (!externalCurrent()) throw cancelled();
+      const command = submitted ?? submitCommand();
+      const current = () => externalCurrent() && command.isCurrent();
       if (!current()) throw cancelled();
-      cancelStart();
       const before = player.queue().items;
-      const items = activation?.items ?? player.queue().items;
-      const candidate = activation && items[activation.index];
+      const items = activation?.items ?? [];
+      const candidate = activation?.entry;
       const needsPreparation = (item: QueueMedia) =>
         deps.prepareQueueMedia &&
         item.facts.kind === 'web' && item.facts.mode === 'unknown';
       const needsResolution = starts && activation && candidate &&
-        (deps.resolveQueueReference && candidate.reference.kind === 'station' ||
-          needsPreparation(candidate));
+        (deps.resolveQueueReference &&
+            candidate.media.reference.kind === 'station' ||
+          needsPreparation(candidate.media));
       if (!starts || !deps.targets && !needsResolution) {
         const reservation = reserveStart(starts);
         try {
-          return commitStart(reservation, () => commit(() => {}));
+          return commitStart(reservation, () =>
+            commit(() => {}, (media) => media));
         } finally {
           reservation?.release();
         }
       }
       const controller = new AbortController();
       const reservation = reserveStart(starts, controller);
-      const abort = () => controller.abort();
+      const abort = () =>
+        controller.abort();
       operation.signal.addEventListener('abort', abort, { once: true });
       authority?.signal.addEventListener('abort', abort, { once: true });
-      pendingStart = controller;
+      command.signal.addEventListener('abort', abort, { once: true });
+      pendingStart = command;
       const prepare = async () => {
         let selected:
-          | { index: number; media: QueueMedia; entryId?: number }
+          | { occurrence: PlannedOccurrence; media: QueueMedia }
           | null
           | undefined;
         if (needsResolution) {
           selected = null;
-          let index = activation.index;
+          let index = items.indexOf(candidate);
           for (let visited = 0; visited < items.length; visited++) {
             if (index < 0 || index >= items.length) break;
             const item = items[index];
-            let media = activation.excluded?.has((item as QueueEntry).id)
-              ? null
-              : item.reference.kind === 'station' && deps.resolveQueueReference
-              ? await deps.resolveQueueReference!(item.reference)
-              : item;
+            let media =
+              item.kind === 'existing' && activation.excluded?.has(item.entryId)
+                ? null
+                : item.media.reference.kind === 'station' &&
+                    deps.resolveQueueReference
+                ? await deps.resolveQueueReference!(item.media.reference)
+                : item.media;
             if (media && needsPreparation(media)) {
               media = await deps.prepareQueueMedia!(media, controller.signal);
             }
             if (controller.signal.aborted) throw cancelled();
             if (media) {
-              selected = { index, media, entryId: (item as QueueEntry).id };
+              selected = { occurrence: item, media };
               break;
             }
             index += activation.direction ?? 1;
@@ -520,15 +553,16 @@ export function createPlayback(deps: {
       };
       return prepare().then((selected) => {
         if (
-          controller.signal.aborted || pendingStart !== controller || !current()
+          controller.signal.aborted || !current()
         ) throw cancelled();
         // A preparation plan refers to occurrences, not reusable ordinals. Queue
         // additions may publish during this await without cancelling the start.
         // Validate the original anchor before the command mutates anything; future
         // queues (consume/add/restore) are installed synchronously by commit.
-        const planned = selected ?? candidate;
-        const entryId = planned &&
-          ('entryId' in planned ? planned.entryId : (planned as QueueEntry).id);
+        const planned = selected?.occurrence ?? candidate;
+        const entryId = planned?.kind === 'existing'
+          ? planned.entryId
+          : undefined;
         const originalIndex = before.findIndex((entry) => entry.id === entryId);
         if (
           originalIndex >= 0 &&
@@ -536,24 +570,32 @@ export function createPlayback(deps: {
         ) {
           throw cancelled();
         }
-        pendingStart = undefined;
         const result = commitStart(reservation, () =>
-          commit(() => {
+          commit((added) => {
             if (selected === undefined) return;
             if (selected === null) {
               player.stop();
               return;
             }
-            if (
-              selected.entryId !== undefined &&
-              player.queue().items[selected.index]?.id !== selected.entryId
-            ) {
-              throw cancelled();
+            const occurrence = selected.occurrence;
+            // Existing identities were validated before commit. New media was
+            // prepared before insertion and receives its id only at publication.
+            if (occurrence.kind === 'existing') {
+              player.replaceOccurrence(occurrence.entryId, selected.media);
             }
-            player.replaceMedia(selected.index, selected.media);
-            if (selected.index !== activation!.index) {
-              player.play(selected.index);
+            if (occurrence !== candidate) {
+              const id = occurrence.kind === 'existing'
+                ? occurrence.entryId
+                : added![occurrence.offset].id;
+              player.playOccurrence(id);
             }
+          }, (media) => {
+            const occurrence = selected?.occurrence;
+            return occurrence?.kind === 'new'
+              ? media.map((item, offset) =>
+                offset === occurrence.offset ? selected!.media : item
+              )
+              : media;
           }));
         if (selected !== undefined) {
           flushQueue();
@@ -568,8 +610,9 @@ export function createPlayback(deps: {
       }).finally(() => {
         reservation?.release();
         authority?.signal.removeEventListener('abort', abort);
+        command.signal.removeEventListener('abort', abort);
         operation.signal.removeEventListener('abort', abort);
-        if (pendingStart === controller) pendingStart = undefined;
+        if (pendingStart === command) pendingStart = undefined;
       });
     });
   const unsubscribeOutputs = outputs &&
@@ -701,7 +744,8 @@ export function createPlayback(deps: {
     source?: CommandSource,
     firstId?: number,
     limit = defaultQueueLimit,
-    replacedStart?: AbortController,
+    replacedStart?: CommandHandle,
+    submitted?: CommandHandle,
   ): QueueEntry[] | Promise<QueueEntry[]> => {
     checkSize(media.length, opts, limit);
     const size = media.length + (opts.clear ? 0 : player.queue().items.length);
@@ -732,23 +776,28 @@ export function createPlayback(deps: {
     // Only entries already in the destination carry occurrence identity in the
     // activation plan; a source id must never be mistaken for a destination id.
     const items = [
-      ...future.slice(0, at),
-      ...media.map((item) => ({ ...item, id: undefined })),
-      ...future.slice(at),
+      ...existingOccurrences(future.slice(0, at)),
+      ...newOccurrences(media),
+      ...existingOccurrences(future.slice(at)),
     ];
     const oldCurrent = player.status().current;
     const index = opts.playbackFromPosition !== undefined
       ? Math.min(Math.max(0, Math.trunc(opts.playbackFromPosition)), size - 1)
       : oldCurrent && !opts.clear
-      ? items.indexOf(oldCurrent)
+      ? items.findIndex((item) =>
+        item.kind === 'existing' && item.entryId === oldCurrent.id
+      )
       : 0;
-    const commit = (activate: () => void) => {
+    const commit = (
+      activate: Activate,
+      prepareNew: PrepareNew = (media) => media,
+    ) => {
       checkSize(media.length, opts, limit);
       if (opts.clear) player.queueClear();
-      const added = player.queueAddSources(media, at, firstId);
+      const added = player.queueAddSources(prepareNew(media), at, firstId);
       if (opts.shuffle !== undefined) player.setShuffle(opts.shuffle);
       if (opts.play) player.play(opts.playbackFromPosition);
-      activate();
+      activate(added);
       record(
         'queueAdd',
         `songs=${media.length}` + (opts.clear ? ' clear' : '') +
@@ -785,8 +834,9 @@ export function createPlayback(deps: {
       undefined,
       opts.clear || opts.playbackFromPosition !== undefined ||
         player.status().state !== 'play'
-        ? { index, items }
+        ? { entry: items[index], items }
         : undefined,
+      submitted,
     );
   };
   const resolveReference = deps.resolveQueueReference ?? createQueueResolver({
@@ -797,6 +847,16 @@ export function createPlayback(deps: {
   // Only add-and-play borrows pendingStart; ordinary adds have their own
   // lifetime, revoked by destructive queue clear/restore or engine disposal.
   let additionTail: Promise<void> | undefined;
+  const orderedAddition = <T>(run: () => T | Promise<T>): T | Promise<T> => {
+    const result = additionTail ? additionTail.then(run) : run();
+    if (result instanceof Promise) {
+      const settled = result.then(() => {}, () => {}).finally(() => {
+        if (additionTail === settled) additionTail = undefined;
+      });
+      additionTail = settled;
+    }
+    return result;
+  };
   const additions = new Set<AbortController>();
   const cancelAdditions = () => {
     for (const controller of additions) controller.abort();
@@ -812,18 +872,22 @@ export function createPlayback(deps: {
   ): QueueEntry[] | Promise<QueueEntry[]> =>
     operations.runImmediate((operation) => {
       requireOpen();
-      const replacedStart = pendingStart;
+      const replacedStart = commands.capture();
       const controller = new AbortController();
       const abort = () => controller.abort();
       operation.signal.addEventListener('abort', abort, { once: true });
       const starts = opts.startPlaying === true || opts.play === true;
-      if (starts) cancelStart();
+      const command = starts ? submitCommand() : undefined;
+      command?.signal.addEventListener('abort', abort, { once: true });
       const reservation = reserveStart(starts, controller);
-      if (starts) pendingStart = controller;
+      if (command) pendingStart = command;
       let limit = defaultQueueLimit;
       additions.add(controller);
       const check = () => {
-        if (controller.signal.aborted || operations.closed) {
+        if (
+          controller.signal.aborted || operations.closed ||
+          command && !command.isCurrent()
+        ) {
           throw new PlaybackError(
             'playback_cancelled',
             'Queue addition cancelled',
@@ -832,9 +896,10 @@ export function createPlayback(deps: {
       };
       const finish = () => {
         operation.signal.removeEventListener('abort', abort);
+        command?.signal.removeEventListener('abort', abort);
         additions.delete(controller);
         reservation?.release();
-        if (pendingStart === controller) pendingStart = undefined;
+        if (pendingStart === command) pendingStart = undefined;
       };
       const failed = (error: unknown): never => {
         if (controller.signal.aborted) {
@@ -850,7 +915,6 @@ export function createPlayback(deps: {
         const commit = (firstId?: number) => {
           check();
           additions.delete(controller);
-          if (pendingStart === controller) pendingStart = undefined;
           const result = commitAdd(
             media,
             opts,
@@ -858,6 +922,7 @@ export function createPlayback(deps: {
             firstId,
             limit,
             replacedStart,
+            command,
           );
           // The transition has acquired its own cancellation and demand now.
           reservation?.release();
@@ -896,16 +961,12 @@ export function createPlayback(deps: {
         });
       };
       try {
-        const result = additionTail ? additionTail.then(run) : run();
+        const result = orderedAddition(run);
         if (!(result instanceof Promise)) {
           finish();
           return result;
         }
         const work = result.catch(failed).finally(finish);
-        const settled = work.then(() => {}, () => {}).finally(() => {
-          if (additionTail === settled) additionTail = undefined;
-        });
-        additionTail = settled;
         return work;
       } catch (error) {
         finish();
@@ -958,12 +1019,12 @@ export function createPlayback(deps: {
             signal: source.signal,
             isCurrent: () => ownsSource(source),
           },
-          plan.index === null ? undefined : {
-            index: plan.index,
-            items: plan.items,
-            wrap: view.repeat === 'all',
-            excluded: failedSources,
-          },
+          plan.index === null
+            ? undefined
+            : existingActivation(plan.items, plan.index, {
+              wrap: view.repeat === 'all',
+              excluded: failedSources,
+            }),
         );
       } catch (error) {
         if (
@@ -1124,12 +1185,14 @@ export function createPlayback(deps: {
           emit(['player']);
         },
         authority,
-        view.state === 'play' ? undefined : { index },
+        view.state === 'play'
+          ? undefined
+          : existingActivation(player.queue().items, index),
       );
     },
     pause(source) {
       requireOpen();
-      cancelStart();
+      submitCommand();
       player.pause();
       record('pause', undefined, source, 'pause');
       flushState();
@@ -1137,7 +1200,7 @@ export function createPlayback(deps: {
     },
     stop(source) {
       requireOpen();
-      cancelStart();
+      submitCommand();
       // Explicit stop releases transport intent, not the bookmark. Engine stop
       // remains the terminal operation for exhaustion and end-of-queue.
       player.pause();
@@ -1160,7 +1223,7 @@ export function createPlayback(deps: {
           emit(['player']);
         },
         undefined,
-        { index },
+        existingActivation(player.queue().items, index),
       );
     },
     next(source) {
@@ -1179,7 +1242,7 @@ export function createPlayback(deps: {
           emit(['player']);
         },
         undefined,
-        { index: next },
+        existingActivation(queue, next),
       );
     },
     previous(source) {
@@ -1198,7 +1261,7 @@ export function createPlayback(deps: {
           emit(['player']);
         },
         undefined,
-        { index, direction: -1 },
+        existingActivation(player.queue().items, index, { direction: -1 }),
       );
     },
     restart(source) {
@@ -1218,12 +1281,12 @@ export function createPlayback(deps: {
           emit(['player']);
         },
         undefined,
-        { index },
+        existingActivation(player.queue().items, index),
       );
     },
     setShuffle(on, source) {
       requireOpen();
-      cancelStart();
+      submitCommand();
       player.setShuffle(on);
       record('shuffle', `shuffle=${on}`, source, 'none', false, {
         shuffle: on,
@@ -1233,7 +1296,7 @@ export function createPlayback(deps: {
     },
     setConsume(on, source) {
       requireOpen();
-      cancelStart();
+      submitCommand();
       player.setConsume(on);
       record('consume', `consume=${on}`, source, 'none', false, {
         consume: on,
@@ -1243,7 +1306,7 @@ export function createPlayback(deps: {
     },
     setRepeat(mode, source) {
       requireOpen();
-      cancelStart();
+      submitCommand();
       player.setRepeat(mode);
       record('repeat', `repeat=${mode}`, source, 'none', false, {
         repeat: mode,
@@ -1327,7 +1390,9 @@ export function createPlayback(deps: {
           return ok;
         },
         undefined,
-        view.state === 'stop' ? { index } : undefined,
+        view.state === 'stop'
+          ? existingActivation(player.queue().items, index)
+          : undefined,
       );
     },
     queueAdd(songs, opts = {}, source) {
@@ -1425,14 +1490,14 @@ export function createPlayback(deps: {
           emit(current ? ['queue', 'player'] : ['queue']);
         },
         undefined,
-        { index, items: future },
+        existingActivation(future, index),
       );
     },
     queueMove(entryId, position, expectedVersion, source) {
       requireOpen();
       checkVersion(expectedVersion);
       requireEntry(entryId);
-      cancelStart();
+      submitCommand();
       player.queueMove(entryId, position);
       record(
         'queueMove',
@@ -1448,7 +1513,7 @@ export function createPlayback(deps: {
     queueClear(source, expectedVersion) {
       requireOpen();
       checkVersion(expectedVersion);
-      cancelStart();
+      submitCommand();
       cancelAdditions();
       player.queueClear();
       record('queueClear', undefined, source, 'stop', true);
@@ -1483,7 +1548,6 @@ export function createPlayback(deps: {
       operations.run(async (operation) => {
         requireOpen();
         checkVersion(opts.expectedVersion);
-        cancelStart();
         const controller = new AbortController();
         const abort = () => controller.abort();
         operation.signal.addEventListener('abort', abort, { once: true });
@@ -1491,47 +1555,71 @@ export function createPlayback(deps: {
         const starts = snapshot.items.length > 0 &&
           (opts.startPlaying === true ||
             replace && player.status().state === 'play');
+        const command = replace || opts.startPlaying
+          ? submitCommand()
+          : undefined;
+        command?.signal.addEventListener('abort', abort, { once: true });
         const reservation = reserveStart(starts, controller);
-        pendingStart = controller;
+        if (command) pendingStart = command;
+        additions.add(controller);
+        const check = () => {
+          if (
+            operations.closed || controller.signal.aborted ||
+            command && !command.isCurrent()
+          ) {
+            throw new PlaybackError(
+              'playback_cancelled',
+              'Queue copy cancelled',
+            );
+          }
+        };
         try {
-          const limit = await queueLimit();
-          controller.signal.throwIfAborted();
-          checkSize(snapshot.items.length, { clear: replace }, limit);
-          const firstId = snapshot.items.length && deps.reserveQueueIds
-            ? await deps.reserveQueueIds(snapshot.items.length)
-            : undefined;
-          controller.signal.throwIfAborted();
-          if (pendingStart !== controller) controller.abort();
-          controller.signal.throwIfAborted();
-          checkVersion(opts.expectedVersion);
-          const previous = player.status();
-          const future = replace ? [] : player.queue().items;
-          const currentIndex = future.findIndex((entry) =>
-            entry.id === previous.current?.id
-          );
-          const position = opts.where === 'next'
-            ? currentIndex + 1
-            : typeof opts.where === 'object'
-            ? opts.where.position
-            : future.length;
-          const at = Math.min(Math.max(0, Math.trunc(position)), future.length);
-          const items = [
-            ...future.slice(0, at),
-            ...snapshot.items,
-            ...future.slice(at),
-          ];
-          const index = replace ? snapshot.currentIndex ?? 0 : at;
-          pendingStart = undefined;
-          const work = transition(
-            starts,
-            (activate) => {
+          await orderedAddition(async () => {
+            check();
+            const limit = await queueLimit();
+            check();
+            checkSize(snapshot.items.length, { clear: replace }, limit);
+            const firstId = snapshot.items.length && deps.reserveQueueIds
+              ? await deps.reserveQueueIds(snapshot.items.length)
+              : undefined;
+            check();
+            checkVersion(opts.expectedVersion);
+            const previous = player.status();
+            const future = replace ? [] : player.queue().items;
+            const currentIndex = future.findIndex((entry) =>
+              entry.id === previous.current?.id
+            );
+            const position = opts.where === 'next'
+              ? currentIndex + 1
+              : typeof opts.where === 'object'
+              ? opts.where.position
+              : future.length;
+            const at = Math.min(
+              Math.max(0, Math.trunc(position)),
+              future.length,
+            );
+            const items = [
+              ...existingOccurrences(future.slice(0, at)),
+              ...newOccurrences(snapshot.items),
+              ...existingOccurrences(future.slice(at)),
+            ];
+            const index = replace ? snapshot.currentIndex ?? 0 : at;
+            const commit = (activate: Activate, prepareNew: PrepareNew) => {
               checkVersion(opts.expectedVersion);
               checkSize(snapshot.items.length, { clear: replace }, limit);
               return publish(() => {
-                requireOpen();
+                // Registry publication may itself wait. Consume only this
+                // submitted command at the actual synchronous mutation boundary.
+                check();
+                checkVersion(opts.expectedVersion);
+                checkSize(snapshot.items.length, { clear: replace }, limit);
                 if (replace) player.queueClear();
                 const added = snapshot.items.length
-                  ? player.queueAddSources(snapshot.items, at, firstId)
+                  ? player.queueAddSources(
+                    prepareNew(snapshot.items),
+                    at,
+                    firstId,
+                  )
                   : [];
                 if (replace) {
                   player.restore({
@@ -1549,7 +1637,7 @@ export function createPlayback(deps: {
                     shuffle: previous.shuffle,
                   });
                 } else if (opts.startPlaying && added.length) player.play(at);
-                activate();
+                activate(added);
                 record(
                   'queueCopy',
                   `mode=${opts.mode}`,
@@ -1566,12 +1654,19 @@ export function createPlayback(deps: {
                     : ['queue'],
                 );
               });
-            },
-            undefined,
-            { index, items },
-          );
-          reservation?.release();
-          await work;
+            };
+            const work = command
+              ? transition(
+                starts,
+                commit,
+                undefined,
+                { entry: items[index], items },
+                command,
+              )
+              : commit(() => {}, (media) => media);
+            reservation?.release();
+            await work;
+          });
         } catch (error) {
           if (controller.signal.aborted) {
             throw new PlaybackError(
@@ -1582,8 +1677,10 @@ export function createPlayback(deps: {
           throw error;
         } finally {
           operation.signal.removeEventListener('abort', abort);
+          command?.signal.removeEventListener('abort', abort);
+          additions.delete(controller);
           reservation?.release();
-          if (pendingStart === controller) pendingStart = undefined;
+          if (pendingStart === command) pendingStart = undefined;
         }
       }),
 
@@ -1619,11 +1716,14 @@ export function createPlayback(deps: {
           emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
         };
         return Promise.resolve(
-          transition(true, commit, undefined, {
-            index,
-            items: future,
-            wrap: view.repeat !== 'off',
-          }),
+          transition(
+            true,
+            commit,
+            undefined,
+            existingActivation(future, index, {
+              wrap: view.repeat !== 'off',
+            }),
+          ),
         ).catch((error) => {
           // Internal transitions have no HTTP caller. Keep the bookmark/queue and
           // publish a paused clock; an explicit newer command always wins.
@@ -1651,6 +1751,7 @@ export function createPlayback(deps: {
       operations.runImmediate(() => {
         requireOpen();
         cancelAdditions();
+        const command = submitCommand();
         const index = snapshot.currentIndex ?? 0;
         const candidate = snapshot.queue[index];
         const prepareUrl = deps.prepareQueueMedia &&
@@ -1672,7 +1773,6 @@ export function createPlayback(deps: {
           snapshot.state !== 'play' || !snapshot.queue.length ||
           !deps.targets && !prepareUrl && !needsCapacity()
         ) {
-          cancelStart();
           return commit();
         }
         return (async () => {
@@ -1683,11 +1783,18 @@ export function createPlayback(deps: {
               activate();
             },
             undefined,
-            { index, items: snapshot.queue },
+            existingActivation(snapshot.queue, index),
+            command,
           );
         })().catch(
           (error) => {
             requireOpen();
+            if (!command.isCurrent()) {
+              throw new PlaybackError(
+                'playback_cancelled',
+                'Restore cancelled',
+              );
+            }
             if (
               error instanceof PlaybackError &&
                 error.code === 'target_unavailable' ||

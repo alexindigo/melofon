@@ -7,6 +7,7 @@ import {
 } from '../playback-source.ts';
 import { type Log, scopedLog } from '../logging.ts';
 import { createOperationScope } from '../operations.ts';
+import { type CommandHandle, createCommandLane } from '../command-authority.ts';
 import { queueDisplay } from '../queue-source.ts';
 import type { Notify } from '../notify.ts';
 import type {
@@ -96,7 +97,7 @@ interface Runtime {
   holdTimer?: ReturnType<typeof setTimeout>;
 }
 interface ResumeWork {
-  controller: AbortController;
+  command: CommandHandle;
   grant?: Grant;
   runtime?: Runtime;
   isCurrent(): boolean;
@@ -170,6 +171,7 @@ export function createAirplayBoot(
   const generations = new Map<string, number>();
   const grants = new Map<string, Grant>();
   const resuming = new Map<string, ResumeWork>();
+  const resumeLanes = new Map<string, ReturnType<typeof createCommandLane>>();
   const preparing = new Map<
     string,
     { controller: AbortController; grant: Grant; host: string; port?: number }
@@ -279,11 +281,10 @@ export function createAirplayBoot(
     }
     return e;
   };
-  const cancelResume = (id: string) => {
-    const work = resuming.get(id);
+  const cancelResume = (id: string, work = resuming.get(id)) => {
     if (!work) return;
-    resuming.delete(id);
-    work.controller.abort();
+    if (resuming.get(id) === work) resuming.delete(id);
+    work.command.cancel();
   };
   const cancelRetry = (id: string) => {
     const e = epoch(id);
@@ -392,14 +393,16 @@ export function createAirplayBoot(
     const incarnation = outputs.revision(id);
     const membershipCurrent = outputAuthority(outputs, id);
     const session = r?.session, transport = r?.transport;
-    const controller = new AbortController();
+    let lane = resumeLanes.get(id);
+    if (!lane) resumeLanes.set(id, lane = createCommandLane());
+    const command = lane.submit();
     const work: ResumeWork = {
-      controller,
+      command,
       grant: permission,
       runtime: r,
       isCurrent() {
         const row = outputs.get(id);
-        return resuming.get(id) === work && !controller.signal.aborted &&
+        return resuming.get(id) === work && command.isCurrent() &&
           !closed && intent === 'play' && intentEpoch === demand &&
           epoch(id).generation === generation &&
           outputs.revision(id) === incarnation && membershipCurrent() &&
@@ -417,11 +420,11 @@ export function createAirplayBoot(
     resuming.set(id, work);
     let retry = false;
     void operations.run(async ({ signal }) => {
-      const abort = () => controller.abort();
+      const abort = () => cancelResume(id, work);
       signal.addEventListener('abort', abort, { once: true });
       try {
         await playback.play(ownedSource, {
-          signal: controller.signal,
+          signal: command.signal,
           isCurrent: work.isCurrent,
         });
         consumeCommands();
@@ -454,7 +457,8 @@ export function createAirplayBoot(
         signal.removeEventListener('abort', abort);
         if (resuming.get(id) === work) resuming.delete(id);
         if (
-          retry && intentEpoch === demand && epoch(id).generation === generation
+          retry && command.isCurrent() && intentEpoch === demand &&
+          epoch(id).generation === generation
         ) scheduleRetry(id);
         reconcile();
       }

@@ -28,7 +28,11 @@ const image = (red: number) =>
     new Uint8Array([red, 20, 40, 255, red, 20, 40, 255, red, 20, 40, 255]),
   );
 
-async function fixture() {
+async function fixture(
+  wrapNetwork: (
+    network: ReturnType<typeof createNetwork>,
+  ) => ReturnType<typeof createNetwork> = (network) => network,
+) {
   const root = await Deno.makeTempDir({ prefix: 'stream-artwork-' });
   let radio!: ReturnType<typeof createRadio>;
   let artwork!: ReturnType<typeof createArtwork>;
@@ -37,7 +41,7 @@ async function fixture() {
     apiFixture({
       storeDir: `${root}/data`,
       services(f) {
-        const network = createNetwork({ state: f.state });
+        const network = wrapNetwork(createNetwork({ state: f.state }));
         radio = createRadio(f.store, {
           dataDir: f.cfg.dataDir,
           state: f.state,
@@ -138,6 +142,75 @@ async function fixture() {
       await Deno.remove(root, { recursive: true });
     },
   };
+}
+
+for (const scope of ['image', 'stream'] as const) {
+  Deno.test(`stream artwork latest-${scope} handle survives reentrant cancellation and late completion`, async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let stream!: ReturnType<ReturnType<typeof createRadio>['streamArtwork']>;
+    let newest: Promise<void> | undefined;
+    let replacement: typeof stream | undefined,
+      latest: typeof stream | undefined;
+    let stationId = '';
+    const t = await fixture((network) => ({
+      ...network,
+      async fetch(authority, input) {
+        if (input.endsWith('/first')) {
+          const cancelled = Promise.withResolvers<void>();
+          authority.signal!.addEventListener('abort', () => {
+            latest = scope === 'stream'
+              ? t.radio.streamArtwork(
+                stationId,
+                'http://melofon.home/live',
+                new AbortController().signal,
+              )
+              : stream;
+            newest = latest.observe('http://melofon.home/third');
+            cancelled.resolve();
+          }, { once: true });
+          entered.resolve();
+          await cancelled.promise;
+        } else if (input.endsWith('/second')) await release.promise;
+        return new Response(image(input.endsWith('/third') ? 70 : 20), {
+          headers: { 'content-type': 'image/png' },
+        });
+      },
+    }));
+    try {
+      const station = await t.station('http://melofon.home/live');
+      stationId = station.id;
+      const key = (await t.f.login('bearer')).credential;
+      stream = t.radio.streamArtwork(
+        station.id,
+        station.streamUrl,
+        new AbortController().signal,
+      );
+      const first = stream.observe('http://melofon.home/first');
+      await entered.promise;
+      replacement = scope === 'stream'
+        ? t.radio.streamArtwork(
+          station.id,
+          station.streamUrl,
+          new AbortController().signal,
+        )
+        : stream;
+      const second = replacement.observe('http://melofon.home/second');
+      await newest;
+      release.resolve();
+      await Promise.all([first, second]);
+      assertEquals(
+        await t.bytes((await t.art(station.id, key)).url, key),
+        image(70),
+      );
+    } finally {
+      release.resolve();
+      await stream?.close();
+      await replacement?.close();
+      await latest?.close();
+      await t.close();
+    }
+  });
 }
 
 async function liveStation() {

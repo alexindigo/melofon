@@ -299,7 +299,9 @@ export interface Player {
   queue(): { version: number; items: QueueEntry[] };
   queueSnapshot(): QueueSnapshot;
   /** Publish newly resolved facts at activation, never on station CRUD. */
-  replaceMedia(index: number, media: QueueMedia): void;
+  replaceOccurrence(entryId: number, media: QueueMedia): boolean;
+  /** Start exactly this occurrence, independent of its current position. */
+  playOccurrence(entryId: number): void;
   /** Appends — or inserts at 0-based `position` (OwnTone queue add
    * semantics: omit = append). Inserting at/before the current item shifts
    * it so it stays current. */
@@ -830,11 +832,17 @@ export function createPlayer(options: {
         })),
       };
     },
-    replaceMedia(index, media) {
-      items = items.map((entry, at) =>
-        at === index ? { ...media, id: entry.id } : entry
+    replaceOccurrence(entryId, media) {
+      if (!items.some((entry) => entry.id === entryId)) return false;
+      items = items.map((entry) =>
+        entry.id === entryId ? { ...media, id: entryId } : entry
       );
       version++;
+      return true;
+    },
+    playOccurrence(entryId) {
+      const at = items.findIndex((entry) => entry.id === entryId);
+      if (at >= 0) startAt(at);
     },
 
     queueAdd(songs, position) {
