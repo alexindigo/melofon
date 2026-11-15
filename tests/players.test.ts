@@ -95,6 +95,7 @@ Deno.test('registry startup rollback joins all engines after a sibling release f
   const held = new Promise<void>((resolve) => finish = resolve);
   let entered!: () => void;
   const disposing = new Promise<void>((resolve) => entered = resolve);
+  const firstFailed = Promise.withResolvers<void>();
   let siblingReleased = false;
   let settled = false;
   const starting = household(store, {
@@ -103,6 +104,7 @@ Deno.test('registry startup rollback joins all engines after a sibling release f
       if (id === 1) {
         playback.close = async () => {
           await close();
+          firstFailed.resolve();
           throw new Error('first engine release failed');
         };
       }
@@ -130,9 +132,7 @@ Deno.test('registry startup rollback joins all engines after a sibling release f
     'Player startup rollback failed',
   );
   try {
-    await disposing;
-    // Let the failing sibling finish before checking the held engine is joined.
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await Promise.all([disposing, firstFailed.promise]);
     assertEquals(settled, false);
     finish();
     await rejected;

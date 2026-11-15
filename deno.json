@@ -10,7 +10,7 @@
     "fmt": "deno fmt",
     "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys --node-modules-dir=auto --watch main.ts",
     "start": "deno --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys --node-modules-dir=auto main.ts",
-    "test": "deno test --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys --node-modules-dir=auto tests/*.ts"
+    "test": "deno test --env --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys --allow-run --node-modules-dir=auto tests/*.ts"
   },
   "imports": {
     "#melofon/": "./layers/melofon/",

@@ -1,4 +1,5 @@
 import type { Store } from '../store/index.ts';
+import { createReleaseSet, releaseOrThrow } from '../releases.ts';
 import { dirname, resolve } from 'node:path';
 import type { LookupInput, LookupJob } from '../store/lookups.ts';
 import type { CandidateInput } from '../store/candidates.ts';
@@ -146,13 +147,16 @@ export async function createLookupRunner(options: {
     options.builtin ?? 'lookups',
     options.dataDir,
   );
-  const hosts = plugins.map((p) =>
-    new LookupHost(p, network, {
+  const releases = createReleaseSet();
+  const hosts = plugins.map((p) => {
+    const host = new LookupHost(p, network, {
       log,
       onStateChange: () =>
         options.notify?.emit(['plugins'], { plugins: [p.id] }, 'admins'),
-    })
-  );
+    });
+    releases.add(`host:${p.id}`, () => host.stop(), 20);
+    return host;
+  });
   for (const plugin of plugins) {
     const prefix = `lookups.plugin.${plugin.id}`;
     state.declare(
@@ -176,6 +180,7 @@ export async function createLookupRunner(options: {
   const shutdown = new AbortController();
   const busy = new Map<LookupHost | string, Promise<void>>();
   let configuration = Promise.resolve();
+  releases.add('configuration', () => configuration, 10);
   const revisions = new Map<LookupHost, number>();
   let intake = Promise.resolve();
   const numeric = async (key: keyof typeof declarations) =>
@@ -201,7 +206,7 @@ export async function createLookupRunner(options: {
       intersectHosts(manifest.network.hosts, approved),
       settings,
     );
-    if (enabled) {
+    if (enabled && !closed && revisions.get(host) === revision) {
       void host.start().catch((error) =>
         log.event('lookup_failed', { plugin: manifest.id, error })
       );
@@ -228,8 +233,9 @@ export async function createLookupRunner(options: {
       scheduleConfiguration(host);
     }
   });
-  // Finish fallible startup store work before starting Workers or pollers.
-  // No returned lifecycle port exists yet to own rollback of those children.
+  releases.add('settings subscription', unsubscribeState);
+  // Settings can start hosts during these awaits. The same acquired releases
+  // own startup rollback and normal shutdown, including queued configuration.
   const housekeeping = async () => {
     await store.lookups.purgeDone(
       Date.now() - await numeric('doneRetentionDays') * 86400000,
@@ -240,7 +246,8 @@ export async function createLookupRunner(options: {
     await store.lookups.resetActive();
     await housekeeping();
   } catch (error) {
-    unsubscribeState();
+    closed = true;
+    await releaseOrThrow(releases, 'Lookup startup rollback failed', { error });
     throw error;
   }
   for (const host of hosts) scheduleConfiguration(host);
@@ -647,6 +654,7 @@ export async function createLookupRunner(options: {
   const unsubscribeNotify = options.notify?.subscribe((types) => {
     if (types.includes('database')) void queueIntake('missing').catch(() => {});
   });
+  if (unsubscribeNotify) releases.add('notify subscription', unsubscribeNotify);
   const reference = createReference({
     store,
     state,
@@ -699,12 +707,18 @@ export async function createLookupRunner(options: {
     },
   });
   const poll = setInterval(pump, 50);
+  releases.add('poll timer', () => clearInterval(poll));
   let cleanup = Promise.resolve();
   const daily = setInterval(() => {
     cleanup = cleanup.then(housekeeping).catch((error) =>
       log.event('lookup_failed', { plugin: 'runner', error })
     );
   }, 86400000);
+  releases.add('housekeeping timer', () => clearInterval(daily));
+  releases.add('runner work', async () => {
+    await Promise.all([intake, cleanup, ...busy.values()]);
+  }, 30);
+  let closing: Promise<void> | undefined;
   return {
     hosts,
     /** A projection of the existing hosts, not a second lifecycle registry. */
@@ -762,16 +776,17 @@ export async function createLookupRunner(options: {
     ) {
       return queueIntake(mode, target);
     },
-    async close() {
-      if (closed) return;
+    close() {
+      if (closing) return closing;
+      const completion = Promise.withResolvers<void>();
+      closing = completion.promise;
       closed = true;
-      clearInterval(poll);
-      clearInterval(daily);
-      unsubscribeState();
-      unsubscribeNotify?.();
-      await Promise.all(hosts.map((host) => host.stop()));
       shutdown.abort(new Error('Lookup runner closed'));
-      await Promise.all([configuration, intake, cleanup, ...busy.values()]);
+      void releaseOrThrow(releases, 'Lookup runner shutdown failed').then(
+        () => completion.resolve(),
+        completion.reject,
+      );
+      return closing;
     },
   };
 }
