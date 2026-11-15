@@ -15,6 +15,7 @@
 // repeat/consume modes — "no auto-advance" was fine for a queue-less mirror,
 // it is a lie with boots attached (HA extrapolates past the end).
 import type { SongRow } from './library.ts';
+import type { PublishedCommandPort } from './save-receipt.ts';
 import {
   catalogMedia,
   queueCapabilities,
@@ -151,6 +152,8 @@ export interface PlayerPersistence {
   saveCommand?(atMs: number): void;
   /** Player slider, independent of the playback bookmark and speaker levels. */
   saveVolume?(volume: number): void;
+  /** Household publication and save receipts, shared with membership/copies. */
+  publishedCommands?: PublishedCommandPort;
   /** Capture a synchronous slider/speaker publication in one durable write. */
   changeVolume?(change: () => void): Promise<void>;
 }

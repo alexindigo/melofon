@@ -19,10 +19,12 @@ import type { QueueSnapshot } from './queue-source.ts';
 import type { PlayerSave } from './store/players.ts';
 import type { AdoptedSpeakerSnapshot } from './store/speakers.ts';
 import type { State } from './state.ts';
+import type { PublishedCommandPort } from './save-receipt.ts';
 
 export type { PersistedPlayerState } from './store/playback.ts';
 
 export interface EnginePersistence extends PlayerPersistence {
+  publishedCommands: PublishedCommandPort;
   /** Ordered occurrences, durable allocator and revision, without runtime facts. */
   loadQueue(): Promise<QueueSnapshot>;
   /** The player's state row, or null when never persisted. */
@@ -34,15 +36,14 @@ export interface EnginePersistence extends PlayerPersistence {
 }
 
 export interface Persistence extends PlayerPersistence, OutputPersistence {
+  publishedCommands: PublishedCommandPort;
   loadQueue(): Promise<QueueSnapshot>;
   loadPlayerState(): Promise<PersistedPlayerState | null>;
   /** Engine ports share the household write tail, never the output cache. */
   forPlayer(playerId: number): EnginePersistence;
-  /** Capture a synchronous membership publication and its induced engine pauses
-   * as one semantic store write, ordered with all other household writes. */
+  /** Compatibility facade for existing captured-publication callers. */
   changeMemberships<T>(change: () => T): Promise<T>;
-  /** Capture a synchronous multi-player command in the same household transaction.
-   * Once published, the command succeeds even if its queued save must retry. */
+  /** Compatibility facade; new consumers use publishedCommands. */
   changePlayers<T>(change: () => T): Promise<T>;
   /** Adopted output preferences only (also seeds the savedOutput cache). */
   loadOutputs(): Promise<PersistedOutput[]>;
@@ -124,7 +125,11 @@ export function createPersistence(
   let policyWork = state ? loadPolicy() : Promise.resolve();
   // Includes published batches still waiting to enter the retry queue on tail.
   let acceptedWrites = 0;
-  const pendingWrites: { save(): Promise<void>; target: string }[] = [];
+  const pendingWrites: {
+    save(): Promise<void>;
+    target: string;
+    saved(): void;
+  }[] = [];
   const cancelRetry = () => {
     retryEpoch++;
     retryTimer?.cancel();
@@ -144,9 +149,10 @@ export function createPersistence(
     cancelRetry();
     while (pendingWrites.length) {
       await pendingWrites[0].save();
-      pendingWrites.shift();
+      const batch = pendingWrites.shift()!;
       acceptedWrites--;
       retryAttempt = 0;
+      batch.saved();
     }
   };
   const observe = (write: Promise<void>) => {
@@ -158,21 +164,29 @@ export function createPersistence(
     observe(write);
     return write;
   };
-  const enqueue = (write: () => Promise<void>, target: string): void => {
+  const admit = () => {
     requireOpen();
     acceptedWrites++;
+    return Promise.withResolvers<void>();
+  };
+  const enqueue = (
+    write: () => Promise<void>,
+    target: string,
+    receipt = admit(),
+  ) => {
     const work = tail.then(async () => {
       // Published intent succeeds independently of storage. Retain every whole
       // batch behind its predecessors; this owner wakes itself when idle.
-      pendingWrites.push({ save: write, target });
+      pendingWrites.push({ save: write, target, saved: receipt.resolve });
       await retryWrites();
     });
     observe(work);
+    return { attempted: tail, saved: receipt.promise };
   };
   const outputCache = new Map<string, PersistedOutput>();
   const outputRevisions = new Map<string, number>();
   const ignored = new Set<string>();
-  let membershipChange: {
+  let publication: {
     players: Map<number, PlayerSave>;
     outputs: Map<string, AdoptedSpeakerSnapshot>;
   } | undefined;
@@ -181,13 +195,13 @@ export function createPersistence(
       Object.keys(row).filter((key) => key !== 'playerId').sort().join(',')
     })`;
   const savePlayer = (row: PlayerSave, save = enqueue) => {
-    requireOpen();
-    if (membershipChange) {
-      membershipChange.players.set(row.playerId, {
-        ...membershipChange.players.get(row.playerId),
+    if (publication) {
+      publication.players.set(row.playerId, {
+        ...publication.players.get(row.playerId),
         ...row,
       });
     } else {
+      requireOpen();
       save(
         () => store.players.saveChanges({ players: [row] }),
         `player:${playerTarget(row)}`,
@@ -212,7 +226,7 @@ export function createPersistence(
       saveQueue(snapshot, state) {
         if (!active) return;
         const copy = structuredClone(snapshot);
-        if (membershipChange) savePlayer({ playerId, queue: copy, state });
+        if (publication) savePlayer({ playerId, queue: copy, state });
         else {
           save(
             () => store.playback.saveQueue(playerId, copy, state),
@@ -222,7 +236,7 @@ export function createPersistence(
       },
       saveState(snapshot) {
         if (!active) return;
-        if (membershipChange) {
+        if (publication) {
           savePlayer({ playerId, state: structuredClone(snapshot) });
         } else {
           save(
@@ -239,7 +253,9 @@ export function createPersistence(
       saveVolume(volume) {
         if (active) savePlayer({ playerId, volume }, save);
       },
-      changeVolume: (change) => changePlayers(change),
+      publishedCommands,
+      changeVolume: async (change) =>
+        await publishedCommands.publish(change).command,
       loadQueue: () => store.playback.loadQueue(playerId),
       loadPlayerState: () => store.playback.loadPlayerState(playerId),
       drain,
@@ -253,42 +269,49 @@ export function createPersistence(
       },
     };
   };
-  const home = forPlayer(1);
-
-  const changePlayers = async <T>(change: () => T): Promise<T> => {
-    requireOpen();
-    if (membershipChange) throw new Error('Nested membership change');
-    const batch = {
-      players: new Map<number, PlayerSave>(),
-      outputs: new Map<string, AdoptedSpeakerSnapshot>(),
-    };
-    membershipChange = batch;
-    let result;
-    try {
-      result = change();
-    } finally {
-      membershipChange = undefined;
-    }
-    // Capture happens without an await: older snapshots finish first, and
-    // subsequent preference/bookmark writes necessarily follow this commit.
-    const commit = () =>
-      store.players.saveChanges({
+  const publishedCommands: PublishedCommandPort = {
+    publish<T>(change: () => T) {
+      requireOpen();
+      if (publication) throw new Error('Nested membership change');
+      // Reserve before calling user code, including reentrant health/close.
+      // Closing intake cannot turn an already-admitted publication into failure.
+      const receipt = admit();
+      const batch = {
+        players: new Map<number, PlayerSave>(),
+        outputs: new Map<string, AdoptedSpeakerSnapshot>(),
+      };
+      publication = batch;
+      let value: T;
+      try {
+        value = change();
+      } catch (error) {
+        acceptedWrites--;
+        throw error;
+      } finally {
+        publication = undefined;
+      }
+      // Capture without an await. Retried values cannot follow later mutation
+      // of a caller's state object, nor replay any runtime command.
+      const changes = structuredClone({
         players: [...batch.players.values()],
         outputs: [...batch.outputs.values()],
       });
-    enqueue(
-      commit,
-      `players:${
-        [...batch.players.values()].map(playerTarget).join(',')
-      } speakers:${[...batch.outputs.keys()].join(',')}`,
-    );
-    // The change is already published. A durable failure is logged and stays
-    // in the ordered queue, not returned as a retryable command failure.
-    await tail;
-    return result;
+      const save = enqueue(
+        () => store.players.saveChanges(changes),
+        `players:${changes.players.map(playerTarget).join(',')} speakers:${
+          changes.outputs.map((row) => row.id).join(',')
+        }`,
+        receipt,
+      );
+      return { command: save.attempted.then(() => value), saved: save.saved };
+    },
   };
+  const home = forPlayer(1);
+  const changePlayers = async <T>(change: () => T): Promise<T> =>
+    await publishedCommands.publish(change).command;
   return {
     forPlayer,
+    publishedCommands,
     changeMemberships: changePlayers,
     changePlayers,
     saveQueue: home.saveQueue,
@@ -299,7 +322,9 @@ export function createPersistence(
     loadPlayerState: home.loadPlayerState,
 
     saveOutput(row) {
-      requireOpen();
+      // A synchronous capture already owns admission, even if an observer
+      // closes intake midway through its publication.
+      if (!publication) requireOpen();
       // Only explicit adoption (or an adopted row loaded at boot) authorizes
       // preferences to reach disk. A temporary selection cannot mint a row.
       if (!outputCache.has(row.id)) return;
@@ -308,8 +333,8 @@ export function createPersistence(
       );
       row = { ...row, connectionStrategy };
       outputCache.set(row.id, row);
-      if (membershipChange) {
-        membershipChange.outputs.set(row.id, { ...row, connectionStrategy });
+      if (publication) {
+        publication.outputs.set(row.id, { ...row, connectionStrategy });
       } else {
         enqueue(
           () => store.playback.saveOutput({ ...row, connectionStrategy }),

@@ -283,7 +283,7 @@ export async function createPlayers(deps: {
       ? engine.capacity.reserve()
       : undefined;
     try {
-      return deps.persistence.changeMemberships(() => {
+      return deps.persistence.publishedCommands.publish(() => {
         const previous = new Set(
           deps.outputs.list().filter((row) =>
             outputPlayerId(row) === id || ids.includes(row.id)
@@ -305,7 +305,7 @@ export async function createPlayers(deps: {
           if (engine && !engine.disposing) engine.playback.checkpoint();
         }
         return true;
-      });
+      }).command;
     } finally {
       reservation?.release();
     }
@@ -416,9 +416,9 @@ export async function createPlayers(deps: {
         if (!speaker || outputPlayerId(speaker) !== id) {
           throw new SpeakerError('not_found', 'Player speaker not found');
         }
-        await deps.persistence.changePlayers(() => {
+        await deps.persistence.publishedCommands.publish(() => {
           deps.outputs.update(speakerId, { linked }, source);
-        });
+        }).command;
       }),
     setSpeakers: (id: number, ids: string[], source?: CommandSource) =>
       mutate(() => changeMembers(id, ids, source)),
@@ -478,10 +478,10 @@ export async function createPlayers(deps: {
           throw new PlayerError('same_player', 'Choose another player');
         }
         await to.queueImport(from.queueCopyView(), opts, source, (change) =>
-          deps.persistence.changePlayers(() => {
+          deps.persistence.publishedCommands.publish(() => {
             change();
             from.queueCopied(targetId, source);
-          }));
+          }).command);
       }),
     defaultId: () => defaultEngine().row.id,
     serverRows: () =>
@@ -559,12 +559,12 @@ export async function createPlayers(deps: {
           engines.delete(id);
           // Always mirror the committed delete in runtime ownership, even if
           // disposal failed. The household owner retains any unsaved batch.
-          await deps.persistence.changeMemberships(() =>
+          await deps.persistence.publishedCommands.publish(() =>
             deps.outputs.setMembers(id, [], {
               kind: 'internal',
               via: 'player-delete',
             })
-          );
+          ).command;
           changed(id);
           deps.notify.emit(['outputs', 'nowPlaying'], undefined, 'all');
         }

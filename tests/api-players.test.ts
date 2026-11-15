@@ -181,6 +181,103 @@ async function setup(beforePrepare?: () => Promise<void>) {
   };
 }
 
+Deno.test('membership, queue copy and linked volume succeed once while their whole save batches recover in order', async () => {
+  const t = await setup();
+  let fail = false;
+  const original = t.f.store.players.saveChanges;
+  const attempts: Parameters<typeof original>[0][] = [];
+  try {
+    const { credential } = await t.f.login('bearer');
+    const kitchen = await t.players.create('Kitchen');
+    await t.addSpeaker('receipt-speaker');
+    await t.players.get(1).queueAdd(t.songs);
+    await t.persistence.drain();
+    const before = await t.f.store.playback.loadQueue(kitchen.id);
+    t.f.store.players.saveChanges = async (changes) => {
+      attempts.push(structuredClone(changes));
+      if (fail) throw new Error('published storage unavailable');
+      await original(changes);
+    };
+    fail = true;
+    await t.command(
+      `/api/v1/players/${kitchen.id}/speakers/receipt-speaker`,
+      'PUT',
+      credential,
+      {},
+    );
+    await t.command('/api/v1/players/1/queue/copy/add', 'POST', credential, {
+      targetPlayerId: kitchen.id,
+    });
+    await t.command(`/api/v1/players/${kitchen.id}/volume`, 'PUT', credential, {
+      volume: 60,
+    });
+    const runtime = t.players.get(kitchen.id).queueView();
+    assertEquals(runtime.items.length, t.songs.length);
+    assertEquals(t.outputs.get('receipt-speaker')!.playerId, kitchen.id);
+    assertEquals(t.outputs.get('receipt-speaker')!.volume, 52);
+    assertEquals(
+      (await t.read(`/api/v1/players/${kitchen.id}`, credential)).player.volume,
+      60,
+    );
+    const unhealthy = await t.f.request('/_/health');
+    assertEquals(unhealthy.status, 503);
+    assertEquals(await unhealthy.json(), {
+      ok: false,
+      persistence: { pendingWrites: 3 },
+    });
+    assertEquals(
+      (await t.f.store.playback.loadQueue(kitchen.id)).items,
+      before.items,
+    );
+    assertEquals(
+      (await t.f.store.speakers.loadMemberships())[0].playerId,
+      null,
+    );
+    assert(attempts.length >= 3);
+    assert(
+      attempts.every((batch) =>
+        JSON.stringify(batch) === JSON.stringify(attempts[0])
+      ),
+    );
+    const retryStart = attempts.length;
+    fail = false;
+    await t.persistence.drain();
+    assertEquals(attempts.length, retryStart + 3);
+    const [membership, copy, volume] = attempts.slice(retryStart);
+    assertEquals(membership, attempts[0]);
+    assertEquals(membership.outputs![0].playerId, kitchen.id);
+    assertEquals(membership.outputs![0].volume, 42);
+    assertEquals(
+      copy.players!.find((p) => p.playerId === kitchen.id)!.queue!.items.map((
+        e,
+      ) => e.id),
+      runtime.items.map((e) => e.id),
+    );
+    assertEquals(volume.players![0].volume, 60);
+    assertEquals(volume.outputs![0].volume, 52);
+    assertEquals(
+      (await t.f.store.playback.loadQueue(kitchen.id)).items.map((e) => e.id),
+      runtime.items.map((e) => e.id),
+    );
+    assertEquals(t.players.get(kitchen.id).queueView(), runtime);
+    assertEquals(
+      (await t.f.store.players.list()).find((p) => p.id === kitchen.id)!.volume,
+      60,
+    );
+    assertEquals((await t.f.store.speakers.loadAdopted())[0].volume, 52);
+    assertEquals(
+      (await t.f.store.speakers.loadMemberships())[0].playerId,
+      kitchen.id,
+    );
+    const healthy = await t.f.request('/_/health');
+    assertEquals(healthy.status, 200);
+    assertEquals(await healthy.json(), { ok: true });
+  } finally {
+    fail = false;
+    await t.close();
+  }
+});
+
 Deno.test('volume HTTP moves only linked members, clips and persists absolute levels for cookie and Bearer users', async () => {
   const t = await setup();
   try {

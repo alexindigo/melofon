@@ -1347,7 +1347,9 @@ export function createPlayback(deps: {
           );
           emit(['volume']);
         };
-        return persistence?.changeVolume
+        return persistence?.publishedCommands
+          ? persistence.publishedCommands.publish(change).command
+          : persistence?.changeVolume
           ? persistence.changeVolume(change)
           : change();
       }),

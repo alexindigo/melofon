@@ -253,7 +253,8 @@ async function startServerRuntime(
   const speakers = createSpeakers({
     outputs,
     state,
-    changePreferences: persistence.changePlayers,
+    changePreferences: (change) =>
+      persistence.publishedCommands.publish(change).command,
     prepare: airplay.preparePlayback,
     registerAddress: airplay.registerAddress,
     adapterView: airplay.describe,
