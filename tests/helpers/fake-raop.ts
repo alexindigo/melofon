@@ -59,7 +59,27 @@ export interface FakeRaopRequest {
   method: string;
   cseq: string;
   atMs: number;
+  /** Only the non-secret scheduling header, never authentication headers. */
+  rtpInfo?: string;
 }
+
+export interface RaopEndpoint {
+  address: string;
+  port: number;
+}
+
+/** Raw wire evidence on one receiver-local monotonic clock. Arrival is not play. */
+export type RaopWireEvent =
+  | {
+    kind: 'audio' | 'control' | 'timing-request' | 'timing-reply';
+    atMs: number;
+    data: Uint8Array;
+    peer: RaopEndpoint;
+    local: RaopEndpoint;
+  }
+  | { kind: 'record'; atMs: number; rtpInfo: string; latencyFrames: number }
+  | { kind: 'flush'; atMs: number; rtpInfo: string }
+  | { kind: 'teardown' | 'close'; atMs: number };
 
 export interface FakeRaopSession {
   /** The Session ID this receiver handed the connection at SETUP. */
@@ -84,6 +104,14 @@ export interface FakeRaopSession {
   /** Methods that passed the optional digest barrier; never stores headers. */
   acceptedRequests: string[];
   authChallenges: number;
+  endpoints: {
+    audio: RaopEndpoint;
+    control: RaopEndpoint;
+    timing: RaopEndpoint;
+    senderControl?: RaopEndpoint;
+    senderTiming?: RaopEndpoint;
+  } | null;
+  wire: RaopWireEvent[];
 }
 
 export interface FakeRaop {
@@ -91,6 +119,9 @@ export interface FakeRaop {
   sessions: FakeRaopSession[];
   close(): void;
   requestRetransmit(id: string): void;
+  requestTiming(id: string): void;
+  /** Same clock as wire.atMs, for scheduled snapshots. */
+  nowMs(): number;
 }
 
 let sessionSeq = 0;
@@ -102,6 +133,8 @@ export function startFakeRaop(
     withholdTeardownReply?: boolean;
     flushDelayMs?: number;
     captureAudio?: boolean;
+    /** Lossless raw scheduling evidence, separate from legacy arrival capture. */
+    captureWire?: boolean;
     refuseRecord?: () => boolean;
     digest?: { password: string; realm?: string };
     /** Test barrier for inspecting restored native input before fake rejection.
@@ -113,6 +146,7 @@ export function startFakeRaop(
   const sockets: { close(): void }[] = [];
   const conns: Deno.TcpConn[] = [];
   const retransmits = new Map<string, () => void>();
+  const timingRequests = new Map<string, () => void>();
   const bindAddress = '127.0.0.1';
   const started = performance.now();
   const now = () => performance.now() - started;
@@ -149,6 +183,8 @@ export function startFakeRaop(
       rtpSequences: [],
       acceptedRequests: [],
       authChallenges: 0,
+      endpoints: null,
+      wire: [],
     };
     sessions.push(session);
 
@@ -165,6 +201,31 @@ export function startFakeRaop(
     const udp = await bindUdp();
     const control = await bindUdp();
     const timing = await bindUdp();
+    const endpoint = (socket: dgram.Socket): RaopEndpoint => ({
+      address: socket.address().address,
+      port: socket.address().port,
+    });
+    session.endpoints = {
+      audio: endpoint(udp),
+      control: endpoint(control),
+      timing: endpoint(timing),
+    };
+    const capture = (
+      kind: 'audio' | 'control' | 'timing-reply',
+      msg: Uint8Array,
+      peer: dgram.RemoteInfo,
+      socket: dgram.Socket,
+    ) => {
+      if (opts.captureWire) {
+        session.wire.push({
+          kind,
+          atMs: now(),
+          data: Uint8Array.from(msg),
+          peer: { address: peer.address, port: peer.port },
+          local: endpoint(socket),
+        });
+      }
+    };
     const recordPeer = (
       observations: FakeRaopSession['rtpSenders'],
       peer: dgram.RemoteInfo,
@@ -180,15 +241,22 @@ export function startFakeRaop(
     };
     control.on(
       'message',
-      (_msg, peer) => recordPeer(session.controlSenders, peer),
+      (msg, peer) => {
+        recordPeer(session.controlSenders, peer);
+        capture('control', msg, peer, control);
+      },
     );
     timing.on(
       'message',
-      (_msg, peer) => recordPeer(session.timingSenders, peer),
+      (msg, peer) => {
+        recordPeer(session.timingSenders, peer);
+        capture('timing-reply', msg, peer, timing);
+      },
     );
     const audioPort = udp.address().port;
     udp.on('message', (msg, peer) => {
       if (opts.digest && !recording) return;
+      capture('audio', msg, peer, udp);
       if (msg.length < 12 || (msg[1] & 0x7f) !== 96) return;
       recordPeer(session.rtpSenders, peer);
       session.audioPackets++;
@@ -223,6 +291,9 @@ export function startFakeRaop(
       } finally {
         ended = true;
         session.closedAtMs ??= now();
+        if (opts.captureWire) {
+          session.wire.push({ kind: 'close', atMs: session.closedAtMs });
+        }
         wake?.();
         wake = undefined;
       }
@@ -275,7 +346,15 @@ export function startFakeRaop(
         buf = buf.subarray(headLen + clen);
 
         const cseq = headers.get('cseq') ?? '0';
-        session.requests.push({ method, cseq, atMs: now() });
+        const atMs = now();
+        session.requests.push({
+          method,
+          cseq,
+          atMs,
+          ...((method === 'RECORD' || method === 'FLUSH')
+            ? { rtpInfo: headers.get('rtp-info') ?? '' }
+            : {}),
+        });
         if (
           opts.digest && !validDigest(
             headers.get('authorization') ?? '',
@@ -307,10 +386,20 @@ export function startFakeRaop(
         if (method === 'SET_PARAMETER' && body.startsWith('volume')) {
           session.volumeParams.push(body.trim());
         }
-        if (method === 'FLUSH') session.flushes++;
+        if (method === 'FLUSH') {
+          session.flushes++;
+          if (opts.captureWire) {
+            session.wire.push({
+              kind: 'flush',
+              atMs,
+              rtpInfo: headers.get('rtp-info') ?? '',
+            });
+          }
+        }
         if (method === 'TEARDOWN') {
           session.teardowns++;
           recording = false;
+          if (opts.captureWire) session.wire.push({ kind: 'teardown', atMs });
         }
         if (method === 'TEARDOWN' && opts.withholdTeardownReply) continue;
         const delay = method === 'FLUSH' ? opts.flushDelayMs : undefined;
@@ -336,6 +425,37 @@ export function startFakeRaop(
           const controlPort = Number(
             transport.match(/control_port=(\d+)/)?.[1],
           );
+          const timingPort = Number(transport.match(/timing_port=(\d+)/)?.[1]);
+          session.endpoints!.senderControl = {
+            address: session.rtspPeer.address,
+            port: controlPort,
+          };
+          session.endpoints!.senderTiming = {
+            address: session.rtspPeer.address,
+            port: timingPort,
+          };
+          let timingSequence = 0;
+          timingRequests.set(session.id, () => {
+            if (!timingPort) return;
+            const request = new Uint8Array(32);
+            const view = new DataView(request.buffer);
+            request.set([0x80, 0xd2, ++timingSequence & 0xff, 0]);
+            const sentAt = now();
+            // A receiver-local NTP clock with an arbitrary epoch. The consumer
+            // measures the sender offset from the reply, not from process time.
+            view.setUint32(24, 2208988800 + Math.floor(sentAt / 1000));
+            view.setUint32(28, Math.floor((sentAt % 1000) / 1000 * 2 ** 32));
+            if (opts.captureWire) {
+              session.wire.push({
+                kind: 'timing-request',
+                atMs: sentAt,
+                data: request,
+                peer: session.endpoints!.senderTiming!,
+                local: endpoint(timing),
+              });
+            }
+            timing.send(request, timingPort, session.rtspPeer.address);
+          });
           retransmits.set(session.id, () => {
             const sequence = session.rtpSequences.at(-1);
             if (!controlPort || sequence === undefined) return;
@@ -348,6 +468,14 @@ export function startFakeRaop(
         } else if (method === 'RECORD') {
           recording = !opts.refuseRecord?.();
           extra = 'Audio-Latency: 11025\r\n';
+          if (opts.captureWire && recording) {
+            session.wire.push({
+              kind: 'record',
+              atMs,
+              rtpInfo: headers.get('rtp-info') ?? '',
+              latencyFrames: 11025,
+            });
+          }
         }
         await conn.write(
           encoder.encode(
@@ -356,6 +484,9 @@ export function startFakeRaop(
             }\r\nCSeq: ${cseq}\r\n${extra}Server: fake-raop\r\nContent-Length: 0\r\n\r\n`,
           ),
         );
+        if (method === 'SETUP' && opts.captureWire) {
+          timingRequests.get(session.id)?.();
+        }
       }
     } catch {
       /* client went away */
@@ -381,8 +512,13 @@ export function startFakeRaop(
     requestRetransmit(id) {
       retransmits.get(id)?.();
     },
+    requestTiming(id) {
+      timingRequests.get(id)?.();
+    },
+    nowMs: now,
     close() {
       retransmits.clear();
+      timingRequests.clear();
       try {
         tcp.close();
       } catch { /* already closed */ }
