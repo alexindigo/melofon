@@ -2,7 +2,9 @@ import type { Output, Outputs } from './player.ts';
 
 /** Physical identity/lifecycle stays household-owned. Only target selection is
  * projected for an engine; a boot keeps this fixed scope for its whole life. */
-export function outputPlayerId(row: Output): number | null {
+export function outputPlayerId(
+  row: Pick<Output, 'playerId' | 'selected'>,
+): number | null {
   return row.playerId === undefined ? (row.selected ? 1 : null) : row.playerId;
 }
 

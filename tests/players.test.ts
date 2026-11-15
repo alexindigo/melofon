@@ -1304,6 +1304,106 @@ for (const result of ['committed', 'refused'] as const) {
   });
 }
 
+for (const path of ['captured', 'ordinary', 'adoption'] as const) {
+  for (const result of ['committed', 'refused'] as const) {
+    Deno.test(`legacy membership ${path} save during ${result} player deletion preserves household persistence`, async () => {
+      const dir = await dataDir(), store = await openStore(dir);
+      const entered = Promise.withResolvers<void>(),
+        release = Promise.withResolvers<void>();
+      const f = await household({
+        ...store,
+        players: {
+          ...store.players,
+          async delete(id) {
+            if (result === 'committed') await store.players.delete(id);
+            entered.resolve();
+            await release.promise;
+            if (result === 'refused') throw new Error('delete refused');
+          },
+        },
+      });
+      let pending: Promise<unknown> | undefined;
+      try {
+        const kitchen = await f.players.create('Kitchen');
+        await f.players.setDefault(kitchen.id);
+        f.outputs.register({
+          id: 'legacy-delete',
+          name: 'Legacy speaker',
+          type: 'Test',
+          selected: true,
+          volume: 40,
+        });
+        if (path !== 'adoption') await f.outputs.adopt('legacy-delete');
+        assertEquals(f.outputs.get('legacy-delete')?.playerId, undefined);
+        assertEquals(f.outputs.get('legacy-delete')?.selected, true);
+        assertEquals(
+          (await store.speakers.loadMemberships()).map((row) => row.playerId),
+          path === 'adoption' ? [] : [1],
+        );
+        const engine = f.players.get(1);
+        pending = f.players.delete(1).then(() => null, (error) => error);
+        await entered.promise;
+        let update: Promise<unknown>;
+        if (path === 'captured') {
+          update = Promise.resolve(engine.setVolume({ volume: 67 }));
+        } else if (path === 'ordinary') {
+          f.outputs.update('legacy-delete', { volume: 58 });
+          update = Promise.resolve();
+        } else update = f.outputs.adopt('legacy-delete');
+        const updated = update.then(() => null, (error) => error);
+        const otherVolume = f.players.get(kitchen.id).setVolume({ volume: 73 });
+        engine.setRepeat('all');
+        release.resolve();
+        const error = await pending;
+        assertEquals(
+          await updated,
+          null,
+          'the output save must not be refused',
+        );
+        await otherVolume;
+        if (result === 'refused') {
+          assert(error instanceof Error);
+          assertEquals(error.message, 'delete refused');
+          assertEquals(f.players.get(1), engine);
+        } else {
+          assertEquals(error, null);
+          assertThrows(() => f.players.get(1), PlayerError, 'not found');
+          assertEquals(f.players.freeSpeakers().map((row) => row.id), [
+            'legacy-delete',
+          ]);
+        }
+        await f.persistence.drain();
+        assertEquals(f.persistence.health(), { pendingWrites: 0 });
+        const players = await store.players.list();
+        assertEquals(players.find((row) => row.id === kitchen.id)?.volume, 73);
+        assertEquals(players.some((row) => row.id === 1), result === 'refused');
+        assertEquals(
+          (await store.speakers.loadAdopted())[0].volume,
+          path === 'captured' ? 57 : path === 'ordinary' ? 58 : 40,
+        );
+        assertEquals(
+          (await store.speakers.loadMemberships())[0].playerId,
+          result === 'refused' ? 1 : null,
+        );
+        if (result === 'refused') {
+          assertEquals(
+            (await store.playback.loadPlayerState(1))?.repeat,
+            'all',
+          );
+        }
+      } finally {
+        release.resolve();
+        await pending;
+        await f.players.close().catch(() => {});
+        await f.reports.close();
+        await f.persistence.close().catch(() => {});
+        await store.close();
+        await Deno.remove(dir, { recursive: true });
+      }
+    });
+  }
+}
+
 Deno.test('published player deletion releases runtime membership despite another player save failing during disposal', async () => {
   const dir = await dataDir();
   const store = await openStore(dir);

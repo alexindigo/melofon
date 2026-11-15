@@ -20,6 +20,7 @@ import type { PlayerSave } from './store/players.ts';
 import type { AdoptedSpeakerSnapshot } from './store/speakers.ts';
 import type { State } from './state.ts';
 import type { PublishedCommandPort } from './save-receipt.ts';
+import { outputPlayerId } from './player-outputs.ts';
 
 export type { PersistedPlayerState } from './store/playback.ts';
 
@@ -190,11 +191,13 @@ export function createPersistence(
   // snapshots and membership references, not the rest of a published batch.
   const deletedPlayers = new Set<number>();
   const survivingOutput = <
-    T extends { playerId?: number | null; linked?: boolean },
-  >(row: T): T =>
-    row.playerId != null && deletedPlayers.has(row.playerId)
-      ? { ...row, playerId: null, linked: true }
+    T extends Pick<PersistedOutput, 'playerId' | 'selected' | 'linked'>,
+  >(row: T): T => {
+    const playerId = outputPlayerId(row);
+    return playerId !== null && deletedPlayers.has(playerId)
+      ? { ...row, selected: false, playerId: null, linked: true }
       : row;
+  };
   const saveChanges = (changes: {
     players: PlayerSave[];
     outputs: AdoptedSpeakerSnapshot[];
