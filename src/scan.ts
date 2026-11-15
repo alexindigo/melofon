@@ -642,9 +642,9 @@ export async function scanLibrary(
     events,
     retainedIds: [...byId.keys()],
   });
-  check();
   // This invalidates only committed catalog facts, even if later candidate
-  // acquisition fails. Progress and legacy database/update events stay separate.
+  // acquisition fails or is cancelled. Revocation cannot undo the committed write.
+  // Progress and legacy database/update events stay separate.
   options.notify?.emit(['library'], undefined, 'all');
   if (changedLibraries.length) {
     options.notify?.emit(
@@ -653,6 +653,7 @@ export async function scanLibrary(
       'admins',
     );
   }
+  check();
   // Catalog owns album/root eligibility. Hashes are already prepared outside its
   // exclusive slot; candidates own the separate atomic reconciliation.
   const picturesByAlbum = new Map<string, Map<string, LocalVersion>>();

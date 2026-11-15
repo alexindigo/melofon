@@ -443,51 +443,64 @@ export function createHlsCache(
         ...facts,
         ...view,
         release,
-        async segment(index) {
-          if (operations.closed) return null;
-          const segment = view.segments[index];
-          if (!segment || released) return null;
-          // A separate read lease survives release of the playlist's lease.
-          await exclusive(() => {
-            entry.users++;
-          });
-          let done = false;
-          const finish = async () => {
-            if (done) return;
-            done = true;
-            await settleLease(async () => {
-              entry.users--;
-              await prune(root);
+        segment(index) {
+          if (operations.closed) return Promise.resolve(null);
+          return operations.run(async ({ signal }) => {
+            const segment = view.segments[index];
+            if (!segment || released) return null;
+            // A separate read lease survives release of the playlist's lease.
+            const leased = await exclusive(() => {
+              signal.throwIfAborted();
+              if (released) return false;
+              entry.users++;
+              return true;
             });
-          };
-          try {
-            const file = await Deno.open(`${dir}/${segment.name}`);
-            const reader = file.readable.getReader();
-            return new ReadableStream<Uint8Array>({
-              async pull(controller) {
-                try {
-                  const next = await reader.read();
-                  if (next.done) {
+            if (!leased) return null;
+            let done = false;
+            const finish = async () => {
+              if (done) return;
+              done = true;
+              await settleLease(async () => {
+                entry.users--;
+                await prune(root);
+              });
+            };
+            try {
+              signal.throwIfAborted();
+              const file = await Deno.open(`${dir}/${segment.name}`);
+              // The file belongs to acquisition until the stream is published.
+              // Revocation must release it before this operation can settle.
+              if (signal.aborted) {
+                file.close();
+                signal.throwIfAborted();
+              }
+              const reader = file.readable.getReader();
+              return new ReadableStream<Uint8Array>({
+                async pull(controller) {
+                  try {
+                    const next = await reader.read();
+                    if (next.done) {
+                      await finish();
+                      controller.close();
+                    } else controller.enqueue(next.value);
+                  } catch (error) {
                     await finish();
-                    controller.close();
-                  } else controller.enqueue(next.value);
-                } catch (error) {
-                  await finish();
-                  controller.error(error);
-                }
-              },
-              async cancel(reason) {
-                try {
-                  await reader.cancel(reason);
-                } finally {
-                  await finish();
-                }
-              },
-            });
-          } catch (error) {
-            await finish();
-            throw error;
-          }
+                    controller.error(error);
+                  }
+                },
+                async cancel(reason) {
+                  try {
+                    await reader.cancel(reason);
+                  } finally {
+                    await finish();
+                  }
+                },
+              });
+            } catch (error) {
+              await finish();
+              throw error;
+            }
+          });
         },
       };
     } catch {
