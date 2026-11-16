@@ -11,10 +11,13 @@ import { createPersistence } from '../../src/persistence.ts';
 import { createSpeakerCredentials } from '../../src/speaker-credentials.ts';
 import { createSecrets, type Secrets } from '../../src/secrets.ts';
 import { createSpeakers } from '../../src/speakers.ts';
-import { createAirplayDevices } from '../../src/boots/airplay-device.ts';
+import { createRecordingAirplayDevices as createAirplayDevices } from './airplay-devices.ts';
 import { createAirplayBoot } from '../../src/boots/airplay.ts';
 import { createAirplayDiscovery } from '../../src/boots/airplay-mdns.ts';
-import type { AirplaySpawn } from '../../src/boots/airplay-profile.ts';
+import type {
+  AirplaySpawn,
+  AirplayStream,
+} from '../../src/boots/airplay-profile.ts';
 import type { MdnsService } from '../../src/mdns.ts';
 import { createPlayback } from '../../src/playback.ts';
 import { createLibrary } from '../../src/library.ts';
@@ -95,6 +98,7 @@ export async function speakerConsumer(
   options: {
     root?: string;
     spawn?: AirplaySpawn;
+    stream?: () => AirplayStream;
     secrets?: Secrets;
     pairingSeconds?: number;
   } = {},
@@ -141,6 +145,7 @@ export async function speakerConsumer(
         outputs,
         credentials,
         spawn: options.spawn,
+        stream: options.stream,
         changed: () => f.notify!.emit(['outputs'], undefined, 'all'),
         resolver: {
           resolve: (_host, port) => {

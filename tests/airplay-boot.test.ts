@@ -5,7 +5,7 @@
 // re-decodes from the engine position, stop / deselect / unregister tear
 // down, volume and pin reach the helper, and a helper "password" event
 // flips needsAuthKey on the output row.
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createMedia, type Media } from '../src/media.ts';
@@ -649,13 +649,13 @@ Deno.test('catalog events do not move sessions: another device registering leave
     spawned[0].onEvent('state', 'connected');
     spawned[1].onEvent('state', 'connected');
     await until(
-      'PCM from the elected source',
+      'PCM from the player stream',
       () => spawned[0].pcmBytes() > 0,
     );
     assertEquals(
       spawned[1].pcmBytes(),
-      0,
-      'peer never opens a duplicate source',
+      spawned[0].pcmBytes(),
+      'one stream delivers the same PCM to both fake receivers',
     );
 
     // The first link dies. The second is live → no pause (hub keeps playing).
@@ -868,9 +868,14 @@ async function recycleSetup(
     spawned,
     decodeCalls,
     close: async () => {
-      await boot.close();
-      await db.close();
-      await Deno.remove(dir, { recursive: true });
+      try {
+        await boot.close();
+      } finally {
+        devices.close();
+        await playback.close();
+        await db.close();
+        await Deno.remove(dir, { recursive: true });
+      }
     },
   };
 }
@@ -1238,7 +1243,11 @@ Deno.test('ATV3 failure: a failed close blocks the output — visibly, until res
         'the block survived play/reselect/catalog events',
       );
     } finally {
-      await close();
+      await assertRejects(
+        close,
+        AggregateError,
+        'AirPlay playback stream release failed',
+      );
     }
   } finally {
     await log.flush();

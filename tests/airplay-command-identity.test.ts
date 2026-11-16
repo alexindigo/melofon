@@ -4,6 +4,7 @@ import { createPlayback } from '../src/playback.ts';
 import { createNotify } from '../src/notify.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { recordingStream } from './helpers/airplay-devices.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 import type { Media } from '../src/media.ts';
 import type { NowPlaying } from '../src/nowplaying.ts';
@@ -36,7 +37,7 @@ Deno.test('AirPlay failed connected resume retries unchanged demand through PCM 
   });
   const events: HelperEventFn[] = [];
   const timers: { callback(): void; cancelled: boolean }[] = [];
-  const devices = createAirplayDevices({
+  const deviceDeps = {
     outputs,
     resolver: {
       resolve: (host, port) =>
@@ -69,6 +70,10 @@ Deno.test('AirPlay failed connected resume retries unchanged demand through PCM 
         start: () => Promise.resolve(),
       };
     },
+  } satisfies Parameters<typeof createAirplayDevices>[0];
+  const devices = createAirplayDevices({
+    ...deviceDeps,
+    stream: recordingStream(deviceDeps.spawn),
   });
   const boot = createAirplayBoot({
     outputs,
@@ -178,7 +183,7 @@ for (const mode of ['append', 'explicit-off'] as const) {
       },
     });
     const events: HelperEventFn[] = [];
-    const devices = createAirplayDevices({
+    const deviceDeps = {
       outputs,
       resolver: {
         resolve: (host, port) =>
@@ -210,6 +215,10 @@ for (const mode of ['append', 'explicit-off'] as const) {
           },
         };
       },
+    } satisfies Parameters<typeof createAirplayDevices>[0];
+    const devices = createAirplayDevices({
+      ...deviceDeps,
+      stream: recordingStream(deviceDeps.spawn),
     });
     const boot = createAirplayBoot({
       outputs,

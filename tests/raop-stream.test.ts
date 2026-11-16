@@ -120,6 +120,42 @@ async function rendered(fake: Receiver, expected: Uint8Array) {
 }
 
 Deno.test({
+  name:
+    'RAOP compatibility: competing input rejects instead of silently dropping PCM',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const a = await startFakeRaop({ captureAudio: true, captureWire: true });
+    const b = await startFakeRaop({ captureAudio: true, captureWire: true });
+    let connected = 0;
+    const event = (kind: string, value?: string) => {
+      if (kind === 'state' && value === 'connected') connected++;
+    };
+    const spawn = createFfiSpawn();
+    const first = spawn(event), second = spawn(event);
+    try {
+      await Promise.all([
+        first.start(profile(a), input),
+        second.start(profile(b), input),
+      ]);
+      await until('two compatibility attachments', () => connected === 2);
+      await first.transport.pcm(pcm(704));
+      await assertRejects(
+        () => second.transport.pcm(new Uint8Array(704 * 4)),
+        Error,
+        'compatibility input busy',
+      );
+      await Promise.all([rendered(a, pcm(704)), rendered(b, pcm(704))]);
+      await libraryProof();
+    } finally {
+      await Promise.all([first.transport.close(), second.transport.close()]);
+      a.close();
+      b.close();
+    }
+  },
+});
+
+Deno.test({
   name: 'RAOP stream: one input fans exact scheduled PCM to two attachments',
   sanitizeOps: false,
   sanitizeResources: false,

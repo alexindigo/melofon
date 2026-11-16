@@ -539,10 +539,10 @@ Deno.test('two-sink boot fences stale decoder EOF after a same-position seek', a
     });
     await until(() => transports.length === 2);
     for (const transport of transports) transport.event('state', 'connected');
-    await until(() => transports.reduce((n, t) => n + t.writes, 0) === 1);
+    await until(() => transports.every((t) => t.writes === 1));
     assertEquals(ends.length, 1);
     await playback.seek({ positionMs: 0 });
-    await until(() => transports.reduce((n, t) => n + t.writes, 0) === 2);
+    await until(() => transports.every((t) => t.writes === 2));
     assertEquals(
       ends.length,
       2,

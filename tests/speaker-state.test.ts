@@ -3,7 +3,7 @@ import { apiFixture } from './helpers/api.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createSpeakers } from '../src/speakers.ts';
 import { createOutputAdmission } from '../src/output-admission.ts';
-import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { createRecordingAirplayDevices as createAirplayDevices } from './helpers/airplay-devices.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 import type { MdnsService } from '../src/mdns.ts';

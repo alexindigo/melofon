@@ -136,12 +136,17 @@ export interface EventFacts {
     devtype: string;
   };
   airplay_policy: { policy: string; default: string };
-  pump_first: OutputFacts & { path: string; bytes: number };
-  pump_end: OutputFacts & { path: string; bytes: number };
-  content_failed: OutputFacts & ErrorFacts;
+  pump_first: {
+    player: number;
+    generation: number;
+    path: string;
+    bytes: number;
+  };
+  pump_end: { player: number; generation: number; path: string; bytes: number };
+  content_failed: { player: number; generation: number } & ErrorFacts;
   session_retire: OutputFacts & { reason: string };
   session_retired: OutputFacts;
-  retirement_failed: OutputFacts & ErrorFacts;
+  retirement_failed: (OutputFacts | { player: number }) & ErrorFacts;
   retry_exhausted: OutputFacts & { attempts: number };
   retry_scheduled: OutputFacts & {
     attempt: number;
@@ -488,19 +493,19 @@ export const events: Record<EventId, EventDefinition> = {
     'airplay',
     'warn',
     'PCM pump first chunk',
-    'output generation path bytes',
+    'player generation path bytes',
   ),
   pump_end: definition(
     'airplay',
     'warn',
     'PCM decoder completed',
-    'output generation path bytes',
+    'player generation path bytes',
   ),
   content_failed: definition(
     'airplay',
     'error',
-    'Output content failed',
-    'output generation error',
+    'Player content failed',
+    'player generation error',
   ),
   session_retire: definition(
     'airplay',
@@ -518,7 +523,7 @@ export const events: Record<EventId, EventDefinition> = {
     'airplay',
     'error',
     'Retirement failed; blocked until authorized restart',
-    'output generation error',
+    'output player generation error',
   ),
   retry_exhausted: definition(
     'airplay',

@@ -103,7 +103,7 @@ Deno.test('known credentials and nested sensitive facts cannot escape through er
   });
   const error = new Error(`failure ${encodeURIComponent(secret)}`, { cause });
   capture.log.event('content_failed', {
-    output: 'fixture',
+    player: 1,
     generation: 9,
     error,
   });

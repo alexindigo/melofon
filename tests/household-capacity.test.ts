@@ -6,6 +6,7 @@ import { createPlaybackReports } from '../src/playback-reports.ts';
 import { PlaybackError } from '../src/playback-errors.ts';
 import type { PlaybackCapacity } from '../src/playback-capacity.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { recordingStream } from './helpers/airplay-devices.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 import { createSpeakers } from '../src/speakers.ts';
@@ -64,7 +65,7 @@ async function household(
   };
   const sessions: Session[] = [];
   const startGates: (Promise<void> | undefined)[] = [];
-  const devices = createAirplayDevices({
+  const deviceDeps = {
     outputs,
     changed: () => notify.emit(['outputs'], undefined, 'all'),
     resolver: {
@@ -105,6 +106,10 @@ async function household(
         },
       };
     },
+  } satisfies Parameters<typeof createAirplayDevices>[0];
+  const devices = createAirplayDevices({
+    ...deviceDeps,
+    ...(deviceDeps.spawn ? { stream: recordingStream(deviceDeps.spawn) } : {}),
   });
   const speakers = createSpeakers({
     outputs,

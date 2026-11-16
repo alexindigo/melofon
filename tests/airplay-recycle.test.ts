@@ -32,9 +32,10 @@ import {
   type HelperEventFn,
 } from '../src/boots/airplay.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
-import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
+import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import {
   createTestAirplayDevices,
+  mapStream,
   recordingSpawn,
 } from './helpers/airplay-devices.ts';
 import { NATIVE_CHANGED } from './helpers/native-changes.ts';
@@ -137,15 +138,11 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // Part A — the shared-feed handoff (boot level, feed-modeling fakes)
 // ---------------------------------------------------------------------------
 
-/** Mirrors raop-ffi.ts: the first pcm writer is THE FEED; every other
- * transport accepts-and-drops. The token releases only when the feed's
- * close() completes successfully. Counts EFFECTIVE accepted bytes. */
+/** Records fake receiver delivery from the explicitly injected stream. It has
+ * no source authority or accepted-and-dropped compatibility input. */
 class FeedFakeTransport implements AirplayTransport {
-  static feed: symbol | null = null;
-  readonly token = Symbol('feedfake');
   readonly cmds: Record<string, unknown>[] = [];
   acceptedBytes = 0;
-  droppedBytes = 0;
   closed = false;
   /** A test-controlled gate: close() cannot complete until it resolves —
    * retirement-window assertions without wall-clock luck. */
@@ -156,13 +153,6 @@ class FeedFakeTransport implements AirplayTransport {
     return Promise.resolve();
   }
   pcm(chunk: Uint8Array) {
-    if (FeedFakeTransport.feed === null) {
-      FeedFakeTransport.feed = this.token;
-    }
-    if (FeedFakeTransport.feed !== this.token) {
-      this.droppedBytes += chunk.length;
-      return Promise.resolve();
-    }
     this.acceptedBytes += chunk.length;
     return Promise.resolve();
   }
@@ -170,17 +160,14 @@ class FeedFakeTransport implements AirplayTransport {
     return (async () => {
       if (this.closeGate !== null) await this.closeGate;
       this.closed = true;
-      if (FeedFakeTransport.feed === this.token) {
-        FeedFakeTransport.feed = null;
-      }
     })();
   }
   ownsSharedFeed() {
-    return FeedFakeTransport.feed === this.token;
+    return false;
   }
   cancelPcm() {}
   totalBytes() {
-    return this.acceptedBytes + this.droppedBytes;
+    return this.acceptedBytes;
   }
 }
 
@@ -194,7 +181,6 @@ function closeGate(): { gate: Promise<void>; release: () => void } {
 }
 
 async function feedSetup() {
-  FeedFakeTransport.feed = null;
   const dir = await Deno.makeTempDir({ prefix: 'melofon-rec-' });
   const store = await openStore(dir);
   const db = store;
@@ -287,9 +273,13 @@ Deno.test('feed handoff: retiring the feed holds the peer’s re-pump until the 
     const gate = closeGate();
     a1.closeGate = gate.gate; // A's close cannot complete until released
     playback.seek({ positionMs: 120_000 }); // sync reconcile: A retires, B held
-    const bDropped = b.droppedBytes;
+    const before = b.totalBytes();
     await sleep(20);
-    assertEquals(b.droppedBytes, bDropped, 'B dropped nothing mid-handoff');
+    assertEquals(
+      b.totalBytes(),
+      before,
+      'B receives no replacement PCM before the release barrier',
+    );
     assertEquals(b.acceptedBytes, 0, 'B not re-pumped while the gate holds');
 
     gate.release();
@@ -341,7 +331,11 @@ Deno.test('feed handoff: reverse ownership — a surviving feed is never re-elec
       b.acceptedBytes > bAccepted,
       'B (surviving feed) kept streaming through the peer retirement',
     );
-    assertEquals(b.droppedBytes, 0, 'B was never demoted');
+    assertEquals(
+      decodeCalls.length,
+      decodesBefore,
+      'attachment loss does not replace stream input',
+    );
     assertEquals(
       b.cmds.filter((c) => c.cmd === 'flush').length,
       bFlushes,
@@ -434,12 +428,12 @@ Deno.test('feed handoff: two concurrent retirements hold the peer until BOTH fin
     a.closeGate = gate.gate; // the SLOW close, test-controlled
     playback.seek({ positionMs: 120_000 }); // retires BOTH affected outputs
     await until('C closed', () => c.closed);
-    const bDropped = b.droppedBytes;
+    const before = b.totalBytes();
     await sleep(20);
     assert(!a.closed, 'A still closing (gated)');
     assertEquals(
-      b.droppedBytes,
-      bDropped,
+      b.totalBytes(),
+      before,
       'B stays held while the second retirement is still in flight',
     );
     gate.release();
@@ -582,39 +576,42 @@ async function integrationSetup(opts: {
   // The REAL boot: its default spawn is the FFI transport.
   const native: AirplayTransport[] = [];
   const localReleases: bigint[] = [];
-  const ffiSpawn = createFfiSpawn();
-  const devices = createTestAirplayDevices(outputs, (event) => {
-    let generation: bigint | undefined;
-    const driver = ffiSpawn((name, value) => {
-      if (
-        observer && generation === undefined && name === 'state' &&
-        value === 'connected'
-      ) {
-        generation = observer.symbols.raop_fi_last_generation();
-      }
-      event(name, value);
-    });
-    const underlying = driver.transport;
-    const transport: AirplayTransport = {
-      send: (command) => underlying.send(command),
-      pcm: (data) => underlying.pcm(data),
-      ownsSharedFeed: () => underlying.ownsSharedFeed(),
-      cancelPcm: () => underlying.cancelPcm(),
-      async close() {
-        await underlying.close();
-        if (observer && generation !== undefined) {
-          assertEquals(
-            observer.symbols.raop_fi_generation_live(generation),
-            0,
-            'native TCP generation destroyed before close resolves/replacement',
-          );
-          localReleases.push(generation);
+  const devices = createTestAirplayDevices(
+    outputs,
+    undefined,
+    mapStream(createFfiStream, (ffiSpawn) => (event) => {
+      let generation: bigint | undefined;
+      const driver = ffiSpawn((name, value) => {
+        if (
+          observer && generation === undefined && name === 'state' &&
+          value === 'connected'
+        ) {
+          generation = observer.symbols.raop_fi_last_generation();
         }
-      },
-    };
-    native.push(transport);
-    return { transport, start: driver.start };
-  });
+        event(name, value);
+      });
+      const underlying = driver.transport;
+      const transport: AirplayTransport = {
+        send: (command) => underlying.send(command),
+        pcm: (data) => underlying.pcm(data),
+        ownsSharedFeed: () => underlying.ownsSharedFeed(),
+        cancelPcm: () => underlying.cancelPcm(),
+        async close() {
+          await underlying.close();
+          if (observer && generation !== undefined) {
+            assertEquals(
+              observer.symbols.raop_fi_generation_live(generation),
+              0,
+              'native TCP generation destroyed before close resolves/replacement',
+            );
+            localReleases.push(generation);
+          }
+        },
+      };
+      native.push(transport);
+      return { transport, start: driver.start };
+    }),
+  );
   const boot = createAirplayBoot({
     outputs,
     playback,
@@ -700,8 +697,8 @@ async function seekBattery(
   );
   assertEquals(it.native.length, 1, 'only intended owner selected initially');
   assert(
-    it.native[0].ownsSharedFeed(),
-    'observe production feed ownership, not RTP at both receivers',
+    !it.native[0].ownsSharedFeed(),
+    'attachments never own production input',
   );
   it.outputs.update(it.companionFirst ? '111111111111' : '222222222222', {
     selected: true,

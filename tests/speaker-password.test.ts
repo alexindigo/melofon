@@ -5,7 +5,7 @@ import { createSpeakerCredentials } from '../src/speaker-credentials.ts';
 import { createPersistence } from '../src/persistence.ts';
 import { createSecrets, type Secrets } from '../src/secrets.ts';
 import { createSpeakers } from '../src/speakers.ts';
-import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { createRecordingAirplayDevices as createAirplayDevices } from './helpers/airplay-devices.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import type { AirplaySpawn } from '../src/boots/airplay-profile.ts';
 import { createPlayback } from '../src/playback.ts';

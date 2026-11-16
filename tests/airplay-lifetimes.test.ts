@@ -9,6 +9,7 @@ import { createPlayback } from '../src/playback.ts';
 import { createNotify } from '../src/notify.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { recordingStream } from './helpers/airplay-devices.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 import type { Media } from '../src/media.ts';
 import type { State } from '../src/state.ts';
@@ -78,7 +79,7 @@ for (const phase of phases) {
         },
       },
     });
-    const devices = createAirplayDevices({
+    const deviceDeps = {
       outputs,
       resolver: {
         async resolve(host, port, s) {
@@ -141,6 +142,10 @@ for (const phase of phases) {
           },
         };
       },
+    } satisfies Parameters<typeof createAirplayDevices>[0];
+    const devices = createAirplayDevices({
+      ...deviceDeps,
+      stream: recordingStream(deviceDeps.spawn),
     });
     const state = {
       declare() {},

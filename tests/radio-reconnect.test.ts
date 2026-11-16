@@ -13,7 +13,7 @@ import { httpRadio, icyBlock } from './helpers/http-radio.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
-import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
+import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createMedia } from '../src/media.ts';
 import { createNetwork } from '../src/lookups/net.ts';
@@ -351,7 +351,7 @@ Deno.test('OwnTone reconnect retains occurrence, tries ordered alternatives, del
         prepareQueueMedia: sources.prepare,
       });
       await f.state.set('playback.source.retryBackoffMs', '100,100,100');
-      devices = createTestAirplayDevices(outputs, createFfiSpawn());
+      devices = createTestAirplayDevices(outputs, undefined, createFfiStream);
       boot = createAirplayBoot({
         outputs,
         playback,

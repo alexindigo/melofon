@@ -6,7 +6,7 @@ import { httpRadio, icyBlock } from './helpers/http-radio.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
-import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
+import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createMedia } from '../src/media.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
@@ -83,7 +83,7 @@ async function fixture(receiverPort?: number) {
         prepareQueueMedia: sources.prepare,
       });
       if (receiverPort) {
-        devices = createTestAirplayDevices(outputs, createFfiSpawn());
+        devices = createTestAirplayDevices(outputs, undefined, createFfiStream);
         boot = createAirplayBoot({
           outputs,
           playback,

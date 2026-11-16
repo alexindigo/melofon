@@ -463,10 +463,10 @@ class FfiTransport implements AirplayTransport {
     }
     const gen = this.writeGen;
     if (this.closed || this.writeGen !== gen) return;
-    // Feed election: the first writer owns the shared stream; every other
-    // selected output's PCM is accepted and dropped (see the header).
+    // Transitional device input is exclusive too: never report dropped PCM as
+    // accepted. Production playback uses the fixed-player stream input instead.
     if (feed === null) feed = this.token;
-    if (feed !== this.token) return;
+    if (feed !== this.token) throw new Error('RAOP compatibility input busy');
     let offset = 0;
     while (offset < chunk.length) {
       // Abandon the remaining bytes when a FLUSH/TEARDOWN/close landed

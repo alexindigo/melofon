@@ -24,7 +24,10 @@ import {
   type ConnectionStrategy,
 } from '../connection-strategy.ts';
 import type { AirplayDevices } from './airplay-device.ts';
-import type { AirplayTransport } from './airplay-profile.ts';
+import type {
+  AirplayPlaybackStream,
+  AirplayTransport,
+} from './airplay-profile.ts';
 import { outputAuthority, outputPlayerId } from '../player-outputs.ts';
 import { SpeakerError, type SpeakerPairingView } from '../speakers.ts';
 export { airplayOutputId } from './airplay-profile.ts';
@@ -82,7 +85,6 @@ interface Runtime {
   transport: AirplayTransport | null;
   activationCurrent?: () => boolean;
   session: number;
-  pump: number;
   connected: boolean;
   authenticationRequired: boolean;
   pin?: RuntimePin;
@@ -178,20 +180,24 @@ export function createAirplayBoot(
   >();
   const retiring = new Map<string, Promise<boolean>>();
   const blocked = new Set<string>();
-  const pendingPumps = new Map<string, Runtime>();
-  // One source lifetime for the native shared stream, elected BEFORE acquisition.
-  // Keep the slot through nonempty EOF: accepted PCM may still be playing out.
-  let source: {
-    id: string;
-    runtime: Runtime;
+  // One fixed-player input lifetime, independent of attachment membership.
+  type StreamOwner = {
+    sink: AirplayPlaybackStream;
+    entry: number | null;
     generation: number;
+    playing: boolean;
+    reset?: Promise<void>;
+  };
+  let stream: StreamOwner | null = null;
+  let streamClosing: Promise<void> | undefined;
+  let source: {
+    stream: StreamOwner;
     lease: PlaybackSource;
   } | null = null;
   const pairings = new Map<string, PairingWork>();
   const forceRelease = new Set<string>();
   let closed = false, running = false, rerun = false, collecting = false;
-  let needsHandoff = false;
-  let feedBlocked = false;
+  let streamBlocked = false;
   let intent: 'play' | 'pause' | 'stop' = playback.playerView().state;
   let intentEpoch = 0;
   let lease: {
@@ -304,7 +310,6 @@ export function createAirplayBoot(
     preparing.delete(id);
     cancelRetry(id);
     grants.delete(id);
-    pendingPumps.delete(id);
     epoch(id).generation++;
     lease?.outputs.delete(id);
   };
@@ -382,7 +387,7 @@ export function createAirplayBoot(
         ) => [id, leaseEntry(id, value.generation)]),
       ),
     };
-    if (source) cancelPump(source.id, source.runtime);
+    cancelPump();
     playback.pause(ownedSource);
   };
   const resume = (out: Output, permission?: Grant, r?: Runtime) => {
@@ -465,14 +470,12 @@ export function createAirplayBoot(
       }
     });
   };
-  const cancelPump = (id: string, r: Runtime) => {
-    if (source?.runtime === r) {
+  const cancelPump = () => {
+    if (source) {
       playback.cancelSource(source.lease);
+      source.stream.sink.cancelPcm();
       source = null;
     }
-    r.pump++;
-    r.transport?.cancelPcm();
-    pendingPumps.delete(id);
   };
   const cancelHold = (r: Runtime) => {
     if (r.holdTimer !== undefined) clearTimeout(r.holdTimer);
@@ -481,30 +484,25 @@ export function createAirplayBoot(
     r.held = false;
   };
 
-  const pumpCurrent = (id: string, r: Runtime) => {
-    const out = outputs.get(id), view = playback.playerView(), t = r.transport;
+  const pumpCurrent = () => {
+    const owner = stream, view = playback.playerView();
     if (
-      closed || blocked.has(id) || runtimes.get(id) !== r || !r.connected ||
-      !t || !r.authority() || !out?.selected || view.state !== 'play' ||
-      !view.current || source || !capacityCurrent()()
+      closed || streamBlocked || !owner || owner.reset || streamClosing ||
+      !usable() || view.state !== 'play' || !view.current || source ||
+      !capacityCurrent()()
     ) return;
     const sourceLease = playback.openSource(view.current.id, view.generation);
     if (!sourceLease) return;
-    const generation = ++r.pump, session = r.session;
     const streamCurrent = capacityCurrent();
-    const authority = { id, runtime: r, generation, lease: sourceLease };
+    const authority = { stream: owner, lease: sourceLease };
     source = authority;
-    r.entry = view.current.id;
     const current = view.current, startMs = sourceLease.startMs;
     const path = current.facts.kind === 'song'
       ? current.facts.song.path
       : undefined;
     const owns = () =>
       source === authority && !sourceLease.signal.aborted && !closed &&
-      r.authority() && streamCurrent() &&
-      runtimes.get(id) === r &&
-      r.transport === t &&
-      r.session === session && r.pump === generation;
+      stream === owner && streamCurrent();
     void operations.run(async () => {
       let bytes = 0;
       try {
@@ -529,16 +527,20 @@ export function createAirplayBoot(
             if (!owns()) return;
             if (DEBUG && path !== undefined && bytes === 0) {
               log.event('pump_first', {
-                output: id,
-                generation: session,
+                player: deps.playerId ?? 1,
+                generation: view.generation,
                 path,
                 bytes: chunk.length,
               });
             }
             try {
-              await t.pcm(chunk);
+              await owner.sink.pcm(chunk);
             } catch (error) {
-              if (owns()) sessionFailed(id, r, 'PCM', error);
+              if (owns()) {
+                for (const [id, r] of [...runtimes]) {
+                  sessionFailed(id, r, 'PCM', error);
+                }
+              }
               return;
             }
             if (!owns()) return;
@@ -555,8 +557,8 @@ export function createAirplayBoot(
         if (!bytes) throw new Error('empty decoder stream');
         if (DEBUG && path !== undefined) {
           log.event('pump_end', {
-            output: id,
-            generation: session,
+            player: deps.playerId ?? 1,
+            generation: view.generation,
             path,
             bytes,
           });
@@ -571,7 +573,11 @@ export function createAirplayBoot(
           playback.reportSourceOutcome(sourceLease, 'decode-error');
           return;
         }
-        log.event('content_failed', { output: id, generation: session, error });
+        log.event('content_failed', {
+          player: deps.playerId ?? 1,
+          generation: view.generation,
+          error,
+        });
         // A shared source failure is not a speaker failure. Fence every demand
         // before retiring any session, so a peer cannot reopen the same source.
         lease = null;
@@ -594,51 +600,78 @@ export function createAirplayBoot(
         }
       }
     }).catch((error) =>
-      log.event('content_failed', { output: id, generation: session, error })
+      log.event('content_failed', {
+        player: deps.playerId ?? 1,
+        generation: view.generation,
+        error,
+      })
     );
   };
   const drainPumps = () => {
-    if (closed || collecting || retiring.size || feedBlocked) return;
-    if (!needsHandoff && !pendingPumps.size) return;
-    const eligible = [...runtimes.entries()].filter(([id, r]) =>
-      r.connected && r.transport && !r.held && !epoch(id).contentError &&
-      !blocked.has(id) && outputs.get(id)?.selected &&
-      playback.playerView().state === 'play'
-    );
-    needsHandoff = false;
-    pendingPumps.clear();
-    if (source || !eligible.length) return;
-    // A held/FLUSHed native session retains its token until close. Reuse it;
-    // otherwise the elected writer claims the free token on its first PCM.
-    const [id, r] = eligible.find(([, r]) => r.transport!.ownsSharedFeed()) ??
-      eligible[0];
-    pumpCurrent(id, r);
+    if (closed || collecting || retiring.size || streamBlocked) return;
+    pumpCurrent();
   };
-  const requestPump = (id: string, r: Runtime) => {
+  const requestPump = (_id: string, r: Runtime) => {
     const view = playback.playerView();
     r.entry = view.current?.id ?? null;
     r.playbackGeneration = view.generation;
-    pendingPumps.set(id, r);
     drainPumps();
+  };
+  const syncStream = (view: View) => {
+    const owner = stream;
+    if (!owner || streamClosing) return;
+    const playing = view.state === 'play' && view.current !== null;
+    const entry = view.current?.id ?? null;
+    if (
+      owner.entry === entry && owner.generation === view.generation &&
+      owner.playing === playing
+    ) return;
+    owner.entry = entry;
+    owner.generation = view.generation;
+    owner.playing = playing;
+    cancelPump();
+    // reset fences admitted native writers now; decoder acquisition/cleanup is
+    // separately C1-owned and cannot hold a new command's control boundary.
+    const resetting = operations.run(() => owner.sink.reset()).catch(
+      (error) => {
+        streamBlocked = true;
+        log.event('retirement_failed', { player: deps.playerId ?? 1, error });
+      },
+    ).finally(() => {
+      if (owner.reset === resetting) owner.reset = undefined;
+      reconcile();
+    });
+    owner.reset = resetting;
+  };
+  const releaseStream = () => {
+    if (!stream || streamClosing) return streamClosing;
+    const owner = stream;
+    cancelPump();
+    streamClosing = owner.sink.close().then(() => {
+      if (stream === owner) stream = null;
+    }).catch((error) => {
+      streamBlocked = true;
+      log.event('retirement_failed', { player: deps.playerId ?? 1, error });
+      throw error;
+    });
+    void streamClosing.then(() => {
+      streamClosing = undefined;
+      reconcile();
+    }, () => {});
+    return streamClosing;
   };
   const retire = (id: string, r: Runtime, reason: string): Promise<boolean> => {
     const existing = retiring.get(id);
     if (existing) return existing;
     if (resuming.get(id)?.runtime === r) cancelResume(id);
     const t = r.transport;
-    const wasFeed = t?.ownsSharedFeed() === true || source?.runtime === r;
-    if (wasFeed) {
-      for (const [peerId, peer] of runtimes) {
-        if (peerId !== id) cancelPump(peerId, peer);
-      }
-    }
-    cancelPump(id, r);
     cancelHold(r);
     releasePin(r);
     r.session++;
     r.connected = false;
     r.transport = null;
     runtimes.delete(id);
+    if (!usable()) cancelPump();
     if (reason !== 'failed' && reason !== 'content') {
       devices.sessionChanged(id, {
         connection: 'disconnected',
@@ -662,11 +695,10 @@ export function createAirplayBoot(
       try {
         await t.send({ cmd: 'teardown' }).catch(() => {});
         await t.close();
-        if (wasFeed) needsHandoff = true;
         log.event('session_retired', { output: id, generation: r.session - 1 });
         return true;
       } catch (error) {
-        if (wasFeed) feedBlocked = true;
+        streamBlocked = true;
         blocked.add(id);
         grants.delete(id);
         cancelRetry(id);
@@ -753,7 +785,7 @@ export function createAirplayBoot(
     if (intent === 'play') scheduleRetry(id);
   };
   const spawnSession = (out: Output) => {
-    if (resuming.has(out.id)) return;
+    if (resuming.has(out.id) || streamClosing || streamBlocked) return;
     const id = out.id, e = epoch(id), permission = grants.get(id);
     if (
       !permission || !permission.authority() ||
@@ -789,6 +821,12 @@ export function createAirplayBoot(
       port: out.port,
     };
     preparing.set(id, work);
+    const owner = stream ??= {
+      sink: devices.createStream(deps.capacity),
+      entry: view.current.id,
+      generation: view.generation,
+      playing: true,
+    };
     let activated: Runtime | undefined;
     const current = () => {
       const row = outputs.get(id);
@@ -796,7 +834,13 @@ export function createAirplayBoot(
         streamCurrent() &&
         permission.epoch === epoch(id).generation &&
         row?.selected === true && intent === 'play' &&
-        playback.playerView().state === 'play' &&
+        (playback.playerView().state === 'play' ||
+          // A receiver challenge induces an internal pause, not revoked user
+          // demand. Its admitted activation must survive through auth/resume.
+          activated !== undefined && lease?.intent === intentEpoch &&
+            leasedGeneration(id) === e.generation &&
+            (activated.authenticationRequired ||
+              resuming.get(id)?.runtime === activated)) &&
         (activated
           ? runtimes.get(id) === activated && activated.session === session
           : grants.get(id) === permission) &&
@@ -810,6 +854,7 @@ export function createAirplayBoot(
         const prepared = await devices.protocol.prepare({
           id,
           capacity: deps.capacity,
+          stream: owner.sink,
           targetRevision: devices.admission.describe(id).targetRevision,
           signal: controller.signal,
           isCurrent: current,
@@ -842,7 +887,6 @@ export function createAirplayBoot(
           transport: null,
           activationCurrent: current,
           session,
-          pump: 0,
           connected: false,
           authenticationRequired: false,
           // Retain queue identity for same-entry seeks before CONNECTED is
@@ -918,10 +962,10 @@ export function createAirplayBoot(
                 releasePin(r);
                 r.connected = false;
                 r.authenticationRequired = true;
-                // The writer feeds a shared native player, not this speaker's
-                // socket. A healthy peer still consumes it while this control
-                // session handles authentication; its token releases at close.
-                if (!usable()) cancelPump(id, r);
+                // The stream owns input independently of this control session.
+                // Healthy peers continue while this attachment authenticates;
+                // capacity remains retained through eventual stream free.
+                if (!usable()) cancelPump();
                 outputs.update(id, { needsAuthKey: true }, ownedSource);
                 devices.sessionChanged(id, {
                   connection: 'connecting',
@@ -987,7 +1031,6 @@ export function createAirplayBoot(
       return;
     }
     if (r.held) return;
-    cancelPump(id, r);
     r.held = true;
     r.deadline = performance.now() + HOLD_MS;
     void operations.run(() =>
@@ -1005,6 +1048,13 @@ export function createAirplayBoot(
   };
   const reconcilePass = () => {
     const view = playback.playerView(), snapshot = outputs.list();
+    syncStream(view);
+    if (
+      stream && !streamClosing && !runtimes.size && !preparing.size &&
+      !retiring.size
+    ) {
+      void releaseStream()?.catch(() => {});
+    }
     const known = new Set(
       snapshot.filter((o) => o.type === 'AirPlay' && o.host).map((o) => o.id),
     );
@@ -1115,7 +1165,6 @@ export function createAirplayBoot(
           ]);
         } else if (r.connected) {
           actions.push(() => {
-            cancelPump(id, r);
             void operations.run(() =>
               r.transport!.send({ cmd: 'flush' }).catch((error) => {
                 if (runtimes.get(id) === r) {
@@ -1539,7 +1588,7 @@ export function createAirplayBoot(
       grants.clear();
       for (const work of preparing.values()) work.controller.abort();
       preparing.clear();
-      pendingPumps.clear();
+      cancelPump();
       for (const id of epochs.keys()) cancelRetry(id);
       for (const [id, r] of [...runtimes]) {
         void retire(id, r, 'boot close');
@@ -1550,6 +1599,7 @@ export function createAirplayBoot(
         // taken before those starts settle. Failed native close stays blocked.
         await settled;
         await Promise.all(retiring.values());
+        await releaseStream();
       })().then(() => completion.resolve(), completion.reject);
       return closeWork;
     },

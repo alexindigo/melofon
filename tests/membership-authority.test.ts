@@ -1,7 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createOutputs } from '../src/player.ts';
 import { createSpeakers } from '../src/speakers.ts';
-import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { createRecordingAirplayDevices as createAirplayDevices } from './helpers/airplay-devices.ts';
 import { PlaybackError } from '../src/playback-errors.ts';
 import { receiver } from './helpers/speaker-consumer.ts';
 import { sleep, until } from './helpers/speaker-consumer.ts';
@@ -318,12 +318,15 @@ async function household() {
     setLookup: (next: typeof lookup) => lookup = next,
     challenge: () => challenge = true,
     async close() {
-      await players.close();
-      await reports.close();
-      devices.close();
-      await persistence.drain();
-      await store.close();
-      await Deno.remove(dir, { recursive: true });
+      try {
+        await players.close();
+      } finally {
+        await reports.close();
+        devices.close();
+        await persistence.drain();
+        await store.close();
+        await Deno.remove(dir, { recursive: true });
+      }
     },
   };
 }
@@ -400,7 +403,11 @@ Deno.test('failed former-owner cleanup cannot admit the new owner to the same re
     assertEquals(f.devices.describe('s').session?.connection, 'failed');
   } finally {
     held.resolve();
-    await f.close();
+    await assertRejects(
+      () => f.close(),
+      AggregateError,
+      'Player registry close failed',
+    );
   }
 });
 

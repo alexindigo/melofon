@@ -6,7 +6,7 @@ import { songEntries, songResolver } from './helpers/queue.ts';
 import { createPersistence } from '../src/persistence.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createSpeakers } from '../src/speakers.ts';
-import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { createRecordingAirplayDevices as createAirplayDevices } from './helpers/airplay-devices.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createLibrary } from '../src/library.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -454,11 +454,15 @@ Deno.test('later transport and auth failures pause only when no healthy peer rem
     await until(() => t.sessions.length === 2);
     for (const session of t.sessions) session.event('state', 'connected');
     await until(() => t.sessions[0].writes > 0);
-    assertEquals(t.sessions[1].writes, 0, 'one shared source writer');
+    assertEquals(
+      t.sessions[1].writes,
+      t.sessions[0].writes,
+      'one stream fans out to both receivers',
+    );
     t.sessions[0].event('state', 'password');
     assertEquals(t.playback.playerView().state, 'play');
-    const sourceWrites = t.sessions[0].writes;
-    await until(() => t.sessions[0].writes > sourceWrites);
+    const sourceWrites = t.sessions[1].writes;
+    await until(() => t.sessions[1].writes > sourceWrites);
     t.sessions[1].event('state', 'failed');
     assertEquals(t.playback.playerView().state, 'pause');
     const bookmark = t.playback.playerView().itemProgressMs;

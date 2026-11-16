@@ -4,8 +4,11 @@ import { apiFixture } from './helpers/api.ts';
 import { speakerMedia, until } from './helpers/speaker-consumer.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
-import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
-import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
+import {
+  createTestAirplayDevices,
+  mapStream,
+} from './helpers/airplay-devices.ts';
+import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createMedia } from '../src/media.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
@@ -65,14 +68,17 @@ Deno.test('HTTP clock and source EOF preserve every buffered tail sample at two 
             connectionStrategy: 'owntone',
           });
         }
-        const spawn = createFfiSpawn();
         devices = createTestAirplayDevices(
           outputs,
-          (event) =>
-            spawn((name, value) => {
-              if (name === 'state' && value === 'connected') connected++;
-              event(name, value);
-            }),
+          undefined,
+          mapStream(
+            createFfiStream,
+            (spawn) => (event) =>
+              spawn((name, value) => {
+                if (name === 'state' && value === 'connected') connected++;
+                event(name, value);
+              }),
+          ),
         );
         playback = createPlayback({
           player: createPlayer(),

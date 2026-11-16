@@ -4,6 +4,7 @@ import { playerOutputs } from '../src/player-outputs.ts';
 import { createPlayback } from '../src/playback.ts';
 import { PlaybackError } from '../src/playback-errors.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
+import { recordingStream } from './helpers/airplay-devices.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 import { createSpeakers } from '../src/speakers.ts';
@@ -71,7 +72,7 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
   const idGates: (Promise<void> | undefined)[] = [];
   const failures: boolean[] = [], entered: string[][] = [[], []];
   const retry: (() => void)[][] = [[], []];
-  const devices = createAirplayDevices({
+  const deviceDeps = {
     outputs,
     changed: () => notify.emit(['outputs'], undefined, 'all'),
     resolver: {
@@ -110,6 +111,10 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
         },
       };
     },
+  } satisfies Parameters<typeof createAirplayDevices>[0];
+  const devices = createAirplayDevices({
+    ...deviceDeps,
+    stream: recordingStream(deviceDeps.spawn),
   });
   const speakers = createSpeakers({
     outputs,
@@ -254,10 +259,19 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
     eofEntered: () => eofEntered,
     async close() {
       for (const engine of playback) await engine.close();
-      await Promise.all(boots.map((boot) => boot.close()));
+      const closed = await Promise.allSettled(
+        boots.map((boot) => boot.close()),
+      );
       devices.close();
       await store.close();
       await Deno.remove(dir, { recursive: true });
+      const failed = closed.filter((r) => r.status === 'rejected');
+      if (failed.length) {
+        throw new AggregateError(
+          failed.map((r) => r.reason),
+          'Fixture boot release failed',
+        );
+      }
     },
   };
 }
@@ -587,12 +601,20 @@ Deno.test('failed transport cleanup keeps shared-stream occupancy blocking other
       f.devices.describe('11').session?.connection === 'failed'
     );
     await busy(() => f.playback[1].play());
-    await f.boots[0].close();
+    await assertRejects(
+      () => f.boots[0].close(),
+      AggregateError,
+      'AirPlay playback stream release failed',
+    );
     await busy(() => f.playback[1].play());
     assertEquals(f.sessions.length, 1);
     assertEquals(f.sessions[0].closed, false);
   } finally {
-    await f.close();
+    await assertRejects(
+      () => f.close(),
+      AggregateError,
+      'Fixture boot release failed',
+    );
   }
 });
 
@@ -607,12 +629,20 @@ Deno.test('published forget succeeds while failed transport cleanup retains shar
     assertEquals(f.outputs.get('11'), null);
     assertEquals(f.playback[0].playerView().state, 'pause');
     await busy(() => f.playback[1].play());
-    await f.boots[0].close();
+    await assertRejects(
+      () => f.boots[0].close(),
+      AggregateError,
+      'AirPlay playback stream release failed',
+    );
     await busy(() => f.playback[1].play());
     assertEquals(f.sessions.length, 1);
     assertEquals(f.sessions[0].closed, false);
   } finally {
-    await f.close();
+    await assertRejects(
+      () => f.close(),
+      AggregateError,
+      'Fixture boot release failed',
+    );
   }
 });
 
@@ -749,6 +779,19 @@ Deno.test('natural advancement retains the stream and releases it after end-of-q
     await f.playback[0].advanceEnded();
     assertEquals(f.playback[0].playerView().state, 'stop');
     await until(() => f.sessions.every((s) => s.closed));
+    // Last attachment close is not stream-storage release. Observe the public
+    // capacity boundary before asking a different player to acquire it.
+    await until(() => {
+      try {
+        f.capacities[1].reserve().release();
+        return true;
+      } catch (error) {
+        if (
+          !(error instanceof PlaybackError) || error.code !== 'airplay_busy'
+        ) throw error;
+        return false;
+      }
+    });
     await f.playback[1].play();
     await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
   } finally {

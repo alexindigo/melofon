@@ -3,7 +3,8 @@ import { apiFixture } from './helpers/api.ts';
 import { createOutputs } from '../src/player.ts';
 import { createSpeakers, SpeakerError } from '../src/speakers.ts';
 import { createOutputAdmission } from '../src/output-admission.ts';
-import { createFfiSpawn } from '../src/boots/raop-ffi.ts';
+import { createFfiSpawn, createFfiStream } from '../src/boots/raop-ffi.ts';
+import { mapStream } from './helpers/airplay-devices.ts';
 import type { AirplaySpawn } from '../src/boots/airplay-profile.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import {
@@ -176,33 +177,37 @@ for (const scenario of ['demand', 'challenge', 'timer', 'send'] as const) {
       await speakerMedia(dir);
       const fake = await startFakeRaop();
       const service = receiver(1, fake.port, { sf: '200' });
-      const native = createFfiSpawn();
       let challenge!: () => void, calls = 0;
       let pinSend = () => Promise.resolve();
       // Real native start/receiver challenge. Only fruit setup is replaced so
       // dependency, reentrancy and timer races can be scheduled deterministically.
-      const spawn: AirplaySpawn = (event, credential) => {
-        challenge = () => event('state', 'password');
-        const d = native(event, credential);
-        return {
-          ...d,
-          transport: {
-            ...d.transport,
-            pcm: (chunk) => d.transport.pcm(chunk),
-            close: () => d.transport.close(),
-            cancelPcm: () => d.transport.cancelPcm(),
-            ownsSharedFeed: () => d.transport.ownsSharedFeed(),
-            send: (command) =>
-              command.cmd === 'pin'
-                ? (calls++, pinSend())
-                : d.transport.send(command),
-          },
+      const wrap =
+        (native: AirplaySpawn): AirplaySpawn => (event, credential) => {
+          challenge = () => event('state', 'password');
+          const d = native(event, credential);
+          return {
+            ...d,
+            transport: {
+              ...d.transport,
+              pcm: (chunk) => d.transport.pcm(chunk),
+              close: () => d.transport.close(),
+              cancelPcm: () => d.transport.cancelPcm(),
+              ownsSharedFeed: () => d.transport.ownsSharedFeed(),
+              send: (command) =>
+                command.cmd === 'pin'
+                  ? (calls++, pinSend())
+                  : d.transport.send(command),
+            },
+          };
         };
-      };
+      const spawn = wrap(createFfiSpawn());
       let t: Awaited<ReturnType<typeof speakerConsumer>> | undefined;
       let release = () => {};
       try {
-        t = await speakerConsumer(dir, [service], { spawn });
+        t = await speakerConsumer(dir, [service], {
+          spawn,
+          stream: mapStream(createFfiStream, wrap),
+        });
         t.discover(service);
         await t.play('1');
         await until(() =>
