@@ -1,5 +1,5 @@
-// b03a proves exact admission only. Ordered receiver cancellation belongs to
-// b03b/b03c; no local reset receipt here is described as FLUSH readiness.
+// Exact admission and ordered native cancellation. Production boot adoption is
+// b03c; the transitional local-reset cases remain local-only proofs.
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createFfiStream, raopFfiInternals } from '../src/boots/raop-ffi.ts';
 import { profileFromService } from '../src/boots/airplay-profile.ts';
@@ -455,6 +455,544 @@ async function faultChild(mode: string) {
     if (line.startsWith('admission native library:')) console.log(line);
   }
 }
+
+function cancelTest(name: string, fn: () => Promise<void>) {
+  Deno.test({
+    name: `RAOP cancel: ${name}`,
+    sanitizeOps: false,
+    sanitizeResources: false,
+    fn,
+  });
+}
+
+async function postCancelRendered(
+  receiver: Receiver,
+  expected: Uint8Array,
+  oldFrames = 352,
+) {
+  const session = receiver.sessions[0];
+  await until(
+    'replacement packets',
+    () => session.audioPackets === (oldFrames + expected.length / 4) / 352,
+  );
+  assertEquals(
+    decodeReceiverAudio(
+      session.sdp,
+      session.audioPayloads.slice(oldFrames / 352),
+    ),
+    expected,
+  );
+  const pending = renderScheduledAudio(session, receiver.nowMs());
+  assertEquals(pending.issues, []);
+  assert(pending.lastPresentationAtMs !== null);
+  await until(
+    'replacement scheduled boundary',
+    () =>
+      receiver.nowMs() > pending.lastPresentationAtMs! +
+          (pending.clockUncertaintyMs ?? 0),
+  );
+  const rendered = renderScheduledAudio(session, receiver.nowMs());
+  assertEquals(rendered.issues, []);
+  assertEquals(rendered.pcm, expected);
+  assertEquals(rendered.pendingFrames, 0);
+  assertEquals(
+    rendered.discarded.map((range) => [range.reason, range.frames]),
+    oldFrames ? [['flush', oldFrames]] : [],
+  );
+  assertEquals([session.flushes, session.teardowns, receiver.sessions.length], [
+    1,
+    0,
+    1,
+  ]);
+}
+
+cancelTest(
+  '353/cancel/351 preserves every accepted replacement frame behind held FLUSH',
+  async () => {
+    const gate = Promise.withResolvers<void>();
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+      beforeFlushReply: () => gate.promise,
+    });
+    let ready = false;
+    const attachment = stream.attach((event, value) => {
+      if (event === 'state' && value === 'connected') ready = true;
+    });
+    const oldEpoch = stream.epoch;
+    const append = (epoch: bigint, bytes: Uint8Array) =>
+      stream.append({ epoch, segment: highSegment, pcm: bytes });
+    try {
+      await attachment.start(profile(receiver), input);
+      await until('ready', () => ready);
+      assertEquals(
+        (await append(oldEpoch, pcm(353, 900))).acceptedFrames,
+        353n,
+      );
+      await until(
+        'old complete packet',
+        () => receiver.sessions[0].audioPackets === 1,
+      );
+      const session = receiver.sessions[0];
+      const oldSequence = session.rtpSequences[0];
+      let settled = false;
+      const canceled = stream.cancel(oldEpoch).then((result) => {
+        settled = true;
+        return result;
+      });
+      assertEquals(stream.epoch, oldEpoch + 1n, 'epoch advances at submission');
+      assertEquals((await append(oldEpoch, pcm(1))).status, 'canceled');
+      assertEquals((await append(stream.epoch, pcm(351))).status, 'not-ready');
+      await until('held FLUSH request', () => session.flushes === 1);
+      await assertRejects(() => stream.ackCancel(oldEpoch), Error, 'pending');
+      await assertRejects(
+        () => attachment.transport.send({ cmd: 'flush' }),
+        Error,
+        'failed',
+      );
+      receiver.requestRetransmit(session.id, oldSequence);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assertEquals([settled, session.audioPackets], [false, 1]);
+      assertEquals((await append(stream.epoch, pcm(351))).acceptedFrames, 0n);
+      gate.resolve();
+      const result = await canceled;
+      assertEquals([
+        result.status,
+        result.cutoffFrames,
+        result.epoch,
+        result.nextEpoch,
+      ], ['ready', 0n, oldEpoch, oldEpoch + 1n]);
+      assert(result.admittedNs > 0n);
+      const expected = pcm(352, 3000);
+      assertEquals(
+        (await append(stream.epoch, expected.subarray(0, 351 * 4)))
+          .acceptedFrames,
+        351n,
+      );
+      // b04 owns tail padding: this is one explicit real packet-completing frame,
+      // asserted byte-for-byte, not implicit silence or a claimed 351-frame tail.
+      assertEquals(
+        (await append(stream.epoch, expected.subarray(351 * 4))).acceptedFrames,
+        1n,
+      );
+      await postCancelRendered(receiver, expected);
+      const count = session.audioPackets;
+      receiver.requestRetransmit(session.id, oldSequence);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assertEquals(
+        session.audioPackets,
+        count,
+        'old cache stays revoked after readiness',
+      );
+      await stream.ackCancel(oldEpoch);
+      await assertRejects(() => stream.ackCancel(oldEpoch), Error, 'absent');
+      await libraryProof();
+    } finally {
+      gate.resolve();
+      await stream.close();
+      receiver.close();
+    }
+  },
+);
+
+cancelTest(
+  'all attachment ACKs fence replacement and repeated cancellation supersedes only old work',
+  async () => {
+    const gates = [
+      Promise.withResolvers<void>(),
+      Promise.withResolvers<void>(),
+    ];
+    const receivers = await Promise.all(gates.map((gate) =>
+      startFakeRaop({
+        captureAudio: true,
+        captureWire: true,
+        beforeFlushReply: () => gate.promise,
+      })
+    ));
+    const stream = createFfiStream();
+    const attachments = receivers.map(() => stream.attach(() => {}));
+    try {
+      await Promise.all(
+        attachments.map((attachment, i) =>
+          attachment.start(profile(receivers[i]), input)
+        ),
+      );
+      assertEquals(
+        (await stream.append({
+          epoch: stream.epoch,
+          segment: 1n,
+          pcm: pcm(353, 900),
+        })).acceptedFrames,
+        353n,
+      );
+      await until(
+        'both old packets',
+        () => receivers.every((r) => r.sessions[0]?.audioPackets === 1),
+      );
+      const firstEpoch = stream.epoch;
+      const first = stream.cancel(firstEpoch);
+      await until(
+        'both held FLUSHes',
+        () => receivers.every((r) => r.sessions[0].flushes === 1),
+      );
+      const secondEpoch = stream.epoch;
+      const second = stream.cancel(secondEpoch);
+      assertEquals((await first).status, 'canceled');
+      gates[0].resolve();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assertEquals(
+        (await stream.append({
+          epoch: stream.epoch,
+          segment: 2n,
+          pcm: pcm(704),
+        })).status,
+        'not-ready',
+      );
+      gates[1].resolve();
+      assertEquals((await second).status, 'ready');
+      const expected = pcm(704, 5000);
+      assertEquals(
+        (await stream.append({
+          epoch: stream.epoch,
+          segment: 2n,
+          pcm: expected,
+        })).acceptedFrames,
+        704n,
+      );
+      await Promise.all(receivers.map((r) => postCancelRendered(r, expected)));
+      await stream.ackCancel(firstEpoch);
+      await stream.ackCancel(secondEpoch);
+      await libraryProof();
+    } finally {
+      gates.forEach((gate) => gate.resolve());
+      await stream.close();
+      receivers.forEach((r) => r.close());
+    }
+  },
+);
+
+cancelTest(
+  'blocked writer settles promptly and its accepted backlog never reaches replacement',
+  async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    try {
+      await stream.append({
+        epoch: stream.epoch,
+        segment: 1n,
+        pcm: pcm(cap, 900),
+      });
+      const writing = stream.pcm(pcm(352, 1900));
+      const rejected = assertRejects(() => writing, Error, 'canceled');
+      const before = performance.now();
+      const result = await stream.cancel(stream.epoch);
+      await rejected;
+      assert(
+        performance.now() - before < 1000,
+        'must not wait for two-second backlog drain',
+      );
+      assertEquals([result.status, result.cutoffFrames], ['ready', 0n]);
+      const expected = pcm(704);
+      assertEquals(
+        (await stream.append({
+          epoch: stream.epoch,
+          segment: 2n,
+          pcm: expected,
+        })).acceptedFrames,
+        704n,
+      );
+      await stream.attach(() => {}).start(profile(receiver), input);
+      await rendered(receiver, expected);
+      await stream.ackCancel(result.epoch);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+);
+
+cancelTest(
+  'close settles a held cancellation and joins session destruction without its ACK',
+  async () => {
+    const gate = Promise.withResolvers<void>();
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+      beforeFlushReply: () => gate.promise,
+    });
+    try {
+      await stream.attach(() => {}).start(profile(receiver), input);
+      await stream.append({ epoch: stream.epoch, segment: 1n, pcm: pcm(353) });
+      await until('old packet', () => receiver.sessions[0]?.audioPackets === 1);
+      const cancel = stream.cancel(stream.epoch);
+      await until('held cancel', () => receiver.sessions[0].flushes === 1);
+      const closing = stream.close();
+      assertEquals(stream.close(), closing);
+      assertEquals((await cancel).status, 'canceled');
+      await closing;
+      await until(
+        'old socket destroyed',
+        () => receiver.sessions[0].closedAtMs !== null,
+      );
+      await assertRejects(() => stream.cancel(stream.epoch), Error, 'closed');
+      await libraryProof();
+    } finally {
+      gate.resolve();
+      await stream.close();
+      receiver.close();
+    }
+  },
+);
+
+cancelTest(
+  'late old handshake is destroyed and cannot rearm the replacement epoch',
+  async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      recordDelayMs: 180,
+      captureAudio: true,
+      captureWire: true,
+    });
+    let connected = 0;
+    const attachment = stream.attach((event, value) => {
+      if (event === 'state' && value === 'connected') connected++;
+    });
+    try {
+      await attachment.start(profile(receiver), input);
+      await until(
+        'old RECORD held',
+        () =>
+          receiver.sessions[0]?.requests.some((r) => r.method === 'RECORD') ??
+            false,
+      );
+      const result = await stream.cancel(stream.epoch);
+      assertEquals([result.status, result.cutoffFrames], ['ready', 0n]);
+      const expected = pcm(704, 7000);
+      await stream.append({ epoch: stream.epoch, segment: 2n, pcm: expected });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assertEquals([connected, receiver.sessions[0].audioPackets], [0, 0]);
+      assert(receiver.sessions[0].closedAtMs !== null);
+      await attachment.start(profile(receiver), input);
+      await until(
+        'replacement session packets',
+        () => receiver.sessions[1]?.audioPackets === 2,
+      );
+      // The old session has no PCM. The new independently scheduled consumer gets
+      // all replacement bytes, despite the old delayed response.
+      const session = receiver.sessions[1];
+      const pending = renderScheduledAudio(session, receiver.nowMs());
+      assertEquals(pending.issues, []);
+      await until(
+        'new session scheduled end',
+        () =>
+          receiver.nowMs() >
+            pending.lastPresentationAtMs! + (pending.clockUncertaintyMs ?? 0),
+      );
+      assertEquals(
+        renderScheduledAudio(session, receiver.nowMs()).pcm,
+        expected,
+      );
+      assertEquals(connected, 1);
+      await stream.ackCancel(result.epoch);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+);
+
+cancelTest(
+  'failed FLUSH proves readiness only through destruction before a fresh session',
+  async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      refuseFlush: true,
+      captureAudio: true,
+      captureWire: true,
+    });
+    const attachment = stream.attach(() => {});
+    try {
+      await attachment.start(profile(receiver), input);
+      await stream.append({ epoch: stream.epoch, segment: 1n, pcm: pcm(353) });
+      await until('old packet', () => receiver.sessions[0]?.audioPackets === 1);
+      const result = await stream.cancel(stream.epoch);
+      assertEquals(result.status, 'ready');
+      await until(
+        'failed FLUSH session destroyed',
+        () => receiver.sessions[0].closedAtMs !== null,
+      );
+      const expected = pcm(704, 8000);
+      await stream.append({ epoch: stream.epoch, segment: 2n, pcm: expected });
+      await attachment.start(profile(receiver), input);
+      await until(
+        'fresh packets',
+        () => receiver.sessions[1]?.audioPackets === 2,
+      );
+      const session = receiver.sessions[1];
+      assertEquals(
+        decodeReceiverAudio(session.sdp, session.audioPayloads),
+        expected,
+      );
+      const pending = renderScheduledAudio(session, receiver.nowMs());
+      assertEquals(pending.issues, []);
+      await until(
+        'fresh scheduled end',
+        () =>
+          receiver.nowMs() >
+            pending.lastPresentationAtMs! + (pending.clockUncertaintyMs ?? 0),
+      );
+      assertEquals(
+        renderScheduledAudio(session, receiver.nowMs()).pcm,
+        expected,
+      );
+      await stream.ackCancel(result.epoch);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+);
+
+cancelTest(
+  'native results survive more than sixteen cancels until individually acknowledged',
+  async () => {
+    const lib = raopFfiInternals.loadLibrary();
+    const raw = lib.symbols.raop_stream_new();
+    assert(raw);
+    try {
+      const receipt = new BigUint64Array(6);
+      const epochs: bigint[] = [];
+      assertEquals(lib.symbols.raop_stream_cancel(raw, 0n), -1);
+      assertEquals(
+        lib.symbols.raop_stream_cancel(raw, 0xffffffffffffffffn),
+        -1,
+      );
+      for (let i = 0; i < 24; i++) {
+        const epoch = lib.symbols.raop_stream_epoch(raw);
+        epochs.push(epoch);
+        assertEquals(lib.symbols.raop_stream_cancel(raw, epoch), 0);
+        assertEquals(
+          lib.symbols.raop_stream_cancel(raw, epoch),
+          -1,
+          'stale cancel never advances epoch twice',
+        );
+      }
+      await until(
+        'all retained cancels applied',
+        () =>
+          epochs.every((epoch) =>
+            lib.symbols.raop_stream_cancel_poll(raw, epoch, receipt) === 1 &&
+            receipt[2] !== 0n
+          ),
+      );
+      for (const epoch of epochs) {
+        assertEquals(
+          lib.symbols.raop_stream_cancel_poll(raw, epoch, receipt),
+          1,
+        );
+        const original = [...receipt];
+        assertEquals(original.slice(0, 2), [epoch, epoch + 1n]);
+        assert([1n, 2n].includes(receipt[2]));
+        assertEquals([receipt[3], receipt[5]], [0n, 1n]);
+        assertEquals(
+          lib.symbols.raop_stream_cancel_poll(raw, epoch, receipt),
+          1,
+        );
+        assertEquals([...receipt], original, 'poll does not consume');
+        assertEquals(lib.symbols.raop_stream_cancel_ack(raw, epoch), 0);
+        assertEquals(
+          lib.symbols.raop_stream_cancel_poll(raw, epoch, receipt),
+          0,
+        );
+      }
+      await libraryProof();
+    } finally {
+      assertEquals(await lib.symbols.raop_stream_free(raw), 0);
+    }
+  },
+);
+
+cancelTest(
+  'cutoff uses scheduled submitted frames rather than accepted backlog',
+  async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    try {
+      const attachment = stream.attach(() => {});
+      await attachment.start(profile(receiver), input);
+      const old = pcm(704);
+      await stream.append({ epoch: stream.epoch, segment: 1n, pcm: old });
+      await rendered(receiver, old);
+      // These accepted frames have not reached a presentation boundary at cancel.
+      const accepted = await stream.append({
+        epoch: stream.epoch,
+        segment: 2n,
+        pcm: pcm(cap, 900),
+      });
+      assertEquals(accepted.acceptedFrames, BigInt(cap));
+      const result = await stream.cancel(stream.epoch);
+      assertEquals([result.status, result.cutoffFrames], ['ready', 704n]);
+      await stream.ackCancel(result.epoch);
+      const next = pcm(250 * 352, 1000);
+      await stream.append({ epoch: stream.epoch, segment: 3n, pcm: next });
+      const session = receiver.sessions[0];
+      await until('all new packets', () => session.audioPackets === 252);
+      const schedule = renderScheduledAudio(session, receiver.nowMs());
+      assertEquals(schedule.issues, []);
+      assert(schedule.lastPresentationAtMs !== null);
+      const firstNewAt = schedule.lastPresentationAtMs -
+        next.length / 4 * 1000 / 44100;
+      await until(
+        'partly presented new epoch',
+        () => receiver.nowMs() > firstNewAt + 100,
+      );
+      const partial = await stream.cancel(stream.epoch);
+      assert(
+        partial.cutoffFrames !== null && partial.cutoffFrames > 0n &&
+          partial.cutoffFrames < BigInt(next.length / 4),
+      );
+      // Map native admission time through the independent receiver timing exchange,
+      // not performance.now or the sender's own presentation implementation.
+      const reply = session.wire.find((event) => event.kind === 'timing-reply');
+      const request = session.wire.find((event) =>
+        event.kind === 'timing-request'
+      );
+      assert(reply && 'data' in reply && request && 'data' in request);
+      const ns = (offset: number) => {
+        const view = new DataView(reply.data.buffer, reply.data.byteOffset);
+        return (BigInt(view.getUint32(offset)) - 2208988800n) * 1000000000n +
+          BigInt(view.getUint32(offset + 4)) * 1000000000n / (1n << 32n);
+      };
+      const localAdmission = (request.atMs + reply.atMs) / 2 +
+        Number(partial.admittedNs - (ns(16) + ns(24)) / 2n) / 1e6;
+      const independent = renderScheduledAudio(session, localAdmission);
+      assertEquals(independent.issues, []);
+      const observedFrames = independent.pcm.length / 4 - 704;
+      const tolerance =
+        Math.ceil((independent.clockUncertaintyMs ?? 0) * 44.1) + 1;
+      assert(
+        Math.abs(Number(partial.cutoffFrames) - observedFrames) <= tolerance,
+        `native cutoff ${partial.cutoffFrames}, independent ${observedFrames}, timing tolerance ${tolerance}`,
+      );
+      await stream.ackCancel(partial.epoch);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+);
 
 for (
   const mode of [

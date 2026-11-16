@@ -86,6 +86,7 @@ struct raop_player
   struct event *timer_ev;        /* EV_READ|EV_PERSIST on timer_fd */
   bool streaming;                /* between CONNECTED and teardown/failed */
   bool fed_in_epoch;             /* loop-owned actual backend write this epoch */
+  bool fenced;                   /* pcm_lock; synchronous cancel admission */
 
   /* PCM read-ahead the 10 ms tick paces out; mutex-guarded (write is
    * called from the caller's thread, the tick from the loop thread). */
@@ -302,7 +303,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
 
       pthread_mutex_lock(&p->pcm_lock);
       avail = evbuffer_get_length(p->pcm);
-      if (avail < 4)
+      if (p->fenced || avail < 4)
         {
           pthread_mutex_unlock(&p->pcm_lock);
           break;
@@ -453,6 +454,17 @@ raop_player_flush(struct raop_player *p)
 {
   pthread_mutex_lock(&p->pcm_lock);
   evbuffer_drain(p->pcm, evbuffer_get_length(p->pcm));
+  pthread_mutex_unlock(&p->pcm_lock);
+}
+
+/* Admission thread fences before cancel returns; loop reopens only after reset
+ * and receiver readiness. A tick already removed from ingress belongs to the
+ * old epoch; replacement input remains fenced until the loop joins that tick. */
+void
+raop_player_fence(struct raop_player *p, bool fenced)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  p->fenced = fenced;
   pthread_mutex_unlock(&p->pcm_lock);
 }
 

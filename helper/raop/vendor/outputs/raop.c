@@ -71,6 +71,7 @@
 #include "transcode.h"
 #include "outputs.h"
 #include "pair_ap/pair.h"
+#include "../../raop-bridge.h"
 
 #define ALAC_HEADER_LEN                      3
 
@@ -161,6 +162,7 @@ struct raop_extra
 struct raop_master_session
 {
   uint64_t stream_id;
+  uint64_t epoch_frames; /* wide frame origin, independent of wrapping RTP */
   struct evbuffer *input_buffer;
   uint32_t input_buffer_samples;
 
@@ -223,6 +225,11 @@ struct raop_session
   struct raop_source rtsp_source;
   struct raop_source rtp_source;
   bool failure_pending;
+  bool cancel_pending; /* only the matching session's ordered FLUSH can clear */
+  bool schedule_valid;
+  bool coverage_failed;
+  uint64_t schedule_origin_ns;
+  uint64_t submitted_frames;
 
   int reqs_in_flight;
   int cseq;
@@ -2132,6 +2139,8 @@ session_free(struct raop_session *rs)
   if (!rs)
     return;
 
+  uint64_t canceled_stream = rs->cancel_pending ? rs->stream_id : 0;
+
   source_observer_cancel(rs);
   if (rs->source_observer) event_free(rs->source_observer);
 
@@ -2162,6 +2171,7 @@ session_free(struct raop_session *rs)
   free(rs->devname);
 
   free(rs);
+  if (canceled_stream) raop_ffi_cancel_changed(canceled_stream);
 }
 
 static void
@@ -3039,7 +3049,7 @@ raop_cb_flush(struct evrtsp_request *req, void *arg)
   int ret;
 
   rs->reqs_in_flight--;
-  if (rs->failure_pending || rs->retiring) return;
+  if (rs->failure_pending || rs->retiring || rs->cancel_pending) return;
 
   if (!req)
     goto error;
@@ -3067,6 +3077,81 @@ raop_cb_flush(struct evrtsp_request *req, void *arg)
 
  error:
   session_failure(rs);
+}
+
+/* The request owns this session until its callback or socket destruction. There
+ * can be only one ordered FLUSH in flight per session. A repeated stream cancel
+ * coalesces behind it while admission is fenced, never after replacement PCM. */
+static void
+raop_cb_cancel(struct evrtsp_request *req, void *arg)
+{
+  struct raop_session *rs = arg;
+  uint64_t stream_id = rs->stream_id;
+  rs->reqs_in_flight--;
+  if (rs->retiring || rs->failure_pending) return;
+  if (!req || req->response_code != RTSP_OK || raop_check_cseq(rs, req) < 0) {
+    session_failure(rs); /* destruction, not failed ACK, establishes readiness */
+    return;
+  }
+  rs->cancel_pending = false;
+  rs->state = RAOP_STATE_CONNECTED;
+  raop_status(rs);
+  if (!rs->reqs_in_flight)
+    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
+  raop_ffi_cancel_changed(stream_id);
+}
+
+int
+raop_cancel_pending(uint64_t stream_id)
+{
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next)
+    if (rs->stream_id == stream_id && rs->cancel_pending) return 1;
+  return 0;
+}
+
+uint64_t
+raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns)
+{
+  uint64_t cutoff = UINT64_MAX;
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != stream_id || rs->retiring || rs->failure_pending)
+      continue;
+    uint64_t played = 0;
+    if (rs->schedule_valid &&
+        admitted_ns > rs->schedule_origin_ns) {
+      uint64_t elapsed = admitted_ns - rs->schedule_origin_ns;
+      played = elapsed / 1000000000ULL * 44100 +
+               elapsed % 1000000000ULL * 44100 / 1000000000ULL;
+      if (played > rs->submitted_frames) played = rs->submitted_frames;
+    }
+    if (played < cutoff) cutoff = played;
+  }
+  raop_discard_pending_input(stream_id);
+  for (struct raop_master_session *rms = raop_master_sessions; rms; rms = rms->next) {
+    if (rms->stream_id != stream_id) continue;
+    rtp_session_flush(rms->rtp_session); /* revoke all old retransmit authority */
+    rms->epoch_frames = 0;
+    evbuffer_drain(rms->encoded_buffer, evbuffer_get_length(rms->encoded_buffer));
+  }
+  for (struct raop_session *rs = raop_sessions, *next; rs; rs = next) {
+    next = rs->next;
+    if (rs->stream_id != stream_id) continue;
+    rs->schedule_valid = false;
+    rs->coverage_failed = false;
+    rs->submitted_frames = 0;
+    if (rs->cancel_pending) continue;
+    rs->cancel_pending = true;
+    if (rs->retiring || rs->failure_pending) continue; /* destruction will notify */
+    if (rs->state != RAOP_STATE_CONNECTED && rs->state != RAOP_STATE_STREAMING) {
+      rs->state = RAOP_STATE_STOPPED;
+      raop_status(rs);
+      session_cleanup(rs); /* fences every old handshake callback */
+      continue;
+    }
+    if (raop_send_req_flush(rs, raop_cb_cancel, "stream_cancel") < 0)
+      session_failure(rs);
+  }
+  return cutoff == UINT64_MAX ? 0 : cutoff;
 }
 
 static void
@@ -3135,7 +3220,8 @@ packet_send(struct raop_session *rs, struct rtp_packet *pkt)
 {
   int ret;
 
-  if (!rs || rs->retiring || rs->failure_pending)
+  if (!rs || rs->retiring || rs->failure_pending || rs->cancel_pending ||
+      raop_ffi_stream_fenced(rs->stream_id))
     return -1;
 
   ret = send(rs->server_fd, pkt->data, pkt->data_len, 0);
@@ -3164,14 +3250,15 @@ packet_send(struct raop_session *rs, struct rtp_packet *pkt)
   return 0;
 }
 
-static void
+static int
 control_packet_send(struct raop_session *rs, struct rtp_packet *pkt)
 {
   socklen_t addrlen;
   int fd;
   int ret;
 
-  if (rs->retiring || rs->failure_pending) return;
+  if (rs->retiring || rs->failure_pending || rs->cancel_pending ||
+      raop_ffi_stream_fenced(rs->stream_id)) return -1;
   switch (rs->family)
     {
       case AF_INET:
@@ -3188,12 +3275,17 @@ control_packet_send(struct raop_session *rs, struct rtp_packet *pkt)
 
       default:
 	DPRINTF(E_WARN, L_RAOP, "Unknown family %d\n", rs->family);
-	return;
+	return -1;
     }
 
   ret = sendto(fd, pkt->data, pkt->data_len, 0, &rs->naddr.sa, addrlen);
   if (ret < 0)
     DPRINTF(E_LOG, L_RAOP, "Could not send playback sync to device '%s': %s\n", rs->devname, strerror(errno));
+  if (ret != pkt->data_len) {
+    rs->coverage_failed = true;
+    return -1;
+  }
+  return 0;
 }
 
 static void
@@ -3208,7 +3300,8 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
   /* The shared control service remains alive for peers during terminal
    * write/close. A retiring session must not send cached old audio or queue
    * a deferred failure while its native release owns destruction. */
-  if (rs->retiring || rs->failure_pending) return;
+  if (rs->retiring || rs->failure_pending || rs->cancel_pending ||
+      raop_ffi_stream_fenced(rs->stream_id)) return;
 
   rtp_session = rs->master_session->rtp_session;
 
@@ -3241,6 +3334,8 @@ packets_send(struct raop_master_session *rms)
   len = alac_encode(rms->encoded_buffer, rms->encode_ctx, rms->rawbuf, rms->rawbuf_size, rms->samples_per_packet, &rms->quality);
   if (len < 0)
     {
+      for (rs = raop_sessions; rs; rs = rs->next)
+        if (rs->master_session == rms) rs->coverage_failed = true;
       return -1;
     }
 
@@ -3252,7 +3347,11 @@ packets_send(struct raop_master_session *rms)
     {
       ret = packet_encrypt(pkt);
       if (ret < 0)
-	return -1;
+        {
+          for (rs = raop_sessions; rs; rs = rs->next)
+            if (rs->master_session == rms) rs->coverage_failed = true;
+          return -1;
+        }
     }
 
   for (rs = raop_sessions; rs; rs = rs->next)
@@ -3260,21 +3359,38 @@ packets_send(struct raop_master_session *rms)
       if (rs->master_session != rms)
 	continue;
 
+      if (rs->cancel_pending) continue;
+
       // Device just joined
       if (rs->state == RAOP_STATE_CONNECTED)
 	{
 	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
-	  packet_send(rs, pkt);
+	  ret = packet_send(rs, pkt);
 	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
 	}
       else if (rs->state == RAOP_STATE_STREAMING)
 	{
-	  packet_send(rs, pkt);
+	  ret = packet_send(rs, pkt);
 	}
+      else continue;
+      struct timespec submitted;
+      clock_gettime(CLOCK_MONOTONIC, &submitted);
+      uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
+      uint64_t deadline = rs->schedule_origin_ns +
+        rms->epoch_frames / 44100 * 1000000000ULL +
+        rms->epoch_frames % 44100 * 1000000000ULL / 44100;
+      /* A late burst is not scheduled coverage. Preserve the known contiguous
+       * prefix rather than crediting audio that missed its presentation time. */
+      if (!rs->schedule_valid || submitted_ns > deadline)
+        rs->coverage_failed = true;
+      if (ret < 0 || rs->submitted_frames != rms->epoch_frames)
+        rs->coverage_failed = true;
+      else if (!rs->coverage_failed) rs->submitted_frames += rms->samples_per_packet;
     }
 
   // Commits packet to retransmit buffer, and prepares the session for the next packet
   rtp_packet_commit(rms->rtp_session, pkt);
+  rms->epoch_frames += rms->samples_per_packet;
 
   return 0;
 }
@@ -3342,11 +3458,23 @@ packets_sync_send(struct raop_master_session *rms)
       // Apply user configured offset
       cur_stamp.pos -= rs->offset_samples;
 
+      if (!rs->schedule_valid && !rs->cancel_pending &&
+          rs->state == RAOP_STATE_CONNECTED) {
+        int64_t lead = (int32_t)(rms->rtp_session->pos - cur_stamp.pos);
+        lead += RAOP_AUDIO_LATENCY_MS * 44100 / 1000;
+        int64_t ns = (int64_t)cur_stamp.ts.tv_sec * 1000000000LL +
+          cur_stamp.ts.tv_nsec + lead * 1000000000LL / 44100 -
+          (int64_t)(rms->epoch_frames / 44100) * 1000000000LL -
+          (int64_t)(rms->epoch_frames % 44100) * 1000000000LL / 44100;
+        if (ns >= 0) rs->schedule_origin_ns = (uint64_t)ns;
+      }
+
       // A device has joined and should get an init sync packet
       if (rs->state == RAOP_STATE_CONNECTED)
 	{
 	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
-	  control_packet_send(rs, sync_pkt);
+	  rs->schedule_valid = control_packet_send(rs, sync_pkt) == 0 &&
+            !rs->coverage_failed;
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);

@@ -25,6 +25,7 @@ import type {
   AirplayAppendError,
   AirplayAppendResult,
   AirplayAppendStatus,
+  AirplayCancelResult,
   AirplayControl,
   AirplayCredentials,
   AirplayDriver,
@@ -50,6 +51,12 @@ const SYMBOLS = {
     parameters: ['pointer', 'u64', 'u64', 'buffer', 'usize', 'buffer'],
     result: 'i32',
   },
+  raop_stream_cancel: { parameters: ['pointer', 'u64'], result: 'i32' },
+  raop_stream_cancel_poll: {
+    parameters: ['pointer', 'u64', 'buffer'],
+    result: 'i32',
+  },
+  raop_stream_cancel_ack: { parameters: ['pointer', 'u64'], result: 'i32' },
   raop_stream_attach: { parameters: ['pointer'], result: 'pointer' },
   raop_attachment_id: { parameters: ['pointer'], result: 'u64' },
   raop_stream_write: {
@@ -548,7 +555,7 @@ export function createFfiStream(
   if (!handle) throw new Error('raop_stream_new failed');
   activeStreams++;
   const id = lib.symbols.raop_stream_id(handle);
-  const epoch = lib.symbols.raop_stream_epoch(handle);
+  let epoch = lib.symbols.raop_stream_epoch(handle);
   const operations = createOperationScope('RAOP stream');
   const releases = createReleaseSet();
   let closing: Promise<void> | undefined;
@@ -565,7 +572,71 @@ export function createFfiStream(
   }, 1);
   return {
     id,
-    epoch,
+    get epoch() {
+      return epoch;
+    },
+    cancel(captured) {
+      return operations.run(async ({ signal }) => {
+        if (
+          typeof captured !== 'bigint' || captured <= 0n ||
+          captured > 0xffffffffffffffffn
+        ) {
+          throw new RangeError(
+            'RAOP cancel requires an unsigned nonzero epoch',
+          );
+        }
+        if (lib.symbols.raop_stream_cancel(handle, captured) !== 0) {
+          throw new Error(
+            'raop_stream_cancel refused stale or unavailable epoch',
+          );
+        }
+        epoch = captured + 1n;
+        generation++; // promptly settle transitional blocked writers too
+        const receipt = new BigUint64Array(6);
+        for (;;) {
+          const rc = lib.symbols.raop_stream_cancel_poll(
+            handle,
+            captured,
+            receipt,
+          );
+          if (
+            rc !== 1 || receipt[0] !== captured ||
+            receipt[1] !== captured + 1n ||
+            receipt[2] > 3n || receipt[5] > 1n
+          ) {
+            throw new Error('Invalid RAOP cancel receipt ABI');
+          }
+          if (receipt[2] !== 0n || signal.aborted) {
+            return Object.freeze({
+              streamId: id,
+              epoch: receipt[0],
+              nextEpoch: receipt[1],
+              status: signal.aborted
+                ? 'canceled'
+                : (['ready', 'canceled', 'failed'] as const)[
+                  Number(receipt[2]) - 1
+                ],
+              cutoffFrames: receipt[5] === 1n ? receipt[3] : null,
+              admittedNs: receipt[4],
+            }) as AirplayCancelResult;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      });
+    },
+    ackCancel(captured) {
+      return operations.run(() => {
+        if (
+          typeof captured !== 'bigint' || captured <= 0n ||
+          captured > 0xffffffffffffffffn ||
+          lib.symbols.raop_stream_cancel_ack(handle, captured) !== 0
+        ) {
+          throw new Error(
+            'raop_stream_cancel_ack refused pending or absent result',
+          );
+        }
+      });
+    },
     append(input) {
       return operations.run(() => {
         for (const value of [input.epoch, input.segment]) {

@@ -68,6 +68,23 @@ uint64_t raop_stream_epoch(raop_stream_t *stream);
 int raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
                        const uint8_t *pcm, size_t len,
                        struct raop_append_result *result);
+/* Cancel is admitted synchronously under the append lock. It advances epoch
+ * before return; replacement append is not-ready until local reset and every
+ * affected session's FLUSH ACK or destruction. No natural drain wait.
+ * Poll retains the result until ack, outside the state ring. All fields u64.
+ * status: 0 pending, 1 ready, 2 superseded/canceled, 3 failed. cutoff_frames is
+ * scheduled contiguous old-epoch transport coverage at admitted_ns, NOT accepted
+ * input or a physical-render acknowledgement. Zero if no healthy coverage.
+ * Poll returns 1 found / 0 absent. Ack refuses pending results. Serialize free
+ * with callers; free cancels and destroys retained storage after attachments. */
+struct raop_cancel_result {
+  uint64_t epoch, next_epoch, status, cutoff_frames, admitted_ns;
+  uint64_t local_reset;
+};
+int raop_stream_cancel(raop_stream_t *stream, uint64_t epoch);
+int raop_stream_cancel_poll(raop_stream_t *stream, uint64_t epoch,
+                            struct raop_cancel_result *result);
+int raop_stream_cancel_ack(raop_stream_t *stream, uint64_t epoch);
 /* Wait for loop-owned local ingress/partial reset. Serialize with write/reset/
  * free: caller fences and joins admitted writers before calling and holds new
  * input until return. This is not a receiver FLUSH acknowledgement. */

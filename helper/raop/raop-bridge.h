@@ -9,6 +9,13 @@ int raop_release_device(uint64_t id, void (*done)(uint64_t, int));
 /* Loop-thread effective-feed discontinuity: discard partial raw ALAC input,
  * retaining peer sessions, RTP clocks and already encoded retransmit packets. */
 void raop_discard_pending_input(uint64_t stream_id);
+/* Loop-owned epoch reset. Clear input/cache, FLUSH established sessions and
+ * destroy old startup sessions. Repeated calls cannot admit PCM between ACKs.
+ * Returns the slowest healthy scheduled cutoff at the captured monotonic time. */
+uint64_t raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns);
+int raop_cancel_pending(uint64_t stream_id);
+void raop_ffi_cancel_changed(uint64_t stream_id);
+int raop_ffi_stream_fenced(uint64_t stream_id);
 /* Copy pairing state into the owning handle's reliable mailbox. NULL is an
  * explicit invalidation, never ordinary device cleanup. No SQL or diagnostics.
  * Returns 0 only when copied; callable from the native producer thread. */

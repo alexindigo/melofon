@@ -71,6 +71,7 @@ struct raop_player *raop_player_new(struct event_base *evbase, uint64_t stream_i
 void raop_player_free(struct raop_player *p);
 int raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_flush(struct raop_player *p);
+void raop_player_fence(struct raop_player *p, bool fenced);
 int raop_player_append(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_session_started(struct raop_player *p);
 void raop_player_session_stopped(struct raop_player *p);
@@ -120,6 +121,7 @@ typedef struct free_sync
 typedef struct cmd
 {
   cmd_type type;
+  uint64_t epoch; /* stream incarnation captured at control admission */
   char host[256];
   int port;
   char name[256];
@@ -192,6 +194,12 @@ struct raop_handle
 
 typedef struct raop_handle raop_t;
 
+struct cancel_receipt {
+  struct raop_cancel_result result;
+  bool applied;
+  struct cancel_receipt *next;
+};
+
 struct raop_stream
 {
   uint64_t id;
@@ -202,6 +210,10 @@ struct raop_stream
   bool active;                      /* rt.lock; guard retained until free */
   bool item_set;                    /* loop-owned first attachment item */
   bool resetting;                   /* rt.lock; local reset admission fence */
+  bool canceling;                   /* rt.lock; ordered receiver reset */
+  struct event *cancel_event;
+  struct cancel_receipt *cancels;
+  struct raop_stream *next;
 };
 
 /* ------------------------------------------------------------------ runtime */
@@ -223,6 +235,7 @@ static struct
   uint64_t active_stream_id;        /* 0 = none, 1 = compatibility group */
   unsigned legacy_claims;
   raop_t *handles_list;        /* all handles (loop thread iterates) */
+  struct raop_stream *streams;
 } rt = {
   .lock = PTHREAD_MUTEX_INITIALIZER,
   .idle = PTHREAD_COND_INITIALIZER,
@@ -252,6 +265,10 @@ stream_claim_locked(struct raop_stream *stream, raop_t *legacy)
 static void
 stream_readiness_locked(raop_t *h)
 {
+  if (h->stream && h->stream->resetting) {
+    raop_player_session_stopped(h->player);
+    return;
+  }
   if (!h->stream) {
     if (h->ready) raop_player_session_started(h->player);
     else raop_player_session_stopped(h->player);
@@ -605,6 +622,12 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
         if (!h->cmds_head) h->cmds_tail = NULL;
         pthread_mutex_unlock(&h->cmds_lock);
       }
+      if (h->stream && (c->type == CMD_START || c->type == CMD_FLUSH)) {
+        pthread_mutex_lock(&rt.lock);
+        bool stale = c->epoch != h->stream->epoch;
+        pthread_mutex_unlock(&rt.lock);
+        if (stale) { cmd_free(c); continue; }
+      }
       if (!released && (c->type == CMD_TEARDOWN || c->type == CMD_FREE ||
                         (c->type == CMD_START && h->device))) {
         pthread_mutex_lock(&rt.lock);
@@ -941,6 +964,8 @@ raop_new(void)
   return handle_new(NULL);
 }
 
+static void stream_cancel_cb(evutil_socket_t fd, short what, void *arg);
+
 raop_stream_t *
 raop_stream_new(void)
 {
@@ -956,6 +981,14 @@ raop_stream_new(void)
   pthread_mutex_unlock(&rt.lock);
   stream->player = raop_player_new(rt.base, stream->id);
   if (!stream->player) { runtime_release(); free(stream); return NULL; }
+  stream->cancel_event = event_new(rt.base, -1, 0, stream_cancel_cb, stream);
+  if (!stream->cancel_event) {
+    raop_player_free(stream->player); runtime_release(); free(stream); return NULL;
+  }
+  pthread_mutex_lock(&rt.lock);
+  stream->next = rt.streams;
+  rt.streams = stream;
+  pthread_mutex_unlock(&rt.lock);
   return stream;
 }
 
@@ -995,7 +1028,7 @@ raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len)
   if (!len) return 0;
   pthread_mutex_lock(&rt.lock);
   int result = stream_claim_locked(stream, NULL);
-  if (result == 0) result = raop_player_write(stream->player, pcm, len);
+  if (result == 0) result = stream->resetting ? 0 : raop_player_write(stream->player, pcm, len);
   pthread_mutex_unlock(&rt.lock);
   return result;
 }
@@ -1049,6 +1082,134 @@ raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
   }
   pthread_mutex_unlock(&rt.lock);
   return 0;
+}
+
+_Static_assert(sizeof(struct raop_cancel_result) == 48, "cancel receipt ABI");
+
+int
+raop_ffi_stream_fenced(uint64_t stream_id)
+{
+  int fenced = 0;
+  pthread_mutex_lock(&rt.lock);
+  for (struct raop_stream *s = rt.streams; s; s = s->next)
+    if (s->id == stream_id) { fenced = s->canceling || s->closing; break; }
+  pthread_mutex_unlock(&rt.lock);
+  return fenced;
+}
+
+void
+raop_ffi_cancel_changed(uint64_t stream_id)
+{
+  pthread_mutex_lock(&rt.lock);
+  for (struct raop_stream *s = rt.streams; s; s = s->next)
+    if (s->id == stream_id && s->canceling && !s->closing) {
+      event_active(s->cancel_event, EV_TIMEOUT, 1);
+      break;
+    }
+  pthread_mutex_unlock(&rt.lock);
+}
+
+static void
+stream_cancel_cb(evutil_socket_t fd, short what, void *arg)
+{
+  struct raop_stream *stream = arg;
+  (void)fd; (void)what;
+  for (;;) {
+    pthread_mutex_lock(&rt.lock);
+    struct cancel_receipt *c = stream->cancels;
+    while (c && c->applied) c = c->next;
+    pthread_mutex_unlock(&rt.lock);
+    if (!c) break;
+    raop_player_session_stopped(stream->player);
+    raop_player_flush(stream->player);
+    uint64_t cutoff = raop_cancel_stream(stream->id, c->result.admitted_ns);
+    pthread_mutex_lock(&rt.lock);
+    c->result.cutoff_frames = cutoff;
+    c->result.local_reset = 1;
+    c->applied = true;
+    pthread_mutex_unlock(&rt.lock);
+  }
+  if (raop_cancel_pending(stream->id)) return;
+  pthread_mutex_lock(&rt.lock);
+  bool all_applied = true;
+  for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
+    if (!c->applied) all_applied = false;
+  if (all_applied && stream->canceling && !stream->closing) {
+    for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
+      if (!c->result.status) c->result.status = 1;
+    stream->canceling = stream->resetting = false;
+    raop_player_fence(stream->player, false);
+    for (raop_t *h = rt.handles_list; h; h = h->next)
+      if (h->stream == stream && h->ready) {
+        raop_player_session_started(stream->player);
+        break;
+      }
+  }
+  pthread_mutex_unlock(&rt.lock);
+}
+
+int
+raop_stream_cancel(raop_stream_t *stream, uint64_t epoch)
+{
+  if (!stream || !epoch) return -1;
+  struct cancel_receipt *receipt = calloc(1, sizeof(*receipt));
+  if (!receipt) return -1;
+  pthread_mutex_lock(&rt.lock);
+  if (stream->closing || epoch != stream->epoch || epoch == UINT64_MAX ||
+      (stream->resetting && !stream->canceling)) {
+    pthread_mutex_unlock(&rt.lock); free(receipt); return -1;
+  }
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  receipt->result = (struct raop_cancel_result){
+    .epoch = epoch, .next_epoch = epoch + 1,
+    .admitted_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec,
+  };
+  struct cancel_receipt **tail = &stream->cancels;
+  for (; *tail; tail = &(*tail)->next)
+    if (!(*tail)->result.status) (*tail)->result.status = 2;
+  *tail = receipt;
+  stream->epoch++;
+  stream->resetting = stream->canceling = true;
+  raop_player_fence(stream->player, true);
+  event_active(stream->cancel_event, EV_TIMEOUT, 1);
+  pthread_mutex_unlock(&rt.lock);
+  return 0;
+}
+
+int
+raop_stream_cancel_poll(raop_stream_t *stream, uint64_t epoch,
+                        struct raop_cancel_result *result)
+{
+  if (!stream || !result) return -1;
+  int found = 0;
+  pthread_mutex_lock(&rt.lock);
+  for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
+    if (c->result.epoch == epoch) {
+      *result = c->result;
+      if (!c->applied) result->status = 0;
+      found = 1; break;
+    }
+  pthread_mutex_unlock(&rt.lock);
+  return found;
+}
+
+int
+raop_stream_cancel_ack(raop_stream_t *stream, uint64_t epoch)
+{
+  if (!stream) return -1;
+  int result = -1;
+  pthread_mutex_lock(&rt.lock);
+  for (struct cancel_receipt **c = &stream->cancels; *c; c = &(*c)->next)
+    if ((*c)->result.epoch == epoch) {
+      if ((*c)->applied && (*c)->result.status) {
+        struct cancel_receipt *old = *c;
+        *c = old->next; free(old); result = 0;
+      }
+      break;
+    }
+  pthread_mutex_unlock(&rt.lock);
+  return result;
 }
 
 struct stream_free_work { struct raop_stream *stream; free_sync *sync; };
@@ -1110,7 +1271,16 @@ stream_free_cb(evutil_socket_t fd, short what, void *arg)
   (void)fd; (void)what;
   raop_player_session_stopped(stream->player);
   raop_player_free(stream->player);
+  event_free(stream->cancel_event);
   pthread_mutex_lock(&rt.lock);
+  struct raop_stream **slot = &rt.streams;
+  while (*slot != stream) slot = &(*slot)->next;
+  *slot = stream->next;
+  while (stream->cancels) {
+    struct cancel_receipt *c = stream->cancels;
+    stream->cancels = c->next;
+    free(c);
+  }
   if (stream->active) rt.active_stream_id = 0;
   pthread_mutex_unlock(&rt.lock);
   free(stream);
@@ -1218,6 +1388,7 @@ raop_open(raop_t *h, const char *host, int port, const char *name, int volume,
 
   pthread_mutex_lock(&rt.lock);
   int claimed = stream_claim_locked(h->stream, h);
+  if (h->stream) c->epoch = h->stream->epoch;
   pthread_mutex_unlock(&rt.lock);
   if (claimed < 0) { cmd_free(c); return claimed; }
   return cmd_push(h, c);
@@ -1287,6 +1458,12 @@ raop_flush(raop_t *h)
   if (!c)
     return -1;
   c->type = CMD_FLUSH;
+  pthread_mutex_lock(&rt.lock);
+  if (h->stream && h->stream->canceling) {
+    pthread_mutex_unlock(&rt.lock); cmd_free(c); return -1;
+  }
+  if (h->stream) c->epoch = h->stream->epoch;
+  pthread_mutex_unlock(&rt.lock);
   return cmd_push(h, c);
 }
 

@@ -118,7 +118,7 @@ export interface FakeRaop {
   port: number;
   sessions: FakeRaopSession[];
   close(): void;
-  requestRetransmit(id: string): void;
+  requestRetransmit(id: string, sequence?: number): void;
   requestTiming(id: string): void;
   /** Same clock as wire.atMs, for scheduled snapshots. */
   nowMs(): number;
@@ -132,6 +132,8 @@ export function startFakeRaop(
     teardownDelayMs?: number;
     withholdTeardownReply?: boolean;
     flushDelayMs?: number;
+    beforeFlushReply?: () => Promise<void>;
+    refuseFlush?: boolean;
     captureAudio?: boolean;
     /** Lossless raw scheduling evidence, separate from legacy arrival capture. */
     captureWire?: boolean;
@@ -145,7 +147,7 @@ export function startFakeRaop(
   const sessions: FakeRaopSession[] = [];
   const sockets: { close(): void }[] = [];
   const conns: Deno.TcpConn[] = [];
-  const retransmits = new Map<string, () => void>();
+  const retransmits = new Map<string, (sequence?: number) => void>();
   const timingRequests = new Map<string, () => void>();
   const bindAddress = '127.0.0.1';
   const started = performance.now();
@@ -402,6 +404,7 @@ export function startFakeRaop(
           if (opts.captureWire) session.wire.push({ kind: 'teardown', atMs });
         }
         if (method === 'TEARDOWN' && opts.withholdTeardownReply) continue;
+        if (method === 'FLUSH') await opts.beforeFlushReply?.();
         const delay = method === 'FLUSH' ? opts.flushDelayMs : undefined;
         if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
 
@@ -456,8 +459,8 @@ export function startFakeRaop(
             }
             timing.send(request, timingPort, session.rtspPeer.address);
           });
-          retransmits.set(session.id, () => {
-            const sequence = session.rtpSequences.at(-1);
+          retransmits.set(session.id, (requested) => {
+            const sequence = requested ?? session.rtpSequences.at(-1);
             if (!controlPort || sequence === undefined) return;
             const request = new Uint8Array([0x80, 0xd5, 0, 1, 0, 0, 0, 1]);
             new DataView(request.buffer).setUint16(4, sequence);
@@ -480,7 +483,10 @@ export function startFakeRaop(
         await conn.write(
           encoder.encode(
             `RTSP/1.0 ${
-              method === 'RECORD' && !recording ? '500 Refused' : '200 OK'
+              (method === 'RECORD' && !recording) ||
+                (method === 'FLUSH' && opts.refuseFlush)
+                ? '500 Refused'
+                : '200 OK'
             }\r\nCSeq: ${cseq}\r\n${extra}Server: fake-raop\r\nContent-Length: 0\r\n\r\n`,
           ),
         );
@@ -509,8 +515,8 @@ export function startFakeRaop(
   return Promise.resolve({
     port,
     sessions,
-    requestRetransmit(id) {
-      retransmits.get(id)?.();
+    requestRetransmit(id, sequence) {
+      retransmits.get(id)?.(sequence);
     },
     requestTiming(id) {
       timingRequests.get(id)?.();

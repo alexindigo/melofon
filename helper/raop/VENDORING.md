@@ -109,7 +109,7 @@ joins its C1 producers, attempts all C3 attachment releases, then frees the
 stream on the loop. Failed native release retains storage and the guard.
 
 This is not concurrent-stream qualification: metadata/crypto/control-service
-isolation and ordered stream cancel/accept/completion remain separate work.
+isolation and retained source completion remain separate work.
 `tests/raop-stream.test.ts` exercises the shipping public FFI through real UDP,
 ALAC decoding and the independent scheduled receiver model, including both
 attachment-removal orders and compatibility/explicit guard competition.
@@ -126,12 +126,33 @@ suffix may be retried. Segment identity is opaque, not native queue policy.
 
 The additive typed `AirplayExactStream` uses the existing C1/C3 stream owner.
 The production boot still uses its transitional PCM/local-reset port. Local
-reset fences new exact admission until its callback applies, but does not yet
-change epochs or prove receiver FLUSH readiness. Ordered cancellation, retained
-source markers and scheduled completion remain separate work. Test-only
+reset fences new exact admission until its callback applies, but does not
+change epochs or prove receiver FLUSH readiness. Retained source markers and
+scheduled completion remain separate work. Test-only
 allocation/reset barriers in `test/faultinject.c` are never linked into the
 shipping library. `tests/raop-stream-cancel.test.ts` exercises both the public
 native receipt ABI and typed port through actual scheduled ALAC consumers.
+
+## Ordered stream cancellation
+
+`raop_stream_cancel` shares append admission, advances the captured epoch and
+fences the pacer and old packet/cache authority before returning. A preallocated
+stream event applies ingress/partial/encoded/cache reset on the native loop.
+Replacement append reports not-ready until every affected session acknowledges
+its ordered FLUSH or is locally destroyed. Old startup sessions are destroyed;
+their delayed callbacks cannot publish CONNECTED. Device START/FLUSH commands
+capture epochs, and a device FLUSH cannot compete with an ordered cancellation.
+Repeated cancellation may share an in-flight session FLUSH only while no new
+input was admissible. No old reset can clear an accepted replacement prefix.
+
+The separate cancel poll/ack list retains every terminal receipt until explicit
+acknowledgement or stream free, independent of the state ring. It records native
+monotonic admission time, applied local reset and the slowest contiguous submitted
+scheduled cutoff, using successful RTP/sync coverage and receiver offset/latency
+once. This is not accepted PCM, natural completion, physical sound or a core
+bookmark projection. Close cancels typed poll waiters, joins them through C1 and
+then destroys attachments and stream storage through the existing C3 owner.
+Production boot adoption remains separate from this additive native/typed port.
 
 ## Device credential input
 

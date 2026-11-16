@@ -99,6 +99,19 @@ export type AirplayAppendResult = Readonly<
 export interface AirplayExactStream extends AirplayStream {
   readonly epoch: bigint;
   append(input: AirplayAppendInput): Promise<AirplayAppendResult>;
+  /** Synchronously fence/advance the captured epoch; resolve after local reset
+   * and receiver readiness, or supersession/close. Retained until explicit ack. */
+  cancel(epoch: bigint): Promise<AirplayCancelResult>;
+  ackCancel(epoch: bigint): Promise<void>;
+}
+export interface AirplayCancelResult {
+  readonly streamId: bigint;
+  readonly epoch: bigint;
+  readonly nextEpoch: bigint;
+  readonly status: 'ready' | 'canceled' | 'failed';
+  /** Null only if close canceled the poll before the local cutoff was captured. */
+  readonly cutoffFrames: bigint | null;
+  readonly admittedNs: bigint;
 }
 /** A fixed player's lazily allocated stream. Device admission holds the private
  * attachment authority; producers cannot construct or rebind receiver handles.
