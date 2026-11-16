@@ -29,6 +29,45 @@ uint64_t raop_attachment_id(raop_t *attachment);
  * -2 = another stream owns the runtime. Device-oriented raop_write refuses
  * explicit attachments: there is exactly one input port per stream. */
 int raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len);
+/* Exact admission, additive to the transitional whole-chunk write port. The
+ * caller supplies its captured epoch and opaque nonzero segment identity. A
+ * receipt attributes ONLY the copied prefix, in stereo frames, to that input;
+ * retry only the unaccepted suffix. It is not packetization or playout proof.
+ * Segment markers/seals are a separate ordered contract. No id is truncated.
+ *
+ * All fields are uint64_t (40 bytes, native byte order) for callback-free FFI.
+ * Return 0 means a receipt was written, including error/canceled/not-ready;
+ * -1 means no result storage was supplied. No result enters the state ring.
+ * Empty valid input is accepted with zero frames. Partial or zero nonempty
+ * acceptance is backpressure. Error/canceled/not-ready never accept frames.
+ * Admission shares rt.lock with stream lifecycle/control admission. The initial
+ * epoch is nonzero; ordered epoch cancellation/receiver readiness is separate
+ * from the transitional local reset below. Serialize readers with free. */
+enum raop_append_status {
+  RAOP_APPEND_ACCEPTED = 0,
+  RAOP_APPEND_BACKPRESSURE = 1,
+  RAOP_APPEND_CANCELED = 2,
+  RAOP_APPEND_ERROR = 3,
+  RAOP_APPEND_NOT_READY = 4,
+};
+enum raop_append_error {
+  RAOP_APPEND_ERROR_NONE = 0,
+  RAOP_APPEND_ERROR_INVALID = 1,
+  RAOP_APPEND_ERROR_BUSY = 2,
+  RAOP_APPEND_ERROR_ALLOCATION = 3,
+  RAOP_APPEND_ERROR_CLOSING = 4,
+};
+struct raop_append_result {
+  uint64_t epoch;
+  uint64_t segment;
+  uint64_t accepted_frames;
+  uint64_t status;
+  uint64_t error;
+};
+uint64_t raop_stream_epoch(raop_stream_t *stream);
+int raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
+                       const uint8_t *pcm, size_t len,
+                       struct raop_append_result *result);
 /* Wait for loop-owned local ingress/partial reset. Serialize with write/reset/
  * free: caller fences and joins admitted writers before calling and holds new
  * input until return. This is not a receiver FLUSH acknowledgement. */

@@ -68,6 +68,38 @@ export interface AirplayStream {
   reset(): Promise<void>;
   close(): Promise<void>;
 }
+export type AirplayAppendStatus =
+  | 'accepted'
+  | 'backpressure'
+  | 'canceled'
+  | 'error'
+  | 'not-ready';
+export type AirplayAppendError = 'invalid' | 'busy' | 'allocation' | 'closing';
+export interface AirplayAppendInput {
+  readonly epoch: bigint;
+  readonly segment: bigint;
+  readonly pcm: Uint8Array;
+}
+export type AirplayAppendResult = Readonly<
+  & {
+    streamId: bigint;
+    epoch: bigint;
+    segment: bigint;
+    acceptedFrames: bigint;
+  }
+  & (
+    | { status: Exclude<AirplayAppendStatus, 'error'>; error?: never }
+    | { status: 'error'; error: AirplayAppendError }
+  )
+>;
+/** Additive exact input port. One admission attempt, never an implicit retry or
+ * drain wait. A receipt owns only its copied prefix; segment is an opaque core
+ * identity, not queue policy. The boot's transitional pcm/reset port is retained
+ * until ordered receiver cancellation is adopted. No playout claim is implied. */
+export interface AirplayExactStream extends AirplayStream {
+  readonly epoch: bigint;
+  append(input: AirplayAppendInput): Promise<AirplayAppendResult>;
+}
 /** A fixed player's lazily allocated stream. Device admission holds the private
  * attachment authority; producers cannot construct or rebind receiver handles.
  * Closing joins admitted preparation, activation and PCM before releasing native

@@ -114,6 +114,25 @@ isolation and ordered stream cancel/accept/completion remain separate work.
 ALAC decoding and the independent scheduled receiver model, including both
 attachment-removal orders and compatibility/explicit guard competition.
 
+## Exact stream admission
+
+`raop_stream_append` adds an epoch/segment-qualified, caller-owned receipt with
+an exact accepted stereo-frame count and accepted/backpressure/canceled/error/
+not-ready status. The fixed-width layout is declared in `ffi.h`; missing symbols
+fail library loading rather than falling back to a byte-only ABI. The existing
+two-second ingress bound and active-stream guard remain. Allocation failure is
+distinct from a full ingress. PCM is copied before return; only the unaccepted
+suffix may be retried. Segment identity is opaque, not native queue policy.
+
+The additive typed `AirplayExactStream` uses the existing C1/C3 stream owner.
+The production boot still uses its transitional PCM/local-reset port. Local
+reset fences new exact admission until its callback applies, but does not yet
+change epochs or prove receiver FLUSH readiness. Ordered cancellation, retained
+source markers and scheduled completion remain separate work. Test-only
+allocation/reset barriers in `test/faultinject.c` are never linked into the
+shipping library. `tests/raop-stream-cancel.test.ts` exercises both the public
+native receipt ABI and typed port through actual scheduled ALAC consumers.
+
 ## Device credential input
 
 `raop_start_v2` adds length-delimited per-device password and restored fruit

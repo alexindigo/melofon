@@ -417,22 +417,33 @@ raop_player_free(struct raop_player *p)
  * bytes accepted; < len means the cap is reached (caller retries — that is
  * the backpressure). Accepted at any time; paced out only while streaming. */
 int
-raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len)
+raop_player_append(struct raop_player *p, const uint8_t *pcm, size_t len)
 {
   size_t avail;
   size_t accept;
 
   pthread_mutex_lock(&p->pcm_lock);
   avail = evbuffer_get_length(p->pcm);
-  accept = len;
-  if (avail + accept > PCM_CAP)
-    accept = avail >= PCM_CAP ? 0 : PCM_CAP - avail;
+  accept = avail >= PCM_CAP ? 0 : PCM_CAP - avail;
+  if (accept > len) accept = len;
   accept &= ~(size_t)3; /* keep whole s16-stereo frames */
   if (accept > 0 && evbuffer_add(p->pcm, pcm, accept) < 0)
-    accept = 0;
+    {
+      pthread_mutex_unlock(&p->pcm_lock);
+      return -1; /* allocation failure is not bounded-ingress backpressure */
+    }
   pthread_mutex_unlock(&p->pcm_lock);
 
   return (int)accept;
+}
+
+/* Transitional byte port preserves its existing zero-on-allocation-failure
+ * behavior. New callers use exact admission and can distinguish the failure. */
+int
+raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len)
+{
+  int result = raop_player_append(p, pcm, len);
+  return result < 0 ? 0 : result;
 }
 
 /* Loop thread: drop buffered PCM (pause/seek/track-change semantics; the

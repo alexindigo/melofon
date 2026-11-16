@@ -71,6 +71,7 @@ struct raop_player *raop_player_new(struct event_base *evbase, uint64_t stream_i
 void raop_player_free(struct raop_player *p);
 int raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_flush(struct raop_player *p);
+int raop_player_append(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_session_started(struct raop_player *p);
 void raop_player_session_stopped(struct raop_player *p);
 void raop_player_item_set(struct raop_player *p, const char *title,
@@ -194,11 +195,13 @@ typedef struct raop_handle raop_t;
 struct raop_stream
 {
   uint64_t id;
+  uint64_t epoch;                    /* rt.lock; exact admission incarnation */
   struct raop_player *player;
   unsigned attachments;             /* rt.lock; includes retiring handles */
   bool closing;                     /* rt.lock; admission fence */
   bool active;                      /* rt.lock; guard retained until free */
   bool item_set;                    /* loop-owned first attachment item */
+  bool resetting;                   /* rt.lock; local reset admission fence */
 };
 
 /* ------------------------------------------------------------------ runtime */
@@ -949,6 +952,7 @@ raop_stream_new(void)
     pthread_mutex_unlock(&rt.lock); runtime_release(); free(stream); return NULL;
   }
   stream->id = rt.next_stream_id++;
+  stream->epoch = 1;
   pthread_mutex_unlock(&rt.lock);
   stream->player = raop_player_new(rt.base, stream->id);
   if (!stream->player) { runtime_release(); free(stream); return NULL; }
@@ -996,6 +1000,57 @@ raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len)
   return result;
 }
 
+_Static_assert(sizeof(struct raop_append_result) == 40, "append receipt ABI");
+
+uint64_t
+raop_stream_epoch(raop_stream_t *stream)
+{
+  pthread_mutex_lock(&rt.lock);
+  uint64_t epoch = stream ? stream->epoch : 0;
+  pthread_mutex_unlock(&rt.lock);
+  return epoch;
+}
+
+int
+raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
+                   const uint8_t *pcm, size_t len,
+                   struct raop_append_result *result)
+{
+  if (!result) return -1;
+  *result = (struct raop_append_result){
+    .epoch = epoch, .segment = segment,
+    .status = RAOP_APPEND_ERROR, .error = RAOP_APPEND_ERROR_INVALID,
+  };
+  if (!stream || !epoch || !segment || (!pcm && len) || len % 4) return 0;
+  pthread_mutex_lock(&rt.lock);
+  if (stream->closing) result->error = RAOP_APPEND_ERROR_CLOSING;
+  else if (epoch != stream->epoch) {
+    result->status = RAOP_APPEND_CANCELED;
+    result->error = RAOP_APPEND_ERROR_NONE;
+  } else if (stream->resetting) {
+    result->status = RAOP_APPEND_NOT_READY;
+    result->error = RAOP_APPEND_ERROR_NONE;
+  } else if (!len) {
+    result->status = RAOP_APPEND_ACCEPTED;
+    result->error = RAOP_APPEND_ERROR_NONE;
+  } else {
+    int claim = stream_claim_locked(stream, NULL);
+    if (claim < 0) result->error = RAOP_APPEND_ERROR_BUSY;
+    else {
+      int accepted = raop_player_append(stream->player, pcm, len);
+      if (accepted < 0) result->error = RAOP_APPEND_ERROR_ALLOCATION;
+      else {
+        result->accepted_frames = (uint64_t)accepted / 4;
+        result->status = (size_t)accepted == len
+          ? RAOP_APPEND_ACCEPTED : RAOP_APPEND_BACKPRESSURE;
+        result->error = RAOP_APPEND_ERROR_NONE;
+      }
+    }
+  }
+  pthread_mutex_unlock(&rt.lock);
+  return 0;
+}
+
 struct stream_free_work { struct raop_stream *stream; free_sync *sync; };
 
 static void
@@ -1008,6 +1063,7 @@ stream_reset_cb(evutil_socket_t fd, short what, void *arg)
   raop_player_flush(stream->player);
   raop_discard_pending_input(stream->id);
   pthread_mutex_lock(&rt.lock);
+  stream->resetting = false;
   for (raop_t *h = rt.handles_list; h; h = h->next)
     if (h->stream == stream && h->ready) {
       raop_player_session_started(stream->player);
@@ -1025,9 +1081,10 @@ raop_stream_reset(raop_stream_t *stream)
 {
   if (!stream) return -1;
   pthread_mutex_lock(&rt.lock);
-  bool closing = stream->closing;
+  bool unavailable = stream->closing || stream->resetting;
+  if (!unavailable) stream->resetting = true;
   pthread_mutex_unlock(&rt.lock);
-  if (closing) return -1;
+  if (unavailable) return -1;
   free_sync sync = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER };
   struct stream_free_work work = { stream, &sync };
   struct timeval zero = { 0, 0 };
@@ -1037,6 +1094,11 @@ raop_stream_reset(raop_stream_t *stream)
     while (!sync.done) pthread_cond_wait(&sync.cond, &sync.lock);
   pthread_mutex_unlock(&sync.lock);
   pthread_cond_destroy(&sync.cond); pthread_mutex_destroy(&sync.lock);
+  if (result < 0) {
+    pthread_mutex_lock(&rt.lock);
+    stream->resetting = false;
+    pthread_mutex_unlock(&rt.lock);
+  }
   return result < 0 ? -1 : 0;
 }
 

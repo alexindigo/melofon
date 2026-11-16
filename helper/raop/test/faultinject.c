@@ -189,6 +189,23 @@ int evbuffer_write(struct evbuffer *buf, evutil_socket_t fd)
   return real_write(buf, fd);
 }
 
+/* Exact-admission probes only: fail the ingress allocation without perturbing
+ * RTSP/encoder/logging buffers. No test knob is linked into the shipping .so. */
+int evbuffer_add(struct evbuffer *buf, const void *data, size_t size)
+{
+  static int (*real_add)(struct evbuffer *, const void *, size_t);
+  if (!real_add) real_add = event_symbol("evbuffer_add");
+  const char *arm = getenv("RAOP_FI_APPEND_ARM_FILE");
+  if (arm && access(arm, F_OK) == 0) {
+    Dl_info info;
+    if (dladdr(__builtin_return_address(0), &info) && info.dli_sname &&
+        strcmp(info.dli_sname, "raop_player_append") == 0) {
+      unlink(arm); return -1;
+    }
+  }
+  return real_add(buf, data, size);
+}
+
 int
 event_base_once(struct event_base *base, evutil_socket_t fd, short events,
                 event_callback_fn cb, void *arg, const struct timeval *tv)
@@ -201,6 +218,16 @@ event_base_once(struct event_base *base, evutil_socket_t fd, short events,
 
   if (!real_once)
     real_once = event_symbol("event_base_once");
+  const char *arm = getenv("RAOP_FI_RESET_ARM_FILE");
+  if (arm && access(arm, F_OK) == 0) {
+    Dl_info info;
+    if (dladdr(__builtin_return_address(0), &info) && info.dli_sname &&
+        strcmp(info.dli_sname, "raop_stream_reset") == 0) {
+      pthread_mutex_lock(&fd_lock); once_blocking = 1; pthread_mutex_unlock(&fd_lock);
+      while (access(arm, F_OK) == 0) usleep(1000);
+      pthread_mutex_lock(&fd_lock); once_blocking = 0; pthread_mutex_unlock(&fd_lock);
+    }
+  }
   n = ++calls;
   if (n == 1 && getenv("RAOP_FI_EBO_BLOCK_FAIL")) {
     pthread_mutex_lock(&fd_lock); once_blocking = 1; pthread_mutex_unlock(&fd_lock);

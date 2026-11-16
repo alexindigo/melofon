@@ -22,12 +22,15 @@
 // are optimistically routed through a broken native state (plan
 // atv3-session-recycle).
 import type {
+  AirplayAppendError,
+  AirplayAppendResult,
+  AirplayAppendStatus,
   AirplayControl,
   AirplayCredentials,
   AirplayDriver,
+  AirplayExactStream,
   AirplayInput,
   AirplayProfile,
-  AirplayStream,
   AirplayTransport,
   HelperEventFn,
   PairingCredentialConsumer,
@@ -42,6 +45,11 @@ const SYMBOLS = {
   raop_new: { parameters: [], result: 'pointer' },
   raop_stream_new: { parameters: [], result: 'pointer' },
   raop_stream_id: { parameters: ['pointer'], result: 'u64' },
+  raop_stream_epoch: { parameters: ['pointer'], result: 'u64' },
+  raop_stream_append: {
+    parameters: ['pointer', 'u64', 'u64', 'buffer', 'usize', 'buffer'],
+    result: 'i32',
+  },
   raop_stream_attach: { parameters: ['pointer'], result: 'pointer' },
   raop_attachment_id: { parameters: ['pointer'], result: 'u64' },
   raop_stream_write: {
@@ -534,12 +542,13 @@ class FfiTransport implements AirplayTransport {
  * another close call. Attachments release before their shared stream storage. */
 export function createFfiStream(
   log: Log = scopedLog('raop-native'),
-): AirplayStream {
+): AirplayExactStream {
   const lib = loadLibrary(log);
   const handle = lib.symbols.raop_stream_new();
   if (!handle) throw new Error('raop_stream_new failed');
   activeStreams++;
   const id = lib.symbols.raop_stream_id(handle);
+  const epoch = lib.symbols.raop_stream_epoch(handle);
   const operations = createOperationScope('RAOP stream');
   const releases = createReleaseSet();
   let closing: Promise<void> | undefined;
@@ -556,6 +565,81 @@ export function createFfiStream(
   }, 1);
   return {
     id,
+    epoch,
+    append(input) {
+      return operations.run(() => {
+        for (const value of [input.epoch, input.segment]) {
+          if (
+            typeof value !== 'bigint' || value < 0n ||
+            value > 0xffffffffffffffffn
+          ) {
+            throw new RangeError(
+              'RAOP identity requires an unsigned 64-bit bigint',
+            );
+          }
+        }
+        // Match native precedence: malformed/stale requests still receive their
+        // own receipt; a valid current request cannot overtake a submitted reset
+        // while it joins the previously admitted transitional writers.
+        if (
+          resetting && input.epoch === epoch && input.segment !== 0n &&
+          input.pcm.length % 4 === 0
+        ) {
+          return Object.freeze(
+            {
+              streamId: id,
+              epoch: input.epoch,
+              segment: input.segment,
+              acceptedFrames: 0n,
+              status: 'not-ready',
+            } as const,
+          );
+        }
+        const receipt = new BigUint64Array(5);
+        const rc = lib.symbols.raop_stream_append(
+          handle,
+          input.epoch,
+          input.segment,
+          input.pcm,
+          BigInt(input.pcm.length),
+          receipt,
+        );
+        const statuses: AirplayAppendStatus[] = [
+          'accepted',
+          'backpressure',
+          'canceled',
+          'error',
+          'not-ready',
+        ];
+        const errors: AirplayAppendError[] = [
+          'invalid',
+          'busy',
+          'allocation',
+          'closing',
+        ];
+        const status = statuses[Number(receipt[3])];
+        const error = errors[Number(receipt[4]) - 1];
+        const frames = BigInt(Math.floor(input.pcm.length / 4));
+        if (
+          rc !== 0 || receipt[0] !== input.epoch ||
+          receipt[1] !== input.segment ||
+          !status || receipt[2] > frames ||
+          (status === 'accepted' && receipt[2] !== frames) ||
+          (status === 'backpressure' && receipt[2] >= frames) ||
+          (!['accepted', 'backpressure'].includes(status) &&
+            receipt[2] !== 0n) ||
+          (status === 'error' ? !error : receipt[4] !== 0n)
+        ) throw new Error('Invalid RAOP append receipt ABI');
+        return Object.freeze({
+          streamId: id,
+          epoch: receipt[0],
+          segment: receipt[1],
+          acceptedFrames: receipt[2],
+          status,
+          ...(status === 'error' ? { error } : {}),
+        }) as AirplayAppendResult;
+      });
+    },
     attach(onEvent, onCredential) {
       if (operations.closed) throw new Error('RAOP stream is closed');
       const transport = new FfiTransport(lib, onEvent, onCredential, handle);
