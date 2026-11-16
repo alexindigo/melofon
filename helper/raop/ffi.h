@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "timeline.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,20 +44,6 @@ int raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len);
  * Admission shares rt.lock with stream lifecycle/control admission. The initial
  * epoch is nonzero; ordered epoch cancellation/receiver readiness is separate
  * from the transitional local reset below. Serialize readers with free. */
-enum raop_append_status {
-  RAOP_APPEND_ACCEPTED = 0,
-  RAOP_APPEND_BACKPRESSURE = 1,
-  RAOP_APPEND_CANCELED = 2,
-  RAOP_APPEND_ERROR = 3,
-  RAOP_APPEND_NOT_READY = 4,
-};
-enum raop_append_error {
-  RAOP_APPEND_ERROR_NONE = 0,
-  RAOP_APPEND_ERROR_INVALID = 1,
-  RAOP_APPEND_ERROR_BUSY = 2,
-  RAOP_APPEND_ERROR_ALLOCATION = 3,
-  RAOP_APPEND_ERROR_CLOSING = 4,
-};
 struct raop_append_result {
   uint64_t epoch;
   uint64_t segment;
@@ -68,6 +55,31 @@ uint64_t raop_stream_epoch(raop_stream_t *stream);
 int raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
                        const uint8_t *pcm, size_t len,
                        struct raop_append_result *result);
+/* Ordered timeline input, additive to append. source is an incarnation, segment
+ * an opaque core range identity. A source must be sealed before the next source
+ * starts. target is its exclusive SOURCE-LOCAL accepted-frame count; end target
+ * is the epoch's exclusive accepted real-frame count. Both are immutable and
+ * retries of the same marker are idempotent. Seal never pads/ends a stream.
+ * Once timeline input starts, unlabelled write/append and the legacy local reset
+ * are refused; only ordered cancel can open a fresh accounted epoch.
+ * Fixed marker storage applies backpressure, never drops a range. This stage
+ * retains records until cancel/free; completion/ack is a separate contract.
+ * Status/error use raop_append_status/error. All fields u64, native byte order.
+ */
+int raop_stream_append_source(raop_stream_t *, uint64_t epoch, uint64_t source,
+                              uint64_t segment, const uint8_t *, size_t,
+                              struct raop_source_append_result *);
+int raop_stream_seal(raop_stream_t *, uint64_t epoch, uint64_t source,
+                     uint64_t target, struct raop_marker_result *);
+int raop_stream_end(raop_stream_t *, uint64_t epoch, uint64_t target,
+                    struct raop_marker_result *);
+/* Coherent pacer facts only, NOT scheduled/successful submission/completion.
+ * source/range: 1 found, 0 absent/stale, -1 invalid. index starts at 0. Silence
+ * has source/segment/offset zero and never advances source fed_frames. */
+int raop_stream_source(raop_stream_t *, uint64_t epoch, uint64_t source,
+                       struct raop_source_snapshot *);
+int raop_stream_range(raop_stream_t *, uint64_t epoch, uint64_t index,
+                      struct raop_range_snapshot *);
 /* Cancel is admitted synchronously under the append lock. It advances epoch
  * before return; replacement append is not-ready until local reset and every
  * affected session's FLUSH ACK or destruction. No natural drain wait.

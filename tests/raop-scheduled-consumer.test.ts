@@ -166,6 +166,53 @@ Deno.test('scheduled receiver: known ALAC and wire clocks render only when due',
   assertEquals(full.ranges[0].atMs, START);
 });
 
+for (const refresh of ['sync', 'timing'] as const) {
+  Deno.test(`scheduled receiver: refreshed ${refresh} does not unschedule an already queued fractional frame`, () => {
+    const capture = fixture();
+    const atMs = START + 100.5 * 1000 / 44100;
+    if (refresh === 'sync') {
+      capture.wire.push({
+        kind: 'control',
+        atMs,
+        data: sync(),
+        peer: endpoints.senderControl,
+        local: endpoints.control,
+      });
+    } else {
+      const request = new Uint8Array(32), reply = new Uint8Array(32);
+      request.set([0x80, 0xd2, 2, 0]);
+      new DataView(request.buffer).setBigUint64(24, 0x2234000000000000n);
+      reply.set([0x80, 0xd3, 2, 0]);
+      reply.set(request.subarray(24), 8);
+      const view = new DataView(reply.buffer);
+      const sender = 0x9123456700000000n +
+        BigInt(Math.round((atMs - 1) * 2 ** 32 / 1000));
+      view.setBigUint64(16, sender);
+      view.setBigUint64(24, sender);
+      capture.wire.push(
+        {
+          kind: 'timing-request',
+          atMs: atMs - 0.25,
+          data: request,
+          peer: endpoints.senderTiming,
+          local: endpoints.timing,
+        },
+        {
+          kind: 'timing-reply',
+          atMs: atMs + 0.25,
+          data: reply,
+          peer: endpoints.senderTiming,
+          local: endpoints.timing,
+        },
+      );
+    }
+    const actual = renderScheduledAudio(capture, 4000);
+    assertEquals(actual.issues, []);
+    assertEquals(actual.discarded, []);
+    assertEquals(actual.pcm, pcm(0, 704));
+  });
+}
+
 for (const kind of ['flush', 'teardown', 'close'] as const) {
   Deno.test(`scheduled receiver: complete arrival still truncates at ${kind}`, () => {
     const capture = fixture();

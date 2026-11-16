@@ -118,6 +118,65 @@ export interface AirplayCancelResult {
   readonly cutoffFrames: bigint | null;
   readonly admittedNs: bigint;
 }
+/** Ordered transport timeline, additive until boot/core adoption. Source targets
+ * are exclusive source-local real frames; endStream targets epoch-wide accepted
+ * real frames. Pacer snapshots are not scheduled progress or completion. */
+export interface AirplayTimelineStream extends AirplayExactStream {
+  /** Legacy local reset is refused after timeline admission. Use cancel(epoch)
+   * so identities and immutable targets cannot be erased within an epoch. */
+  reset(): Promise<void>;
+  appendSource(
+    input: AirplayAppendInput & { readonly source: bigint },
+  ): Promise<
+    AirplayAppendResult & {
+      readonly source: bigint;
+      readonly sourceOffset: bigint;
+      readonly inputOffset: bigint;
+    }
+  >;
+  seal(
+    epoch: bigint,
+    source: bigint,
+    target: bigint,
+  ): Promise<AirplayMarkerResult>;
+  endStream(epoch: bigint, target: bigint): Promise<AirplayMarkerResult>;
+  source(epoch: bigint, source: bigint): Promise<AirplaySourceSnapshot | null>;
+  range(epoch: bigint, index: bigint): Promise<AirplayRangeSnapshot | null>;
+}
+export type AirplayMarkerResult = Readonly<
+  & {
+    streamId: bigint;
+    epoch: bigint;
+    source: bigint;
+    target: bigint;
+    inputEnd: bigint;
+  }
+  & (
+    | { status: Exclude<AirplayAppendStatus, 'error'>; error?: never }
+    | { status: 'error'; error: AirplayAppendError }
+  )
+>;
+export interface AirplaySourceSnapshot {
+  readonly streamId: bigint;
+  readonly epoch: bigint;
+  readonly source: bigint;
+  readonly acceptedFrames: bigint;
+  readonly fedFrames: bigint;
+  readonly sealed: boolean;
+  readonly target: bigint | null;
+  readonly inputEnd: bigint | null;
+}
+export interface AirplayRangeSnapshot {
+  readonly streamId: bigint;
+  readonly epoch: bigint;
+  readonly index: bigint;
+  readonly kind: 'real' | 'underrun' | 'padding' | 'drain';
+  readonly source: bigint;
+  readonly segment: bigint;
+  readonly sourceOffset: bigint;
+  readonly transportStart: bigint;
+  readonly frames: bigint;
+}
 /** A fixed player's lazily allocated stream. Device admission holds the private
  * attachment authority; producers cannot construct or rebind receiver handles.
  * Closing joins admitted preparation, activation and PCM before releasing native

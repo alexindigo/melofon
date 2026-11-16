@@ -263,3 +263,24 @@ assertion/loader/allocator and unsupported library failures are not suppressed.
 enabled raw writers/key-dump symbols outside the logger transport; its negative
 fixture proves a raw writer is detected. `test/probe_logging.c` verifies bounded
 queue/copy/consumer ownership without touching control or pacing structures.
+
+## Ordered timeline ingress
+
+The additive `raop_stream_append_source` / `seal` / `end` port shares the exact
+append/cancel admission lock. Source-local exclusive targets and epoch-wide real
+input offsets are distinct from transport frames. A seal does not flush, pad or
+end the stream. Final end permits packet-aligned zero padding, followed by paced
+drain silence; absent input after the first real frame yields labeled underrun
+silence. Neither silence nor handshake time advances real-source counters.
+
+`timeline.h` holds value-only ABI records without importing public entry points
+into vendor translation units. The pacer retains bounded source/input markers
+(256 each), reserving dispatch/silence storage before accepting bytes. Exhaustion
+returns zero/backpressure rather than dropping records or moving a seal. This
+initial port retains markers until cancel/free; terminal acknowledgement and
+ongoing reclamation belong to the completion layer. Polling source/range records
+observes admission and pacer dispatch only, not successful submission, scheduled
+playout or completion. Timeline input refuses unlabelled writes in that epoch.
+The existing production boot still uses exact append/cancel, not this port.
+The legacy local reset is refused once timeline input starts: only ordered cancel
+can retire those identities and admit replacement input in a new epoch.

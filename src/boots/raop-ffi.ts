@@ -29,9 +29,10 @@ import type {
   AirplayControl,
   AirplayCredentials,
   AirplayDriver,
-  AirplayExactStream,
   AirplayInput,
+  AirplayMarkerResult,
   AirplayProfile,
+  AirplayTimelineStream,
   AirplayTransport,
   HelperEventFn,
   PairingCredentialConsumer,
@@ -52,6 +53,26 @@ const SYMBOLS = {
     result: 'i32',
   },
   raop_stream_cancel: { parameters: ['pointer', 'u64'], result: 'i32' },
+  raop_stream_append_source: {
+    parameters: ['pointer', 'u64', 'u64', 'u64', 'buffer', 'usize', 'buffer'],
+    result: 'i32',
+  },
+  raop_stream_seal: {
+    parameters: ['pointer', 'u64', 'u64', 'u64', 'buffer'],
+    result: 'i32',
+  },
+  raop_stream_end: {
+    parameters: ['pointer', 'u64', 'u64', 'buffer'],
+    result: 'i32',
+  },
+  raop_stream_source: {
+    parameters: ['pointer', 'u64', 'u64', 'buffer'],
+    result: 'i32',
+  },
+  raop_stream_range: {
+    parameters: ['pointer', 'u64', 'u64', 'buffer'],
+    result: 'i32',
+  },
   raop_stream_cancel_v2: {
     parameters: ['pointer', 'u64', 'buffer', 'usize'],
     result: 'i32',
@@ -553,7 +574,7 @@ class FfiTransport implements AirplayTransport {
  * another close call. Attachments release before their shared stream storage. */
 export function createFfiStream(
   log: Log = scopedLog('raop-native'),
-): AirplayExactStream {
+): AirplayTimelineStream {
   const lib = loadLibrary(log);
   const handle = lib.symbols.raop_stream_new();
   if (!handle) throw new Error('raop_stream_new failed');
@@ -566,6 +587,66 @@ export function createFfiStream(
   let generation = 0;
   const writers = new Set<Promise<void>>();
   let resetting: Promise<void> | undefined;
+  const u64 = (...values: bigint[]) => {
+    for (const value of values) {
+      if (
+        typeof value !== 'bigint' || value < 0n || value > 0xffffffffffffffffn
+      ) {
+        throw new RangeError('RAOP timeline requires unsigned 64-bit bigints');
+      }
+    }
+  };
+  const status = (value: bigint, error: bigint) => {
+    const name =
+      (['accepted', 'backpressure', 'canceled', 'error', 'not-ready'] as const)[
+        Number(value)
+      ];
+    const reason = (['invalid', 'busy', 'allocation', 'closing'] as const)[
+      Number(error) - 1
+    ];
+    if (!name || (name === 'error' ? !reason : error !== 0n)) {
+      throw new Error('Invalid RAOP timeline status ABI');
+    }
+    return name === 'error'
+      ? { status: name, error: reason }
+      : { status: name };
+  };
+  const marker = (
+    captured: bigint,
+    source: bigint,
+    target: bigint,
+    end: boolean,
+  ) =>
+    operations.run(() => {
+      u64(captured, source, target);
+      if (resetting && captured === epoch) {
+        return Object.freeze(
+          {
+            streamId: id,
+            epoch: captured,
+            source,
+            target,
+            inputEnd: 0n,
+            status: 'not-ready',
+          } as const,
+        );
+      }
+      const r = new BigUint64Array(6);
+      const rc = end
+        ? lib.symbols.raop_stream_end(handle, captured, target, r)
+        : lib.symbols.raop_stream_seal(handle, captured, source, target, r);
+      if (rc !== 0 || r[0] !== captured || r[1] !== source || r[2] !== target) {
+        throw new Error('Invalid RAOP marker receipt ABI');
+      }
+      return Object.freeze({
+        streamId: id,
+        epoch: r[0],
+        source: r[1],
+        target: r[2],
+        inputEnd: r[3],
+        ...status(r[4], r[5]),
+      }) as AirplayMarkerResult;
+    });
   releases.add('stream', async () => {
     const rc = await lib.symbols.raop_stream_free(handle);
     if (rc < 0) {
@@ -578,6 +659,116 @@ export function createFfiStream(
     id,
     get epoch() {
       return epoch;
+    },
+    appendSource(input) {
+      return operations.run(() => {
+        u64(input.epoch, input.source, input.segment);
+        if (
+          resetting && input.epoch === epoch && input.source && input.segment &&
+          input.pcm.length % 4 === 0
+        ) {
+          return Object.freeze(
+            {
+              streamId: id,
+              epoch: input.epoch,
+              source: input.source,
+              segment: input.segment,
+              sourceOffset: 0n,
+              inputOffset: 0n,
+              acceptedFrames: 0n,
+              status: 'not-ready',
+            } as const,
+          );
+        }
+        const r = new BigUint64Array(8);
+        const rc = lib.symbols.raop_stream_append_source(
+          handle,
+          input.epoch,
+          input.source,
+          input.segment,
+          input.pcm,
+          BigInt(input.pcm.length),
+          r,
+        );
+        const outcome = status(r[6], r[7]);
+        const frames = BigInt(Math.floor(input.pcm.length / 4));
+        if (
+          rc !== 0 || r[0] !== input.epoch || r[1] !== input.source ||
+          r[2] !== input.segment || r[3] > frames ||
+          (outcome.status === 'accepted' && r[3] !== frames) ||
+          (outcome.status === 'backpressure' && frames > 0n &&
+            r[3] >= frames) ||
+          (!['accepted', 'backpressure'].includes(outcome.status) &&
+            r[3] !== 0n)
+        ) {
+          throw new Error('Invalid RAOP source append receipt ABI');
+        }
+        return Object.freeze({
+          streamId: id,
+          epoch: r[0],
+          source: r[1],
+          segment: r[2],
+          acceptedFrames: r[3],
+          sourceOffset: r[4],
+          inputOffset: r[5],
+          ...outcome,
+        });
+      });
+    },
+    seal: (captured, source, target) => marker(captured, source, target, false),
+    endStream: (captured, target) => marker(captured, 0n, target, true),
+    source(captured, source) {
+      return operations.run(() => {
+        u64(captured, source);
+        const r = new BigUint64Array(7);
+        const rc = lib.symbols.raop_stream_source(handle, captured, source, r);
+        if (rc === 0) return null;
+        if (
+          rc !== 1 || r[0] !== captured || r[1] !== source || r[3] > r[2] ||
+          r[4] > 1n || (r[4] === 1n && r[5] !== r[2])
+        ) {
+          throw new Error('Invalid RAOP source snapshot ABI');
+        }
+        return Object.freeze({
+          streamId: id,
+          epoch: r[0],
+          source: r[1],
+          acceptedFrames: r[2],
+          fedFrames: r[3],
+          sealed: r[4] === 1n,
+          target: r[4] ? r[5] : null,
+          inputEnd: r[4] ? r[6] : null,
+        });
+      });
+    },
+    range(captured, index) {
+      return operations.run(() => {
+        u64(captured, index);
+        const r = new BigUint64Array(8);
+        const rc = lib.symbols.raop_stream_range(handle, captured, index, r);
+        if (rc === 0) return null;
+        const kind =
+          (['real', 'underrun', 'padding', 'drain'] as const)[Number(r[2])];
+        if (
+          rc !== 1 || r[0] !== captured || r[1] !== index || !kind || !r[7] ||
+          (kind === 'real'
+            ? !r[3] || !r[4]
+            : r[3] !== 0n || r[4] !== 0n || r[5] !== 0n)
+        ) {
+          throw new Error('Invalid RAOP range snapshot ABI');
+        }
+        return Object.freeze({
+          streamId: id,
+          epoch: r[0],
+          index: r[1],
+          kind,
+          source: r[3],
+          segment: r[4],
+          sourceOffset: r[5],
+          transportStart: r[6],
+          frames: r[7],
+        });
+      });
     },
     cancel(captured, retire = []) {
       return operations.run(async ({ signal }) => {

@@ -41,6 +41,8 @@ OBJ = $(SRC:.c=.o)
 libmelofon_raop.so: $(OBJ)
 	$(CC) -shared -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
+ffi.o player.o stub/stubs.o vendor/outputs/raop.o test/driver.o: timeline.h
+
 # Functional smoke test: driver links the library; a fake RAOP device (no
 # Apple hardware needed) asserts the wire.
 test/driver: test/driver.o libmelofon_raop.so

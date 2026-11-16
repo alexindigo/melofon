@@ -1084,7 +1084,8 @@ raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
     if (claim < 0) result->error = RAOP_APPEND_ERROR_BUSY;
     else {
       int accepted = raop_player_append(stream->player, pcm, len);
-      if (accepted < 0) result->error = RAOP_APPEND_ERROR_ALLOCATION;
+      if (accepted < 0) result->error = accepted == -2
+        ? RAOP_APPEND_ERROR_INVALID : RAOP_APPEND_ERROR_ALLOCATION;
       else {
         result->accepted_frames = (uint64_t)accepted / 4;
         result->status = (size_t)accepted == len
@@ -1098,6 +1099,104 @@ raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
 }
 
 _Static_assert(sizeof(struct raop_cancel_result) == 48, "cancel receipt ABI");
+_Static_assert(sizeof(struct raop_source_append_result) == 64, "source append ABI");
+_Static_assert(sizeof(struct raop_marker_result) == 48, "marker ABI");
+_Static_assert(sizeof(struct raop_source_snapshot) == 56, "source snapshot ABI");
+_Static_assert(sizeof(struct raop_range_snapshot) == 64, "range snapshot ABI");
+
+/* rt.lock is the admission linearization point for PCM, seals, end and cancel.
+ * The pacer owns dispatch, under its inner lock, and never calls the backend
+ * while holding it. No JS queue or decoder EOF can overtake admitted PCM. */
+static bool
+timeline_admit_locked(raop_stream_t *stream, uint64_t epoch, uint64_t *status, uint64_t *error)
+{
+  if (stream->closing) *error = RAOP_APPEND_ERROR_CLOSING;
+  else if (epoch != stream->epoch) {
+    *status = RAOP_APPEND_CANCELED; *error = RAOP_APPEND_ERROR_NONE;
+  } else if (stream->resetting) {
+    *status = RAOP_APPEND_NOT_READY; *error = RAOP_APPEND_ERROR_NONE;
+  } else return true;
+  return false;
+}
+
+int
+raop_stream_append_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+                          uint64_t segment, const uint8_t *pcm, size_t len,
+                          struct raop_source_append_result *result)
+{
+  if (!result) return -1;
+  *result = (struct raop_source_append_result){ .epoch = epoch, .source = source,
+    .segment = segment, .status = RAOP_APPEND_ERROR, .error = RAOP_APPEND_ERROR_INVALID };
+  if (!stream || !epoch || !source || !segment || (!pcm && len) || len % 4) return 0;
+  pthread_mutex_lock(&rt.lock);
+  if (timeline_admit_locked(stream, epoch, &result->status, &result->error)) {
+    if (rt.active_stream_id && rt.active_stream_id != stream->id)
+      result->error = RAOP_APPEND_ERROR_BUSY;
+    else {
+      raop_player_append_source(stream->player, source, segment, pcm, len, result);
+      if (result->accepted_frames) stream_claim_locked(stream, NULL);
+    }
+  }
+  pthread_mutex_unlock(&rt.lock);
+  return 0;
+}
+
+static int
+stream_marker(raop_stream_t *stream, uint64_t epoch, uint64_t source, uint64_t target,
+               bool end, struct raop_marker_result *result)
+{
+  if (!result) return -1;
+  *result = (struct raop_marker_result){ .epoch = epoch, .source = source,
+    .target = target, .status = RAOP_APPEND_ERROR, .error = RAOP_APPEND_ERROR_INVALID };
+  if (!stream || !epoch || (!end && !source)) return 0;
+  pthread_mutex_lock(&rt.lock);
+  if (timeline_admit_locked(stream, epoch, &result->status, &result->error)) {
+    if (end) raop_player_end(stream->player, target, result);
+    else raop_player_seal(stream->player, source, target, result);
+  }
+  pthread_mutex_unlock(&rt.lock);
+  return 0;
+}
+
+int
+raop_stream_seal(raop_stream_t *stream, uint64_t epoch, uint64_t source, uint64_t target,
+                 struct raop_marker_result *result)
+{
+  return stream_marker(stream, epoch, source, target, false, result);
+}
+
+int
+raop_stream_end(raop_stream_t *stream, uint64_t epoch, uint64_t target,
+                struct raop_marker_result *result)
+{
+  return stream_marker(stream, epoch, 0, target, true, result);
+}
+
+int
+raop_stream_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+                   struct raop_source_snapshot *result)
+{
+  if (!stream || !result || !source) return -1;
+  pthread_mutex_lock(&rt.lock);
+  int found = epoch == stream->epoch && !stream->resetting
+    ? raop_player_source(stream->player, source, result) : 0;
+  if (found) result->epoch = epoch;
+  pthread_mutex_unlock(&rt.lock);
+  return found;
+}
+
+int
+raop_stream_range(raop_stream_t *stream, uint64_t epoch, uint64_t index,
+                  struct raop_range_snapshot *result)
+{
+  if (!stream || !result) return -1;
+  pthread_mutex_lock(&rt.lock);
+  int found = epoch == stream->epoch && !stream->resetting
+    ? raop_player_range(stream->player, index, result) : 0;
+  if (found) result->epoch = epoch;
+  pthread_mutex_unlock(&rt.lock);
+  return found;
+}
 
 int
 raop_ffi_stream_fenced(uint64_t stream_id)
@@ -1314,7 +1413,10 @@ raop_stream_reset(raop_stream_t *stream)
 {
   if (!stream) return -1;
   pthread_mutex_lock(&rt.lock);
-  bool unavailable = stream->closing || stream->resetting;
+  /* The legacy local reset has no epoch advance or retained outcome. It cannot
+   * erase timeline identities/targets within an epoch: use ordered cancel. */
+  bool unavailable = stream->closing || stream->resetting ||
+    raop_player_timeline_active(stream->player);
   if (!unavailable) stream->resetting = true;
   pthread_mutex_unlock(&rt.lock);
   if (unavailable) return -1;

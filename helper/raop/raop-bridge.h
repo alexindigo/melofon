@@ -3,6 +3,16 @@
 #define MELOFON_RAOP_BRIDGE_H
 #include <stdint.h>
 #include <stddef.h>
+#include "timeline.h"
+struct raop_player;
+int raop_player_timeline_active(struct raop_player *);
+int raop_player_append_source(struct raop_player *, uint64_t source, uint64_t segment,
+                              const uint8_t *, size_t, struct raop_source_append_result *);
+void raop_player_seal(struct raop_player *, uint64_t source, uint64_t target,
+                       struct raop_marker_result *);
+void raop_player_end(struct raop_player *, uint64_t target, struct raop_marker_result *);
+int raop_player_source(struct raop_player *, uint64_t source, struct raop_source_snapshot *);
+int raop_player_range(struct raop_player *, uint64_t index, struct raop_range_snapshot *);
 /* -1: cleanup could not start, retain ownership. 0: accepted. Callback after
  * all device-local sessions/sockets are destroyed, possibly inline. sent=0
  * all final requests wrote locally, -1 some unsent; neither means remote ACK. */

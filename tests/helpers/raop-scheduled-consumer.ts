@@ -69,6 +69,9 @@ type Queued = {
   pcm: Uint8Array;
   used: number;
   arrivalMs: number;
+  /** Readiness is established once. Later valid clock/sync refreshes update the
+   * presentation mapping, not the arrival of an already scheduled packet. */
+  readyMs: number | null;
 };
 
 /** Snapshot replay, intentionally separate from decodeReceiverAudio's arrival
@@ -141,7 +144,11 @@ export function renderScheduledAudio(
       );
       // Audio, clock exchange and sync must all have arrived before a frame can
       // be scheduled. A delayed retransmit never retroactively renders sound.
-      const ready = Math.max(packet.arrivalMs, clock!.readyMs, sync!.atMs);
+      const ready = packet.readyMs ??= Math.max(
+        packet.arrivalMs,
+        clock!.readyMs,
+        sync!.atMs,
+      );
       const missed = Math.min(
         frames,
         Math.max(
@@ -368,6 +375,7 @@ export function renderScheduledAudio(
       pcm,
       used: 0,
       arrivalMs: event.atMs,
+      readyMs: null,
     };
     queued.push(packet);
     seen.set(sequence, packet);

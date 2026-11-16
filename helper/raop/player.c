@@ -78,6 +78,28 @@ struct raop_metadata_mirror
  * the buffer is NOT drained when the session connects. */
 #define PCM_CAP (2 * 44100 * 4)
 
+/* Bounded retained marker storage, independent of the PCM byte cap. Input runs
+ * reserve their dispatch record plus the possible following silence records, so
+ * the loop never needs an allocation or drops a range after accepting bytes.
+ * b04c adds terminal acknowledgement/reclamation; reset/free reclaim today. */
+#define TIMELINE_MARKERS 256
+#define TRANSPORT_RANGES (3 * TIMELINE_MARKERS + 3)
+struct source_record {
+  uint64_t id, accepted, fed, target, input_end;
+  bool sealed;
+};
+struct input_range {
+  uint64_t source, segment, source_offset, frames, fed;
+};
+struct timeline {
+  bool enabled, ended, tail_reached;
+  uint64_t accepted, end_target, padding_left;
+  size_t sources, inputs, next_input, ranges;
+  struct source_record source[TIMELINE_MARKERS];
+  struct input_range input[TIMELINE_MARKERS];
+  struct raop_range_snapshot range[TRANSPORT_RANGES];
+};
+
 struct raop_player
 {
   uint64_t stream_id;
@@ -92,6 +114,7 @@ struct raop_player
    * called from the caller's thread, the tick from the loop thread). */
   struct evbuffer *pcm;
   pthread_mutex_t pcm_lock;
+  struct timeline *timeline;     /* pcm_lock; allocated before first admission */
 
   /* The pts stream clock, OwnTone's shape (player.c: pb_session.pts =
    * CLOCK_MONOTONIC at start + samples written): the sync packets' NTP
@@ -303,7 +326,9 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
 
       pthread_mutex_lock(&p->pcm_lock);
       avail = evbuffer_get_length(p->pcm);
-      if (p->fenced || avail < 4)
+      struct timeline *t = p->timeline;
+      bool timeline = t && t->enabled;
+      if (p->fenced || (avail < 4 && (!timeline || !p->clock_started)))
         {
           pthread_mutex_unlock(&p->pcm_lock);
           break;
@@ -314,6 +339,57 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           pthread_mutex_unlock(&p->pcm_lock);
           break;
         }
+      size_t real = n / 4;
+      if (timeline) {
+        /* Dispatch every tick on the same clock. A source seal is not involved:
+         * only genuinely absent ingress (or explicit stream end) emits zeros. */
+        memset(scratch + n, 0, TICK_BYTES - n);
+        uint64_t transport = p->pts_samples;
+        size_t left = real;
+        while (left) {
+          struct input_range *in = &t->input[t->next_input];
+          size_t take = in->frames - in->fed;
+          if (take > left) take = left;
+          struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1] : NULL;
+          if (!r || r->kind != RAOP_RANGE_REAL || r->source != in->source ||
+              r->segment != in->segment || r->transport_start + r->frames != transport ||
+              r->source_offset + r->frames != in->source_offset + in->fed) {
+            r = &t->range[t->ranges++];
+            *r = (struct raop_range_snapshot){ .kind = RAOP_RANGE_REAL,
+              .source = in->source, .segment = in->segment,
+              .source_offset = in->source_offset + in->fed, .transport_start = transport };
+          }
+          r->frames += take;
+          for (size_t i = 0; i < t->sources; i++)
+            if (t->source[i].id == in->source) { t->source[i].fed += take; break; }
+          in->fed += take;
+          if (in->fed == in->frames) t->next_input++;
+          transport += take;
+          left -= take;
+        }
+        size_t silence = TICK_SAMPLES - real;
+        if (t->ended && t->next_input == t->inputs && !t->tail_reached) {
+          t->tail_reached = true;
+          t->padding_left = (352 - transport % 352) % 352;
+        }
+        size_t padding = t->padding_left;
+        if (padding > silence) padding = silence;
+        t->padding_left -= padding;
+        for (int pass = 0; pass < 2; pass++) {
+          size_t count = pass ? silence - padding : padding;
+          if (!count) continue;
+          uint64_t kind = pass ? (t->ended ? RAOP_RANGE_DRAIN : RAOP_RANGE_UNDERRUN)
+                               : RAOP_RANGE_PADDING;
+          struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1] : NULL;
+          if (!r || r->kind != kind) {
+            r = &t->range[t->ranges++];
+            *r = (struct raop_range_snapshot){ .kind = kind, .transport_start = transport };
+          }
+          r->frames += count;
+          transport += count;
+        }
+        n = TICK_BYTES;
+      }
       pthread_mutex_unlock(&p->pcm_lock);
 
       if (!p->clock_started)
@@ -408,6 +484,7 @@ raop_player_free(struct raop_player *p)
   if (p->timer_fd >= 0)
     close(p->timer_fd);
   evbuffer_free(p->pcm);
+  free(p->timeline);
   pthread_mutex_destroy(&p->pcm_lock);
   free(p->title);
   free(p->artist);
@@ -424,6 +501,10 @@ raop_player_append(struct raop_player *p, const uint8_t *pcm, size_t len)
   size_t accept;
 
   pthread_mutex_lock(&p->pcm_lock);
+  if (p->timeline && p->timeline->enabled) {
+    pthread_mutex_unlock(&p->pcm_lock);
+    return -2; /* unlabeled input cannot enter an accounted epoch */
+  }
   avail = evbuffer_get_length(p->pcm);
   accept = avail >= PCM_CAP ? 0 : PCM_CAP - avail;
   if (accept > len) accept = len;
@@ -444,7 +525,168 @@ int
 raop_player_write(struct raop_player *p, const uint8_t *pcm, size_t len)
 {
   int result = raop_player_append(p, pcm, len);
-  return result < 0 ? 0 : result;
+  return result == -2 ? -1 : (result < 0 ? 0 : result);
+}
+
+int
+raop_player_timeline_active(struct raop_player *p)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  int active = p->timeline && p->timeline->enabled;
+  pthread_mutex_unlock(&p->pcm_lock);
+  return active;
+}
+
+/* All timeline admission is called under the same outer rt.lock as cancel.
+ * pcm_lock additionally serializes the loop's range dispatch and snapshots.
+ * Refusals do not create a source, close input or consume marker capacity. */
+static struct timeline *
+timeline_get(struct raop_player *p)
+{
+  if (!p->timeline) p->timeline = calloc(1, sizeof(*p->timeline));
+  return p->timeline;
+}
+
+int
+raop_player_append_source(struct raop_player *p, uint64_t source, uint64_t segment,
+                          const uint8_t *pcm, size_t len,
+                          struct raop_source_append_result *result)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  struct timeline *t = timeline_get(p);
+  if (!t) { result->error = RAOP_APPEND_ERROR_ALLOCATION; goto out; }
+  if ((!t->enabled && (p->clock_started || evbuffer_get_length(p->pcm))) || t->ended)
+    goto out;
+  struct source_record *s = NULL;
+  for (size_t i = 0; i < t->sources; i++)
+    if (t->source[i].id == source) { s = &t->source[i]; break; }
+  if (s && s->sealed) goto out;
+  if (!s && t->sources && !t->source[t->sources - 1].sealed) goto out;
+  result->input_offset = t->accepted;
+  result->source_offset = s ? s->accepted : 0;
+  struct input_range *in = t->inputs ? &t->input[t->inputs - 1] : NULL;
+  /* Merge retries only while the same run still has queued input. Once fully
+   * dispatched a later append gets a new run, since silence may intervene. */
+  bool merge = in && in->source == source && in->segment == segment && in->fed < in->frames;
+  if ((!s && t->sources == TIMELINE_MARKERS) ||
+      (len && !merge && t->inputs == TIMELINE_MARKERS)) {
+    result->status = RAOP_APPEND_BACKPRESSURE;
+    result->error = RAOP_APPEND_ERROR_NONE;
+    goto out;
+  }
+  size_t avail = evbuffer_get_length(p->pcm);
+  size_t accept = avail >= PCM_CAP ? 0 : PCM_CAP - avail;
+  if (accept > len) accept = len;
+  accept &= ~(size_t)3;
+  if (t->accepted > UINT64_MAX - accept / 4 ||
+      (s && s->accepted > UINT64_MAX - accept / 4)) goto out;
+  if (accept && evbuffer_add(p->pcm, pcm, accept) < 0) {
+    result->error = RAOP_APPEND_ERROR_ALLOCATION;
+    goto out;
+  }
+  if (!s && (!len || accept)) {
+    s = &t->source[t->sources++];
+    *s = (struct source_record){ .id = source };
+  }
+  if (accept) {
+    if (!merge) {
+      in = &t->input[t->inputs++];
+      *in = (struct input_range){ .source = source, .segment = segment,
+                                 .source_offset = s->accepted };
+    }
+    in->frames += accept / 4;
+    s->accepted += accept / 4;
+    t->accepted += accept / 4;
+  }
+  /* Empty explicit source input establishes identity but never anchors time. */
+  if (s) t->enabled = true;
+  result->accepted_frames = accept / 4;
+  result->status = accept == len ? RAOP_APPEND_ACCEPTED : RAOP_APPEND_BACKPRESSURE;
+  result->error = RAOP_APPEND_ERROR_NONE;
+out:
+  pthread_mutex_unlock(&p->pcm_lock);
+  return 0;
+}
+
+void
+raop_player_seal(struct raop_player *p, uint64_t source, uint64_t target,
+                 struct raop_marker_result *result)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  struct timeline *t = p->timeline;
+  if (t) for (size_t i = 0; i < t->sources; i++) {
+    struct source_record *s = &t->source[i];
+    if (s->id != source || target != s->accepted) continue;
+    if (!s->sealed) {
+      s->sealed = true;
+      s->target = target;
+      s->input_end = t->accepted;
+    }
+    result->input_end = s->input_end;
+    result->status = RAOP_APPEND_ACCEPTED;
+    result->error = RAOP_APPEND_ERROR_NONE;
+    break;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+}
+
+void
+raop_player_end(struct raop_player *p, uint64_t target, struct raop_marker_result *result)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  struct timeline *t = timeline_get(p);
+  if (!t) result->error = RAOP_APPEND_ERROR_ALLOCATION;
+  else if (!t->enabled) {
+    if (!p->clock_started && !evbuffer_get_length(p->pcm) && target == 0) {
+      t->enabled = t->ended = true;
+      result->status = RAOP_APPEND_ACCEPTED;
+      result->error = RAOP_APPEND_ERROR_NONE;
+    }
+  } else if (t->enabled && target == t->accepted &&
+             (!t->sources || t->source[t->sources - 1].sealed)) {
+    t->ended = true;
+    t->end_target = target;
+    result->input_end = target;
+    result->status = RAOP_APPEND_ACCEPTED;
+    result->error = RAOP_APPEND_ERROR_NONE;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+}
+
+int
+raop_player_source(struct raop_player *p, uint64_t source, struct raop_source_snapshot *result)
+{
+  int found = 0;
+  pthread_mutex_lock(&p->pcm_lock);
+  struct timeline *t = p->timeline;
+  if (t) for (size_t i = 0; i < t->sources; i++) {
+    struct source_record *s = &t->source[i];
+    if (s->id != source) continue;
+    result->source = source;
+    result->accepted_frames = s->accepted;
+    result->fed_frames = s->fed;
+    result->sealed = s->sealed;
+    result->target = s->target;
+    result->input_end = s->input_end;
+    found = 1;
+    break;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+  return found;
+}
+
+int
+raop_player_range(struct raop_player *p, uint64_t index, struct raop_range_snapshot *result)
+{
+  int found = 0;
+  pthread_mutex_lock(&p->pcm_lock);
+  if (p->timeline && index < p->timeline->ranges) {
+    *result = p->timeline->range[index];
+    result->index = index;
+    found = 1;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+  return found;
 }
 
 /* Loop thread: drop buffered PCM (pause/seek/track-change semantics; the
@@ -454,6 +696,11 @@ raop_player_flush(struct raop_player *p)
 {
   pthread_mutex_lock(&p->pcm_lock);
   evbuffer_drain(p->pcm, evbuffer_get_length(p->pcm));
+  if (p->timeline && p->timeline->enabled) {
+    memset(p->timeline, 0, sizeof(*p->timeline));
+    p->pts_samples = 0;
+    p->clock_started = false;
+  }
   pthread_mutex_unlock(&p->pcm_lock);
 }
 
