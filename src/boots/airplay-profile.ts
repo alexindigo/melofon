@@ -92,16 +92,21 @@ export type AirplayAppendResult = Readonly<
     | { status: 'error'; error: AirplayAppendError }
   )
 >;
-/** Additive exact input port. One admission attempt, never an implicit retry or
+/** Exact input port. One admission attempt, never an implicit retry or
  * drain wait. A receipt owns only its copied prefix; segment is an opaque core
- * identity, not queue policy. The boot's transitional pcm/reset port is retained
- * until ordered receiver cancellation is adopted. No playout claim is implied. */
+ * identity, not queue policy. Compatibility pcm/reset callers remain separate
+ * from production playback. No playout claim is implied. */
 export interface AirplayExactStream extends AirplayStream {
   readonly epoch: bigint;
   append(input: AirplayAppendInput): Promise<AirplayAppendResult>;
   /** Synchronously fence/advance the captured epoch; resolve after local reset
-   * and receiver readiness, or supersession/close. Retained until explicit ack. */
-  cancel(epoch: bigint): Promise<AirplayCancelResult>;
+   * and receiver readiness, or supersession/close. Listed attachment identities
+   * retire instead of FLUSH; omitted attachments retain the FLUSH default.
+   * Retained until explicit ack. */
+  cancel(
+    epoch: bigint,
+    retire?: readonly bigint[],
+  ): Promise<AirplayCancelResult>;
   ackCancel(epoch: bigint): Promise<void>;
 }
 export interface AirplayCancelResult {
@@ -119,6 +124,15 @@ export interface AirplayCancelResult {
  * storage and capacity. A failed close remains quarantined. */
 export interface AirplayPlaybackStream {
   readonly id: bigint | null;
+  /** Null until an attachment or input allocates the native stream. */
+  readonly epoch: bigint | null;
+  append(input: AirplayAppendInput): Promise<AirplayAppendResult>;
+  cancel(
+    epoch: bigint,
+    retire?: readonly AirplayTransport[],
+  ): Promise<AirplayCancelResult>;
+  ackCancel(epoch: bigint): Promise<void>;
+  /** Transitional callers only; production uses exact append/cancel. */
   pcm(chunk: Uint8Array): Promise<void>;
   cancelPcm(): void;
   /** Same writer-fenced local reset contract as AirplayStream. */

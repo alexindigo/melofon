@@ -196,9 +196,22 @@ typedef struct raop_handle raop_t;
 
 struct cancel_receipt {
   struct raop_cancel_result result;
+  size_t retire_count;
+  uint64_t *retire_ids;
+  cmd **retire_commands;
   bool applied;
   struct cancel_receipt *next;
 };
+
+static void
+cancel_receipt_free(struct cancel_receipt *c)
+{
+  for (size_t i = 0; i < c->retire_count; i++)
+    if (c->retire_commands[i]) cmd_free(c->retire_commands[i]);
+  free(c->retire_commands);
+  free(c->retire_ids);
+  free(c);
+}
 
 struct raop_stream
 {
@@ -1122,10 +1135,34 @@ stream_cancel_cb(evutil_socket_t fd, short what, void *arg)
     if (!c) break;
     raop_player_session_stopped(stream->player);
     raop_player_flush(stream->player);
-    uint64_t cutoff = raop_cancel_stream(stream->id, c->result.admitted_ns);
+    uint64_t cutoff = raop_cancel_stream(stream->id, c->result.admitted_ns,
+                                        c->retire_ids, c->retire_count);
+    bool failed = false;
+    for (size_t i = 0; i < c->retire_count; i++) {
+      raop_t *h;
+      /* Loop-owned handle lifetime; lookup by captured identity, never a pointer
+       * retained from admission. A missing handle already proved destruction. */
+      for (h = rt.handles_list; h && h->id != c->retire_ids[i]; h = h->next) {}
+      if (!h) continue;
+      pthread_mutex_lock(&rt.lock);
+      h->quiescing = true;
+      h->ready = false;
+      stream_readiness_locked(h);
+      pthread_mutex_unlock(&rt.lock);
+      cmd *command = c->retire_commands[i];
+      c->retire_commands[i] = NULL;
+      if (cmd_push(h, command) < 0) {
+        /* A concurrent close may have already admitted FREE (and its owned
+         * destruction). It is the same readiness proof, not failed retirement. */
+        pthread_mutex_lock(&h->cmds_lock);
+        if (!h->free_requested) failed = true;
+        pthread_mutex_unlock(&h->cmds_lock);
+      }
+    }
     pthread_mutex_lock(&rt.lock);
     c->result.cutoff_frames = cutoff;
     c->result.local_reset = 1;
+    if (failed && !c->result.status) c->result.status = 3;
     c->applied = true;
     pthread_mutex_unlock(&rt.lock);
   }
@@ -1134,7 +1171,10 @@ stream_cancel_cb(evutil_socket_t fd, short what, void *arg)
   bool all_applied = true;
   for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
     if (!c->applied) all_applied = false;
-  if (all_applied && stream->canceling && !stream->closing) {
+  bool failed = false;
+  for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
+    if (c->result.status == 3) failed = true;
+  if (all_applied && !failed && stream->canceling && !stream->closing) {
     for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
       if (!c->result.status) c->result.status = 1;
     stream->canceling = stream->resetting = false;
@@ -1151,13 +1191,45 @@ stream_cancel_cb(evutil_socket_t fd, short what, void *arg)
 int
 raop_stream_cancel(raop_stream_t *stream, uint64_t epoch)
 {
-  if (!stream || !epoch) return -1;
+  return raop_stream_cancel_v2(stream, epoch, NULL, 0);
+}
+
+int
+raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
+                      const uint64_t *retire_ids, size_t retire_count)
+{
+  if (!stream || !epoch || (retire_count && !retire_ids) ||
+      retire_count > SIZE_MAX / sizeof(uint64_t) ||
+      retire_count > SIZE_MAX / sizeof(cmd *)) return -1;
   struct cancel_receipt *receipt = calloc(1, sizeof(*receipt));
   if (!receipt) return -1;
+  if (retire_count) {
+    receipt->retire_ids = malloc(retire_count * sizeof(uint64_t));
+    receipt->retire_commands = calloc(retire_count, sizeof(cmd *));
+    if (!receipt->retire_ids || !receipt->retire_commands) {
+      cancel_receipt_free(receipt); return -1;
+    }
+    receipt->retire_count = retire_count;
+    memcpy(receipt->retire_ids, retire_ids, retire_count * sizeof(uint64_t));
+    for (size_t i = 0; i < retire_count; i++) {
+      receipt->retire_commands[i] = calloc(1, sizeof(cmd));
+      if (!receipt->retire_commands[i]) { cancel_receipt_free(receipt); return -1; }
+      receipt->retire_commands[i]->type = CMD_TEARDOWN;
+    }
+  }
   pthread_mutex_lock(&rt.lock);
   if (stream->closing || epoch != stream->epoch || epoch == UINT64_MAX ||
       (stream->resetting && !stream->canceling)) {
-    pthread_mutex_unlock(&rt.lock); free(receipt); return -1;
+    pthread_mutex_unlock(&rt.lock); cancel_receipt_free(receipt); return -1;
+  }
+  for (size_t i = 0; i < retire_count; i++) {
+    raop_t *h;
+    for (h = rt.handles_list; h && h->id != retire_ids[i]; h = h->next) {}
+    bool duplicate = false;
+    for (size_t j = 0; j < i; j++) if (retire_ids[j] == retire_ids[i]) duplicate = true;
+    if (!h || h->stream != stream || duplicate) {
+      pthread_mutex_unlock(&rt.lock); cancel_receipt_free(receipt); return -1;
+    }
   }
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1204,7 +1276,7 @@ raop_stream_cancel_ack(raop_stream_t *stream, uint64_t epoch)
     if ((*c)->result.epoch == epoch) {
       if ((*c)->applied && (*c)->result.status) {
         struct cancel_receipt *old = *c;
-        *c = old->next; free(old); result = 0;
+       *c = old->next; cancel_receipt_free(old); result = 0;
       }
       break;
     }
@@ -1279,7 +1351,7 @@ stream_free_cb(evutil_socket_t fd, short what, void *arg)
   while (stream->cancels) {
     struct cancel_receipt *c = stream->cancels;
     stream->cancels = c->next;
-    free(c);
+    cancel_receipt_free(c);
   }
   if (stream->active) rt.active_stream_id = 0;
   pthread_mutex_unlock(&rt.lock);

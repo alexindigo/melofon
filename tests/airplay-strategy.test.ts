@@ -847,7 +847,7 @@ Deno.test('stale decoder rejection cannot pause or retire its replacement', asyn
       if (++calls === 1) return new Promise((_, no) => reject = no);
       return Promise.resolve({
         async *[Symbol.asyncIterator]() {
-          yield new Uint8Array([9]);
+          yield new Uint8Array([9, 0, 0, 0]);
         },
       });
     },

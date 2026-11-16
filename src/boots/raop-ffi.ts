@@ -52,6 +52,10 @@ const SYMBOLS = {
     result: 'i32',
   },
   raop_stream_cancel: { parameters: ['pointer', 'u64'], result: 'i32' },
+  raop_stream_cancel_v2: {
+    parameters: ['pointer', 'u64', 'buffer', 'usize'],
+    result: 'i32',
+  },
   raop_stream_cancel_poll: {
     parameters: ['pointer', 'u64', 'buffer'],
     result: 'i32',
@@ -575,7 +579,7 @@ export function createFfiStream(
     get epoch() {
       return epoch;
     },
-    cancel(captured) {
+    cancel(captured, retire = []) {
       return operations.run(async ({ signal }) => {
         if (
           typeof captured !== 'bigint' || captured <= 0n ||
@@ -585,7 +589,22 @@ export function createFfiStream(
             'RAOP cancel requires an unsigned nonzero epoch',
           );
         }
-        if (lib.symbols.raop_stream_cancel(handle, captured) !== 0) {
+        for (const id of retire) {
+          if (typeof id !== 'bigint' || id <= 0n || id > 0xffffffffffffffffn) {
+            throw new RangeError(
+              'RAOP retirement requires unsigned nonzero attachment ids',
+            );
+          }
+        }
+        const ids = new BigUint64Array(retire);
+        if (
+          lib.symbols.raop_stream_cancel_v2(
+            handle,
+            captured,
+            ids,
+            BigInt(ids.length),
+          ) !== 0
+        ) {
           throw new Error(
             'raop_stream_cancel refused stale or unavailable epoch',
           );

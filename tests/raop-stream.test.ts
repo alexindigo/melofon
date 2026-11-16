@@ -6,6 +6,7 @@ import {
 } from '../src/boots/raop-ffi.ts';
 import { profileFromService } from '../src/boots/airplay-profile.ts';
 import type {
+  AirplayExactStream,
   AirplayPlaybackStream,
   AirplayStream,
   AirplayTransport,
@@ -857,7 +858,7 @@ Deno.test({
       captureAudio: true,
       captureWire: true,
     });
-    let native: AirplayStream | undefined;
+    let native: AirplayExactStream | undefined;
     let attempts = 0;
     const f = deviceFixture([receiver], {
       stream() {
@@ -1073,6 +1074,10 @@ Deno.test('RAOP device stream: failed attachment close still releases siblings a
       let next = 0;
       return {
         id: 1000n,
+        epoch: 1n,
+        append: () => Promise.reject(new Error('unused fixture input')),
+        cancel: () => Promise.reject(new Error('unused fixture cancel')),
+        ackCancel: () => Promise.reject(new Error('unused fixture ack')),
         attach(event) {
           const index = next++;
           let closing: Promise<void> | undefined;
@@ -1274,6 +1279,10 @@ for (const explicit of [true, false]) {
       spawn: attach,
       stream: () => ({
         id: 1000n,
+        epoch: 1n,
+        append: () => Promise.reject(new Error('unused fixture input')),
+        cancel: () => Promise.reject(new Error('unused fixture cancel')),
+        ackCancel: () => Promise.reject(new Error('unused fixture ack')),
         attach,
         pcm: () => Promise.resolve(),
         cancelPcm() {},

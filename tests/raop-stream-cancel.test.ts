@@ -1,5 +1,5 @@
-// Exact admission and ordered native cancellation. Production boot adoption is
-// b03c; the transitional local-reset cases remain local-only proofs.
+// Exact admission and ordered native cancellation. Production boot consumers are
+// in airplay-stream-cancel.test.ts; local-reset cases remain local-only proofs.
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createFfiStream, raopFfiInternals } from '../src/boots/raop-ffi.ts';
 import { profileFromService } from '../src/boots/airplay-profile.ts';
@@ -464,6 +464,160 @@ function cancelTest(name: string, fn: () => Promise<void>) {
     fn,
   });
 }
+
+cancelTest(
+  'mixed retirement captures one cutoff and never FLUSHes the retiring attachment',
+  async () => {
+    const gate = Promise.withResolvers<void>();
+    const receivers = await Promise.all([
+      startFakeRaop({ captureAudio: true, captureWire: true }),
+      startFakeRaop({
+        captureAudio: true,
+        captureWire: true,
+        beforeFlushReply: () => gate.promise,
+      }),
+    ]);
+    const stream = createFfiStream();
+    const attachments = receivers.map(() => stream.attach(() => {}));
+    try {
+      await Promise.all(
+        attachments.map((a, i) => a.start(profile(receivers[i]), input)),
+      );
+      await stream.append({
+        epoch: stream.epoch,
+        segment: 1n,
+        pcm: pcm(353, 900),
+      });
+      await until(
+        'old packet at both',
+        () => receivers.every((r) => r.sessions[0]?.audioPackets === 1),
+      );
+      const old = stream.epoch;
+      const retiring = [attachments[0].id];
+      const canceled = stream.cancel(old, retiring);
+      retiring[0] = attachments[1].id; // native owns an immutable copied disposition
+      assertEquals(stream.epoch, old + 1n);
+      assertEquals(
+        (await stream.append({
+          epoch: stream.epoch,
+          segment: 2n,
+          pcm: pcm(352),
+        })).status,
+        'not-ready',
+      );
+      await until(
+        'retirement and held survivor ACK',
+        () =>
+          receivers[0].sessions[0].closedAtMs !== null &&
+          receivers[1].sessions[0].flushes === 1,
+      );
+      assertEquals(receivers[0].sessions[0].flushes, 0);
+      assertEquals(receivers[0].sessions[0].teardowns, 1);
+      assertEquals(
+        (await stream.append({
+          epoch: stream.epoch,
+          segment: 2n,
+          pcm: pcm(352),
+        })).acceptedFrames,
+        0n,
+      );
+      gate.resolve();
+      const result = await canceled;
+      assertEquals([result.status, result.cutoffFrames], ['ready', 0n]);
+      const expected = pcm(352, 5000);
+      await stream.append({
+        epoch: stream.epoch,
+        segment: 2n,
+        pcm: expected.subarray(0, 351 * 4),
+      });
+      await stream.append({
+        epoch: stream.epoch,
+        segment: 3n,
+        pcm: expected.subarray(351 * 4),
+      });
+      await postCancelRendered(receivers[1], expected);
+      assertEquals(receivers[0].sessions[0].audioPackets, 1);
+      await stream.ackCancel(old);
+      await libraryProof();
+    } finally {
+      gate.resolve();
+      await stream.close();
+      receivers.forEach((r) => r.close());
+    }
+  },
+);
+
+cancelTest(
+  'retirement identities reject foreign and duplicate attachments without advancing epoch',
+  async () => {
+    const stream = createFfiStream(), foreign = createFfiStream();
+    try {
+      const a = stream.attach(() => {}), b = foreign.attach(() => {});
+      const epoch = stream.epoch;
+      await assertRejects(() => stream.cancel(epoch, [b.id]), Error, 'refused');
+      await assertRejects(
+        () => stream.cancel(epoch, [a.id, a.id]),
+        Error,
+        'refused',
+      );
+      await assertRejects(
+        () => stream.cancel(epoch, [-1n]),
+        RangeError,
+        'unsigned',
+      );
+      assertEquals(stream.epoch, epoch);
+      const result = await stream.cancel(epoch, [a.id]);
+      assertEquals(result.status, 'ready');
+      await stream.ackCancel(epoch);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      await foreign.close();
+    }
+  },
+);
+
+cancelTest(
+  'retiring-only cancellation retains scheduled cutoff after destroying its old session',
+  async () => {
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const stream = createFfiStream();
+    const attachment = stream.attach(() => {});
+    try {
+      await attachment.start(profile(receiver), input);
+      await stream.append({
+        epoch: stream.epoch,
+        segment: 1n,
+        pcm: pcm(704, 1600),
+      });
+      await rendered(receiver, pcm(704, 1600));
+      const epoch = stream.epoch;
+      const result = await stream.cancel(epoch, [attachment.id]);
+      assertEquals([result.status, result.cutoffFrames], ['ready', 704n]);
+      await until(
+        'old session destroyed',
+        () => receiver.sessions[0].closedAtMs !== null,
+      );
+      assertEquals([
+        receiver.sessions[0].flushes,
+        receiver.sessions[0].teardowns,
+      ], [0, 1]);
+      assertEquals(
+        result.cutoffFrames,
+        704n,
+        'destruction does not erase the captured old schedule',
+      );
+      await stream.ackCancel(epoch);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  },
+);
 
 async function postCancelRendered(
   receiver: Receiver,

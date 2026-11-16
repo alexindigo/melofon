@@ -26,8 +26,10 @@ import { createOperationScope } from '../operations.ts';
 import { createReleaseSet, releaseOrThrow } from '../releases.ts';
 import {
   airplayAbilities,
+  type AirplayAppendInput,
   type AirplayCredentials,
   type AirplayDriver,
+  type AirplayExactStream,
   type AirplayInput,
   airplayOutputId,
   type AirplayPlaybackStream,
@@ -46,7 +48,7 @@ export function createAirplayDevices(deps: {
   admission?: OutputAdmission;
   resolver?: MdnsResolver;
   spawn?: AirplaySpawn;
-  stream?: () => AirplayStream;
+  stream?: () => AirplayExactStream;
   credentials?: Pick<SpeakerCredentials, 'session'>;
   changed?(): void;
 }) {
@@ -108,13 +110,20 @@ export function createAirplayDevices(deps: {
   const newStreamOwner = (capacity?: PlaybackCapacity) => {
     const operations = createOperationScope('AirPlay playback stream');
     const releases = createReleaseSet();
-    let native: AirplayStream | undefined;
+    let native: AirplayExactStream | undefined;
+    let nativeClosing: Promise<void> | undefined;
     let retained: { release(): void } | undefined;
     let nativeReleased = false;
     let closing: Promise<void> | undefined;
     let attachment = 0;
+    const attachments = new WeakMap<
+      AirplayTransport,
+      () => bigint | undefined
+    >();
+    const closeNative = () =>
+      nativeClosing ??= native?.close() ?? Promise.resolve();
     releases.add('native', async () => {
-      await native?.close();
+      await closeNative();
       nativeReleased = true;
     }, 1);
     releases.add('capacity', () => {
@@ -145,6 +154,36 @@ export function createAirplayDevices(deps: {
       get id() {
         return native?.id ?? null;
       },
+      get epoch() {
+        return native?.epoch ?? null;
+      },
+      append: (input: AirplayAppendInput) =>
+        operations.run(() => acquire().append(input)),
+      cancel: (epoch: bigint, retire: readonly AirplayTransport[] = []) =>
+        operations.run(async ({ signal }) => {
+          // Close must revoke native polling before joining it. Native close owns
+          // session destruction and memoizes failures; C3 still joins that release.
+          const abort = () => {
+            void closeNative().catch(() => {});
+          };
+          signal.addEventListener('abort', abort, { once: true });
+          try {
+            const ids = retire.flatMap((transport) => {
+              if (!attachments.has(transport)) {
+                throw new Error('Foreign AirPlay retirement attachment');
+              }
+              const id = attachments.get(transport)?.();
+              // Publication may precede native acquisition. Revoked activation
+              // owns its cleanup; there is no native identity to cancel yet.
+              return id === undefined ? [] : [id];
+            });
+            return await acquire().cancel(epoch, ids);
+          } finally {
+            signal.removeEventListener('abort', abort);
+          }
+        }),
+      ackCancel: (epoch: bigint) =>
+        operations.run(() => acquire().ackCancel(epoch)),
       pcm: (chunk: Uint8Array) => operations.run(() => acquire().pcm(chunk)),
       cancelPcm: () => native?.cancelPcm(),
       reset: () => operations.run(() => native?.reset()),
@@ -168,8 +207,13 @@ export function createAirplayDevices(deps: {
       stream,
       attach: (...args: Parameters<AirplayStream['attach']>) =>
         acquire().attach(...args),
-      register(close: () => Promise<void>) {
+      register(
+        close: () => Promise<void>,
+        transport: AirplayTransport,
+        id: () => bigint | undefined,
+      ) {
         releases.add(`attachment:${++attachment}`, close);
+        attachments.set(transport, id);
       },
     };
   };
@@ -177,6 +221,7 @@ export function createAirplayDevices(deps: {
   const streams = new WeakMap<AirplayPlaybackStream, StreamOwner>();
   const streamInputs = new WeakMap<AirplayInput, StreamOwner>();
   const drivers = new WeakMap<AirplayDriver['transport'], AirplayDriver>();
+  const attachmentIds = new WeakMap<AirplayTransport, bigint>();
   const privateInputs = new WeakMap<AirplayInput, AirplayCredentials>();
   const receipts = new WeakMap<AirplayInput, PairingCredentialConsumer>();
   const consumers = new WeakMap<AirplayTransport, PairingCredentialConsumer>();
@@ -299,6 +344,12 @@ export function createAirplayDevices(deps: {
               await consumer(change);
             },
           );
+          if (owner) {
+            attachmentIds.set(
+              transport,
+              (bound as ReturnType<AirplayStream['attach']>).id,
+            );
+          }
           constructing = false;
           for (const event of pending) onEvent(event);
           if (closing) {
@@ -463,7 +514,6 @@ export function createAirplayDevices(deps: {
                   }
                 })();
               closers.set(transport, close);
-              owner?.register(close);
               published = {
                 send: (command) => transport.send(command),
                 pcm: (chunk) => transport.pcm(chunk),
@@ -471,6 +521,11 @@ export function createAirplayDevices(deps: {
                 cancelPcm: () => transport.cancelPcm(),
                 close,
               };
+              owner?.register(
+                close,
+                published,
+                () => attachmentIds.get(transport),
+              );
               lifecycle.publish(published);
             },
           });

@@ -25,6 +25,7 @@ import {
 } from '../connection-strategy.ts';
 import type { AirplayDevices } from './airplay-device.ts';
 import type {
+  AirplayCancelResult,
   AirplayPlaybackStream,
   AirplayTransport,
 } from './airplay-profile.ts';
@@ -187,6 +188,9 @@ export function createAirplayBoot(
     generation: number;
     playing: boolean;
     reset?: Promise<void>;
+    segment: bigint;
+    cutoff?: AirplayCancelResult;
+    sourceStarted: boolean;
   };
   let stream: StreamOwner | null = null;
   let streamClosing: Promise<void> | undefined;
@@ -473,7 +477,6 @@ export function createAirplayBoot(
   const cancelPump = () => {
     if (source) {
       playback.cancelSource(source.lease);
-      source.stream.sink.cancelPcm();
       source = null;
     }
   };
@@ -494,8 +497,13 @@ export function createAirplayBoot(
     const sourceLease = playback.openSource(view.current.id, view.generation);
     if (!sourceLease) return;
     const streamCurrent = capacityCurrent();
+    const nativeEpoch = owner.sink.epoch;
+    if (nativeEpoch === null) {
+      throw new Error('Connected AirPlay stream has no epoch');
+    }
     const authority = { stream: owner, lease: sourceLease };
     source = authority;
+    owner.sourceStarted = true;
     const current = view.current, startMs = sourceLease.startMs;
     const path = current.facts.kind === 'song'
       ? current.facts.song.path
@@ -534,7 +542,44 @@ export function createAirplayBoot(
               });
             }
             try {
-              await owner.sink.pcm(chunk);
+              const segment = ++owner.segment;
+              let offset = 0;
+              while (offset < chunk.length && owns()) {
+                const receipt = await owner.sink.append({
+                  epoch: nativeEpoch,
+                  segment,
+                  pcm: chunk.subarray(offset),
+                });
+                // Only this copied prefix belongs to the source. Never account
+                // a refused suffix or retry a prefix after cancellation.
+                const accepted = Number(receipt.acceptedFrames) * 4;
+                offset += accepted;
+                bytes += accepted;
+                if (owns() && accepted) {
+                  playback.sourceAudio(sourceLease, accepted / 176400 * 1000);
+                }
+                if (!owns()) return;
+                if (receipt.status === 'error') {
+                  throw new Error(`RAOP append failed: ${receipt.error}`);
+                }
+                if (receipt.status === 'canceled') {
+                  throw new Error('Current AirPlay source epoch canceled');
+                }
+                if (offset < chunk.length) {
+                  await new Promise<void>((resolve) => {
+                    const done = () => {
+                      clearTimeout(timer);
+                      sourceLease.signal.removeEventListener('abort', done);
+                      resolve();
+                    };
+                    const timer = setTimeout(done, 10);
+                    sourceLease.signal.addEventListener('abort', done, {
+                      once: true,
+                    });
+                    if (sourceLease.signal.aborted) done();
+                  });
+                }
+              }
             } catch (error) {
               if (owns()) {
                 for (const [id, r] of [...runtimes]) {
@@ -544,11 +589,6 @@ export function createAirplayBoot(
               return;
             }
             if (!owns()) return;
-            bytes += chunk.length;
-            playback.sourceAudio(
-              sourceLease,
-              chunk.length / (44100 * 2 * 2) * 1000,
-            );
           }
         } finally {
           await iterator.return?.();
@@ -630,17 +670,52 @@ export function createAirplayBoot(
     owner.generation = view.generation;
     owner.playing = playing;
     cancelPump();
-    // reset fences admitted native writers now; decoder acquisition/cleanup is
-    // separately C1-owned and cannot hold a new command's control boundary.
-    const resetting = operations.run(() => owner.sink.reset()).catch(
+    // Before a source lifetime exists, there is no old input/schedule to cancel.
+    // Connecting/auth sessions can absorb the newest intent without destroying
+    // their handshake. Once a source starts (even unresolved acquisition), its
+    // discontinuity must fence native input. Further intent changes while that
+    // fence waits can share its still-empty replacement epoch.
+    if (!owner.sourceStarted) return;
+    const epoch = owner.sink.epoch;
+    if (epoch === null) return; // No native audio/session exists to cancel yet.
+    // Native cancellation advances the epoch before the first await and owns
+    // local reset plus every attachment's FLUSH/destruction readiness barrier.
+    const previous = owner.reset;
+    const cancellation = operations.run(async () => {
+      const retiring = [...runtimes].flatMap(([id, r]) => {
+        if (!r.transport) return [];
+        const choice = outputs.get(id)?.connectionStrategy ?? r.strategy;
+        const retire = forceRelease.has(id) ||
+          (!playing
+            ? CONNECTION_STRATEGIES[choice].idle === 'retire'
+            : CONNECTION_STRATEGIES[choice].discontinuity === 'retire');
+        return retire ? [r.transport] : [];
+      });
+      const pending = owner.sink.cancel(epoch, retiring);
+      owner.sourceStarted = false;
+      const result = await pending;
+      if (result.status === 'failed') throw new Error('AirPlay cancel failed');
+      if (closed || stream !== owner) return;
+      // The source transition was committed above. Keep its exact cutoff for
+      // later timeline projection; this is not yet a public media bookmark.
+      if (!owner.cutoff || owner.cutoff.epoch < result.epoch) {
+        owner.cutoff = result;
+      }
+      await owner.sink.ackCancel(result.epoch);
+    }).catch(
       (error) => {
         streamBlocked = true;
         log.event('retirement_failed', { player: deps.playerId ?? 1, error });
       },
-    ).finally(() => {
-      if (owner.reset === resetting) owner.reset = undefined;
-      reconcile();
-    });
+    );
+    // Fence the new command immediately, but retain every older cancel/ack in
+    // the release barrier. A superseding fast cancel cannot close the lazy
+    // owner while an older retirement is still settling its retained receipt.
+    const resetting = Promise.all([previous, cancellation]).then(() => {})
+      .finally(() => {
+        if (owner.reset === resetting) owner.reset = undefined;
+        reconcile();
+      });
     owner.reset = resetting;
   };
   const releaseStream = () => {
@@ -826,6 +901,8 @@ export function createAirplayBoot(
       entry: view.current.id,
       generation: view.generation,
       playing: true,
+      segment: 0n,
+      sourceStarted: false,
     };
     let activated: Runtime | undefined;
     const current = () => {
@@ -1015,7 +1092,12 @@ export function createAirplayBoot(
       }
     });
   };
-  const idle = (id: string, r: Runtime, choice: ConnectionStrategy) => {
+  const idle = (
+    id: string,
+    r: Runtime,
+    choice: ConnectionStrategy,
+    enteredAt: number,
+  ) => {
     // An internal no-audio pause retains the challenged control session so its
     // bounded native auth handshake can complete. Explicit Pause/Stop revokes
     // the lease and follows the normal retirement policy.
@@ -1032,12 +1114,7 @@ export function createAirplayBoot(
     }
     if (r.held) return;
     r.held = true;
-    r.deadline = performance.now() + HOLD_MS;
-    void operations.run(() =>
-      r.transport!.send({ cmd: 'flush' }).catch((error) => {
-        if (runtimes.get(id) === r) sessionFailed(id, r, 'flush', error);
-      })
-    );
+    r.deadline = enteredAt + HOLD_MS;
     if (runtimes.get(id) !== r || !r.held) return;
     const session = r.session;
     r.holdTimer = setTimeout(() => {
@@ -1047,10 +1124,12 @@ export function createAirplayBoot(
     }, Math.max(0, r.deadline! - performance.now()));
   };
   const reconcilePass = () => {
+    const enteredAt = performance.now();
     const view = playback.playerView(), snapshot = outputs.list();
     syncStream(view);
     if (
-      stream && !streamClosing && !runtimes.size && !preparing.size &&
+      stream && !stream.reset && !streamClosing && !runtimes.size &&
+      !preparing.size &&
       !retiring.size
     ) {
       void releaseStream()?.catch(() => {});
@@ -1122,7 +1201,7 @@ export function createAirplayBoot(
         if (r) {
           // OwnTone may keep a current-null Stop transport; clear/deselect
           // were handled above and always release immediately.
-          actions.push(() => idle(id, r, out.connectionStrategy));
+          actions.push(() => idle(id, r, out.connectionStrategy, enteredAt));
         } else if (grants.has(id)) {
           actions.push(() => spawnSession(outputs.get(id) ?? out));
         }
@@ -1165,13 +1244,6 @@ export function createAirplayBoot(
           ]);
         } else if (r.connected) {
           actions.push(() => {
-            void operations.run(() =>
-              r.transport!.send({ cmd: 'flush' }).catch((error) => {
-                if (runtimes.get(id) === r) {
-                  sessionFailed(id, r, 'flush', error);
-                }
-              })
-            );
             requestPump(id, r);
           });
         }
@@ -1593,6 +1665,10 @@ export function createAirplayBoot(
       for (const [id, r] of [...runtimes]) {
         void retire(id, r, 'boot close');
       }
+      // Revoke native cancel waiters now, before joining boot work which may
+      // itself be waiting for a held FLUSH. Decoder cleanup remains joined.
+      const releasing = releaseStream();
+      void releasing?.catch(() => {});
       void (async () => {
         // Starts can acquire a child while unwinding a canceled await. Join the
         // admitted work first, then its remaining retirements, not a snapshot
@@ -1600,6 +1676,7 @@ export function createAirplayBoot(
         await settled;
         await Promise.all(retiring.values());
         await releaseStream();
+        await releasing;
       })().then(() => completion.resolve(), completion.reject);
       return closeWork;
     },

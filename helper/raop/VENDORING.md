@@ -99,8 +99,8 @@ Master sharing, writes, CONNECTED promotion and pending-input discard match
 the addressed stream; removing one attachment never stops a healthy peer's
 pacer or clears its partial ALAC input.
 
-The compatibility device API still has device-local pacers and the existing
-TypeScript feed election until boot adoption. Both paths reserve one native
+The compatibility device API retains device-local pacers and exclusive legacy
+input; production playback uses one fixed-player stream producer. Both paths reserve one native
 active-stream guard before session allocation or PCM acceptance. A competing
 explicit/compatibility context returns an error, not accepted-and-dropped PCM.
 Dormant streams retain a runtime reference; native free refuses while any
@@ -124,9 +124,11 @@ two-second ingress bound and active-stream guard remain. Allocation failure is
 distinct from a full ingress. PCM is copied before return; only the unaccepted
 suffix may be retried. Segment identity is opaque, not native queue policy.
 
-The additive typed `AirplayExactStream` uses the existing C1/C3 stream owner.
-The production boot still uses its transitional PCM/local-reset port. Local
-reset fences new exact admission until its callback applies, but does not
+The typed `AirplayExactStream` uses the existing C1/C3 stream owner and is adopted
+through the lazy device boundary by production playback. The boot accounts each
+accepted prefix and retries only its unaccepted suffix with the same segment and
+captured epoch. Transitional local reset remains for compatibility callers; it
+fences new exact admission until its callback applies, but does not
 change epochs or prove receiver FLUSH readiness. Retained source markers and
 scheduled completion remain separate work. Test-only
 allocation/reset barriers in `test/faultinject.c` are never linked into the
@@ -152,7 +154,24 @@ scheduled cutoff, using successful RTP/sync coverage and receiver offset/latency
 once. This is not accepted PCM, natural completion, physical sound or a core
 bookmark projection. Close cancels typed poll waiters, joins them through C1 and
 then destroys attachments and stream storage through the existing C3 owner.
-Production boot adoption remains separate from this additive native/typed port.
+The production boot commits its source transition before acknowledging the cancel
+receipt and retains older cancel/ack work in the stream release barrier. Decoder
+acquisition never holds the native fence; shutdown revokes native polling before
+joining source acquisition and cleanup.
+
+`raop_stream_cancel_v2` additionally copies a set of retiring attachment identities
+at the same admission boundary. Unknown, foreign or duplicate identities reject
+without advancing epoch. Other attachments retain the original FLUSH default.
+The loop snapshots the whole old cohort's scheduled cutoff before resetting any
+schedule or queuing the selected device retirements through the existing owned
+TEARDOWN/release queue. Those sessions never receive FLUSH, and only their local
+destruction establishes readiness. A concurrently admitted FREE provides that
+same destruction proof rather than becoming a failed redundant teardown.
+Production strategies supply these dispositions privately through the adapter;
+the core never constructs native attachment identities. Both unchanged native
+40-seek recycle batteries and the HTTP/decoder scheduled-prefix consumers cover
+the mixed-retire/retain path. Natural seal/end/tail completion and public native
+media-position projection remain separate contracts.
 
 ## Device credential input
 

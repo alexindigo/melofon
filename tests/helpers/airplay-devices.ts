@@ -2,6 +2,7 @@
 import type { Outputs } from '../../src/player.ts';
 import { createAirplayDevices } from '../../src/boots/airplay-device.ts';
 import {
+  type AirplayExactStream,
   type AirplaySpawn,
   airplayStartFields,
   type AirplayStream,
@@ -28,11 +29,13 @@ export function recordingSpawn(
 /** Lifecycle-test stream: one input, fanout to connected fake attachments. The
  * attachment's PCM recorder observes delivery, never source election. Native
  * fixtures supply createFfiStream explicitly instead. */
-export function recordingStream(spawn: AirplaySpawn): () => AirplayStream {
+export function recordingStream(spawn: AirplaySpawn): () => AirplayExactStream {
   let incarnation = 0n;
   return () => {
     const id = ++incarnation;
+    let epoch = 1n;
     type Peer = {
+      id: bigint;
       transport: AirplayTransport;
       ready: boolean;
       close(): Promise<void>;
@@ -43,9 +46,59 @@ export function recordingStream(spawn: AirplaySpawn): () => AirplayStream {
     };
     return {
       id,
+      get epoch() {
+        return epoch;
+      },
+      async append(input) {
+        if (input.epoch !== epoch) {
+          return {
+            streamId: id,
+            epoch: input.epoch,
+            segment: input.segment,
+            acceptedFrames: 0n,
+            status: 'canceled',
+          };
+        }
+        await Promise.all(
+          [...peers].filter((p) => p.ready).map((p) =>
+            p.transport.pcm(input.pcm)
+          ),
+        );
+        return {
+          streamId: id,
+          epoch: input.epoch,
+          segment: input.segment,
+          acceptedFrames: BigInt(input.pcm.length / 4),
+          status: 'accepted',
+        };
+      },
+      async cancel(captured, retire = []) {
+        if (epoch !== captured) throw new Error('stale fixture epoch');
+        epoch++;
+        cancelPcm();
+        await Promise.all(
+          [...peers].map((p) =>
+            retire.includes(p.id)
+              ? p.close()
+              : p.ready
+              ? p.transport.send({ cmd: 'flush' })
+              : Promise.resolve()
+          ),
+        );
+        return {
+          streamId: id,
+          epoch: captured,
+          nextEpoch: captured + 1n,
+          status: epoch === captured + 1n ? 'ready' : 'canceled',
+          cutoffFrames: 0n,
+          admittedNs: 0n,
+        };
+      },
+      ackCancel: () => Promise.resolve(),
       attach(event, credential) {
         let closing: Promise<void> | undefined;
         const peer: Peer = {
+          id: ++incarnation,
           transport: null as unknown as AirplayTransport,
           ready: false,
           close: () =>
@@ -73,7 +126,7 @@ export function recordingStream(spawn: AirplaySpawn): () => AirplayStream {
         peer.transport = driver.transport;
         peers.add(peer);
         return {
-          id: ++incarnation,
+          id: peer.id,
           streamId: id,
           transport,
           start: driver.start,
@@ -100,13 +153,16 @@ export function recordingStream(spawn: AirplaySpawn): () => AirplayStream {
 /** Apply attachment instrumentation to the real stream without replacing its
  * input or native identity. */
 export function mapStream(
-  factory: () => AirplayStream,
+  factory: () => AirplayExactStream,
   wrap: (spawn: AirplaySpawn) => AirplaySpawn,
-): () => AirplayStream {
+): () => AirplayExactStream {
   return () => {
     const stream = factory();
     return {
       ...stream,
+      get epoch() {
+        return stream.epoch;
+      },
       attach(...args) {
         let attached: ReturnType<AirplayStream['attach']> | undefined;
         const driver = wrap((...input) => attached = stream.attach(...input))(
@@ -137,7 +193,7 @@ export function createRecordingAirplayDevices(
 export function createTestAirplayDevices(
   outputs: Outputs,
   spawn?: AirplaySpawn,
-  stream?: () => AirplayStream,
+  stream?: () => AirplayExactStream,
 ) {
   return createAirplayDevices({
     outputs,

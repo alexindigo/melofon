@@ -2,6 +2,7 @@
 #ifndef MELOFON_RAOP_BRIDGE_H
 #define MELOFON_RAOP_BRIDGE_H
 #include <stdint.h>
+#include <stddef.h>
 /* -1: cleanup could not start, retain ownership. 0: accepted. Callback after
  * all device-local sessions/sockets are destroyed, possibly inline. sent=0
  * all final requests wrote locally, -1 some unsent; neither means remote ACK. */
@@ -12,7 +13,8 @@ void raop_discard_pending_input(uint64_t stream_id);
 /* Loop-owned epoch reset. Clear input/cache, FLUSH established sessions and
  * destroy old startup sessions. Repeated calls cannot admit PCM between ACKs.
  * Returns the slowest healthy scheduled cutoff at the captured monotonic time. */
-uint64_t raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns);
+uint64_t raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns,
+                            const uint64_t *retire_ids, size_t retire_count);
 int raop_cancel_pending(uint64_t stream_id);
 void raop_ffi_cancel_changed(uint64_t stream_id);
 int raop_ffi_stream_fenced(uint64_t stream_id);

@@ -82,6 +82,11 @@ struct raop_cancel_result {
   uint64_t local_reset;
 };
 int raop_stream_cancel(raop_stream_t *stream, uint64_t epoch);
+/* Same atomic boundary; these immutable attachment identities retire instead of
+ * FLUSH. Others retain the default FLUSH disposition. Reject foreign/duplicate
+ * identities before advancing epoch; capture cutoff before any retirement. */
+int raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
+                           const uint64_t *retire_ids, size_t retire_count);
 int raop_stream_cancel_poll(raop_stream_t *stream, uint64_t epoch,
                             struct raop_cancel_result *result);
 int raop_stream_cancel_ack(raop_stream_t *stream, uint64_t epoch);

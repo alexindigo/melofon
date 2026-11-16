@@ -3110,7 +3110,8 @@ raop_cancel_pending(uint64_t stream_id)
 }
 
 uint64_t
-raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns)
+raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns,
+                   const uint64_t *retire_ids, size_t retire_count)
 {
   uint64_t cutoff = UINT64_MAX;
   for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
@@ -3142,6 +3143,12 @@ raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns)
     if (rs->cancel_pending) continue;
     rs->cancel_pending = true;
     if (rs->retiring || rs->failure_pending) continue; /* destruction will notify */
+    bool retire = false;
+    for (size_t i = 0; i < retire_count; i++)
+      if (retire_ids[i] == rs->device_id) { retire = true; break; }
+    /* FFI queues these owned releases after this function captures the entire
+     * old cohort's cutoff. Only local session destruction clears readiness. */
+    if (retire) continue;
     if (rs->state != RAOP_STATE_CONNECTED && rs->state != RAOP_STATE_STREAMING) {
       rs->state = RAOP_STATE_STOPPED;
       raop_status(rs);

@@ -97,7 +97,7 @@ function fixture(
         async *[Symbol.asyncIterator]() {
           for (let i = 0; i < 10000; i++) {
             await sleep(2);
-            yield new Uint8Array([tag]);
+            yield new Uint8Array([tag, 0, 0, 0]);
           }
         },
       });

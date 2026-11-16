@@ -15,8 +15,8 @@ import { createRecordingAirplayDevices as createAirplayDevices } from './airplay
 import { createAirplayBoot } from '../../src/boots/airplay.ts';
 import { createAirplayDiscovery } from '../../src/boots/airplay-mdns.ts';
 import type {
+  AirplayExactStream,
   AirplaySpawn,
-  AirplayStream,
 } from '../../src/boots/airplay-profile.ts';
 import type { MdnsService } from '../../src/mdns.ts';
 import { createPlayback } from '../../src/playback.ts';
@@ -98,7 +98,7 @@ export async function speakerConsumer(
   options: {
     root?: string;
     spawn?: AirplaySpawn;
-    stream?: () => AirplayStream;
+    stream?: () => AirplayExactStream;
     secrets?: Secrets;
     pairingSeconds?: number;
   } = {},
