@@ -157,6 +157,9 @@ rtp_sync_is_time(struct rtp_session *session);
 
 struct rtp_packet *
 rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stamp, uint8_t type);
+/* Explicit receiver-local RTSP start anchor; never rewind the shared session. */
+struct rtp_packet *
+rtp_sync_packet_at(struct rtp_session *session, struct rtcp_timestamp cur_stamp, uint32_t pos, uint8_t type);
 
 int
 rtcp_packet_parse(struct rtcp_packet *pkt, uint8_t *data, size_t size);

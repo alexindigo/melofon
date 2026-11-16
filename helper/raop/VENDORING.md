@@ -25,6 +25,21 @@ Do not "sync" these files wholesale from upstream without re-running
 `make test`; `struct raop_extra` remains mirrored in `ffi.c`. Native session
 layouts are not mirrored: `raop-bridge.h` exposes device-ID local release.
 
+## Intentional local patch: receiver-local first-sync anchor
+
+`outputs/raop.c` retains each receiver's exact RECORD/FLUSH RTP timestamp until
+its first sync is sent. Another peer may keep the shared master advancing during
+that handshake. `rtp_common` accepts an explicit sync position so this receiver's
+first sync matches RTSP without rewinding the master or changing other peers.
+Both sides of the live RTP/NTP correlation are translated by the same frame
+interval; periodic sync and native scheduled progress retain the live clock.
+
+This follows upstream `rtp_common.c`'s documented first-sync/RTSP compatibility
+requirement (Eufy Genie) and the RECORD and sync definitions in sections 5.1-5.2
+of <https://nto.github.io/AirPlay.html>. Deterministic delayed-RECORD proofs cover
+master advancement shorter and longer than the transport buffer lead, through
+the unchanged strict scheduled receiver and exact decoded PCM assertions.
+
 ## Intentional local patches: connection strategies
 
 | Path                                           | Local contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |

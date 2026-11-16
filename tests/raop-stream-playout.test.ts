@@ -1626,6 +1626,100 @@ test('completion late-join captured at seal fails missing prefix instead of cred
   }
 });
 
+for (const heldFrames of [4410n, 110250n]) {
+  test(`late-join first sync retains RECORD anchor while master advances ${heldFrames} frames`, async () => {
+    const stream = createFfiStream();
+    const reply = Promise.withResolvers<void>();
+    let entered = false;
+    const healthy = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const late = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+      beforeRecordReply: () => {
+        entered = true;
+        return reply.promise;
+      },
+    });
+    const original = stream.attach(() => {}), joined = stream.attach(() => {});
+    const bytes = pcm(353, 71);
+    let starting: Promise<void> | undefined;
+    try {
+      await original.start(profile(healthy), item);
+      await append(stream, highSource, bytes);
+      await until(
+        'original source is dispatched before join',
+        async () =>
+          (await stream.source(stream.epoch, highSource))!.fedFrames === 353n,
+      );
+      starting = joined.start(profile(late), item);
+      await until('late RECORD reply is held', () => entered);
+      const before =
+        (await stream.progress(stream.epoch, highSource))!.fedFrames;
+      await until(
+        'master advances while late RECORD is held',
+        async () =>
+          (await stream.progress(stream.epoch, highSource))!.fedFrames >=
+            before + heldFrames,
+      );
+      reply.resolve();
+      await starting;
+      await until(
+        'late first sync and audio arrive',
+        () =>
+          late.sessions[0].wire.some((e) => e.kind === 'control') &&
+          late.sessions[0].audioPackets > 0,
+      );
+      const record = late.sessions[0].wire.find((e) => e.kind === 'record');
+      const firstSync = late.sessions[0].wire.find((e) => e.kind === 'control');
+      assert(record?.kind === 'record' && firstSync?.kind === 'control');
+      assertEquals(firstSync.data[0], 0x90);
+      assertEquals(
+        new DataView(firstSync.data.buffer, firstSync.data.byteOffset)
+          .getUint32(16),
+        Number(/rtptime=(\d+)/.exec(record.rtpInfo)![1]),
+        'first sync uses this receiver RTSP anchor, not the later shared position',
+      );
+      await stream.seal(stream.epoch, highSource, 353n);
+      await stream.endStream(stream.epoch, 353n);
+      const identity = key(stream, highSource, 353n);
+      const failed = await stream.waitCompletion(identity);
+      assertEquals(failed.status, 'failed');
+      const outcome = failed.attachments.find((a) =>
+        a.attachment === joined.id
+      )!;
+      assertEquals(outcome.outcome, 'failed');
+      assert(
+        outcome.coverageStart >= 353n,
+        'late receiver cannot credit missed source',
+      );
+      const revised = await stream.reviseCompletion(identity, [joined.id]);
+      assertEquals((await stream.waitCompletion(revised)).status, 'complete');
+      await rendered(stream, healthy, 353, new Map([[highSource, bytes]]));
+      await until(
+        'late packet is independently scheduled',
+        () =>
+          renderScheduledAudio(late.sessions[0], late.nowMs()).pcm.length >=
+            352 * 4,
+      );
+      const suffix = renderScheduledAudio(late.sessions[0], late.nowMs());
+      assertEquals(suffix.issues, []);
+      assertEquals(suffix.discarded, []);
+      assertEquals(suffix.pcm, new Uint8Array(suffix.pcm.length));
+      assertEquals(await stream.pollCompletion(identity), failed);
+      await libraryProof();
+    } finally {
+      reply.resolve();
+      await starting?.catch(() => {});
+      await stream.close();
+      healthy.close();
+      late.close();
+    }
+  });
+}
+
 test('completion revised failure cannot wait forever for an unsubmitted healthy suffix', async () => {
   const stream = createFfiStream();
   const healthy = await startFakeRaop({
