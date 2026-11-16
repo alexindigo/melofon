@@ -26,6 +26,8 @@ import type {
   AirplayAppendResult,
   AirplayAppendStatus,
   AirplayCancelResult,
+  AirplayCompletionKey,
+  AirplayCompletionResult,
   AirplayControl,
   AirplayCredentials,
   AirplayDriver,
@@ -78,6 +80,24 @@ const SYMBOLS = {
     result: 'i32',
     nonblocking: true,
   },
+  raop_stream_completion_poll: {
+    parameters: ['pointer', 'u64', 'u64', 'u64', 'buffer'],
+    result: 'i32',
+    nonblocking: true,
+  },
+  raop_stream_completion_attachment: {
+    parameters: ['pointer', 'u64', 'u64', 'u64', 'u64', 'buffer'],
+    result: 'i32',
+  },
+  raop_stream_completion_revise: {
+    parameters: ['pointer', 'u64', 'u64', 'u64', 'u64', 'buffer', 'usize'],
+    result: 'i32',
+  },
+  raop_stream_completion_ack: {
+    parameters: ['pointer', 'u64', 'u64', 'u64', 'u64'],
+    result: 'i32',
+  },
+  raop_stream_close_input: { parameters: ['pointer'], result: 'i32' },
   raop_stream_cancel_v2: {
     parameters: ['pointer', 'u64', 'buffer', 'usize'],
     result: 'i32',
@@ -652,6 +672,99 @@ export function createFfiStream(
         ...status(r[4], r[5]),
       }) as AirplayMarkerResult;
     });
+  const completionKey = (key: AirplayCompletionKey) => {
+    u64(key.epoch, key.source, key.target, key.revision);
+    if (!key.epoch || !key.source || !key.revision) {
+      throw new RangeError('RAOP completion requires nonzero identities');
+    }
+  };
+  const progressErrors = [
+    'none',
+    'allocation',
+    'encoder',
+    'cipher',
+    'send',
+    'sync',
+    'overdue',
+    'transport',
+  ] as const;
+  const readCompletion = async (
+    key: AirplayCompletionKey,
+  ): Promise<AirplayCompletionResult | null> => {
+    completionKey(key);
+    const r = new BigUint64Array(12);
+    const rc = await lib.symbols.raop_stream_completion_poll(
+      handle,
+      key.epoch,
+      key.source,
+      key.revision,
+      r,
+    );
+    if (rc === 0) return null;
+    const state =
+      (['pending', 'complete', 'canceled', 'failed'] as const)[Number(r[6])];
+    const error = progressErrors[Number(r[7])];
+    if (
+      rc !== 1 || r[0] !== id || r[1] !== key.epoch || r[2] !== key.source ||
+      r[3] !== key.target || r[5] !== key.revision || !state || !error ||
+      r[10] > BigInt(Number.MAX_SAFE_INTEGER) || r[11] > r[10]
+    ) {
+      throw new Error('Invalid RAOP completion receipt ABI or target');
+    }
+    const attachments: AirplayCompletionResult['attachments'][number][] = [];
+    for (let i = 0n; i < r[10]; i++) {
+      const a = new BigUint64Array(8);
+      const found = lib.symbols.raop_stream_completion_attachment(
+        handle,
+        key.epoch,
+        key.source,
+        key.revision,
+        i,
+        a,
+      );
+      const outcome =
+        (['pending', 'complete', 'withdrawn', 'failed', 'canceled'] as const)[
+          Number(a[2])
+        ];
+      const reason = progressErrors[Number(a[4])];
+      if (
+        found !== 1 || !a[0] || !outcome || a[3] > 1n || !reason || a[7] > a[6]
+      ) {
+        throw new Error('Invalid RAOP completion attachment ABI');
+      }
+      attachments.push(Object.freeze({
+        attachment: a[0],
+        session: a[1],
+        outcome,
+        excluded: a[3] === 1n,
+        error: reason,
+        coverageStart: a[5],
+        submittedFrames: a[6],
+        scheduledFrames: a[7],
+      }));
+    }
+    if (
+      BigInt(attachments.filter((a) => !a.excluded).length) !== r[11] ||
+      (state === 'complete' && (!r[3] || !r[11] || error !== 'none' ||
+        attachments.some((a) => !a.excluded && a.outcome !== 'complete')))
+    ) {
+      throw new Error('Invalid RAOP completion cohort ABI');
+    }
+    return Object.freeze({
+      streamId: id,
+      epoch: r[1],
+      source: r[2],
+      target: r[3],
+      inputEnd: r[4],
+      revision: r[5],
+      status: state,
+      error,
+      transportEnd: r[8],
+      capturedNs: r[9],
+      required: r[11],
+      attachments: Object.freeze(attachments),
+    });
+  };
   releases.add('stream', async () => {
     const rc = await lib.symbols.raop_stream_free(handle);
     if (rc < 0) {
@@ -722,6 +835,56 @@ export function createFfiStream(
     },
     seal: (captured, source, target) => marker(captured, source, target, false),
     endStream: (captured, target) => marker(captured, 0n, target, true),
+    pollCompletion: (key) => operations.run(() => readCompletion(key)),
+    waitCompletion(key) {
+      return operations.run(async () => {
+        for (;;) {
+          const receipt = await readCompletion(key);
+          if (!receipt) throw new Error('RAOP completion receipt absent');
+          if (receipt.status !== 'pending') return receipt;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      });
+    },
+    reviseCompletion(key, exclude) {
+      return operations.run(() => {
+        completionKey(key);
+        u64(...exclude);
+        const ids = new BigUint64Array(exclude);
+        if (
+          lib.symbols.raop_stream_completion_revise(
+            handle,
+            key.epoch,
+            key.source,
+            key.target,
+            key.revision,
+            ids,
+            BigInt(ids.length),
+          ) !== 0
+        ) {
+          throw new Error('RAOP completion revision refused');
+        }
+        return Object.freeze({ ...key, revision: key.revision + 1n });
+      });
+    },
+    ackCompletion(key) {
+      return operations.run(() => {
+        completionKey(key);
+        if (
+          lib.symbols.raop_stream_completion_ack(
+            handle,
+            key.epoch,
+            key.source,
+            key.target,
+            key.revision,
+          ) !== 0
+        ) {
+          throw new Error(
+            'RAOP completion ack refused pending or mismatched result',
+          );
+        }
+      });
+    },
     source(captured, source) {
       return operations.run(() => {
         u64(captured, source);
@@ -1061,6 +1224,9 @@ export function createFfiStream(
     },
     close() {
       if (!closing) {
+        // Settle retained waiters before C1 joins them, without a drain or FLUSH
+        // wait. C3 still owns every attachment and the eventual native free.
+        lib.symbols.raop_stream_close_input(handle);
         const settled = operations.close();
         closing = settled.then(() =>
           releaseOrThrow(releases, 'RAOP stream release failed')

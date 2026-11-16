@@ -3,6 +3,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createFfiStream, raopFfiInternals } from '../src/boots/raop-ffi.ts';
 import {
+  type AirplayCompletionKey,
   type AirplayRangeSnapshot,
   profileFromService,
 } from '../src/boots/airplay-profile.ts';
@@ -12,6 +13,12 @@ import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 
 type Stream = ReturnType<typeof createFfiStream>;
 type Receiver = Awaited<ReturnType<typeof startFakeRaop>>;
+const key = (
+  stream: Stream,
+  source: bigint,
+  target: bigint,
+  revision = 1n,
+): AirplayCompletionKey => ({ epoch: stream.epoch, source, target, revision });
 const highSource = 0xfedcba9876543210n;
 const sleep = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(
@@ -254,6 +261,31 @@ for (const frames of [1, 351, 352, 353, 441, 44100 + 137]) {
         all.some((r) => r.kind === 'drain' && r.frames > 44100n),
         'paced drain persists through the receiver schedule',
       );
+      const identity = key(stream, highSource, BigInt(frames));
+      const completed = await stream.waitCompletion(identity);
+      assertEquals([
+        completed.status,
+        completed.target,
+        completed.transportEnd,
+        completed.required,
+        completed.attachments[0].outcome,
+      ], ['complete', BigInt(frames), BigInt(frames), 1n, 'complete']);
+      assertEquals(await stream.pollCompletion(identity), completed);
+      assert(
+        completed.attachments[0].submittedFrames >= completed.transportEnd,
+      );
+      assert(
+        completed.attachments[0].scheduledFrames >= completed.transportEnd,
+      );
+      const fed = (await stream.progress(stream.epoch))!.fedFrames;
+      await sleep(50);
+      assertEquals(
+        (await stream.progress(stream.epoch))!.fedFrames,
+        fed,
+        'ended drain stops only after the retained scheduled completion',
+      );
+      await stream.ackCompletion(identity);
+      assertEquals(await stream.pollCompletion(identity), null);
       await libraryProof();
     } finally {
       await stream.close();
@@ -562,6 +594,26 @@ for (const manySources of [true, false]) {
       assertEquals((await stream.cancel(old)).status, 'ready');
       assertEquals(await stream.source(old, 1n), null);
       assertEquals((await stream.seal(old, 1n, 1n)).status, 'canceled');
+      if (manySources) {
+        assertEquals(
+          (await stream.appendSource({
+            epoch: stream.epoch,
+            source: 1n,
+            segment: 1n,
+            pcm: pcm(1),
+          })).status,
+          'backpressure',
+          'unacked old terminal receipts retain marker capacity across cancel',
+        );
+        for (let source = 1n; source <= frames; source++) {
+          await stream.ackCompletion({
+            epoch: old,
+            source,
+            target: 1n,
+            revision: 1n,
+          });
+        }
+      }
       await append(stream, 1n, pcm(1));
       assertEquals((await stream.source(stream.epoch, 1n))!.acceptedFrames, 1n);
       await stream.ackCancel(old);
@@ -814,6 +866,10 @@ for (
           'group cannot use the faster boundary',
         );
         assert(peer.sourceFrames < fast.sourceFrames);
+        assertEquals(
+          (await stream.pollCompletion(key(stream, highSource, 704n)))!.status,
+          'pending',
+        );
         await until(
           'slow group final source boundary',
           async () =>
@@ -845,6 +901,12 @@ for (
         const final = (await stream.progress(stream.epoch, highSource))!;
         assert(final.submittedFrames > 65536n);
         assertEquals(final.sourceFrames, 704n);
+        const complete = await stream.waitCompletion(
+          key(stream, highSource, 704n),
+        );
+        assertEquals(complete.status, 'complete');
+        assertEquals(complete.required, 2n);
+        assert(complete.attachments.every((a) => a.outcome === 'complete'));
         await libraryProof();
         observer.close();
         return;
@@ -896,6 +958,16 @@ for (
           (await stream.source(stream.epoch, highSource))!.acceptedFrames,
           704n,
         );
+        const identity = key(stream, highSource, 704n);
+        assertEquals(
+          (await stream.pollCompletion(identity))!.status,
+          'pending',
+        );
+        await assertRejects(
+          () => stream.ackCompletion(identity),
+          Error,
+          'pending',
+        );
         await Deno.remove(hold);
         await rendered(stream, receiver, 704, new Map([[highSource, source]]));
         const progress = (await stream.progress(stream.epoch, highSource))!;
@@ -910,6 +982,11 @@ for (
           progress.realFrames + progress.silenceFrames,
           progress.scheduledFrames,
         );
+        const completed = await stream.waitCompletion(identity);
+        assertEquals(completed.status, 'complete');
+        assertEquals(completed.attachments[0].outcome, 'complete');
+        assertEquals(await stream.pollCompletion(identity), completed);
+        await stream.ackCompletion(identity);
       } else {
         if (mode === 'overdue' || mode === 'periodic sync') {
           await until(
@@ -945,6 +1022,10 @@ for (
         assertEquals(failure.error, mode === 'periodic sync' ? 'sync' : mode);
         assert(failure.sourceFrames < BigInt(source.length / 4));
         assertEquals(failure.sourceFrames, failure.realFrames);
+        const identity = key(stream, highSource, BigInt(source.length / 4));
+        const failed = await stream.waitCompletion(identity);
+        assertEquals([failed.status, failed.error], ['failed', failure.error]);
+        assert(failed.attachments.some((a) => a.outcome === 'failed'));
         await sleep(100);
         assertEquals(
           await stream.progress(stream.epoch, highSource),
@@ -983,6 +1064,12 @@ for (
         );
         const old = stream.epoch;
         assertEquals((await stream.cancel(old)).status, 'ready');
+        assertEquals(
+          await stream.pollCompletion(identity),
+          failed,
+          'old terminal source failure survives cancellation unchanged',
+        );
+        await stream.ackCompletion(identity);
         assertEquals(await stream.progress(old, highSource), null);
         assertEquals((await stream.progress(stream.epoch))!.error, 'none');
         await stream.ackCancel(old);
@@ -1108,6 +1195,495 @@ test('scheduled ranges project each sealed source without double-counting a shar
     ], [353n, 351n, 704n, 704n]);
     assertEquals(first.realFrames + first.silenceFrames, first.scheduledFrames);
     assert(Object.isFrozen(first));
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+test('completion retains more than sixteen exact terminal results across polling delays and cancel', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {});
+  const sources = new Map<bigint, Uint8Array>();
+  const identities: AirplayCompletionKey[] = [];
+  try {
+    for (let i = 1n; i <= 24n; i++) {
+      const bytes = pcm(1, Number(i));
+      sources.set(i, bytes);
+      await append(stream, i, bytes);
+      await stream.seal(stream.epoch, i, 1n);
+      identities.push(key(stream, i, 1n));
+    }
+    await stream.endStream(stream.epoch, 24n);
+    const pending = await stream.pollCompletion(identities[23]);
+    assertEquals(pending!.status, 'pending');
+    assertEquals(pending!.transportEnd, 0n);
+    await assertRejects(
+      () => stream.ackCompletion(identities[23]),
+      Error,
+      'pending',
+    );
+    await attachment.start(profile(receiver), item);
+    // Deliberately do not poll during playout: source receipts are not events in
+    // the 16-entry device ring and do not depend on a consumer keeping up.
+    await rendered(stream, receiver, 24, sources);
+    const results = [];
+    for (let i = 0; i < identities.length; i++) {
+      const result = await stream.waitCompletion(identities[i]);
+      assertEquals([
+        result.streamId,
+        result.status,
+        result.inputEnd,
+        result.transportEnd,
+      ], [stream.id, 'complete', BigInt(i + 1), BigInt(i + 1)]);
+      assertEquals(result.attachments.map((a) => a.attachment), [
+        attachment.id,
+      ]);
+      assert(
+        Object.isFrozen(result) && Object.isFrozen(result.attachments) &&
+          Object.isFrozen(result.attachments[0]),
+      );
+      results.push(result);
+    }
+    const old = stream.epoch;
+    await stream.cancel(old);
+    for (let i = 0; i < identities.length; i++) {
+      assertEquals(await stream.pollCompletion(identities[i]), results[i]);
+    }
+    for (
+      const change of [{ target: 2n }, { epoch: stream.epoch }, {
+        revision: 2n,
+      }, { source: 99n }]
+    ) {
+      await assertRejects(
+        () => stream.ackCompletion({ ...identities[0], ...change }),
+        Error,
+        'ack refused',
+      );
+    }
+    // Same opaque source in a new epoch cannot coalesce with the old terminal.
+    await append(stream, 1n, pcm(351, 17));
+    await stream.seal(stream.epoch, 1n, 351n);
+    const fresh = key(stream, 1n, 351n);
+    assertEquals((await stream.pollCompletion(fresh))!.status, 'pending');
+    for (const identity of identities) await stream.ackCompletion(identity);
+    assertEquals(await stream.pollCompletion(identities[0]), null);
+    assertEquals((await stream.pollCompletion(fresh))!.status, 'pending');
+    await stream.cancel(stream.epoch);
+    const canceled = await stream.waitCompletion(fresh);
+    assertEquals(canceled.status, 'canceled');
+    assertEquals(canceled.attachments[0].outcome, 'canceled');
+    assertEquals(await stream.pollCompletion(fresh), canceled);
+    await stream.ackCompletion(fresh);
+    await stream.ackCancel(old);
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+test('completion ack reclaims bounded source, input and silence ranges during a continuous epoch', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {});
+  const positions: { end: bigint; bytes: Uint8Array }[] = [];
+  try {
+    await attachment.start(profile(receiver), item);
+    for (let batch = 0; batch < 4; batch++) {
+      const identities = [];
+      for (let n = 1; n <= 90; n++) {
+        const source = BigInt(batch * 90 + n);
+        const bytes = pcm(1, Number(source));
+        await append(stream, source, bytes);
+        await stream.seal(stream.epoch, source, 1n);
+        identities.push(key(stream, source, 1n));
+      }
+      if (batch === 3) await stream.endStream(stream.epoch, 360n);
+      assertEquals(
+        (await stream.waitCompletion(identities[89])).status,
+        'complete',
+      );
+      for (const identity of identities) {
+        const result = await stream.waitCompletion(identity);
+        positions.push({
+          end: result.transportEnd,
+          bytes: pcm(1, Number(identity.source)),
+        });
+        // Retain the first source while acknowledging later sources: silence
+        // ownership cannot be inferred from the remaining real neighbors.
+        if (identity.source === 1n) continue;
+        await stream.ackCompletion(identity);
+        assertEquals(await stream.source(stream.epoch, identity.source), null);
+        assertEquals(await stream.pollCompletion(identity), null);
+      }
+      await sleep(30); // A real underrun after ack must not acquire a surviving neighbor's owner.
+      let retainedRanges = 0n;
+      while (await stream.range(stream.epoch, retainedRanges)) retainedRanges++;
+      assert(
+        retainedRanges <= 3n,
+        'orphan silence cannot accumulate behind an unacked prefix',
+      );
+    }
+    const final = positions[positions.length - 1].end;
+    await until(
+      'all final packet padding scheduled',
+      () =>
+        BigInt(
+          renderScheduledAudio(receiver.sessions[0], receiver.nowMs()).pcm
+            .length / 4,
+        ) >= (final + 351n) / 352n * 352n,
+    );
+    const rendered = renderScheduledAudio(
+      receiver.sessions[0],
+      receiver.nowMs(),
+    );
+    assertEquals(rendered.issues, []);
+    assertEquals(rendered.discarded, []);
+    const expected = new Uint8Array(rendered.pcm.length);
+    for (const { end, bytes } of positions) {
+      expected.set(bytes, Number(end - 1n) * 4);
+    }
+    assertEquals(
+      rendered.pcm,
+      expected,
+      'all 360 acknowledged sources once; every other transport byte zero',
+    );
+    assertEquals([
+      receiver.sessions.length,
+      receiver.sessions[0].flushes,
+      receiver.sessions[0].teardowns,
+    ], [1, 0, 0]);
+    await stream.ackCompletion(key(stream, 1n, 1n));
+    assertEquals(await stream.source(stream.epoch, 1n), null);
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+for (const loss of ['withdrawal', 'transport failure'] as const) {
+  test(`completion cohort ${loss} is retained and only explicit revision can exclude it`, async () => {
+    const stream = createFfiStream();
+    const healthy = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const lost = await startFakeRaop({ captureAudio: true, captureWire: true });
+    const peer = stream.attach(() => {}), departing = stream.attach(() => {});
+    const bytes = pcm(353, 9);
+    const identity = key(stream, highSource, 353n);
+    let late: Receiver | undefined;
+    try {
+      await peer.start(profile(healthy), item);
+      await departing.start(profile(lost), item);
+      await append(stream, highSource, bytes);
+      await stream.seal(stream.epoch, highSource, 353n);
+      await stream.endStream(stream.epoch, 353n);
+      await until(
+        'both peers received the whole source, not yet scheduled',
+        () =>
+          healthy.sessions[0]?.audioPackets >= 2 &&
+          lost.sessions[0]?.audioPackets >= 2,
+      );
+      assertEquals((await stream.pollCompletion(identity))!.status, 'pending');
+      await assertRejects(
+        () => stream.reviseCompletion(identity, [peer.id]),
+        Error,
+        'revision refused',
+      );
+      if (loss === 'withdrawal') await departing.transport.close();
+      else lost.close();
+      const failed = await stream.waitCompletion(identity);
+      assertEquals(failed.status, 'failed');
+      const excluded = failed.attachments.find((a) =>
+        a.attachment === departing.id
+      )!;
+      assertEquals(
+        excluded.outcome,
+        loss === 'withdrawal' ? 'withdrawn' : 'failed',
+      );
+      assertEquals(excluded.excluded, false);
+      await assertRejects(
+        () => stream.reviseCompletion(identity, [departing.id, departing.id]),
+        Error,
+        'revision refused',
+      );
+      await assertRejects(
+        () => stream.reviseCompletion(identity, [9999n]),
+        Error,
+        'revision refused',
+      );
+      const revised = await stream.reviseCompletion(identity, [departing.id]);
+      assertEquals(revised, { ...identity, revision: 2n });
+      if (loss === 'withdrawal') {
+        late = await startFakeRaop({ captureAudio: true, captureWire: true });
+        const joined = stream.attach(() => {});
+        await joined.start(profile(late), item);
+        await until(
+          'late join has suffix coverage',
+          async () =>
+            (await stream.progress(stream.epoch, highSource, joined.id))!
+              .coverageStart > 353n,
+        );
+        assertEquals(
+          (await stream.progress(stream.epoch, highSource, joined.id))!
+            .sourceFrames,
+          0n,
+        );
+      }
+      const complete = await stream.waitCompletion(revised);
+      assertEquals([
+        complete.status,
+        complete.target,
+        complete.inputEnd,
+        complete.required,
+      ], ['complete', 353n, 353n, 1n]);
+      assertEquals(
+        complete.attachments.length,
+        2,
+        'a late join never extends a sealed cohort',
+      );
+      assertEquals(
+        complete.attachments.find((a) => a.attachment === peer.id)!.outcome,
+        'complete',
+      );
+      assertEquals(
+        complete.attachments.find((a) => a.attachment === departing.id)!
+          .outcome,
+        excluded.outcome,
+      );
+      assertEquals(
+        complete.attachments.find((a) => a.attachment === departing.id)!
+          .excluded,
+        true,
+      );
+      assertEquals(
+        await stream.pollCompletion(identity),
+        failed,
+        'original failed revision is immutable',
+      );
+      await rendered(stream, healthy, 353, new Map([[highSource, bytes]]));
+      assertEquals(
+        renderScheduledAudio(lost.sessions[0], lost.nowMs()).pcm.length,
+        0,
+        'departed peer was not credited with unheard scheduled audio',
+      );
+      await stream.ackCompletion(identity);
+      assertEquals(await stream.pollCompletion(revised), complete);
+      await stream.ackCompletion(revised);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      healthy.close();
+      lost.close();
+      late?.close();
+    }
+  });
+}
+
+test('completion never succeeds with no captured participants, empty source or all exclusions', async () => {
+  const stream = createFfiStream();
+  try {
+    await append(stream, 1n, pcm(1));
+    await stream.seal(stream.epoch, 1n, 1n);
+    const absent = await stream.waitCompletion(key(stream, 1n, 1n));
+    assertEquals([absent.status, absent.required, absent.attachments.length], [
+      'failed',
+      0n,
+      0,
+    ]);
+    await append(stream, 2n, new Uint8Array());
+    await stream.seal(stream.epoch, 2n, 0n);
+    assertEquals(
+      (await stream.waitCompletion(key(stream, 2n, 0n))).status,
+      'failed',
+    );
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    try {
+      const only = stream.attach(() => {});
+      await append(stream, 3n, pcm(1));
+      await stream.seal(stream.epoch, 3n, 1n);
+      const identity = key(stream, 3n, 1n);
+      await only.transport.close();
+      assertEquals((await stream.waitCompletion(identity)).status, 'failed');
+      const revised = await stream.reviseCompletion(identity, [only.id]);
+      const none = await stream.waitCompletion(revised);
+      assertEquals([none.status, none.required, none.attachments[0].excluded], [
+        'failed',
+        0n,
+        true,
+      ]);
+      await stream.ackCompletion(identity);
+      await stream.ackCompletion(revised);
+      await libraryProof();
+    } finally {
+      receiver.close();
+    }
+  } finally {
+    await stream.close();
+  }
+});
+
+test('completion close cancels and joins admitted polls/waits before attachment and stream release', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {});
+  try {
+    await append(stream, highSource, pcm(353));
+    await stream.seal(stream.epoch, highSource, 353n);
+    const identity = key(stream, highSource, 353n);
+    await attachment.start(profile(receiver), item);
+    const waiting = stream.waitCompletion(identity);
+    const reading = stream.pollCompletion(identity);
+    const closing = stream.close();
+    assertEquals(stream.close(), closing);
+    const canceled = await waiting;
+    assertEquals(canceled.status, 'canceled');
+    assertEquals(canceled.attachments[0].outcome, 'canceled');
+    assertEquals((await reading)!.status, 'canceled');
+    await closing;
+    await assertRejects(() => stream.pollCompletion(identity), Error, 'closed');
+    await assertRejects(() => stream.ackCompletion(identity), Error, 'closed');
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+test('completion late-join captured at seal fails missing prefix instead of crediting past audio', async () => {
+  const stream = createFfiStream();
+  const healthy = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const late = await startFakeRaop({ captureAudio: true, captureWire: true });
+  const original = stream.attach(() => {}), joined = stream.attach(() => {});
+  const bytes = pcm(353, 67);
+  try {
+    await original.start(profile(healthy), item);
+    await append(stream, highSource, bytes);
+    await until(
+      'source dispatched before late receiver starts',
+      async () =>
+        (await stream.source(stream.epoch, highSource))!.fedFrames === 353n,
+    );
+    await joined.start(profile(late), item);
+    await until(
+      'late receiver has an explicit suffix anchor',
+      async () =>
+        (await stream.progress(stream.epoch, highSource, joined.id))!
+          .coverageStart > 0n,
+    );
+    await stream.seal(stream.epoch, highSource, 353n);
+    await stream.endStream(stream.epoch, 353n);
+    const identity = key(stream, highSource, 353n);
+    const failed = await stream.waitCompletion(identity);
+    assertEquals(failed.status, 'failed');
+    assertEquals(
+      failed.attachments.find((a) => a.attachment === joined.id)!.outcome,
+      'failed',
+    );
+    const revised = await stream.reviseCompletion(identity, [joined.id]);
+    assertEquals((await stream.waitCompletion(revised)).status, 'complete');
+    await rendered(stream, healthy, 353, new Map([[highSource, bytes]]));
+    const suffix = renderScheduledAudio(late.sessions[0], late.nowMs());
+    assertEquals(suffix.issues, []);
+    const joinedOutcome = failed.attachments.find((a) =>
+      a.attachment === joined.id
+    )!;
+    const expected = new Uint8Array(suffix.pcm.length);
+    if (joinedOutcome.coverageStart < 353n) {
+      expected.set(bytes.subarray(Number(joinedOutcome.coverageStart) * 4));
+    }
+    assertEquals(
+      suffix.pcm,
+      expected,
+      'only the declared packet suffix, never the missed prefix',
+    );
+    assertEquals(await stream.pollCompletion(identity), failed);
+    await libraryProof();
+  } finally {
+    await stream.close();
+    healthy.close();
+    late.close();
+  }
+});
+
+test('completion revised failure cannot wait forever for an unsubmitted healthy suffix', async () => {
+  const stream = createFfiStream();
+  const healthy = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const lost = await startFakeRaop({ captureAudio: true, captureWire: true });
+  const a = stream.attach(() => {}), b = stream.attach(() => {});
+  try {
+    await a.start(profile(healthy), item);
+    await b.start(profile(lost), item);
+    await append(stream, highSource, pcm(44100));
+    await stream.seal(stream.epoch, highSource, 44100n);
+    const identity = key(stream, highSource, 44100n);
+    await until(
+      'initial packets before source fully submitted',
+      () =>
+        healthy.sessions[0]?.audioPackets > 0 &&
+        lost.sessions[0]?.audioPackets > 0,
+    );
+    lost.close();
+    assertEquals((await stream.waitCompletion(identity)).status, 'failed');
+    const revised = await stream.reviseCompletion(identity, [b.id]);
+    const result = await stream.waitCompletion(revised);
+    assertEquals(result.status, 'failed');
+    assertEquals(
+      result.attachments.find((peer) => peer.attachment === a.id)!.outcome,
+      'failed',
+    );
+    assertEquals((await stream.cancel(stream.epoch)).status, 'ready');
+    assertEquals(await stream.pollCompletion(revised), result);
+    await libraryProof();
+  } finally {
+    await stream.close();
+    healthy.close();
+    lost.close();
+  }
+});
+
+test('completion failed RECORD settles the captured source before any PCM submission', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+    refuseRecord: () => true,
+  });
+  const attachment = stream.attach(() => {});
+  try {
+    await append(stream, highSource, pcm(353));
+    await stream.seal(stream.epoch, highSource, 353n);
+    await attachment.start(profile(receiver), item);
+    const failed = await stream.waitCompletion(key(stream, highSource, 353n));
+    assertEquals([
+      failed.status,
+      failed.attachments[0].outcome,
+      failed.attachments[0].submittedFrames,
+    ], ['failed', 'failed', 0n]);
+    assertEquals(receiver.sessions[0].audioPackets, 0);
     await libraryProof();
   } finally {
     await stream.close();

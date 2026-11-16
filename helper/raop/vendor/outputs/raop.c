@@ -2269,7 +2269,7 @@ static void
 session_failure(struct raop_session *rs)
 {
   if (!rs->cancel_pending && !rs->retiring)
-    raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_TRANSPORT);
+    raop_ffi_attachment_failed(rs->stream_id, rs->device_id, RAOP_PROGRESS_TRANSPORT);
   /* Session failed, let our user know */
   if (rs->state != RAOP_STATE_PASSWORD)
     rs->state = RAOP_STATE_FAILED;
@@ -2286,7 +2286,7 @@ deferred_session_failure(struct raop_session *rs)
 
   if (rs->retiring || rs->failure_pending) return;
   if (!rs->cancel_pending)
-    raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_TRANSPORT);
+    raop_ffi_attachment_failed(rs->stream_id, rs->device_id, RAOP_PROGRESS_TRANSPORT);
   rs->failure_pending = true;
   source_observer_cancel(rs);
   rs->state = RAOP_STATE_FAILED;
@@ -3244,14 +3244,14 @@ packet_send(struct raop_session *rs, struct rtp_packet *pkt)
 
       // Can't free it right away, it would make the ->next in the calling
       // master_session and session loops invalid
-      raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_SEND);
+      raop_ffi_attachment_failed(rs->stream_id, rs->device_id, RAOP_PROGRESS_SEND);
       deferred_session_failure(rs);
       return -1;
     }
   else if (ret != pkt->data_len)
     {
       DPRINTF(E_WARN, L_RAOP, "Partial send (%d) for '%s'\n", ret, rs->devname);
-      raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_SEND);
+      raop_ffi_attachment_failed(rs->stream_id, rs->device_id, RAOP_PROGRESS_SEND);
       return -1;
     }
 
@@ -3342,7 +3342,7 @@ control_packet_send(struct raop_session *rs, struct rtp_packet *pkt)
     DPRINTF(E_LOG, L_RAOP, "Could not send playback sync to device '%s': %s\n", rs->devname, strerror(errno));
   if (ret != pkt->data_len) {
     rs->coverage_failed = true;
-    raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_SYNC);
+    raop_ffi_attachment_failed(rs->stream_id, rs->device_id, RAOP_PROGRESS_SYNC);
     return -1;
   }
   return 0;

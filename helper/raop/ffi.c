@@ -165,6 +165,8 @@ struct raop_handle
   bool ready;                       /* loop-owned attachment readiness */
   bool quiescing;                   /* local release fences late callbacks */
   bool legacy_claim;                /* rt.lock; retained until proven free */
+  uint64_t session_revision;        /* loop-owned, never reuses retired session */
+  bool probe_only;
 
   /* Event ring for raop_poll. */
   char events[EVENT_RING][EVENT_LEN];
@@ -203,6 +205,16 @@ struct cancel_receipt {
   struct cancel_receipt *next;
 };
 
+#define COMPLETION_CAP 256
+struct completion_receipt {
+  struct raop_completion_result result;
+  struct raop_completion_attachment *attachment;
+  struct completion_receipt *next;
+};
+static void completion_update_locked(struct raop_stream *);
+static void completion_withdraw_locked(raop_t *);
+static void completion_settle_locked(struct raop_stream *, uint64_t, uint64_t, uint64_t);
+
 static void
 cancel_receipt_free(struct cancel_receipt *c)
 {
@@ -221,12 +233,16 @@ struct raop_stream
   unsigned attachments;             /* rt.lock; includes retiring handles */
   unsigned readers;                 /* rt.lock; loop-dispatched progress reads */
   bool closing;                     /* rt.lock; admission fence */
+  bool input_closed;                /* rt.lock; typed close precedes join/free */
   bool active;                      /* rt.lock; guard retained until free */
   bool item_set;                    /* loop-owned first attachment item */
   bool resetting;                   /* rt.lock; local reset admission fence */
   bool canceling;                   /* rt.lock; ordered receiver reset */
   struct event *cancel_event;
   struct cancel_receipt *cancels;
+  struct completion_receipt *completions; /* rt.lock; retained across epochs */
+  size_t completion_count;
+  bool marker_reserved;             /* current unsealed source's receipt slot */
   struct raop_stream *next;
 };
 
@@ -263,7 +279,7 @@ static int
 stream_claim_locked(struct raop_stream *stream, raop_t *legacy)
 {
   uint64_t id = stream ? stream->id : 1;
-  if (stream && stream->closing) return -1;
+  if (stream && (stream->closing || stream->input_closed)) return -1;
   if (rt.active_stream_id && rt.active_stream_id != id) return -2;
   rt.active_stream_id = id;
   if (stream) stream->active = true;
@@ -332,6 +348,10 @@ raop_ffi_on_state(uint64_t device_id, enum output_device_state state)
   for (h = rt.handles_list; h; h = h->next)
     if (h->id == device_id)
       {
+        if (h->stream && (state == OUTPUT_STATE_FAILED || state == OUTPUT_STATE_PASSWORD)) {
+          completion_update_locked(h->stream);
+          completion_settle_locked(h->stream, h->id, 3, RAOP_PROGRESS_TRANSPORT);
+        }
         h->state = state;
         /* OwnTone arms the playback timer when the device reports
          * CONNECTED and disarms it on teardown/failure — no PCM leaves
@@ -485,9 +505,16 @@ device_start(raop_t *h, cmd *c)
   struct raop_extra_mirror *re;
   char *address;
 
+  if (h->session_revision == UINT64_MAX) {
+    if (h->stream) raop_ffi_attachment_failed(h->stream->id, h->id, RAOP_PROGRESS_TRANSPORT);
+    event_push(h, "failed");
+    return -1;
+  }
+
   address = resolve_address(c->host);
   if (!address)
     {
+      if (h->stream) raop_ffi_attachment_failed(h->stream->id, h->id, RAOP_PROGRESS_TRANSPORT);
       event_push(h, "failed");
       return -1;
     }
@@ -496,6 +523,7 @@ device_start(raop_t *h, cmd *c)
   re = calloc(1, sizeof(*re));
   if (!dev || !re)
     {
+      if (h->stream) raop_ffi_attachment_failed(h->stream->id, h->id, RAOP_PROGRESS_ALLOCATION);
       free(dev);
       free(re);
       free(address);
@@ -544,7 +572,11 @@ device_start(raop_t *h, cmd *c)
     }
 
   h->device = dev;
+  pthread_mutex_lock(&rt.lock);
+  if (c->probe) completion_withdraw_locked(h);
+  h->probe_only = c->probe;
   h->quiescing = false;
+  pthread_mutex_unlock(&rt.lock);
   h->state = OUTPUT_STATE_STARTUP;
   event_push(h, "starting");
 
@@ -564,6 +596,7 @@ device_start(raop_t *h, cmd *c)
 
   if ((c->probe ? output_raop.device_probe(dev, 0) : output_raop.device_start(dev, 0)) < 0)
     {
+      if (h->stream) raop_ffi_attachment_failed(h->stream->id, h->id, RAOP_PROGRESS_TRANSPORT);
       device_free(h);
       h->state = OUTPUT_STATE_FAILED;
       event_push(h, "failed");
@@ -645,6 +678,7 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
       if (!released && (c->type == CMD_TEARDOWN || c->type == CMD_FREE ||
                         (c->type == CMD_START && h->device))) {
         pthread_mutex_lock(&rt.lock);
+        completion_withdraw_locked(h);
         h->quiescing = true;
         h->ready = false;
         stream_readiness_locked(h);
@@ -677,6 +711,9 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             break;
 
           case CMD_FLUSH:
+            pthread_mutex_lock(&rt.lock);
+            completion_withdraw_locked(h);
+            pthread_mutex_unlock(&rt.lock);
             if (!h->stream) raop_player_flush(h->player);
             if (h->device && h->device->session)
               output_raop.device_flush(h->device, 0);
@@ -925,6 +962,7 @@ handle_new(struct raop_stream *stream)
   pthread_mutex_init(&h->cmds_lock, NULL);
   pthread_mutex_init(&h->credential_lock, NULL);
   h->state = OUTPUT_STATE_STOPPED;
+  h->session_revision = 1;
 
   if (runtime_acquire() < 0)
     {
@@ -1023,7 +1061,7 @@ raop_stream_attach(raop_stream_t *stream)
 {
   if (!stream) return NULL;
   pthread_mutex_lock(&rt.lock);
-  if (stream->closing || stream->attachments == UINT_MAX) {
+  if (stream->closing || stream->input_closed || stream->attachments == UINT_MAX) {
     pthread_mutex_unlock(&rt.lock); return NULL;
   }
   stream->attachments++;
@@ -1070,7 +1108,7 @@ raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
   };
   if (!stream || !epoch || !segment || (!pcm && len) || len % 4) return 0;
   pthread_mutex_lock(&rt.lock);
-  if (stream->closing) result->error = RAOP_APPEND_ERROR_CLOSING;
+  if (stream->closing || stream->input_closed) result->error = RAOP_APPEND_ERROR_CLOSING;
   else if (epoch != stream->epoch) {
     result->status = RAOP_APPEND_CANCELED;
     result->error = RAOP_APPEND_ERROR_NONE;
@@ -1105,6 +1143,147 @@ _Static_assert(sizeof(struct raop_marker_result) == 48, "marker ABI");
 _Static_assert(sizeof(struct raop_source_snapshot) == 56, "source snapshot ABI");
 _Static_assert(sizeof(struct raop_range_snapshot) == 64, "range snapshot ABI");
 _Static_assert(sizeof(struct raop_progress_snapshot) == 120, "progress snapshot ABI");
+_Static_assert(sizeof(struct raop_completion_result) == 96, "completion ABI");
+_Static_assert(sizeof(struct raop_completion_attachment) == 64, "completion attachment ABI");
+
+static uint64_t
+completion_now(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static struct completion_receipt *
+completion_find(raop_stream_t *s, uint64_t epoch, uint64_t source, uint64_t revision)
+{
+  for (struct completion_receipt *c = s->completions; c; c = c->next)
+    if (c->result.epoch == epoch && c->result.source == source &&
+        c->result.revision == revision) return c;
+  return NULL;
+}
+
+/* Only loop-thread observations resolve successful boundaries. Pending reads
+ * may coalesce; terminal values never change, even when a newer epoch starts. */
+static void
+completion_update_locked(raop_stream_t *s)
+{
+  for (struct completion_receipt *c = s->completions; c; c = c->next) {
+    if (c->result.status || c->result.epoch != s->epoch || s->resetting) continue;
+    bool complete = c->result.required > 0 && c->result.target > 0;
+    for (size_t i = 0; i < c->result.attachments; i++) {
+      struct raop_completion_attachment *a = &c->attachment[i];
+      if (a->excluded) continue;
+      if (!a->outcome) {
+        struct raop_progress_snapshot p;
+        uint64_t end = 0;
+        int fed = raop_player_completion_progress(s->player, c->result.source,
+          a->attachment, &p, &end);
+        a->coverage_start = p.coverage_start;
+        a->submitted_frames = p.submitted_frames;
+        a->scheduled_frames = p.scheduled_frames;
+        if (fed) c->result.transport_end = end;
+        if (fed && p.participants && p.status == 1 &&
+            p.source_frames == c->result.target && p.scheduled_frames >= end &&
+            p.submitted_frames >= end) a->outcome = 1;
+        else if (fed && p.participants && p.status == 1 &&
+                 p.scheduled_frames >= end && p.source_frames < c->result.target) {
+          /* A late join's suffix can never become full-source coverage, even
+           * after its clock passes the end. Resolve the impossible barrier. */
+          a->outcome = 3; a->error = RAOP_PROGRESS_TRANSPORT;
+        }
+      }
+      if (a->outcome != 1) complete = false;
+      if (a->outcome == 2 || a->outcome == 3) {
+        c->result.status = 3; c->result.error = a->error;
+        c->result.captured_ns = completion_now();
+      }
+    }
+    if (complete) {
+      c->result.status = 1;
+      c->result.captured_ns = completion_now();
+    }
+  }
+}
+
+void
+raop_ffi_completion_update(uint64_t stream_id)
+{
+  pthread_mutex_lock(&rt.lock);
+  for (raop_stream_t *s = rt.streams; s; s = s->next) if (s->id == stream_id) {
+    completion_update_locked(s);
+    bool pending = false;
+    for (struct completion_receipt *c = s->completions; c; c = c->next)
+      if (c->result.epoch == s->epoch && !c->result.status) pending = true;
+    /* Completion is not receiver release. Stop only the ended stream's pacer,
+     * after real playout; natural A/B seals keep their one clock running. */
+    if (!pending && raop_player_ended(s->player)) raop_player_drain_complete(s->player);
+    break;
+  }
+  pthread_mutex_unlock(&rt.lock);
+}
+
+static void
+completion_settle_locked(raop_stream_t *s, uint64_t attachment, uint64_t outcome, uint64_t error)
+{
+  for (struct completion_receipt *c = s->completions; c; c = c->next) {
+    if (c->result.status || c->result.epoch != s->epoch) continue;
+    bool affected = false;
+    for (size_t i = 0; i < c->result.attachments; i++) {
+      struct raop_completion_attachment *a = &c->attachment[i];
+      if (a->excluded || (attachment && a->attachment != attachment)) continue;
+      /* A per-attachment completion already observed at its boundary survives
+       * that peer's later loss while another peer is still draining. */
+      if (a->outcome == 1) continue;
+      a->outcome = outcome; a->error = error; affected = true;
+    }
+    if (affected) {
+      c->result.status = outcome == 4 ? 2 : 3;
+      c->result.error = error;
+      c->result.captured_ns = completion_now();
+    }
+  }
+}
+
+static void
+completion_withdraw_locked(raop_t *h)
+{
+  if (!h->stream) return;
+  completion_update_locked(h->stream);
+  completion_settle_locked(h->stream, h->id, 2, RAOP_PROGRESS_TRANSPORT);
+  if (h->session_revision < UINT64_MAX) h->session_revision++;
+}
+
+static struct completion_receipt *
+completion_prepare_locked(raop_stream_t *s, uint64_t epoch, uint64_t source,
+  uint64_t target, struct raop_marker_result *result)
+{
+  if (s->completion_count == COMPLETION_CAP) {
+    result->status = RAOP_APPEND_BACKPRESSURE; result->error = RAOP_APPEND_ERROR_NONE;
+    return NULL;
+  }
+  size_t count = 0;
+  /* Both passes use only rt.lock-owned membership facts. free_requested belongs
+   * to cmds_lock and may change between sizing and copying; a queued FREE is
+   * instead observed by the loop as an explicit captured-session withdrawal. */
+  for (raop_t *h = rt.handles_list; h; h = h->next)
+    if (h->stream == s && !h->quiescing && !h->probe_only) count++;
+  struct completion_receipt *c = calloc(1, sizeof(*c));
+  if (c) c->attachment = calloc(count ? count : 1, sizeof(*c->attachment));
+  if (!c || !c->attachment) {
+    if (c) free(c);
+    result->error = RAOP_APPEND_ERROR_ALLOCATION;
+    return NULL;
+  }
+  c->result = (struct raop_completion_result){ .stream = s->id, .epoch = epoch,
+    .source = source, .target = target, .revision = 1, .attachments = count, .required = count };
+  size_t i = 0;
+  for (raop_t *h = rt.handles_list; h; h = h->next)
+    if (h->stream == s && !h->quiescing && !h->probe_only)
+      c->attachment[i++] = (struct raop_completion_attachment){
+        .attachment = h->id, .session = h->session_revision };
+  return c;
+}
 
 /* rt.lock is the admission linearization point for PCM, seals, end and cancel.
  * The pacer owns dispatch, under its inner lock, and never calls the backend
@@ -1112,7 +1291,7 @@ _Static_assert(sizeof(struct raop_progress_snapshot) == 120, "progress snapshot 
 static bool
 timeline_admit_locked(raop_stream_t *stream, uint64_t epoch, uint64_t *status, uint64_t *error)
 {
-  if (stream->closing) *error = RAOP_APPEND_ERROR_CLOSING;
+  if (stream->closing || stream->input_closed) *error = RAOP_APPEND_ERROR_CLOSING;
   else if (epoch != stream->epoch) {
     *status = RAOP_APPEND_CANCELED; *error = RAOP_APPEND_ERROR_NONE;
   } else if (stream->resetting) {
@@ -1135,7 +1314,16 @@ raop_stream_append_source(raop_stream_t *stream, uint64_t epoch, uint64_t source
     if (rt.active_stream_id && rt.active_stream_id != stream->id)
       result->error = RAOP_APPEND_ERROR_BUSY;
     else {
-      raop_player_append_source(stream->player, source, segment, pcm, len, result);
+      struct raop_source_snapshot existing;
+      bool found = raop_player_source(stream->player, source, &existing);
+      if (!found && stream->completion_count == COMPLETION_CAP) {
+        result->status = RAOP_APPEND_BACKPRESSURE; result->error = RAOP_APPEND_ERROR_NONE;
+      } else {
+        raop_player_append_source(stream->player, source, segment, pcm, len, result);
+        if (!found && result->status == RAOP_APPEND_ACCEPTED)
+          stream->marker_reserved = true;
+        if (!found && result->accepted_frames) stream->marker_reserved = true;
+      }
       if (result->accepted_frames) stream_claim_locked(stream, NULL);
     }
   }
@@ -1154,7 +1342,34 @@ stream_marker(raop_stream_t *stream, uint64_t epoch, uint64_t source, uint64_t t
   pthread_mutex_lock(&rt.lock);
   if (timeline_admit_locked(stream, epoch, &result->status, &result->error)) {
     if (end) raop_player_end(stream->player, target, result);
-    else raop_player_seal(stream->player, source, target, result);
+    else {
+      struct completion_receipt *old = stream->completions;
+      while (old && (old->result.epoch != epoch || old->result.source != source)) old = old->next;
+      if (old) raop_player_seal(stream->player, source, target, result);
+      else {
+        struct completion_receipt *c = completion_prepare_locked(stream, epoch, source, target, result);
+        if (c) {
+          raop_player_seal(stream->player, source, target, result);
+          if (result->status == RAOP_APPEND_ACCEPTED) {
+            c->result.input_end = result->input_end;
+            struct raop_progress_snapshot failure;
+            raop_player_failure(stream->player, &failure);
+            if (!c->result.required || !target || failure.error) {
+              c->result.status = 3;
+              c->result.error = failure.error ? failure.error : RAOP_PROGRESS_TRANSPORT;
+              c->result.captured_ns = completion_now();
+              for (size_t i = 0; i < c->result.attachments; i++) {
+                c->attachment[i].outcome = 3;
+                c->attachment[i].error = c->result.error;
+              }
+            }
+            c->next = stream->completions; stream->completions = c;
+            stream->completion_count++;
+            stream->marker_reserved = false;
+          } else { free(c->attachment); free(c); }
+        }
+      }
+    }
   }
   pthread_mutex_unlock(&rt.lock);
   return 0;
@@ -1204,6 +1419,8 @@ struct progress_work {
   raop_stream_t *stream;
   uint64_t epoch, source, attachment;
   struct raop_progress_snapshot *result;
+  struct raop_completion_result *completion;
+  uint64_t revision;
   free_sync sync;
   int found;
 };
@@ -1215,7 +1432,11 @@ stream_progress_cb(evutil_socket_t fd, short what, void *arg)
   struct progress_work *work = arg;
   pthread_mutex_lock(&rt.lock);
   raop_stream_t *s = work->stream;
-  if (!s->closing && !s->resetting && s->epoch == work->epoch) {
+  if (work->completion && !s->closing) {
+    completion_update_locked(s);
+    struct completion_receipt *c = completion_find(s, work->epoch, work->source, work->revision);
+    if (c) { *work->completion = c->result; work->found = 1; }
+  } else if (!s->closing && !s->resetting && s->epoch == work->epoch) {
     work->found = raop_player_progress(s->player, work->source, work->attachment, work->result);
     work->result->epoch = work->epoch;
   }
@@ -1252,6 +1473,121 @@ raop_stream_progress(raop_stream_t *stream, uint64_t epoch, uint64_t source,
   return rc < 0 ? -1 : work.found;
 }
 
+int
+raop_stream_completion_poll(raop_stream_t *s, uint64_t epoch, uint64_t source,
+  uint64_t revision, struct raop_completion_result *result)
+{
+  if (!s || !epoch || !source || !revision || !result) return -1;
+  struct progress_work work = { .stream = s, .epoch = epoch, .source = source,
+    .revision = revision, .completion = result,
+    .sync = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER } };
+  struct timeval zero = { 0, 0 };
+  pthread_mutex_lock(&work.sync.lock);
+  pthread_mutex_lock(&rt.lock);
+  int rc = -1;
+  if (!s->closing) {
+    s->readers++;
+    rc = event_base_once(rt.base, -1, EV_TIMEOUT, stream_progress_cb, &work, &zero);
+    if (rc < 0) s->readers--;
+  }
+  pthread_mutex_unlock(&rt.lock);
+  if (!rc) while (!work.sync.done) pthread_cond_wait(&work.sync.cond, &work.sync.lock);
+  pthread_mutex_unlock(&work.sync.lock);
+  pthread_cond_destroy(&work.sync.cond); pthread_mutex_destroy(&work.sync.lock);
+  return rc < 0 ? -1 : work.found;
+}
+
+int
+raop_stream_completion_attachment(raop_stream_t *s, uint64_t epoch, uint64_t source,
+  uint64_t revision, uint64_t index, struct raop_completion_attachment *result)
+{
+  if (!s || !result) return -1;
+  pthread_mutex_lock(&rt.lock);
+  struct completion_receipt *c = completion_find(s, epoch, source, revision);
+  int found = c && index < c->result.attachments;
+  if (found) *result = c->attachment[index];
+  pthread_mutex_unlock(&rt.lock);
+  return found;
+}
+
+int
+raop_stream_completion_revise(raop_stream_t *s, uint64_t epoch, uint64_t source,
+  uint64_t target, uint64_t revision, const uint64_t *exclude, size_t count)
+{
+  if (!s || !count || !exclude || revision == UINT64_MAX) return -1;
+  int rc = -1;
+  pthread_mutex_lock(&rt.lock);
+  struct completion_receipt *old = completion_find(s, epoch, source, revision);
+  if (s->closing || s->input_closed || s->resetting || s->epoch != epoch || !old ||
+      old->result.target != target || old->result.status != 3 ||
+      s->completion_count + s->marker_reserved == COMPLETION_CAP ||
+      completion_find(s, epoch, source, revision + 1)) goto out;
+  for (size_t i = 0; i < count; i++) {
+    bool found = false;
+    for (size_t j = 0; j < old->result.attachments; j++) {
+      struct raop_completion_attachment *a = &old->attachment[j];
+      if (a->attachment == exclude[i] && !a->excluded &&
+          (a->outcome == 2 || a->outcome == 3)) found = true;
+    }
+    for (size_t j = 0; j < i; j++) if (exclude[j] == exclude[i]) found = false;
+    if (!found) goto out;
+  }
+  struct completion_receipt *c = calloc(1, sizeof(*c));
+  if (!c) goto out;
+  c->attachment = malloc(old->result.attachments * sizeof(*c->attachment));
+  if (!c->attachment) { free(c); goto out; }
+  memcpy(c->attachment, old->attachment, old->result.attachments * sizeof(*c->attachment));
+  c->result = old->result; c->result.revision++; c->result.status = c->result.error = 0;
+  c->result.captured_ns = 0;
+  struct raop_progress_snapshot epoch_progress;
+  /* Stored epoch failures are safe to read here under pcm_lock. Its presence
+   * means the pacer cannot supply a missing suffix; only already submitted
+   * healthy full-source coverage may still reach its presentation boundary. */
+  raop_player_failure(s->player, &epoch_progress);
+  for (size_t i = 0; i < c->result.attachments; i++) {
+    struct raop_completion_attachment *a = &c->attachment[i];
+    for (size_t j = 0; j < count; j++) if (a->attachment == exclude[j]) {
+      a->excluded = 1; c->result.required--;
+    }
+    if (!a->excluded && !a->outcome && epoch_progress.error &&
+        (!c->result.transport_end || a->submitted_frames < c->result.transport_end)) {
+      a->outcome = 3; a->error = epoch_progress.error;
+    }
+    if (!a->excluded && (a->outcome == 2 || a->outcome == 3)) {
+      c->result.status = 3; c->result.error = a->error;
+    }
+  }
+  if (!c->result.required) { c->result.status = 3; c->result.error = RAOP_PROGRESS_TRANSPORT; }
+  if (c->result.status) c->result.captured_ns = completion_now();
+  c->next = s->completions; s->completions = c; s->completion_count++;
+  rc = 0;
+out:
+  pthread_mutex_unlock(&rt.lock);
+  return rc;
+}
+
+int
+raop_stream_completion_ack(raop_stream_t *s, uint64_t epoch, uint64_t source,
+  uint64_t target, uint64_t revision)
+{
+  if (!s) return -1;
+  int rc = -1;
+  pthread_mutex_lock(&rt.lock);
+  for (struct completion_receipt **slot = &s->completions; *slot; slot = &(*slot)->next) {
+    struct completion_receipt *c = *slot;
+    if (c->result.epoch != epoch || c->result.source != source || c->result.revision != revision) continue;
+    if (c->result.target != target || !c->result.status) break;
+    *slot = c->next; free(c->attachment); free(c); s->completion_count--;
+    bool retained = false;
+    for (c = s->completions; c; c = c->next)
+      if (c->result.epoch == epoch && c->result.source == source) retained = true;
+    if (!retained && epoch == s->epoch) raop_player_ack_source(s->player, source);
+    rc = 0; break;
+  }
+  pthread_mutex_unlock(&rt.lock);
+  return rc;
+}
+
 /* Loop thread only, before a failing session is retired. Failure is an epoch
  * fact retained by the stream, not a lossy device state-ring notification. */
 void
@@ -1260,6 +1596,22 @@ raop_ffi_progress_failed(uint64_t stream_id, uint64_t error)
   pthread_mutex_lock(&rt.lock);
   for (struct raop_stream *s = rt.streams; s; s = s->next)
     if (s->id == stream_id && !s->canceling && !s->closing) {
+      completion_update_locked(s);
+      completion_settle_locked(s, 0, 3, error);
+      raop_player_failed(s->player, error);
+      break;
+    }
+  pthread_mutex_unlock(&rt.lock);
+}
+
+void
+raop_ffi_attachment_failed(uint64_t stream_id, uint64_t attachment, uint64_t error)
+{
+  pthread_mutex_lock(&rt.lock);
+  for (raop_stream_t *s = rt.streams; s; s = s->next)
+    if (s->id == stream_id && !s->canceling && !s->closing) {
+      completion_update_locked(s);
+      completion_settle_locked(s, attachment, 3, error);
       raop_player_failed(s->player, error);
       break;
     }
@@ -1272,7 +1624,7 @@ raop_ffi_stream_fenced(uint64_t stream_id)
   int fenced = 0;
   pthread_mutex_lock(&rt.lock);
   for (struct raop_stream *s = rt.streams; s; s = s->next)
-    if (s->id == stream_id) { fenced = s->canceling || s->closing; break; }
+    if (s->id == stream_id) { fenced = s->canceling || s->closing || s->input_closed; break; }
   pthread_mutex_unlock(&rt.lock);
   return fenced;
 }
@@ -1341,7 +1693,7 @@ stream_cancel_cb(evutil_socket_t fd, short what, void *arg)
   bool failed = false;
   for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
     if (c->result.status == 3) failed = true;
-  if (all_applied && !failed && stream->canceling && !stream->closing) {
+  if (all_applied && !failed && stream->canceling && !stream->closing && !stream->input_closed) {
     for (struct cancel_receipt *c = stream->cancels; c; c = c->next)
       if (!c->result.status) c->result.status = 1;
     stream->canceling = stream->resetting = false;
@@ -1385,7 +1737,7 @@ raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
     }
   }
   pthread_mutex_lock(&rt.lock);
-  if (stream->closing || epoch != stream->epoch || epoch == UINT64_MAX ||
+  if (stream->closing || stream->input_closed || epoch != stream->epoch || epoch == UINT64_MAX ||
       (stream->resetting && !stream->canceling)) {
     pthread_mutex_unlock(&rt.lock); cancel_receipt_free(receipt); return -1;
   }
@@ -1408,7 +1760,9 @@ raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
   for (; *tail; tail = &(*tail)->next)
     if (!(*tail)->result.status) (*tail)->result.status = 2;
   *tail = receipt;
+  completion_settle_locked(stream, 0, 4, RAOP_PROGRESS_OK);
   stream->epoch++;
+  stream->marker_reserved = false;
   stream->resetting = stream->canceling = true;
   raop_player_fence(stream->player, true);
   event_active(stream->cancel_event, EV_TIMEOUT, 1);
@@ -1453,6 +1807,18 @@ raop_stream_cancel_ack(raop_stream_t *stream, uint64_t epoch)
 
 struct stream_free_work { struct raop_stream *stream; free_sync *sync; };
 
+int
+raop_stream_close_input(raop_stream_t *stream)
+{
+  if (!stream) return -1;
+  pthread_mutex_lock(&rt.lock);
+  stream->input_closed = true;
+  raop_player_fence(stream->player, true);
+  completion_settle_locked(stream, 0, 4, RAOP_PROGRESS_OK);
+  pthread_mutex_unlock(&rt.lock);
+  return 0;
+}
+
 static void
 stream_reset_cb(evutil_socket_t fd, short what, void *arg)
 {
@@ -1484,6 +1850,9 @@ raop_stream_reset(raop_stream_t *stream)
   pthread_mutex_lock(&rt.lock);
   /* The legacy local reset has no epoch advance or retained outcome. It cannot
    * erase timeline identities/targets within an epoch: use ordered cancel. */
+  /* Cleanup already admitted by the typed owner may reach this port after
+   * close_input fences producers. input_closed is permanent, so this reset
+   * cannot reopen admission; C1 still joins it before the eventual free. */
   bool unavailable = stream->closing || stream->resetting ||
     raop_player_timeline_active(stream->player);
   if (!unavailable) stream->resetting = true;
@@ -1513,6 +1882,9 @@ stream_free_cb(evutil_socket_t fd, short what, void *arg)
   struct raop_stream *stream = work->stream;
   (void)fd; (void)what;
   raop_player_session_stopped(stream->player);
+  pthread_mutex_lock(&rt.lock);
+  completion_settle_locked(stream, 0, 4, RAOP_PROGRESS_OK);
+  pthread_mutex_unlock(&rt.lock);
   raop_player_free(stream->player);
   event_free(stream->cancel_event);
   pthread_mutex_lock(&rt.lock);
@@ -1523,6 +1895,11 @@ stream_free_cb(evutil_socket_t fd, short what, void *arg)
     struct cancel_receipt *c = stream->cancels;
     stream->cancels = c->next;
     cancel_receipt_free(c);
+  }
+  while (stream->completions) {
+    struct completion_receipt *c = stream->completions;
+    stream->completions = c->next;
+    free(c->attachment); free(c);
   }
   if (stream->active) rt.active_stream_id = 0;
   pthread_mutex_unlock(&rt.lock);

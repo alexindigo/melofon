@@ -82,7 +82,7 @@ struct raop_metadata_mirror
 /* Bounded retained marker storage, independent of the PCM byte cap. Input runs
  * reserve their dispatch record plus the possible following silence records, so
  * the loop never needs an allocation or drops a range after accepting bytes.
- * b04c adds terminal acknowledgement/reclamation; reset/free reclaim today. */
+ * Terminal acknowledgement reclaims source/input/range observations. */
 #define TIMELINE_MARKERS 256
 #define TRANSPORT_RANGES (3 * TIMELINE_MARKERS + 3)
 struct source_record {
@@ -93,12 +93,13 @@ struct input_range {
   uint64_t source, segment, source_offset, frames, fed;
 };
 struct timeline {
-  bool enabled, ended, tail_reached;
+  bool enabled, ended, tail_reached, complete;
   uint64_t accepted, end_target, padding_left;
   size_t sources, inputs, next_input, ranges;
   struct source_record source[TIMELINE_MARKERS];
   struct input_range input[TIMELINE_MARKERS];
   struct raop_range_snapshot range[TRANSPORT_RANGES];
+  uint64_t range_owner[TRANSPORT_RANGES], last_source;
 };
 
 struct raop_player
@@ -356,12 +357,14 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           if (!r || r->kind != RAOP_RANGE_REAL || r->source != in->source ||
               r->segment != in->segment || r->transport_start + r->frames != transport ||
               r->source_offset + r->frames != in->source_offset + in->fed) {
+            t->range_owner[t->ranges] = in->source;
             r = &t->range[t->ranges++];
             *r = (struct raop_range_snapshot){ .kind = RAOP_RANGE_REAL,
               .source = in->source, .segment = in->segment,
               .source_offset = in->source_offset + in->fed, .transport_start = transport };
           }
           r->frames += take;
+          t->last_source = in->source;
           for (size_t i = 0; i < t->sources; i++)
             if (t->source[i].id == in->source) { t->source[i].fed += take; break; }
           in->fed += take;
@@ -383,7 +386,8 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           uint64_t kind = pass ? (t->ended ? RAOP_RANGE_DRAIN : RAOP_RANGE_UNDERRUN)
                                : RAOP_RANGE_PADDING;
           struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1] : NULL;
-          if (!r || r->kind != kind) {
+          if (!r || r->kind != kind || r->transport_start + r->frames != transport) {
+            t->range_owner[t->ranges] = t->last_source;
             r = &t->range[t->ranges++];
             *r = (struct raop_range_snapshot){ .kind = kind, .transport_start = transport };
           }
@@ -431,6 +435,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
     }
 
   player_debug(p);
+  raop_ffi_completion_update(p->stream_id);
 }
 
 struct raop_player *
@@ -743,6 +748,94 @@ raop_player_progress(struct raop_player *p, uint64_t source, uint64_t attachment
   return 1;
 }
 
+void
+raop_player_failure(struct raop_player *p, struct raop_progress_snapshot *result)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  *result = p->failure;
+  pthread_mutex_unlock(&p->pcm_lock);
+}
+
+/* A captured barrier observes each attachment separately, not the mutable live
+ * group or the frozen epoch-wide diagnostic failure. Shared failures settle
+ * every attachment at their producer; exclusions cannot hide such a failure. */
+int
+raop_player_completion_progress(struct raop_player *p, uint64_t source,
+  uint64_t attachment, struct raop_progress_snapshot *result, uint64_t *transport_end)
+{
+  int sealed = 0;
+  pthread_mutex_lock(&p->pcm_lock);
+  raop_transport_progress(p->stream_id, attachment, monotonic_ns(), result);
+  struct timeline *t = p->timeline;
+  if (t) {
+    for (size_t i = 0; i < t->sources; i++)
+      if (t->source[i].id == source)
+        sealed = t->source[i].sealed && t->source[i].fed == t->source[i].target;
+    for (size_t i = 0; i < t->ranges; i++) {
+      const struct raop_range_snapshot *r = &t->range[i];
+      if (r->kind != RAOP_RANGE_REAL || r->source != source) continue;
+      *transport_end = r->transport_start + r->frames;
+      uint64_t start = r->transport_start > result->coverage_start
+        ? r->transport_start : result->coverage_start;
+      uint64_t end = r->transport_start + r->frames;
+      if (end > result->scheduled_frames) end = result->scheduled_frames;
+      if (end > start) result->source_frames += end - start;
+    }
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+  return sealed;
+}
+
+int
+raop_player_ended(struct raop_player *p)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  int ended = p->timeline && p->timeline->ended;
+  pthread_mutex_unlock(&p->pcm_lock);
+  return ended;
+}
+
+/* Ack ends source/range observation lifetime. Compact all three bounded ledgers
+ * together, including already dispatched inputs. Never erase a queued suffix.
+ * Remaining transport/source offsets stay absolute, not rebased after reclaim. */
+void
+raop_player_ack_source(struct raop_player *p, uint64_t source)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  struct timeline *t = p->timeline;
+  if (t) {
+    for (size_t i = 0; i < t->sources; i++)
+      if (t->source[i].id == source && t->source[i].fed != t->source[i].accepted) {
+        pthread_mutex_unlock(&p->pcm_lock);
+        return; /* failed queued input still owns PCM until ordered cancel */
+      }
+    size_t n = 0, next = 0;
+    for (size_t i = 0; i < t->inputs; i++) {
+      if (t->input[i].source == source) continue;
+      if (i < t->next_input) next++;
+      t->input[n++] = t->input[i];
+    }
+    t->inputs = n; t->next_input = next;
+    n = 0;
+    for (size_t i = 0; i < t->ranges; i++) {
+      uint64_t owner = t->range_owner[i];
+      bool retained = false;
+      for (size_t j = 0; j < t->sources; j++)
+        if (t->source[j].id == owner && owner != source) retained = true;
+      if (retained) {
+        t->range_owner[n] = owner;
+        t->range[n++] = t->range[i];
+      }
+    }
+    t->ranges = n;
+    n = 0;
+    for (size_t i = 0; i < t->sources; i++)
+      if (t->source[i].id != source) t->source[n++] = t->source[i];
+    t->sources = n;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+}
+
 /* Loop thread: drop buffered PCM (pause/seek/track-change semantics; the
  * stream clock continues — resume re-feeds from the engine position). */
 void
@@ -778,6 +871,10 @@ raop_player_session_started(struct raop_player *p)
 {
   struct itimerspec tick;
 
+  pthread_mutex_lock(&p->pcm_lock);
+  bool complete = p->timeline && p->timeline->complete;
+  pthread_mutex_unlock(&p->pcm_lock);
+  if (complete) return;
   if (p->streaming)
     return;
   p->fed_in_epoch = false;
@@ -815,6 +912,15 @@ raop_player_session_stopped(struct raop_player *p)
   memset(&zero, 0, sizeof(zero));
   timerfd_settime(p->timer_fd, 0, &zero, NULL);
   event_del(p->timer_ev);
+}
+
+void
+raop_player_drain_complete(struct raop_player *p)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  if (p->timeline) p->timeline->complete = true;
+  pthread_mutex_unlock(&p->pcm_lock);
+  raop_player_session_stopped(p);
 }
 
 /* Loop thread: the start command's item (title/artist/len) and the TXT

@@ -62,8 +62,8 @@ int raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
  * retries of the same marker are idempotent. Seal never pads/ends a stream.
  * Once timeline input starts, unlabelled write/append and the legacy local reset
  * are refused; only ordered cancel can open a fresh accounted epoch.
- * Fixed marker storage applies backpressure, never drops a range. This stage
- * retains records until cancel/free; completion/ack is a separate contract.
+ * Fixed marker storage applies backpressure, never drops a range. Completion
+ * acknowledgement retires source/range observations and reclaims their storage.
  * Status/error use raop_append_status/error. All fields u64, native byte order.
  */
 int raop_stream_append_source(raop_stream_t *, uint64_t epoch, uint64_t source,
@@ -74,7 +74,9 @@ int raop_stream_seal(raop_stream_t *, uint64_t epoch, uint64_t source,
 int raop_stream_end(raop_stream_t *, uint64_t epoch, uint64_t target,
                     struct raop_marker_result *);
 /* Coherent pacer facts only, NOT scheduled/successful submission/completion.
- * source/range: 1 found, 0 absent/stale, -1 invalid. index starts at 0. Silence
+ * source/range: 1 found, 0 absent/stale, -1 invalid. index starts at 0 and is a
+ * view index, not an incarnation; ack compacts it. After ack, historical source
+ * and range projections are unavailable. Transport offsets remain absolute. Silence
  * has source/segment/offset zero and never advances source fed_frames. */
 int raop_stream_source(raop_stream_t *, uint64_t epoch, uint64_t source,
                        struct raop_source_snapshot *);
@@ -84,7 +86,32 @@ int raop_stream_range(raop_stream_t *, uint64_t epoch, uint64_t index,
  * the current epoch, 0 if canceled/reset, -1 on scheduling/closing failure.
  * Source=0 reports transport only; attachment=0 uses all required live peers. */
 int raop_stream_progress(raop_stream_t *, uint64_t epoch, uint64_t source,
-                         uint64_t attachment, struct raop_progress_snapshot *);
+                          uint64_t attachment, struct raop_progress_snapshot *);
+/* Seal captures attached incarnations, including not-yet-started attachments.
+ * Late joins are not added to old barriers. Poll/attachment reads retain the
+ * exact terminal value until ack, across cancellation. revision starts at 1.
+ * poll: 1 found (possibly pending), 0 absent, -1 invalid/closing/schedule error.
+ * attachment: 1 found, 0 absent. Read indices 0..attachments-1.
+ * revise explicitly excludes withdrawn/failed peers from a failed barrier,
+ * returning a NEW revision; the old result remains immutable and retained.
+ * No required participants, empty sources, or incomplete suffixes can succeed.
+ * ack must match epoch/source/target/revision and refuses pending results.
+ * Ack all revisions only after their core outcomes/transitions are committed;
+ * the last ack retires that source's observations/ranges and marker storage.
+ * Source incarnations must not be reused after acknowledgement. Readers and
+ * close share the native reader reservation; explicit free ends all lifetimes. */
+int raop_stream_completion_poll(raop_stream_t *, uint64_t epoch, uint64_t source,
+  uint64_t revision, struct raop_completion_result *);
+int raop_stream_completion_attachment(raop_stream_t *, uint64_t epoch, uint64_t source,
+  uint64_t revision, uint64_t index, struct raop_completion_attachment *);
+int raop_stream_completion_revise(raop_stream_t *, uint64_t epoch, uint64_t source,
+  uint64_t target, uint64_t revision, const uint64_t *exclude, size_t count);
+int raop_stream_completion_ack(raop_stream_t *, uint64_t epoch, uint64_t source,
+  uint64_t target, uint64_t revision);
+/* Stop input admission and settle pending source results as canceled, retaining
+ * terminal reads until free. Join admitted readers before releasing attachments
+ * and stream storage. Idempotent; does not wait for drain or remote replies. */
+int raop_stream_close_input(raop_stream_t *);
 /* Cancel is admitted synchronously under the append lock. It advances epoch
  * before return; replacement append is not-ready until local reset and every
  * affected session's FLUSH ACK or destruction. No natural drain wait.

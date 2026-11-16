@@ -18,6 +18,14 @@ void raop_transport_progress(uint64_t stream_id, uint64_t attachment, uint64_t n
 int raop_player_progress(struct raop_player *, uint64_t source, uint64_t attachment,
                           struct raop_progress_snapshot *);
 void raop_player_failed(struct raop_player *, uint64_t error);
+void raop_player_failure(struct raop_player *, struct raop_progress_snapshot *);
+int raop_player_completion_progress(struct raop_player *, uint64_t source,
+  uint64_t attachment, struct raop_progress_snapshot *, uint64_t *transport_end);
+void raop_player_ack_source(struct raop_player *, uint64_t source);
+int raop_player_ended(struct raop_player *);
+void raop_player_drain_complete(struct raop_player *);
+void raop_ffi_completion_update(uint64_t stream_id);
+void raop_ffi_attachment_failed(uint64_t stream_id, uint64_t attachment, uint64_t error);
 void raop_ffi_progress_failed(uint64_t stream_id, uint64_t error);
 /* -1: cleanup could not start, retain ownership. 0: accepted. Callback after
  * all device-local sessions/sockets are destroyed, possibly inline. sent=0

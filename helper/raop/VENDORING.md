@@ -277,8 +277,8 @@ silence. Neither silence nor handshake time advances real-source counters.
 into vendor translation units. The pacer retains bounded source/input markers
 (256 each), reserving dispatch/silence storage before accepting bytes. Exhaustion
 returns zero/backpressure rather than dropping records or moving a seal. This
-initial port retains markers until cancel/free; terminal acknowledgement and
-ongoing reclamation belong to the completion layer. Polling source/range records
+port reclaims markers after terminal acknowledgement in the completion layer.
+Polling source/range records
 observes admission and pacer dispatch only, not successful submission, scheduled
 playout or completion. Timeline input refuses unlabelled writes in that epoch.
 The existing production boot still uses exact append/cancel, not this port.
@@ -312,6 +312,40 @@ reset and require ordered cancel; this adds neither FLUSH nor receiver reopen.
 `test/progress-faultinject.c` is compiled only by the timeline consumer tests.
 It controls dependency failures and actual timer expirations, exercises the
 existing backend offset field and forces wire counter wrap. None of its controls
-or symbols enters production. Scheduled progress is not retained source
-completion: captured cohorts, terminal outcomes, poll/ack and marker reclamation
-belong to that separate layer. The boot/core have not adopted this timeline port.
+or symbols enters production. Scheduled progress is not a retained source
+completion. The boot/core have not adopted this timeline port.
+
+## Retained source completion
+
+Seal reserves a retained receipt and captures the immutable stream/epoch/source,
+exclusive target, input end and attached incarnation/session cohort. A native-loop
+observation completes each required peer only after all real source frames were
+packetized, contiguously submitted and scheduled through their final exclusive
+boundary. Terminal values remain outside the lossy device ring until exact ack,
+including across cancel. Shared native failures fail pending contributors;
+device-specific loss retains that attachment's failure, not success. Empty sources
+and empty cohorts fail explicitly. Late joins cover suffixes only and cannot
+satisfy missing earlier source frames.
+
+Voluntary teardown/FLUSH retires that captured session as withdrawn. An explicit
+revision can exclude withdrawn/failed outcomes from the same immutable source
+target. It creates a new retained barrier and keeps exclusions visible; it never
+edits the original terminal receipt. With an epoch failure the pacer cannot supply
+a missing suffix: a revised healthy peer lacking full submission fails rather than
+waiting forever. Already submitted healthy coverage can still reach its actual
+presentation boundary. Broader source recovery remains the core's responsibility.
+
+The retained receipt bound is 256, including old epochs and revisions. Source
+admission reserves its seal slot; exhaustion applies backpressure without losing
+terminal values. The last exact ack of a source's revisions reclaims its dispatched
+source/input/range observations, including associated silence. Range indices are
+view indices and compact at ack; offsets remain epoch-absolute. Acknowledged source
+incarnations must not be reused. Source/progress range projections cover retained
+observations only after ack. Queued failed input is not reclaimed ahead of cancel.
+
+Only ended streams stop pacing after their final retained barrier settles; a
+natural source seal never ends the stream or releases its receivers. Typed poll,
+wait, revision and ack use the existing C1 operation owner. Close first fences
+native input and settles pending results as canceled, then joins all readers and
+waiters before C3 attachment/stream release. Native reader reservations prevent
+raw free from reclaiming queued poll readers. Failed-free quarantine is unchanged.

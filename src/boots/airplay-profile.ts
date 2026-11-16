@@ -147,10 +147,49 @@ export interface AirplayTimelineStream extends AirplayExactStream {
     source?: bigint,
     attachment?: bigint,
   ): Promise<AirplayProgressSnapshot | null>;
+  /** Retained poll, never an implicit ack. Serialize ack with readers of the
+   * same receipt. Ack only after committing its matching core outcome. */
+  pollCompletion(
+    key: AirplayCompletionKey,
+  ): Promise<AirplayCompletionResult | null>;
+  waitCompletion(key: AirplayCompletionKey): Promise<AirplayCompletionResult>;
+  /** Explicit exclusion creates revision + 1; old terminal outcomes survive. */
+  reviseCompletion(
+    key: AirplayCompletionKey,
+    exclude: readonly bigint[],
+  ): Promise<AirplayCompletionKey>;
+  ackCompletion(key: AirplayCompletionKey): Promise<void>;
+}
+export interface AirplayCompletionKey {
+  readonly epoch: bigint;
+  readonly source: bigint;
+  readonly target: bigint;
+  readonly revision: bigint;
+}
+export interface AirplayCompletionResult extends AirplayCompletionKey {
+  readonly streamId: bigint;
+  readonly inputEnd: bigint;
+  readonly status: 'pending' | 'complete' | 'canceled' | 'failed';
+  readonly error: AirplayProgressSnapshot['error'];
+  readonly transportEnd: bigint;
+  readonly capturedNs: bigint;
+  readonly required: bigint;
+  readonly attachments: readonly Readonly<{
+    attachment: bigint;
+    session: bigint;
+    outcome: 'pending' | 'complete' | 'withdrawn' | 'failed' | 'canceled';
+    excluded: boolean;
+    error: AirplayProgressSnapshot['error'];
+    coverageStart: bigint;
+    submittedFrames: bigint;
+    scheduledFrames: bigint;
+  }>[];
 }
 /** Coherent native fact, not a terminal completion receipt. All boundaries are
  * exclusive epoch transport frames. A join covers a suffix, never prior audio.
- * Failed snapshots freeze the last proven group prefix, even after session loss. */
+ * Failed snapshots freeze the last proven group prefix, even after session loss.
+ * Acknowledged source/range observations are retired; real/silence/source counts
+ * project retained ranges only. Transport boundaries remain epoch-absolute. */
 export interface AirplayProgressSnapshot {
   readonly streamId: bigint;
   readonly epoch: bigint;

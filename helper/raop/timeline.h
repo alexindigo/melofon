@@ -43,4 +43,18 @@ struct raop_progress_snapshot {
   uint64_t coverage_start, submitted_frames, scheduled_frames, schedule_origin_ns;
   uint64_t fed_frames, real_frames, silence_frames, source_frames;
 };
+/* Retained terminal source receipt, independent of the device state ring.
+ * status: pending/complete/canceled/failed. All identities/targets are exact.
+ * A revision retains excluded outcomes; it never turns an excluded peer into
+ * a successful participant. Acknowledgement ends this receipt's read lifetime. */
+struct raop_completion_result {
+  uint64_t stream, epoch, source, target, input_end, revision;
+  uint64_t status, error, transport_end, captured_ns, attachments, required;
+};
+/* outcome: pending/complete/withdrawn/failed/canceled; excluded is explicit.
+ * Boundaries are exclusive epoch transport frames, never arrival counts. */
+struct raop_completion_attachment {
+  uint64_t attachment, session, outcome, excluded, error;
+  uint64_t coverage_start, submitted_frames, scheduled_frames;
+};
 #endif
