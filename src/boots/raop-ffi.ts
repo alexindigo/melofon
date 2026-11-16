@@ -73,6 +73,11 @@ const SYMBOLS = {
     parameters: ['pointer', 'u64', 'u64', 'buffer'],
     result: 'i32',
   },
+  raop_stream_progress: {
+    parameters: ['pointer', 'u64', 'u64', 'u64', 'buffer'],
+    result: 'i32',
+    nonblocking: true,
+  },
   raop_stream_cancel_v2: {
     parameters: ['pointer', 'u64', 'buffer', 'usize'],
     result: 'i32',
@@ -767,6 +772,59 @@ export function createFfiStream(
           sourceOffset: r[5],
           transportStart: r[6],
           frames: r[7],
+        });
+      });
+    },
+    progress(captured, source = 0n, attachment = 0n) {
+      return operations.run(async () => {
+        u64(captured, source, attachment);
+        const r = new BigUint64Array(15);
+        const rc = await lib.symbols.raop_stream_progress(
+          handle,
+          captured,
+          source,
+          attachment,
+          r,
+        );
+        if (rc === 0) return null;
+        const state =
+          (['waiting', 'scheduled', 'failed'] as const)[Number(r[4])];
+        const error = ([
+          'none',
+          'allocation',
+          'encoder',
+          'cipher',
+          'send',
+          'sync',
+          'overdue',
+          'transport',
+        ] as const)[Number(r[5])];
+        if (
+          rc !== 1 || r[0] !== captured || r[1] !== source ||
+          r[2] !== attachment ||
+          !state || !error || (state === 'failed') !== (error !== 'none') ||
+          r[9] > r[8] || r[14] > r[12] ||
+          r[12] + r[13] > r[9]
+        ) {
+          throw new Error('Invalid RAOP progress snapshot ABI');
+        }
+        return Object.freeze({
+          streamId: id,
+          epoch: r[0],
+          source: r[1],
+          attachment: r[2],
+          capturedNs: r[3],
+          status: state,
+          error,
+          participants: r[6],
+          coverageStart: r[7],
+          submittedFrames: r[8],
+          scheduledFrames: r[9],
+          scheduleOriginNs: r[10],
+          fedFrames: r[11],
+          realFrames: r[12],
+          silenceFrames: r[13],
+          sourceFrames: r[14],
         });
       });
     },

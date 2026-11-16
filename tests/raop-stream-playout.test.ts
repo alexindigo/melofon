@@ -1,5 +1,5 @@
 // Ordered timeline ingress -> shipping native library -> independently scheduled
-// UDP/ALAC consumer. Pacer ranges are not scheduled completion receipts.
+// UDP/ALAC consumer. Scheduled progress is not a terminal completion receipt.
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createFfiStream, raopFfiInternals } from '../src/boots/raop-ffi.ts';
 import {
@@ -688,6 +688,428 @@ test('empty end never anchors and raw ABI refuses malformed identities and frame
     await libraryProof();
   } finally {
     assertEquals(await lib.symbols.raop_stream_free(raw), 0);
+    await stream.close();
+    receiver.close();
+  }
+});
+
+async function progressChild(mode: string) {
+  const directory = await Deno.makeTempDir({ prefix: 'raop-progress-' });
+  const helper = new URL('../helper/raop/', import.meta.url).pathname;
+  const interposer = `${directory}/progress.so`;
+  const build = await new Deno.Command('cc', {
+    args: [
+      '-shared',
+      '-fPIC',
+      '-I',
+      `${helper}stub`,
+      '-I',
+      `${helper}vendor`,
+      '-o',
+      interposer,
+      `${helper}test/progress-faultinject.c`,
+      '-ldl',
+    ],
+  }).output();
+  assertEquals(build.code, 0, new TextDecoder().decode(build.stderr));
+  const child = await new Deno.Command(Deno.execPath(), {
+    args: [
+      'test',
+      '--frozen',
+      '--cached-only',
+      '--node-modules-dir=manual',
+      '-A',
+      '--filter',
+      `RAOP timeline: progress ${mode}`,
+      new URL(import.meta.url).pathname,
+    ],
+    env: {
+      LD_PRELOAD: interposer,
+      RAOP_PROGRESS_CASE: mode,
+      RAOP_PROGRESS_DIRECTORY: directory,
+      RAOP_PROGRESS_ARM: `${directory}/arm`,
+      RAOP_PROGRESS_HOLD: `${directory}/hold`,
+      RAOP_PROGRESS_FAULT: mode,
+      ...(mode === 'offsets and wrap' ? { RAOP_PROGRESS_WRAP: '1' } : {}),
+    },
+  }).output();
+  await Deno.writeFile(`${directory}/child.stdout`, child.stdout);
+  await Deno.writeFile(`${directory}/child.stderr`, child.stderr);
+  const stdout = new TextDecoder().decode(child.stdout);
+  assertEquals(child.code, 0, stdout + new TextDecoder().decode(child.stderr));
+  assert(/1 passed.*0 failed/.test(stdout));
+  for (const line of stdout.split('\n')) {
+    if (line.startsWith('playout native library:')) console.log(line);
+  }
+}
+
+for (
+  const mode of [
+    'held emission',
+    'catchup',
+    'offsets and wrap',
+    'allocation',
+    'encoder',
+    'cipher',
+    'send',
+    'sync',
+    'periodic sync',
+    'overdue',
+  ]
+) {
+  test(`progress ${mode}`, async () => {
+    if (Deno.env.get('RAOP_PROGRESS_CASE') !== mode) {
+      return await progressChild(mode);
+    }
+    const directory = Deno.env.get('RAOP_PROGRESS_DIRECTORY')!;
+    const hold = `${directory}/hold`, arm = `${directory}/arm`;
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const attachment = stream.attach(() => {});
+    const source = pcm(
+      ['overdue', 'catchup'].includes(mode) ? 44100 : 704,
+      347,
+    );
+    let second: Receiver | undefined;
+    try {
+      const empty = await stream.progress(stream.epoch, highSource);
+      assertEquals([empty!.status, empty!.participants, empty!.sourceFrames], [
+        'waiting',
+        0n,
+        0n,
+      ]);
+      if (mode === 'held emission') await Deno.writeTextFile(hold, 'hold');
+      if (mode === 'offsets and wrap') {
+        second = await startFakeRaop({ captureAudio: true, captureWire: true });
+        const slow = stream.attach(() => {});
+        const observer = Deno.dlopen(`${directory}/progress.so`, {
+          raop_fi_offset: { parameters: ['u64', 'i32'], result: 'void' },
+        });
+        observer.symbols.raop_fi_offset(slow.id, 150);
+        // Both are ready before real input; neither receiver owns the clock.
+        await attachment.start(profile(receiver), item);
+        await slow.start(profile(second), item);
+        await append(stream, highSource, source);
+        await stream.seal(stream.epoch, highSource, 704n);
+        await stream.endStream(stream.epoch, 704n);
+        await until(
+          'fast receiver final source boundary',
+          async () =>
+            (await stream.progress(stream.epoch, highSource, attachment.id))!
+              .sourceFrames === 704n,
+        );
+        const fast =
+          (await stream.progress(stream.epoch, highSource, attachment.id))!;
+        const peer =
+          (await stream.progress(stream.epoch, highSource, slow.id))!;
+        const group = (await stream.progress(stream.epoch, highSource))!;
+        assertEquals(fast.status, 'scheduled');
+        assertEquals(peer.scheduleOriginNs - fast.scheduleOriginNs, 150000000n);
+        assertEquals(group.participants, 2n);
+        assert(
+          group.sourceFrames < 704n,
+          'group cannot use the faster boundary',
+        );
+        assert(peer.sourceFrames < fast.sourceFrames);
+        await until(
+          'slow group final source boundary',
+          async () =>
+            (await stream.progress(stream.epoch, highSource))!.sourceFrames ===
+              704n,
+        );
+        await rendered(stream, receiver, 704, new Map([[highSource, source]]));
+        await rendered(stream, second, 704, new Map([[highSource, source]]));
+        const wire = receiver.sessions[0].wire.filter((e) =>
+          e.kind === 'audio'
+        );
+        assert(wire.length > 2);
+        assert(receiver.sessions[0].rtpSequences.includes(65535));
+        assert(receiver.sessions[0].rtpSequences.includes(0));
+        const timestamps = wire.map((e) => {
+          assert('data' in e);
+          return new DataView(
+            e.data.buffer,
+            e.data.byteOffset,
+            e.data.byteLength,
+          ).getUint32(4);
+        });
+        assert(
+          timestamps.some((value, i) => i > 0 && value < timestamps[i - 1]),
+          'actual wire RTP timestamp wrapped',
+        );
+        // The independent renderer extends both wrapping counters; exact PCM
+        // plus wide native submission proves neither counter is an identity.
+        const final = (await stream.progress(stream.epoch, highSource))!;
+        assert(final.submittedFrames > 65536n);
+        assertEquals(final.sourceFrames, 704n);
+        await libraryProof();
+        observer.close();
+        return;
+      }
+      await append(stream, highSource, source);
+      await stream.seal(stream.epoch, highSource, BigInt(source.length / 4));
+      await stream.endStream(stream.epoch, BigInt(source.length / 4));
+      if (['allocation', 'encoder', 'cipher', 'send', 'sync'].includes(mode)) {
+        await Deno.writeTextFile(arm, 'fail next matching real dependency');
+      }
+      await attachment.start({
+        ...profile(receiver),
+        encrypt: mode === 'cipher',
+        // Native Apple TV 1 explicitly disables encryption regardless of ek.
+        // Use the generic encrypted RAOP branch to reach the real AES call.
+        devtype: mode === 'cipher' ? 'other' : 'appletv',
+      }, item);
+      if (mode === 'catchup') {
+        await until(
+          'initial packet before recoverable stall',
+          () => receiver.sessions[0]?.audioPackets > 0,
+        );
+        await Deno.writeTextFile(hold, 'hold inside actual presentation lead');
+        await sleep(200);
+        await Deno.remove(hold);
+        await rendered(
+          stream,
+          receiver,
+          44100,
+          new Map([[highSource, source]]),
+        );
+        const progress = (await stream.progress(stream.epoch, highSource))!;
+        assertEquals([progress.status, progress.error, progress.sourceFrames], [
+          'scheduled',
+          'none',
+          44100n,
+        ]);
+      } else if (mode === 'held emission') {
+        await sleep(2500); // Longer than the old accepted-EOF/latency estimate.
+        const held = (await stream.progress(stream.epoch, highSource))!;
+        assertEquals([
+          held.sourceFrames,
+          held.scheduledFrames,
+          held.submittedFrames,
+          held.fedFrames,
+          receiver.sessions[0].audioPackets,
+        ], [0n, 0n, 0n, 0n, 0]);
+        assertEquals(
+          (await stream.source(stream.epoch, highSource))!.acceptedFrames,
+          704n,
+        );
+        await Deno.remove(hold);
+        await rendered(stream, receiver, 704, new Map([[highSource, source]]));
+        const progress = (await stream.progress(stream.epoch, highSource))!;
+        assertEquals([
+          progress.status,
+          progress.error,
+          progress.sourceFrames,
+          progress.realFrames,
+        ], ['scheduled', 'none', 704n, 704n]);
+        assert(progress.silenceFrames > 0n);
+        assertEquals(
+          progress.realFrames + progress.silenceFrames,
+          progress.scheduledFrames,
+        );
+      } else {
+        if (mode === 'overdue' || mode === 'periodic sync') {
+          await until(
+            'first submitted packet',
+            () => receiver.sessions[0]?.audioPackets > 0,
+          );
+          if (mode === 'overdue') {
+            await Deno.writeTextFile(hold, 'hold actual timer expirations');
+            const held = (await stream.progress(stream.epoch, highSource))!;
+            await sleep(2600);
+            const covered = (await stream.progress(stream.epoch, highSource))!;
+            assertEquals(covered.status, 'scheduled');
+            assertEquals(covered.submittedFrames, held.submittedFrames);
+            assert(covered.sourceFrames <= covered.submittedFrames);
+            assert(
+              covered.sourceFrames < BigInt(source.length / 4),
+              'elapsed time cannot credit unsubmitted EOF',
+            );
+            await Deno.remove(hold);
+          } else {
+            Deno.env.set('RAOP_PROGRESS_FAULT', 'sync');
+            // libc getenv observes process environment set by Deno.env.set.
+            await Deno.writeTextFile(arm, 'fail periodic wire sync');
+          }
+        }
+        await until(
+          'explicit retained epoch failure',
+          async () =>
+            (await stream.progress(stream.epoch, highSource))?.status ===
+              'failed',
+        );
+        const failure = (await stream.progress(stream.epoch, highSource))!;
+        assertEquals(failure.error, mode === 'periodic sync' ? 'sync' : mode);
+        assert(failure.sourceFrames < BigInt(source.length / 4));
+        assertEquals(failure.sourceFrames, failure.realFrames);
+        await sleep(100);
+        assertEquals(
+          await stream.progress(stream.epoch, highSource),
+          failure,
+          'failure is retained outside the state ring, with frozen proven prefix',
+        );
+        if (
+          ['allocation', 'encoder', 'cipher', 'send', 'sync'].includes(mode)
+        ) {
+          assertEquals([
+            failure.sourceFrames,
+            receiver.sessions[0].audioPackets,
+          ], [0n, 0]);
+        } else if (mode === 'overdue') {
+          assertEquals(
+            receiver.sessions[0].audioPackets * 352,
+            Number(failure.submittedFrames),
+            'no overdue packet was emitted, not just no credited progress',
+          );
+          const replay = renderScheduledAudio(
+            receiver.sessions[0],
+            receiver.nowMs(),
+          );
+          assertEquals(replay.issues, []);
+          assertEquals(replay.pcm.length / 4, Number(failure.sourceFrames));
+          assertEquals(replay.pcm, source.subarray(0, replay.pcm.length));
+        }
+        assertEquals(
+          (await stream.appendSource({
+            epoch: stream.epoch,
+            source: 2n,
+            segment: 2n,
+            pcm: pcm(1),
+          })).status,
+          'error',
+        );
+        const old = stream.epoch;
+        assertEquals((await stream.cancel(old)).status, 'ready');
+        assertEquals(await stream.progress(old, highSource), null);
+        assertEquals((await stream.progress(stream.epoch))!.error, 'none');
+        await stream.ackCancel(old);
+      }
+      await libraryProof();
+    } finally {
+      try {
+        await Deno.remove(hold);
+      } catch { /* not armed */ }
+      await stream.close();
+      receiver.close();
+      second?.close();
+    }
+  });
+}
+
+test('scheduled source position freezes across real underrun and excludes every silence range', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {});
+  const a = pcm(353), b = pcm(351, 987);
+  try {
+    await attachment.start(profile(receiver), item);
+    await append(stream, highSource, a);
+    await until(
+      'first real prefix scheduled',
+      async () =>
+        (await stream.progress(stream.epoch, highSource))!.sourceFrames ===
+          353n,
+    );
+    const first = (await stream.progress(stream.epoch, highSource))!;
+    await sleep(100);
+    const starved = (await stream.progress(stream.epoch, highSource))!;
+    assertEquals(starved.sourceFrames, first.sourceFrames);
+    assert(starved.silenceFrames > first.silenceFrames);
+    assert(starved.scheduledFrames > first.scheduledFrames);
+    const before = receiver.nowMs();
+    const observed = (await stream.progress(stream.epoch, highSource))!;
+    const after = receiver.nowMs();
+    const snapshot = renderScheduledAudio(receiver.sessions[0], after);
+    assertEquals(snapshot.issues, []);
+    const uncertainty = snapshot.clockUncertaintyMs! + 1;
+    const lower =
+      renderScheduledAudio(receiver.sessions[0], before - uncertainty).pcm
+        .length / 4;
+    const upper =
+      renderScheduledAudio(receiver.sessions[0], after + uncertainty).pcm
+        .length / 4;
+    assert(
+      Number(observed.scheduledFrames) >= lower &&
+        Number(observed.scheduledFrames) <= upper,
+      `native boundary ${observed.scheduledFrames} is inside independent wire-clock interval ${lower}..${upper}`,
+    );
+    await append(stream, highSource, b, 2n);
+    await stream.seal(stream.epoch, highSource, 704n);
+    await stream.endStream(stream.epoch, 704n);
+    await until(
+      'resumed source scheduled',
+      async () =>
+        (await stream.progress(stream.epoch, highSource))!.sourceFrames ===
+          704n,
+    );
+    const source = new Uint8Array(704 * 4);
+    source.set(a);
+    source.set(b, a.length);
+    const real = (await ranges(stream)).filter((r) => r.kind === 'real');
+    await rendered(
+      stream,
+      receiver,
+      Number(real[1].transportStart + real[1].frames),
+      new Map([[highSource, source]]),
+    );
+    const pending = stream.progress(stream.epoch, highSource);
+    const closing = stream.close();
+    assertEquals((await pending)!.sourceFrames, 704n);
+    await closing; // C1 joins the loop-dispatched native reader before C3 free.
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+test('scheduled ranges project each sealed source without double-counting a shared packet', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {});
+  const a = pcm(353), b = pcm(351, 321);
+  try {
+    await append(stream, 1n, a);
+    await stream.seal(stream.epoch, 1n, 353n);
+    await append(stream, highSource, b);
+    await stream.seal(stream.epoch, highSource, 351n);
+    await stream.endStream(stream.epoch, 704n);
+    await attachment.start(profile(receiver), item);
+    await until(
+      'accepted EOF dispatched but not yet presented',
+      async () =>
+        (await stream.source(stream.epoch, highSource))!.fedFrames === 351n,
+    );
+    assertEquals(
+      (await stream.progress(stream.epoch, highSource))!.sourceFrames,
+      0n,
+    );
+    assertEquals(
+      renderScheduledAudio(receiver.sessions[0], receiver.nowMs()).pcm.length,
+      0,
+    );
+    await rendered(stream, receiver, 704, new Map([[1n, a], [highSource, b]]));
+    const first = (await stream.progress(stream.epoch, 1n))!;
+    const second = (await stream.progress(stream.epoch, highSource))!;
+    assertEquals([
+      first.sourceFrames,
+      second.sourceFrames,
+      first.realFrames,
+      second.realFrames,
+    ], [353n, 351n, 704n, 704n]);
+    assertEquals(first.realFrames + first.silenceFrames, first.scheduledFrames);
+    assert(Object.isFrozen(first));
+    await libraryProof();
+  } finally {
     await stream.close();
     receiver.close();
   }

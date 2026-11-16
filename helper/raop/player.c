@@ -37,6 +37,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 #include <pthread.h>
 #include <sys/timerfd.h>
 
@@ -115,6 +116,7 @@ struct raop_player
   struct evbuffer *pcm;
   pthread_mutex_t pcm_lock;
   struct timeline *timeline;     /* pcm_lock; allocated before first admission */
+  struct raop_progress_snapshot failure; /* pcm_lock; first failure is retained */
 
   /* The pts stream clock, OwnTone's shape (player.c: pb_session.pts =
    * CLOCK_MONOTONIC at start + samples written): the sync packets' NTP
@@ -308,8 +310,8 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
   ret = read(p->timer_fd, &overrun, sizeof(overrun));
   if (ret <= 0)
     {
-      helper_log_event(E_LOG, L_PLAYER, "timer_read_failed", NULL);
-      overrun = 0;
+      if (errno != EAGAIN) raop_player_failed(p, RAOP_PROGRESS_TRANSPORT);
+      return;
     }
   else if (overrun > 0)
     overrun--;
@@ -328,7 +330,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
       avail = evbuffer_get_length(p->pcm);
       struct timeline *t = p->timeline;
       bool timeline = t && t->enabled;
-      if (p->fenced || (avail < 4 && (!timeline || !p->clock_started)))
+      if (p->fenced || p->failure.error || (avail < 4 && (!timeline || !p->clock_started)))
         {
           pthread_mutex_unlock(&p->pcm_lock);
           break;
@@ -501,6 +503,7 @@ raop_player_append(struct raop_player *p, const uint8_t *pcm, size_t len)
   size_t accept;
 
   pthread_mutex_lock(&p->pcm_lock);
+  if (p->failure.error) { pthread_mutex_unlock(&p->pcm_lock); return -1; }
   if (p->timeline && p->timeline->enabled) {
     pthread_mutex_unlock(&p->pcm_lock);
     return -2; /* unlabeled input cannot enter an accounted epoch */
@@ -555,6 +558,7 @@ raop_player_append_source(struct raop_player *p, uint64_t source, uint64_t segme
   pthread_mutex_lock(&p->pcm_lock);
   struct timeline *t = timeline_get(p);
   if (!t) { result->error = RAOP_APPEND_ERROR_ALLOCATION; goto out; }
+  if (p->failure.error) goto out;
   if ((!t->enabled && (p->clock_started || evbuffer_get_length(p->pcm))) || t->ended)
     goto out;
   struct source_record *s = NULL;
@@ -689,6 +693,56 @@ raop_player_range(struct raop_player *p, uint64_t index, struct raop_range_snaps
   return found;
 }
 
+/* Loop-only backend observations. The API dispatches the entire read onto this
+ * loop so clock, successful coverage and ledger projection are one observation.
+ * A failure freezes the proven prefix before a deferred session can disappear. */
+static uint64_t
+monotonic_ns(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+void
+raop_player_failed(struct raop_player *p, uint64_t error)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  if (!p->failure.error) {
+    raop_transport_progress(p->stream_id, 0, monotonic_ns(), &p->failure);
+    p->failure.status = 2;
+    p->failure.error = error;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+}
+
+int
+raop_player_progress(struct raop_player *p, uint64_t source, uint64_t attachment,
+                      struct raop_progress_snapshot *result)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  if (p->failure.error) *result = p->failure;
+  else raop_transport_progress(p->stream_id, attachment, monotonic_ns(), result);
+  result->source = source;
+  result->attachment = attachment;
+  result->fed_frames = p->pts_samples;
+  struct timeline *t = p->timeline;
+  if (t) for (size_t i = 0; i < t->ranges; i++) {
+    const struct raop_range_snapshot *r = &t->range[i];
+    uint64_t start = r->transport_start > result->coverage_start
+      ? r->transport_start : result->coverage_start;
+    uint64_t end = r->transport_start + r->frames;
+    if (end > result->scheduled_frames) end = result->scheduled_frames;
+    if (end <= start) continue;
+    if (r->kind == RAOP_RANGE_REAL) {
+      result->real_frames += end - start;
+      if (r->source == source) result->source_frames += end - start;
+    } else result->silence_frames += end - start;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+  return 1;
+}
+
 /* Loop thread: drop buffered PCM (pause/seek/track-change semantics; the
  * stream clock continues — resume re-feeds from the engine position). */
 void
@@ -696,6 +750,7 @@ raop_player_flush(struct raop_player *p)
 {
   pthread_mutex_lock(&p->pcm_lock);
   evbuffer_drain(p->pcm, evbuffer_get_length(p->pcm));
+  memset(&p->failure, 0, sizeof(p->failure));
   if (p->timeline && p->timeline->enabled) {
     memset(p->timeline, 0, sizeof(*p->timeline));
     p->pts_samples = 0;

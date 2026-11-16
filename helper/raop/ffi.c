@@ -219,6 +219,7 @@ struct raop_stream
   uint64_t epoch;                    /* rt.lock; exact admission incarnation */
   struct raop_player *player;
   unsigned attachments;             /* rt.lock; includes retiring handles */
+  unsigned readers;                 /* rt.lock; loop-dispatched progress reads */
   bool closing;                     /* rt.lock; admission fence */
   bool active;                      /* rt.lock; guard retained until free */
   bool item_set;                    /* loop-owned first attachment item */
@@ -1103,6 +1104,7 @@ _Static_assert(sizeof(struct raop_source_append_result) == 64, "source append AB
 _Static_assert(sizeof(struct raop_marker_result) == 48, "marker ABI");
 _Static_assert(sizeof(struct raop_source_snapshot) == 56, "source snapshot ABI");
 _Static_assert(sizeof(struct raop_range_snapshot) == 64, "range snapshot ABI");
+_Static_assert(sizeof(struct raop_progress_snapshot) == 120, "progress snapshot ABI");
 
 /* rt.lock is the admission linearization point for PCM, seals, end and cancel.
  * The pacer owns dispatch, under its inner lock, and never calls the backend
@@ -1196,6 +1198,72 @@ raop_stream_range(raop_stream_t *stream, uint64_t epoch, uint64_t index,
   if (found) result->epoch = epoch;
   pthread_mutex_unlock(&rt.lock);
   return found;
+}
+
+struct progress_work {
+  raop_stream_t *stream;
+  uint64_t epoch, source, attachment;
+  struct raop_progress_snapshot *result;
+  free_sync sync;
+  int found;
+};
+
+static void
+stream_progress_cb(evutil_socket_t fd, short what, void *arg)
+{
+  (void)fd; (void)what;
+  struct progress_work *work = arg;
+  pthread_mutex_lock(&rt.lock);
+  raop_stream_t *s = work->stream;
+  if (!s->closing && !s->resetting && s->epoch == work->epoch) {
+    work->found = raop_player_progress(s->player, work->source, work->attachment, work->result);
+    work->result->epoch = work->epoch;
+  }
+  s->readers--;
+  pthread_mutex_unlock(&rt.lock);
+  pthread_mutex_lock(&work->sync.lock);
+  work->sync.done = 1;
+  pthread_cond_signal(&work->sync.cond);
+  pthread_mutex_unlock(&work->sync.lock);
+}
+
+int
+raop_stream_progress(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+                      uint64_t attachment, struct raop_progress_snapshot *result)
+{
+  if (!stream || !result || !epoch) return -1;
+  struct progress_work work = { .stream = stream, .epoch = epoch,
+    .source = source, .attachment = attachment, .result = result,
+    .sync = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER } };
+  struct timeval zero = { 0, 0 };
+  pthread_mutex_lock(&work.sync.lock);
+  pthread_mutex_lock(&rt.lock);
+  int rc = -1;
+  if (!stream->closing) {
+    stream->readers++;
+    rc = event_base_once(rt.base, -1, EV_TIMEOUT, stream_progress_cb, &work, &zero);
+    if (rc < 0) stream->readers--;
+  }
+  pthread_mutex_unlock(&rt.lock);
+  if (rc == 0) while (!work.sync.done) pthread_cond_wait(&work.sync.cond, &work.sync.lock);
+  pthread_mutex_unlock(&work.sync.lock);
+  pthread_cond_destroy(&work.sync.cond);
+  pthread_mutex_destroy(&work.sync.lock);
+  return rc < 0 ? -1 : work.found;
+}
+
+/* Loop thread only, before a failing session is retired. Failure is an epoch
+ * fact retained by the stream, not a lossy device state-ring notification. */
+void
+raop_ffi_progress_failed(uint64_t stream_id, uint64_t error)
+{
+  pthread_mutex_lock(&rt.lock);
+  for (struct raop_stream *s = rt.streams; s; s = s->next)
+    if (s->id == stream_id && !s->canceling && !s->closing) {
+      raop_player_failed(s->player, error);
+      break;
+    }
+  pthread_mutex_unlock(&rt.lock);
 }
 
 int
@@ -1394,6 +1462,7 @@ stream_reset_cb(evutil_socket_t fd, short what, void *arg)
   raop_player_session_stopped(stream->player);
   raop_player_flush(stream->player);
   raop_discard_pending_input(stream->id);
+  raop_reanchor_stream(stream->id);
   pthread_mutex_lock(&rt.lock);
   stream->resetting = false;
   for (raop_t *h = rt.handles_list; h; h = h->next)
@@ -1469,8 +1538,8 @@ raop_stream_free(raop_stream_t *stream)
 {
   if (!stream) return -1;
   pthread_mutex_lock(&rt.lock);
-  if (stream->closing || stream->attachments) {
-    int result = stream->attachments ? -2 : -1;
+  if (stream->closing || stream->attachments || stream->readers) {
+    int result = stream->attachments || stream->readers ? -2 : -1;
     pthread_mutex_unlock(&rt.lock); return result;
   }
   stream->closing = true;

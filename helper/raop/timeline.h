@@ -32,4 +32,15 @@ enum raop_range_kind { RAOP_RANGE_REAL = 0, RAOP_RANGE_UNDERRUN = 1,
 struct raop_range_snapshot {
   uint64_t epoch, index, kind, source, segment, source_offset, transport_start, frames;
 };
+enum raop_progress_error { RAOP_PROGRESS_OK = 0, RAOP_PROGRESS_ALLOCATION = 1,
+  RAOP_PROGRESS_ENCODER = 2, RAOP_PROGRESS_CIPHER = 3, RAOP_PROGRESS_SEND = 4,
+  RAOP_PROGRESS_SYNC = 5, RAOP_PROGRESS_OVERDUE = 6, RAOP_PROGRESS_TRANSPORT = 7 };
+/* Exclusive frame boundaries. attachment=0 selects the intersection of live
+ * required sessions, never vacuous coverage. A late join covers a suffix only.
+ * status: 0 waiting, 1 scheduled, 2 failed. This is not a completion receipt. */
+struct raop_progress_snapshot {
+  uint64_t epoch, source, attachment, captured_ns, status, error, participants;
+  uint64_t coverage_start, submitted_frames, scheduled_frames, schedule_origin_ns;
+  uint64_t fed_frames, real_frames, silence_frames, source_frames;
+};
 #endif

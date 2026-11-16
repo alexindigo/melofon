@@ -230,6 +230,7 @@ struct raop_session
   bool coverage_failed;
   uint64_t schedule_origin_ns;
   uint64_t submitted_frames;
+  uint64_t coverage_start;
 
   int reqs_in_flight;
   int cseq;
@@ -623,7 +624,7 @@ alac_encode_no_xcode(struct evbuffer *evbuf, uint8_t *rawbuf, size_t rawbuf_size
     }
 
   alac_encode_uncompressed(dst, rawbuf, rawbuf_size);
-  evbuffer_add(evbuf, dst, len);
+  if (evbuffer_add(evbuf, dst, len) < 0) return -1;
   return len;
 #undef BODY_LEN
 }
@@ -2267,6 +2268,8 @@ raop_release_device(uint64_t id, void (*done)(uint64_t, int))
 static void
 session_failure(struct raop_session *rs)
 {
+  if (!rs->cancel_pending && !rs->retiring)
+    raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_TRANSPORT);
   /* Session failed, let our user know */
   if (rs->state != RAOP_STATE_PASSWORD)
     rs->state = RAOP_STATE_FAILED;
@@ -2282,6 +2285,8 @@ deferred_session_failure(struct raop_session *rs)
   struct timeval tv;
 
   if (rs->retiring || rs->failure_pending) return;
+  if (!rs->cancel_pending)
+    raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_TRANSPORT);
   rs->failure_pending = true;
   source_observer_cancel(rs);
   rs->state = RAOP_STATE_FAILED;
@@ -3140,6 +3145,7 @@ raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns,
     rs->schedule_valid = false;
     rs->coverage_failed = false;
     rs->submitted_frames = 0;
+    rs->coverage_start = 0;
     if (rs->cancel_pending) continue;
     rs->cancel_pending = true;
     if (rs->retiring || rs->failure_pending) continue; /* destruction will notify */
@@ -3238,12 +3244,14 @@ packet_send(struct raop_session *rs, struct rtp_packet *pkt)
 
       // Can't free it right away, it would make the ->next in the calling
       // master_session and session loops invalid
+      raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_SEND);
       deferred_session_failure(rs);
       return -1;
     }
   else if (ret != pkt->data_len)
     {
       DPRINTF(E_WARN, L_RAOP, "Partial send (%d) for '%s'\n", ret, rs->devname);
+      raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_SEND);
       return -1;
     }
 
@@ -3255,6 +3263,50 @@ packet_send(struct raop_session *rs, struct rtp_packet *pkt)
     );
 */
   return 0;
+}
+
+/* Loop-only, wide epoch coordinates, independent of RTP timestamp/sequence wrap.
+ * Successful wire sync establishes origin; packet submission only extends a
+ * contiguous suffix. Clock passage alone can never extend that coverage. */
+void
+raop_transport_progress(uint64_t stream_id, uint64_t attachment, uint64_t now_ns,
+                         struct raop_progress_snapshot *out)
+{
+  *out = (struct raop_progress_snapshot){ .captured_ns = now_ns };
+  uint64_t submitted = UINT64_MAX, scheduled = UINT64_MAX;
+  bool valid = true;
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != stream_id || rs->retiring || rs->only_probe ||
+        rs->cancel_pending || (attachment && rs->device_id != attachment)) continue;
+    out->participants++;
+    if (!rs->schedule_valid) valid = false;
+    uint64_t elapsed = now_ns > rs->schedule_origin_ns ? now_ns - rs->schedule_origin_ns : 0;
+    uint64_t played = elapsed / 1000000000ULL * 44100 +
+      elapsed % 1000000000ULL * 44100 / 1000000000ULL;
+    if (!rs->schedule_valid) played = rs->coverage_start;
+    if (played > rs->submitted_frames) played = rs->submitted_frames;
+    if (played < scheduled) scheduled = played;
+    if (rs->submitted_frames < submitted) submitted = rs->submitted_frames;
+    if (rs->coverage_start > out->coverage_start) out->coverage_start = rs->coverage_start;
+    if (rs->schedule_origin_ns > out->schedule_origin_ns)
+      out->schedule_origin_ns = rs->schedule_origin_ns;
+  }
+  if (!out->participants) return;
+  out->submitted_frames = submitted;
+  out->scheduled_frames = valid ? scheduled : 0;
+  out->status = valid ? 1 : 0;
+}
+
+void
+raop_reanchor_stream(uint64_t stream_id)
+{
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != stream_id || rs->retiring || rs->failure_pending ||
+        rs->cancel_pending || (rs->state != RAOP_STATE_CONNECTED &&
+        rs->state != RAOP_STATE_STREAMING)) continue;
+    rs->schedule_valid = false;
+    rs->state = RAOP_STATE_CONNECTED; /* next write emits a new actual sync */
+  }
 }
 
 static int
@@ -3290,6 +3342,7 @@ control_packet_send(struct raop_session *rs, struct rtp_packet *pkt)
     DPRINTF(E_LOG, L_RAOP, "Could not send playback sync to device '%s': %s\n", rs->devname, strerror(errno));
   if (ret != pkt->data_len) {
     rs->coverage_failed = true;
+    raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_SYNC);
     return -1;
   }
   return 0;
@@ -3343,12 +3396,19 @@ packets_send(struct raop_master_session *rms)
     {
       for (rs = raop_sessions; rs; rs = rs->next)
         if (rs->master_session == rms) rs->coverage_failed = true;
+      raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_ENCODER);
       return -1;
     }
 
   pkt = rtp_packet_next(rms->rtp_session, len, rms->samples_per_packet, RAOP_RTP_PAYLOADTYPE);
-
-  evbuffer_remove(rms->encoded_buffer, pkt->payload, pkt->payload_len);
+  if (!pkt) {
+    raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_ALLOCATION);
+    return -1;
+  }
+  if (evbuffer_remove(rms->encoded_buffer, pkt->payload, pkt->payload_len) != pkt->payload_len) {
+    raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_ENCODER);
+    return -1;
+  }
 
   if (rms->encrypt)
     {
@@ -3357,6 +3417,7 @@ packets_send(struct raop_master_session *rms)
         {
           for (rs = raop_sessions; rs; rs = rs->next)
             if (rs->master_session == rms) rs->coverage_failed = true;
+          raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_CIPHER);
           return -1;
         }
     }
@@ -3367,6 +3428,25 @@ packets_send(struct raop_master_session *rms)
 	continue;
 
       if (rs->cancel_pending) continue;
+
+      if (rs->state != RAOP_STATE_CONNECTED && rs->state != RAOP_STATE_STREAMING)
+        continue;
+      struct timespec submitted;
+      clock_gettime(CLOCK_MONOTONIC, &submitted);
+      uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
+      uint64_t deadline = rs->schedule_origin_ns +
+        rms->epoch_frames / 44100 * 1000000000ULL +
+        rms->epoch_frames % 44100 * 1000000000ULL / 44100;
+      if (!rs->schedule_valid || rs->coverage_failed || rs->submitted_frames != rms->epoch_frames) {
+        raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_SYNC);
+        return -1;
+      }
+      /* Catch up only inside actual available presentation lead. Check BEFORE
+       * sending, not after emitting an overdue burst. No guessed retry quota. */
+      if (submitted_ns >= deadline) {
+        raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_OVERDUE);
+        return -1;
+      }
 
       // Device just joined
       if (rs->state == RAOP_STATE_CONNECTED)
@@ -3380,19 +3460,16 @@ packets_send(struct raop_master_session *rms)
 	  ret = packet_send(rs, pkt);
 	}
       else continue;
-      struct timespec submitted;
       clock_gettime(CLOCK_MONOTONIC, &submitted);
-      uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
-      uint64_t deadline = rs->schedule_origin_ns +
-        rms->epoch_frames / 44100 * 1000000000ULL +
-        rms->epoch_frames % 44100 * 1000000000ULL / 44100;
+      submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
       /* A late burst is not scheduled coverage. Preserve the known contiguous
        * prefix rather than crediting audio that missed its presentation time. */
-      if (!rs->schedule_valid || submitted_ns > deadline)
-        rs->coverage_failed = true;
-      if (ret < 0 || rs->submitted_frames != rms->epoch_frames)
-        rs->coverage_failed = true;
-      else if (!rs->coverage_failed) rs->submitted_frames += rms->samples_per_packet;
+      if (ret < 0) return -1;
+      if (submitted_ns >= deadline) {
+        raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_OVERDUE);
+        return -1;
+      }
+      rs->submitted_frames += rms->samples_per_packet;
     }
 
   // Commits packet to retransmit buffer, and prepares the session for the next packet
@@ -3440,7 +3517,7 @@ timestamp_set(struct raop_master_session *rms, struct timespec ts)
   rms->cur_stamp.pos = rms->rtp_session->pos + rms->input_buffer_samples - rms->output_buffer_samples;
 }
 
-static void
+static int
 packets_sync_send(struct raop_master_session *rms)
 {
   struct rtp_packet *sync_pkt;
@@ -3474,14 +3551,23 @@ packets_sync_send(struct raop_master_session *rms)
           (int64_t)(rms->epoch_frames / 44100) * 1000000000LL -
           (int64_t)(rms->epoch_frames % 44100) * 1000000000LL / 44100;
         if (ns >= 0) rs->schedule_origin_ns = (uint64_t)ns;
+        else {
+          raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_SYNC);
+          return -1;
+        }
+        rs->coverage_start = rs->submitted_frames = rms->epoch_frames;
       }
 
       // A device has joined and should get an init sync packet
       if (rs->state == RAOP_STATE_CONNECTED)
 	{
 	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
-	  rs->schedule_valid = control_packet_send(rs, sync_pkt) == 0 &&
-            !rs->coverage_failed;
+	  if (!sync_pkt) {
+            raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_ALLOCATION);
+            return -1;
+          }
+          if (control_packet_send(rs, sync_pkt) < 0) return -1;
+          rs->schedule_valid = !rs->coverage_failed;
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
@@ -3489,9 +3575,14 @@ packets_sync_send(struct raop_master_session *rms)
       else if (is_sync_time && rs->state == RAOP_STATE_STREAMING)
 	{
 	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80);
-	  control_packet_send(rs, sync_pkt);
+          if (!sync_pkt) {
+            raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_ALLOCATION);
+            return -1;
+          }
+	  if (control_packet_send(rs, sync_pkt) < 0) return -1;
 	}
     }
+  return 0;
 }
 
 
@@ -5048,10 +5139,13 @@ raop_write(struct output_buffer *obuf)
 	  timestamp_set(rms, obuf->pts);
 
 	  // Sends sync packets to new sessions, and if it is sync time then also to old sessions
-	  packets_sync_send(rms);
+	  if (packets_sync_send(rms) < 0) return;
 
 	  // TODO avoid this copy
-	  evbuffer_add(rms->input_buffer, obuf->data[i].buffer, obuf->data[i].bufsize);
+	  if (evbuffer_add(rms->input_buffer, obuf->data[i].buffer, obuf->data[i].bufsize) < 0) {
+            raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_ALLOCATION);
+            return;
+          }
 	  rms->input_buffer_samples += obuf->data[i].samples;
 
 	  // Send as many packets as we have data for (one packet requires rawbuf_size bytes)
@@ -5060,7 +5154,7 @@ raop_write(struct output_buffer *obuf)
 	      evbuffer_remove(rms->input_buffer, rms->rawbuf, rms->rawbuf_size);
 	      rms->input_buffer_samples -= rms->samples_per_packet;
 
-	      packets_send(rms);
+	      if (packets_send(rms) < 0) return;
 	    }
 	}
     }

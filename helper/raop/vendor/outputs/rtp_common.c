@@ -131,11 +131,12 @@ rtp_packet_next(struct rtp_session *session, size_t payload_len, int samples, ui
   // allocation should in most cases suffice. If not, we realloc.
   if (!pkt->data || payload_len > pkt->payload_size)
     {
-      pkt->data_size = RTP_HEADER_LEN + payload_len;
-      if (!pkt->data)
-	CHECK_NULL(L_PLAYER, pkt->data = malloc(pkt->data_size));
-      else
-	CHECK_NULL(L_PLAYER, pkt->data = realloc(pkt->data, pkt->data_size));
+      if (payload_len > SIZE_MAX - RTP_HEADER_LEN) return NULL;
+      size_t size = RTP_HEADER_LEN + payload_len;
+      void *data = realloc(pkt->data, size);
+      if (!data) return NULL; /* preserve old storage; no successful packet */
+      pkt->data = data;
+      pkt->data_size = size;
       pkt->header  = pkt->data;
       pkt->payload = pkt->data + RTP_HEADER_LEN;
       pkt->payload_size = payload_len;
@@ -353,7 +354,8 @@ rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stam
     {
       pkt->data_size = session->ptp_clock_id ? RTCP_SYNC_PACKET_PTP_LEN : RTCP_SYNC_PACKET_NTP_LEN;
       pkt->data_len = pkt->data_size;
-      CHECK_NULL(L_PLAYER, pkt->data = malloc(pkt->data_size));
+      pkt->data = malloc(pkt->data_size);
+      if (!pkt->data) return NULL;
     }
 
   if (session->ptp_clock_id)

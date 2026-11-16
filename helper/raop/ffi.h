@@ -80,6 +80,11 @@ int raop_stream_source(raop_stream_t *, uint64_t epoch, uint64_t source,
                        struct raop_source_snapshot *);
 int raop_stream_range(raop_stream_t *, uint64_t epoch, uint64_t index,
                       struct raop_range_snapshot *);
+/* Coherent loop-thread observation, including range projection. Returns 1 for
+ * the current epoch, 0 if canceled/reset, -1 on scheduling/closing failure.
+ * Source=0 reports transport only; attachment=0 uses all required live peers. */
+int raop_stream_progress(raop_stream_t *, uint64_t epoch, uint64_t source,
+                         uint64_t attachment, struct raop_progress_snapshot *);
 /* Cancel is admitted synchronously under the append lock. It advances epoch
  * before return; replacement append is not-ready until local reset and every
  * affected session's FLUSH ACK or destruction. No natural drain wait.

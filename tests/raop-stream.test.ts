@@ -496,8 +496,14 @@ Deno.test({
       assertEquals(session.flushes, 0, 'local reset is not receiver FLUSH');
       assertEquals(session.teardowns, 0);
       await libraryProof();
-      // Only the pre-reset packet has a scheduled-render assertion here. Local
-      // reset neither retracts wire packets nor proves b03's FLUSH readiness.
+      // Local reset must synchronize the pacer's new anchor on the wire too.
+      // It still neither retracts old wire packets nor proves FLUSH readiness.
+      await rendered(receiver, expected);
+      const progress = (await stream.progress(stream.epoch))!;
+      assertEquals(progress.error, 'none');
+      assertEquals(progress.coverageStart, 352n);
+      assertEquals(progress.submittedFrames, 1056n);
+      assertEquals(progress.scheduledFrames, 1056n);
     } finally {
       await stream.close();
       receiver.close();

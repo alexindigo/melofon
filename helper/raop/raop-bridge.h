@@ -13,6 +13,12 @@ void raop_player_seal(struct raop_player *, uint64_t source, uint64_t target,
 void raop_player_end(struct raop_player *, uint64_t target, struct raop_marker_result *);
 int raop_player_source(struct raop_player *, uint64_t source, struct raop_source_snapshot *);
 int raop_player_range(struct raop_player *, uint64_t index, struct raop_range_snapshot *);
+void raop_transport_progress(uint64_t stream_id, uint64_t attachment, uint64_t now_ns,
+                              struct raop_progress_snapshot *);
+int raop_player_progress(struct raop_player *, uint64_t source, uint64_t attachment,
+                          struct raop_progress_snapshot *);
+void raop_player_failed(struct raop_player *, uint64_t error);
+void raop_ffi_progress_failed(uint64_t stream_id, uint64_t error);
 /* -1: cleanup could not start, retain ownership. 0: accepted. Callback after
  * all device-local sessions/sockets are destroyed, possibly inline. sent=0
  * all final requests wrote locally, -1 some unsent; neither means remote ACK. */
@@ -20,6 +26,10 @@ int raop_release_device(uint64_t id, void (*done)(uint64_t, int));
 /* Loop-thread effective-feed discontinuity: discard partial raw ALAC input,
  * retaining peer sessions, RTP clocks and already encoded retransmit packets. */
 void raop_discard_pending_input(uint64_t stream_id);
+/* Compatibility local reset reanchors the pacer without FLUSH. Its next write
+ * must establish a fresh wire sync too, not reuse the old presentation origin.
+ * Accounted timeline epochs refuse this path and require ordered cancel. */
+void raop_reanchor_stream(uint64_t stream_id);
 /* Loop-owned epoch reset. Clear input/cache, FLUSH established sessions and
  * destroy old startup sessions. Repeated calls cannot admit PCM between ACKs.
  * Returns the slowest healthy scheduled cutoff at the captured monotonic time. */

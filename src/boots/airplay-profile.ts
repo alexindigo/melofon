@@ -120,7 +120,7 @@ export interface AirplayCancelResult {
 }
 /** Ordered transport timeline, additive until boot/core adoption. Source targets
  * are exclusive source-local real frames; endStream targets epoch-wide accepted
- * real frames. Pacer snapshots are not scheduled progress or completion. */
+ * real frames. Pacer snapshots are distinct from scheduled progress/completion. */
 export interface AirplayTimelineStream extends AirplayExactStream {
   /** Legacy local reset is refused after timeline admission. Use cancel(epoch)
    * so identities and immutable targets cannot be erased within an epoch. */
@@ -142,6 +142,40 @@ export interface AirplayTimelineStream extends AirplayExactStream {
   endStream(epoch: bigint, target: bigint): Promise<AirplayMarkerResult>;
   source(epoch: bigint, source: bigint): Promise<AirplaySourceSnapshot | null>;
   range(epoch: bigint, index: bigint): Promise<AirplayRangeSnapshot | null>;
+  progress(
+    epoch: bigint,
+    source?: bigint,
+    attachment?: bigint,
+  ): Promise<AirplayProgressSnapshot | null>;
+}
+/** Coherent native fact, not a terminal completion receipt. All boundaries are
+ * exclusive epoch transport frames. A join covers a suffix, never prior audio.
+ * Failed snapshots freeze the last proven group prefix, even after session loss. */
+export interface AirplayProgressSnapshot {
+  readonly streamId: bigint;
+  readonly epoch: bigint;
+  readonly source: bigint;
+  readonly attachment: bigint;
+  readonly capturedNs: bigint;
+  readonly status: 'waiting' | 'scheduled' | 'failed';
+  readonly error:
+    | 'none'
+    | 'allocation'
+    | 'encoder'
+    | 'cipher'
+    | 'send'
+    | 'sync'
+    | 'overdue'
+    | 'transport';
+  readonly participants: bigint;
+  readonly coverageStart: bigint;
+  readonly submittedFrames: bigint;
+  readonly scheduledFrames: bigint;
+  readonly scheduleOriginNs: bigint;
+  readonly fedFrames: bigint;
+  readonly realFrames: bigint;
+  readonly silenceFrames: bigint;
+  readonly sourceFrames: bigint;
 }
 export type AirplayMarkerResult = Readonly<
   & {

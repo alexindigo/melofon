@@ -284,3 +284,34 @@ playout or completion. Timeline input refuses unlabelled writes in that epoch.
 The existing production boot still uses exact append/cancel, not this port.
 The legacy local reset is refused once timeline input starts: only ordered cancel
 can retire those identities and admit replacement input in a new epoch.
+
+## Scheduled timeline progress
+
+`raop_stream_progress` dispatches one coherent observation onto the native loop:
+successful contiguous per-attachment packet coverage, the monotonic presentation
+boundary established by successful RTP/sync/NTP output, and projection through
+the source/transport range ledger. Receiver latency is included once, along with
+the existing device offset. Wide epoch frame counters do not wrap with RTP.
+Attachment zero selects the group intersection and slowest boundary. A late join
+covers only its explicit suffix; no participants means waiting, never success.
+Source zero selects transport-only projection. Silence advances transport, not
+source frames. Snapshot reads reserve storage and the typed operation owner joins
+them before native release.
+
+Packet allocation, encoding, cipher, send and sync errors retain an explicit
+epoch failure and the last proven group prefix before deferred session cleanup.
+Failed snapshots remain frozen until ordered cancel/reset. Pacer catch-up checks
+each packet's established presentation deadline before emission, and again after
+send; missing the available lead fails the epoch rather than emitting a stale
+burst and crediting it as played. Successful submission alone is not playout.
+The compatibility local-reset path reanchors the pacer and orders a fresh wire
+sync for its retained attachments together. It cannot reuse an old presentation
+deadline after changing the input clock. Accounted epochs still refuse local
+reset and require ordered cancel; this adds neither FLUSH nor receiver reopen.
+
+`test/progress-faultinject.c` is compiled only by the timeline consumer tests.
+It controls dependency failures and actual timer expirations, exercises the
+existing backend offset field and forces wire counter wrap. None of its controls
+or symbols enters production. Scheduled progress is not retained source
+completion: captured cohorts, terminal outcomes, poll/ack and marker reclamation
+belong to that separate layer. The boot/core have not adopted this timeline port.
