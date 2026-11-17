@@ -34,6 +34,8 @@ import type {
   AirplayInput,
   AirplayMarkerResult,
   AirplayProfile,
+  AirplayProgressSnapshot,
+  AirplaySourceCancelResult,
   AirplayTimelineStream,
   AirplayTransport,
   HelperEventFn,
@@ -100,6 +102,14 @@ const SYMBOLS = {
   raop_stream_close_input: { parameters: ['pointer'], result: 'i32' },
   raop_stream_cancel_v2: {
     parameters: ['pointer', 'u64', 'buffer', 'usize'],
+    result: 'i32',
+  },
+  raop_stream_cancel_source: {
+    parameters: ['pointer', 'u64', 'u64', 'buffer', 'usize'],
+    result: 'i32',
+  },
+  raop_stream_cancel_source_poll: {
+    parameters: ['pointer', 'u64', 'u64', 'buffer'],
     result: 'i32',
   },
   raop_stream_cancel_poll: {
@@ -688,6 +698,97 @@ export function createFfiStream(
     'overdue',
     'transport',
   ] as const;
+  const projectProgress = (
+    captured: bigint,
+    source: bigint,
+    attachment: bigint,
+    r: BigUint64Array,
+  ): AirplayProgressSnapshot => {
+    const state = (['waiting', 'scheduled', 'failed'] as const)[Number(r[4])];
+    const error = progressErrors[Number(r[5])];
+    if (
+      r[0] !== captured || r[1] !== source || r[2] !== attachment ||
+      !state || !error || (state === 'failed') !== (error !== 'none') ||
+      r[9] > r[8] || r[14] > r[12] || r[12] + r[13] > r[9]
+    ) throw new Error('Invalid RAOP progress snapshot ABI');
+    return Object.freeze({
+      streamId: id,
+      epoch: r[0],
+      source: r[1],
+      attachment: r[2],
+      capturedNs: r[3],
+      status: state,
+      error,
+      participants: r[6],
+      coverageStart: r[7],
+      submittedFrames: r[8],
+      scheduledFrames: r[9],
+      scheduleOriginNs: r[10],
+      fedFrames: r[11],
+      realFrames: r[12],
+      silenceFrames: r[13],
+      sourceFrames: r[14],
+    });
+  };
+  const cancel = (captured: bigint, retire: readonly bigint[], source = 0n) =>
+    operations.run(async ({ signal }) => {
+      u64(captured, source, ...retire);
+      if (!captured || retire.some((id) => !id)) {
+        throw new RangeError(
+          'RAOP cancel requires nonzero epoch/attachment ids',
+        );
+      }
+      const ids = new BigUint64Array(retire);
+      const rc = source
+        ? lib.symbols.raop_stream_cancel_source(
+          handle,
+          captured,
+          source,
+          ids,
+          BigInt(ids.length),
+        )
+        : lib.symbols.raop_stream_cancel_v2(
+          handle,
+          captured,
+          ids,
+          BigInt(ids.length),
+        );
+      if (rc !== 0) {
+        throw new Error(
+          'raop_stream_cancel refused stale or unavailable epoch/source',
+        );
+      }
+      epoch = captured + 1n;
+      generation++;
+      const receipt = new BigUint64Array(6);
+      for (;;) {
+        const rc = lib.symbols.raop_stream_cancel_poll(
+          handle,
+          captured,
+          receipt,
+        );
+        if (
+          rc !== 1 || receipt[0] !== captured || receipt[1] !== captured + 1n ||
+          receipt[2] > 3n || receipt[5] > 1n
+        ) throw new Error('Invalid RAOP cancel receipt ABI');
+        if (receipt[2] !== 0n || signal.aborted) {
+          const result = Object.freeze({
+            streamId: id,
+            epoch: receipt[0],
+            nextEpoch: receipt[1],
+            status: signal.aborted
+              ? 'canceled'
+              : (['ready', 'canceled', 'failed'] as const)[
+                Number(receipt[2]) - 1
+              ],
+            cutoffFrames: receipt[5] === 1n ? receipt[3] : null,
+            admittedNs: receipt[4],
+          }) as AirplayCancelResult;
+          return result;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    });
   const readCompletion = async (
     key: AirplayCompletionKey,
   ): Promise<AirplayCompletionResult | null> => {
@@ -950,109 +1051,44 @@ export function createFfiStream(
           r,
         );
         if (rc === 0) return null;
-        const state =
-          (['waiting', 'scheduled', 'failed'] as const)[Number(r[4])];
-        const error = ([
-          'none',
-          'allocation',
-          'encoder',
-          'cipher',
-          'send',
-          'sync',
-          'overdue',
-          'transport',
-        ] as const)[Number(r[5])];
-        if (
-          rc !== 1 || r[0] !== captured || r[1] !== source ||
-          r[2] !== attachment ||
-          !state || !error || (state === 'failed') !== (error !== 'none') ||
-          r[9] > r[8] || r[14] > r[12] ||
-          r[12] + r[13] > r[9]
-        ) {
-          throw new Error('Invalid RAOP progress snapshot ABI');
-        }
-        return Object.freeze({
-          streamId: id,
-          epoch: r[0],
-          source: r[1],
-          attachment: r[2],
-          capturedNs: r[3],
-          status: state,
-          error,
-          participants: r[6],
-          coverageStart: r[7],
-          submittedFrames: r[8],
-          scheduledFrames: r[9],
-          scheduleOriginNs: r[10],
-          fedFrames: r[11],
-          realFrames: r[12],
-          silenceFrames: r[13],
-          sourceFrames: r[14],
-        });
+        if (rc !== 1) throw new Error('Invalid RAOP progress read ABI');
+        return projectProgress(captured, source, attachment, r);
       });
     },
-    cancel(captured, retire = []) {
-      return operations.run(async ({ signal }) => {
+    cancel: (captured, retire = []) => cancel(captured, retire),
+    cancelSource(captured, source, retire = []) {
+      return operations.run(async () => {
+        u64(source);
+        if (!source) {
+          throw new RangeError('RAOP source requires a nonzero identity');
+        }
+        const result = await cancel(captured, retire, source);
+        const r = new BigUint64Array(15);
+        const rc = lib.symbols.raop_stream_cancel_source_poll(
+          handle,
+          captured,
+          source,
+          r,
+        );
         if (
-          typeof captured !== 'bigint' || captured <= 0n ||
-          captured > 0xffffffffffffffffn
+          rc !== 0 && rc !== 1 || (result.cutoffFrames !== null && rc !== 1)
         ) {
-          throw new RangeError(
-            'RAOP cancel requires an unsigned nonzero epoch',
-          );
+          throw new Error('Invalid RAOP source cutoff ABI');
         }
-        for (const id of retire) {
-          if (typeof id !== 'bigint' || id <= 0n || id > 0xffffffffffffffffn) {
-            throw new RangeError(
-              'RAOP retirement requires unsigned nonzero attachment ids',
-            );
-          }
-        }
-        const ids = new BigUint64Array(retire);
+        const progress = rc === 1
+          ? projectProgress(captured, source, 0n, r)
+          : null;
         if (
-          lib.symbols.raop_stream_cancel_v2(
-            handle,
-            captured,
-            ids,
-            BigInt(ids.length),
-          ) !== 0
+          progress && (progress.capturedNs !== result.admittedNs ||
+            progress.scheduledFrames !== result.cutoffFrames)
         ) {
-          throw new Error(
-            'raop_stream_cancel refused stale or unavailable epoch',
-          );
+          throw new Error('RAOP source cutoff disagrees with cancel receipt');
         }
-        epoch = captured + 1n;
-        generation++; // promptly settle transitional blocked writers too
-        const receipt = new BigUint64Array(6);
-        for (;;) {
-          const rc = lib.symbols.raop_stream_cancel_poll(
-            handle,
-            captured,
-            receipt,
-          );
-          if (
-            rc !== 1 || receipt[0] !== captured ||
-            receipt[1] !== captured + 1n ||
-            receipt[2] > 3n || receipt[5] > 1n
-          ) {
-            throw new Error('Invalid RAOP cancel receipt ABI');
-          }
-          if (receipt[2] !== 0n || signal.aborted) {
-            return Object.freeze({
-              streamId: id,
-              epoch: receipt[0],
-              nextEpoch: receipt[1],
-              status: signal.aborted
-                ? 'canceled'
-                : (['ready', 'canceled', 'failed'] as const)[
-                  Number(receipt[2]) - 1
-                ],
-              cutoffFrames: receipt[5] === 1n ? receipt[3] : null,
-              admittedNs: receipt[4],
-            }) as AirplayCancelResult;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 5));
-        }
+        return Object.freeze({
+          ...result,
+          source,
+          progress,
+        }) as AirplaySourceCancelResult;
       });
     },
     ackCancel(captured) {

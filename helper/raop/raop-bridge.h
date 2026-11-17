@@ -16,7 +16,9 @@ int raop_player_range(struct raop_player *, uint64_t index, struct raop_range_sn
 void raop_transport_progress(uint64_t stream_id, uint64_t attachment, uint64_t now_ns,
                               struct raop_progress_snapshot *);
 int raop_player_progress(struct raop_player *, uint64_t source, uint64_t attachment,
-                          struct raop_progress_snapshot *);
+                           struct raop_progress_snapshot *);
+int raop_player_progress_at(struct raop_player *, uint64_t source, uint64_t attachment,
+                            uint64_t captured_ns, struct raop_progress_snapshot *);
 void raop_player_failed(struct raop_player *, uint64_t error);
 void raop_player_failure(struct raop_player *, struct raop_progress_snapshot *);
 int raop_player_completion_progress(struct raop_player *, uint64_t source,

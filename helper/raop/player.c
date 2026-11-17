@@ -94,7 +94,7 @@ struct input_range {
 };
 struct timeline {
   bool enabled, ended, tail_reached, complete;
-  uint64_t accepted, end_target, padding_left;
+  uint64_t accepted, end_target, padding_left, transport_end;
   size_t sources, inputs, next_input, ranges;
   struct source_record source[TIMELINE_MARKERS];
   struct input_range input[TIMELINE_MARKERS];
@@ -375,6 +375,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         size_t silence = TICK_SAMPLES - real;
         if (t->ended && t->next_input == t->inputs && !t->tail_reached) {
           t->tail_reached = true;
+          t->transport_end = transport;
           t->padding_left = (352 - transport % 352) % 352;
         }
         size_t padding = t->padding_left;
@@ -723,11 +724,31 @@ raop_player_failed(struct raop_player *p, uint64_t error)
 
 int
 raop_player_progress(struct raop_player *p, uint64_t source, uint64_t attachment,
-                      struct raop_progress_snapshot *result)
+                       struct raop_progress_snapshot *result)
+{
+  return raop_player_progress_at(p, source, attachment, monotonic_ns(), result);
+}
+
+/* Same range projection for polling and an admitted cancellation. The caller
+ * supplies the original admission time, not the later FLUSH/readiness time. */
+int
+raop_player_progress_at(struct raop_player *p, uint64_t source, uint64_t attachment,
+                        uint64_t captured_ns, struct raop_progress_snapshot *result)
 {
   pthread_mutex_lock(&p->pcm_lock);
-  if (p->failure.error) *result = p->failure;
-  else raop_transport_progress(p->stream_id, attachment, monotonic_ns(), result);
+  if (p->failure.error) {
+    *result = p->failure;
+    /* A dependency may fail after cancel admission but before its loop callback.
+     * Keep failure explicit, but never credit presentation after that cutoff. */
+    if (captured_ns < result->captured_ns) {
+      uint64_t elapsed = captured_ns > result->schedule_origin_ns && result->schedule_origin_ns
+        ? captured_ns - result->schedule_origin_ns : 0;
+      uint64_t frames = elapsed / 1000000000ULL * 44100 +
+                        elapsed % 1000000000ULL * 44100 / 1000000000ULL;
+      if (frames < result->scheduled_frames) result->scheduled_frames = frames;
+    }
+  }
+  else raop_transport_progress(p->stream_id, attachment, captured_ns, result);
   result->source = source;
   result->attachment = attachment;
   result->fed_frames = p->pts_samples;
@@ -918,9 +939,20 @@ void
 raop_player_drain_complete(struct raop_player *p)
 {
   pthread_mutex_lock(&p->pcm_lock);
-  if (p->timeline) p->timeline->complete = true;
+  struct timeline *t = p->timeline;
+  bool ready = t && t->ended && (!t->end_target || p->failure.error);
+  /* A terminal failed cohort is not an ended transport. Its healthy peers must
+   * still receive the queued tail while core observes/revises that receipt.
+   * Keep the exclusive end independently of reclaimable source/range markers. */
+  if (t && t->ended && t->tail_reached && !t->padding_left) {
+    struct raop_progress_snapshot progress;
+    raop_transport_progress(p->stream_id, 0, monotonic_ns(), &progress);
+    if (progress.participants && progress.status == 1 &&
+        progress.scheduled_frames >= t->transport_end) ready = true;
+  }
+  if (ready) t->complete = true;
   pthread_mutex_unlock(&p->pcm_lock);
-  raop_player_session_stopped(p);
+  if (ready) raop_player_session_stopped(p);
 }
 
 /* Loop thread: the start command's item (title/artist/len) and the TXT

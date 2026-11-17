@@ -364,3 +364,22 @@ wait, revision and ack use the existing C1 operation owner. Close first fences
 native input and settles pending results as canceled, then joins all readers and
 waiters before C3 attachment/stream release. Native reader reservations prevent
 raw free from reclaiming queued poll readers. Failed-free quarantine is unchanged.
+
+## Source-cutoff bridge
+
+`raop_stream_cancel_source` adds an identified source projection to the ordered
+cancel boundary. Before the old range ledger is cleared, its real-source frames
+are projected at the captured admission timestamp, excluding underrun/padding/
+drain silence. `raop_stream_cancel_source_poll` retains this immutable observation
+with the existing cancel receipt until its exact epoch ack. Waiting/no-peer and
+failed prefixes remain explicit; failure cannot credit a later presentation time.
+Legacy exact cancel and its transport-cutoff receipt remain unchanged. The lazy
+device owner now forwards timeline ports with the existing operation/release
+lifetime; core public position and end-gate adoption are separate changes.
+
+Failed source receipts do not by themselves finish an ended transport. The pacer
+retains its exclusive final real transport boundary independently of reclaimable
+source markers, and continues healthy queued audio/padding until that scheduled
+boundary passes. A later explicit cohort revision therefore cannot strand an
+unsubmitted healthy tail behind a prematurely stopped pacer. Irreversible epoch
+failure remains explicit and requires ordered cancellation/recovery.
