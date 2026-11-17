@@ -36,6 +36,7 @@ import type {
   AirplayProfile,
   AirplayProgressSnapshot,
   AirplaySourceCancelResult,
+  AirplaySourceCutoff,
   AirplayTimelineStream,
   AirplayTransport,
   HelperEventFn,
@@ -734,7 +735,12 @@ export function createFfiStream(
       sourceFrames: r[14],
     });
   };
-  const cancel = (captured: bigint, retire: readonly bigint[], source = 0n) =>
+  const cancel = (
+    captured: bigint,
+    retire: readonly bigint[],
+    source = 0n,
+    capture?: (cutoff: AirplaySourceCutoff) => void,
+  ) =>
     operations.run(async ({ signal }) => {
       u64(captured, source, ...retire);
       if (!captured || retire.some((id) => !id)) {
@@ -765,6 +771,8 @@ export function createFfiStream(
       epoch = captured + 1n;
       generation++;
       const receipt = new BigUint64Array(6);
+      let capturedSource = false;
+      let captureFailure: { error: unknown } | undefined;
       for (;;) {
         const rc = lib.symbols.raop_stream_cancel_poll(
           handle,
@@ -775,7 +783,45 @@ export function createFfiStream(
           rc !== 1 || receipt[0] !== captured || receipt[1] !== captured + 1n ||
           receipt[2] > 3n || receipt[5] > 1n
         ) throw new Error('Invalid RAOP cancel receipt ABI');
+        if (source && capture && !capturedSource && receipt[5] === 1n) {
+          const r = new BigUint64Array(15);
+          const found = lib.symbols.raop_stream_cancel_source_poll(
+            handle,
+            captured,
+            source,
+            r,
+          );
+          if (found !== 1) {
+            throw new Error('Missing applied RAOP source cutoff');
+          }
+          const progress = projectProgress(captured, source, 0n, r);
+          if (
+            progress.capturedNs !== receipt[4] ||
+            progress.scheduledFrames !== receipt[3]
+          ) {
+            throw new Error('RAOP source cutoff disagrees with applied cancel');
+          }
+          capturedSource = true;
+          // Admission is synchronous, but consumers publish paused intent before
+          // adopting the captured generation. Never invoke capture reentrantly.
+          await Promise.resolve();
+          try {
+            capture(Object.freeze({
+              streamId: id,
+              epoch: captured,
+              nextEpoch: captured + 1n,
+              source,
+              admittedNs: receipt[4],
+              progress,
+            }));
+          } catch (error) {
+            // Keep joining transport readiness even if the consumer rejects its
+            // projection. No callback failure releases or acknowledges native work.
+            captureFailure = { error };
+          }
+        }
         if (receipt[2] !== 0n || signal.aborted) {
+          if (captureFailure) throw captureFailure.error;
           const result = Object.freeze({
             streamId: id,
             epoch: receipt[0],
@@ -1075,13 +1121,13 @@ export function createFfiStream(
       });
     },
     cancel: (captured, retire = []) => cancel(captured, retire),
-    cancelSource(captured, source, retire = []) {
+    cancelSource(captured, source, retire = [], capture) {
       return operations.run(async () => {
         u64(source);
         if (!source) {
           throw new RangeError('RAOP source requires a nonzero identity');
         }
-        const result = await cancel(captured, retire, source);
+        const result = await cancel(captured, retire, source, capture);
         const r = new BigUint64Array(15);
         const rc = lib.symbols.raop_stream_cancel_source_poll(
           handle,

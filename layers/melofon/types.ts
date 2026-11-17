@@ -694,6 +694,7 @@ export interface PlayerPlayback {
     volume: number;
     itemLengthMs: number;
     itemProgressMs: number;
+    playbackRate: number;
     capabilities: { live: boolean; seekable: boolean };
   };
   serverNowPlayingView():

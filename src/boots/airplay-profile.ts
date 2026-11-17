@@ -128,6 +128,7 @@ export interface AirplayTimelineStream extends AirplayExactStream {
     epoch: bigint,
     source: bigint,
     retire?: readonly bigint[],
+    capture?: (cutoff: AirplaySourceCutoff) => void,
   ): Promise<AirplaySourceCancelResult>;
   /** Legacy local reset is refused after timeline admission. Use cancel(epoch)
    * so identities and immutable targets cannot be erased within an epoch. */
@@ -167,6 +168,17 @@ export interface AirplayTimelineStream extends AirplayExactStream {
     exclude: readonly bigint[],
   ): Promise<AirplayCompletionKey>;
   ackCompletion(key: AirplayCompletionKey): Promise<void>;
+}
+/** Immutable local cutoff, observed after admission applies but independently of
+ * remote FLUSH/retirement readiness. Publishing it never permits input or ACK.
+ * The optional capture runs once, asynchronously, inside the owned cancel poll. */
+export interface AirplaySourceCutoff {
+  readonly streamId: bigint;
+  readonly epoch: bigint;
+  readonly nextEpoch: bigint;
+  readonly source: bigint;
+  readonly admittedNs: bigint;
+  readonly progress: AirplayProgressSnapshot;
 }
 export interface AirplaySourceCancelResult extends AirplayCancelResult {
   readonly source: bigint;
@@ -295,6 +307,7 @@ export interface AirplayPlaybackStream extends
     epoch: bigint,
     source: bigint,
     retire?: readonly AirplayTransport[],
+    capture?: (cutoff: AirplaySourceCutoff) => void,
   ): Promise<AirplaySourceCancelResult>;
   /** Transitional callers only; production uses source-labelled append/cancel. */
   pcm(chunk: Uint8Array): Promise<void>;

@@ -331,4 +331,5 @@ export interface PlayerViewRow {
   current: QueueEntryRow | null;
   itemLengthMs: number;
   itemProgressMs: number;
+  playbackRate: number;
 }

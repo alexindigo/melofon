@@ -7,11 +7,11 @@
 // drive this engine; they never hold player state themselves. The engine
 // emits nothing itself — app.playback commands do (core owns the hub).
 //
-// No audio means progress is wall-clock: while state is 'play' the position
-// advances in real time from the last seek/start base, clamped for finite
-// media, unbounded for live sources. An attached source additionally gates
-// completion on EOF and matching native scheduled completion. Engine-only
-// source callers retain their legacy accepted-duration clock. advanceEnded()
+// Physical sinks project only scheduled real-source frames, holding the commanded
+// origin before first presentation and across starvation. Without a physical sink
+// the existing monotonic engine clock remains. Completion requires EOF plus
+// matching native scheduled completion. Engine-only source callers retain their
+// legacy accepted-duration clock. advanceEnded()
 // (driven by the playback core's clock) replays/advances/drops/stops per the
 // repeat/consume modes — "no auto-advance" was fine for a queue-less mirror,
 // it is a lie with boots attached (HA extrapolates past the end).
@@ -119,6 +119,8 @@ export interface PlayerStatus {
   current: QueueEntry | null;
   itemLengthMs: number;
   itemProgressMs: number;
+  /** Observed source progress, not playback intent. Zero during sink buffering. */
+  playbackRate: number;
   /** Retained engine clock facts, absent when stopped. A restored run's
    * historical start is unknown; reportedAtMs is the observed transition,
    * never the time of a status read. Progress still uses a monotonic clock. */
@@ -146,9 +148,13 @@ export interface PlayerStateSnapshot {
  * 1 Hz position tick while playing). */
 export interface PlayerPersistence {
   /** Atomically save occurrence references/allocator/revision and bookmark. */
-  saveQueue(snapshot: QueueSnapshot, state: PlayerStateSnapshot): void;
+  saveQueue(
+    snapshot: QueueSnapshot,
+    state: PlayerStateSnapshot,
+    position?: Promise<number>,
+  ): void;
   /** Upsert this player's state row (updated_at = now). */
-  saveState(snapshot: PlayerStateSnapshot): void;
+  saveState(snapshot: PlayerStateSnapshot, position?: Promise<number>): void;
   /** Operator command time, separate from periodic position bookmarks. */
   saveCommand?(atMs: number): void;
   /** Player slider, independent of the playback bookmark and speaker levels. */
@@ -277,6 +283,13 @@ export interface Player {
   cancelSource(source: PlaybackSource): void;
   sourceComplete(source: PlaybackSource): boolean;
   sourceCompatibilityRemaining(source: PlaybackSource): number;
+  sourcePosition(
+    source: PlaybackSource,
+    positionMs: number,
+    playbackRate: number,
+  ): boolean;
+  /** Only the captured paused incarnation may adopt an asynchronous cutoff. */
+  freezePosition(generation: number, positionMs: number): boolean;
   /** Accepted PCM duration, reported after the sink write resolves. */
   sourceAudio(source: PlaybackSource, durationMs: number): boolean;
   sourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
@@ -509,6 +522,8 @@ export function createPlayer(options: {
   let generation = 0, sourceGeneration = 0;
   const sinks = new Set<object>();
   let sinkRequired = false;
+  let scheduledProgressMs: number | null = null;
+  let playbackRate = 0;
   let deliveredGeneration = -1;
   let source: {
     token: PlaybackSource;
@@ -520,6 +535,7 @@ export function createPlayer(options: {
   const cancelSource = () => {
     const old = source;
     source = null;
+    playbackRate = 0;
     if (old) {
       items = items.map((entry) => {
         if (
@@ -541,6 +557,8 @@ export function createPlayer(options: {
     generation++;
     cancelSource();
     sinkRequired = sinks.size > 0;
+    scheduledProgressMs = null;
+    playbackRate = 0;
   };
   const anchor = (restart = false) => {
     const at = now();
@@ -556,6 +574,7 @@ export function createPlayer(options: {
   const progressMs = (): number => {
     const entry = currentEntry();
     if (entry === null) return 0;
+    if (sinkRequired) return scheduledProgressMs ?? baseProgressMs;
     const length = queueDuration(entry);
     const elapsed = state === 'play'
       ? baseProgressMs + (monotonicNow() - startedAt)
@@ -686,6 +705,7 @@ export function createPlayer(options: {
         current: entry,
         itemLengthMs: entry === null ? 0 : queueDuration(entry) ?? 0,
         itemProgressMs: state === 'stop' ? 0 : progressMs(),
+        playbackRate: state !== 'play' ? 0 : sinkRequired ? playbackRate : 1,
         clock: clock === null ? null : { ...clock },
         generation,
         capabilities: queueCapabilities(entry),
@@ -733,6 +753,26 @@ export function createPlayer(options: {
       return length > 0
         ? Math.max(0, length - baseProgressMs - (monotonicNow() - startedAt))
         : 0;
+    },
+    sourcePosition(token, positionMs, rate) {
+      if (
+        source?.token !== token || token.signal.aborted || !sinkRequired ||
+        !Number.isSafeInteger(positionMs) || positionMs < 0
+      ) return false;
+      scheduledProgressMs = positionMs;
+      playbackRate = rate;
+      if (clock) clock = { ...clock, reportedAtMs: now() };
+      return true;
+    },
+    freezePosition(expectedGeneration, positionMs) {
+      if (
+        generation !== expectedGeneration || state !== 'pause' ||
+        !Number.isSafeInteger(positionMs) || positionMs < 0
+      ) return false;
+      baseProgressMs = positionMs;
+      scheduledProgressMs = positionMs;
+      playbackRate = 0;
+      return true;
     },
     sourceAudio(token, durationMs) {
       if (
@@ -1011,11 +1051,9 @@ export function createPlayer(options: {
         return;
       }
       currentIndex = Math.min(Math.max(0, index), items.length - 1);
-      const length = queueDuration(items[currentIndex]) ?? 0;
-      baseProgressMs = Math.min(
-        Math.max(0, Math.round(snapshot.positionMs)),
-        length,
-      );
+      // A declared catalog duration is not an upper bound on decoded media.
+      // Keep the saved native bookmark even for longer/unknown decodes.
+      baseProgressMs = Math.max(0, Math.round(snapshot.positionMs));
       startedAt = monotonicNow();
       state = snapshot.state;
       // The snapshot stores position/state, not the original start time.

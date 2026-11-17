@@ -229,9 +229,9 @@ export function createAirplayDevices(deps: {
         operations.run(() => timeline().reviseCompletion(...args)),
       ackCompletion: (key) =>
         operations.run(() => timeline().ackCompletion(key)),
-      cancelSource: (epoch, source, retire = []) =>
+      cancelSource: (epoch, source, retire = [], capture) =>
         cancelable(() =>
-          timeline().cancelSource(epoch, source, retirementIds(retire))
+          timeline().cancelSource(epoch, source, retirementIds(retire), capture)
         ),
       pcm: (chunk: Uint8Array) => operations.run(() => acquire().pcm(chunk)),
       cancelPcm: () => native?.cancelPcm(),

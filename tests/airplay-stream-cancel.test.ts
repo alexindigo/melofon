@@ -92,6 +92,8 @@ async function scenario(
   const appends: { bytes: Uint8Array; receipt: AirplayAppendResult }[] = [];
   const cancels: { epoch: bigint; retire: readonly bigint[] }[] = [];
   const acknowledgments: bigint[] = [];
+  const cancelAck = Promise.withResolvers<void>();
+  let attachmentCount = 0;
   const completedAudio = traceTimelineAudio(createFfiStream);
   let ids: string[] = [];
   try {
@@ -127,6 +129,33 @@ async function scenario(
             get epoch() {
               return native.epoch;
             },
+            attach(...args: Parameters<typeof native.attach>) {
+              const attached = native.attach(...args);
+              const first = ++attachmentCount === 1;
+              const transport = attached.transport;
+              return {
+                ...attached,
+                transport: {
+                  send: transport.send.bind(transport),
+                  pcm: transport.pcm.bind(transport),
+                  ownsSharedFeed: transport.ownsSharedFeed.bind(transport),
+                  cancelPcm: transport.cancelPcm.bind(transport),
+                  async close() {
+                    await transport.close();
+                    if (
+                      first && strategy !== 'owntone' && mode === 'replace'
+                    ) {
+                      await cancelAck.promise;
+                      // Drain ACK/reset microtasks before publishing attachment
+                      // retirement. This forces the formerly racy empty-set gap.
+                      await new Promise<void>((resolve) =>
+                        setTimeout(resolve, 0)
+                      );
+                    }
+                  },
+                },
+              };
+            },
             async appendSource(
               input: Parameters<
                 ReturnType<typeof createFfiStream>['appendSource']
@@ -149,6 +178,7 @@ async function scenario(
             async ackCancel(epoch) {
               await native.ackCancel(epoch);
               acknowledgments.push(epoch);
+              cancelAck.resolve();
             },
             pcm() {
               throw new Error('production must use exact append');
@@ -292,6 +322,11 @@ async function scenario(
       await until(() => appends.some((a) => a.receipt.acceptedFrames === 351n));
       const b = appends.find((a) => a.receipt.acceptedFrames === 351n)!;
       assertEquals(b.bytes, replacement.subarray(0, 351 * 4));
+      assertEquals(
+        b.receipt.streamId,
+        appends[0].receipt.streamId,
+        'attachment replacement retains the player stream',
+      );
       assertEquals(b.receipt.epoch, BigInt(cancels.length + 1));
       const session = receiver.sessions.at(-1)!;
       // Timeline starvation can packetize the 351-frame prefix with labelled
@@ -383,6 +418,7 @@ async function scenario(
   } finally {
     flush.resolve();
     tail.resolve();
+    cancelAck.resolve();
     await boot?.close();
     devices?.close();
     await playback?.close();

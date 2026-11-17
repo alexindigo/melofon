@@ -157,11 +157,46 @@ export function recordingStream(
         sources.delete(key.source);
         return Promise.resolve();
       },
-      cancelSource: async (captured, source, retire) => ({
-        ...await api.cancel(captured, retire),
-        source,
-        progress: null,
-      }),
+      async cancelSource(captured, source, retire, capture) {
+        const ready = api.cancel(captured, retire);
+        const cutoff = {
+          streamId: id,
+          epoch: captured,
+          nextEpoch: captured + 1n,
+          admittedNs: 0n,
+          source,
+          // This lifecycle recorder has no presentation schedule. Its explicit
+          // unobserved zero prefix is not accepted PCM masquerading as playback.
+          progress: {
+            streamId: id,
+            epoch: captured,
+            source,
+            attachment: 0n,
+            capturedNs: 0n,
+            status: 'waiting' as const,
+            error: 'none' as const,
+            participants: 0n,
+            coverageStart: 0n,
+            submittedFrames: 0n,
+            scheduledFrames: 0n,
+            scheduleOriginNs: 0n,
+            fedFrames: 0n,
+            realFrames: 0n,
+            silenceFrames: 0n,
+            sourceFrames: 0n,
+          },
+        };
+        await Promise.resolve();
+        let failure: { error: unknown } | undefined;
+        try {
+          capture?.(cutoff);
+        } catch (error) {
+          failure = { error };
+        }
+        const result = await ready;
+        if (failure) throw failure.error;
+        return { ...result, source, progress: cutoff.progress };
+      },
       async cancel(captured, retire = []) {
         if (epoch !== captured) throw new Error('stale fixture epoch');
         epoch++;

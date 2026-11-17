@@ -586,6 +586,9 @@ Deno.test('cold OwnTone ICY radio announces, restores at live edge with no-op se
       ws.snapshots.some((q) => q.items[0]?.album === 'Epoch 0 B')
     );
     assertEquals((await t.queue()).items[0].title, 'House radio');
+    // Arrival/read-ahead metadata is not scheduled playback. Establish the
+    // nonzero old position that the reset assertion below compares against.
+    await eventually(async () => (await t.player()).item_progress_ms > 0);
     epoch = 1;
     const restored = await announce(
       t,

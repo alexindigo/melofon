@@ -380,7 +380,8 @@ export async function createPlayers(deps: {
     queueCopied: (...args) => current().queueCopied(...args),
     queueImport: (...args) => current().queueImport(...args),
     advanceEnded: () => current().advanceEnded(),
-    attachSink: () => current().attachSink(),
+    attachSink: (...args) => current().attachSink(...args),
+    sourceProgress: (...args) => current().sourceProgress(...args),
     bindSource: (...args) => current().bindSource(...args),
     sealSource: (...args) => current().sealSource(...args),
     sourceCompatibilityRemaining: (...args) =>

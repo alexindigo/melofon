@@ -45,6 +45,8 @@ import { planSourceFailure } from './source-recovery.ts';
 import {
   createPlaybackTimeline,
   type TimelineCompletion,
+  type TimelineCutoff,
+  type TimelineProgress,
   type TimelineSource,
 } from './playback-timeline.ts';
 import {
@@ -75,6 +77,16 @@ import type {
 export interface PlaybackAuthority {
   signal: AbortSignal;
   isCurrent(): boolean;
+}
+
+/** Injected sink control. Admission fences input synchronously; its immutable
+ * source projection may settle after intent publication, never from a JS clock. */
+export interface PlaybackSink {
+  cutoff(
+    source: TimelineSource,
+    intent: 'pause' | 'stop',
+    commit: (cutoff: TimelineCutoff) => void,
+  ): Promise<void> | null;
 }
 
 type PlannedOccurrence =
@@ -210,7 +222,7 @@ export interface Playback {
    * Emits player (+queue when consume dropped the finished item). */
   advanceEnded(): void | Promise<void>;
   /** Elected boot source lifetime; engine transitions synchronously revoke it. */
-  attachSink(): () => void;
+  attachSink(sink?: PlaybackSink): () => void;
   openSource(entryId: number, generation: number): PlaybackSource | null;
   bindSource(
     source: PlaybackSource,
@@ -218,6 +230,7 @@ export interface Playback {
     epoch: bigint,
   ): TimelineSource | null;
   sealSource(source: PlaybackSource, target: bigint): boolean;
+  sourceProgress(source: PlaybackSource, progress: TimelineProgress): boolean;
   sourceCompatibilityRemaining(source: PlaybackSource): number;
   /** Resolves after this source's matching core transition/cancellation commits,
    * not when the receipt is first observed. The boot can then acknowledge it. */
@@ -313,6 +326,9 @@ export function createPlayback(deps: {
   const operations = createOperationScope('Player');
   const timeline = createPlaybackTimeline();
   const timelineSources = new WeakMap<PlaybackSource, TimelineSource>();
+  const sinks = new Set<PlaybackSink>();
+  let cutting: TimelineSource | undefined;
+  let bookmark: { generation: number; position: Promise<number> } | undefined;
   let closeWork: Promise<void> | undefined;
   let activeReservation: PlaybackReservation | undefined;
   const needsCapacity = () =>
@@ -440,7 +456,7 @@ export function createPlayback(deps: {
       startedAtMs: status.clock.startedAtMs,
       reportedAtMs: status.clock.reportedAtMs,
       state: status.state === 'play' ? 'playing' : 'paused',
-      playbackRate: 1,
+      playbackRate: status.playbackRate,
     };
   };
   let serverPresent = hasServerRow();
@@ -520,24 +536,31 @@ export function createPlayback(deps: {
         (deps.resolveQueueReference &&
             candidate.media.reference.kind === 'station' ||
           needsPreparation(candidate.media));
-      if (!starts || !deps.targets && !needsResolution) {
+      const pendingBookmark =
+        bookmark?.generation === player.status().generation
+          ? bookmark.position
+          : undefined;
+      if ((!starts || !deps.targets && !needsResolution) && !pendingBookmark) {
         const reservation = reserveStart(starts);
         try {
-          return commitStart(reservation, () =>
-            commit(() => {}, (media) => media));
+          return commitStart(
+            reservation,
+            () => commit(() => {}, (media) => media),
+          );
         } finally {
           reservation?.release();
         }
       }
       const controller = new AbortController();
       const reservation = reserveStart(starts, controller);
-      const abort = () =>
-        controller.abort();
+      const abort = () => controller.abort();
       operation.signal.addEventListener('abort', abort, { once: true });
       authority?.signal.addEventListener('abort', abort, { once: true });
       command.signal.addEventListener('abort', abort, { once: true });
       pendingStart = command;
       const prepare = async () => {
+        await pendingBookmark;
+        if (!current() || controller.signal.aborted) throw cancelled();
         let selected:
           | { occurrence: PlannedOccurrence; media: QueueMedia }
           | null
@@ -567,7 +590,7 @@ export function createPlayback(deps: {
             if (activation.wrap) index = (index + items.length) % items.length;
           }
         }
-        if (selected !== null) {
+        if (starts && selected !== null) {
           await deps.targets?.preparePlayback(controller.signal);
         }
         return selected;
@@ -655,7 +678,7 @@ export function createPlayback(deps: {
         !deps.targets.hasPlaybackTarget()
       ) {
         cancelStart();
-        player.pause();
+        pauseAtCutoff();
         record('pause', undefined, {
           kind: 'internal',
           via: 'playback-target-loss',
@@ -722,9 +745,60 @@ export function createPlayback(deps: {
       consume: status.consume,
     };
   };
+  const bookmarkPosition = () =>
+    bookmark?.generation === player.status().generation
+      ? bookmark.position
+      : undefined;
   const flushQueue = () =>
-    persistence?.saveQueue(player.queueSnapshot(), stateSnapshot());
-  const flushState = () => persistence?.saveState(stateSnapshot());
+    persistence?.saveQueue(
+      player.queueSnapshot(),
+      stateSnapshot(),
+      bookmarkPosition(),
+    );
+  const flushState = () =>
+    persistence?.saveState(stateSnapshot(), bookmarkPosition());
+  // All explicit and induced pauses share the same capture. The engine publishes
+  // intent immediately; saves capture this command's immutable position receipt
+  // in their existing ordered batch, including membership publications.
+  const pauseAtCutoff = (intent: 'pause' | 'stop' = 'pause') => {
+    const view = player.status();
+    const source = openedSource;
+    const mapping = source ? timelineSources.get(source) : undefined;
+    let cutoff: Promise<void> | null = null;
+    let generation = view.generation;
+    let positionMs = view.itemProgressMs;
+    if (view.state === 'play' && mapping) {
+      for (const sink of sinks) {
+        cutoff = sink.cutoff(mapping, intent, (result) => {
+          if (!timeline.cancel(mapping, result)) {
+            throw new Error('Native source cutoff did not match its bookmark');
+          }
+          positionMs = timeline.position(mapping)!.positionMs;
+          player.freezePosition(generation, positionMs);
+          timeline.retire(mapping);
+        });
+        if (cutoff) break;
+      }
+    }
+    cutting = cutoff ? mapping : undefined;
+    player.pause();
+    cutting = undefined;
+    if (!cutoff || !mapping) return;
+    generation = player.status().generation;
+    const position = operations.run(async () => {
+      await cutoff;
+      timeline.retire(mapping);
+      return positionMs;
+    });
+    bookmark = { generation, position };
+    void position.catch((error) =>
+      log.event('media_failed', {
+        operation: 'source-cutoff',
+        path: String(mapping.entryId),
+        error,
+      })
+    );
+  };
   const checkVersion = (expectedVersion?: number) => {
     if (
       expectedVersion !== undefined &&
@@ -1058,7 +1132,7 @@ export function createPlayback(deps: {
           reason: 'activation-failed',
           attempts: recoveryForRun().attempts,
         });
-        player.pause();
+        pauseAtCutoff();
         record(
           'pause',
           undefined,
@@ -1079,9 +1153,14 @@ export function createPlayback(deps: {
     }
   };
   return {
-    attachSink() {
+    attachSink(sink) {
       requireOpen();
-      return player.attachSink();
+      if (sink) sinks.add(sink);
+      const detach = player.attachSink();
+      return () => {
+        if (sink) sinks.delete(sink);
+        detach();
+      };
     },
     bindSource(source, streamId, epoch) {
       if (!ownsSource(source) || timelineSources.has(source)) return null;
@@ -1093,10 +1172,34 @@ export function createPlayback(deps: {
         originMs: source.startMs,
       });
       timelineSources.set(source, mapping);
-      source.signal.addEventListener('abort', () => timeline.retire(mapping), {
-        once: true,
-      });
+      const generation = player.status().generation;
+      source.signal.addEventListener('abort', () => {
+        // Reader cleanup does not retire the sink's run-wide bookmark authority.
+        if (
+          cutting !== mapping &&
+          (operations.closed || player.status().generation !== generation)
+        ) {
+          timeline.retire(mapping);
+        }
+      }, { once: true });
       return mapping;
+    },
+    sourceProgress(source, progress) {
+      const mapping = timelineSources.get(source);
+      if (!ownsSource(source) || !mapping) return false;
+      const previous = timeline.position(mapping)!;
+      if (!timeline.observe(mapping, progress)) return false;
+      const rate = player.status().playbackRate;
+      const accepted = player.sourcePosition(
+        source,
+        timeline.position(mapping)!.positionMs,
+        progress.status === 'scheduled' &&
+          progress.sourceFrames > previous.sourceFrames
+          ? 1
+          : 0,
+      );
+      if (accepted && rate !== player.status().playbackRate) emit(['player']);
+      return accepted;
     },
     sealSource(source, target) {
       const mapping = timelineSources.get(source);
@@ -1132,11 +1235,13 @@ export function createPlayback(deps: {
     cancelSource(source) {
       if (operations.closed) return;
       const version = player.queue().version;
+      const rate = player.status().playbackRate;
       player.cancelSource(source);
       if (player.queue().version !== version) {
         flushQueue();
         emit(['queue', 'nowPlaying']);
       }
+      if (rate !== player.status().playbackRate) emit(['player']);
     },
     sourceAudio(source, durationMs) {
       if (operations.closed) return;
@@ -1215,7 +1320,7 @@ export function createPlayback(deps: {
           void advanceFailedSource();
           return true;
         }
-        player.pause();
+        pauseAtCutoff();
         record(
           'pause',
           undefined,
@@ -1257,7 +1362,7 @@ export function createPlayback(deps: {
     pause(source) {
       requireOpen();
       submitCommand();
-      player.pause();
+      pauseAtCutoff();
       record('pause', undefined, source, 'pause');
       flushState();
       emit(['player']);
@@ -1267,13 +1372,22 @@ export function createPlayback(deps: {
       submitCommand();
       // Explicit stop releases transport intent, not the bookmark. Engine stop
       // remains the terminal operation for exhaustion and end-of-queue.
-      player.pause();
+      pauseAtCutoff('stop');
       record('stop', undefined, source, 'stop');
       flushState();
       emit(['player']);
     },
     toggle(source) {
       const view = player.status();
+      if (view.state === 'play') {
+        requireOpen();
+        submitCommand();
+        pauseAtCutoff();
+        record('toggle', undefined, source, 'pause');
+        flushState();
+        emit(['player']);
+        return;
+      }
       const index = view.current
         ? player.queue().items.findIndex((e) => e.id === view.current!.id)
         : 0;
@@ -1818,7 +1932,7 @@ export function createPlayback(deps: {
             !operations.closed && player.status().state === 'play' &&
             !pendingStart
           ) {
-            player.pause();
+            pauseAtCutoff();
             record('pause', undefined, {
               kind: 'internal',
               via: 'playback-target-loss',
@@ -1930,13 +2044,15 @@ export function createPlayback(deps: {
       activeReservation = undefined;
       // Revoke a parked source even if its boot is being closed separately.
       if (openedSource) player.cancelSource(openedSource);
-      timeline.close();
       unsubscribeOutputs?.();
       if (tick !== null) clearInterval(tick);
       void Promise.all([
         settled,
         deps.reports === undefined ? reports.close() : undefined,
-      ]).then(() => completion.resolve(), completion.reject);
+      ]).then(() => {
+        timeline.close();
+        completion.resolve();
+      }, completion.reject);
       return closeWork;
     },
   };

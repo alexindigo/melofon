@@ -1,11 +1,12 @@
 // Core and real lazy device owner -> shipping native timeline -> independent
-// scheduled UDP/ALAC consumer. Public position/bookmarks remain b05c.
+// scheduled UDP/ALAC consumer, including public position and command bookmarks.
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createPlaybackTimeline } from '../src/playback-timeline.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
 import { createFfiStream, raopFfiInternals } from '../src/boots/raop-ffi.ts';
 import type {
   AirplayCompletionKey,
+  AirplaySourceCutoff,
   AirplayTimelineStream,
   AirplayTransport,
 } from '../src/boots/airplay-profile.ts';
@@ -170,6 +171,624 @@ const origin = {
   originMs: 5000,
 };
 
+function renderedRealFrames(
+  f: Awaited<ReturnType<typeof nativeHttpFixture>>,
+  at = f.receiver.nowMs(),
+) {
+  const replay = renderScheduledAudio(f.receiver.sessions[0], at);
+  assertEquals(replay.issues, []);
+  const v = new DataView(
+    replay.pcm.buffer,
+    replay.pcm.byteOffset,
+    replay.pcm.byteLength,
+  );
+  let frames = 0;
+  for (let i = 0; i < replay.pcm.length; i += 4) {
+    if (v.getInt16(i, true) || v.getInt16(i + 2, true)) frames++;
+  }
+  return { frames, uncertainty: replay.clockUncertaintyMs ?? 0 };
+}
+
+test('cold HTTP position and reports hold the origin through delayed acquisition', async () => {
+  const acquisition = Promise.withResolvers<void>();
+  const f = await nativeHttpFixture({
+    pcm: pcm(44100 * 5),
+    acquisition: acquisition.promise,
+  });
+  try {
+    await f.play();
+    await until('reader acquisition', () => f.opens === 1);
+    await sleep(600);
+    const own = await f.own('/player');
+    assertEquals(own.item_progress_ms, 0);
+    assertEquals(f.playback.serverNowPlayingView()!.playbackRate, 0);
+    const { credential } = await f.fixture.login('bearer');
+    const response = await f.fixture.get('/api/v1/players/1', credential);
+    assertEquals(response.status, 200);
+    const { player: native } = await response.json();
+    assertEquals(native.positionMs, 0);
+    assertEquals(native.current.playbackRate, 0);
+    acquisition.resolve();
+    await until(
+      'first scheduled source position',
+      () => f.playback.playerView().itemProgressMs > 50,
+    );
+    const view = await f.own('/player');
+    const rendered = renderedRealFrames(f);
+    assert(
+      view.item_progress_ms <=
+        rendered.frames * 1000 / 44100 + rendered.uncertainty,
+    );
+    assert(
+      view.item_progress_ms < 1000,
+      'preparation/receiver lead is not media progress',
+    );
+    await libraryProof();
+  } finally {
+    acquisition.resolve();
+    await f.close();
+  }
+});
+
+test('cold HTTP starvation freezes public progress and playbackRate at rendered real frames', async () => {
+  const afterFirstChunk = Promise.withResolvers<void>();
+  const f = await nativeHttpFixture({
+    pcm: pcm(44100 * 5),
+    afterFirstChunk: afterFirstChunk.promise,
+  });
+  try {
+    await f.play();
+    await until('scheduled first real chunk', () => {
+      if (!f.native || !f.token) return false;
+      const p = f.playback.playerView();
+      return p.itemProgressMs > 0 && p.playbackRate === 0;
+    });
+    const first = await f.own('/player');
+    await sleep(500);
+    const second = await f.own('/player');
+    assertEquals(second.item_progress_ms, first.item_progress_ms);
+    assertEquals(f.playback.serverNowPlayingView()!.playbackRate, 0);
+    const rendered = renderedRealFrames(f);
+    assertEquals(
+      second.item_progress_ms,
+      Math.floor(rendered.frames * 1000 / 44100),
+    );
+    afterFirstChunk.resolve();
+    await until(
+      'real progress resumes',
+      () => f.playback.playerView().itemProgressMs > second.item_progress_ms,
+    );
+    await libraryProof();
+  } finally {
+    afterFirstChunk.resolve();
+    await f.close();
+  }
+});
+
+test('cold HTTP Stop saves the atomic scheduled cutoff, releases speakers and Play restores the bookmark', async () => {
+  const f = await nativeHttpFixture({ pcm: pcm(44100 * 10), persist: true });
+  try {
+    await f.play();
+    await until(
+      'audible prefix',
+      () => f.playback.playerView().itemProgressMs > 250,
+    );
+    const before = f.playback.playerView().itemProgressMs;
+    await f.own('/player/stop', 'PUT');
+    assertEquals(f.playback.playerView().state, 'pause');
+    await until(
+      'source cutoff and speaker release',
+      () =>
+        f.cutoffs.length === 1 && f.receiver.sessions[0].closedAtMs !== null,
+    );
+    const cutoff = f.cutoffs[0];
+    assert(cutoff.progress);
+    const expected = Math.floor(
+      Number(cutoff.progress.sourceFrames) * 1000 / 44100,
+    );
+    assert(
+      expected >= before && expected < 1500,
+      'accepted/read frames are not the bookmark',
+    );
+    assertEquals(f.playback.playerView().itemProgressMs, expected);
+    assertEquals((await f.saved())!.positionMs, expected);
+    await sleep(300);
+    assertEquals((await f.own('/player')).item_progress_ms, expected);
+    const rendered = renderedRealFrames(f);
+    const { before: lowAt, after: highAt } = f.cancelTimes[0];
+    const low = renderedRealFrames(f, lowAt - rendered.uncertainty).frames;
+    const high = renderedRealFrames(f, highAt + rendered.uncertainty).frames;
+    assert(
+      Number(cutoff.progress.sourceFrames) >= low &&
+        Number(cutoff.progress.sourceFrames) <= high,
+      `cutoff agrees with independently rendered wire schedule ${low}..${high}`,
+    );
+    await f.own('/player/play', 'PUT');
+    await until('reopened source at bookmark', () => f.origins.length === 2);
+    assertEquals(f.origins[1], expected);
+    assertEquals((await f.own('/player')).item_progress_ms, expected);
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
+test('cold HTTP held Pause commits admission cutoff before save, not delayed FLUSH readiness', async () => {
+  const flush = Promise.withResolvers<void>();
+  const f = await nativeHttpFixture({
+    pcm: pcm(44100 * 10),
+    persist: true,
+    receiver: { beforeFlushReply: () => flush.promise },
+  });
+  try {
+    await f.play();
+    await until(
+      'scheduled prefix',
+      () => f.playback.playerView().itemProgressMs > 100,
+    );
+    await f.own('/player/pause', 'PUT');
+    assertEquals(f.playback.playerView().state, 'pause');
+    await until('FLUSH held', () => f.receiver.sessions[0].flushes === 1);
+    const provisional = f.playback.playerView().itemProgressMs;
+    await until(
+      'cutoff captured before readiness',
+      () => f.capturedCutoffs.length === 1,
+    );
+    const cutoff = f.capturedCutoffs[0];
+    const expected = Math.floor(
+      Number(cutoff.progress.sourceFrames) * 1000 / 44100,
+    );
+    await sleep(350);
+    assertEquals(f.cutoffs.length, 0);
+    assertEquals(f.cancelAcks.length, 0);
+    assertEquals(f.playback.playerView().itemProgressMs, expected);
+    await f.saved();
+    const stored = await f.fixture.store.playback.loadPlayerState(1);
+    assertEquals(
+      stored!.state,
+      'pause',
+      'atomic cutoff saves without waiting for remote readiness',
+    );
+    assertEquals(stored!.positionMs, expected);
+    flush.resolve();
+    await until('ready cancellation', () => f.cutoffs.length === 1);
+    const saved = await f.saved();
+    assertEquals(f.cutoffs[0].progress, cutoff.progress);
+    assertEquals(saved!.positionMs, expected);
+    assertEquals(saved!.state, 'pause');
+    assertEquals((await f.own('/player')).item_progress_ms, expected);
+    assert(
+      expected < provisional + 350,
+      'held readiness cannot advance the bookmark',
+    );
+    await f.own('/player/play', 'PUT');
+    await until('resume source', () => f.origins.length === 2);
+    assertEquals(f.origins[1], expected);
+    await libraryProof();
+  } finally {
+    flush.resolve();
+    await f.close();
+  }
+});
+
+test('cold HTTP native previous and restart remain distinct from OwnTone scheduled threshold', async () => {
+  const f = await nativeHttpFixture({ pcm: pcm(44100 * 10) });
+  try {
+    await f.play();
+    await f.play(false);
+    const { credential } = await f.fixture.login('bearer');
+    const command = async (kind: string, body: unknown = {}) => {
+      const r = await f.fixture.json(
+        `/api/v1/players/1/${kind}`,
+        'POST',
+        body,
+        credential,
+      );
+      assertEquals(r.status, 204, await r.text());
+    };
+    const entries = f.playback.queueView().items;
+    await command('next');
+    await command('seek', { positionMs: 4000 });
+    assertEquals(f.playback.playerView().current!.id, entries[1].id);
+    await command('previous');
+    assertEquals(f.playback.playerView().current!.id, entries[0].id);
+    await command('next');
+    await command('seek', { positionMs: 4000 });
+    await f.own('/player/previous', 'PUT');
+    assertEquals(
+      f.playback.playerView().current!.id,
+      entries[1].id,
+      'OwnTone >3000 restarts current',
+    );
+    assertEquals(f.playback.playerView().itemProgressMs, 0);
+    await f.own('/player/previous', 'PUT');
+    assertEquals(
+      f.playback.playerView().current!.id,
+      entries[0].id,
+      'OwnTone <=3000 moves to previous',
+    );
+    await command('pause');
+    await command('restart');
+    assertEquals(f.playback.playerView().state, 'pause');
+    assertEquals(f.playback.playerView().itemProgressMs, 0);
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
+test('cold HTTP last-target loss uses the same atomic scheduled bookmark as Pause', async () => {
+  const f = await nativeHttpFixture({
+    pcm: pcm(44100 * 10),
+    persist: true,
+    targetChecks: true,
+  });
+  try {
+    await f.play();
+    await until(
+      'scheduled prefix before target loss',
+      () => f.playback.playerView().itemProgressMs > 100,
+    );
+    await f.own('/outputs/1', 'PUT', { selected: false });
+    assertEquals(f.playback.playerView().state, 'pause');
+    await until('target-loss cutoff', () => f.cutoffs.length === 1);
+    const saved = await f.saved(), cutoff = f.cutoffs[0];
+    assert(cutoff.progress);
+    const expected = Math.floor(
+      Number(cutoff.progress.sourceFrames) * 1000 / 44100,
+    );
+    assertEquals(saved!.positionMs, expected);
+    assertEquals((await f.own('/player')).item_progress_ms, expected);
+    assertEquals(f.playback.lastCommand()!.source.via, 'playback-target-loss');
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
+test('cold HTTP newer same-entry seek supersedes a command waiting on an old Pause cutoff', async () => {
+  const flush = Promise.withResolvers<void>();
+  const capture = Promise.withResolvers<void>();
+  let latestAdmitted = false;
+  const f = await nativeHttpFixture({
+    pcm: pcm(44100 * 12),
+    persist: true,
+    cutoffCapture: capture.promise,
+    seekAdmitted: (positionMs) => {
+      if (positionMs === 6000) latestAdmitted = true;
+    },
+    receiver: { beforeFlushReply: () => flush.promise },
+  });
+  try {
+    await f.play();
+    await until(
+      'scheduled prefix before seek race',
+      () => f.playback.playerView().itemProgressMs > 100,
+    );
+    await f.own('/player/pause', 'PUT');
+    await until(
+      'old source FLUSH held',
+      () => f.receiver.sessions[0].flushes === 1,
+    );
+    await until('old atomic cutoff held', () => f.capturedCutoffs.length === 1);
+    const entry = f.playback.playerView().current!.id;
+    let oldSettled = false;
+    const stale = Promise.resolve(f.playback.seek({ positionMs: 4000 })).then(
+      () => 'published',
+      () => 'canceled',
+    ).finally(() => oldSettled = true);
+    const latest = f.own('/player/seek?position_ms=6000', 'PUT');
+    await until('newer HTTP seek admitted', () => latestAdmitted);
+    assertEquals(
+      oldSettled,
+      false,
+      'older seek is still waiting on its captured bookmark',
+    );
+    capture.resolve();
+    flush.resolve();
+    await latest;
+    assertEquals(await stale, 'canceled');
+    await until(
+      'new source starts at latest origin',
+      () => f.origins.length === 2,
+    );
+    assertEquals(f.origins[1], 6000);
+    assertEquals(f.playback.playerView().current!.id, entry);
+    assertEquals((await f.own('/player')).item_progress_ms, 6000);
+    assertEquals((await f.saved())!.positionMs, 6000);
+    await sleep(200);
+    assertEquals(
+      (await f.own('/player')).item_progress_ms,
+      6000,
+      'old receipt cannot change a same-entry new incarnation',
+    );
+    await libraryProof();
+  } finally {
+    capture.resolve();
+    flush.resolve();
+    await f.close();
+  }
+});
+
+test('membership save batch retains its atomic source cutoff through a failed save and retry', async () => {
+  const flush = Promise.withResolvers<void>();
+  const f = await nativeHttpFixture({
+    pcm: pcm(44100 * 10),
+    persist: true,
+    targetChecks: true,
+    receiver: { beforeFlushReply: () => flush.promise },
+  });
+  const original = f.fixture.store.players.saveChanges;
+  try {
+    await f.play();
+    await until(
+      'source before membership publication',
+      () => f.playback.playerView().itemProgressMs > 100,
+    );
+    await f.saved();
+    let fail = true;
+    const attempts: number[] = [];
+    f.fixture.store.players.saveChanges = (changes) => {
+      if (changes.outputs?.length && changes.players?.some((p) => p.state)) {
+        attempts.push(changes.players.find((p) => p.state)!.state!.positionMs);
+        if (fail) {
+          fail = false;
+          return Promise.reject(new Error('injected membership save failure'));
+        }
+      }
+      return original(changes);
+    };
+    const receipt = f.publish(() => {
+      f.outputs.setEnabled([]);
+      f.playback.checkpoint();
+    });
+    assertEquals(f.playback.playerView().state, 'pause');
+    await until(
+      'membership cutoff FLUSH held',
+      () => f.receiver.sessions[0].flushes === 1,
+    );
+    await receipt.command;
+    // Deselection may establish readiness by local session destruction even
+    // while the old FLUSH reply is held. Atomic saving does not depend on it.
+    assertEquals(
+      (await f.fixture.store.playback.loadPlayerState(1))!.state,
+      'play',
+    );
+    assertEquals(
+      (await f.fixture.store.playback.loadOutputs())[0].selected,
+      true,
+    );
+    assertEquals(attempts.length, 1);
+    const cutoff = f.capturedCutoffs[0];
+    assert(cutoff.progress);
+    const expected = Math.floor(
+      Number(cutoff.progress.sourceFrames) * 1000 / 44100,
+    );
+    assertEquals(attempts, [expected]);
+    assertEquals(
+      (await f.fixture.store.playback.loadPlayerState(1))!.state,
+      'play',
+      'failed transaction did not half-publish membership or bookmark',
+    );
+    const saved = await f.saved();
+    await receipt.saved;
+    assertEquals(
+      attempts,
+      [expected, expected],
+      'retry keeps the same cutoff instead of re-reading a live clock',
+    );
+    assertEquals(saved!.positionMs, expected);
+    assertEquals(saved!.state, 'pause');
+    assertEquals(
+      (await f.fixture.store.playback.loadOutputs())[0].selected,
+      false,
+    );
+    flush.resolve();
+    await libraryProof();
+  } finally {
+    f.fixture.store.players.saveChanges = original;
+    flush.resolve();
+    await f.close();
+  }
+});
+
+test('cold HTTP reader cleanup cannot retire an accepted source bookmark or leave reports extrapolating', async () => {
+  const f = await nativeHttpFixture({ pcm: pcm(44100 * 10), persist: true });
+  try {
+    await f.play();
+    await until(
+      'real scheduled prefix before reader cleanup',
+      () => f.playback.playerView().itemProgressMs > 100,
+    );
+    const position = f.playback.playerView().itemProgressMs;
+    f.playback.cancelSource(f.token!);
+    await sleep(100);
+    assertEquals(f.playback.serverNowPlayingView()!.playbackRate, 0);
+    assertEquals(f.playback.playerView().itemProgressMs, position);
+    await f.own('/player/stop', 'PUT');
+    const saved = await f.saved();
+    assert(f.capturedCutoffs[0].progress);
+    assertEquals(
+      saved!.positionMs,
+      Math.floor(
+        Number(f.capturedCutoffs[0].progress.sourceFrames) * 1000 / 44100,
+      ),
+    );
+    assert(saved!.positionMs >= position);
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
+test('lazy atomic cutoff is observable before FLUSH readiness without permitting replacement or ACK', async () => {
+  const flush = Promise.withResolvers<void>();
+  const f = await fixture({ beforeFlushReply: () => flush.promise });
+  try {
+    await f.activate();
+    const epoch = f.stream.epoch!, source = 91n;
+    const bytes = pcm(44100);
+    const accepted = await f.stream.appendSource({
+      epoch,
+      source,
+      segment: 1n,
+      pcm: bytes,
+    });
+    assertEquals(accepted.acceptedFrames, 44100n);
+    await until(
+      'scheduled source prefix',
+      async () => (await f.stream.progress(epoch, source))!.sourceFrames > 441n,
+    );
+    const captures: AirplaySourceCutoff[] = [];
+    let ready = false;
+    const pending = f.stream.cancelSource(
+      epoch,
+      source,
+      [],
+      (cutoff) => captures.push(cutoff),
+    );
+    void pending.then(() => ready = true);
+    await until(
+      'immutable cutoff before held FLUSH',
+      () => captures.length === 1,
+    );
+    const cutoff = captures[0];
+    assert(Object.isFrozen(cutoff) && Object.isFrozen(cutoff.progress));
+    const frozen = structuredClone(cutoff);
+    await sleep(100);
+    assertEquals(ready, false);
+    assertEquals(captures, [frozen]);
+    await assertRejects(
+      () => f.stream.ackCancel(epoch),
+      Error,
+      'pending or absent',
+    );
+    const replacement = {
+      epoch: epoch + 1n,
+      source: source + 1n,
+      segment: 2n,
+      pcm: pcm(351, 9),
+    };
+    assertEquals(
+      (await f.stream.appendSource(replacement)).status,
+      'not-ready',
+    );
+    flush.resolve();
+    const result = await pending;
+    assertEquals(result.progress, cutoff.progress);
+    assertEquals(captures.length, 1);
+    assertEquals(
+      (await f.stream.appendSource(replacement)).acceptedFrames,
+      351n,
+    );
+    await f.stream.ackCancel(epoch);
+    await libraryProof();
+  } finally {
+    flush.resolve();
+    await f.close();
+  }
+});
+
+test('cold HTTP process restart restores the exact Stop cutoff without a live clock', async () => {
+  const phase = Deno.env.get('MELOFON_POSITION_RESTART_PHASE');
+  if (!phase) {
+    const directory = await Deno.makeTempDir({ prefix: 'position-restart-' });
+    try {
+      for (const phase of ['save', 'restore']) {
+        const child = await new Deno.Command(Deno.execPath(), {
+          args: [
+            'test',
+            '--frozen',
+            '--cached-only',
+            '--node-modules-dir=manual',
+            '-A',
+            '--filter=cold HTTP process restart restores',
+            new URL(import.meta.url).pathname,
+          ],
+          env: {
+            MELOFON_POSITION_RESTART_PHASE: phase,
+            MELOFON_POSITION_RESTART_DIR: directory,
+          },
+        }).output();
+        await Deno.writeFile(`${directory}/${phase}.stdout`, child.stdout);
+        await Deno.writeFile(`${directory}/${phase}.stderr`, child.stderr);
+        assertEquals(
+          child.code,
+          0,
+          new TextDecoder().decode(child.stdout) +
+            new TextDecoder().decode(child.stderr),
+        );
+        const proof = new TextDecoder().decode(child.stdout).split('\n').find((
+          line,
+        ) => line.startsWith('position native library:'));
+        assert(proof, 'child exercised this exact production library');
+        console.log(`restart ${phase} ${proof}`);
+      }
+    } finally {
+      await Deno.remove(directory, { recursive: true });
+    }
+    return;
+  }
+  const directory = Deno.env.get('MELOFON_POSITION_RESTART_DIR')!;
+  const f = await nativeHttpFixture({
+    pcm: pcm(44100 * 10),
+    persist: true,
+    directory,
+    storeDir: `${directory}/store`,
+    restore: phase === 'restore',
+  });
+  try {
+    if (phase === 'save') {
+      await f.play();
+      await until(
+        'first process plays source',
+        () => f.playback.playerView().itemProgressMs > 200,
+      );
+      await f.own('/player/stop', 'PUT');
+      const saved = await f.saved();
+      assert(saved!.positionMs > 0 && saved!.positionMs < 2000);
+      await Deno.writeTextFile(
+        `${directory}/bookmark.json`,
+        JSON.stringify(saved),
+      );
+    } else {
+      const saved = JSON.parse(
+        await Deno.readTextFile(`${directory}/bookmark.json`),
+      );
+      const restored = await f.own('/player');
+      assertEquals(restored.state, 'pause');
+      assertEquals(restored.item_progress_ms, saved.positionMs);
+      assertEquals(
+        f.receiver.sessions.length,
+        0,
+        'restoring Stop never seizes the speaker',
+      );
+      await sleep(300);
+      assertEquals((await f.own('/player')).item_progress_ms, saved.positionMs);
+      await f.own('/player/play', 'PUT');
+      await until(
+        'second process opens saved origin',
+        () => f.origins.length === 1,
+      );
+      assertEquals(f.origins[0], saved.positionMs);
+      assertEquals((await f.own('/player')).item_progress_ms, saved.positionMs);
+      await until(
+        'second process scheduled source',
+        () => f.playback.playerView().itemProgressMs > saved.positionMs + 50,
+      );
+      const view = await f.own('/player'), rendered = renderedRealFrames(f);
+      assert(
+        view.item_progress_ms <=
+          saved.positionMs + rendered.frames * 1000 / 44100 +
+            rendered.uncertainty,
+      );
+    }
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
 test('cold HTTP natural stop waits for scheduled final PCM after late acquisition', async () => {
   const acquisition = Promise.withResolvers<void>(), bytes = pcm(44100 + 353);
   const f = await nativeHttpFixture({
@@ -261,8 +880,17 @@ for (
 
 for (const declaredMs of [null, 0]) {
   test(`cold HTTP catalog duration ${declaredMs} retains completed sink authority until Stop`, async () => {
+    const terminalProgress = Promise.withResolvers<void>();
+    let progressHeld = false;
     const bytes = pcm(353),
-      f = await nativeHttpFixture({ pcm: bytes, declaredMs });
+      f = await nativeHttpFixture({
+        pcm: bytes,
+        declaredMs,
+        completionProgress: () => {
+          progressHeld = true;
+          return terminalProgress.promise;
+        },
+      });
     try {
       await f.play();
       await f.own('/player/consume?state=true', 'PUT');
@@ -276,6 +904,10 @@ for (const declaredMs of [null, 0]) {
         'reader completion observed without ack',
         () => f.audio.epochs.length === 1,
       );
+      await until(
+        'terminal progress held after completion',
+        () => progressHeld,
+      );
       assertEquals((await f.own('/player')).state, 'play');
       assertEquals(f.playback.queueView().items.length, 1);
       assertEquals(f.ackStates, []);
@@ -284,6 +916,17 @@ for (const declaredMs of [null, 0]) {
         bytes,
       );
       await f.own('/player/stop', 'PUT');
+      assertEquals((await f.own('/player')).state, 'pause');
+      await until(
+        'source cancellation acknowledged',
+        () => f.cancelAcks.length === 1,
+      );
+      assertEquals(
+        f.ackStates,
+        [],
+        'held source cleanup is not yet acknowledged',
+      );
+      terminalProgress.resolve();
       await until(
         'retained result ack after explicit Stop',
         () => f.ackStates.length === 1,
@@ -296,6 +939,7 @@ for (const declaredMs of [null, 0]) {
       );
       await libraryProof();
     } finally {
+      terminalProgress.resolve();
       await f.close();
     }
   });
@@ -850,6 +1494,8 @@ test('cold HTTP held native emission cannot consume or release accepted EOF', as
     await until('source sealed behind accepted EOF', () => !!f.key);
     await sleep(1200);
     assertEquals((await f.own('/player')).state, 'play');
+    assertEquals((await f.own('/player')).item_progress_ms, 0);
+    assertEquals(f.playback.serverNowPlayingView()!.playbackRate, 0);
     assertEquals(f.playback.queueView().items.length, 1);
     assertEquals(f.ackStates, []);
     assertEquals(
