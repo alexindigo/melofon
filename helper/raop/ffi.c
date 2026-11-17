@@ -1208,18 +1208,24 @@ completion_update_locked(raop_stream_t *s)
   }
 }
 
+static void
+completion_retire_locked(raop_stream_t *s)
+{
+  bool pending = false;
+  for (struct completion_receipt *c = s->completions; c; c = c->next)
+    if (c->result.epoch == s->epoch && !c->result.status) pending = true;
+  /* A settled failed receipt can be revised later. The pacer additionally
+   * checks its actual end, never terminal receipt state alone. */
+  if (!pending && raop_player_ended(s->player)) raop_player_drain_complete(s->player);
+}
+
 void
 raop_ffi_completion_update(uint64_t stream_id)
 {
   pthread_mutex_lock(&rt.lock);
   for (raop_stream_t *s = rt.streams; s; s = s->next) if (s->id == stream_id) {
     completion_update_locked(s);
-    bool pending = false;
-    for (struct completion_receipt *c = s->completions; c; c = c->next)
-      if (c->result.epoch == s->epoch && !c->result.status) pending = true;
-    /* A settled failed receipt can be revised later. The pacer additionally
-     * checks its actual end, never terminal receipt state alone. */
-    if (!pending && raop_player_ended(s->player)) raop_player_drain_complete(s->player);
+    completion_retire_locked(s);
     break;
   }
   pthread_mutex_unlock(&rt.lock);
@@ -1392,6 +1398,18 @@ raop_stream_end(raop_stream_t *stream, uint64_t epoch, uint64_t target,
 }
 
 int
+raop_stream_compatibility_silence(raop_stream_t *stream, uint64_t epoch, uint64_t source)
+{
+  if (!stream || !epoch || !source) return -1;
+  uint64_t status = RAOP_APPEND_ERROR, error = RAOP_APPEND_ERROR_INVALID;
+  pthread_mutex_lock(&rt.lock);
+  int rc = timeline_admit_locked(stream, epoch, &status, &error)
+    ? raop_player_compatibility_silence(stream->player, source) : -1;
+  pthread_mutex_unlock(&rt.lock);
+  return rc;
+}
+
+int
 raop_stream_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
                    struct raop_source_snapshot *result)
 {
@@ -1436,6 +1454,9 @@ stream_progress_cb(evutil_socket_t fd, short what, void *arg)
   raop_stream_t *s = work->stream;
   if (work->completion && !s->closing) {
     completion_update_locked(s);
+    /* Polling may be the first observation across the final presentation
+     * boundary. Retire ended pacing on this same loop before returning it. */
+    completion_retire_locked(s);
     struct completion_receipt *c = completion_find(s, work->epoch, work->source, work->revision);
     if (c) { *work->completion = c->result; work->found = 1; }
   } else if (!s->closing && !s->resetting && s->epoch == work->epoch) {

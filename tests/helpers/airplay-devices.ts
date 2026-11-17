@@ -2,10 +2,13 @@
 import type { Outputs } from '../../src/player.ts';
 import { createAirplayDevices } from '../../src/boots/airplay-device.ts';
 import {
+  type AirplayCompletionKey,
   type AirplayExactStream,
+  type AirplaySourceSnapshot,
   type AirplaySpawn,
   airplayStartFields,
   type AirplayStream,
+  type AirplayTimelineStream,
   type AirplayTransport,
   type HelperEventFn,
 } from '../../src/boots/airplay-profile.ts';
@@ -29,7 +32,9 @@ export function recordingSpawn(
 /** Lifecycle-test stream: one input, fanout to connected fake attachments. The
  * attachment's PCM recorder observes delivery, never source election. Native
  * fixtures supply createFfiStream explicitly instead. */
-export function recordingStream(spawn: AirplaySpawn): () => AirplayExactStream {
+export function recordingStream(
+  spawn: AirplaySpawn,
+): () => AirplayTimelineStream {
   let incarnation = 0n;
   return () => {
     const id = ++incarnation;
@@ -41,10 +46,25 @@ export function recordingStream(spawn: AirplaySpawn): () => AirplayExactStream {
       close(): Promise<void>;
     };
     const peers = new Set<Peer>();
+    const sources = new Map<bigint, AirplaySourceSnapshot>();
+    let inputFrames = 0n;
     const cancelPcm = () => {
       for (const peer of peers) peer.transport.cancelPcm();
     };
-    return {
+    // Explicit lifecycle recorder, not native scheduled-consumer evidence. Its
+    // fake attachments accept synchronously and have no transport schedule.
+    const completion = (key: AirplayCompletionKey) => ({
+      ...key,
+      streamId: id,
+      inputEnd: sources.get(key.source)?.inputEnd ?? 0n,
+      status: key.epoch === epoch ? 'complete' as const : 'canceled' as const,
+      error: 'none' as const,
+      transportEnd: inputFrames,
+      capturedNs: 0n,
+      required: BigInt(peers.size),
+      attachments: [],
+    });
+    const api: AirplayTimelineStream = {
       id,
       get epoch() {
         return epoch;
@@ -72,9 +92,80 @@ export function recordingStream(spawn: AirplaySpawn): () => AirplayExactStream {
           status: 'accepted',
         };
       },
+      async appendSource(input) {
+        const previous = sources.get(input.source)?.acceptedFrames ?? 0n;
+        const receipt = await api.append(input);
+        const inputOffset = inputFrames;
+        inputFrames += receipt.acceptedFrames;
+        if (receipt.acceptedFrames) {
+          sources.set(input.source, {
+            streamId: id,
+            epoch: input.epoch,
+            source: input.source,
+            acceptedFrames: previous + receipt.acceptedFrames,
+            fedFrames: previous + receipt.acceptedFrames,
+            sealed: false,
+            target: null,
+            inputEnd: null,
+          });
+        }
+        return {
+          ...receipt,
+          source: input.source,
+          sourceOffset: previous,
+          inputOffset,
+        };
+      },
+      seal(captured, source, target) {
+        const record = sources.get(source);
+        if (!record || record.acceptedFrames !== target) {
+          throw new Error('invalid fixture seal');
+        }
+        sources.set(source, {
+          ...record,
+          sealed: true,
+          target,
+          inputEnd: inputFrames,
+        });
+        return Promise.resolve({
+          streamId: id,
+          epoch: captured,
+          source,
+          target,
+          inputEnd: inputFrames,
+          status: 'accepted' as const,
+        });
+      },
+      endStream: (captured, target) =>
+        Promise.resolve({
+          streamId: id,
+          epoch: captured,
+          source: 0n,
+          target,
+          inputEnd: target,
+          status: 'accepted',
+        }),
+      compatibilitySilence: () => Promise.resolve(),
+      source: (_epoch, source) => Promise.resolve(sources.get(source) ?? null),
+      range: () => Promise.resolve(null),
+      progress: () => Promise.resolve(null),
+      pollCompletion: (key) => Promise.resolve(completion(key)),
+      waitCompletion: (key) => Promise.resolve(completion(key)),
+      reviseCompletion: (key) =>
+        Promise.resolve({ ...key, revision: key.revision + 1n }),
+      ackCompletion: (key) => {
+        sources.delete(key.source);
+        return Promise.resolve();
+      },
+      cancelSource: async (captured, source, retire) => ({
+        ...await api.cancel(captured, retire),
+        source,
+        progress: null,
+      }),
       async cancel(captured, retire = []) {
         if (epoch !== captured) throw new Error('stale fixture epoch');
         epoch++;
+        inputFrames = 0n;
         cancelPcm();
         await Promise.all(
           [...peers].map((p) =>
@@ -147,6 +238,7 @@ export function recordingStream(spawn: AirplaySpawn): () => AirplayExactStream {
         await Promise.all([...peers].map((p) => p.close()));
       },
     };
+    return api;
   };
 }
 

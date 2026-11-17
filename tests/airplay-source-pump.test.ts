@@ -4,6 +4,7 @@ import { apiFixture } from './helpers/api.ts';
 import { speakerMedia, until } from './helpers/speaker-consumer.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
+import { traceTimelineAudio } from './helpers/raop-timeline-audio.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 import {
   createTestAirplayDevices,
@@ -46,6 +47,7 @@ for (const removed of [-1, 0, 1]) {
         await startFakeRaop({ captureAudio: true, captureWire: true }),
         await startFakeRaop({ captureAudio: true, captureWire: true }),
       ];
+      const audio = traceTimelineAudio(createFfiStream);
       let boot: ReturnType<typeof createAirplayBoot> | undefined;
       let devices: ReturnType<typeof createTestAirplayDevices> | undefined;
       let playback: ReturnType<typeof createPlayback> | undefined;
@@ -85,7 +87,7 @@ for (const removed of [-1, 0, 1]) {
             devices = createTestAirplayDevices(
               outputs,
               undefined,
-              mapStream(createFfiStream, (spawn) => (event) => {
+              mapStream(audio.stream, (spawn) => (event) => {
                 const i = native.length;
                 const driver = spawn((name, value) => {
                   if (name === 'state' && value === 'connected') {
@@ -103,10 +105,10 @@ for (const removed of [-1, 0, 1]) {
                 };
               }),
             );
-            // Fix the engine's clock at the head. Both runs are exactly packet-sized;
-            // this checks every sample, independently of decoder/native read-ahead.
+            // No advance tick runs here. Native completion retires pacing without
+            // a queue transition; all real samples remain independently checked.
             playback = createPlayback({
-              player: createPlayer({ now: () => 0, monotonicNow: () => 0 }),
+              player: createPlayer(),
               outputs,
               library,
               cfg: f.cfg,
@@ -175,13 +177,13 @@ for (const removed of [-1, 0, 1]) {
         );
         assertEquals(added.status, 200, await added.text());
         await until(() =>
-          receivers.every((r) => r.sessions[0]?.audioPackets === 1)
+          receivers.every((r) => r.sessions[0]?.audioPackets >= 1)
         );
         assertEquals(starts, [0], 'one source open for both receivers');
         for (const receiver of receivers) {
           const session = receiver.sessions[0];
           assertEquals(
-            decodeReceiverAudio(session.sdp, session.audioPayloads),
+            decodeReceiverAudio(session.sdp, session.audioPayloads.slice(0, 1)),
             pcm.subarray(0, 352 * 4),
             'identical first packet at both receivers from one decoder',
           );
@@ -202,9 +204,7 @@ for (const removed of [-1, 0, 1]) {
           await until(() => receivers[removed].sessions[0].closedAtMs !== null);
         }
         resume.resolve();
-        await until(() =>
-          receivers[survivor].sessions[0].audioPackets === packets
-        );
+        await until(() => audio.epochs.length === 1);
         assertEquals(
           starts,
           [0],
@@ -217,7 +217,7 @@ for (const removed of [-1, 0, 1]) {
         );
         const session = receivers[survivor].sessions[0];
         assertEquals(
-          decodeReceiverAudio(session.sdp, session.audioPayloads),
+          audio.realAudio(session),
           pcm,
         );
         assertEquals(timestamp(1), (firstTimestamp + 352) >>> 0);
@@ -239,7 +239,10 @@ for (const removed of [-1, 0, 1]) {
           session,
           receivers[survivor].nowMs(),
         );
-        assertEquals(rendered.pcm, pcm);
+        assertEquals(
+          audio.scheduledRealAudio(session, receivers[survivor].nowMs()),
+          pcm,
+        );
         assertEquals(rendered.pendingFrames, 0);
         assertEquals(rendered.discarded, []);
         assertEquals(session.flushes, 0);
@@ -247,7 +250,7 @@ for (const removed of [-1, 0, 1]) {
         if (removed < 0) {
           const other = receivers[1];
           await until(() =>
-            other.sessions[0].audioPackets === packets &&
+            other.sessions[0].audioPackets >= packets &&
             other.sessions[0].wire.some((e) => e.kind === 'timing-reply')
           );
           const pendingOther = renderScheduledAudio(
@@ -268,7 +271,10 @@ for (const removed of [-1, 0, 1]) {
             other.sessions[0],
             other.nowMs(),
           );
-          assertEquals(otherRendered.pcm, pcm);
+          assertEquals(
+            audio.scheduledRealAudio(other.sessions[0], other.nowMs()),
+            pcm,
+          );
           assertEquals(otherRendered.pendingFrames, 0);
           assertEquals(otherRendered.discarded, []);
           assertEquals(other.sessions.length, 1);

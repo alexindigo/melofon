@@ -73,6 +73,9 @@ int raop_stream_seal(raop_stream_t *, uint64_t epoch, uint64_t source,
                      uint64_t target, struct raop_marker_result *);
 int raop_stream_end(raop_stream_t *, uint64_t epoch, uint64_t target,
                     struct raop_marker_result *);
+/* After sealed catalog EOF, pace explicitly labelled compatibility silence until
+ * core's separate eligibility deadline. Does not credit media or end a stream. */
+int raop_stream_compatibility_silence(raop_stream_t *, uint64_t epoch, uint64_t source);
 /* Coherent pacer facts only, NOT scheduled/successful submission/completion.
  * source/range: 1 found, 0 absent/stale, -1 invalid. index starts at 0 and is a
  * view index, not an incarnation; ack compacts it. After ack, historical source

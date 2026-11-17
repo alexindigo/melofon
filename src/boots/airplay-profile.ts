@@ -118,7 +118,7 @@ export interface AirplayCancelResult {
   readonly cutoffFrames: bigint | null;
   readonly admittedNs: bigint;
 }
-/** Ordered transport timeline, additive until boot/core adoption. Source targets
+/** Ordered transport timeline used by the production boot/core. Source targets
  * are exclusive source-local real frames; endStream targets epoch-wide accepted
  * real frames. Pacer snapshots are distinct from scheduled progress/completion. */
 export interface AirplayTimelineStream extends AirplayExactStream {
@@ -147,6 +147,7 @@ export interface AirplayTimelineStream extends AirplayExactStream {
     target: bigint,
   ): Promise<AirplayMarkerResult>;
   endStream(epoch: bigint, target: bigint): Promise<AirplayMarkerResult>;
+  compatibilitySilence(epoch: bigint, source: bigint): Promise<void>;
   source(epoch: bigint, source: bigint): Promise<AirplaySourceSnapshot | null>;
   range(epoch: bigint, index: bigint): Promise<AirplayRangeSnapshot | null>;
   progress(
@@ -255,7 +256,7 @@ export interface AirplayRangeSnapshot {
   readonly streamId: bigint;
   readonly epoch: bigint;
   readonly index: bigint;
-  readonly kind: 'real' | 'underrun' | 'padding' | 'drain';
+  readonly kind: 'real' | 'underrun' | 'padding' | 'drain' | 'compatibility';
   readonly source: bigint;
   readonly segment: bigint;
   readonly sourceOffset: bigint;
@@ -272,6 +273,7 @@ export interface AirplayPlaybackStream extends
     | 'appendSource'
     | 'seal'
     | 'endStream'
+    | 'compatibilitySilence'
     | 'source'
     | 'range'
     | 'progress'
@@ -294,7 +296,7 @@ export interface AirplayPlaybackStream extends
     source: bigint,
     retire?: readonly AirplayTransport[],
   ): Promise<AirplaySourceCancelResult>;
-  /** Transitional callers only; production uses exact append/cancel. */
+  /** Transitional callers only; production uses source-labelled append/cancel. */
   pcm(chunk: Uint8Array): Promise<void>;
   cancelPcm(): void;
   /** Same writer-fenced local reset contract as AirplayStream. */

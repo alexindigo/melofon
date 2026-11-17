@@ -380,6 +380,12 @@ export async function createPlayers(deps: {
     queueCopied: (...args) => current().queueCopied(...args),
     queueImport: (...args) => current().queueImport(...args),
     advanceEnded: () => current().advanceEnded(),
+    attachSink: () => current().attachSink(),
+    bindSource: (...args) => current().bindSource(...args),
+    sealSource: (...args) => current().sealSource(...args),
+    sourceCompatibilityRemaining: (...args) =>
+      current().sourceCompatibilityRemaining(...args),
+    completeSource: (...args) => current().completeSource(...args),
     openSource: (...args) => current().openSource(...args),
     cancelSource: (...args) => current().cancelSource(...args),
     sourceAudio: (...args) => current().sourceAudio(...args),

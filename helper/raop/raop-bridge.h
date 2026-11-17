@@ -11,6 +11,7 @@ int raop_player_append_source(struct raop_player *, uint64_t source, uint64_t se
 void raop_player_seal(struct raop_player *, uint64_t source, uint64_t target,
                        struct raop_marker_result *);
 void raop_player_end(struct raop_player *, uint64_t target, struct raop_marker_result *);
+int raop_player_compatibility_silence(struct raop_player *, uint64_t source);
 int raop_player_source(struct raop_player *, uint64_t source, struct raop_source_snapshot *);
 int raop_player_range(struct raop_player *, uint64_t index, struct raop_range_snapshot *);
 void raop_transport_progress(uint64_t stream_id, uint64_t attachment, uint64_t now_ns,

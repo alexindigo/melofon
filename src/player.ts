@@ -10,7 +10,8 @@
 // No audio means progress is wall-clock: while state is 'play' the position
 // advances in real time from the last seek/start base, clamped for finite
 // media, unbounded for live sources. An attached source additionally gates
-// completion on EOF and playout of accepted PCM. advanceEnded()
+// completion on EOF and matching native scheduled completion. Engine-only
+// source callers retain their legacy accepted-duration clock. advanceEnded()
 // (driven by the playback core's clock) replays/advances/drops/stops per the
 // repeat/consume modes — "no auto-advance" was fine for a queue-less mirror,
 // it is a lie with boots attached (HA extrapolates past the end).
@@ -269,8 +270,13 @@ export async function planRestore(opts: {
 
 export interface Player {
   status(): PlayerStatus;
+  /** A physical sink requires native completion even before/after its reader.
+   * Releasing the binding never reopens the current run's clock-only end gate. */
+  attachSink(): () => void;
   openSource(entryId: number, generation: number): PlaybackSource | null;
   cancelSource(source: PlaybackSource): void;
+  sourceComplete(source: PlaybackSource): boolean;
+  sourceCompatibilityRemaining(source: PlaybackSource): number;
   /** Accepted PCM duration, reported after the sink write resolves. */
   sourceAudio(source: PlaybackSource, durationMs: number): boolean;
   sourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
@@ -501,12 +507,15 @@ export function createPlayer(options: {
   let startedAt = 0;
   let clock: PlayerStatus['clock'] = null;
   let generation = 0, sourceGeneration = 0;
+  const sinks = new Set<object>();
+  let sinkRequired = false;
   let deliveredGeneration = -1;
   let source: {
     token: PlaybackSource;
     controller: AbortController;
     outcome?: SourceOutcome;
-    drainAt: number;
+    complete: boolean;
+    legacyDrainAt: number;
   } | null = null;
   const cancelSource = () => {
     const old = source;
@@ -531,6 +540,7 @@ export function createPlayer(options: {
   const discontinuity = () => {
     generation++;
     cancelSource();
+    sinkRequired = sinks.size > 0;
   };
   const anchor = (restart = false) => {
     const at = now();
@@ -637,21 +647,31 @@ export function createPlayer(options: {
     if (!entry || entry.facts.kind === 'web' && entry.facts.mode !== 'finite') {
       return false;
     }
-    // An attached source must finish delivering and play out its accepted PCM.
-    // Decoder read-ahead is never permission to flush buffered tail audio.
-    if (
+    // A physical sink owns the gate for the entire run, not the reader's life.
+    // Missing/cleaned-up readers, EOF and accepted durations cannot open it.
+    if (sinkRequired) {
+      if (!source || source.outcome !== 'eof' || !source.complete) return false;
+    } else if (
       source && (source.outcome !== 'eof' ||
-        monotonicNow() < source.drainAt)
+        monotonicNow() < source.legacyDrainAt)
     ) return false;
     const length = queueDuration(entry) ?? 0;
     if (entry.facts.kind === 'web' && source) {
       return source.outcome === 'eof';
     }
     // Preserve library duration-clock behavior, including unknown lengths.
-    return length > 0 && progressMs() >= length;
+    return length > 0 && baseProgressMs + monotonicNow() - startedAt >= length;
   };
 
   return {
+    attachSink() {
+      const binding = {};
+      sinks.add(binding);
+      sinkRequired = true;
+      return () => {
+        sinks.delete(binding);
+      };
+    },
     status(): PlayerStatus {
       // Stopped means no current — not the queue head. A queue-head-as-
       // current fallback makes a stale item look played everywhere the
@@ -686,11 +706,33 @@ export function createPlayer(options: {
           : 0,
         signal: controller.signal,
       });
-      source = { token, controller, drainAt: monotonicNow() };
+      source = {
+        token,
+        controller,
+        complete: false,
+        legacyDrainAt: monotonicNow(),
+      };
       return token;
     },
     cancelSource(token) {
       if (source?.token === token) cancelSource();
+    },
+    sourceComplete(token) {
+      if (
+        source?.token !== token || source.outcome !== 'eof' ||
+        source.complete || token.signal.aborted
+      ) return false;
+      source.complete = true;
+      return true;
+    },
+    sourceCompatibilityRemaining(token) {
+      if (source?.token !== token || !sinkRequired) return 0;
+      const entry = currentEntry();
+      if (entry?.facts.kind !== 'song') return 0;
+      const length = queueDuration(entry) ?? 0;
+      return length > 0
+        ? Math.max(0, length - baseProgressMs - (monotonicNow() - startedAt))
+        : 0;
     },
     sourceAudio(token, durationMs) {
       if (
@@ -698,7 +740,10 @@ export function createPlayer(options: {
         !Number.isFinite(durationMs) || durationMs <= 0
       ) return false;
       deliveredGeneration = generation;
-      source.drainAt = Math.max(monotonicNow(), source.drainAt) + durationMs;
+      if (!sinkRequired) {
+        source.legacyDrainAt = Math.max(monotonicNow(), source.legacyDrainAt) +
+          durationMs;
+      }
       return true;
     },
     sourceOutcome(token, outcome) {

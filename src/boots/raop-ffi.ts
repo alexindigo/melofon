@@ -69,6 +69,10 @@ const SYMBOLS = {
     parameters: ['pointer', 'u64', 'u64', 'buffer'],
     result: 'i32',
   },
+  raop_stream_compatibility_silence: {
+    parameters: ['pointer', 'u64', 'u64'],
+    result: 'i32',
+  },
   raop_stream_source: {
     parameters: ['pointer', 'u64', 'u64', 'buffer'],
     result: 'i32',
@@ -936,6 +940,19 @@ export function createFfiStream(
     },
     seal: (captured, source, target) => marker(captured, source, target, false),
     endStream: (captured, target) => marker(captured, 0n, target, true),
+    compatibilitySilence: (captured, source) =>
+      operations.run(() => {
+        u64(captured, source);
+        if (
+          lib.symbols.raop_stream_compatibility_silence(
+            handle,
+            captured,
+            source,
+          ) !== 0
+        ) {
+          throw new Error('RAOP compatibility silence refused');
+        }
+      }),
     pollCompletion: (key) => operations.run(() => readCompletion(key)),
     waitCompletion(key) {
       return operations.run(async () => {
@@ -1017,7 +1034,9 @@ export function createFfiStream(
         const rc = lib.symbols.raop_stream_range(handle, captured, index, r);
         if (rc === 0) return null;
         const kind =
-          (['real', 'underrun', 'padding', 'drain'] as const)[Number(r[2])];
+          (['real', 'underrun', 'padding', 'drain', 'compatibility'] as const)[
+            Number(r[2])
+          ];
         if (
           rc !== 1 || r[0] !== captured || r[1] !== index || !kind || !r[7] ||
           (kind === 'real'

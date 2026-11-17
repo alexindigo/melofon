@@ -43,6 +43,11 @@ import type {
 } from './playback-capacity.ts';
 import { planSourceFailure } from './source-recovery.ts';
 import {
+  createPlaybackTimeline,
+  type TimelineCompletion,
+  type TimelineSource,
+} from './playback-timeline.ts';
+import {
   catalogMedia,
   createQueueResolver,
   type QueueAddReference,
@@ -205,7 +210,21 @@ export interface Playback {
    * Emits player (+queue when consume dropped the finished item). */
   advanceEnded(): void | Promise<void>;
   /** Elected boot source lifetime; engine transitions synchronously revoke it. */
+  attachSink(): () => void;
   openSource(entryId: number, generation: number): PlaybackSource | null;
+  bindSource(
+    source: PlaybackSource,
+    streamId: bigint,
+    epoch: bigint,
+  ): TimelineSource | null;
+  sealSource(source: PlaybackSource, target: bigint): boolean;
+  sourceCompatibilityRemaining(source: PlaybackSource): number;
+  /** Resolves after this source's matching core transition/cancellation commits,
+   * not when the receipt is first observed. The boot can then acknowledge it. */
+  completeSource(
+    source: PlaybackSource,
+    receipt: TimelineCompletion,
+  ): Promise<boolean>;
   cancelSource(source: PlaybackSource): void;
   sourceAudio(source: PlaybackSource, durationMs: number): void;
   /** One bounded source retry, cancelled with the lease. Not a speaker retry. */
@@ -292,6 +311,8 @@ export function createPlayback(deps: {
 }): Playback {
   const { player, library, outputs, notify, persistence } = deps;
   const operations = createOperationScope('Player');
+  const timeline = createPlaybackTimeline();
+  const timelineSources = new WeakMap<PlaybackSource, TimelineSource>();
   let closeWork: Promise<void> | undefined;
   let activeReservation: PlaybackReservation | undefined;
   const needsCapacity = () =>
@@ -1058,6 +1079,49 @@ export function createPlayback(deps: {
     }
   };
   return {
+    attachSink() {
+      requireOpen();
+      return player.attachSink();
+    },
+    bindSource(source, streamId, epoch) {
+      if (!ownsSource(source) || timelineSources.has(source)) return null;
+      const mapping = timeline.begin({
+        streamId,
+        epoch,
+        entryId: source.entryId,
+        generation: source.generation,
+        originMs: source.startMs,
+      });
+      timelineSources.set(source, mapping);
+      source.signal.addEventListener('abort', () => timeline.retire(mapping), {
+        once: true,
+      });
+      return mapping;
+    },
+    sealSource(source, target) {
+      const mapping = timelineSources.get(source);
+      return ownsSource(source) && !!mapping && timeline.seal(mapping, target);
+    },
+    sourceCompatibilityRemaining: (source) =>
+      player.sourceCompatibilityRemaining(source),
+    completeSource: (source, receipt) =>
+      operations.run(async () => {
+        const mapping = timelineSources.get(source);
+        if (
+          !ownsSource(source) || !mapping ||
+          !timeline.complete(mapping, receipt) ||
+          !player.sourceComplete(source)
+        ) return false;
+        await new Promise<void>((resolve) => {
+          source.signal.addEventListener('abort', () => resolve(), {
+            once: true,
+          });
+          if (source.signal.aborted) resolve();
+        });
+        // Abort fires within the synchronous core mutation. This continuation
+        // follows its persistence publication and notification, never precedes it.
+        return true;
+      }),
     openSource: (entryId, generation) => {
       if (operations.closed) return null;
       if (needsCapacity() && !deps.capacity!.authority()()) return null;
@@ -1866,6 +1930,7 @@ export function createPlayback(deps: {
       activeReservation = undefined;
       // Revoke a parked source even if its boot is being closed separately.
       if (openedSource) player.cancelSource(openedSource);
+      timeline.close();
       unsubscribeOutputs?.();
       if (tick !== null) clearInterval(tick);
       void Promise.all([

@@ -1,5 +1,5 @@
-// b05a foundation: the real lazy device owner -> shipping native timeline ->
-// independent scheduled UDP/ALAC consumer. HTTP/core adoption follows in b05b/c.
+// Core and real lazy device owner -> shipping native timeline -> independent
+// scheduled UDP/ALAC consumer. Public position/bookmarks remain b05c.
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createPlaybackTimeline } from '../src/playback-timeline.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
@@ -12,6 +12,7 @@ import type {
 import { createOutputs } from '../src/player.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
+import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 
 const sleep = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(
@@ -169,6 +170,236 @@ const origin = {
   originMs: 5000,
 };
 
+test('cold HTTP natural stop waits for scheduled final PCM after late acquisition', async () => {
+  const acquisition = Promise.withResolvers<void>(), bytes = pcm(44100 + 353);
+  const f = await nativeHttpFixture({
+    pcm: bytes,
+    acquisition: acquisition.promise,
+  });
+  try {
+    await f.play();
+    await until('reader starts acquisition', () => f.opens === 1);
+    await sleep(1300);
+    assertEquals((await f.own('/player')).state, 'play');
+    assertEquals(f.receiver.sessions[0].audioPayloads.length, 0);
+    acquisition.resolve();
+    await until(
+      'natural terminal outcome',
+      () => f.playback.playerView().state === 'stop',
+    );
+    const replay = renderScheduledAudio(
+      f.receiver.sessions[0],
+      f.receiver.nowMs(),
+    );
+    assertEquals(replay.issues, []);
+    assert(
+      replay.pcm.length >= bytes.length,
+      `scheduled ${replay.pcm.length / 4} of ${
+        bytes.length / 4
+      } real frames before stop`,
+    );
+    assertEquals(
+      replay.pcm.subarray(0, bytes.length),
+      bytes,
+      'every real source frame is scheduled before natural stop can flush',
+    );
+    assertEquals(
+      replay.pcm.subarray(bytes.length),
+      new Uint8Array(replay.pcm.length - bytes.length),
+    );
+    assertEquals(f.opens, 1);
+    await libraryProof();
+  } finally {
+    acquisition.resolve();
+    await f.close();
+  }
+});
+
+for (
+  const [name, declaredMs, frames] of [
+    ['shorter decode paces labelled compatibility silence', 4000, 4410],
+    ['longer decode plays beyond the catalog duration', 10, 22050 + 353],
+  ] as const
+) {
+  test(`cold HTTP ${name}`, async () => {
+    const bytes = pcm(frames),
+      f = await nativeHttpFixture({ pcm: bytes, declaredMs });
+    try {
+      await f.play();
+      if (declaredMs === 4000) {
+        await until('sealed shorter source', () => !!f.key);
+        await sleep(2800);
+        assertEquals((await f.own('/player')).state, 'play');
+        assertEquals(f.ackStates.length, 0);
+        assertEquals(
+          (await f.native.progress(f.key!.epoch, f.key!.source))!.sourceFrames,
+          BigInt(frames),
+        );
+      }
+      await until(
+        'catalog natural stop',
+        () => f.playback.playerView().state === 'stop',
+      );
+      assertEquals(f.audio.realAudio(f.receiver.sessions[0]), bytes);
+      assertEquals(
+        f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+        bytes,
+      );
+      if (declaredMs === 4000) {
+        assert(
+          f.audio.epochs[0].ranges.some((r) => r.kind === 'compatibility'),
+        );
+      }
+      await until('ack after committed stop', () => f.ackStates.length === 1);
+      assertEquals(f.ackStates[0].state, 'stop');
+      await libraryProof();
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const declaredMs of [null, 0]) {
+  test(`cold HTTP catalog duration ${declaredMs} retains completed sink authority until Stop`, async () => {
+    const bytes = pcm(353),
+      f = await nativeHttpFixture({ pcm: bytes, declaredMs });
+    try {
+      await f.play();
+      await f.own('/player/consume?state=true', 'PUT');
+      await until(
+        'native completion retained',
+        async () =>
+          !!f.key &&
+          (await f.native.pollCompletion(f.key))?.status === 'complete',
+      );
+      await until(
+        'reader completion observed without ack',
+        () => f.audio.epochs.length === 1,
+      );
+      assertEquals((await f.own('/player')).state, 'play');
+      assertEquals(f.playback.queueView().items.length, 1);
+      assertEquals(f.ackStates, []);
+      assertEquals(
+        f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+        bytes,
+      );
+      await f.own('/player/stop', 'PUT');
+      await until(
+        'retained result ack after explicit Stop',
+        () => f.ackStates.length === 1,
+      );
+      assertEquals(f.ackStates[0].state, 'pause');
+      assertEquals(
+        f.playback.queueView().items.length,
+        1,
+        'Stop does not consume',
+      );
+      await libraryProof();
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test('cold HTTP losing a reader cannot fall through to catalog clock completion', async () => {
+  const gate = Promise.withResolvers<void>();
+  const f = await nativeHttpFixture({
+    pcm: pcm(4410),
+    acquisition: gate.promise,
+  });
+  try {
+    await f.play();
+    await until('reader acquired', () => !!f.token);
+    f.playback.cancelSource(f.token!);
+    gate.resolve();
+    await sleep(350);
+    await f.playback.advanceEnded();
+    assertEquals((await f.own('/player')).state, 'play');
+    assertEquals(
+      f.key,
+      undefined,
+      'cleaned-up reader never sealed a native source',
+    );
+    assertEquals(f.receiver.sessions[0].audioPayloads.length, 0);
+    assertEquals(f.ackStates, []);
+    await libraryProof();
+  } finally {
+    gate.resolve();
+    await f.close();
+  }
+});
+
+test('cold HTTP starvation holds EOF gate and preserves real PCM around labelled silence', async () => {
+  const gate = Promise.withResolvers<void>(), bytes = pcm(22050 + 353);
+  const f = await nativeHttpFixture({
+    pcm: bytes,
+    declaredMs: 10,
+    afterFirstChunk: gate.promise,
+  });
+  try {
+    await f.play();
+    await until('first native frames', async () =>
+      !!f.token &&
+      (await f.native.progress(f.native.epoch, 1n))?.sourceFrames! > 0n);
+    await sleep(2700);
+    assertEquals((await f.own('/player')).state, 'play');
+    assertEquals(f.key, undefined, 'starvation is not source EOF');
+    gate.resolve();
+    await until(
+      'starved tail renders then stops',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(f.audio.realAudio(f.receiver.sessions[0]), bytes);
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      bytes,
+    );
+    assert(f.audio.epochs[0].ranges.some((r) => r.kind === 'underrun'));
+    await libraryProof();
+  } finally {
+    gate.resolve();
+    await f.close();
+  }
+});
+
+test('cold HTTP finite web EOF needs matching scheduled completion', async () => {
+  const bytes = pcm(4410 + 353),
+    f = await nativeHttpFixture({ pcm: bytes, web: 'finite' });
+  try {
+    await f.play();
+    await until(
+      'finite web natural stop',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(f.audio.realAudio(f.receiver.sessions[0]), bytes);
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      bytes,
+    );
+    await until('finite ack', () => f.ackStates.length === 1);
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
+test('cold HTTP live EOF remains a source failure and never seals a natural completion', async () => {
+  const f = await nativeHttpFixture({ pcm: pcm(4410), web: 'live' });
+  try {
+    await f.play();
+    await until(
+      'exhausted live source stops',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(f.playback.lastCommand()?.kind, 'sourceSkip');
+    assertEquals(f.key, undefined);
+    assertEquals(f.ackStates, []);
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
 test('core source identities hold the origin and only project matching scheduled facts', () => {
   const timeline = createPlaybackTimeline();
   const a = timeline.begin(origin);
@@ -202,6 +433,50 @@ test('core source identities hold the origin and only project matching scheduled
     'later starvation observation cannot invent elapsed media',
   );
   assert(Object.isFrozen(a) && Object.isFrozen(timeline.position(a)));
+});
+
+test('core end authority requires its own sealed target and matching terminal completion', () => {
+  const timeline = createPlaybackTimeline(), source = timeline.begin(origin);
+  const result = {
+    ...source,
+    target: 353n,
+    revision: 1n,
+    status: 'complete' as const,
+  };
+  assertEquals(
+    timeline.complete(source, result),
+    false,
+    'EOF without a seal is not native completion',
+  );
+  assert(timeline.seal(source, 353n));
+  assertEquals(timeline.seal(source, 354n), false);
+  for (
+    const change of [
+      { epoch: 2n },
+      { streamId: 3n },
+      { source: 999n },
+      { target: 352n },
+      { revision: 2n },
+      { status: 'failed' as const },
+      { status: 'canceled' as const },
+      { status: 'pending' as const },
+    ]
+  ) {
+    assertEquals(timeline.complete(source, { ...result, ...change }), false);
+  }
+  assertEquals(
+    timeline.complete({ ...source }, result),
+    false,
+    'copied identity has no authority',
+  );
+  assert(timeline.complete(source, result));
+  assertEquals(
+    timeline.complete(source, result),
+    false,
+    'one committed outcome',
+  );
+  timeline.retire(source);
+  assertEquals(timeline.complete(source, result), false);
 });
 
 test('core commits the atomic old cutoff and rejects delayed old facts after repeat or seek', () => {
@@ -510,7 +785,10 @@ test('mid-source cutoff matches the independent schedule at cancel admission not
   }
 });
 
-async function cohortPacerChild() {
+async function cohortPacerChild(
+  filter = 'lazy completion cohort revision',
+  extra: Record<string, string> = {},
+) {
   const directory = await Deno.makeTempDir({ prefix: 'playback-cohort-' });
   const helper = new URL('../helper/raop/', import.meta.url).pathname;
   const interposer = `${directory}/progress.so`;
@@ -536,13 +814,15 @@ async function cohortPacerChild() {
       '--cached-only',
       '--node-modules-dir=manual',
       '-A',
-      '--filter=lazy completion cohort revision',
+      `--filter=${filter}`,
       new URL(import.meta.url).pathname,
     ],
     env: {
       LD_PRELOAD: interposer,
       MELOFON_COHORT_CASE: 'held-pacer',
       RAOP_PROGRESS_HOLD: `${directory}/hold`,
+      RAOP_PROGRESS_ARM: `${directory}/arm`,
+      ...extra,
     },
   }).output();
   await Deno.writeFile(`${directory}/child.stdout`, child.stdout);
@@ -554,6 +834,93 @@ async function cohortPacerChild() {
     if (line.startsWith('position native library:')) console.log(line);
   }
 }
+
+test('cold HTTP held native emission cannot consume or release accepted EOF', async () => {
+  if (Deno.env.get('MELOFON_HTTP_PACER_CASE') !== 'held') {
+    return await cohortPacerChild('cold HTTP held native emission', {
+      MELOFON_HTTP_PACER_CASE: 'held',
+    });
+  }
+  const hold = Deno.env.get('RAOP_PROGRESS_HOLD')!;
+  await Deno.writeTextFile(hold, 'hold accepted EOF before actual emission');
+  const bytes = pcm(4410 + 353), f = await nativeHttpFixture({ pcm: bytes });
+  try {
+    await f.play();
+    await f.own('/player/consume?state=true', 'PUT');
+    await until('source sealed behind accepted EOF', () => !!f.key);
+    await sleep(1200);
+    assertEquals((await f.own('/player')).state, 'play');
+    assertEquals(f.playback.queueView().items.length, 1);
+    assertEquals(f.ackStates, []);
+    assertEquals(
+      (await f.native.source(f.key!.epoch, f.key!.source))!.fedFrames,
+      0n,
+    );
+    assertEquals((await f.native.pollCompletion(f.key!))!.status, 'pending');
+    assertEquals(f.receiver.sessions[0].audioPayloads.length, 0);
+    assert(
+      !f.receiver.sessions[0].wire.some((e) =>
+        e.kind === 'flush' || e.kind === 'teardown'
+      ),
+    );
+    await Deno.remove(hold);
+    await until(
+      'single natural consume after native rendering',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(f.playback.queueView().items, []);
+    assertEquals(f.audio.realAudio(f.receiver.sessions[0]), bytes);
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      bytes,
+    );
+    await until(
+      'ack follows committed consume',
+      () => f.ackStates.length === 1,
+    );
+    assertEquals(f.ackStates[0].state, 'stop');
+    await libraryProof();
+  } finally {
+    await Deno.remove(hold).catch(() => {});
+    await f.close();
+  }
+});
+
+test('cold HTTP native encoding failure cannot complete or consume sealed EOF', async () => {
+  if (Deno.env.get('MELOFON_HTTP_PACER_CASE') !== 'encoder') {
+    return await cohortPacerChild('cold HTTP native encoding failure', {
+      MELOFON_HTTP_PACER_CASE: 'encoder',
+      RAOP_PROGRESS_FAULT: 'encoder',
+    });
+  }
+  const hold = Deno.env.get('RAOP_PROGRESS_HOLD')!,
+    arm = Deno.env.get('RAOP_PROGRESS_ARM')!;
+  await Deno.writeTextFile(hold, 'seal before native failure');
+  const f = await nativeHttpFixture({ pcm: pcm(4410 + 353) });
+  try {
+    await f.play();
+    await f.own('/player/consume?state=true', 'PUT');
+    await until('failed source sealed', () => !!f.key);
+    await Deno.writeTextFile(arm, 'fail the actual encoder');
+    await Deno.remove(hold);
+    await until(
+      'failed native source pauses',
+      () => f.playback.playerView().state === 'pause',
+    );
+    assertEquals((await f.own('/player')).state, 'pause');
+    assertEquals(f.playback.queueView().items.length, 1);
+    assertEquals(
+      f.audio.epochs,
+      [],
+      'failed result never credited as complete',
+    );
+    assertEquals(f.receiver.sessions[0].audioPayloads.length, 0);
+    await libraryProof();
+  } finally {
+    await Deno.remove(hold).catch(() => {});
+    await f.close();
+  }
+});
 
 test('lazy completion cohort revision reports withdrawal and only credits the healthy peer', async () => {
   if (Deno.env.get('MELOFON_COHORT_CASE') !== 'held-pacer') {

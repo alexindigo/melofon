@@ -178,6 +178,7 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
   );
   for (const engine of playback) await engine.queueAdd(songs);
   const sourceEnds = [new Set<number>(), new Set<number>()];
+  const sourceCompletions = [new Set<number>(), new Set<number>()];
   let eofEntered = false;
   const boots = playback.map((engine, index) => {
     const media = createMedia();
@@ -191,6 +192,13 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
             sourceEnds[index].add(source.entryId);
           }
           return accepted;
+        },
+        completeSource(source, receipt) {
+          const committed = engine.completeSource(source, receipt);
+          if (receipt.status === 'complete') {
+            sourceCompletions[index].add(source.entryId);
+          }
+          return committed;
         },
       },
       capacity: capacities[index],
@@ -256,6 +264,7 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
     retry,
     times,
     sourceEnds,
+    sourceCompletions,
     eofEntered: () => eofEntered,
     async close() {
       for (const engine of playback) await engine.close();
@@ -770,12 +779,14 @@ Deno.test('natural advancement retains the stream and releases it after end-of-q
     await busy(() => f.playback[1].play());
     held.resolve();
     await until(() => f.sourceEnds[0].has(first));
+    await until(() => f.sourceCompletions[0].has(first));
     await f.playback[0].advanceEnded();
     await until(() => f.sessions[1]?.bytes > 0);
     const second = f.playback[0].playerView().current!.id;
     await until(() => f.sourceEnds[0].has(second));
     await busy(() => f.playback[1].play());
     f.times[0] += f.playback[0].playerView().itemLengthMs + 1;
+    await until(() => f.sourceCompletions[0].has(second));
     await f.playback[0].advanceEnded();
     assertEquals(f.playback[0].playerView().state, 'stop');
     await until(() => f.sessions.every((s) => s.closed));

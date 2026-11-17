@@ -6,6 +6,7 @@ import { until } from './helpers/speaker-consumer.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
+import { traceTimelineAudio } from './helpers/raop-timeline-audio.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import type { AirplayAppendResult } from '../src/boots/airplay-profile.ts';
@@ -91,6 +92,7 @@ async function scenario(
   const appends: { bytes: Uint8Array; receipt: AirplayAppendResult }[] = [];
   const cancels: { epoch: bigint; retire: readonly bigint[] }[] = [];
   const acknowledgments: bigint[] = [];
+  const completedAudio = traceTimelineAudio(createFfiStream);
   let ids: string[] = [];
   try {
     f = await apiFixture({
@@ -119,14 +121,18 @@ async function scenario(
           connectionStrategy: strategy,
         });
         devices = createTestAirplayDevices(outputs, undefined, () => {
-          const native = createFfiStream();
+          const native = completedAudio.stream();
           return {
             ...native,
             get epoch() {
               return native.epoch;
             },
-            async append(input) {
-              const receipt = await native.append(input);
+            async appendSource(
+              input: Parameters<
+                ReturnType<typeof createFfiStream>['appendSource']
+              >[0],
+            ) {
+              const receipt = await native.appendSource(input);
               appends.push({ bytes: input.pcm.slice(), receipt });
               return receipt;
             },
@@ -154,7 +160,7 @@ async function scenario(
           };
         });
         const core = createPlayback({
-          player: createPlayer({ now: () => 0, monotonicNow: () => 0 }),
+          player: createPlayer(),
           outputs,
           library,
           cfg: f.cfg,
@@ -222,7 +228,7 @@ async function scenario(
     assertEquals(added.status, 200, await added.text());
     await until(() => receiver.sessions[0]?.audioPackets >= 1);
     if (mode === 'backpressure') {
-      await until(() => receiver.sessions[0].audioPackets === 251);
+      await until(() => completedAudio.epochs.length === 1);
       const receipts = appends.filter((a) => a.receipt.epoch === 1n);
       assert(
         receipts.some((a) =>
@@ -241,10 +247,7 @@ async function scenario(
       assertEquals(offset, old.length);
       assertEquals(new Set(receipts.map((a) => a.receipt.segment)).size, 1);
       assertEquals(
-        decodeReceiverAudio(
-          receiver.sessions[0].sdp,
-          receiver.sessions[0].audioPayloads,
-        ),
+        completedAudio.realAudio(receiver.sessions[0]),
         old,
       );
       assertEquals(
@@ -291,19 +294,30 @@ async function scenario(
       assertEquals(b.bytes, replacement.subarray(0, 351 * 4));
       assertEquals(b.receipt.epoch, BigInt(cancels.length + 1));
       const session = receiver.sessions.at(-1)!;
-      const oldPackets = strategy === 'owntone' ? 1 : 0;
+      // Timeline starvation can packetize the 351-frame prefix with labelled
+      // zero transport; it still must never contain the canceled old partial.
+      const anchor = session.wire.findLastIndex((e) =>
+        e.kind === 'record' || e.kind === 'flush'
+      );
+      const prefix = decodeReceiverAudio(
+        session.sdp,
+        session.wire.slice(anchor).flatMap((e) =>
+          e.kind === 'audio' ? [e.data.subarray(12)] : []
+        ),
+      );
+      const realPrefix = Math.min(prefix.length, 351 * 4);
       assertEquals(
-        session.audioPackets,
-        oldPackets,
-        '351 real replacement frames cannot contain an old partial',
+        prefix.subarray(0, realPrefix),
+        replacement.subarray(0, realPrefix),
+      );
+      assertEquals(
+        prefix.subarray(realPrefix),
+        new Uint8Array(prefix.length - realPrefix),
       );
       tail.resolve();
-      await until(() => session.audioPackets === oldPackets + 1);
+      await until(() => completedAudio.epochs.length === 1);
       assertEquals(
-        decodeReceiverAudio(
-          session.sdp,
-          session.audioPayloads.slice(oldPackets),
-        ),
+        completedAudio.realAudio(session, strategy === 'owntone' ? 1 : 0),
         replacement,
       );
       assertEquals(opens.map((path) => path.slice(-5)), ['a.wav', 'b.wav']);
@@ -317,6 +331,7 @@ async function scenario(
       assertEquals(Math.round(audio.reduce((a, b) => a + b, 0) * 44.1), 705);
     }
     const session = receiver.sessions.at(-1)!;
+    await until(() => completedAudio.epochs.length === 1);
     await until(() => session.wire.some((e) => e.kind === 'timing-reply'));
     const pending = renderScheduledAudio(session, receiver.nowMs());
     assertEquals(pending.issues, []);
@@ -330,12 +345,40 @@ async function scenario(
     );
     const rendered = renderScheduledAudio(session, receiver.nowMs());
     assertEquals(rendered.issues, []);
-    assertEquals(rendered.pcm, mode === 'backpressure' ? old : replacement);
-    assertEquals(rendered.pendingFrames, 0);
     assertEquals(
-      rendered.discarded.map((r) => [r.reason, r.frames]),
-      mode !== 'backpressure' && strategy === 'owntone' ? [['flush', 352]] : [],
+      completedAudio.scheduledRealAudio(
+        session,
+        receiver.nowMs(),
+        mode !== 'backpressure' && strategy === 'owntone' ? 1 : 0,
+      ),
+      mode === 'backpressure' ? old : replacement,
     );
+    assertEquals(rendered.pendingFrames, 0);
+    if (mode !== 'backpressure' && strategy === 'owntone') {
+      const beforeFlush = session.wire.slice(
+        0,
+        session.wire.findIndex((e) => e.kind === 'flush'),
+      );
+      const oldPackets = beforeFlush.flatMap((e) =>
+        e.kind === 'audio' ? [e.data.subarray(12)] : []
+      );
+      const oldPcm = decodeReceiverAudio(session.sdp, oldPackets);
+      const real = Math.min(old.length, oldPcm.length);
+      assertEquals(oldPcm.subarray(0, real), old.subarray(0, real));
+      assertEquals(oldPcm.subarray(real), new Uint8Array(oldPcm.length - real));
+      assertEquals(
+        rendered.ranges.filter((r) => r.epoch === 1),
+        [],
+        'no canceled old frame renders',
+      );
+      assertEquals(
+        rendered.discarded.reduce((n, r) => n + r.frames, 0),
+        oldPcm.length / 4,
+      );
+      assert(
+        rendered.discarded.every((r) => r.reason === 'flush' && r.epoch === 1),
+      );
+    } else assertEquals(rendered.discarded, []);
     await libraryProof();
   } finally {
     flush.resolve();

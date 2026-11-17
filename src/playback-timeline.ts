@@ -1,5 +1,6 @@
 // Core-owned source incarnations and native-fact projection. No queue policy,
-// timers, protocol imports or inferred progress. Production adoption is separate.
+// timers, protocol imports or inferred progress. Seal/completion authority stays
+// with the same immutable source until its core transition commits.
 export interface TimelineSource {
   readonly streamId: bigint;
   readonly epoch: bigint;
@@ -33,6 +34,14 @@ export interface TimelinePosition {
   readonly error: string;
   readonly canceled: boolean;
 }
+export interface TimelineCompletion {
+  readonly streamId: bigint;
+  readonly epoch: bigint;
+  readonly source: bigint;
+  readonly target: bigint;
+  readonly revision: bigint;
+  readonly status: 'pending' | 'complete' | 'canceled' | 'failed';
+}
 const u64 = (n: bigint) => {
   if (typeof n !== 'bigint' || n < 0n || n > 0xffffffffffffffffn) {
     throw new RangeError('Timeline facts require unsigned 64-bit values');
@@ -45,6 +54,8 @@ export function createPlaybackTimeline() {
   const records = new Map<bigint, {
     source: TimelineSource;
     position: TimelinePosition;
+    target?: bigint;
+    completed?: boolean;
   }>();
   const canceledThrough = new Map<bigint, bigint>();
   const owned = (source: TimelineSource) => {
@@ -101,6 +112,27 @@ export function createPlaybackTimeline() {
     },
     position(source: TimelineSource): TimelinePosition | null {
       return owned(source)?.position ?? null;
+    },
+    seal(source: TimelineSource, target: bigint): boolean {
+      u64(target);
+      const record = owned(source);
+      if (!record || record.position.canceled || record.target !== undefined) {
+        return false;
+      }
+      record.target = target;
+      return true;
+    },
+    complete(source: TimelineSource, receipt: TimelineCompletion): boolean {
+      const record = owned(source);
+      if (
+        !record || record.position.canceled || record.completed ||
+        receipt.streamId !== source.streamId ||
+        receipt.epoch !== source.epoch ||
+        receipt.source !== source.source || receipt.target !== record.target ||
+        receipt.revision !== 1n || receipt.status !== 'complete'
+      ) return false;
+      record.completed = true;
+      return true;
     },
     observe(source: TimelineSource, progress: TimelineProgress): boolean {
       const record = owned(source);
