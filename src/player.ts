@@ -284,6 +284,8 @@ export interface Player {
    * Releasing the binding never reopens the current run's clock-only end gate. */
   attachSink(): () => void;
   openSource(entryId: number, generation: number): PlaybackSource | null;
+  /** Reserve a future read incarnation without changing current or its gate. */
+  prepareSource(entryId: number, generation: number): PlaybackSource | null;
   cancelSource(source: PlaybackSource): void;
   sourceComplete(source: PlaybackSource): boolean;
   sourceCompatibilityRemaining(source: PlaybackSource): number;
@@ -354,7 +356,11 @@ export interface Player {
   /** Exhausted sources bypass repeat-single; failed occurrences cannot wrap. */
   advanceFailed(failed: ReadonlySet<number>): AdvanceResult;
   /** Apply exactly the prepared occurrence/effects, only in its captured revision. */
-  applySuccessor(plan: SuccessorPlan, entryId?: number | null): AdvanceResult;
+  applySuccessor(
+    plan: SuccessorPlan,
+    entryId?: number | null,
+    prepared?: PlaybackSource,
+  ): AdvanceResult;
   /** Boot-time restore (plan restart-transparency): load the rehydrated
    * queue plus the persisted snapshot in one shot. main.ts decides
    * play-vs-pause per shouldAutoResume. Emits nothing and persists nothing
@@ -531,13 +537,31 @@ export function createPlayer(options: {
   let scheduledProgressMs: number | null = null;
   let playbackRate = 0;
   let deliveredGeneration = -1;
-  let source: {
+  type SourceRecord = {
     token: PlaybackSource;
     controller: AbortController;
+    claimed: boolean;
     outcome?: SourceOutcome;
     complete: boolean;
     legacyDrainAt: number;
-  } | null = null;
+  };
+  let source: SourceRecord | null = null;
+  const preparedSources = new Map<PlaybackSource, SourceRecord>();
+  const makeSource = (entryId: number, startMs: number): SourceRecord => {
+    const controller = new AbortController();
+    return {
+      token: Object.freeze({
+        entryId,
+        generation: ++sourceGeneration,
+        startMs,
+        signal: controller.signal,
+      }),
+      controller,
+      claimed: false,
+      complete: false,
+      legacyDrainAt: monotonicNow(),
+    };
+  };
   const cancelSource = () => {
     const old = source;
     source = null;
@@ -562,6 +586,9 @@ export function createPlayer(options: {
   const discontinuity = () => {
     generation++;
     cancelSource();
+    const prepared = [...preparedSources.values()];
+    preparedSources.clear();
+    for (const record of prepared) record.controller.abort();
     sinkRequired = sinks.size > 0;
     scheduledProgressMs = null;
     playbackRate = 0;
@@ -691,19 +718,28 @@ export function createPlayer(options: {
   const applySuccessor = (
     plan: SuccessorPlan,
     entryId = plan.entryId,
+    prepared?: PlaybackSource,
   ): AdvanceResult => {
+    const reading = prepared ? preparedSources.get(prepared) : undefined;
     if (
       plan.revision !== version || plan.currentEntryId !== currentEntry()?.id ||
       plan.repeat !== repeat || plan.consume !== consume ||
       plan.reason === 'natural' && !canAdvanceEnded() ||
-      entryId !== null && !plan.candidates.includes(entryId)
+      entryId !== null && !plan.candidates.includes(entryId) ||
+      prepared &&
+        (!reading || prepared.signal.aborted || prepared.entryId !== entryId)
     ) return 'none';
+    // Transfer the exact reserved incarnation through the discontinuity. Other
+    // future reads are revoked; the previous playing record still owns its EOF
+    // and completion until this synchronous publication.
+    if (prepared) preparedSources.delete(prepared);
     if (plan.removedEntryId !== null) {
       items = items.filter((item) => item.id !== plan.removedEntryId);
       version++;
     }
     if (entryId === null) doStop();
     else startAt(items.findIndex((item) => item.id === entryId));
+    if (reading) source = reading;
     return plan.removedEntryId === null ? 'player' : 'player+queue';
   };
 
@@ -740,27 +776,31 @@ export function createPlayer(options: {
     openSource(entryId, expectedGeneration) {
       if (
         state !== 'play' || currentEntry()?.id !== entryId ||
-        generation !== expectedGeneration || source
+        generation !== expectedGeneration || source?.claimed
       ) return null;
-      const controller = new AbortController();
-      const token = Object.freeze({
+      source ??= makeSource(
         entryId,
-        generation: ++sourceGeneration,
-        startMs: queueCapabilities(currentEntry()).seekable
+        queueCapabilities(currentEntry()).seekable
           ? deliveredGeneration === generation ? progressMs() : baseProgressMs
           : 0,
-        signal: controller.signal,
-      });
-      source = {
-        token,
-        controller,
-        complete: false,
-        legacyDrainAt: monotonicNow(),
-      };
-      return token;
+      );
+      source.claimed = true;
+      return source.token;
+    },
+    prepareSource(entryId, expectedGeneration) {
+      if (
+        state !== 'play' || generation !== expectedGeneration ||
+        !items.some((item) => item.id === entryId)
+      ) return null;
+      const record = makeSource(entryId, 0);
+      preparedSources.set(record.token, record);
+      return record.token;
     },
     cancelSource(token) {
       if (source?.token === token) cancelSource();
+      const prepared = preparedSources.get(token);
+      preparedSources.delete(token);
+      prepared?.controller.abort();
     },
     sourceComplete(token) {
       if (

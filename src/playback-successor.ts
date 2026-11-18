@@ -66,3 +66,32 @@ export function planPlaybackSuccessor(input: {
     entryId: candidates[0] ?? null,
   });
 }
+
+/** Rebase unscheduled preparation only when the relationship it has actually
+ * read is unchanged. Later queue entries and unrelated revisions are not locks.
+ * A null selection means exhaustion, so the whole candidate list was read. */
+export function reconcilePlaybackSuccessor(
+  captured: SuccessorPlan,
+  current: SuccessorPlan,
+  through: number | null,
+): SuccessorPlan | null {
+  if (
+    captured.reason !== current.reason ||
+    captured.currentEntryId !== current.currentEntryId ||
+    captured.repeat !== current.repeat ||
+    captured.consume !== current.consume ||
+    captured.removedEntryId !== current.removedEntryId ||
+    captured.excluded.length !== current.excluded.length ||
+    captured.excluded.some((id) => !current.excluded.includes(id))
+  ) return null;
+  const count = through === null
+    ? captured.candidates.length
+    : captured.candidates.indexOf(through) + 1;
+  if (!count && through !== null) return null;
+  if (through === null && count !== current.candidates.length) return null;
+  return captured.candidates.slice(0, count).every((id, index) =>
+      current.candidates[index] === id
+    )
+    ? current
+    : null;
+}

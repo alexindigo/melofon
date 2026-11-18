@@ -17,6 +17,7 @@ import { startFakeRaop } from './fake-raop.ts';
 import { wireInt } from '../../layers/owntone/payloads.ts';
 import { traceTimelineAudio } from './raop-timeline-audio.ts';
 import type { PlaybackSource } from '../../src/player.ts';
+import type { QueueMedia, QueueReference } from '../../src/queue-source.ts';
 import type {
   AirplayCompletionKey,
   AirplayTimelineStream,
@@ -48,6 +49,10 @@ export async function nativeHttpFixture(options: {
   seekAdmitted?: (positionMs: number) => void;
   sourcePath?: string;
   sourceOpened?: (source: PlaybackSource) => void;
+  resolveSource?: (
+    reference: QueueReference,
+    resolve: () => Promise<QueueMedia | null>,
+  ) => Promise<QueueMedia | null>;
   append?: (
     request: Parameters<AirplayTimelineStream['appendSource']>[0],
     append: AirplayTimelineStream['appendSource'],
@@ -216,6 +221,36 @@ export async function nativeHttpFixture(options: {
         cfg: f.cfg,
         notify: f.notify,
         nowPlaying: createNowPlaying(f.store),
+        ...(options.resolveSource
+          ? {
+            resolveQueueReference: (reference: QueueReference) =>
+              options.resolveSource!(reference, async () => {
+                if (reference.kind === 'song') {
+                  const song = await library.getSong(reference.id);
+                  return song ? catalogMedia(song) : null;
+                }
+                assert(radio);
+                // Inspection accepts a direct URL. Retain the caller's station
+                // identity only after acquiring its actual finite/live facts.
+                const prepared = await sources.prepare({
+                  reference: { kind: 'url', url: `${radio.origin}/source` },
+                  facts: {
+                    kind: 'web',
+                    url: `${radio.origin}/source`,
+                    title: null,
+                    artistName: null,
+                    durationMs: null,
+                    mode: 'unknown',
+                    seekable: false,
+                    streamTitle: null,
+                    streamUrl: null,
+                  },
+                }, new AbortController().signal);
+                assert(prepared.facts.kind === 'web');
+                return { reference, facts: prepared.facts };
+              }),
+          }
+          : {}),
         ...(options.targetChecks
           ? {
             targets: {

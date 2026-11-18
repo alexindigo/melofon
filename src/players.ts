@@ -388,6 +388,7 @@ export async function createPlayers(deps: {
       current().sourceCompatibilityRemaining(...args),
     completeSource: (...args) => current().completeSource(...args),
     openSource: (...args) => current().openSource(...args),
+    sourcePlanView: () => current().sourcePlanView(),
     cancelSource: (...args) => current().cancelSource(...args),
     sourceAudio: (...args) => current().sourceAudio(...args),
     retrySource: (...args) => current().retrySource(...args),
