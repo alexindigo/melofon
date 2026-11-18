@@ -3303,6 +3303,26 @@ raop_transport_progress(uint64_t stream_id, uint64_t attachment, uint64_t now_ns
   out->status = valid ? 1 : 0;
 }
 
+uint64_t
+raop_transport_input_deadline(uint64_t stream_id)
+{
+  uint64_t earliest = UINT64_MAX;
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != stream_id || rs->retiring || rs->only_probe ||
+        rs->failure_pending || rs->cancel_pending || !rs->schedule_valid ||
+        rs->coverage_failed || (rs->state != RAOP_STATE_CONNECTED &&
+        rs->state != RAOP_STATE_STREAMING)) continue;
+    uint64_t frames = rs->master_session->epoch_frames;
+    /* Input must complete a packet before the receiver's required buffering
+     * lead, not at its presentation instant. This is the same receiver latency
+     * included by first sync, not an additional position/schedule offset. */
+    uint64_t deadline = rs->schedule_origin_ns + frames / 44100 * 1000000000ULL +
+      frames % 44100 * 1000000000ULL / 44100 - RAOP_AUDIO_LATENCY_MS * 1000000ULL;
+    if (deadline < earliest) earliest = deadline;
+  }
+  return earliest == UINT64_MAX ? 0 : earliest;
+}
+
 void
 raop_reanchor_stream(uint64_t stream_id)
 {

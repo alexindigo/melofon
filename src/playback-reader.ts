@@ -1,0 +1,334 @@
+// One bounded, ordered reader per transport epoch. Core chooses every successor;
+// a completed decoder releases input, not the playing cursor or its sink gate.
+import { createOperationScope } from './operations.ts';
+import type { Playback, PlaybackRead } from './playback.ts';
+import type { PlaybackSource } from './player.ts';
+import type { PlaybackSources } from './playback-source.ts';
+import type { QueueEntry } from './queue-source.ts';
+import { queueDuration } from './queue-source.ts';
+import type { TimelineSource, TimelineWriter } from './playback-timeline.ts';
+
+export function createPlaybackReader(deps: {
+  playback: Playback;
+  sources: PlaybackSources;
+  sink: TimelineWriter;
+  streamId: bigint;
+  epoch: bigint;
+  initial: PlaybackRead;
+  current(): boolean;
+  segment(): bigint;
+  mapping(source: PlaybackSource, mapping: TimelineSource): void;
+  admitted(): void;
+  inputObserved?(
+    phase: 'first' | 'end',
+    read: PlaybackRead,
+    bytes: number,
+  ): void;
+  transportFailed(error: unknown): void;
+  contentFailed(entry: QueueEntry, error: unknown): void;
+  retirementFailed(error: unknown): void;
+}) {
+  const { playback, sink, epoch } = deps;
+  const operations = createOperationScope('Playback reader');
+  const controller = new AbortController();
+  const mappings = new Map<PlaybackSource, TimelineSource>();
+  const leases = new Set<PlaybackSource>([deps.initial.source]);
+  let continuous = false;
+  const live = () => !controller.signal.aborted && deps.current();
+  const owns = (source: PlaybackSource) => live() && !source.signal.aborted;
+  const wait = (ms: number, source?: PlaybackSource) =>
+    new Promise<void>((resolve) => {
+      const signal = source
+        ? AbortSignal.any([controller.signal, source.signal])
+        : controller.signal;
+      const done = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      signal.addEventListener('abort', done, { once: true });
+      if (signal.aborted) done();
+    });
+  const bind = (read: PlaybackRead) => {
+    const source = read.source;
+    const mapping = playback.bindSource(source, deps.streamId, epoch);
+    if (!mapping) return null;
+    leases.add(source);
+    mappings.set(source, mapping);
+    deps.mapping(source, mapping);
+    void operations.run(async () => {
+      while (owns(source)) {
+        if (playback.sourcePlanView().playing === source) {
+          const progress = await sink.progress(epoch, mapping.source);
+          if (progress && owns(source)) {
+            playback.sourceProgress(source, progress);
+          }
+        }
+        await wait(25, source);
+      }
+    }).catch((error) => {
+      if (owns(source)) deps.transportFailed(error);
+    });
+    return mapping;
+  };
+  const acquire = (read: PlaybackRead) =>
+    operations.run(async () => {
+      const pcm = await deps.sources.open(read.entry, {
+        signal: read.source.signal,
+        startMs: read.source.startMs,
+        onMetadata: (metadata) => {
+          if (owns(read.source)) {
+            playback.reportSourceMetadata(read.source, metadata);
+          }
+        },
+        retry: (reason, signal) =>
+          playback.retrySource(read.source, reason, signal),
+      });
+      if (!pcm) throw new Error('No decodable audio');
+      void operations.run(() => pcm.completion);
+      if (!owns(read.source)) {
+        await pcm.return();
+        return null;
+      }
+      // At most one decoded head is retained outside the bounded native ingress.
+      try {
+        const head = await pcm.next();
+        return { pcm, head };
+      } catch (error) {
+        await pcm.return();
+        throw error;
+      }
+    });
+  type Acquired = Awaited<ReturnType<typeof acquire>>;
+  const future = (after: PlaybackSource) =>
+    operations.run(async () => {
+      let read: PlaybackRead | null;
+      try {
+        read = await playback.prepareNextSource(after);
+      } catch (error) {
+        if (!owns(after)) return null;
+        // Preparation has its own retained failure. The due transition applies
+        // existing source policy after A's native completion, never at read EOF.
+        return { preparationFailed: true as const, error };
+      }
+      if (!live() || !read || !playback.admitSource(read)) return null;
+      continuous = true;
+      const mapping = bind(read);
+      if (!mapping) return null;
+      try {
+        return { read, mapping, input: await acquire(read) };
+      } catch (error) {
+        if (owns(read.source)) {
+          playback.reportSourceOutcome(read.source, 'decode-error');
+        }
+        return { read, mapping, input: null, error };
+      }
+    });
+  const observeCompletion = (
+    source: PlaybackSource,
+    mapping: TimelineSource,
+    target: bigint,
+  ) => {
+    const key = { epoch, source: mapping.source, target, revision: 1n };
+    void operations.run(async () => {
+      try {
+        const completion = await sink.waitCompletion(key);
+        if (!owns(source)) return;
+        if (completion.status !== 'complete') {
+          throw new Error(`Source completion failed: ${completion.status}`);
+        }
+        const progress = await sink.progress(epoch, mapping.source);
+        if (progress && owns(source)) playback.sourceProgress(source, progress);
+        await playback.completeSource(source, completion);
+      } catch (error) {
+        if (owns(source)) deps.transportFailed(error);
+      } finally {
+        try {
+          await sink.waitCompletion(key);
+          await sink.ackCompletion(key);
+        } catch (error) {
+          deps.retirementFailed(error);
+        }
+        mappings.delete(source);
+        leases.delete(source);
+      }
+    });
+  };
+  const write = async (
+    read: PlaybackRead,
+    mapping: TimelineSource,
+    input: NonNullable<Acquired>,
+  ) => {
+    const { source } = read, { pcm } = input;
+    let bytes = 0;
+    try {
+      if (pcm.originFrame !== mapping.originFrame) {
+        throw new Error('Playback source differs from its timeline origin');
+      }
+      let part = input.head;
+      while (!part.done && owns(source)) {
+        const chunk = part.value, segment = deps.segment();
+        if (!bytes) deps.inputObserved?.('first', read, chunk.length);
+        let offset = 0;
+        while (offset < chunk.length && owns(source)) {
+          deps.admitted();
+          const receipt = await sink.appendSource({
+            epoch,
+            source: mapping.source,
+            segment,
+            pcm: chunk.subarray(offset),
+          });
+          const accepted = Number(receipt.acceptedFrames) * 4;
+          if (owns(source)) pcm.accept(chunk, receipt.acceptedFrames);
+          offset += accepted;
+          bytes += accepted;
+          if (owns(source) && accepted) {
+            playback.sourceAccepted(source, receipt.acceptedFrames);
+            playback.sourceAudio(source, accepted / 176400 * 1000);
+          }
+          if (!owns(source)) return null;
+          if (receipt.status === 'error' || receipt.status === 'canceled') {
+            deps.transportFailed(
+              new Error(`RAOP append failed: ${receipt.status}`),
+            );
+            return null;
+          }
+          if (offset < chunk.length) await wait(10, source);
+        }
+        if (!owns(source)) return null;
+        part = await pcm.next();
+      }
+      if (!owns(source)) return null;
+      if (!pcm.eof || !bytes) {
+        throw new Error('Empty or incomplete decoder stream');
+      }
+      deps.inputObserved?.('end', read, bytes);
+      playback.reportSourceOutcome(source, 'eof');
+      if (!owns(source)) return null;
+      const target = BigInt(bytes / 4);
+      if (!playback.sealSource(source, target)) return null;
+      let marker;
+      do {
+        marker = await sink.seal(epoch, mapping.source, target);
+        if (marker.status === 'accepted') break;
+        if (!['backpressure', 'not-ready'].includes(marker.status)) {
+          throw new Error(`RAOP seal failed: ${marker.status}`);
+        }
+        await wait(10, source);
+      } while (owns(source));
+      if (!owns(source)) return null;
+      observeCompletion(source, mapping, target);
+      return { inputEnd: marker.inputEnd, frames: target };
+    } finally {
+      await pcm.return();
+      await pcm.completion;
+    }
+  };
+  const natural = (entry: QueueEntry) =>
+    entry.facts.kind === 'song'
+      ? (queueDuration(entry) ?? 0) > 0
+      : entry.facts.mode === 'finite';
+  const work = operations.run(async () => {
+    let read = deps.initial, mapping = bind(read);
+    if (!mapping) return;
+    let input: Acquired = null;
+    try {
+      while (owns(read.source)) {
+        // Preparation and one incoming head run concurrently with the outgoing
+        // decoder, while the core keeps public current at the playing cursor.
+        const pending = natural(read.entry) ? future(read.source) : null;
+        void pending?.catch(() => {});
+        input ??= await acquire(read);
+        if (!input) return;
+        const end = await write(read, mapping, input);
+        input = null;
+        if (!end || !live()) return;
+        const length = queueDuration(read.entry) ?? 0;
+        if (
+          read.entry.facts.kind === 'song' &&
+          Math.round(Number(end.frames) * 1000 / 44100) + read.source.startMs <
+            length
+        ) {
+          await sink.compatibilitySilence(epoch, mapping.source);
+          while (
+            owns(read.source) &&
+            playback.sourcePlanView().playing !== read.source
+          ) {
+            await wait(10, read.source);
+          }
+          while (
+            owns(read.source) &&
+            playback.sourceCompatibilityRemaining(read.source) > 0
+          ) {
+            await wait(
+              playback.sourceCompatibilityRemaining(read.source),
+              read.source,
+            );
+          }
+        }
+        let next = await pending;
+        if (next && 'preparationFailed' in next) {
+          await sink.endStream(epoch, end.inputEnd);
+          return;
+        }
+        while (
+          live() && next?.read.source.signal.aborted && owns(read.source)
+        ) {
+          await next.input?.pcm.return();
+          const replacement = await future(read.source);
+          if (replacement && 'preparationFailed' in replacement) {
+            await sink.endStream(epoch, end.inputEnd);
+            return;
+          }
+          next = replacement;
+        }
+        if (!live()) return;
+        if (!next) {
+          if (
+            continuous && natural(read.entry) &&
+            !playback.finishSources(read.source)
+          ) {
+            return;
+          }
+          const result = await sink.endStream(epoch, end.inputEnd);
+          if (result.status !== 'accepted') {
+            throw new Error(`RAOP end failed: ${result.status}`);
+          }
+          return;
+        }
+        if (!next.input) {
+          // Its failure is due-only core policy. End the healthy prefix so its
+          // exact tail can complete before that failure is published.
+          await sink.endStream(epoch, end.inputEnd);
+          return;
+        }
+        read = next.read;
+        mapping = next.mapping;
+        input = next.input;
+      }
+    } catch (error) {
+      if (owns(read.source)) {
+        deps.contentFailed(read.entry, error);
+        playback.reportSourceOutcome(read.source, 'decode-error');
+      }
+    } finally {
+      await input?.pcm.return();
+    }
+  });
+  void work.catch(deps.transportFailed);
+  return {
+    settled: work.then(() => operations.close()),
+    mapping(source: PlaybackSource) {
+      return mappings.get(source);
+    },
+    cancel() {
+      controller.abort();
+      for (const source of leases) playback.cancelSource(source);
+    },
+    async close() {
+      this.cancel();
+      await operations.close();
+    },
+  };
+}

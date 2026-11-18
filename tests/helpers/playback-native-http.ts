@@ -34,6 +34,7 @@ import type {
 
 export async function nativeHttpFixture(options: {
   pcm: Uint8Array;
+  additionalPcm?: Uint8Array[];
   declaredMs?: number | null;
   acquisition?: Promise<void>;
   web?: 'finite' | 'live';
@@ -82,6 +83,15 @@ export async function nativeHttpFixture(options: {
       `${directory}/media/source.${options.sourcePath.split('.').pop()}`,
     );
   } else await Deno.writeFile(`${directory}/media/source.wav`, wav);
+  for (const [i, pcm] of (options.additionalPcm ?? []).entries()) {
+    const file = new Uint8Array(44 + pcm.length);
+    file.set(wav.subarray(0, 44));
+    const header = new DataView(file.buffer);
+    header.setUint32(4, file.length - 8, true);
+    header.setUint32(40, pcm.length, true);
+    file.set(pcm, 44);
+    await Deno.writeFile(`${directory}/media/next-${i}.wav`, file);
+  }
   const receiver = await startFakeRaop({
     captureAudio: true,
     captureWire: true,
@@ -93,6 +103,9 @@ export async function nativeHttpFixture(options: {
   let outputOwner!: ReturnType<typeof createOutputs>;
   let timer: ReturnType<typeof setInterval> | undefined;
   let opens = 0, songId = '';
+  let songIds: string[] = [];
+  const published = new Set<PlaybackSource>();
+  let unsubscribePlaying: (() => void) | undefined;
   const origins: number[] = [], cutoffs: AirplaySourceCancelResult[] = [];
   const capturedCutoffs: AirplaySourceCutoff[] = [], cancelAcks: bigint[] = [];
   const cancelTimes: { before: number; after: number }[] = [];
@@ -179,7 +192,14 @@ export async function nativeHttpFixture(options: {
       }
       await scanLibrary(f.store);
       const catalog = createLibrary(f.store);
-      songId = (await catalog.listSongs({ offset: 0, size: 1 }))[0].id;
+      const songs = await catalog.listSongs({ offset: 0, size: 100 });
+      songId = songs.find((s) => /\/source\./.test(s.path))!.id;
+      songIds = [
+        songId,
+        ...(options.additionalPcm ?? []).map((_, i) =>
+          songs.find((s) => s.path.endsWith(`/next-${i}.wav`))!.id
+        ),
+      ];
       const library = {
         ...catalog,
         async getSong(id: string) {
@@ -276,10 +296,20 @@ export async function nativeHttpFixture(options: {
         },
         openSource(...args) {
           token = engine.openSource(...args) ?? undefined;
-          if (token) options.sourceOpened?.(token);
+          if (token && !published.has(token)) {
+            published.add(token);
+            options.sourceOpened?.(token);
+          }
           return token ?? null;
         },
       };
+      unsubscribePlaying = f.notify.subscribe(() => {
+        const playing = engine.sourcePlanView().playing;
+        if (!playing || published.has(playing)) return;
+        token = playing;
+        published.add(playing);
+        options.sourceOpened?.(playing);
+      });
       if (options.restore && persistence) {
         const snapshot = await planRestore({
           queue: await persistence.loadQueue(),
@@ -370,6 +400,7 @@ export async function nativeHttpFixture(options: {
     cancelTimes,
     fixture: f,
     outputs: outputOwner,
+    songIds,
     publish(change: () => void) {
       assert(persistence);
       return persistence.publishedCommands.publish(change);
@@ -403,6 +434,7 @@ export async function nativeHttpFixture(options: {
       ),
     async close() {
       clearInterval(timer);
+      unsubscribePlaying?.();
       await boot.close();
       devices.close();
       await playback.close();

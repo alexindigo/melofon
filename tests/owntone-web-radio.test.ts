@@ -374,10 +374,17 @@ Deno.test('HA-shaped HTTP finite URL adds deliver complete native receiver audio
     await until(() =>
       t.playback.playerView().current?.id === added.items[1].id
     );
-    const received = () => t.audio.realAudio(receiver.sessions[0]);
+    // B is already arriving when A publishes its scheduled completion. Compare
+    // the exact completed source region, not all speculative future transport.
+    const received = () => t.audio.realAudio(receiver.sessions[0], 0, true);
     const first = received();
     assertEquals(
-      t.audio.scheduledRealAudio(receiver.sessions[0], receiver.nowMs()),
+      t.audio.scheduledRealAudio(
+        receiver.sessions[0],
+        receiver.nowMs(),
+        0,
+        true,
+      ),
       pcm,
     );
     assertEquals(
@@ -404,7 +411,12 @@ Deno.test('HA-shaped HTTP finite URL adds deliver complete native receiver audio
       'both complete finite sources reach the ALAC consumer before natural stop',
     );
     assertEquals(
-      t.audio.scheduledRealAudio(receiver.sessions[0], receiver.nowMs()),
+      t.audio.scheduledRealAudio(
+        receiver.sessions[0],
+        receiver.nowMs(),
+        0,
+        true,
+      ),
       expected,
     );
     assertEquals(receiver.sessions.length, 1, 'natural next retains the sink');

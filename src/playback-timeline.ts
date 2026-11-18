@@ -45,6 +45,38 @@ export interface TimelineCompletion {
   readonly revision: bigint;
   readonly status: 'pending' | 'complete' | 'canceled' | 'failed';
 }
+/** The reader consumes an injected timeline port, not a protocol adapter. */
+export interface TimelineWriter {
+  appendSource(input: {
+    epoch: bigint;
+    source: bigint;
+    segment: bigint;
+    pcm: Uint8Array;
+  }): Promise<{
+    acceptedFrames: bigint;
+    status: 'accepted' | 'backpressure' | 'not-ready' | 'canceled' | 'error';
+    error?: string;
+  }>;
+  seal(epoch: bigint, source: bigint, target: bigint): Promise<{
+    status: string;
+    inputEnd: bigint;
+  }>;
+  endStream(epoch: bigint, target: bigint): Promise<{ status: string }>;
+  compatibilitySilence(epoch: bigint, source: bigint): Promise<void>;
+  progress(epoch: bigint, source: bigint): Promise<TimelineProgress | null>;
+  waitCompletion(key: {
+    epoch: bigint;
+    source: bigint;
+    target: bigint;
+    revision: bigint;
+  }): Promise<TimelineCompletion>;
+  ackCompletion(key: {
+    epoch: bigint;
+    source: bigint;
+    target: bigint;
+    revision: bigint;
+  }): Promise<void>;
+}
 const u64 = (n: bigint) => {
   if (typeof n !== 'bigint' || n < 0n || n > 0xffffffffffffffffn) {
     throw new RangeError('Timeline facts require unsigned 64-bit values');

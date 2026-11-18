@@ -10,13 +10,9 @@ import { createOperationScope } from '../operations.ts';
 import { type CommandHandle, createCommandLane } from '../command-authority.ts';
 import { queueDisplay } from '../queue-source.ts';
 import type { Notify } from '../notify.ts';
-import type {
-  CommandSource,
-  Output,
-  Outputs,
-  PlaybackSource,
-} from '../player.ts';
+import type { CommandSource, Output, Outputs } from '../player.ts';
 import type { Playback } from '../playback.ts';
+import { createPlaybackReader } from '../playback-reader.ts';
 import type { TimelineSource } from '../playback-timeline.ts';
 import type { PlaybackCapacity } from '../playback-capacity.ts';
 import type { State } from '../state.ts';
@@ -27,7 +23,6 @@ import {
 import type { AirplayDevices } from './airplay-device.ts';
 import type {
   AirplayCancelResult,
-  AirplayCompletionKey,
   AirplayPlaybackStream,
   AirplayTransport,
 } from './airplay-profile.ts';
@@ -250,7 +245,7 @@ export function createAirplayBoot(
   let streamClosing: Promise<void> | undefined;
   let source: {
     stream: StreamOwner;
-    lease: PlaybackSource;
+    reader: ReturnType<typeof createPlaybackReader>;
   } | null = null;
   const pairings = new Map<string, PairingWork>();
   const forceRelease = new Set<string>();
@@ -529,7 +524,7 @@ export function createAirplayBoot(
   };
   const cancelPump = () => {
     if (source) {
-      playback.cancelSource(source.lease);
+      source.reader.cancel();
       source = null;
     }
   };
@@ -554,236 +549,49 @@ export function createAirplayBoot(
     if (nativeEpoch === null) {
       throw new Error('Connected AirPlay stream has no epoch');
     }
-    const authority = { stream: owner, lease: sourceLease };
-    const mapping = playback.bindSource(
-      sourceLease,
-      owner.sink.id!,
-      nativeEpoch,
-    );
-    if (!mapping) {
-      playback.cancelSource(sourceLease);
-      return;
-    }
-    source = authority;
     owner.sourceStarted = true;
-    owner.mapping = mapping;
     owner.admitted = false;
-    const current = view.current, startMs = sourceLease.startMs;
-    const path = current.facts.kind === 'song'
-      ? current.facts.song.path
-      : undefined;
-    const owns = () =>
-      source === authority && !sourceLease.signal.aborted && !closed &&
-      stream === owner && streamCurrent();
-    void operations.run(async () => {
-      while (owns()) {
-        const progress = await owner.sink.progress(nativeEpoch, mapping.source);
-        if (progress && owns()) playback.sourceProgress(sourceLease, progress);
-        await new Promise<void>((resolve) => {
-          const finish = () => {
-            clearTimeout(timer);
-            sourceLease.signal.removeEventListener('abort', finish);
-            resolve();
-          };
-          const timer = setTimeout(finish, 25);
-          sourceLease.signal.addEventListener('abort', finish, { once: true });
-          if (sourceLease.signal.aborted) finish();
-        });
-      }
-    }).catch((error) => {
-      if (owns()) {
+    const failed = (error: unknown) => {
+      if (!closed && stream === owner) {
         for (const [id, r] of [...runtimes]) {
-          sessionFailed(id, r, 'progress', error);
+          sessionFailed(id, r, 'source transport', error);
         }
       }
-    });
-    const readSource = async () => {
-      let bytes = 0;
-      let key: AirplayCompletionKey | undefined;
-      const wait = (ms: number) =>
-        new Promise<void>((resolve) => {
-          const done = () => {
-            clearTimeout(timer);
-            sourceLease.signal.removeEventListener('abort', done);
-            resolve();
-          };
-          const timer = setTimeout(done, ms);
-          sourceLease.signal.addEventListener('abort', done, { once: true });
-          if (sourceLease.signal.aborted) done();
+    };
+    const reader = createPlaybackReader({
+      playback,
+      sources,
+      sink: owner.sink,
+      streamId: owner.sink.id!,
+      epoch: nativeEpoch,
+      initial: { source: sourceLease, entry: view.current },
+      current: () => !closed && stream === owner && streamCurrent(),
+      segment: () => ++owner.segment,
+      mapping(lease, mapping) {
+        if (playback.sourcePlanView().playing === lease) {
+          owner.mapping = mapping;
+        }
+      },
+      admitted() {
+        owner.admitted = true;
+      },
+      inputObserved(phase, read, bytes) {
+        if (!DEBUG || read.entry.facts.kind !== 'song') return;
+        log.event(phase === 'first' ? 'pump_first' : 'pump_end', {
+          player: deps.playerId ?? 1,
+          generation: read.source.generation,
+          path: read.entry.facts.song.path,
+          bytes,
         });
-      try {
-        const stream = await sources.open(current, {
-          signal: sourceLease.signal,
-          startMs,
-          onMetadata: (metadata) => {
-            if (owns()) playback.reportSourceMetadata(sourceLease, metadata);
-          },
-          retry: (reason, signal) =>
-            playback.retrySource(sourceLease, reason, signal),
-        });
-        if (!stream) {
-          if (!owns()) return;
-          throw new Error('no decodable audio');
-        }
-        const iterator = stream[Symbol.asyncIterator]();
-        try {
-          if (stream.originFrame !== mapping.originFrame) {
-            throw new Error('Playback source differs from its timeline origin');
-          }
-          if (!owns()) return;
-          for await (
-            const chunk of { [Symbol.asyncIterator]: () => iterator }
-          ) {
-            if (!owns()) return;
-            if (DEBUG && path !== undefined && bytes === 0) {
-              log.event('pump_first', {
-                player: deps.playerId ?? 1,
-                generation: view.generation,
-                path,
-                bytes: chunk.length,
-              });
-            }
-            try {
-              const segment = ++owner.segment;
-              let offset = 0;
-              while (offset < chunk.length && owns()) {
-                owner.admitted = true;
-                const receipt = await owner.sink.appendSource({
-                  epoch: nativeEpoch,
-                  source: mapping.source,
-                  segment,
-                  pcm: chunk.subarray(offset),
-                });
-                // Only this copied prefix belongs to the source. Never account
-                // a refused suffix or retry a prefix after cancellation.
-                const accepted = Number(receipt.acceptedFrames) * 4;
-                if (owns()) stream.accept(chunk, receipt.acceptedFrames);
-                offset += accepted;
-                bytes += accepted;
-                if (owns() && accepted) {
-                  playback.sourceAccepted(sourceLease, receipt.acceptedFrames);
-                  playback.sourceAudio(sourceLease, accepted / 176400 * 1000);
-                }
-                if (!owns()) return;
-                if (receipt.status === 'error') {
-                  throw new Error(`RAOP append failed: ${receipt.error}`);
-                }
-                if (receipt.status === 'canceled') {
-                  throw new Error('Current AirPlay source epoch canceled');
-                }
-                if (offset < chunk.length) {
-                  await wait(10);
-                }
-              }
-            } catch (error) {
-              if (owns()) {
-                for (const [id, r] of [...runtimes]) {
-                  sessionFailed(id, r, 'PCM', error);
-                }
-              }
-              return;
-            }
-            if (!owns()) return;
-          }
-        } finally {
-          try {
-            await iterator.return?.();
-          } finally {
-            await stream.completion;
-          }
-        }
-        if (!owns()) return;
-        if (!stream.eof) throw new Error('Playback decoder closed before EOF');
-        if (!bytes) throw new Error('empty decoder stream');
-        if (DEBUG && path !== undefined) {
-          log.event('pump_end', {
-            player: deps.playerId ?? 1,
-            generation: view.generation,
-            path,
-            bytes,
-          });
-        }
-        // Nonempty EOF is decoder completion, not audible/drained completion.
-        playback.reportSourceOutcome(sourceLease, 'eof');
-        if (!owns()) return; // Live EOF is failure, never a natural seal.
-        const target = BigInt(bytes / 4);
-        if (!playback.sealSource(sourceLease, target)) return;
-        try {
-          let marker;
-          do {
-            marker = await owner.sink.seal(nativeEpoch, mapping.source, target);
-            if (
-              marker.status === 'backpressure' || marker.status === 'not-ready'
-            ) await wait(10);
-            else break;
-          } while (owns());
-          if (marker.status !== 'accepted') {
-            if (!owns()) return;
-            throw new Error(`RAOP seal failed: ${marker.status}`);
-          }
-          key = {
-            epoch: nativeEpoch,
-            source: mapping.source,
-            target,
-            revision: 1n,
-          };
-          // Catalog logical eligibility remains core policy, separate from native
-          // real-source progress. Its shorter decode keeps a labelled paced gap.
-          if (playback.sourceCompatibilityRemaining(sourceLease) > 0) {
-            await owner.sink.compatibilitySilence(nativeEpoch, mapping.source);
-            while (owns()) {
-              const remaining = playback.sourceCompatibilityRemaining(
-                sourceLease,
-              );
-              if (remaining <= 0) break;
-              await wait(remaining);
-            }
-          }
-          if (!owns()) return;
-          const ended = await owner.sink.endStream(
-            nativeEpoch,
-            marker.inputEnd,
-          );
-          if (ended.status !== 'accepted') {
-            throw new Error(`RAOP end failed: ${ended.status}`);
-          }
-          const completion = await owner.sink.waitCompletion(key);
-          if (!owns()) return;
-          if (completion.status !== 'complete') {
-            throw new Error(
-              `RAOP source did not complete: ${completion.status}/${completion.error}`,
-            );
-          }
-          const progress = await owner.sink.progress(
-            nativeEpoch,
-            mapping.source,
-          );
-          if (progress && owns()) {
-            playback.sourceProgress(sourceLease, progress);
-          }
-          await playback.completeSource(sourceLease, completion);
-        } catch (error) {
-          if (owns()) {
-            for (const [id, r] of [...runtimes]) {
-              sessionFailed(id, r, 'completion', error);
-            }
-          }
-        }
-      } catch (error) {
-        if (!owns()) return;
-        if (current.facts.kind === 'web') {
-          // The source owner exhausted its bounded retries. Healthy receiver
-          // sessions remain admitted; core alone skips/stops the failed item.
-          playback.reportSourceOutcome(sourceLease, 'decode-error');
-          return;
-        }
+      },
+      transportFailed: failed,
+      contentFailed(entry, error) {
+        if (entry.facts.kind === 'web') return;
         log.event('content_failed', {
           player: deps.playerId ?? 1,
           generation: view.generation,
           error,
         });
-        // A shared source failure is not a speaker failure. Fence every demand
-        // before retiring any session, so a peer cannot reopen the same source.
         lease = null;
         for (const out of outputs.list()) {
           if (out.type !== 'AirPlay' || !out.selected) continue;
@@ -798,37 +606,26 @@ export function createAirplayBoot(
             },
           });
         }
-        playback.reportSourceOutcome(sourceLease, 'decode-error');
-        for (const [peerId, peer] of [...runtimes]) {
-          void retire(peerId, peer, 'content');
+        for (const [id, r] of [...runtimes]) void retire(id, r, 'content');
+      },
+      retirementFailed(error) {
+        if (!closed && !streamClosing) {
+          streamBlocked = true;
+          log.event('retirement_failed', { player: deps.playerId ?? 1, error });
         }
-      } finally {
-        // The reader's return/cleanup did not release this authority. Retire the
-        // native result only after the matching core transition or cancellation.
-        if (key) {
-          try {
-            await owner.sink.waitCompletion(key);
-            if (sourceLease.signal.aborted) await owner.sink.ackCompletion(key);
-          } catch (error) {
-            if (!closed && !streamClosing) {
-              streamBlocked = true;
-              log.event('retirement_failed', {
-                player: deps.playerId ?? 1,
-                error,
-              });
-            }
-          }
-        }
-      }
-    };
-    void operations.run(() => owner.sourceOperations.run(readSource)).catch(
-      (error) =>
-        log.event('content_failed', {
-          player: deps.playerId ?? 1,
-          generation: view.generation,
-          error,
-        }),
-    );
+      },
+    });
+    source = { stream: owner, reader };
+    void operations.run(() =>
+      owner.sourceOperations.run(async ({ signal }) => {
+        const cancel = () => reader.cancel();
+        signal.addEventListener('abort', cancel, { once: true });
+        // Reader ownership spans input EOF, all completion receipts and their ACKs.
+        // Its close is admitted now, not discovered after stream destruction.
+        await reader.settled;
+        signal.removeEventListener('abort', cancel);
+      })
+    ).catch(failed);
   };
   const drainPumps = () => {
     if (closed || collecting || retiring.size || streamBlocked) return;
@@ -907,6 +704,20 @@ export function createAirplayBoot(
     owner.playing = playing;
     if (playing) owner.idleAt = undefined;
     else owner.idleAt ??= performance.now();
+    const primary = playback.sourcePlanView().playing;
+    const natural = primary && source?.stream === owner
+      ? source.reader.mapping(primary)
+      : undefined;
+    if (playing && natural) {
+      owner.mapping = natural;
+      // Natural publication is not a seek, including repeat-single on the same
+      // occurrence. Keep every attachment and the already-admitted future input.
+      for (const r of runtimes.values()) {
+        r.entry = entry;
+        r.playbackGeneration = view.generation;
+      }
+      return;
+    }
     cancelPump();
     // A core cutoff already fenced this source before intent publication.
     if (!owner.sourceStarted) return;
