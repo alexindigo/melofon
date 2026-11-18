@@ -46,6 +46,11 @@ export async function nativeHttpFixture(options: {
   completionProgress?: () => Promise<void>;
   cutoffCapture?: Promise<void>;
   seekAdmitted?: (positionMs: number) => void;
+  sourcePath?: string;
+  append?: (
+    request: Parameters<AirplayTimelineStream['appendSource']>[0],
+    append: AirplayTimelineStream['appendSource'],
+  ) => ReturnType<AirplayTimelineStream['appendSource']>;
 }) {
   const directory = options.directory ??
     await Deno.makeTempDir({ prefix: 'native-http-' });
@@ -65,7 +70,12 @@ export async function nativeHttpFixture(options: {
   wav.set(text.encode('data'), 36);
   view.setUint32(40, options.pcm.length, true);
   wav.set(options.pcm, 44);
-  await Deno.writeFile(`${directory}/media/source.wav`, wav);
+  if (options.sourcePath) {
+    await Deno.copyFile(
+      options.sourcePath,
+      `${directory}/media/source.${options.sourcePath.split('.').pop()}`,
+    );
+  } else await Deno.writeFile(`${directory}/media/source.wav`, wav);
   const receiver = await startFakeRaop({
     captureAudio: true,
     captureWire: true,
@@ -88,6 +98,10 @@ export async function nativeHttpFixture(options: {
     native = createFfiStream();
     return {
       ...native,
+      appendSource: (request) =>
+        options.append
+          ? options.append(request, native.appendSource)
+          : native.appendSource(request),
       async progress(epoch, source) {
         const result = await native.progress(epoch, source);
         if (

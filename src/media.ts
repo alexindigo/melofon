@@ -9,6 +9,7 @@
 // raop.c), streamed frame by frame. The transcode slice adds transcodeAudio:
 // decode → encode → mux, STREAMED through the muxer's write callback into a
 // ReadableStream (chunked HTTP, never buffered whole, no ffmpeg CLI).
+import { PCM_RATE, pcmOrigin } from './pcm-origin.ts';
 import {
   AV_CHANNEL_LAYOUT_STEREO,
   AV_CODEC_FLAG_QSCALE,
@@ -392,7 +393,6 @@ const EMPTY: Probe = {
 };
 
 // The PCM contract every boot decodes to (RAOP's default quality).
-const PCM_RATE = 44100;
 const PCM_CHANNELS = 2;
 const PCM_BYTES_PER_SAMPLE = 2 * PCM_CHANNELS; // s16le interleaved
 
@@ -439,25 +439,6 @@ function pcmDecoder(input: Demuxer, signal?: AbortSignal): Promise<Decoder> {
       channelLayout: AV_CHANNEL_LAYOUT_STEREO,
     },
   });
-}
-
-function pcmOrigin(options: PcmOptions): bigint {
-  let frame = options.startFrame;
-  if (frame !== undefined && options.startMs !== undefined) {
-    throw new RangeError('PCM origin requires either startFrame or startMs');
-  }
-  if (frame === undefined) {
-    const ms = options.startMs ?? 0;
-    const rounded = Math.round(ms * PCM_RATE / 1000);
-    if (!Number.isFinite(ms) || ms < 0 || !Number.isSafeInteger(rounded)) {
-      throw new RangeError('PCM origin is not representable');
-    }
-    frame = BigInt(rounded);
-  }
-  if (typeof frame !== 'bigint' || frame < 0n || frame > 0xffffffffffffffffn) {
-    throw new RangeError('PCM origin requires an unsigned 64-bit frame');
-  }
-  return frame;
 }
 
 /** A timestamp must resolve to an actual output-frame boundary, not a rounded

@@ -778,16 +778,20 @@ function syntheticMedia(
       calls.push({ path, startMs: o?.startMs });
       const tag = calls.length & 0xff;
       let n = 0;
-      return Promise.resolve({
-        async *[Symbol.asyncIterator]() {
-          while (n++ < chunks) {
-            if (paceMs > 0) {
-              await new Promise((resolve) => setTimeout(resolve, paceMs));
+      return Promise.resolve(fixturePcm(
+        {
+          async *[Symbol.asyncIterator]() {
+            while (n++ < chunks) {
+              if (paceMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, paceMs));
+              }
+              yield new Uint8Array(chunkBytes).fill(tag);
             }
-            yield new Uint8Array(chunkBytes).fill(tag);
-          }
+          },
         },
-      });
+        undefined,
+        o,
+      ));
     },
   } as unknown as Media;
 }

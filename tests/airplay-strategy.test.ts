@@ -117,14 +117,18 @@ function setup(backoff = [0, 20], finite = false, opts: {
     decodePcm: opts.decode ?? ((path: string, opts?: { startMs?: number }) => {
       decoded.push({ path, start: opts?.startMs });
       const tag = decoded.length;
-      return Promise.resolve({
-        async *[Symbol.asyncIterator]() {
-          for (let n = 0; n < (finite ? 2 : 100000); n++) {
-            await sleep(2);
-            yield new Uint8Array(64).fill(tag);
-          }
+      return Promise.resolve(fixturePcm(
+        {
+          async *[Symbol.asyncIterator]() {
+            for (let n = 0; n < (finite ? 2 : 100000); n++) {
+              await sleep(2);
+              yield new Uint8Array(64).fill(tag);
+            }
+          },
         },
-      });
+        undefined,
+        opts,
+      ));
     }),
   } as unknown as Media;
   const transports: Transport[] = [];
@@ -844,13 +848,17 @@ Deno.test('stale decoder rejection cannot pause or retire its replacement', asyn
   let reject!: (error: Error) => void;
   let calls = 0;
   const s = setup([0], false, {
-    decode: () => {
+    decode: (_path, options) => {
       if (++calls === 1) return new Promise((_, no) => reject = no);
-      return Promise.resolve(fixturePcm({
-        async *[Symbol.asyncIterator]() {
-          yield new Uint8Array([9, 0, 0, 0]);
+      return Promise.resolve(fixturePcm(
+        {
+          async *[Symbol.asyncIterator]() {
+            yield new Uint8Array([9, 0, 0, 0]);
+          },
         },
-      }));
+        undefined,
+        options,
+      ));
     },
   });
   try {

@@ -8,6 +8,7 @@ import { createAirplayBoot } from '../src/boots/airplay.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 import type { MdnsService } from '../src/mdns.ts';
 import type { Media } from '../src/media.ts';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import { createPlayback } from '../src/playback.ts';
 import { createLibrary } from '../src/library.ts';
 import { createLibraries } from '../src/libraries.ts';
@@ -113,12 +114,16 @@ async function setup() {
         notify: f.notify,
         retryBackoffMs: [],
         media: {
-          decodePcm: () =>
-            Promise.resolve({
-              async *[Symbol.asyncIterator]() {
-                yield new Uint8Array(64).fill(5);
+          decodePcm: (_path: string, options?: { startMs?: number }) =>
+            Promise.resolve(fixturePcm(
+              {
+                async *[Symbol.asyncIterator]() {
+                  yield new Uint8Array(64).fill(5);
+                },
               },
-            }),
+              undefined,
+              options,
+            )),
         } as unknown as Media,
       });
       return {

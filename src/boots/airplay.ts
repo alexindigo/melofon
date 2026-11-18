@@ -610,7 +610,8 @@ export function createAirplayBoot(
           onMetadata: (metadata) => {
             if (owns()) playback.reportSourceMetadata(sourceLease, metadata);
           },
-          retry: (reason) => playback.retrySource(sourceLease, reason),
+          retry: (reason, signal) =>
+            playback.retrySource(sourceLease, reason, signal),
         });
         if (!stream) {
           if (!owns()) return;
@@ -618,6 +619,9 @@ export function createAirplayBoot(
         }
         const iterator = stream[Symbol.asyncIterator]();
         try {
+          if (stream.originFrame !== mapping.originFrame) {
+            throw new Error('Playback source differs from its timeline origin');
+          }
           if (!owns()) return;
           for await (
             const chunk of { [Symbol.asyncIterator]: () => iterator }
@@ -645,6 +649,7 @@ export function createAirplayBoot(
                 // Only this copied prefix belongs to the source. Never account
                 // a refused suffix or retry a prefix after cancellation.
                 const accepted = Number(receipt.acceptedFrames) * 4;
+                if (owns()) stream.accept(chunk, receipt.acceptedFrames);
                 offset += accepted;
                 bytes += accepted;
                 if (owns() && accepted) {
@@ -672,9 +677,14 @@ export function createAirplayBoot(
             if (!owns()) return;
           }
         } finally {
-          await iterator.return?.();
+          try {
+            await iterator.return?.();
+          } finally {
+            await stream.completion;
+          }
         }
         if (!owns()) return;
+        if (!stream.eof) throw new Error('Playback decoder closed before EOF');
         if (!bytes) throw new Error('empty decoder stream');
         if (DEBUG && path !== undefined) {
           log.event('pump_end', {

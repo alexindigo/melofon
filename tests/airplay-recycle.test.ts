@@ -21,6 +21,7 @@ import { assert, assertEquals } from '@std/assert';
 import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import type { Media } from '../src/media.ts';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
@@ -106,16 +107,20 @@ function syntheticMedia(
       calls.push({ path, startMs: o?.startMs });
       const tag = calls.length & 0xff;
       let n = 0;
-      return Promise.resolve({
-        async *[Symbol.asyncIterator]() {
-          while (n++ < chunks) {
-            if (paceMs > 0) {
-              await new Promise((resolve) => setTimeout(resolve, paceMs));
+      return Promise.resolve(fixturePcm(
+        {
+          async *[Symbol.asyncIterator]() {
+            while (n++ < chunks) {
+              if (paceMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, paceMs));
+              }
+              yield new Uint8Array(chunkBytes).fill(tag);
             }
-            yield new Uint8Array(chunkBytes).fill(tag);
-          }
+          },
         },
-      });
+        undefined,
+        o,
+      ));
     },
   } as unknown as Media;
 }

@@ -1,6 +1,7 @@
 // Core-owned source incarnations and native-fact projection. No queue policy,
 // timers, protocol imports or inferred progress. Seal/completion authority stays
 // with the same immutable source until its core transition commits.
+import { pcmOrigin } from './pcm-origin.ts';
 export interface TimelineSource {
   readonly streamId: bigint;
   readonly epoch: bigint;
@@ -8,6 +9,8 @@ export interface TimelineSource {
   readonly entryId: number;
   readonly generation: number;
   readonly originMs: number;
+  /** Exact normalized decoder origin, relative to media start, not its PTS. */
+  readonly originFrame: bigint;
 }
 export interface TimelineProgress {
   readonly streamId: bigint;
@@ -84,7 +87,11 @@ export function createPlaybackTimeline() {
     });
   };
   return {
-    begin(input: Omit<TimelineSource, 'source'>): TimelineSource {
+    begin(
+      input: Omit<TimelineSource, 'source' | 'originFrame'> & {
+        originFrame?: bigint;
+      },
+    ): TimelineSource {
       if (closed) throw new Error('Playback timeline is closed');
       u64(input.streamId);
       u64(input.epoch);
@@ -96,7 +103,17 @@ export function createPlaybackTimeline() {
         !Number.isSafeInteger(input.generation) || input.generation < 0 ||
         !Number.isSafeInteger(input.originMs) || input.originMs < 0
       ) throw new RangeError('Invalid timeline source incarnation or origin');
-      const source = Object.freeze({ ...input, source: nextSource++ });
+      const originFrame = pcmOrigin(
+        input.originFrame === undefined
+          ? { startMs: input.originMs }
+          : { startFrame: input.originFrame },
+      );
+      u64(originFrame);
+      const source = Object.freeze({
+        ...input,
+        originFrame,
+        source: nextSource++,
+      });
       records.set(source.source, {
         source,
         position: Object.freeze({

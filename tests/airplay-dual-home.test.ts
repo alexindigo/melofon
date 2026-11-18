@@ -12,6 +12,7 @@ import {
 import type { Library, SongRow } from '../src/library.ts';
 import type { NowPlaying } from '../src/nowplaying.ts';
 import type { Media } from '../src/media.ts';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import type { State } from '../src/state.ts';
 import type { ConnectionStrategy } from '../src/connection-strategy.ts';
 import { captureLogs } from './helpers/logging.ts';
@@ -93,14 +94,18 @@ function fixture(
     decodePcm(_path: string, options?: { startMs?: number }) {
       starts.push(options?.startMs ?? 0);
       const tag = starts.length;
-      return Promise.resolve({
-        async *[Symbol.asyncIterator]() {
-          for (let i = 0; i < 10000; i++) {
-            await sleep(2);
-            yield new Uint8Array([tag, 0, 0, 0]);
-          }
+      return Promise.resolve(fixturePcm(
+        {
+          async *[Symbol.asyncIterator]() {
+            for (let i = 0; i < 10000; i++) {
+              await sleep(2);
+              yield new Uint8Array([tag, 0, 0, 0]);
+            }
+          },
         },
-      });
+        undefined,
+        options,
+      ));
     },
   } as unknown as Media;
   const state = {

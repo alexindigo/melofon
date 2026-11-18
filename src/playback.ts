@@ -241,7 +241,11 @@ export interface Playback {
   cancelSource(source: PlaybackSource): void;
   sourceAudio(source: PlaybackSource, durationMs: number): void;
   /** One bounded source retry, cancelled with the lease. Not a speaker retry. */
-  retrySource(source: PlaybackSource, reason: SourceOutcome): Promise<boolean>;
+  retrySource(
+    source: PlaybackSource,
+    reason: SourceOutcome,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   reportSourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
   /** Raw facts from the currently elected lease; no commands or hat labels. */
   reportSourceMetadata(
@@ -1249,10 +1253,14 @@ export function createPlayback(deps: {
         recoveryForRun().audioMs += durationMs;
       }
     },
-    retrySource: (source, reason) =>
+    retrySource: (source, reason, cancellation) =>
       operations.run(async () => {
+        const signal = cancellation
+          ? AbortSignal.any([source.signal, cancellation])
+          : source.signal;
         if (
-          !ownsSource(source) || player.status().current?.facts.kind !== 'web'
+          signal.aborted || !ownsSource(source) ||
+          player.status().current?.facts.kind !== 'web'
         ) return false;
         const run = recoveryForRun();
         const backoff =
@@ -1262,7 +1270,9 @@ export function createPlayback(deps: {
           await deps.state?.getTyped('playback.source.retryResetAudioMs') ??
             recoverySettings.retryResetAudioMs.default,
         );
-        if (!ownsSource(source) || recovery !== run) return false;
+        if (
+          signal.aborted || !ownsSource(source) || recovery !== run
+        ) return false;
         if (run.audioMs >= reset) {
           run.attempts = 0;
           failedSources.clear();
@@ -1287,14 +1297,14 @@ export function createPlayback(deps: {
         await new Promise<void>((resolve) => {
           const finish = () => {
             clearTimeout(timer);
-            source.signal.removeEventListener('abort', finish);
+            signal.removeEventListener('abort', finish);
             resolve();
           };
           const timer = setTimeout(finish, waitMs);
-          source.signal.addEventListener('abort', finish, { once: true });
-          if (source.signal.aborted) finish();
+          signal.addEventListener('abort', finish, { once: true });
+          if (signal.aborted) finish();
         });
-        return ownsSource(source) && recovery === run;
+        return !signal.aborted && ownsSource(source) && recovery === run;
       }),
     reportSourceMetadata(source, metadata) {
       if (operations.closed || !player.sourceMetadata(source, metadata)) {

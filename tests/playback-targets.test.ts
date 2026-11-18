@@ -13,6 +13,7 @@ import { createLibraries } from '../src/libraries.ts';
 import { scanLibrary } from '../src/scan.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import type { Media } from '../src/media.ts';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import type { MdnsService } from '../src/mdns.ts';
 import type { HelperEventFn } from '../src/boots/airplay.ts';
 import { wireInt } from '../layers/owntone/payloads.ts';
@@ -168,15 +169,19 @@ async function setup(storeDir?: string, retryPolicy?: string) {
           ? { retryBackoffMs: [] }
           : { state: f.state }),
         media: {
-          decodePcm: () =>
-            Promise.resolve({
-              async *[Symbol.asyncIterator]() {
-                for (let n = 0; n < 1000; n++) {
-                  await sleep(2);
-                  yield new Uint8Array(64).fill(5);
-                }
+          decodePcm: (_path: string, options?: { startMs?: number }) =>
+            Promise.resolve(fixturePcm(
+              {
+                async *[Symbol.asyncIterator]() {
+                  for (let n = 0; n < 1000; n++) {
+                    await sleep(2);
+                    yield new Uint8Array(64).fill(5);
+                  }
+                },
               },
-            }),
+              undefined,
+              options,
+            )),
         } as unknown as Media,
       });
       if (retryPolicy !== undefined) {

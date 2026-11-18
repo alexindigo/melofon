@@ -1,12 +1,210 @@
 // Core composition of a queue activation and its owned byte/decoder lifetime.
-// The boot elects one caller; networking and native decoding keep their owners.
+// One stream caller reports copied frames; reads never imply sink acceptance.
 import { separateIcy } from './icy.ts';
-import type { Media } from './media.ts';
+import type { InputPcm, Media, PcmOptions } from './media.ts';
+import { pcmOrigin } from './pcm-origin.ts';
 import type { QueueMedia, SourceMetadata } from './queue-source.ts';
 import type { createRadioSource } from './radio-source.ts';
 import type { State } from './state.ts';
 import type { SourceOutcome } from './player.ts';
 import type { createRadio } from './radio.ts';
+import { createOperationScope } from './operations.ts';
+import { createReleaseSet, releaseOrThrow } from './releases.ts';
+
+export interface PlaybackPcm extends AsyncIterableIterator<Uint8Array> {
+  readonly originFrame: bigint;
+  readonly acceptedFrames: bigint;
+  readonly eof: boolean;
+  /** Cleanup settlement only, never decoder EOF or scheduled sink completion. */
+  readonly completion: Promise<void>;
+  /** Report only the copied whole-frame prefix of this exact outstanding chunk.
+   * A later attempt cannot accept a receipt belonging to an earlier read. */
+  accept(chunk: Uint8Array, frames: bigint): void;
+  return(): Promise<IteratorResult<Uint8Array>>;
+}
+
+function ownPlaybackPcm(options: {
+  originFrame: bigint;
+  signal: AbortSignal;
+  acquire(signal: AbortSignal, originFrame: bigint): Promise<
+    {
+      pcm: InputPcm;
+      close(): Promise<void>;
+    } | null
+  >;
+  close(): Promise<void>;
+  cancel?(): void;
+  finite: boolean;
+  failureReason(): SourceOutcome;
+  retry?: (reason: SourceOutcome, signal: AbortSignal) => Promise<boolean>;
+  retrying(): void;
+}) {
+  const operations = createOperationScope('Playback PCM');
+  const shutdown = new AbortController();
+  const signal = AbortSignal.any([options.signal, shutdown.signal]);
+  const releases = createReleaseSet();
+  const settled = Promise.withResolvers<void>();
+  let attempt: Awaited<ReturnType<typeof options.acquire>>;
+  let offered: Uint8Array | undefined, outstanding = 0n;
+  let acceptedFrames = 0n, decodedFrames = 0n, eof = false;
+  let cleanup: Promise<void> | undefined, retiring: Promise<void> | undefined;
+  releases.add('source session', options.close, 1);
+  const finish = () =>
+    cleanup ??= (async () => {
+      try {
+        await releaseOrThrow(releases, 'Playback source cleanup failed');
+      } finally {
+        options.signal.removeEventListener('abort', abort);
+        settled.resolve();
+      }
+    })();
+  const acquire = async () => {
+    signal.throwIfAborted();
+    attempt = await options.acquire(
+      signal,
+      options.originFrame +
+        (options.finite ? acceptedFrames : 0n),
+    );
+    if (attempt) {
+      releases.add('decoder attempt', attempt.close);
+      signal.throwIfAborted();
+      if (
+        attempt.pcm.originFrame !== options.originFrame +
+            (options.finite ? acceptedFrames : 0n)
+      ) {
+        throw new Error('Decoder returned a different PCM origin');
+      }
+    }
+    return !!attempt;
+  };
+  const releaseAttempt = async () => {
+    offered = undefined;
+    outstanding = 0n;
+    await releaseOrThrow(
+      releases,
+      'Playback attempt cleanup failed',
+      undefined,
+      [
+        'decoder attempt',
+      ],
+    );
+    attempt = null;
+  };
+  const result: PlaybackPcm = Object.freeze({
+    originFrame: options.originFrame,
+    get acceptedFrames() {
+      return acceptedFrames;
+    },
+    get eof() {
+      return eof;
+    },
+    completion: settled.promise,
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    accept(chunk: Uint8Array, frames: bigint) {
+      if (
+        offered !== chunk || typeof frames !== 'bigint' || frames < 0n ||
+        frames > outstanding || cleanup || retiring
+      ) {
+        throw new RangeError('Invalid or stale PCM acceptance receipt');
+      }
+      outstanding -= frames;
+      acceptedFrames += frames;
+    },
+    async next(): Promise<IteratorResult<Uint8Array>> {
+      if (cleanup || retiring) return { done: true, value: undefined };
+      return await operations.run(async () => {
+        offered = undefined;
+        outstanding = 0n;
+        try {
+          while (true) {
+            let reason: SourceOutcome = 'decode-error', failure: unknown;
+            let natural = false;
+            try {
+              if (!attempt && !await acquire()) {
+                await finish();
+                return { done: true, value: undefined };
+              }
+              const read = await attempt!.pcm.next();
+              signal.throwIfAborted();
+              if (!read.done) {
+                if (read.value.length % 4) {
+                  throw new Error('Incomplete PCM frame');
+                }
+                offered = read.value;
+                outstanding = BigInt(read.value.length / 4);
+                decodedFrames += outstanding;
+                return read;
+              }
+              if (!attempt!.pcm.eof) {
+                throw new Error('Decoder closed before EOF');
+              }
+              if (options.retry && decodedFrames === 0n) {
+                throw new Error('Empty decoder stream');
+              }
+              natural = true;
+            } catch (error) {
+              failure = error;
+              reason = options.failureReason();
+            }
+            // Cleanup failures are terminal, not another retryable decode error.
+            await releaseAttempt();
+            if (natural && options.finite) {
+              eof = true;
+              await finish();
+              return { done: true, value: undefined };
+            }
+            if (natural) {
+              reason = 'eof';
+              failure = new Error('Live source ended');
+            }
+            signal.throwIfAborted();
+            options.retrying();
+            const retry = await options.retry?.(reason, signal);
+            signal.throwIfAborted();
+            if (!retry) throw failure;
+          }
+        } catch (error) {
+          await finish();
+          throw error;
+        }
+      });
+    },
+    async return(): Promise<IteratorResult<Uint8Array>> {
+      if (!retiring) {
+        const done = Promise.withResolvers<void>();
+        retiring = done.promise;
+        shutdown.abort(
+          new DOMException('Playback source returned', 'AbortError'),
+        );
+        options.cancel?.();
+        void (async () => {
+          await operations.close();
+          await finish();
+        })().then(done.resolve, done.reject);
+      }
+      await retiring;
+      return { done: true, value: undefined };
+    },
+  });
+  function abort() {
+    void result.return().catch(() => {});
+  }
+  options.signal.addEventListener('abort', abort, { once: true });
+  if (options.signal.aborted) abort();
+  return {
+    pcm: result,
+    async ready() {
+      try {
+        return await operations.run(acquire);
+      } catch (error) {
+        await result.return();
+        throw error;
+      }
+    },
+  };
+}
 
 function responseSize(headers: Headers): number | undefined {
   const text = headers.get('content-length');
@@ -172,17 +370,49 @@ export function createPlaybackSource(deps: {
       media: QueueMedia,
       options: {
         signal: AbortSignal;
-        startMs: number;
         onMetadata?: (metadata: SourceMetadata) => void;
-        retry?: (reason: SourceOutcome) => Promise<boolean>;
-      },
-    ): Promise<AsyncIterable<Uint8Array> | null> {
+        retry?: (
+          reason: SourceOutcome,
+          signal: AbortSignal,
+        ) => Promise<boolean>;
+      } & PcmOptions,
+    ): Promise<PlaybackPcm | null> {
       options.signal.throwIfAborted();
+      const originFrame =
+        media.facts.kind === 'web' && media.facts.mode !== 'finite'
+          ? 0n
+          : pcmOrigin(options);
       if (media.facts.kind === 'song') {
-        return await deps.media.decodePcm(
-          media.facts.song.path,
-          options.startMs > 0 ? { startMs: options.startMs } : undefined,
-        );
+        const path = media.facts.song.path;
+        const owner = ownPlaybackPcm({
+          originFrame,
+          signal: options.signal,
+          finite: true,
+          acquire: async (signal, startFrame) => {
+            const pcm = await deps.media.decodePcm(path, {
+              signal,
+              ...(options.startFrame === undefined
+                ? { startMs: options.startMs ?? 0 }
+                : { startFrame }),
+            });
+            return pcm && {
+              pcm,
+              close: async () => {
+                try {
+                  await pcm.return();
+                } finally {
+                  await pcm.completion;
+                }
+              },
+            };
+          },
+          close: () => Promise.resolve(),
+          failureReason: () => 'decode-error',
+          retrying: () => {},
+        });
+        if (await owner.ready()) return owner.pcm;
+        await owner.pcm.return();
+        return null;
       }
       if (!deps.radio) throw new Error('Web source playback is not available');
       // Station facts were resolved at activation. Never resolve again midway
@@ -190,28 +420,42 @@ export function createPlaybackSource(deps: {
       const enteredUrl = media.reference.kind === 'url'
         ? media.reference.url
         : media.facts.url;
-      const session = deps.radio.session(enteredUrl, options.signal);
+      const lifetime = new AbortController();
+      const session = deps.radio.session(
+        enteredUrl,
+        AbortSignal.any([
+          options.signal,
+          lifetime.signal,
+        ]),
+      );
       const finite = media.facts.mode === 'finite';
-      let deliveredMs = 0;
-      const decode = async (onResponse?: () => void) => {
+      let reason: SourceOutcome = 'transport-error';
+      const decode = async (signal: AbortSignal, startFrame: bigint) => {
+        reason = 'transport-error';
         const lease = await session.open();
-        onResponse?.();
+        reason = 'decode-error';
         let active = true;
-        const artwork = media.reference.kind === 'station'
-          ? deps.artwork?.streamArtwork(
-            media.reference.id,
-            enteredUrl,
-            options.signal,
-          )
-          : undefined;
+        const releases = createReleaseSet();
+        releases.add('response', () => lease.close(), 2);
+        let artwork:
+          | ReturnType<NonNullable<typeof deps.artwork>['streamArtwork']>
+          | undefined;
         const metadata = (facts: SourceMetadata) => {
-          if (active && !options.signal.aborted) {
+          if (active && !signal.aborted) {
             options.onMetadata?.(facts);
             artwork?.observe(facts.streamUrl);
           }
         };
         try {
-          options.signal.throwIfAborted();
+          if (media.reference.kind === 'station') {
+            artwork = deps.artwork?.streamArtwork(
+              media.reference.id,
+              enteredUrl,
+              signal,
+            );
+            if (artwork) releases.add('artwork', () => artwork!.close(), 1);
+          }
+          signal.throwIfAborted();
           const title = lease.response.headers.get('icy-name');
           if (title && media.reference.kind === 'url') metadata({ title });
           const pcm = await deps.media.decodeInputPcm({
@@ -222,79 +466,58 @@ export function createPlaybackSource(deps: {
             ),
             close: async () => {
               active = false;
-              await artwork?.close();
-              await (options.retry ? lease.close() : session.close());
+              await releaseOrThrow(
+                releases,
+                'Web input cleanup failed',
+                undefined,
+                ['artwork', 'response'],
+              );
             },
           }, {
-            signal: options.signal,
-            startMs: finite ? options.startMs + deliveredMs : 0,
+            signal,
+            startFrame,
+          });
+          releases.add('decoder', async () => {
+            try {
+              await pcm.return();
+            } finally {
+              await pcm.completion;
+            }
           });
           return {
             pcm,
             close: async () => {
               active = false;
-              await artwork?.close();
-              await pcm.return();
-              await pcm.completion;
-              await lease.close();
+              await releaseOrThrow(releases, 'Web decoder cleanup failed');
             },
           };
         } catch (error) {
           active = false;
-          await artwork?.close();
-          await lease.close();
+          await releaseOrThrow(releases, 'Web acquisition cleanup failed', {
+            error,
+          });
           throw error;
         }
       };
-      if (!options.retry) {
-        try {
-          return (await decode()).pcm;
-        } catch (error) {
+      const owner = ownPlaybackPcm({
+        originFrame,
+        signal: options.signal,
+        finite: finite || !options.retry,
+        acquire: decode,
+        cancel: () => lifetime.abort(),
+        close: async () => {
+          lifetime.abort();
           await session.close();
-          throw error;
-        }
-      }
-      // Acquisition stays lazy within the elected lease. Each attempt owns a
-      // fresh decoder; the session retains ordered playlist alternatives and
-      // the original trust context. It never concatenates compressed responses.
-      const iterate = async function* () {
-        try {
-          while (true) {
-            let reason: SourceOutcome = 'transport-error';
-            let failure: unknown;
-            try {
-              const attempt = await decode(() => reason = 'decode-error');
-              let chunks = 0;
-              try {
-                for await (const chunk of attempt.pcm) {
-                  chunks++;
-                  yield chunk;
-                  // The elected consumer resumes only after its sink write and
-                  // sourceAudio report. A cancelled/failed write cannot count.
-                  deliveredMs += chunk.length / 176400 * 1000;
-                }
-              } finally {
-                await attempt.close();
-              }
-              if (!chunks && deliveredMs === 0) {
-                throw new Error('Empty decoder stream');
-              }
-              if (finite || !options.retry) return;
-              reason = 'eof';
-              failure = new Error('Live source ended');
-            } catch (error) {
-              failure = error;
-            }
-            options.signal.throwIfAborted();
-            options.onMetadata?.({ streamTitle: null, streamUrl: null });
-            if (!options.retry || !await options.retry(reason)) throw failure;
-            options.signal.throwIfAborted();
-          }
-        } finally {
-          await session.close();
-        }
-      };
-      return iterate();
+        },
+        failureReason: () => reason,
+        retry: options.retry,
+        retrying: () =>
+          options.onMetadata?.({ streamTitle: null, streamUrl: null }),
+      });
+      // Preserve eager no-retry validation and lazy retry acquisition, but both
+      // paths have an owner before their first await, including unread return.
+      if (!options.retry) await owner.ready();
+      return owner.pcm;
     },
   };
 }
