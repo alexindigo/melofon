@@ -24,8 +24,8 @@ export default async function (request: HatRequest, context: HatContext) {
     if (name !== undefined) await context.app.players.rename(id, name);
     const playback = context.app.players.get(id);
     const provenance = source(request, context);
-    if (repeat !== undefined) playback.setRepeat(repeat, provenance);
-    if (consume !== undefined) playback.setConsume(consume, provenance);
+    if (repeat !== undefined) await playback.setRepeat(repeat, provenance);
+    if (consume !== undefined) await playback.setConsume(consume, provenance);
     return playerPayload(context, id);
   });
   return Response.json({ player }, {

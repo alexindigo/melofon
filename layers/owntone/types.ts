@@ -104,12 +104,12 @@ export interface HatContext {
       next(source?: CommandSourceRow): void | Promise<void>;
       previous(source?: CommandSourceRow): void | Promise<void>;
       restart(source?: CommandSourceRow): void | Promise<void>;
-      setShuffle(on: boolean, source?: CommandSourceRow): void;
-      setConsume(on: boolean, source?: CommandSourceRow): void;
+      setShuffle(on: boolean, source?: CommandSourceRow): void | Promise<void>;
+      setConsume(on: boolean, source?: CommandSourceRow): void | Promise<void>;
       setRepeat(
         mode: 'off' | 'all' | 'single',
         source?: CommandSourceRow,
-      ): void;
+      ): void | Promise<void>;
       setVolume(
         opts: { volume?: number; step?: number },
         source?: CommandSourceRow,

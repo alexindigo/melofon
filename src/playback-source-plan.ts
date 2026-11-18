@@ -22,10 +22,13 @@ export interface SourcePreparation {
   readonly plan: SuccessorPlan;
   readonly generation: number;
   readonly command: CommandHandle;
+  readonly after?: PlaybackSource;
   readonly signal: AbortSignal;
   readonly settled: Promise<void>;
   readonly ready: PreparedSource | Promise<PreparedSource>;
   source: PlaybackSource | null;
+  media: QueueMedia | null;
+  refreshed: boolean;
   through: number | null;
   error?: unknown;
 }
@@ -36,12 +39,17 @@ export function createSourcePlanOwner(deps: {
     media: QueueMedia,
     signal: AbortSignal,
   ): QueueMedia | null | Promise<QueueMedia | null>;
-  current(reason: SuccessorPlan['reason']): SuccessorPlan;
+  current(reason: SuccessorPlan['reason']): SuccessorPlan | null;
+  afterCurrent?(
+    reason: SuccessorPlan['reason'],
+    after: PlaybackSource,
+  ): SuccessorPlan | null;
 }) {
   const operations = createOperationScope('Source preparation');
   let reading: SourcePreparation | null = null;
   let latest: SourcePreparation | null = null;
   let playing: PlaybackSource | null = null;
+  const admitted: SourcePreparation[] = [];
   const controllers = new WeakMap<SourcePreparation, AbortController>();
   const unbind = new WeakMap<SourcePreparation, () => void>();
   const cancelled = () =>
@@ -55,12 +63,19 @@ export function createSourcePlanOwner(deps: {
   };
   const reconcile = (record: SourcePreparation) => {
     if (
-      record.signal.aborted || !record.command.isCurrent() ||
-      deps.player.status().generation !== record.generation
+      record.signal.aborted ||
+      !admitted.includes(record) && !record.command.isCurrent() ||
+      (record.after
+        ? !deps.player.hasSource(record.after)
+        : deps.player.status().generation !== record.generation)
     ) return null;
+    const current = record.after && deps.afterCurrent
+      ? deps.afterCurrent(record.plan.reason, record.after)
+      : deps.current(record.plan.reason);
+    if (!current) return null;
     return reconcilePlaybackSuccessor(
       record.plan,
-      deps.current(record.plan.reason),
+      current,
       record.through,
     );
   };
@@ -73,18 +88,27 @@ export function createSourcePlanOwner(deps: {
       // even after its reader is revoked. Reader cancellation is not retirement.
       return playing;
     },
+    get admitted(): readonly SourcePreparation[] {
+      return admitted;
+    },
     playingSource(source: PlaybackSource) {
       playing = source;
     },
     reconcile() {
       if (reading && !reconcile(reading)) cancel(reading);
+      return admitted.findIndex((record) => !reconcile(record));
     },
     validate: reconcile,
-    prepare(plan: SuccessorPlan, command: CommandHandle): SourcePreparation {
+    prepare(
+      plan: SuccessorPlan,
+      command: CommandHandle,
+      after?: PlaybackSource,
+    ): SourcePreparation {
       if (operations.closed) throw cancelled();
       if (
         reading && reading.plan.reason === plan.reason &&
-        reading.command === command && reconcile(reading)
+        reading.command === command &&
+        (reading.after ?? playing) === (after ?? playing) && reconcile(reading)
       ) {
         return reading;
       }
@@ -97,6 +121,7 @@ export function createSourcePlanOwner(deps: {
       const record: SourcePreparation = {
         plan,
         command,
+        after,
         generation: deps.player.status().generation,
         signal: controller.signal,
         get settled() {
@@ -106,6 +131,8 @@ export function createSourcePlanOwner(deps: {
           return ready;
         },
         source: null,
+        media: null,
+        refreshed: false,
         through: plan.entryId,
       };
       controllers.set(record, controller);
@@ -153,7 +180,11 @@ export function createSourcePlanOwner(deps: {
                 if (!reconcile(record) || source.signal.aborted) {
                   throw cancelled();
                 }
-                if (media) return { source, media, refreshed: media !== item };
+                if (media) {
+                  record.media = media;
+                  record.refreshed = media !== item;
+                  return { source, media, refreshed: record.refreshed };
+                }
                 deps.player.cancelSource(source);
                 record.source = null;
                 return null;
@@ -201,6 +232,23 @@ export function createSourcePlanOwner(deps: {
       } else acquired();
       return record;
     },
+    admit(record: SourcePreparation) {
+      if (
+        reading !== record || !reconcile(record) || !record.source ||
+        !deps.player.admitSource(record.source)
+      ) return false;
+      admitted.push(record);
+      reading = null;
+      // Accepted input follows the source/transport lifetime, not a later
+      // harmless option command. Relationship reconciliation fences edits.
+      unbind.get(record)?.();
+      unbind.delete(record);
+      return true;
+    },
+    discardFuture(from = 0) {
+      if (reading) cancel(reading);
+      for (const record of admitted.splice(from)) cancel(record);
+    },
     commit(
       record: SourcePreparation,
       change: (plan: SuccessorPlan) => boolean,
@@ -212,6 +260,12 @@ export function createSourcePlanOwner(deps: {
       }
       if (!change(plan)) return false;
       if (reading === record) reading = null;
+      const index = admitted.indexOf(record);
+      if (index >= 0) {
+        if (index !== 0) throw new Error('Cannot publish an unordered source');
+        admitted.shift();
+        playing = record.source;
+      }
       // The command can be superseded after promotion without aborting the
       // playing source (e.g. an option edit). Player discontinuities own that.
       controllers.delete(record);
@@ -222,6 +276,7 @@ export function createSourcePlanOwner(deps: {
     cancel,
     close() {
       if (reading) cancel(reading);
+      for (const record of admitted.splice(0)) cancel(record);
       return operations.close();
     },
   };

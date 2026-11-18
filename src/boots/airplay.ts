@@ -133,6 +133,14 @@ export function createAirplayBoot(
   let closeWork: Promise<void> | undefined;
   const sources = deps.sources ?? createPlaybackSource({ media });
   const detachSink = playback.attachSink({
+    reanchor(mapping, commit) {
+      const owner = stream;
+      if (
+        !owner || streamClosing || owner.mapping !== mapping ||
+        !owner.sourceStarted
+      ) return null;
+      return cancelStream(owner, true, mapping, false, commit);
+    },
     cutoff(mapping, intent, commit) {
       const owner = stream;
       if (
@@ -653,6 +661,7 @@ export function createAirplayBoot(
                 offset += accepted;
                 bytes += accepted;
                 if (owns() && accepted) {
+                  playback.sourceAccepted(sourceLease, receipt.acceptedFrames);
                   playback.sourceAudio(sourceLease, accepted / 176400 * 1000);
                 }
                 if (!owns()) return;

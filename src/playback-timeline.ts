@@ -57,6 +57,7 @@ export function createPlaybackTimeline() {
   const records = new Map<bigint, {
     source: TimelineSource;
     position: TimelinePosition;
+    acceptedFrames: bigint;
     target?: bigint;
     completed?: boolean;
   }>();
@@ -116,6 +117,7 @@ export function createPlaybackTimeline() {
       });
       records.set(source.source, {
         source,
+        acceptedFrames: 0n,
         position: Object.freeze({
           positionMs: source.originMs,
           sourceFrames: 0n,
@@ -129,6 +131,19 @@ export function createPlaybackTimeline() {
     },
     position(source: TimelineSource): TimelinePosition | null {
       return owned(source)?.position ?? null;
+    },
+    accepted(source: TimelineSource): bigint {
+      return owned(source)?.acceptedFrames ?? 0n;
+    },
+    accept(source: TimelineSource, frames: bigint): boolean {
+      u64(frames);
+      const record = owned(source);
+      if (!record || record.position.canceled || record.target !== undefined) {
+        return false;
+      }
+      u64(record.acceptedFrames + frames);
+      record.acceptedFrames += frames;
+      return true;
     },
     seal(source: TimelineSource, target: bigint): boolean {
       u64(target);

@@ -7,9 +7,9 @@ import {
 } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
 
-export default (request: HatRequest, context: HatContext) => {
+export default async (request: HatRequest, context: HatContext) => {
   const state = request.query.get('state');
   if (state === null) return badRequest();
-  context.app.playback.setShuffle(boolParam(state), sourceFrom(request));
+  await context.app.playback.setShuffle(boolParam(state), sourceFrom(request));
   return noContent();
 };

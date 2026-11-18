@@ -41,22 +41,58 @@ export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
       };
     },
     realAudio(session: FakeRaopSession, firstEpoch = 0) {
-      const payloads: Uint8Array[][] = [];
-      let current: Uint8Array[] | undefined;
+      // RTSP and UDP are independently delivered. Arrival after FLUSH does not
+      // grant an old datagram authority in the replacement epoch. Attribute by
+      // RTP location, retaining hole/conflicting-duplicate checks before decode.
+      const payloads: Map<number, Uint8Array>[] = [];
+      let current: Map<number, Uint8Array> | undefined;
+      let anchor = 0, sequence = 0, highest = 0;
       for (const event of session.wire) {
         if (event.kind === 'record' || event.kind === 'flush') {
-          current = [];
+          const info = /^seq=(\d+);rtptime=(\d+)$/.exec(event.rtpInfo);
+          assert(info, 'arrival epoch has valid RTP-Info');
+          sequence = Number(info[1]);
+          anchor = Number(info[2]);
+          highest = 0;
+          current = new Map();
           payloads.push(current);
         } else if (event.kind === 'audio') {
           assert(current);
-          current.push(event.data.subarray(12));
+          const header = new DataView(
+            event.data.buffer,
+            event.data.byteOffset,
+            event.data.byteLength,
+          );
+          const rawOffset = header.getUint32(4) - anchor;
+          const offset = rawOffset +
+            Math.round((highest - rawOffset) / 2 ** 32) * 2 ** 32;
+          if (offset < 0) continue; // in-flight old-epoch packet
+          assertEquals(
+            offset % 352,
+            0,
+            'RTP timestamp has whole packet offset',
+          );
+          assertEquals(
+            header.getUint16(2),
+            (sequence + offset / 352) % 65536,
+            'RTP sequence agrees with timestamp',
+          );
+          highest = Math.max(highest, offset);
+          const bytes = event.data.subarray(12), previous = current.get(offset);
+          if (previous) assertEquals(bytes, previous, 'RTP duplicate agrees');
+          else current.set(offset, bytes);
         }
       }
       const pieces: Uint8Array[] = [];
       for (const [i, epoch] of epochs.entries()) {
+        const packets = [...(payloads[firstEpoch + i] ?? new Map()).entries()]
+          .sort(([a], [b]) => a - b);
+        for (const [index, [offset]] of packets.entries()) {
+          assertEquals(offset, index * 352, 'arrival coverage has no RTP hole');
+        }
         const received = decodeReceiverAudio(
           session.sdp,
-          payloads[firstEpoch + i] ?? [],
+          packets.map(([, bytes]) => bytes),
         );
         let accounted = 0;
         for (const range of epoch.ranges) {

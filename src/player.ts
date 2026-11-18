@@ -286,6 +286,15 @@ export interface Player {
   openSource(entryId: number, generation: number): PlaybackSource | null;
   /** Reserve a future read incarnation without changing current or its gate. */
   prepareSource(entryId: number, generation: number): PlaybackSource | null;
+  /** Claim a reserved future reader without publishing it as current. */
+  admitSource(source: PlaybackSource): boolean;
+  hasSource(source: PlaybackSource): boolean;
+  /** Reopen the surviving current occurrence after a native future-input fence. */
+  reanchorSource(
+    generation: number,
+    entryId: number,
+    positionMs: number,
+  ): boolean;
   cancelSource(source: PlaybackSource): void;
   sourceComplete(source: PlaybackSource): boolean;
   sourceCompatibilityRemaining(source: PlaybackSource): number;
@@ -360,6 +369,7 @@ export interface Player {
     plan: SuccessorPlan,
     entryId?: number | null,
     prepared?: PlaybackSource,
+    continuous?: boolean,
   ): AdvanceResult;
   /** Boot-time restore (plan restart-transparency): load the rehydrated
    * queue plus the persisted snapshot in one shot. main.ts decides
@@ -544,6 +554,8 @@ export function createPlayer(options: {
     outcome?: SourceOutcome;
     complete: boolean;
     legacyDrainAt: number;
+    positionMs: number;
+    playbackRate: number;
   };
   let source: SourceRecord | null = null;
   const preparedSources = new Map<PlaybackSource, SourceRecord>();
@@ -560,6 +572,8 @@ export function createPlayer(options: {
       claimed: false,
       complete: false,
       legacyDrainAt: monotonicNow(),
+      positionMs: startMs,
+      playbackRate: 0,
     };
   };
   const cancelSource = () => {
@@ -719,6 +733,7 @@ export function createPlayer(options: {
     plan: SuccessorPlan,
     entryId = plan.entryId,
     prepared?: PlaybackSource,
+    continuous = false,
   ): AdvanceResult => {
     const reading = prepared ? preparedSources.get(prepared) : undefined;
     if (
@@ -727,7 +742,8 @@ export function createPlayer(options: {
       plan.reason === 'natural' && !canAdvanceEnded() ||
       entryId !== null && !plan.candidates.includes(entryId) ||
       prepared &&
-        (!reading || prepared.signal.aborted || prepared.entryId !== entryId)
+        (!reading || prepared.signal.aborted || prepared.entryId !== entryId) ||
+      continuous && (!reading?.claimed || plan.reason !== 'natural')
     ) return 'none';
     // Transfer the exact reserved incarnation through the discontinuity. Other
     // future reads are revoked; the previous playing record still owns its EOF
@@ -737,7 +753,20 @@ export function createPlayer(options: {
       items = items.filter((item) => item.id !== plan.removedEntryId);
       version++;
     }
-    if (entryId === null) doStop();
+    if (continuous && reading) {
+      const previous = source;
+      source = reading;
+      currentIndex = items.findIndex((item) => item.id === entryId);
+      generation++;
+      baseProgressMs = reading.token.startMs;
+      scheduledProgressMs = reading.positionMs;
+      playbackRate = reading.playbackRate;
+      startedAt = monotonicNow();
+      anchor(true);
+      // Publication revokes only the completed primary. Later admitted readers
+      // and their accepted native prefixes belong to this same transport epoch.
+      previous?.controller.abort();
+    } else if (entryId === null) doStop();
     else startAt(items.findIndex((item) => item.id === entryId));
     if (reading) source = reading;
     return plan.removedEntryId === null ? 'player' : 'player+queue';
@@ -796,6 +825,28 @@ export function createPlayer(options: {
       preparedSources.set(record.token, record);
       return record.token;
     },
+    admitSource(token) {
+      const record = preparedSources.get(token);
+      if (!record || token.signal.aborted || record.claimed) return false;
+      record.claimed = true;
+      return true;
+    },
+    hasSource(token) {
+      return !token.signal.aborted &&
+        (source?.token === token || preparedSources.has(token));
+    },
+    reanchorSource(expectedGeneration, entryId, positionMs) {
+      if (
+        generation !== expectedGeneration || currentEntry()?.id !== entryId ||
+        state !== 'play' || !Number.isSafeInteger(positionMs) || positionMs < 0
+      ) return false;
+      discontinuity();
+      baseProgressMs = positionMs;
+      scheduledProgressMs = positionMs;
+      startedAt = monotonicNow();
+      anchor();
+      return true;
+    },
     cancelSource(token) {
       if (source?.token === token) cancelSource();
       const prepared = preparedSources.get(token);
@@ -803,11 +854,14 @@ export function createPlayer(options: {
       prepared?.controller.abort();
     },
     sourceComplete(token) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
       if (
-        source?.token !== token || source.outcome !== 'eof' ||
-        source.complete || token.signal.aborted
+        !record?.claimed || record.outcome !== 'eof' ||
+        record.complete || token.signal.aborted
       ) return false;
-      source.complete = true;
+      record.complete = true;
       return true;
     },
     sourceCompatibilityRemaining(token) {
@@ -820,10 +874,16 @@ export function createPlayer(options: {
         : 0;
     },
     sourcePosition(token, positionMs, rate) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
       if (
-        source?.token !== token || token.signal.aborted || !sinkRequired ||
+        !record?.claimed || token.signal.aborted || !sinkRequired ||
         !Number.isSafeInteger(positionMs) || positionMs < 0
       ) return false;
+      record.positionMs = positionMs;
+      record.playbackRate = rate;
+      if (source !== record) return true;
       scheduledProgressMs = positionMs;
       playbackRate = rate;
       if (clock) clock = { ...clock, reportedAtMs: now() };
@@ -840,10 +900,14 @@ export function createPlayer(options: {
       return true;
     },
     sourceAudio(token, durationMs) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
       if (
-        source?.token !== token || source.outcome ||
+        !record?.claimed || record.outcome || token.signal.aborted ||
         !Number.isFinite(durationMs) || durationMs <= 0
       ) return false;
+      if (source !== record) return true;
       deliveredGeneration = generation;
       if (!sinkRequired) {
         source.legacyDrainAt = Math.max(monotonicNow(), source.legacyDrainAt) +
@@ -852,11 +916,14 @@ export function createPlayer(options: {
       return true;
     },
     sourceOutcome(token, outcome) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
       if (
-        source?.token !== token || source.outcome || state !== 'play' ||
-        currentEntry()?.id !== token.entryId
+        !record?.claimed || record.outcome || state !== 'play' ||
+        token.signal.aborted
       ) return false;
-      source.outcome = outcome;
+      record.outcome = outcome;
       return true;
     },
     sourceMetadata(token, metadata) {
