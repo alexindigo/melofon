@@ -48,6 +48,11 @@ const SYMBOLS = {
   raop_log_poll: { parameters: ['buffer', 'usize'], result: 'i32' },
   raop_new: { parameters: [], result: 'pointer' },
   raop_stream_new: { parameters: [], result: 'pointer' },
+  raop_stream_metadata: {
+    parameters: ['pointer', 'buffer', 'buffer', 'u32', 'u32'],
+    result: 'i32',
+    nonblocking: true,
+  },
   raop_stream_id: { parameters: ['pointer'], result: 'u64' },
   raop_stream_epoch: { parameters: ['pointer'], result: 'u64' },
   raop_stream_append: {

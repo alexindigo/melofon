@@ -162,6 +162,7 @@ struct raop_extra
 struct raop_master_session
 {
   uint64_t stream_id;
+  struct raop_stream_context *context;
   uint64_t epoch_frames; /* wide frame origin, independent of wrapping RTP */
   struct evbuffer *input_buffer;
   uint32_t input_buffer_samples;
@@ -201,6 +202,7 @@ struct raop_session
 {
   uint64_t device_id;
   uint64_t stream_id;
+  struct raop_stream_context *context;
   int callback_id;
 
   struct raop_master_session *master_session;
@@ -349,23 +351,25 @@ static struct media_quality raop_quality_default =
 /* From player.c */
 extern struct event_base *evbase_player;
 
-/* RAOP AES stream key */
-static uint8_t raop_aes_key[16];
-static uint8_t raop_aes_iv[16];
-static gcry_cipher_hd_t raop_aes_ctx;
-
-/* Base64-encoded AES key and IV for SDP */
-static char *raop_aes_key_b64;
-static char *raop_aes_iv_b64;
+/* Loop-owned stream state outlives its sessions and masters. Dormant contexts
+ * retain their metadata and crypto until the FFI stream is actually freed. */
+struct raop_stream_context
+{
+  uint64_t id;
+  uint8_t aes_key[16], aes_iv[16];
+  gcry_cipher_hd_t aes_ctx;
+  char *aes_key_b64, *aes_iv_b64;
+  struct output_metadata *metadata;
+  struct raop_stream_context *next;
+};
+static struct raop_stream_context *raop_stream_contexts;
+static struct raop_stream_context *stream_context_get(uint64_t id);
 
 /* AirTunes v2 time synchronization */
 static struct raop_service raop_timing_svc;
 
 /* AirTunes v2 playback synchronization / control */
 static struct raop_service raop_control_svc;
-
-/* Metadata */
-static struct output_metadata *raop_cur_metadata;
 
 /* Keep-alive timer - hack for ATV's with tvOS 10 */
 static struct event *keep_alive_timer;
@@ -905,7 +909,7 @@ raop_crypt_add_oaep_padding(uint8_t *em, const size_t emlen, const uint8_t *m, c
 }
 
 static char *
-raop_crypt_encrypt_aes_key_base64(void)
+raop_crypt_encrypt_aes_key_base64(const uint8_t key[16])
 {
   char ebuf[64];
   uint8_t padded_key[256];
@@ -926,7 +930,7 @@ raop_crypt_encrypt_aes_key_base64(void)
   result = NULL;
 
   /* Add RSA-OAES-SHA1 padding */
-  ret = raop_crypt_add_oaep_padding(padded_key, sizeof(padded_key), raop_aes_key, sizeof(raop_aes_key), NULL, 0);
+  ret = raop_crypt_add_oaep_padding(padded_key, sizeof(padded_key), key, 16, NULL, 0);
   if (ret < 0)
     return NULL;
 
@@ -1389,7 +1393,7 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
   if (rs->encrypt)
     ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT,
 			      session_id, af, address, rs_af, rs->address, RAOP_SAMPLES_PER_PACKET,
-			      raop_aes_key_b64, raop_aes_iv_b64);
+                              rs->context->aes_key_b64, rs->context->aes_iv_b64);
   else
     ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT_NO_ENC,
 			      session_id, af, address, rs_af, rs->address, RAOP_SAMPLES_PER_PACKET);
@@ -2120,6 +2124,7 @@ master_session_make(uint64_t stream_id, struct media_quality *quality, bool encr
     }
 
   rms->stream_id = stream_id;
+  rms->context = stream_context_get(stream_id);
   rms->encrypt = encrypt;
   rms->quality = *quality;
   rms->samples_per_packet = RAOP_SAMPLES_PER_PACKET;
@@ -2483,6 +2488,8 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
 
   re = rd->extra_device_info;
 
+  struct raop_stream_context *context = stream_context_get(rd->stream_id);
+  if (!context) return NULL;
 
   CHECK_NULL(L_RAOP, rs = calloc(1, sizeof(struct raop_session)));
   CHECK_NULL(L_RAOP, rs->deferredev = evtimer_new(evbase_player, deferredev_cb, rs));
@@ -2498,6 +2505,7 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
 
   rs->device_id = rd->id;
   rs->stream_id = rd->stream_id;
+  rs->context = context;
   rs->callback_id = callback_id;
 
   rs->server_fd = -1;
@@ -2589,15 +2597,15 @@ raop_metadata_free(struct raop_metadata *rmd)
   free(rmd);
 }
 
-static void
-raop_metadata_purge(void)
+void
+raop_metadata_purge_stream(uint64_t stream_id)
 {
-  if (!raop_cur_metadata)
-    return;
-
-  raop_metadata_free(raop_cur_metadata->priv);
-  free(raop_cur_metadata);
-  raop_cur_metadata = NULL;
+  struct raop_stream_context *s;
+  for (s = raop_stream_contexts; s && s->id != stream_id; s = s->next) {}
+  if (!s || !s->metadata) return;
+  raop_metadata_free(s->metadata->priv);
+  free(s->metadata);
+  s->metadata = NULL;
 }
 
 // *** Thread: worker ***
@@ -2858,37 +2866,46 @@ raop_metadata_send_generic(struct raop_session *rs, struct output_metadata *meta
 static int
 raop_metadata_startup_send(struct raop_session *rs)
 {
-  if (!rs->wanted_metadata || !raop_cur_metadata)
+  struct output_metadata *metadata = rs->context->metadata;
+  if (!rs->wanted_metadata || !metadata)
     return 0;
 
-  raop_cur_metadata->startup = true;
-
-  return raop_metadata_send_generic(rs, raop_cur_metadata, false);
+  struct output_metadata startup = *metadata;
+  startup.startup = true;
+  return raop_metadata_send_generic(rs, &startup, false);
 }
 
 static int
 raop_metadata_keep_alive_send(struct raop_session *rs)
 {
-  if (!rs->wanted_metadata || !raop_cur_metadata)
+  struct output_metadata *metadata = rs->context->metadata;
+  if (!rs->wanted_metadata || !metadata)
     return 0;
 
-  raop_cur_metadata->startup = false;
-
-  return raop_metadata_send_generic(rs, raop_cur_metadata, true);
+  struct output_metadata keepalive = *metadata;
+  keepalive.startup = false;
+  return raop_metadata_send_generic(rs, &keepalive, true);
 }
 
-static void
-raop_metadata_send(struct output_metadata *metadata)
+int
+raop_metadata_send_stream(uint64_t stream_id, struct output_metadata *metadata)
 {
+  struct raop_stream_context *s = stream_context_get(stream_id);
   struct raop_session *rs;
   struct raop_session *next;
   int ret;
+
+  if (!s) {
+    raop_metadata_free(metadata->priv);
+    free(metadata);
+    return -1;
+  }
 
   for (rs = raop_sessions; rs; rs = next)
     {
       next = rs->next;
 
-      if (!(rs->state & RAOP_STATE_F_CONNECTED) || !rs->wanted_metadata)
+      if (rs->stream_id != stream_id || !(rs->state & RAOP_STATE_F_CONNECTED) || !rs->wanted_metadata)
 	continue;
 
       ret = raop_metadata_send_generic(rs, metadata, false);
@@ -2900,8 +2917,9 @@ raop_metadata_send(struct output_metadata *metadata)
     }
 
   // Replace current metadata with the new stuff
-  raop_metadata_purge();
-  raop_cur_metadata = metadata;
+  raop_metadata_purge_stream(stream_id);
+  s->metadata = metadata;
+  return 0;
 }
 
 
@@ -3199,13 +3217,13 @@ raop_keep_alive_timer_cb(int fd, short what, void *arg)
 /* -------------------- Creation and sending of RTP packets  ---------------- */
 
 static int
-packet_encrypt(struct rtp_packet *pkt)
+packet_encrypt(struct rtp_packet *pkt, struct raop_stream_context *s)
 {
   char ebuf[64];
   gpg_error_t gc_err;
 
   // Reset cipher
-  gc_err = gcry_cipher_reset(raop_aes_ctx);
+  gc_err = gcry_cipher_reset(s->aes_ctx);
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
@@ -3214,7 +3232,7 @@ packet_encrypt(struct rtp_packet *pkt)
     }
 
   // Set IV
-  gc_err = gcry_cipher_setiv(raop_aes_ctx, raop_aes_iv, sizeof(raop_aes_iv));
+  gc_err = gcry_cipher_setiv(s->aes_ctx, s->aes_iv, sizeof(s->aes_iv));
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
@@ -3223,7 +3241,7 @@ packet_encrypt(struct rtp_packet *pkt)
     }
 
   // Encrypt in blocks of 16 bytes
-  gc_err = gcry_cipher_encrypt(raop_aes_ctx, pkt->payload, (pkt->payload_len / 16) * 16, NULL, 0);
+  gc_err = gcry_cipher_encrypt(s->aes_ctx, pkt->payload, (pkt->payload_len / 16) * 16, NULL, 0);
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
@@ -3422,7 +3440,7 @@ packets_send(struct raop_master_session *rms)
 
   if (rms->encrypt)
     {
-      ret = packet_encrypt(pkt);
+      ret = packet_encrypt(pkt, rms->context);
       if (ret < 0)
         {
           for (rs = raop_sessions; rs; rs = rs->next)
@@ -5220,64 +5238,105 @@ raop_write(struct output_buffer *obuf)
     }
 }
 
-static int
-raop_init(void)
+/* Explicitly erase owned key copies before releasing a context. */
+static void
+stream_context_clear(struct raop_stream_context *s)
 {
+  if (s->aes_ctx) gcry_cipher_close(s->aes_ctx);
+  free(s->aes_key_b64);
+  free(s->aes_iv_b64);
+  volatile uint8_t *key = s->aes_key, *iv = s->aes_iv;
+  for (size_t i = 0; i < 16; i++) key[i] = iv[i] = 0;
+  free(s);
+}
+
+void
+raop_backend_stream_free(uint64_t stream_id)
+{
+  struct raop_stream_context **slot = &raop_stream_contexts;
+  while (*slot && (*slot)->id != stream_id) slot = &(*slot)->next;
+  if (!*slot) return;
+  struct raop_stream_context *s = *slot;
+  raop_metadata_purge_stream(stream_id);
+  *slot = s->next;
+  stream_context_clear(s);
+}
+
+static struct raop_stream_context *
+stream_context_get(uint64_t id)
+{
+  struct raop_stream_context *s;
+  for (s = raop_stream_contexts; s; s = s->next)
+    if (s->id == id) return s;
+  s = calloc(1, sizeof(*s));
+  if (!s) return NULL;
+  s->id = id;
   char ebuf[64];
   char *ptr;
   gpg_error_t gc_err;
-  int ret;
 
   // Generate AES key and IV
-  gcry_randomize(raop_aes_key, sizeof(raop_aes_key), GCRY_STRONG_RANDOM);
-  gcry_randomize(raop_aes_iv, sizeof(raop_aes_iv), GCRY_STRONG_RANDOM);
+  gcry_randomize(s->aes_key, sizeof(s->aes_key), GCRY_STRONG_RANDOM);
+  gcry_randomize(s->aes_iv, sizeof(s->aes_iv), GCRY_STRONG_RANDOM);
 
   // Setup AES
-  gc_err = gcry_cipher_open(&raop_aes_ctx, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC, 0);
+  gc_err = gcry_cipher_open(&s->aes_ctx, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC, 0);
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not open AES cipher: %s\n", ebuf);
 
-      return -1;
+      goto error;
     }
 
   // Set key
-  gc_err = gcry_cipher_setkey(raop_aes_ctx, raop_aes_key, sizeof(raop_aes_key));
+  gc_err = gcry_cipher_setkey(s->aes_ctx, s->aes_key, sizeof(s->aes_key));
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not set AES key: %s\n", ebuf);
 
-      goto out_close_cipher;
+      goto error;
     }
 
   // Prepare Base64-encoded key & IV for SDP
-  raop_aes_key_b64 = raop_crypt_encrypt_aes_key_base64();
-  if (!raop_aes_key_b64)
+  s->aes_key_b64 = raop_crypt_encrypt_aes_key_base64(s->aes_key);
+  if (!s->aes_key_b64)
     {
       DPRINTF(E_LOG, L_RAOP, "Couldn't encrypt and encode AES session key\n");
 
-      goto out_close_cipher;
+      goto error;
     }
 
-  raop_aes_iv_b64 = b64_encode(raop_aes_iv, sizeof(raop_aes_iv));
-  if (!raop_aes_iv_b64)
+  s->aes_iv_b64 = b64_encode(s->aes_iv, sizeof(s->aes_iv));
+  if (!s->aes_iv_b64)
     {
       DPRINTF(E_LOG, L_RAOP, "Couldn't encode AES IV\n");
 
-      goto out_free_b64_key;
+      goto error;
     }
 
   // Remove base64 padding
-  ptr = strchr(raop_aes_key_b64, '=');
+  ptr = strchr(s->aes_key_b64, '=');
   if (ptr)
     *ptr = '\0';
 
-  ptr = strchr(raop_aes_iv_b64, '=');
+  ptr = strchr(s->aes_iv_b64, '=');
   if (ptr)
     *ptr = '\0';
 
+  s->next = raop_stream_contexts;
+  raop_stream_contexts = s;
+  return s;
+ error:
+  stream_context_clear(s);
+  return NULL;
+}
+
+static int
+raop_init(void)
+{
+  int ret;
   CHECK_NULL(L_RAOP, keep_alive_timer = evtimer_new(evbase_player, raop_keep_alive_timer_cb, NULL));
 
   ret = service_start(&raop_timing_svc, timing_svc_cb, 0, "RAOP timing");
@@ -5314,11 +5373,6 @@ raop_init(void)
   service_stop(&raop_timing_svc);
  out_free_timer:
   event_free(keep_alive_timer);
-  free(raop_aes_iv_b64);
- out_free_b64_key:
-  free(raop_aes_key_b64);
- out_close_cipher:
-  gcry_cipher_close(raop_aes_ctx);
 
   return -1;
 }
@@ -5340,10 +5394,8 @@ raop_deinit(void)
       session_free(rs);
     }
 
-  gcry_cipher_close(raop_aes_ctx);
-
-  free(raop_aes_key_b64);
-  free(raop_aes_iv_b64);
+  while (raop_stream_contexts)
+    raop_backend_stream_free(raop_stream_contexts->id);
 }
 
 struct output_definition output_raop =
@@ -5369,7 +5421,5 @@ struct output_definition output_raop =
   .device_volume_to_pct = raop_volume_to_pct,
   .write = raop_write,
   .metadata_prepare = raop_metadata_prepare,
-  .metadata_send = raop_metadata_send,
-  .metadata_purge = raop_metadata_purge,
   .device_authorize = raop_device_authorize,
 };

@@ -1027,6 +1027,54 @@ raop_new(void)
 
 static void stream_cancel_cb(evutil_socket_t fd, short what, void *arg);
 
+struct stream_metadata_work {
+  raop_stream_t *stream;
+  const char *title, *artist;
+  uint32_t position, length;
+  free_sync sync;
+};
+
+static void
+stream_metadata_cb(evutil_socket_t fd, short what, void *arg)
+{
+  struct stream_metadata_work *work = arg;
+  (void)fd; (void)what;
+  work->sync.result = raop_player_metadata(work->stream->player, work->title,
+    work->artist, work->position, work->length);
+  if (!work->sync.result) work->stream->item_set = true;
+  pthread_mutex_lock(&rt.lock);
+  work->stream->readers--;
+  pthread_mutex_unlock(&rt.lock);
+  pthread_mutex_lock(&work->sync.lock);
+  work->sync.done = 1;
+  pthread_cond_signal(&work->sync.cond);
+  pthread_mutex_unlock(&work->sync.lock);
+}
+
+int
+raop_stream_metadata(raop_stream_t *stream, const char *title, const char *artist,
+                     uint32_t position, uint32_t length)
+{
+  if (!stream) return -1;
+  struct stream_metadata_work work = { .stream = stream, .title = title,
+    .artist = artist, .position = position, .length = length,
+    .sync = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER } };
+  struct timeval zero = { 0, 0 };
+  pthread_mutex_lock(&work.sync.lock);
+  pthread_mutex_lock(&rt.lock);
+  int rc = -1;
+  if (!stream->closing && !stream->input_closed) {
+    stream->readers++;
+    rc = event_base_once(rt.base, -1, EV_TIMEOUT, stream_metadata_cb, &work, &zero);
+    if (rc < 0) stream->readers--;
+  }
+  pthread_mutex_unlock(&rt.lock);
+  if (!rc) while (!work.sync.done) pthread_cond_wait(&work.sync.cond, &work.sync.lock);
+  pthread_mutex_unlock(&work.sync.lock);
+  pthread_cond_destroy(&work.sync.cond); pthread_mutex_destroy(&work.sync.lock);
+  return rc < 0 ? -1 : work.sync.result;
+}
+
 raop_stream_t *
 raop_stream_new(void)
 {
@@ -1917,6 +1965,7 @@ stream_free_cb(evutil_socket_t fd, short what, void *arg)
   completion_settle_locked(stream, 0, 4, RAOP_PROGRESS_OK);
   pthread_mutex_unlock(&rt.lock);
   raop_player_free(stream->player);
+  raop_backend_stream_free(stream->id);
   event_free(stream->cancel_event);
   pthread_mutex_lock(&rt.lock);
   struct raop_stream **slot = &rt.streams;

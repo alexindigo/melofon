@@ -5,6 +5,13 @@
 #include <stddef.h>
 #include "timeline.h"
 struct raop_player;
+struct output_metadata;
+/* Loop-owned backend state; independent of attachment/master lifetime. Send
+ * takes ownership even on allocation failure. Free follows all device joins. */
+int raop_metadata_send_stream(uint64_t stream_id, struct output_metadata *);
+void raop_metadata_purge_stream(uint64_t stream_id);
+void raop_backend_stream_free(uint64_t stream_id);
+int raop_player_metadata(struct raop_player *, const char *, const char *, uint32_t, uint32_t);
 int raop_player_timeline_active(struct raop_player *);
 int raop_player_append_source(struct raop_player *, uint64_t source, uint64_t segment,
                               const uint8_t *, size_t, struct raop_source_append_result *);

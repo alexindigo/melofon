@@ -123,11 +123,35 @@ attachment is still owned, including during terminal release. The typed port
 joins its C1 producers, attempts all C3 attachment releases, then frees the
 stream on the loop. Failed native release retains storage and the guard.
 
-This is not concurrent-stream qualification: metadata/crypto/control-service
-isolation and retained source completion remain separate work.
+This is not concurrent-stream qualification: control-service isolation and
+removal of the native guard remain separate work.
 `tests/raop-stream.test.ts` exercises the shipping public FFI through real UDP,
 ALAC decoding and the independent scheduled receiver model, including both
 attachment-removal orders and compatibility/explicit guard competition.
+
+## Stream-local metadata and crypto
+
+`outputs/raop.c` lazily owns one backend context per stream incarnation. It
+retains metadata, AES key/IV/cipher and matching RSA-OAEP/base64 SDP material
+across attachment/master retirement. Stream free, after all device joins,
+purges only that context and erases its key copies. Runtime crypto bootstrap,
+the timing service and the 25-second keepalive scheduler remain shared.
+
+Metadata sends filter by stream; startup and keepalive select the session's
+context without mutating another receiver's startup projection. Content is
+built independently of the first receiver's metadata wishes. The additive,
+callback-free `raop_stream_metadata` port retains current transport metadata
+even for a dormant stream and reserves storage through loop dispatch. It is
+not a source-marker scheduling API; natural-boundary policy remains in core.
+
+`tests/raop-stream-isolation.test.ts` exercises dormant/current replacement,
+purge, retirement, receiver wishes and the real keepalive interval. The
+test-only `test/crypto-observer.c` observes libgcrypt in memory, independently
+unmasks RSA-OAEP input, matches it to the cipher key and SDP output, and decrypts
+actual receiver ciphertext for exact ALAC/scheduled assertions. It never
+exports or logs keys and is not linked into the shipping library. Encrypted
+and unencrypted masters remain distinct within one stream. These sequential
+context proofs do not qualify concurrent streams or physical hardware.
 
 ## Exact stream admission
 

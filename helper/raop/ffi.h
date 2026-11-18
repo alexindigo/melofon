@@ -23,6 +23,12 @@ typedef struct raop_stream raop_stream_t;
  * is refused with -2 until the owner's resources are proven released.
  * Metadata/crypto/control-service isolation is not yet multi-stream capable. */
 raop_stream_t *raop_stream_new(void);
+/* Replace this stream's current transport metadata, including while dormant.
+ * This is not a source-marker scheduler. Text is copied before return; the
+ * callback-free call joins loop dispatch and reserves storage against free.
+ * Returns 0 on success, -1 on closed input, scheduling or allocation failure. */
+int raop_stream_metadata(raop_stream_t *stream, const char *title, const char *artist,
+                         uint32_t position_ms, uint32_t length_ms);
 uint64_t raop_stream_id(raop_stream_t *stream);
 raop_t *raop_stream_attach(raop_stream_t *stream);
 uint64_t raop_attachment_id(raop_t *attachment);
