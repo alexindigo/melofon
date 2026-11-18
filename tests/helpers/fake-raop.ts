@@ -129,6 +129,7 @@ let sessionSeq = 0;
 export function startFakeRaop(
   opts: {
     recordDelayMs?: number;
+    beforeRecordReply?: () => Promise<void>;
     teardownDelayMs?: number;
     withholdTeardownReply?: boolean;
     flushDelayMs?: number;
@@ -408,6 +409,7 @@ export function startFakeRaop(
         const delay = method === 'FLUSH' ? opts.flushDelayMs : undefined;
         if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
 
+        if (method === 'RECORD') await opts.beforeRecordReply?.();
         if (method === 'RECORD' && opts.recordDelayMs !== undefined) {
           await new Promise((resolve) =>
             setTimeout(resolve, opts.recordDelayMs)

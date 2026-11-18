@@ -347,6 +347,12 @@ sync_packet_ntp_make(uint8_t *data, struct rtcp_timestamp cur_stamp, uint32_t po
 struct rtp_packet *
 rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stamp, uint8_t type)
 {
+  return rtp_sync_packet_at(session, cur_stamp, session->pos, type);
+}
+
+struct rtp_packet *
+rtp_sync_packet_at(struct rtp_session *session, struct rtcp_timestamp cur_stamp, uint32_t pos, uint8_t type)
+{
   struct rtp_packet *pkt = &session->sync_packet_next;
 
   // One-off allocation of some permanent space for the packet data
@@ -359,9 +365,9 @@ rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stam
     }
 
   if (session->ptp_clock_id)
-    sync_packet_ptp_make(pkt->data, cur_stamp, session->pos, type, session->ptp_clock_id);
+    sync_packet_ptp_make(pkt->data, cur_stamp, pos, type, session->ptp_clock_id);
   else
-    sync_packet_ntp_make(pkt->data, cur_stamp, session->pos, type);
+    sync_packet_ntp_make(pkt->data, cur_stamp, pos, type);
 
   return pkt;
 }

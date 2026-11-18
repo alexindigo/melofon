@@ -231,6 +231,8 @@ struct raop_session
   uint64_t schedule_origin_ns;
   uint64_t submitted_frames;
   uint64_t coverage_start;
+  uint32_t sync_start_pos; /* exact RTP-Info sent by this receiver's RECORD/FLUSH */
+  bool sync_start_pending;
 
   int reqs_in_flight;
   int cseq;
@@ -1502,8 +1504,10 @@ raop_send_req_flush(struct raop_session *rs, evrtsp_req_cb cb, const char *log_c
       return -1;
     }
 
-  /* Restart sequence */
-  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
+  /* Restart sequence: the first sync retains this receiver's exact RTSP anchor. */
+  rs->sync_start_pos = rms->rtp_session->pos;
+  rs->sync_start_pending = true;
+  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rs->sync_start_pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in FLUSH request\n");
@@ -1607,8 +1611,10 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_
 
   evrtsp_add_header(req->output_headers, "Range", "npt=0-");
 
-  /* Start sequence: next sequence */
-  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
+  /* The shared master can advance before this receiver's RECORD reply. */
+  rs->sync_start_pos = rms->rtp_session->pos;
+  rs->sync_start_pending = true;
+  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rs->sync_start_pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
@@ -3584,12 +3590,27 @@ packets_sync_send(struct raop_master_session *rms)
       // A device has joined and should get an init sync packet
       if (rs->state == RAOP_STATE_CONNECTED)
 	{
-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
+          struct rtcp_timestamp start_stamp = cur_stamp;
+          uint32_t start_pos = rms->rtp_session->pos;
+          if (rs->sync_start_pending) {
+            start_pos = rs->sync_start_pos;
+            /* Translate both sides of the live RTP/NTP correlation equally.
+             * Even a RECORD delay longer than the buffer lead cannot alter the
+             * presentation clock or give the joining receiver missed audio. */
+            uint32_t elapsed = rms->rtp_session->pos - start_pos;
+            struct timespec delta = { .tv_sec = elapsed / rms->quality.sample_rate,
+              .tv_nsec = (uint64_t)(elapsed % rms->quality.sample_rate) * 1000000000ULL /
+                         rms->quality.sample_rate };
+            start_stamp.pos -= elapsed;
+            start_stamp.ts = timespec_sub(start_stamp.ts, delta);
+          }
+	  sync_pkt = rtp_sync_packet_at(rms->rtp_session, start_stamp, start_pos, 0x90);
 	  if (!sync_pkt) {
             raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_ALLOCATION);
             return -1;
           }
           if (control_packet_send(rs, sync_pkt) < 0) continue;
+          rs->sync_start_pending = false;
           rs->schedule_valid = !rs->coverage_failed;
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
