@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <gcrypt.h>
+#include <netdb.h>
 #include "outputs.h"
 #include "transcode.h"
 
@@ -28,6 +29,14 @@ static int arm(const char *kind)
   return mode && path && !strcmp(mode, kind) && unlink(path) == 0;
 }
 static int player_timer = -1;
+int getaddrinfo(const char *host, const char *service,
+                const struct addrinfo *hints, struct addrinfo **result)
+{
+  if (host && !strcmp(host, "invalid host")) return EAI_NONAME;
+  int (*real)(const char *, const char *, const struct addrinfo *, struct addrinfo **) =
+    symbol("getaddrinfo", "libc.so.6");
+  return real(host, service, hints, result);
+}
 int timerfd_create(int clock, int flags)
 {
   int (*real)(int, int) = symbol("timerfd_create", "libc.so.6");
@@ -39,6 +48,9 @@ int timerfd_create(int clock, int flags)
 }
 ssize_t read(int fd, void *buffer, size_t size)
 {
+  if (fd == player_timer && size == 8 && arm("timer")) {
+    errno = EIO; return -1;
+  }
   const char *path = getenv("RAOP_PROGRESS_HOLD");
   if (fd == player_timer && size == 8 && path && access(path, F_OK) == 0) {
     /* Keep timer expirations intact; libevent still services progress queries.
@@ -51,8 +63,13 @@ ssize_t read(int fd, void *buffer, size_t size)
 ssize_t send(int fd, const void *buffer, size_t size, int flags)
 {
   const uint8_t *bytes = buffer;
-  if (size >= 12 && (bytes[1] & 0x7f) == 0x60 && arm("send")) {
-    errno = EIO; return -1;
+  static int countdown;
+  if (size >= 12 && (bytes[1] & 0x7f) == 0x60) {
+    if (arm("send")) {
+      const char *skip = getenv("RAOP_PROGRESS_SEND_SKIP");
+      countdown = 1 + (skip ? atoi(skip) : 0);
+    }
+    if (countdown > 0 && --countdown == 0) { errno = EIO; return -1; }
   }
   ssize_t (*real)(int, const void *, size_t, int) = symbol("send", "libc.so.6");
   return real(fd, buffer, size, flags);

@@ -298,8 +298,12 @@ Source zero selects transport-only projection. Silence advances transport, not
 source frames. Snapshot reads reserve storage and the typed operation owner joins
 them before native release.
 
-Packet allocation, encoding, cipher, send and sync errors retain an explicit
-epoch failure and the last proven group prefix before deferred session cleanup.
+Packet allocation, encoding, cipher and timer failures retain an explicit epoch
+failure and the last proven group prefix. Attachment startup, send and sync
+failures settle that attachment and leave viable peers pacing; loss of every
+viable attachment also freezes shared diagnostics. Packet fanout validates its
+cohort before sending and commits the shared RTP position exactly once after
+sending, even when a later receiver fails, preserving successful peer coverage.
 Failed snapshots remain frozen until ordered cancel/reset. Pacer catch-up checks
 each packet's established presentation deadline before emission, and again after
 send; missing the available lead fails the epoch rather than emitting a stale
@@ -330,7 +334,9 @@ satisfy missing earlier source frames.
 Voluntary teardown/FLUSH retires that captured session as withdrawn. An explicit
 revision can exclude withdrawn/failed outcomes from the same immutable source
 target. It creates a new retained barrier and keeps exclusions visible; it never
-edits the original terminal receipt. With an epoch failure the pacer cannot supply
+edits the original terminal receipt. Captured session facts keep receiving lifecycle
+outcomes behind the frozen result, so a revision sees losses that happened after
+an earlier peer failed. With an epoch failure the pacer cannot supply
 a missing suffix: a revised healthy peer lacking full submission fails rather than
 waiting forever. Already submitted healthy coverage can still reach its actual
 presentation boundary. Broader source recovery remains the core's responsibility.
@@ -343,8 +349,11 @@ view indices and compact at ack; offsets remain epoch-absolute. Acknowledged sou
 incarnations must not be reused. Source/progress range projections cover retained
 observations only after ack. Queued failed input is not reclaimed ahead of cancel.
 
-Only ended streams stop pacing after their final retained barrier settles; a
-natural source seal never ends the stream or releases its receivers. Typed poll,
+Only ended streams stop pacing after ingress and final packet padding are
+exhausted and surviving healthy transports pass the actual final real-frame
+boundary. A failed or acknowledged receipt cannot stop queued playback. Every
+ordered epoch transition resets transport frame zero before recording ranges.
+A natural source seal never ends the stream or releases its receivers. Typed poll,
 wait, revision and ack use the existing C1 operation owner. Close first fences
 native input and settles pending results as canceled, then joins all readers and
 waiters before C3 attachment/stream release. Native reader reservations prevent

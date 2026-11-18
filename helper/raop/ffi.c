@@ -166,6 +166,7 @@ struct raop_handle
   bool quiescing;                   /* local release fences late callbacks */
   bool legacy_claim;                /* rt.lock; retained until proven free */
   uint64_t session_revision;        /* loop-owned, never reuses retired session */
+  uint64_t failure_epoch, session_error; /* rt.lock; attachment-local failure */
   bool probe_only;
 
   /* Event ring for raop_poll. */
@@ -209,6 +210,10 @@ struct cancel_receipt {
 struct completion_receipt {
   struct raop_completion_result result;
   struct raop_completion_attachment *attachment;
+  /* Latest captured-session facts remain live behind an immutable terminal
+   * result. A revision copies these facts, never mutates the old snapshot. */
+  struct raop_completion_attachment *observed;
+  uint64_t observed_transport_end;
   struct completion_receipt *next;
 };
 static void completion_update_locked(struct raop_stream *);
@@ -504,6 +509,10 @@ device_start(raop_t *h, cmd *c)
   struct output_device *dev;
   struct raop_extra_mirror *re;
   char *address;
+
+  pthread_mutex_lock(&rt.lock);
+  h->failure_epoch = h->session_error = 0;
+  pthread_mutex_unlock(&rt.lock);
 
   if (h->session_revision == UINT64_MAX) {
     if (h->stream) raop_ffi_attachment_failed(h->stream->id, h->id, RAOP_PROGRESS_TRANSPORT);
@@ -1169,10 +1178,12 @@ static void
 completion_update_locked(raop_stream_t *s)
 {
   for (struct completion_receipt *c = s->completions; c; c = c->next) {
-    if (c->result.status || c->result.epoch != s->epoch || s->resetting) continue;
+    if (c->result.epoch != s->epoch || s->resetting) continue;
+    bool terminal = c->result.status != 0;
     bool complete = c->result.required > 0 && c->result.target > 0;
     for (size_t i = 0; i < c->result.attachments; i++) {
-      struct raop_completion_attachment *a = &c->attachment[i];
+      struct raop_completion_attachment *a = terminal
+        ? &c->observed[i] : &c->attachment[i];
       if (a->excluded) continue;
       if (!a->outcome) {
         struct raop_progress_snapshot p;
@@ -1182,7 +1193,10 @@ completion_update_locked(raop_stream_t *s)
         a->coverage_start = p.coverage_start;
         a->submitted_frames = p.submitted_frames;
         a->scheduled_frames = p.scheduled_frames;
-        if (fed) c->result.transport_end = end;
+        if (fed) {
+          c->observed_transport_end = end;
+          if (!terminal) c->result.transport_end = end;
+        }
         if (fed && p.participants && p.status == 1 &&
             p.source_frames == c->result.target && p.scheduled_frames >= end &&
             p.submitted_frames >= end) a->outcome = 1;
@@ -1194,12 +1208,13 @@ completion_update_locked(raop_stream_t *s)
         }
       }
       if (a->outcome != 1) complete = false;
-      if (a->outcome == 2 || a->outcome == 3) {
+      if (!terminal && (a->outcome == 2 || a->outcome == 3)) {
         c->result.status = 3; c->result.error = a->error;
         c->result.captured_ns = completion_now();
       }
+      c->observed[i] = *a;
     }
-    if (complete) {
+    if (!terminal && complete) {
       c->result.status = 1;
       c->result.captured_ns = completion_now();
     }
@@ -1212,12 +1227,9 @@ raop_ffi_completion_update(uint64_t stream_id)
   pthread_mutex_lock(&rt.lock);
   for (raop_stream_t *s = rt.streams; s; s = s->next) if (s->id == stream_id) {
     completion_update_locked(s);
-    bool pending = false;
-    for (struct completion_receipt *c = s->completions; c; c = c->next)
-      if (c->result.epoch == s->epoch && !c->result.status) pending = true;
     /* Completion is not receiver release. Stop only the ended stream's pacer,
-     * after real playout; natural A/B seals keep their one clock running. */
-    if (!pending && raop_player_ended(s->player)) raop_player_drain_complete(s->player);
+     * after actual surviving transport playout, not receipt settlement/ack. */
+    raop_player_drain_complete(s->player);
     break;
   }
   pthread_mutex_unlock(&rt.lock);
@@ -1227,17 +1239,18 @@ static void
 completion_settle_locked(raop_stream_t *s, uint64_t attachment, uint64_t outcome, uint64_t error)
 {
   for (struct completion_receipt *c = s->completions; c; c = c->next) {
-    if (c->result.status || c->result.epoch != s->epoch) continue;
+    if (c->result.epoch != s->epoch) continue;
     bool affected = false;
     for (size_t i = 0; i < c->result.attachments; i++) {
-      struct raop_completion_attachment *a = &c->attachment[i];
+      struct raop_completion_attachment *a = &c->observed[i];
       if (a->excluded || (attachment && a->attachment != attachment)) continue;
       /* A per-attachment completion already observed at its boundary survives
        * that peer's later loss while another peer is still draining. */
-      if (a->outcome == 1) continue;
+      if (a->outcome) continue;
       a->outcome = outcome; a->error = error; affected = true;
+      if (!c->result.status) c->attachment[i] = *a;
     }
-    if (affected) {
+    if (affected && !c->result.status) {
       c->result.status = outcome == 4 ? 2 : 3;
       c->result.error = error;
       c->result.captured_ns = completion_now();
@@ -1269,7 +1282,7 @@ completion_prepare_locked(raop_stream_t *s, uint64_t epoch, uint64_t source,
   for (raop_t *h = rt.handles_list; h; h = h->next)
     if (h->stream == s && !h->quiescing && !h->probe_only) count++;
   struct completion_receipt *c = calloc(1, sizeof(*c));
-  if (c) c->attachment = calloc(count ? count : 1, sizeof(*c->attachment));
+  if (c) c->attachment = calloc(count ? count * 2 : 1, sizeof(*c->attachment));
   if (!c || !c->attachment) {
     if (c) free(c);
     result->error = RAOP_APPEND_ERROR_ALLOCATION;
@@ -1277,11 +1290,15 @@ completion_prepare_locked(raop_stream_t *s, uint64_t epoch, uint64_t source,
   }
   c->result = (struct raop_completion_result){ .stream = s->id, .epoch = epoch,
     .source = source, .target = target, .revision = 1, .attachments = count, .required = count };
+  c->observed = c->attachment + count;
   size_t i = 0;
   for (raop_t *h = rt.handles_list; h; h = h->next)
     if (h->stream == s && !h->quiescing && !h->probe_only)
       c->attachment[i++] = (struct raop_completion_attachment){
-        .attachment = h->id, .session = h->session_revision };
+        .attachment = h->id, .session = h->session_revision,
+        .outcome = h->failure_epoch == epoch ? 3 : 0,
+        .error = h->failure_epoch == epoch ? h->session_error : 0 };
+  memcpy(c->observed, c->attachment, count * sizeof(*c->attachment));
   return c;
 }
 
@@ -1363,6 +1380,7 @@ stream_marker(raop_stream_t *stream, uint64_t epoch, uint64_t source, uint64_t t
                 c->attachment[i].error = c->result.error;
               }
             }
+            memcpy(c->observed, c->attachment, c->result.attachments * sizeof(*c->attachment));
             c->next = stream->completions; stream->completions = c;
             stream->completion_count++;
             stream->marker_reserved = false;
@@ -1525,7 +1543,7 @@ raop_stream_completion_revise(raop_stream_t *s, uint64_t epoch, uint64_t source,
   for (size_t i = 0; i < count; i++) {
     bool found = false;
     for (size_t j = 0; j < old->result.attachments; j++) {
-      struct raop_completion_attachment *a = &old->attachment[j];
+      struct raop_completion_attachment *a = &old->observed[j];
       if (a->attachment == exclude[i] && !a->excluded &&
           (a->outcome == 2 || a->outcome == 3)) found = true;
     }
@@ -1534,10 +1552,12 @@ raop_stream_completion_revise(raop_stream_t *s, uint64_t epoch, uint64_t source,
   }
   struct completion_receipt *c = calloc(1, sizeof(*c));
   if (!c) goto out;
-  c->attachment = malloc(old->result.attachments * sizeof(*c->attachment));
+  c->attachment = malloc(old->result.attachments * 2 * sizeof(*c->attachment));
   if (!c->attachment) { free(c); goto out; }
-  memcpy(c->attachment, old->attachment, old->result.attachments * sizeof(*c->attachment));
+  memcpy(c->attachment, old->observed, old->result.attachments * sizeof(*c->attachment));
+  c->observed = c->attachment + old->result.attachments;
   c->result = old->result; c->result.revision++; c->result.status = c->result.error = 0;
+  c->observed_transport_end = c->result.transport_end = old->observed_transport_end;
   c->result.captured_ns = 0;
   struct raop_progress_snapshot epoch_progress;
   /* Stored epoch failures are safe to read here under pcm_lock. Its presence
@@ -1558,6 +1578,7 @@ raop_stream_completion_revise(raop_stream_t *s, uint64_t epoch, uint64_t source,
     }
   }
   if (!c->result.required) { c->result.status = 3; c->result.error = RAOP_PROGRESS_TRANSPORT; }
+  memcpy(c->observed, c->attachment, c->result.attachments * sizeof(*c->attachment));
   if (c->result.status) c->result.captured_ns = completion_now();
   c->next = s->completions; s->completions = c; s->completion_count++;
   rc = 0;
@@ -1612,7 +1633,17 @@ raop_ffi_attachment_failed(uint64_t stream_id, uint64_t attachment, uint64_t err
     if (s->id == stream_id && !s->canceling && !s->closing) {
       completion_update_locked(s);
       completion_settle_locked(s, attachment, 3, error);
-      raop_player_failed(s->player, error);
+      bool viable = false;
+      for (raop_t *h = rt.handles_list; h; h = h->next) {
+        if (h->stream != s || h->quiescing || h->probe_only) continue;
+        if (h->id == attachment) {
+          if (h->failure_epoch != s->epoch) { h->failure_epoch = s->epoch; h->session_error = error; }
+        }
+        else if (h->failure_epoch != s->epoch) viable = true;
+      }
+      /* A failed join/start or receiver is not a pacer failure. Freeze shared
+       * diagnostics only when no attachment can continue this epoch. */
+      if (!viable) raop_player_failed(s->player, error);
       break;
     }
   pthread_mutex_unlock(&rt.lock);

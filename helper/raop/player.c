@@ -94,7 +94,7 @@ struct input_range {
 };
 struct timeline {
   bool enabled, ended, tail_reached, complete;
-  uint64_t accepted, end_target, padding_left;
+  uint64_t accepted, end_target, padding_left, end_transport;
   size_t sources, inputs, next_input, ranges;
   struct source_record source[TIMELINE_MARKERS];
   struct input_range input[TIMELINE_MARKERS];
@@ -311,7 +311,10 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
   ret = read(p->timer_fd, &overrun, sizeof(overrun));
   if (ret <= 0)
     {
-      if (errno != EAGAIN) raop_player_failed(p, RAOP_PROGRESS_TRANSPORT);
+      if (errno != EAGAIN) {
+        raop_player_failed(p, RAOP_PROGRESS_TRANSPORT);
+        raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_TRANSPORT);
+      }
       return;
     }
   else if (overrun > 0)
@@ -343,6 +346,12 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           break;
         }
       size_t real = n / 4;
+      /* Establish the epoch coordinate before recording any transport range. */
+      if (!p->clock_started) {
+        clock_gettime(CLOCK_MONOTONIC, &p->pts_base);
+        p->pts_samples = 0;
+        p->clock_started = true;
+      }
       if (timeline) {
         /* Dispatch every tick on the same clock. A source seal is not involved:
          * only genuinely absent ingress (or explicit stream end) emits zeros. */
@@ -375,6 +384,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         size_t silence = TICK_SAMPLES - real;
         if (t->ended && t->next_input == t->inputs && !t->tail_reached) {
           t->tail_reached = true;
+          t->end_transport = transport;
           t->padding_left = (352 - transport % 352) % 352;
         }
         size_t padding = t->padding_left;
@@ -398,14 +408,6 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
       }
       pthread_mutex_unlock(&p->pcm_lock);
 
-      if (!p->clock_started)
-        {
-          /* OwnTone anchors start_ts on the first source_read — which is
-           * after the timer starts, never during the handshake. */
-          clock_gettime(CLOCK_MONOTONIC, &p->pts_base);
-          p->pts_samples = 0;
-          p->clock_started = true;
-        }
       if (!p->peak_logged)
         {
           helper_log_event(E_LOG, L_RAOP, "pcm_peak", &(struct helper_log_fields){
@@ -846,9 +848,9 @@ raop_player_flush(struct raop_player *p)
   memset(&p->failure, 0, sizeof(p->failure));
   if (p->timeline && p->timeline->enabled) {
     memset(p->timeline, 0, sizeof(*p->timeline));
-    p->pts_samples = 0;
-    p->clock_started = false;
   }
+  p->pts_samples = 0;
+  p->clock_started = false;
   pthread_mutex_unlock(&p->pcm_lock);
 }
 
@@ -918,9 +920,19 @@ void
 raop_player_drain_complete(struct raop_player *p)
 {
   pthread_mutex_lock(&p->pcm_lock);
-  if (p->timeline) p->timeline->complete = true;
+  struct timeline *t = p->timeline;
+  struct raop_progress_snapshot progress;
+  bool complete = t && t->ended && t->tail_reached && !t->padding_left &&
+    !p->failure.error && !evbuffer_get_length(p->pcm);
+  if (complete) {
+    raop_transport_progress(p->stream_id, 0, monotonic_ns(), &progress);
+    complete = progress.participants && progress.status == 1 &&
+      progress.submitted_frames >= t->end_transport &&
+      progress.scheduled_frames >= t->end_transport;
+  }
+  if (complete) t->complete = true;
   pthread_mutex_unlock(&p->pcm_lock);
-  raop_player_session_stopped(p);
+  if (complete) raop_player_session_stopped(p);
 }
 
 /* Loop thread: the start command's item (title/artist/len) and the TXT
