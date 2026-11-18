@@ -1,6 +1,7 @@
 // Non-loopback HTTP -> real lossless decoder -> production boot/exact stream ->
 // shipping native library -> independently scheduled UDP/ALAC consumer.
 import { assert, assertEquals } from '@std/assert';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import { apiFixture } from './helpers/api.ts';
 import { until } from './helpers/speaker-consumer.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
@@ -224,7 +225,7 @@ async function scenario(
                 bytes.set(chunk, offset);
                 offset += chunk.length;
               }
-              return {
+              return fixturePcm({
                 async *[Symbol.asyncIterator]() {
                   if (path.endsWith('/b.wav')) {
                     yield bytes.subarray(0, 351 * 4);
@@ -232,7 +233,7 @@ async function scenario(
                     yield bytes.subarray(351 * 4); // explicit real packet-completing frame, not b04 padding
                   } else yield bytes; // real decoded PCM in one oversized ingress call
                 },
-              };
+              }, decoded);
             },
           },
           notify: f.notify,

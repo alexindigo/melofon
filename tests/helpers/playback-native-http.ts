@@ -1,5 +1,6 @@
 // Cold plain-HTTP control -> real file decoder -> production boot -> native RAOP.
 import { assert, assertEquals } from '@std/assert';
+import { fixturePcm } from './decoded-pcm.ts';
 import { apiFixture } from './api.ts';
 import { createMedia } from '../../src/media.ts';
 import { createLibrary } from '../../src/library.ts';
@@ -260,16 +261,19 @@ export async function nativeHttpFixture(options: {
             await options.acquisition;
             const decoded = await media.decodePcm(path, settings);
             if (!decoded || !options.afterFirstChunk) return decoded;
-            return (async function* () {
-              let first = true;
-              for await (const chunk of decoded) {
-                yield chunk;
-                if (first) {
-                  first = false;
-                  await options.afterFirstChunk;
+            return fixturePcm(
+              (async function* () {
+                let first = true;
+                for await (const chunk of decoded) {
+                  yield chunk;
+                  if (first) {
+                    first = false;
+                    await options.afterFirstChunk;
+                  }
                 }
-              }
-            })();
+              })(),
+              decoded,
+            );
           },
         },
       });

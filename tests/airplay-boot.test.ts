@@ -6,6 +6,7 @@
 // down, volume and pin reach the helper, and a helper "password" event
 // flips needsAuthKey on the output row.
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import { openStore } from '../src/store/index.ts';
 import { createLibrary, type SongRow } from '../src/library.ts';
 import { createMedia, type Media } from '../src/media.ts';
@@ -358,13 +359,16 @@ Deno.test('no PCM before the helper reports connected', async () => {
       startMs = opts?.startMs;
       const stream = await realMedia.decodePcm(path, opts);
       if (stream === null) return null;
-      return (async function* () {
-        for await (const chunk of stream) {
-          decodedBytes += chunk.length;
-          yield chunk;
-        }
-        decoded = true;
-      })();
+      return fixturePcm(
+        (async function* () {
+          for await (const chunk of stream) {
+            decodedBytes += chunk.length;
+            yield chunk;
+          }
+          decoded = true;
+        })(),
+        stream,
+      );
     },
   };
   const { outputs, playback, spawned, close } = await setup({ media });

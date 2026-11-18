@@ -156,10 +156,27 @@ export interface CompressedInput {
 
 export interface InputPcm extends AsyncIterableIterator<Uint8Array> {
   return(): Promise<IteratorResult<Uint8Array>>;
+  /** First requested sample in the normalized 44100 Hz output, relative to the
+   * media start, not container PTS. Every yielded byte starts at this exact
+   * frame (or the iterator is empty when the request is beyond EOF). */
+  readonly originFrame: bigint;
+  /** Natural decoder EOF only. Cancellation/cleanup is never evidence of EOF,
+   * and neither fact means that an output sink has played the samples. */
+  readonly eof: boolean;
   /** Available container/stream duration, including native size/bitrate facts. */
   durationMs: number | null;
-  /** Settles after reader, source lease, demuxer, decoder and frames release. */
+  /** Settles after reader/source/native cleanup attempts finish. Cleanup errors
+   * still reject next()/return(); this receipt is neither EOF nor sink completion. */
   completion: Promise<void>;
+}
+
+export interface PcmOptions {
+  signal?: AbortSignal;
+  /** Rounded once to the nearest normalized output frame. */
+  startMs?: number;
+  /** Exact frame reopen, without a frames -> milliseconds -> frames round trip.
+   * Mutually exclusive with startMs. */
+  startFrame?: bigint;
 }
 
 export interface Media {
@@ -222,20 +239,21 @@ export interface Media {
   /** Audio track of `path` decoded to raw interleaved PCM — 44100 Hz,
    * 16-bit, stereo, the RAOP default quality (raop.c). Boots stream the
    * chunks to their sink; each chunk is one decoded frame's bytes (a copy,
-   * safe after the frame is freed). `startMs` seeks (keyframe granularity)
-   * for a pause → resume. Null when the file has no audio, seeking fails, or
+   * safe after the frame is freed). Reopen trims backward-seek overlap to the
+   * exact requested normalized frame. When timestamps cannot establish that
+   * origin, decode-and-skip from the start instead. Null when the file has no audio, seeking fails, or
    * the decoder cannot be created; mid-stream errors propagate. Breaking
    * out of the iteration cancels the decode and frees everything. Returning
    * its iterator also releases an acquired stream before its first next(). */
   decodePcm(
     path: string,
-    opts?: { startMs?: number },
-  ): Promise<AsyncIterable<Uint8Array> | null>;
+    opts?: PcmOptions,
+  ): Promise<InputPcm | null>;
   /** Non-seekable core-fed audio. MIME is not evidence of format. Throws on
    * unsupported input, source failure or abort, preserving source errors. */
   decodeInputPcm(
     source: CompressedInput,
-    opts?: { signal?: AbortSignal; startMs?: number },
+    opts?: PcmOptions,
   ): Promise<InputPcm>;
 }
 
@@ -410,10 +428,11 @@ function inputDuration(input: Demuxer): number | null {
     : null;
 }
 
-function pcmDecoder(input: Demuxer): Promise<Decoder> {
+function pcmDecoder(input: Demuxer, signal?: AbortSignal): Promise<Decoder> {
   const audio = input.audio();
   if (!audio) throw new Error('Media input has no audio');
   return Decoder.create(audio, {
+    signal,
     resample: {
       sampleRate: PCM_RATE,
       sampleFormat: AV_SAMPLE_FMT_S16,
@@ -422,19 +441,55 @@ function pcmDecoder(input: Demuxer): Promise<Decoder> {
   });
 }
 
+function pcmOrigin(options: PcmOptions): bigint {
+  let frame = options.startFrame;
+  if (frame !== undefined && options.startMs !== undefined) {
+    throw new RangeError('PCM origin requires either startFrame or startMs');
+  }
+  if (frame === undefined) {
+    const ms = options.startMs ?? 0;
+    const rounded = Math.round(ms * PCM_RATE / 1000);
+    if (!Number.isFinite(ms) || ms < 0 || !Number.isSafeInteger(rounded)) {
+      throw new RangeError('PCM origin is not representable');
+    }
+    frame = BigInt(rounded);
+  }
+  if (typeof frame !== 'bigint' || frame < 0n || frame > 0xffffffffffffffffn) {
+    throw new RangeError('PCM origin requires an unsigned 64-bit frame');
+  }
+  return frame;
+}
+
+/** A timestamp must resolve to an actual output-frame boundary, not a rounded
+ * invented origin. Rate-converted decoders also need their original phase, so
+ * they always use decode-and-skip, never this timestamp shortcut. */
+function pcmTimestamp(pts: bigint, timeBase: { num: number; den: number }) {
+  if (pts === AV_NOPTS_VALUE || timeBase.num <= 0 || timeBase.den <= 0) {
+    return null;
+  }
+  const numerator = pts * BigInt(timeBase.num) * BigInt(PCM_RATE);
+  const denominator = BigInt(timeBase.den);
+  return numerator % denominator === 0n ? numerator / denominator : null;
+}
+
 /** Acquisition ownership is outside the generator, including return-before-next.
  * Stop pending IO first, but queue native disposal behind active iteration. */
 function ownedPcm(
   releases: ReleaseSet,
   input: Demuxer,
   decoder: Decoder,
-  owner?: { stop(): void; check(): void },
-  startMs = 0,
+  owner?: { stop(): void; check(): void; signal?: AbortSignal },
+  originFrame = 0n,
+  seek?: {
+    origin: bigint;
+    restart(): Promise<{ input: Demuxer; decoder: Decoder }>;
+  },
 ): InputPcm {
   const heartbeat = acquireHeartbeat();
   releases.add('heartbeat', () => heartbeat[Symbol.dispose](), 3);
-  let skipBytes = Math.max(0, Math.round(startMs * PCM_RATE / 1000)) *
-    PCM_BYTES_PER_SAMPLE;
+  let skipFrames = originFrame;
+  let eof = false;
+  const durationMs = inputDuration(input);
   let complete!: () => void;
   const completion = new Promise<void>((resolve) => complete = resolve);
   let closing: Promise<void> | undefined;
@@ -449,26 +504,73 @@ function ownedPcm(
   const iterator = (async function* () {
     try {
       owner?.check();
-      for await (
-        const frame of decoder.frames(input.packets(input.audio()!.index))
-      ) {
-        if (frame === null) continue;
-        try {
-          owner?.check();
-          const plane = frame.data?.[0];
-          if (plane !== undefined && frame.nbSamples > 0) {
-            const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
-            const chunk = new Uint8Array(Math.min(bytes, plane.length));
-            chunk.set(plane.subarray(0, chunk.length));
-            const skip = Math.min(skipBytes, chunk.length);
-            skipBytes -= skip;
-            if (skip < chunk.length) yield chunk.subarray(skip);
+      while (true) {
+        let trimming = !!seek, retry = false, reliable = true;
+        let previousEnd: bigint | undefined;
+        const packets = async function* () {
+          for await (const packet of input.packets(input.audio()!.index)) {
+            // node-av extrapolates missing decoded PTS. Such a value cannot
+            // establish a seek landing position after a discontinuity.
+            if (packet && packet.pts === AV_NOPTS_VALUE) reliable = false;
+            yield packet;
           }
-        } finally {
-          frame.free();
+        };
+        for await (const frame of decoder.frames(packets())) {
+          if (frame === null) continue;
+          try {
+            owner?.check();
+            if (frame.nbSamples <= 0) continue;
+            const frames = BigInt(frame.nbSamples);
+            if (trimming) {
+              const timestamp = pcmTimestamp(frame.pts, frame.timeBase);
+              const at = timestamp === null ? null : timestamp - seek!.origin;
+              if (
+                !reliable || at === null || at > originFrame ||
+                previousEnd !== undefined && at !== previousEnd
+              ) {
+                retry = true;
+                break;
+              }
+              previousEnd = at + frames;
+              skipFrames = originFrame - at;
+            }
+            if (skipFrames >= frames) {
+              skipFrames -= frames;
+              continue;
+            }
+            const bytes = frame.nbSamples * PCM_BYTES_PER_SAMPLE;
+            const plane = frame.data?.[0];
+            if (!plane || plane.length < bytes) {
+              throw new Error('Decoded PCM has incomplete stereo frames');
+            }
+            const chunk = new Uint8Array(
+              bytes - Number(skipFrames) * PCM_BYTES_PER_SAMPLE,
+            );
+            chunk.set(
+              plane.subarray(Number(skipFrames) * PCM_BYTES_PER_SAMPLE, bytes),
+            );
+            skipFrames = 0n;
+            trimming = false;
+            yield chunk;
+          } finally {
+            frame.free();
+          }
         }
+        if (seek && (retry || trimming)) {
+          // Nothing was yielded from an unproven origin. Retire this complete
+          // native attempt before acquiring a fresh decoder from the beginning.
+          const reopened = await seek.restart();
+          input = reopened.input;
+          decoder = reopened.decoder;
+          seek = undefined;
+          skipFrames = originFrame;
+          owner?.check();
+          continue;
+        }
+        break;
       }
       owner?.check();
+      eof = true;
     } catch (error) {
       owner?.check(); // Native EIO/EOF must not hide the original byte failure.
       throw error;
@@ -476,9 +578,13 @@ function ownedPcm(
       await close();
     }
   })();
-  return {
+  const result: InputPcm = {
+    originFrame,
+    get eof() {
+      return eof;
+    },
     completion,
-    durationMs: inputDuration(input),
+    durationMs,
     [Symbol.asyncIterator]() {
       return this;
     },
@@ -492,6 +598,17 @@ function ownedPcm(
       }
     },
   };
+  const retire = () => {
+    void result.return().catch(() => {});
+  };
+  owner?.signal?.addEventListener('abort', retire, { once: true });
+  releases.add(
+    'PCM abort callback',
+    () => owner?.signal?.removeEventListener('abort', retire),
+    -3,
+  );
+  if (owner?.signal?.aborted) retire();
+  return Object.freeze(result);
 }
 
 // Artwork's native boundary. Callers inspect image headers and admit work first.
@@ -1103,6 +1220,7 @@ export function createMedia(
         if (failure) throw failure.error;
       };
       try {
+        const originFrame = pcmOrigin(opts);
         const limits = { ...INPUT_LIMITS };
         for (const name of Object.keys(limits) as (keyof typeof limits)[]) {
           limits[name] = Number(
@@ -1191,25 +1309,17 @@ export function createMedia(
         });
         releases.add('input', () => input.close(), 2);
         check();
-        const decoder = await pcmDecoder(input);
+        const decoder = await pcmDecoder(input, signal);
         releases.add('decoder', () => decoder[Symbol.dispose](), 1);
         check();
         opening = false;
         clearTimeout(timer);
         const stream = ownedPcm(releases, input, decoder, {
+          signal,
           stop: () =>
             abort.abort(new DOMException('PCM input cancelled', 'AbortError')),
           check,
-        }, opts.startMs);
-        // Abort also releases a successfully acquired but unconsumed iterator.
-        const retire = () => {
-          void stream.return().catch(() => {});
-        };
-        signal.addEventListener('abort', retire, { once: true });
-        void stream.completion.then(() =>
-          signal.removeEventListener('abort', retire)
-        );
-        if (signal.aborted) retire();
+        }, originFrame);
         return stream;
       } catch (error) {
         const reason = signal.aborted ? signal.reason : failure?.error ?? error;
@@ -1619,50 +1729,87 @@ export function createMedia(
 
     async decodePcm(path, opts = {}) {
       using _heartbeat = acquireHeartbeat();
-      let input: Demuxer;
-      try {
-        input = await Demuxer.open(path);
-      } catch {
-        return null; // not a media file FFmpeg recognizes
-      }
+      const originFrame = pcmOrigin(opts);
+      const abort = new AbortController();
+      const signal = abort.signal;
+      const onAbort = () => abort.abort(opts.signal!.reason);
       const releases = createReleaseSet();
-      releases.add('input', () => input.close(), 2);
-      let decoder: Decoder;
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
+      releases.add(
+        'source callbacks',
+        () => opts.signal?.removeEventListener('abort', onAbort),
+        -3,
+      );
+      if (opts.signal?.aborted) onAbort();
+      const open = async () => {
+        signal.throwIfAborted();
+        const input = await Demuxer.open(path, { signal });
+        releases.add('input', () => input.close(), 2);
+        signal.throwIfAborted();
+        return input;
+      };
+      const decode = async (input: Demuxer) => {
+        const decoder = await pcmDecoder(input, signal);
+        releases.add('decoder', () => decoder[Symbol.dispose](), 1);
+        signal.throwIfAborted();
+        return decoder;
+      };
       try {
+        const input = await open();
         const audio = input.audio();
         if (audio === undefined) {
           await releaseOrThrow(releases, 'PCM input release failed');
           return null; // no audio track to decode
         }
-        if (opts.startMs !== undefined && opts.startMs > 0) {
-          // OwnTone-style audio seek: the native API expects this stream's
-          // time base, not the convenience seek's global microseconds.
-          // Preserve fractional engine milliseconds at microsecond precision.
-          const microseconds = BigInt(
-            Math.round(opts.startMs * AV_TIME_BASE / 1000),
-          );
-          let targetPts = avRescaleQ(
-            microseconds,
-            AV_TIME_BASE_Q,
+        const timestampOrigin = pcmTimestamp(audio.startTime, audio.timeBase);
+        const seekableOrigin = originFrame > 0n && timestampOrigin !== null &&
+          audio.codecpar.sampleRate === PCM_RATE;
+        if (seekableOrigin) {
+          const targetPts = audio.startTime + avRescaleQ(
+            originFrame,
+            { num: 1, den: PCM_RATE },
             audio.timeBase,
           );
-          const startTime = audio.startTime;
-          if (startTime !== AV_NOPTS_VALUE && startTime > 0n) {
-            targetPts += startTime;
-          }
-          // Backward/keyframe seeking can overlap the requested position.
           const ret = await input.getFormatContext().seekFrame(
             audio.index,
             targetPts,
             AVSEEK_FLAG_BACKWARD,
           );
           FFmpegError.throwIfError(ret, 'PCM seek');
+          signal.throwIfAborted();
         }
         // Allocate only after successful seeking; a failed preflight owns
         // just the input, which the existing failure handler closes.
-        decoder = await pcmDecoder(input);
-        releases.add('decoder', () => decoder[Symbol.dispose](), 1);
-        return ownedPcm(releases, input, decoder);
+        const decoder = await decode(input);
+        return ownedPcm(
+          releases,
+          input,
+          decoder,
+          {
+            signal,
+            stop: () =>
+              abort.abort(
+                new DOMException('PCM input cancelled', 'AbortError'),
+              ),
+            check: () => signal.throwIfAborted(),
+          },
+          originFrame,
+          seekableOrigin
+            ? {
+              origin: timestampOrigin!,
+              async restart() {
+                await releaseOrThrow(
+                  releases,
+                  'PCM seek fallback release failed',
+                  undefined,
+                  ['decoder', 'input'],
+                );
+                const input = await open();
+                return { input, decoder: await decode(input) };
+              },
+            }
+            : undefined,
+        );
       } catch (err) {
         log.event('media_failed', { operation: 'decodePcm', path, error: err });
         const report = await releases.release();
@@ -1672,6 +1819,17 @@ export function createMedia(
             path,
             error,
           });
+        }
+        if (signal.aborted) {
+          if (report.failed.length) {
+            throw new AggregateError([
+              signal.reason,
+              ...report.failed.map(({ name, error }) =>
+                new Error(`Release failed: ${name}`, { cause: error })
+              ),
+            ], 'PCM acquisition rollback failed');
+          }
+          throw signal.reason;
         }
         return null;
       }

@@ -1,5 +1,6 @@
 // Real OwnTone HTTP -> one file decoder -> boot-owned stream -> two consumers.
 import { assert, assertEquals } from '@std/assert';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import { apiFixture } from './helpers/api.ts';
 import { speakerMedia, until } from './helpers/speaker-consumer.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
@@ -129,7 +130,7 @@ for (const removed of [-1, 0, 1]) {
                   await until(() => connected.size === 2);
                   const decoded = await media.decodePcm(path, opts);
                   assert(decoded);
-                  return {
+                  return fixturePcm({
                     async *[Symbol.asyncIterator]() {
                       // Real lossless decode, split at exactly one pacer tick so an
                       // 89-frame native partial exists across the HTTP detach.
@@ -147,7 +148,7 @@ for (const removed of [-1, 0, 1]) {
                         offset += chunk.length;
                       }
                     },
-                  };
+                  }, decoded);
                 },
               },
             });

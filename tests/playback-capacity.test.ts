@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { playerOutputs } from '../src/player-outputs.ts';
 import { createPlayback } from '../src/playback.ts';
@@ -211,13 +212,16 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
           async decodePcm(path, opts) {
             const stream = await media.decodePcm(path, opts);
             if (!stream) return null;
-            return (async function* () {
-              for await (const chunk of stream) yield chunk;
-              if (index === 0) {
-                eofEntered = true;
-                await options.eofGate;
-              }
-            })();
+            return fixturePcm(
+              (async function* () {
+                for await (const chunk of stream) yield chunk;
+                if (index === 0) {
+                  eofEntered = true;
+                  await options.eofGate;
+                }
+              })(),
+              stream,
+            );
           },
         }
         : media,
