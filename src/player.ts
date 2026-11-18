@@ -33,6 +33,10 @@ import type { State } from './state.ts';
 import { SpeakerError } from './speaker-errors.ts';
 import { outputPlayerId } from './player-outputs.ts';
 import { planSourceFailure } from './source-recovery.ts';
+import {
+  planPlaybackSuccessor,
+  type SuccessorPlan,
+} from './playback-successor.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   CONNECTION_STRATEGIES,
@@ -349,6 +353,8 @@ export interface Player {
   advanceEnded(): AdvanceResult;
   /** Exhausted sources bypass repeat-single; failed occurrences cannot wrap. */
   advanceFailed(failed: ReadonlySet<number>): AdvanceResult;
+  /** Apply exactly the prepared occurrence/effects, only in its captured revision. */
+  applySuccessor(plan: SuccessorPlan, entryId?: number | null): AdvanceResult;
   /** Boot-time restore (plan restart-transparency): load the rehydrated
    * queue plus the persisted snapshot in one shot. main.ts decides
    * play-vs-pause per shouldAutoResume. Emits nothing and persists nothing
@@ -682,6 +688,25 @@ export function createPlayer(options: {
     return length > 0 && baseProgressMs + monotonicNow() - startedAt >= length;
   };
 
+  const applySuccessor = (
+    plan: SuccessorPlan,
+    entryId = plan.entryId,
+  ): AdvanceResult => {
+    if (
+      plan.revision !== version || plan.currentEntryId !== currentEntry()?.id ||
+      plan.repeat !== repeat || plan.consume !== consume ||
+      plan.reason === 'natural' && !canAdvanceEnded() ||
+      entryId !== null && !plan.candidates.includes(entryId)
+    ) return 'none';
+    if (plan.removedEntryId !== null) {
+      items = items.filter((item) => item.id !== plan.removedEntryId);
+      version++;
+    }
+    if (entryId === null) doStop();
+    else startAt(items.findIndex((item) => item.id === entryId));
+    return plan.removedEntryId === null ? 'player' : 'player+queue';
+  };
+
   return {
     attachSink() {
       const binding = {};
@@ -982,53 +1007,27 @@ export function createPlayer(options: {
 
     advanceEnded() {
       if (!canAdvanceEnded()) return 'none';
-
-      if (repeat === 'single') {
-        // Replay the same item: reset the clock, keep playing.
-        startAt(currentIndex!);
-        return 'player';
-      }
-      if (repeat === 'all') {
-        // Next, wrapping to the head past the last item.
-        startAt((currentIndex! + 1) % items.length);
-        return 'player';
-      }
-      if (consume) {
-        // Drop the finished item; whatever lands at the index plays.
-        const at = currentIndex!;
-        items = [...items.slice(0, at), ...items.slice(at + 1)];
-        version++;
-        if (at >= items.length) {
-          doStop();
-          return 'player+queue';
-        }
-        startAt(at);
-        return 'player+queue';
-      }
-      // repeat off: next; past the last item stops (next() semantics).
-      if (currentIndex! + 1 >= items.length) {
-        doStop();
-        return 'player';
-      }
-      startAt(currentIndex! + 1);
-      return 'player';
+      return applySuccessor(planPlaybackSuccessor({
+        reason: 'natural',
+        revision: version,
+        items,
+        currentEntryId: currentEntry()?.id,
+        repeat,
+        consume,
+      }));
     },
 
     advanceFailed(failed) {
-      const plan = planSourceFailure(
+      return applySuccessor(planSourceFailure(
         items,
         currentEntry()?.id,
         failed,
         repeat,
         consume,
-      );
-      const changed = plan.items.length !== items.length;
-      items = plan.items;
-      if (changed) version++;
-      if (plan.index === null) doStop();
-      else startAt(plan.index);
-      return changed ? 'player+queue' : 'player';
+        version,
+      ));
     },
+    applySuccessor,
 
     restore(snapshot) {
       discontinuity();

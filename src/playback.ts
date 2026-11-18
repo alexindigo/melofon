@@ -43,6 +43,10 @@ import type {
 } from './playback-capacity.ts';
 import { planSourceFailure } from './source-recovery.ts';
 import {
+  planPlaybackSuccessor,
+  type SuccessorPlan,
+} from './playback-successor.ts';
+import {
   createPlaybackTimeline,
   type TimelineCompletion,
   type TimelineCutoff,
@@ -59,6 +63,7 @@ import {
   type SourceMetadata,
 } from './queue-source.ts';
 import type {
+  AdvanceResult,
   CommandSource,
   LastCommand,
   Outputs,
@@ -96,22 +101,30 @@ interface ActivationPlan {
   entry: PlannedOccurrence | undefined;
   items: PlannedOccurrence[];
   direction?: number;
-  wrap?: boolean;
-  excluded?: ReadonlySet<number>;
+  successor?: SuccessorPlan;
 }
-const existingOccurrences = (entries: QueueEntry[]): PlannedOccurrence[] =>
+const existingOccurrences = (
+  entries: readonly QueueEntry[],
+): PlannedOccurrence[] =>
   entries.map(({ id, ...media }) => ({ kind: 'existing', entryId: id, media }));
 const newOccurrences = (media: QueueMedia[]): PlannedOccurrence[] =>
   media.map((item, offset) => ({ kind: 'new', offset, media: item }));
 const existingActivation = (
-  entries: QueueEntry[],
+  entries: readonly QueueEntry[],
   index: number,
-  options: Pick<ActivationPlan, 'direction' | 'wrap' | 'excluded'> = {},
+  options: Pick<ActivationPlan, 'direction'> = {},
 ): ActivationPlan => {
   const items = existingOccurrences(entries);
   return { entry: items[index], items, ...options };
 };
-type Activate = (added?: QueueEntry[]) => void;
+const successorActivation = (plan: SuccessorPlan): ActivationPlan => ({
+  ...existingActivation(
+    plan.items,
+    plan.items.findIndex((item) => item.id === plan.entryId),
+  ),
+  successor: plan,
+});
+type Activate = (added?: QueueEntry[]) => AdvanceResult | void;
 type PrepareNew = (media: QueueMedia[]) => QueueMedia[];
 
 export interface QueueAddOptions {
@@ -549,7 +562,14 @@ export function createPlayback(deps: {
         try {
           return commitStart(
             reservation,
-            () => commit(() => {}, (media) => media),
+            () =>
+              commit(
+                () =>
+                  activation?.successor
+                    ? player.applySuccessor(activation.successor)
+                    : undefined,
+                (media) => media,
+              ),
           );
         } finally {
           reservation?.release();
@@ -572,16 +592,22 @@ export function createPlayback(deps: {
         if (needsResolution) {
           selected = null;
           let index = items.indexOf(candidate);
-          for (let visited = 0; visited < items.length; visited++) {
-            if (index < 0 || index >= items.length) break;
-            const item = items[index];
-            let media =
-              item.kind === 'existing' && activation.excluded?.has(item.entryId)
-                ? null
-                : item.media.reference.kind === 'station' &&
-                    deps.resolveQueueReference
-                ? await deps.resolveQueueReference!(item.media.reference)
-                : item.media;
+          const candidates = activation.successor?.candidates.map((id) =>
+            items.find((item) =>
+              item.kind === 'existing' && item.entryId === id
+            )!
+          );
+          for (
+            let visited = 0;
+            visited < (candidates?.length ?? items.length);
+            visited++
+          ) {
+            if (!candidates && (index < 0 || index >= items.length)) break;
+            const item = candidates ? candidates[visited] : items[index];
+            let media = item.media.reference.kind === 'station' &&
+                deps.resolveQueueReference
+              ? await deps.resolveQueueReference!(item.media.reference)
+              : item.media;
             if (media && needsPreparation(media)) {
               media = await deps.prepareQueueMedia!(media, controller.signal);
             }
@@ -591,7 +617,6 @@ export function createPlayback(deps: {
               break;
             }
             index += activation.direction ?? 1;
-            if (activation.wrap) index = (index + items.length) % items.length;
           }
         }
         if (starts && selected !== null) {
@@ -620,6 +645,21 @@ export function createPlayback(deps: {
         }
         const result = commitStart(reservation, () =>
           commit((added) => {
+            if (activation?.successor) {
+              const entryId = selected === null
+                ? null
+                : selected?.occurrence.kind === 'existing'
+                ? selected.occurrence.entryId
+                : activation.successor.entryId;
+              const result = player.applySuccessor(
+                activation.successor,
+                entryId,
+              );
+              if (result !== 'none' && selected && entryId !== null) {
+                player.replaceOccurrence(entryId, selected.media);
+              }
+              return result;
+            }
             if (selected === undefined) return;
             if (selected === null) {
               player.stop();
@@ -1084,47 +1124,56 @@ export function createPlayback(deps: {
       failedSource = null;
       return Promise.resolve();
     }
-    const view = player.status();
-    const plan = planSourceFailure(
-      player.queue().items,
-      view.current?.id,
-      failedSources,
-      view.repeat,
-      view.consume,
-    );
-    const commit = (activate: () => void) => {
-      if (
-        !ownsSource(source) || player.status().generation !== view.generation
-      ) return;
-      failedSource = null;
-      const result = player.advanceFailed(failedSources);
-      activate();
-      record('sourceSkip', undefined, {
-        kind: 'internal',
-        via: 'source-outcome',
-      }, player.status().state);
-      if (result === 'player+queue') flushQueue();
-      else flushState();
-      emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
-    };
     const work = { source, promise: Promise.resolve() };
     failureWork = work;
     work.promise = operations.run(async () => {
       try {
-        await transition(
-          plan.index !== null,
-          commit,
-          {
-            signal: source.signal,
-            isCurrent: () => ownsSource(source),
-          },
-          plan.index === null
-            ? undefined
-            : existingActivation(plan.items, plan.index, {
-              wrap: view.repeat === 'all',
-              excluded: failedSources,
-            }),
-        );
+        const command = submitCommand();
+        const advance = async (): Promise<void> => {
+          const view = player.status();
+          const queue = player.queue();
+          const plan = planSourceFailure(
+            queue.items,
+            view.current?.id,
+            failedSources,
+            view.repeat,
+            view.consume,
+            queue.version,
+          );
+          let replan = false;
+          await transition(
+            plan.entryId !== null,
+            (activate) => {
+              if (
+                !ownsSource(source) ||
+                player.status().generation !== view.generation
+              ) return;
+              if (player.queue().version !== plan.revision) {
+                replan = true;
+                return;
+              }
+              const result = activate();
+              if (!result || result === 'none') return;
+              failedSource = null;
+              record('sourceSkip', undefined, {
+                kind: 'internal',
+                via: 'source-outcome',
+              }, player.status().state);
+              if (result === 'player+queue') flushQueue();
+              else flushState();
+              emit(
+                result === 'player+queue' ? ['queue', 'player'] : ['player'],
+              );
+            },
+            { signal: source.signal, isCurrent: () => ownsSource(source) },
+            successorActivation(plan),
+            command,
+          );
+          if (replan && command.isCurrent() && ownsSource(source)) {
+            await advance();
+          }
+        };
+        await advance();
       } catch (error) {
         if (
           error instanceof PlaybackError && error.code === 'playback_cancelled'
@@ -1886,20 +1935,16 @@ export function createPlayback(deps: {
         const advance = (): void | Promise<void> => {
           const view = player.status();
           const queue = player.queue();
-          const items = queue.items;
-          const current = items.findIndex((e) => e.id === view.current?.id);
-          const index = view.repeat === 'single'
-            ? current
-            : view.repeat === 'all'
-            ? (current + 1) % items.length
-            : view.consume
-            ? current
-            : current + 1;
-          const future = view.consume && view.repeat === 'off'
-            ? items.filter((_, i) => i !== current)
-            : items;
+          const plan = planPlaybackSuccessor({
+            reason: 'natural',
+            revision: queue.version,
+            items: queue.items,
+            currentEntryId: view.current?.id,
+            repeat: view.repeat,
+            consume: view.consume,
+          });
           let replan = false;
-          const commit = (activate: () => void) => {
+          const commit = (activate: Activate) => {
             if (player.status().generation !== view.generation) return;
             // FIFO additions can create a destination while targets are preparing.
             // Never let the engine advance to an occurrence absent from this plan.
@@ -1907,10 +1952,9 @@ export function createPlayback(deps: {
               replan = true;
               return;
             }
-            const result = player.advanceEnded();
-            if (result === 'none') return;
+            const result = activate();
+            if (!result || result === 'none') return;
             failedSources.clear();
-            activate();
             if (result === 'player+queue') flushQueue();
             else flushState();
             emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
@@ -1920,9 +1964,7 @@ export function createPlayback(deps: {
               true,
               commit,
               undefined,
-              existingActivation(future, index, {
-                wrap: view.repeat !== 'off',
-              }),
+              successorActivation(plan),
               command,
             ),
           ).then(() => {

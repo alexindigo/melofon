@@ -47,6 +47,7 @@ export async function nativeHttpFixture(options: {
   cutoffCapture?: Promise<void>;
   seekAdmitted?: (positionMs: number) => void;
   sourcePath?: string;
+  sourceOpened?: (source: PlaybackSource) => void;
   append?: (
     request: Parameters<AirplayTimelineStream['appendSource']>[0],
     append: AirplayTimelineStream['appendSource'],
@@ -240,6 +241,7 @@ export async function nativeHttpFixture(options: {
         },
         openSource(...args) {
           token = engine.openSource(...args) ?? undefined;
+          if (token) options.sourceOpened?.(token);
           return token ?? null;
         },
       };
