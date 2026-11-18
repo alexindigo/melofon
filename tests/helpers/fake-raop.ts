@@ -118,7 +118,7 @@ export interface FakeRaop {
   port: number;
   sessions: FakeRaopSession[];
   close(): void;
-  requestRetransmit(id: string, sequence?: number): void;
+  requestRetransmit(id: string, sequence?: number, target?: RaopEndpoint): void;
   requestTiming(id: string): void;
   /** Same clock as wire.atMs, for scheduled snapshots. */
   nowMs(): number;
@@ -148,7 +148,10 @@ export function startFakeRaop(
   const sessions: FakeRaopSession[] = [];
   const sockets: { close(): void }[] = [];
   const conns: Deno.TcpConn[] = [];
-  const retransmits = new Map<string, (sequence?: number) => void>();
+  const retransmits = new Map<
+    string,
+    (sequence?: number, target?: RaopEndpoint) => void
+  >();
   const timingRequests = new Map<string, () => void>();
   const bindAddress = '127.0.0.1';
   const started = performance.now();
@@ -461,12 +464,16 @@ export function startFakeRaop(
             }
             timing.send(request, timingPort, session.rtspPeer.address);
           });
-          retransmits.set(session.id, (requested) => {
+          retransmits.set(session.id, (requested, target) => {
             const sequence = requested ?? session.rtpSequences.at(-1);
             if (!controlPort || sequence === undefined) return;
             const request = new Uint8Array([0x80, 0xd5, 0, 1, 0, 0, 0, 1]);
             new DataView(request.buffer).setUint16(4, sequence);
-            control.send(request, controlPort, session.rtspPeer.address);
+            control.send(
+              request,
+              target?.port ?? controlPort,
+              target?.address ?? session.rtspPeer.address,
+            );
           });
           extra =
             `Session: ${session.id}\r\nTransport: RTP/AVP/UDP;unicast;mode=record;server_port=${audioPort};control_port=${control.address().port};timing_port=${timing.address().port}\r\n`;
@@ -517,8 +524,8 @@ export function startFakeRaop(
   return Promise.resolve({
     port,
     sessions,
-    requestRetransmit(id, sequence) {
-      retransmits.get(id)?.(sequence);
+    requestRetransmit(id, sequence, target) {
+      retransmits.get(id)?.(sequence, target);
     },
     requestTiming(id) {
       timingRequests.get(id)?.();

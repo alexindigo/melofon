@@ -283,6 +283,7 @@ struct raop_metadata
 
 struct raop_service
 {
+  uint64_t stream_id; /* control ownership; stateless timing uses zero */
   struct net_socket socket;
   unsigned short port;
   struct event *ev4;
@@ -360,6 +361,7 @@ struct raop_stream_context
   gcry_cipher_hd_t aes_ctx;
   char *aes_key_b64, *aes_iv_b64;
   struct output_metadata *metadata;
+  struct raop_service control;
   struct raop_stream_context *next;
 };
 static struct raop_stream_context *raop_stream_contexts;
@@ -367,9 +369,6 @@ static struct raop_stream_context *stream_context_get(uint64_t id);
 
 /* AirTunes v2 time synchronization */
 static struct raop_service raop_timing_svc;
-
-/* AirTunes v2 playback synchronization / control */
-static struct raop_service raop_control_svc;
 
 /* Keep-alive timer - hack for ATV's with tvOS 10 */
 static struct event *keep_alive_timer;
@@ -2451,32 +2450,28 @@ session_connection_setup(struct raop_session *rs, struct output_device *rd, int 
 }
 
 static struct raop_session *
-session_find_by_address(union net_sockaddr *peer_addr)
+session_find_by_control_endpoint(struct raop_service *svc,
+                                union net_sockaddr *peer_addr, socklen_t length)
 {
-  struct raop_session *rs;
-  uint32_t *addr_ptr;
-  int family = peer_addr->sa.sa_family;
-
-  for (rs = raop_sessions; rs; rs = rs->next)
-    {
-      if (family == rs->family)
-	{
-	  if (family == AF_INET && peer_addr->sin.sin_addr.s_addr == rs->naddr.sin.sin_addr.s_addr)
-	    break;
-
-	  if (family == AF_INET6 && IN6_ARE_ADDR_EQUAL(&peer_addr->sin6.sin6_addr, &rs->naddr.sin6.sin6_addr))
-	    break;
-	}
-      else if (family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&peer_addr->sin6.sin6_addr))
-	{
-	  // ipv4 mapped to ipv6 consists of 16 bytes/4 words: 0x00000000 0x00000000 0x0000ffff 0x[IPv4]
-	  addr_ptr = (uint32_t *)(&peer_addr->sin6.sin6_addr);
-	  if (addr_ptr[3] == rs->naddr.sin.sin_addr.s_addr)
-	    break;
-	}
-    }
-
-  return rs;
+  struct raop_source peer;
+  struct raop_session *found = NULL;
+  if (source_normalize(&peer, peer_addr, length) < 0) return NULL;
+  unsigned short port = ntohs(peer_addr->sa.sa_family == AF_INET ?
+    peer_addr->sin.sin_port : peer_addr->sin6.sin6_port);
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != svc->stream_id || rs->control_svc != svc ||
+        rs->retiring || rs->failure_pending || rs->cancel_pending ||
+        (rs->state != RAOP_STATE_CONNECTED && rs->state != RAOP_STATE_STREAMING) || !rs->control_port ||
+        rs->control_port != port) continue;
+    struct raop_source receiver;
+    socklen_t n = rs->naddr.sa.sa_family == AF_INET ? sizeof(rs->naddr.sin) : sizeof(rs->naddr.sin6);
+    if (source_normalize(&receiver, &rs->naddr, n) < 0 ||
+        !source_equal(&peer, &receiver)) continue;
+    /* An ambiguous negotiated endpoint cannot choose an arbitrary cache. */
+    if (found) return NULL;
+    found = rs;
+  }
+  return found;
 }
 
 static struct raop_session *
@@ -2548,7 +2543,7 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
     }
 
   rs->timing_svc = &raop_timing_svc;
-  rs->control_svc = &raop_control_svc;
+  rs->control_svc = &context->control;
 
   ret = session_connection_setup(rs, rd, AF_INET6);
   if (ret < 0)
@@ -3794,6 +3789,7 @@ timing_svc_cb(int fd, short what, void *arg)
 static void
 control_svc_cb(int fd, short what, void *arg)
 {
+  struct raop_service *svc = arg;
   union net_sockaddr peer_addr = { 0 };
   socklen_t peer_addrlen = sizeof(peer_addr);
   char address[INET6_ADDRSTRLEN];
@@ -3822,7 +3818,7 @@ control_svc_cb(int fd, short what, void *arg)
       return;
     }
 
-  rs = session_find_by_address(&peer_addr);
+  rs = session_find_by_control_endpoint(svc, &peer_addr, peer_addrlen);
   if (!rs)
     {
       net_address_get(address, sizeof(address), &peer_addr);
@@ -5242,6 +5238,7 @@ raop_write(struct output_buffer *obuf)
 static void
 stream_context_clear(struct raop_stream_context *s)
 {
+  service_stop(&s->control);
   if (s->aes_ctx) gcry_cipher_close(s->aes_ctx);
   free(s->aes_key_b64);
   free(s->aes_iv_b64);
@@ -5271,6 +5268,7 @@ stream_context_get(uint64_t id)
   s = calloc(1, sizeof(*s));
   if (!s) return NULL;
   s->id = id;
+  s->control.socket.fd4 = s->control.socket.fd6 = -1;
   char ebuf[64];
   char *ptr;
   gpg_error_t gc_err;
@@ -5325,6 +5323,9 @@ stream_context_get(uint64_t id)
   if (ptr)
     *ptr = '\0';
 
+  if (service_start(&s->control, control_svc_cb, 0, "RAOP stream control") < 0)
+    goto error;
+  s->control.stream_id = id;
   s->next = raop_stream_contexts;
   raop_stream_contexts = s;
   return s;
@@ -5347,14 +5348,6 @@ raop_init(void)
       goto out_free_timer;
     }
 
-  ret = service_start(&raop_control_svc, control_svc_cb, 0, "RAOP control");
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "AirPlay playback control failed to start\n");
-
-      goto out_stop_timing;
-    }
-
   raop_uncompressed_alac = cfg_getbool(cfg_getsec(cfg, "airplay_shared"), "uncompressed_alac");
 
   ret = mdns_browse("_raop._tcp", raop_device_cb, MDNS_CONNECTION_TEST);
@@ -5362,13 +5355,11 @@ raop_init(void)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not add mDNS browser for AirPlay devices\n");
 
-      goto out_stop_control;
+      goto out_stop_timing;
     }
 
   return 0;
 
- out_stop_control:
-  service_stop(&raop_control_svc);
  out_stop_timing:
   service_stop(&raop_timing_svc);
  out_free_timer:
@@ -5382,7 +5373,6 @@ raop_deinit(void)
 {
   struct raop_session *rs;
 
-  service_stop(&raop_control_svc);
   service_stop(&raop_timing_svc);
 
   event_free(keep_alive_timer);

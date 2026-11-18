@@ -123,8 +123,8 @@ attachment is still owned, including during terminal release. The typed port
 joins its C1 producers, attempts all C3 attachment releases, then frees the
 stream on the loop. Failed native release retains storage and the guard.
 
-This is not concurrent-stream qualification: control-service isolation and
-removal of the native guard remain separate work.
+This is not concurrent-stream qualification: removal of the native guard
+remains separate work.
 `tests/raop-stream.test.ts` exercises the shipping public FFI through real UDP,
 ALAC decoding and the independent scheduled receiver model, including both
 attachment-removal orders and compatibility/explicit guard competition.
@@ -152,6 +152,21 @@ actual receiver ciphertext for exact ALAC/scheduled assertions. It never
 exports or logs keys and is not linked into the shipping library. Encrypted
 and unencrypted masters remain distinct within one stream. These sequential
 context proofs do not qualify concurrent streams or physical hardware.
+
+## Stream control endpoints
+
+Each backend context owns a dynamically bound control/sync service, advertised
+by that stream's SETUP and retained until stream free. Timing replies remain
+stateless on the shared timing service. Retransmit lookup matches the receiving
+service, stream incarnation, normalized receiver address (including IPv4-mapped
+IPv6 and link-local scope) and negotiated control source port. Unknown, retiring
+or ambiguous endpoints cannot select a session/cache. IP-only lookup is removed.
+
+The existing ordered-cancel fence and `rtp_session_flush` revoke old cache
+authority before replacement input; receiver ACK/destruction still gates the
+new epoch. Same-IP public-FFI tests force overlapping sequence numbers and wrap,
+check exact retransmitted packet identity at each destination, reject spoofed
+and old endpoints, and independently render the retained/replacement schedules.
 
 ## Exact stream admission
 

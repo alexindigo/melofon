@@ -91,6 +91,19 @@ export function nativeStream() {
         bytes.length,
       );
     },
+    async cancel() {
+      const epoch = lib.raop_stream_epoch(pointer);
+      assertEquals(lib.raop_stream_cancel(pointer, epoch), 0);
+      const receipt = new BigUint64Array(6);
+      await until(
+        'ordered stream reset',
+        () =>
+          lib.raop_stream_cancel_poll(pointer, epoch, receipt) === 1 &&
+          receipt[2] !== 0n,
+      );
+      assertEquals(receipt[2], 1n);
+      assertEquals(lib.raop_stream_cancel_ack(pointer, epoch), 0);
+    },
     async close() {
       if (closed) return;
       for (const h of handles.splice(0)) {
@@ -128,11 +141,12 @@ export async function rendered(
   receiver: Receiver,
   expected: Uint8Array,
   transform: (session: FakeRaopSession) => FakeRaopSession = (s) => s,
+  expectedFlushes = 0,
 ) {
   await until(
     'complete wire PCM and timing',
     () =>
-      receiver.sessions[0].audioPackets === expected.length / (352 * 4) &&
+      receiver.sessions[0].audioPackets >= expected.length / (352 * 4) &&
       receiver.sessions[0].wire.some((e) => e.kind === 'timing-reply'),
   );
   const session = transform(receiver.sessions[0]);
@@ -158,7 +172,7 @@ export async function rendered(
   assertEquals(actual.pendingFrames, 0);
   assertEquals(actual.discarded, []);
   assertEquals([session.flushes, session.teardowns, receiver.sessions.length], [
-    0,
+    expectedFlushes,
     0,
     1,
   ]);

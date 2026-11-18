@@ -630,10 +630,12 @@ def terminal_fault_scenarios(modes=None):
                     for line in observations:
                         if line.startswith('SNAPSHOT '): return ast.literal_eval(line[9:])
                 before = snapshot()
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                    for _ in range(12):
-                        sock.sendto(struct.pack('>BBHHH', 0x80, 0xd5, 1, seq, 1), ('127.0.0.1', control))
-                        time.sleep(0.001)
+                # Use the retired receiver's negotiated control endpoint, not
+                # an unknown ephemeral source rejected by endpoint validation.
+                for _ in range(12):
+                    fake.stdin.write(f'RETRANSMIT 2 {control} {seq}\n')
+                    fake.stdin.flush()
+                    time.sleep(0.001)
                 time.sleep(0.03)
                 after = snapshot()
                 child.stdin.write('finish\n'); child.stdin.flush()

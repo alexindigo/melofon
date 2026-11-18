@@ -122,7 +122,7 @@ class UDPCollector(threading.Thread):
 
 
 audio_sock, audio_port = udp_socket()
-control_sock, control_port = udp_socket()
+control_sockets = {}
 _, timing_port = udp_socket()
 UDPCollector(audio_sock).start()
 
@@ -153,13 +153,12 @@ class ControlCollector(threading.Thread):
                     }
 
 
-ControlCollector(control_sock).start()
-
-
 class RTSPHandler(socketserver.BaseRequestHandler):
     timing_port = None
 
     def setup(self):
+        self.control_sock, self.control_port = udp_socket()
+        ControlCollector(self.control_sock).start()
         self.chunks = queue.Queue()
         self.nonce = secrets.token_hex(16)
         self.connection = {'generation': len(state['connections']) + 1,
@@ -237,6 +236,7 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     state['active_remotes'].add(headers['active-remote'])
                 cseq = headers.get('cseq', '0')
                 if method == 'SETUP':
+                    control_sockets[headers.get('active-remote', '0')] = self.control_sock
                     safe_headers = {k: v for k, v in headers.items() if k != 'authorization'}
                     print(f'SETUP headers: {safe_headers!r}', file=sys.stderr, flush=True)
                     print(f'CONTROL {headers.get("active-remote", "0")} {headers["transport"].split("control_port=")[1].split(";")[0]}', flush=True)
@@ -278,7 +278,7 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     extra = (f'Session: DEADBEEF\r\n'
                              f'Transport: RTP/AVP/UDP;unicast;mode=record;'
                              f'server_port={audio_port};'
-                             f'control_port={control_port};'
+                              f'control_port={self.control_port};'
                              f'timing_port={timing_port}\r\n')
                 if method == 'RECORD':
                     extra = 'Audio-Latency: 11025\r\n'
@@ -330,6 +330,10 @@ while True:
         if line == '': break
         if line.strip() == 'SNAPSHOT':
             print('SNAPSHOT ' + repr(state['audio_by_source']), flush=True)
+        elif line.startswith('RETRANSMIT '):
+            _, device, port, sequence = line.split()
+            control_sockets[device].sendto(struct.pack('>BBHHH', 0x80, 0xd5, 1,
+                int(sequence), 1), ('127.0.0.1', int(port)))
 
 report = dict(state)
 report['seqs'] = state['seqs']
