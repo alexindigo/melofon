@@ -3399,7 +3399,6 @@ packets_send(struct raop_master_session *rms)
   struct raop_session *rs;
   int len;
   int ret;
-  bool submitted_any = false;
   bool overdue = false;
 
   len = alac_encode(rms->encoded_buffer, rms->encode_ctx, rms->rawbuf, rms->rawbuf_size, rms->samples_per_packet, &rms->quality);
@@ -3496,14 +3495,16 @@ packets_send(struct raop_master_session *rms)
         continue;
       }
       rs->submitted_frames += rms->samples_per_packet;
-      submitted_any = true;
     }
 
   // Commits packet to retransmit buffer, and prepares the session for the next packet
   rtp_packet_commit(rms->rtp_session, pkt);
   rms->epoch_frames += rms->samples_per_packet;
 
-  return submitted_any && !overdue ? 0 : -1;
+  /* packet_send owns attachment-local failure and retirement. Even if this
+   * master lost every recipient, raop_write must feed the other masters from
+   * the same input. Only shared failures abort the write. */
+  return overdue ? -1 : 0;
 }
 
 // Overview of rtptimes as they should be when starting a stream, and assuming

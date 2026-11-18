@@ -319,6 +319,9 @@ failures settle that attachment and leave viable peers pacing; loss of every
 viable attachment also freezes shared diagnostics. Packet fanout validates its
 cohort before sending and commits the shared RTP position exactly once after
 sending, even when a later receiver fails, preserving successful peer coverage.
+An attachment-local send failure, including loss of a master's only receiver,
+does not abort feeding other masters of the stream. Mixed encrypted/plain
+master regressions verify exact healthy PCM with both input APIs.
 Failed snapshots remain frozen until ordered cancel/reset. Pacer catch-up checks
 each packet's established presentation deadline before emission, and again after
 send; missing the available lead fails the epoch rather than emitting a stale

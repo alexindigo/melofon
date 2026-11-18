@@ -137,10 +137,20 @@ export function renderScheduledAudio(
   };
   const advance = (atMs: number) => {
     for (const packet of queued.sort((a, b) => a.timestamp - b.timestamp)) {
+      const frames = packet.pcm.length / 4;
+      // Emitted RTP coordinates cannot become audible again when a refreshed
+      // mapping moves their presentation into the future. Preserve continuation
+      // exactly at the frontier, including partially rendered packets.
+      if (presentationEnd !== null) {
+        discard(
+          packet,
+          Math.min(frames, presentationFrame - packet.timestamp) - packet.used,
+          'late',
+        );
+      }
+      if (packet.used >= frames) continue;
       const mapped = startMs(packet);
       if (mapped === null) continue;
-      const frames = packet.pcm.length / 4;
-      if (packet.used >= frames) continue;
       // A refresh can refine future scheduling, never rewrite time already
       // rendered. Carry one frontier across packets and fractional advances.
       const start = presentationEnd === null ? mapped : Math.max(
