@@ -18,8 +18,8 @@
  *
  * The additive explicit-stream API instead owns one player per stream and
  * immutable device attachments. Compatibility handles retain their old pacers
- * during the boot migration. Both routes reserve the same active-stream guard;
- * dormant streams keep the runtime alive without activating native sessions.
+ * during the boot migration. Explicit streams are independent; compatibility
+ * handles share group 1. Dormant streams retain their own runtime reference.
  *
  * Exported API (see also helper/raop/ffi.h):
  *   raop_t *raop_new(void);
@@ -164,7 +164,6 @@ struct raop_handle
   struct raop_stream *stream;       /* immutable; NULL = compatibility handle */
   bool ready;                       /* loop-owned attachment readiness */
   bool quiescing;                   /* local release fences late callbacks */
-  bool legacy_claim;                /* rt.lock; retained until proven free */
   uint64_t session_revision;        /* loop-owned, never reuses retired session */
   uint64_t failure_epoch, session_error; /* rt.lock; attachment-local failure */
   bool probe_only;
@@ -239,7 +238,6 @@ struct raop_stream
   unsigned readers;                 /* rt.lock; loop-dispatched progress reads */
   bool closing;                     /* rt.lock; admission fence */
   bool input_closed;                /* rt.lock; typed close precedes join/free */
-  bool active;                      /* rt.lock; guard retained until free */
   bool item_set;                    /* loop-owned first attachment item */
   bool resetting;                   /* rt.lock; local reset admission fence */
   bool canceling;                   /* rt.lock; ordered receiver reset */
@@ -267,8 +265,6 @@ static struct
   pthread_cond_t idle;
   uint64_t next_device_id;
   uint64_t next_stream_id;
-  uint64_t active_stream_id;        /* 0 = none, 1 = compatibility group */
-  unsigned legacy_claims;
   raop_t *handles_list;        /* all handles (loop thread iterates) */
   struct raop_stream *streams;
 } rt = {
@@ -278,20 +274,12 @@ static struct
   .next_stream_id = 2,
 };
 
-/* All admission routes, including compatibility read-ahead, share this guard.
- * Retain it through failed close and all queued/retiring native resources. */
+/* Runtime ownership is reference-counted, not an active-stream singleton.
+ * Admission checks only the addressed stream's permanent lifecycle fences. */
 static int
-stream_claim_locked(struct raop_stream *stream, raop_t *legacy)
+stream_admit_locked(struct raop_stream *stream)
 {
-  uint64_t id = stream ? stream->id : 1;
   if (stream && (stream->closing || stream->input_closed)) return -1;
-  if (rt.active_stream_id && rt.active_stream_id != id) return -2;
-  rt.active_stream_id = id;
-  if (stream) stream->active = true;
-  else if (!legacy->legacy_claim) {
-    legacy->legacy_claim = true;
-    rt.legacy_claims++;
-  }
   return 0;
 }
 
@@ -747,8 +735,6 @@ cmds_drain_cb(evutil_socket_t fd, short what, void *arg)
             for (link = &rt.handles_list; *link; link = &(*link)->next)
               if (*link == h) { *link = h->next; break; }
             if (h->stream) h->stream->attachments--;
-            if (h->legacy_claim && --rt.legacy_claims == 0)
-              rt.active_stream_id = 0;
             pthread_mutex_unlock(&rt.lock);
             if (!h->stream) raop_player_free(h->player);
             event_free(h->resume_event);
@@ -1136,7 +1122,7 @@ raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len)
   if (!stream || !pcm || len % 4) return -1;
   if (!len) return 0;
   pthread_mutex_lock(&rt.lock);
-  int result = stream_claim_locked(stream, NULL);
+  int result = stream_admit_locked(stream);
   if (result == 0) result = stream->resetting ? 0 : raop_player_write(stream->player, pcm, len);
   pthread_mutex_unlock(&rt.lock);
   return result;
@@ -1176,18 +1162,14 @@ raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
     result->status = RAOP_APPEND_ACCEPTED;
     result->error = RAOP_APPEND_ERROR_NONE;
   } else {
-    int claim = stream_claim_locked(stream, NULL);
-    if (claim < 0) result->error = RAOP_APPEND_ERROR_BUSY;
+    int accepted = raop_player_append(stream->player, pcm, len);
+    if (accepted < 0) result->error = accepted == -2
+      ? RAOP_APPEND_ERROR_INVALID : RAOP_APPEND_ERROR_ALLOCATION;
     else {
-      int accepted = raop_player_append(stream->player, pcm, len);
-      if (accepted < 0) result->error = accepted == -2
-        ? RAOP_APPEND_ERROR_INVALID : RAOP_APPEND_ERROR_ALLOCATION;
-      else {
-        result->accepted_frames = (uint64_t)accepted / 4;
-        result->status = (size_t)accepted == len
-          ? RAOP_APPEND_ACCEPTED : RAOP_APPEND_BACKPRESSURE;
-        result->error = RAOP_APPEND_ERROR_NONE;
-      }
+      result->accepted_frames = (uint64_t)accepted / 4;
+      result->status = (size_t)accepted == len
+        ? RAOP_APPEND_ACCEPTED : RAOP_APPEND_BACKPRESSURE;
+      result->error = RAOP_APPEND_ERROR_NONE;
     }
   }
   pthread_mutex_unlock(&rt.lock);
@@ -1376,20 +1358,15 @@ raop_stream_append_source(raop_stream_t *stream, uint64_t epoch, uint64_t source
   if (!stream || !epoch || !source || !segment || (!pcm && len) || len % 4) return 0;
   pthread_mutex_lock(&rt.lock);
   if (timeline_admit_locked(stream, epoch, &result->status, &result->error)) {
-    if (rt.active_stream_id && rt.active_stream_id != stream->id)
-      result->error = RAOP_APPEND_ERROR_BUSY;
-    else {
-      struct raop_source_snapshot existing;
-      bool found = raop_player_source(stream->player, source, &existing);
-      if (!found && stream->completion_count == COMPLETION_CAP) {
-        result->status = RAOP_APPEND_BACKPRESSURE; result->error = RAOP_APPEND_ERROR_NONE;
-      } else {
-        raop_player_append_source(stream->player, source, segment, pcm, len, result);
-        if (!found && result->status == RAOP_APPEND_ACCEPTED)
-          stream->marker_reserved = true;
-        if (!found && result->accepted_frames) stream->marker_reserved = true;
-      }
-      if (result->accepted_frames) stream_claim_locked(stream, NULL);
+    struct raop_source_snapshot existing;
+    bool found = raop_player_source(stream->player, source, &existing);
+    if (!found && stream->completion_count == COMPLETION_CAP) {
+      result->status = RAOP_APPEND_BACKPRESSURE; result->error = RAOP_APPEND_ERROR_NONE;
+    } else {
+      raop_player_append_source(stream->player, source, segment, pcm, len, result);
+      if (!found && result->status == RAOP_APPEND_ACCEPTED)
+        stream->marker_reserved = true;
+      if (!found && result->accepted_frames) stream->marker_reserved = true;
     }
   }
   pthread_mutex_unlock(&rt.lock);
@@ -1981,7 +1958,6 @@ stream_free_cb(evutil_socket_t fd, short what, void *arg)
     stream->completions = c->next;
     free(c->attachment); free(c);
   }
-  if (stream->active) rt.active_stream_id = 0;
   pthread_mutex_unlock(&rt.lock);
   free(stream);
   pthread_mutex_lock(&work->sync->lock);
@@ -2087,7 +2063,7 @@ raop_open(raop_t *h, const char *host, int port, const char *name, int volume,
     snprintf(c->artist, sizeof(c->artist), "%s", artist);
 
   pthread_mutex_lock(&rt.lock);
-  int claimed = stream_claim_locked(h->stream, h);
+  int claimed = stream_admit_locked(h->stream);
   if (h->stream) c->epoch = h->stream->epoch;
   pthread_mutex_unlock(&rt.lock);
   if (claimed < 0) { cmd_free(c); return claimed; }
@@ -2126,8 +2102,7 @@ raop_write(raop_t *h, const uint8_t *pcm, size_t len)
   if (!h || !pcm || h->stream)
     return -1;
   pthread_mutex_lock(&rt.lock);
-  int result = stream_claim_locked(NULL, h);
-  if (result == 0) result = raop_player_write(h->player, pcm, len);
+  int result = raop_player_write(h->player, pcm, len);
   pthread_mutex_unlock(&rt.lock);
   return result;
 }

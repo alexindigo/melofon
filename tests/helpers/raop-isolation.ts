@@ -27,6 +27,59 @@ export function pcm(frames: number, seed = 0) {
   return bytes;
 }
 export const text = (s: string) => new TextEncoder().encode(`${s}\0`);
+export async function faultChild(name: string) {
+  if (Deno.env.get('RAOP_ISOLATION_FAULT_CHILD') === name) return false;
+  const directory = await Deno.makeTempDir({ prefix: 'raop-isolation-fault-' });
+  const path = `${directory}/fault.so`;
+  try {
+    const build = await new Deno.Command('cc', {
+      args: [
+        '-shared',
+        '-fPIC',
+        '-o',
+        path,
+        new URL('../../helper/raop/test/faultinject.c', import.meta.url)
+          .pathname,
+        '-ldl',
+        '-levent',
+        '-lpthread',
+      ],
+    }).output();
+    assertEquals(build.code, 0, new TextDecoder().decode(build.stderr));
+    const child = await new Deno.Command(Deno.execPath(), {
+      args: [
+        'test',
+        '--frozen',
+        '--cached-only',
+        '--node-modules-dir=manual',
+        '-A',
+        '--filter',
+        name,
+        new URL('../raop-stream-isolation.test.ts', import.meta.url).pathname,
+      ],
+      env: {
+        LD_PRELOAD: path,
+        RAOP_ISOLATION_FAULT_CHILD: name,
+        RAOP_ISOLATION_FAULT_LIB: path,
+        RAOP_FI_RELEASE_ALLOC_ARM_FILE: `${directory}/release`,
+        RAOP_FI_CALLOC_ARM_FILE: `${directory}/calloc`,
+      },
+    }).output();
+    const output = new TextDecoder().decode(child.stdout);
+    assertEquals(
+      child.code,
+      0,
+      output + new TextDecoder().decode(child.stderr),
+    );
+    assert(/1 passed.*0 failed/.test(output));
+    for (const line of output.split('\n')) {
+      if (line.startsWith('isolation native library:')) console.log(line);
+    }
+    return true;
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+}
 export function nativeStream() {
   const lib = raopFfiInternals.loadLibrary().symbols;
   const pointer = lib.raop_stream_new();
@@ -49,12 +102,17 @@ export function nativeStream() {
         position,
         length,
       ),
-    async attach(receiver: Receiver, metadata = 5, encrypted = false) {
+    async attach(
+      receiver: Receiver,
+      metadata = 5,
+      encrypted = false,
+      probe = false,
+    ) {
       const handle = lib.raop_stream_attach(pointer);
       assert(handle);
       handles.push(handle);
       assertEquals(
-        lib.raop_start_v2(
+        (probe ? lib.raop_probe_v2 : lib.raop_start_v2)(
           handle,
           text('127.0.0.1'),
           receiver.port,
@@ -77,6 +135,20 @@ export function nativeStream() {
         ),
         0,
       );
+      if (probe) {
+        // A successful ordinary OPTIONS probe reports STARTUP, then destroys
+        // its session; it is neither CONNECTED nor pairing's STOPPED result.
+        await until(
+          'probe OPTIONS session locally closed',
+          () =>
+            receiver.sessions.some(
+              (s) =>
+                s.closedAtMs !== null &&
+                s.requests.some((r) => r.method === 'OPTIONS'),
+            ),
+        );
+        return handle;
+      }
       const events = new Uint8Array(4096);
       await until('public FFI connected', () => {
         const n = lib.raop_poll(handle, events, BigInt(events.length));
@@ -90,6 +162,66 @@ export function nativeStream() {
         lib.raop_stream_write(pointer, bytes, BigInt(bytes.length)),
         bytes.length,
       );
+    },
+    source(source: bigint, bytes: Uint8Array) {
+      const r = new BigUint64Array(8);
+      assertEquals(
+        lib.raop_stream_append_source(
+          pointer,
+          lib.raop_stream_epoch(pointer),
+          source,
+          source,
+          bytes,
+          BigInt(bytes.length),
+          r,
+        ),
+        0,
+      );
+      assertEquals([r[3], r[6], r[7]], [BigInt(bytes.length / 4), 0n, 0n]);
+    },
+    seal(source: bigint, frames: bigint) {
+      const r = new BigUint64Array(6);
+      assertEquals(
+        lib.raop_stream_seal(
+          pointer,
+          lib.raop_stream_epoch(pointer),
+          source,
+          frames,
+          r,
+        ),
+        0,
+      );
+      assertEquals([r[4], r[5]], [0n, 0n]);
+    },
+    end(frames: bigint) {
+      const r = new BigUint64Array(6);
+      assertEquals(
+        lib.raop_stream_end(pointer, lib.raop_stream_epoch(pointer), frames, r),
+        0,
+      );
+      assertEquals([r[4], r[5]], [0n, 0n]);
+    },
+    async completion(source: bigint, epoch = lib.raop_stream_epoch(pointer)) {
+      const r = new BigUint64Array(12);
+      assertEquals(
+        await lib.raop_stream_completion_poll(pointer, epoch, source, 1n, r),
+        1,
+      );
+      return r;
+    },
+    async snapshot() {
+      const r = new BigUint64Array(15);
+      assertEquals(
+        await lib.raop_stream_progress(
+          pointer,
+          lib.raop_stream_epoch(pointer),
+          0n,
+          0n,
+          r,
+        ),
+        1,
+      );
+      return r;
     },
     async cancel() {
       const epoch = lib.raop_stream_epoch(pointer);

@@ -115,19 +115,17 @@ the addressed stream; removing one attachment never stops a healthy peer's
 pacer or clears its partial ALAC input.
 
 The compatibility device API retains device-local pacers and exclusive legacy
-input; production playback uses one fixed-player stream producer. Both paths reserve one native
-active-stream guard before session allocation or PCM acceptance. A competing
-explicit/compatibility context returns an error, not accepted-and-dropped PCM.
+input in group 1; production playback uses one fixed-player stream producer.
+Explicit contexts activate concurrently without sharing PCM or native masters.
 Dormant streams retain a runtime reference; native free refuses while any
 attachment is still owned, including during terminal release. The typed port
 joins its C1 producers, attempts all C3 attachment releases, then frees the
-stream on the loop. Failed native release retains storage and the guard.
+stream on the loop. Failed native release retains its storage and runtime reference.
 
-This is not concurrent-stream qualification: removal of the native guard
-remains separate work.
 `tests/raop-stream.test.ts` exercises the shipping public FFI through real UDP,
 ALAC decoding and the independent scheduled receiver model, including both
-attachment-removal orders and compatibility/explicit guard competition.
+attachment-removal orders and concurrent compatibility/explicit contexts.
+Public household capacity remains one until core's separate admission change.
 
 ## Stream-local metadata and crypto
 
@@ -150,8 +148,9 @@ test-only `test/crypto-observer.c` observes libgcrypt in memory, independently
 unmasks RSA-OAEP input, matches it to the cipher key and SDP output, and decrypts
 actual receiver ciphertext for exact ALAC/scheduled assertions. It never
 exports or logs keys and is not linked into the shipping library. Encrypted
-and unencrypted masters remain distinct within one stream. These sequential
-context proofs do not qualify concurrent streams or physical hardware.
+and unencrypted masters remain distinct within one stream. Sequential and
+concurrent proofs retain independent keys through foreign retirement; neither
+qualifies physical hardware.
 
 ## Stream control endpoints
 
@@ -168,13 +167,25 @@ new epoch. Same-IP public-FFI tests force overlapping sequence numbers and wrap,
 check exact retransmitted packet identity at each destination, reject spoofed
 and old endpoints, and independently render the retained/replacement schedules.
 
+## Concurrent native lifetime
+
+One runtime reference belongs to every stream and device, including dormant and
+probe-only owners. Removing A cannot deinitialize B's loop or timing service.
+Every stream-affecting iteration selects a stream, exact master or unique device;
+only final runtime shutdown visits all contexts. Native admission has no global
+active-stream slot. A failed close retains its own reference and resources.
+Partial master/session construction unwinds owned allocations without aborting
+the shared process. Test-only dependency interposition checks rollback and failed
+release while B's exact partial input and schedule survive; the encoder observer
+confirms same-stream sharing and cross-stream separation without private ABI mirrors.
+
 ## Exact stream admission
 
 `raop_stream_append` adds an epoch/segment-qualified, caller-owned receipt with
 an exact accepted stereo-frame count and accepted/backpressure/canceled/error/
 not-ready status. The fixed-width layout is declared in `ffi.h`; missing symbols
 fail library loading rather than falling back to a byte-only ABI. The existing
-two-second ingress bound and active-stream guard remain. Allocation failure is
+two-second per-stream ingress bound remains. Allocation failure is
 distinct from a full ingress. PCM is copied before return; only the unaccepted
 suffix may be retried. Segment identity is opaque, not native queue policy.
 

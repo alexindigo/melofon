@@ -21,6 +21,8 @@
 #include <time.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/timerfd.h>
+#include <stdatomic.h>
 
 #include <event2/event.h>
 #include <event2/buffer.h>
@@ -37,6 +39,27 @@ static void *event_symbol(const char *name)
   }
   if (!symbol) { fprintf(stderr, "fault observer cannot resolve %s\n", name); abort(); }
   return symbol;
+}
+
+/* Public-FFI lifetime tests fail construction after runtime acquisition. */
+static _Atomic int allocation_stage;
+void raop_fi_allocation_stage(int stage) { atomic_store(&allocation_stage, stage); }
+int timerfd_create(int clock, int flags)
+{
+  int expected = 1;
+  if (atomic_compare_exchange_strong(&allocation_stage, &expected, 0)) {
+    errno = EMFILE; return -1;
+  }
+  int (*real)(int, int) = dlsym(RTLD_NEXT, "timerfd_create");
+  return real(clock, flags);
+}
+struct event *event_new(struct event_base *base, evutil_socket_t fd, short events,
+                         event_callback_fn cb, void *arg)
+{
+  int expected = 2;
+  if (atomic_compare_exchange_strong(&allocation_stage, &expected, 0)) return NULL;
+  struct event *(*real)(struct event_base *, evutil_socket_t, short, event_callback_fn, void *) = event_symbol("event_new");
+  return real(base, fd, events, cb, arg);
 }
 
 /* Test-only independently observed live TCP generations (not RAOP state). */

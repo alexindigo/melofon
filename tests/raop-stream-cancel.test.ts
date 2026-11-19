@@ -235,13 +235,13 @@ test('public native ABI preserves identities and refuses invalid or stale input 
           pcm: pcm(1),
         })).status,
         'accepted',
-        'refused and empty input must not claim the active-stream guard',
+        'another stream has independent ingress',
       );
     } finally {
       await competitor.close();
     }
-    // Refusals above cannot use any of the bounded capacity or claim another
-    // stream. Exactly the whole cap is still available, then zero is reported.
+    // Refusals above cannot use this stream's bounded capacity.
+    // Exactly the whole cap is still available, then zero is reported.
     assertEquals(append(epoch, highSegment, pcm(cap), BigInt(cap * 4)), [
       epoch,
       highSegment,
@@ -299,7 +299,7 @@ test('typed validation never truncates identities and mismatched epochs cannot r
   }
 });
 
-test('busy stream errors accept nothing and do not cross-feed the owner', async () => {
+test('independent stream receipts accept their own PCM without cross-feeding', async () => {
   const owner = createFfiStream(), other = createFfiStream();
   const receiver = await startFakeRaop({
     captureAudio: true,
@@ -325,9 +325,8 @@ test('busy stream errors accept nothing and do not cross-feed the owner', async 
       streamId: other.id,
       epoch: other.epoch,
       segment: highSegment,
-      acceptedFrames: 0n,
-      status: 'error',
-      error: 'busy',
+      acceptedFrames: 704n,
+      status: 'accepted',
     });
     await attachment.start(profile(receiver), input);
     await until('owner ready', () => ready);

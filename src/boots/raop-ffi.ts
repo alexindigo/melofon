@@ -12,7 +12,7 @@
 // Transitional device-oriented path, retained until boot adoption: one master
 // stream, many devices. The additive createFfiStream port below has one native
 // PCM/pacer owner with immutable attachments and no receiver-writer election.
-// Both paths share the native active-stream guard. Compatibility masters match
+// Explicit streams are independent. Compatibility masters match
 // per stream+quality+encrypt, so N selected outputs share OwnTone's synced
 // multi-speaker model. The boot pumps PCM per output; this module designates
 // the first writer as THE FEED and silently accepts-and-drops the other
@@ -598,8 +598,8 @@ class FfiTransport implements AirplayTransport {
   }
 }
 
-/** Additive fixed-owner port. The existing boot adopts it in b02b; compatibility
- * transports and explicit streams share the native single-active-stream guard.
+/** Fixed-owner port. Explicit streams have independent native audio lifetimes;
+ * compatibility transports share their separate legacy group.
  * A failed native free retains ownership/logging and cannot become success on
  * another close call. Attachments release before their shared stream storage. */
 export function createFfiStream(

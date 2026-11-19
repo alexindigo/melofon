@@ -254,7 +254,7 @@ for (const removed of [0, 1]) {
 
 Deno.test({
   name:
-    'RAOP stream: dormant and compatibility contexts cannot cross-feed the active owner',
+    'RAOP stream: concurrent explicit and compatibility contexts cannot cross-feed',
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -267,64 +267,58 @@ Deno.test({
       captureAudio: true,
       captureWire: true,
     });
+    const compatibility = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
     let ready = false;
     const owner = a.attach((kind, value) => {
       if (kind === 'state' && value === 'connected') ready = true;
     });
-    const dormant = b.attach(() => {});
-    const legacy = createFfiSpawn()(() => {});
+    let otherReady = false, legacyReady = false;
+    const dormant = b.attach((kind, value) => {
+      if (kind === 'state' && value === 'connected') otherReady = true;
+    });
+    const legacy = createFfiSpawn()((kind, value) => {
+      if (kind === 'state' && value === 'connected') legacyReady = true;
+    });
     try {
       assert(b.id > a.id);
       await owner.start(profile(first), input);
       await until('active owner ready', () => ready);
-      await assertRejects(
-        () => dormant.start(profile(refused), input),
-        Error,
-        'active stream busy',
-      );
-      await assertRejects(
-        () => legacy.start(profile(refused), input),
-        Error,
-        'active stream busy',
-      );
-      await assertRejects(() => b.pcm(pcm(352)), Error, 'active stream busy');
-      await a.pcm(pcm(704));
-      await rendered(first, pcm(704));
-      assertEquals(
-        refused.sessions.length,
-        0,
-        'refusal precedes RTSP allocation',
-      );
-      await owner.transport.close();
-      await assertRejects(
-        () => dormant.start(profile(refused), input),
-        Error,
-        'active stream busy',
-      );
-      await a.close();
-      ready = false;
-      const replacement = b.attach((kind, value) => {
-        if (kind === 'state' && value === 'connected') ready = true;
-      });
-      await replacement.start(profile(refused), input);
+      await dormant.start(profile(refused), input);
+      await legacy.start(profile(compatibility), input);
       await until(
-        'dormant context activated after proven release',
-        () => ready,
+        'independent contexts ready',
+        () => otherReady && legacyReady,
       );
-      await b.pcm(pcm(704));
-      await rendered(refused, pcm(704));
+      const otherPcm = new Uint8Array(704 * 4).fill(0x35);
+      const legacyPcm = new Uint8Array(704 * 4).fill(0x61);
+      await a.pcm(pcm(704));
+      await b.pcm(otherPcm);
+      await legacy.transport.pcm(legacyPcm);
+      await Promise.all([
+        rendered(first, pcm(704)),
+        rendered(refused, otherPcm),
+        rendered(compatibility, legacyPcm),
+      ]);
+      await owner.transport.close();
+      await a.close();
+      await rendered(refused, otherPcm);
+      assertEquals(refused.sessions.length, 1);
       await libraryProof();
     } finally {
       await Promise.all([a.close(), b.close(), legacy.transport.close()]);
       first.close();
       refused.close();
+      compatibility.close();
     }
   },
 });
 
 Deno.test({
   name:
-    'RAOP stream: compatibility ownership also refuses explicit activation and PCM',
+    'RAOP stream: explicit activation is independent of an existing compatibility owner',
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -341,23 +335,22 @@ Deno.test({
     const legacy = createFfiSpawn()((kind, value) => {
       if (kind === 'state' && value === 'connected') ready = true;
     });
-    const attachment = stream.attach(() => {});
+    let explicitReady = false;
+    const attachment = stream.attach((kind, value) => {
+      if (kind === 'state' && value === 'connected') explicitReady = true;
+    });
     try {
       await legacy.start(profile(receiver), input);
       await until('compatibility owner ready', () => ready);
-      await assertRejects(
-        () => attachment.start(profile(refused), input),
-        Error,
-        'active stream busy',
-      );
-      await assertRejects(
-        () => stream.pcm(pcm(352)),
-        Error,
-        'active stream busy',
-      );
+      await attachment.start(profile(refused), input);
+      await until('explicit context ready', () => explicitReady);
+      const explicitPcm = new Uint8Array(704 * 4).fill(0x42);
+      await stream.pcm(explicitPcm);
       await legacy.transport.pcm(pcm(704));
-      await rendered(receiver, pcm(704));
-      assertEquals(refused.sessions.length, 0);
+      await Promise.all([
+        rendered(receiver, pcm(704)),
+        rendered(refused, explicitPcm),
+      ]);
       await libraryProof();
     } finally {
       await stream.close();
@@ -569,11 +562,7 @@ Deno.test({
       );
       const before = timestamps(receiver)[0];
       await dormant.reset();
-      await assertRejects(
-        () => dormant.pcm(pcm(352)),
-        Error,
-        'active stream busy',
-      );
+      await dormant.pcm(pcm(352));
       await active.pcm(expected.subarray(441 * 4));
       await rendered(receiver, expected);
       assertEquals(timestamps(receiver)[1], (before + 352) >>> 0);
@@ -764,7 +753,7 @@ for (const removed of [null, 0, 1]) {
 
 Deno.test({
   name:
-    'RAOP device stream: competing active stream refuses before RTSP allocation',
+    'RAOP device stream: independent native activation without public capacity',
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -774,27 +763,18 @@ Deno.test({
       ),
     );
     const f = deviceFixture(receivers);
-    // Deliberately omit core capacity here to prove the native guard itself.
+    // Plan b17 removes native capacity only; public capacity assertions stay.
     const first = f.devices.createStream(), second = f.devices.createStream();
     try {
       await f.activate(0, first);
-      const permit = await f.prepare(1, second);
-      assert(permit.ok);
-      const result = await f.devices.protocol.activate(permit.value, input, {
-        publish() {},
-        onEvent() {},
-      });
-      assert(!result.ok);
-      assertEquals(result.error.code, 'start-failed');
-      assert(result.error.message.includes('active stream busy'));
-      await assertRejects(
-        () => second.pcm(pcm(352)),
-        Error,
-        'active stream busy',
-      );
-      assertEquals(receivers[1].sessions.length, 0);
+      await f.activate(1, second);
+      const distinct = new Uint8Array(704 * 4).fill(0x23);
+      await second.pcm(distinct);
       await first.pcm(pcm(704));
-      await rendered(receivers[0], pcm(704));
+      await Promise.all([
+        rendered(receivers[0], pcm(704)),
+        rendered(receivers[1], distinct),
+      ]);
       await libraryProof();
     } finally {
       await Promise.all([first.close(), second.close()]);

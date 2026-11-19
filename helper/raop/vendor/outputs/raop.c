@@ -2090,7 +2090,8 @@ master_session_make(uint64_t stream_id, struct media_quality *quality, bool encr
       return NULL;
     }
 
-  CHECK_NULL(L_RAOP, rms = calloc(1, sizeof(struct raop_master_session)));
+  rms = calloc(1, sizeof(struct raop_master_session));
+  if (!rms) { outputs_quality_unsubscribe(quality); return NULL; }
 
   rms->rtp_session = rtp_session_new(quality, RAOP_PACKET_BUFFER_SIZE, 0, 0);
   if (!rms->rtp_session)
@@ -2130,9 +2131,10 @@ master_session_make(uint64_t stream_id, struct media_quality *quality, bool encr
   rms->rawbuf_size = STOB(rms->samples_per_packet, quality->bits_per_sample, quality->channels);
   rms->output_buffer_samples = (buffer_duration_ms - RAOP_AUDIO_LATENCY_MS) * quality->sample_rate / 1000;
 
-  CHECK_NULL(L_RAOP, rms->rawbuf = malloc(rms->rawbuf_size));
-  CHECK_NULL(L_RAOP, rms->input_buffer = evbuffer_new());
-  CHECK_NULL(L_RAOP, rms->encoded_buffer = evbuffer_new());
+  rms->rawbuf = malloc(rms->rawbuf_size);
+  rms->input_buffer = evbuffer_new();
+  rms->encoded_buffer = evbuffer_new();
+  if (!rms->rawbuf || !rms->input_buffer || !rms->encoded_buffer) goto error;
 
   rms->next = raop_master_sessions;
   raop_master_sessions = rms;
@@ -2486,10 +2488,14 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
   struct raop_stream_context *context = stream_context_get(rd->stream_id);
   if (!context) return NULL;
 
-  CHECK_NULL(L_RAOP, rs = calloc(1, sizeof(struct raop_session)));
-  CHECK_NULL(L_RAOP, rs->deferredev = evtimer_new(evbase_player, deferredev_cb, rs));
+  rs = calloc(1, sizeof(struct raop_session));
+  if (!rs) return NULL;
+  rs->server_fd = -1;
+  rs->deferredev = evtimer_new(evbase_player, deferredev_cb, rs);
+  if (!rs->deferredev) goto error;
 
   rs->devname = strdup(rd->name);
+  if (!rs->devname) goto error;
   rs->volume = rd->volume;
   rs->offset_samples = rd->offset_ms * rd->quality.sample_rate / 1000;
 
