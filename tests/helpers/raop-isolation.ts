@@ -63,6 +63,67 @@ export async function faultChild(name: string) {
         RAOP_ISOLATION_FAULT_LIB: path,
         RAOP_FI_RELEASE_ALLOC_ARM_FILE: `${directory}/release`,
         RAOP_FI_CALLOC_ARM_FILE: `${directory}/calloc`,
+        RAOP_FI_WRITE_BLOCK_ARM_FILE: `${directory}/write-block`,
+        RAOP_FI_POLL_ARM_FILE: `${directory}/poll`,
+      },
+    }).output();
+    const output = new TextDecoder().decode(child.stdout);
+    assertEquals(
+      child.code,
+      0,
+      output + new TextDecoder().decode(child.stderr),
+    );
+    assert(/1 passed.*0 failed/.test(output));
+    for (const line of output.split('\n')) {
+      if (line.startsWith('isolation native library:')) console.log(line);
+    }
+    return true;
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+}
+export async function progressChild(name: string, mode: string) {
+  if (Deno.env.get('RAOP_ISOLATION_PROGRESS_CHILD') === name) return false;
+  const directory = await Deno.makeTempDir({
+    prefix: 'raop-isolation-progress-',
+  });
+  const path = `${directory}/progress.so`;
+  const helper = new URL('../../helper/raop/', import.meta.url).pathname;
+  try {
+    const build = await new Deno.Command('cc', {
+      args: [
+        '-shared',
+        '-fPIC',
+        '-I',
+        `${helper}stub`,
+        '-I',
+        `${helper}vendor`,
+        '-o',
+        path,
+        `${helper}test/progress-faultinject.c`,
+        '-ldl',
+        '-lpthread',
+      ],
+    }).output();
+    assertEquals(build.code, 0, new TextDecoder().decode(build.stderr));
+    const child = await new Deno.Command(Deno.execPath(), {
+      args: [
+        'test',
+        '--frozen',
+        '--cached-only',
+        '--node-modules-dir=manual',
+        '-A',
+        '--filter',
+        name,
+        new URL('../raop-stream-isolation.test.ts', import.meta.url).pathname,
+      ],
+      env: {
+        LD_PRELOAD: path,
+        RAOP_ISOLATION_PROGRESS_CHILD: name,
+        RAOP_PROGRESS_WRAP: '1',
+        RAOP_ISOLATION_PROGRESS_LIB: path,
+        RAOP_PROGRESS_FAULT: mode,
+        RAOP_PROGRESS_ARM: `${directory}/arm`,
       },
     }).output();
     const output = new TextDecoder().decode(child.stdout);
@@ -209,13 +270,13 @@ export function nativeStream() {
       );
       return r;
     },
-    async snapshot() {
+    async snapshot(source = 0n) {
       const r = new BigUint64Array(15);
       assertEquals(
         await lib.raop_stream_progress(
           pointer,
           lib.raop_stream_epoch(pointer),
-          0n,
+          source,
           0n,
           r,
         ),

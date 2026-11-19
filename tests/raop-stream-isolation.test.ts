@@ -1,8 +1,13 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { createSocket } from 'node:dgram';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
-import { raopFfiInternals } from '../src/boots/raop-ffi.ts';
+import {
+  createFfiStream,
+  raopFfiInternals,
+  shutdownNativeLogging,
+} from '../src/boots/raop-ffi.ts';
+import { profileFromService } from '../src/boots/airplay-profile.ts';
 import type { FakeRaopSession } from './helpers/fake-raop.ts';
 import {
   faultChild,
@@ -10,6 +15,7 @@ import {
   nativeStream,
   pcm,
   progress,
+  progressChild,
   rendered,
   startFakeRaop,
   titles,
@@ -39,6 +45,383 @@ function retransmission(actual: Uint8Array | undefined, original: Uint8Array) {
   expected[1] &= 0x7f;
   assertEquals(actual, expected);
 }
+async function timelineRendered(
+  receiver: Awaited<ReturnType<typeof startFakeRaop>>,
+  expected: Uint8Array,
+) {
+  const session = receiver.sessions[0];
+  await until(
+    'independent real source presentation',
+    () =>
+      session.wire.some((e) => e.kind === 'timing-reply') &&
+      renderScheduledAudio(session, receiver.nowMs()).pcm.length >=
+        expected.length,
+  );
+  const result = renderScheduledAudio(session, receiver.nowMs());
+  assertEquals(result.issues, []);
+  assertEquals(result.discarded, []);
+  assertEquals(result.pcm.subarray(0, expected.length), expected);
+  assert(
+    result.pcm.subarray(expected.length).every((v) => v === 0),
+    'all scheduled transport silence is zero',
+  );
+  const bytes = decodeReceiverAudio(session.sdp, session.audioPayloads);
+  assertEquals(bytes.subarray(0, expected.length), expected);
+  assert(
+    bytes.subarray(expected.length).every((v) => v === 0),
+    'all packet padding/drain silence is zero',
+  );
+  assertEquals([session.flushes, session.teardowns, receiver.sessions.length], [
+    0,
+    0,
+    1,
+  ]);
+}
+
+for (
+  const [mode, error] of [
+    ['encoder', 2n],
+    ['cipher', 3n],
+    ['send', 4n],
+    ['sync', 5n],
+    ['timer', 7n],
+    ['allocation', 1n],
+  ] as const
+) {
+  const name =
+    `RAOP isolation acceptance: ${mode} failure in A cannot fail or truncate B`;
+  Deno.test({
+    name,
+    sanitizeOps: false,
+    sanitizeResources: false,
+    fn: async () => {
+      if (await progressChild(name, mode)) return;
+      // The timer observer selects the most recently constructed player, A.
+      const b = nativeStream(), a = nativeStream();
+      const rb = await startFakeRaop({ captureAudio: true, captureWire: true });
+      const ra = await startFakeRaop({ captureAudio: true, captureWire: true });
+      const faults = Deno.dlopen(Deno.env.get('RAOP_ISOLATION_PROGRESS_LIB')!, {
+        raop_fi_target_stream: { parameters: ['u64'], result: 'void' },
+      });
+      try {
+        await b.attach(rb);
+        await a.attach(ra, 0, mode === 'cipher');
+        faults.symbols.raop_fi_target_stream(a.id);
+        const expected = pcm(44100 + 137, 180);
+        b.source(1n, expected);
+        b.seal(1n, BigInt(expected.length / 4));
+        b.end(BigInt(expected.length / 4));
+        await until(
+          'B active before A fault',
+          () => rb.sessions[0].audioPackets >= 2,
+        );
+        await Deno.writeTextFile(Deno.env.get('RAOP_PROGRESS_ARM')!, 'arm');
+        a.source(1n, pcm(704, 800));
+        a.seal(1n, 704n);
+        a.end(704n);
+        await until(
+          'A explicit terminal failure',
+          async () => (await a.completion(1n))[6] !== 0n,
+        );
+        const failed = await a.completion(1n);
+        assertEquals([failed[6], failed[7]], [3n, error]);
+        await a.close();
+        await until(
+          'B independent successful completion',
+          async () => (await b.completion(1n))[6] !== 0n,
+        );
+        const completed = await b.completion(1n);
+        assertEquals(
+          [completed[3], completed[6], completed[7], completed[11]],
+          [BigInt(expected.length / 4), 1n, 0n, 1n],
+        );
+        const snapshot = await b.snapshot(1n);
+        assertEquals([snapshot[5], snapshot[14]], [
+          0n,
+          BigInt(expected.length / 4),
+        ]);
+        await timelineRendered(rb, expected);
+        assertEquals(rb.sessions[0].closedAtMs, null);
+        await libraryProof();
+      } finally {
+        await a.close();
+        await b.close();
+        ra.close();
+        rb.close();
+        faults.close();
+      }
+    },
+  });
+}
+
+const wrapName =
+  'RAOP isolation acceptance: long wrapping timelines retain every receipt through state-ring overflow';
+Deno.test({
+  name: wrapName,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    if (await progressChild(wrapName, 'none')) return;
+    const a = nativeStream(), b = nativeStream();
+    const ra = await startFakeRaop({ captureAudio: true, captureWire: true });
+    const rb = await startFakeRaop({ captureAudio: true, captureWire: true });
+    const lib = raopFfiInternals.loadLibrary().symbols;
+    try {
+      const handle = await a.attach(ra);
+      await b.attach(rb);
+      const expectedA = new Uint8Array(24 * 352 * 4);
+      for (let i = 0; i < 24; i++) {
+        const bytes = pcm(352, i * 197);
+        expectedA.set(bytes, i * 352 * 4);
+        a.source(BigInt(i + 1), bytes);
+        a.seal(BigInt(i + 1), 352n);
+      }
+      a.end(BigInt(expectedA.length / 4));
+      const expectedB = pcm(79300, 501);
+      b.source(1n, expectedB);
+      b.seal(1n, 79300n);
+      b.end(79300n);
+      await until(
+        'both wrapped clocks emitted',
+        () =>
+          ra.sessions[0].audioPackets >= 3 && rb.sessions[0].audioPackets >= 3,
+      );
+      for (const receiver of [ra, rb]) {
+        const packets = audio(receiver.sessions[0]);
+        assertEquals(receiver.sessions[0].rtpSequences.slice(0, 3), [
+          65534,
+          65535,
+          0,
+        ]);
+        const timestamp = (p: Uint8Array) =>
+          new DataView(p.buffer, p.byteOffset).getUint32(4);
+        assert(
+          timestamp(packets[2]) < timestamp(packets[0]),
+          'RTP timestamp wrapped too',
+        );
+      }
+      for (let i = 0; i < 40; i++) {
+        assertEquals(lib.raop_volume(handle, i + 10), 0);
+      }
+      await until(
+        'all protocol state updates acknowledged by receiver',
+        () => ra.sessions[0].volumeParams.length === 41,
+      );
+      await until(
+        'last A source completed',
+        async () => (await a.completion(24n))[6] === 1n,
+      );
+      const events = new Uint8Array(4096);
+      let retainedEvents = 0;
+      while (lib.raop_poll(handle, events, BigInt(events.length)) > 0) {
+        retainedEvents++;
+      }
+      assert(
+        retainedEvents > 0 && retainedEvents < 40,
+        'lossy state ring overflowed',
+      );
+      // Completion storage is independent: do not poll/ack any source until now.
+      for (let i = 1n; i <= 24n; i++) {
+        const r = await a.completion(i);
+        assertEquals([r[0], r[2], r[3], r[6], r[7]], [a.id, i, 352n, 1n, 0n]);
+        assertEquals(
+          lib.raop_stream_completion_ack(a.pointer, 1n, i, 352n, 1n),
+          0,
+        );
+      }
+      await timelineRendered(ra, expectedA);
+      await a.close();
+      await until(
+        'B long timeline complete',
+        async () => (await b.completion(1n))[6] === 1n,
+      );
+      const snapshot = await b.snapshot(1n);
+      assert(snapshot[8] >= 79300n && snapshot[9] >= 79300n);
+      assertEquals(snapshot[14], 79300n);
+      await timelineRendered(rb, expectedB);
+      await libraryProof();
+    } finally {
+      await a.close();
+      await b.close();
+      ra.close();
+      rb.close();
+    }
+  },
+});
+
+const slowName =
+  'RAOP isolation acceptance: slow A terminal write and stream recreation do not block B timeline';
+Deno.test({
+  name: slowName,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    if (await faultChild(slowName)) return;
+    const a = nativeStream(), b = nativeStream();
+    const ra = await startFakeRaop({ captureAudio: true, captureWire: true });
+    const rb = await startFakeRaop({ captureAudio: true, captureWire: true });
+    const observer = Deno.dlopen(Deno.env.get('RAOP_ISOLATION_FAULT_LIB')!, {
+      raop_fi_write_blocking: { parameters: [], result: 'i32' },
+    });
+    let replacement: ReturnType<typeof nativeStream> | undefined;
+    try {
+      await a.attach(ra);
+      await b.attach(rb);
+      const expected = pcm(79300, 620);
+      b.source(1n, expected);
+      b.seal(1n, 79300n);
+      b.end(79300n);
+      a.write(pcm(352, 3));
+      await until(
+        'both active before slow release',
+        () =>
+          ra.sessions[0].audioPackets === 1 && rb.sessions[0].audioPackets >= 1,
+      );
+      await Deno.writeTextFile(
+        Deno.env.get('RAOP_FI_WRITE_BLOCK_ARM_FILE')!,
+        'arm',
+      );
+      let closed = false;
+      const closing = a.close().then(() => closed = true);
+      await until(
+        'A terminal write held by real dependency',
+        () => observer.symbols.raop_fi_write_blocking() === 1,
+      );
+      const packets = rb.sessions[0].audioPackets;
+      await until(
+        'B emits while A close is pending',
+        () => rb.sessions[0].audioPackets > packets + 3,
+      );
+      assertEquals(closed, false);
+      await closing;
+      replacement = nativeStream();
+      assert(
+        replacement.id > a.id,
+        'destroy/recreate never reuses stream identity',
+      );
+      await replacement.metadata('Fresh A', 'New incarnation', 0, 1000);
+      await replacement.attach(ra);
+      replacement.write(pcm(704, 1011));
+      await rendered({ ...ra, sessions: [ra.sessions[1]] }, pcm(704, 1011));
+      assert(
+        titles(ra.sessions[1]).every((s) =>
+          s.includes('Fresh A') && s.includes('New incarnation')
+        ),
+      );
+      assertEquals(ra.sessions[0].teardowns, 1);
+      await until(
+        'B completed despite slow A release',
+        async () => (await b.completion(1n))[6] === 1n,
+      );
+      await timelineRendered(rb, expected);
+      assertEquals(rb.sessions[0].closedAtMs, null);
+      await libraryProof();
+    } finally {
+      await replacement?.close();
+      await a.close();
+      await b.close();
+      ra.close();
+      rb.close();
+      observer.close();
+    }
+  },
+});
+
+const closeName =
+  'RAOP isolation acceptance: close joins retained polls and backpressure without unloading B';
+Deno.test({
+  name: closeName,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    if (await faultChild(closeName)) return;
+    const a = createFfiStream(),
+      blocked = createFfiStream(),
+      b = createFfiStream();
+    const observer = Deno.dlopen(Deno.env.get('RAOP_ISOLATION_FAULT_LIB')!, {
+      raop_fi_poll_blocking: { parameters: [], result: 'i32' },
+    });
+    const hold = Deno.env.get('RAOP_FI_POLL_ARM_FILE')!;
+    const rb = await startFakeRaop({ captureAudio: true, captureWire: true });
+    let connected = false;
+    const peer = b.attach((kind, value) => {
+      if (kind === 'state' && value === 'connected') connected = true;
+    });
+    a.attach(() => {}); // A retained source has a participant, not vacuous success.
+    try {
+      await peer.start(
+        profileFromService({
+          name: '001122334455@B._raop._tcp.local',
+          host: 'fixture.local',
+          address: '127.0.0.1',
+          port: rb.port,
+          ttlMs: 60000,
+          txt: { tp: 'UDP', am: 'AppleTV2,1' },
+        }),
+        { volume: 50, positionMs: 0, lengthMs: 1000, title: 'B', artist: 'B' },
+      );
+      await until('B typed stream ready', () => connected);
+      const expected = pcm(704, 130);
+      await b.pcm(expected.subarray(0, 441 * 4));
+      await until(
+        'B typed partial packet',
+        () => rb.sessions[0].audioPackets === 1,
+      );
+      assertEquals(
+        (await a.appendSource({
+          epoch: a.epoch,
+          source: 1n,
+          segment: 1n,
+          pcm: pcm(353),
+        })).status,
+        'accepted',
+      );
+      await a.seal(a.epoch, 1n, 353n);
+      const key = { epoch: a.epoch, source: 1n, target: 353n, revision: 1n };
+      await Deno.writeTextFile(hold, 'hold');
+      const waiting = a.waitCompletion(key), reading = a.pollCompletion(key);
+      await until(
+        'native completion reads held after reservation',
+        () => observer.symbols.raop_fi_poll_blocking() === 1,
+      );
+      const writer = blocked.pcm(new Uint8Array((2 * 44100 + 1) * 4));
+      const rejected = assertRejects(() => writer, Error, 'producer canceled');
+      let closedA = false;
+      const closingA = a.close().then(() => closedA = true),
+        closingWriter = blocked.close();
+      await b.pcm(expected.subarray(441 * 4));
+      await until(
+        'B continues while A polls block its close',
+        () => rb.sessions[0].audioPackets === 2,
+      );
+      assertEquals(
+        closedA,
+        false,
+        'stream free must join the reserved native readers',
+      );
+      await Deno.remove(hold);
+      const canceled = await waiting;
+      assertEquals(canceled.status, 'canceled');
+      assertEquals(canceled.attachments[0].outcome, 'canceled');
+      assertEquals((await reading)!.status, 'canceled');
+      await Promise.all([closingA, closingWriter, rejected]);
+      shutdownNativeLogging(); // B's typed stream and handle retain the library/log owner.
+      await rendered(rb, expected);
+      assertEquals(rb.sessions[0].closedAtMs, null);
+      await assertRejects(() => a.pollCompletion(key), Error, 'closed');
+      await libraryProof();
+    } finally {
+      await Deno.remove(hold).catch((e) => {
+        if (!(e instanceof Deno.errors.NotFound)) throw e;
+      });
+      await a.close();
+      await blocked.close();
+      await b.close();
+      rb.close();
+      observer.close();
+    }
+  },
+});
 for (const concurrent of [false, true]) {
   const routingName = `RAOP isolation: ${
     concurrent ? 'concurrent' : 'sequential'

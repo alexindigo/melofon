@@ -13,6 +13,7 @@
 #include <gcrypt.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include "outputs.h"
 #include "transcode.h"
 
@@ -23,8 +24,25 @@ static void *symbol(const char *name, const char *library)
   if (!p) abort();
   return p;
 }
+static _Atomic uint64_t target_stream;
+static _Thread_local uint64_t writing_stream;
+static void (*write_original)(struct output_buffer *);
+static void target_write(struct output_buffer *buffer)
+{
+  writing_stream = buffer->stream_id;
+  write_original(buffer);
+  writing_stream = 0;
+}
+void raop_fi_target_stream(uint64_t id)
+{
+  struct output_definition *backend = dlsym(dlopen(getenv("MELOFON_RAOP_LIB"), RTLD_NOW | RTLD_LOCAL), "output_raop");
+  if (!write_original) { write_original = backend->write; backend->write = target_write; }
+  atomic_store(&target_stream, id);
+}
 static int arm(const char *kind)
 {
+  uint64_t target = atomic_load(&target_stream);
+  if (target && strcmp(kind, "timer") && writing_stream != target) return 0;
   const char *mode = getenv("RAOP_PROGRESS_FAULT");
   const char *path = getenv("RAOP_PROGRESS_ARM");
   return mode && path && !strcmp(mode, kind) && unlink(path) == 0;

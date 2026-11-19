@@ -132,6 +132,28 @@ static char bootstrap[1 << 16];
 static size_t bootstrap_off;
 static int resolving;
 static int once_blocking;
+static _Atomic int poll_blocking;
+int raop_fi_poll_blocking(void) { return atomic_load(&poll_blocking); }
+struct held_poll {
+  struct event_base *base;
+  event_callback_fn callback;
+  void *arg;
+};
+static void held_poll_cb(evutil_socket_t fd, short events, void *arg)
+{
+  struct held_poll *work = arg;
+  const char *arm = getenv("RAOP_FI_POLL_ARM_FILE");
+  if (arm && access(arm, F_OK) == 0) {
+    atomic_store(&poll_blocking, 1);
+    int (*real)(struct event_base *, evutil_socket_t, short, event_callback_fn, void *, const struct timeval *) = event_symbol("event_base_once");
+    struct timeval retry = { 0, 1000 };
+    if (real(work->base, -1, EV_TIMEOUT, held_poll_cb, work, &retry) < 0) abort();
+    return;
+  }
+  atomic_store(&poll_blocking, 0);
+  work->callback(fd, events, work->arg);
+  free(work);
+}
 int raop_fi_once_blocking(void)
 {
   pthread_mutex_lock(&fd_lock);
@@ -241,6 +263,19 @@ event_base_once(struct event_base *base, evutil_socket_t fd, short events,
 
   if (!real_once)
     real_once = event_symbol("event_base_once");
+  const char *poll_arm = getenv("RAOP_FI_POLL_ARM_FILE");
+  if (poll_arm && access(poll_arm, F_OK) == 0) {
+    Dl_info info;
+    if (dladdr(__builtin_return_address(0), &info) && info.dli_sname &&
+        strcmp(info.dli_sname, "raop_stream_completion_poll") == 0) {
+      struct held_poll *work = calloc(1, sizeof(*work));
+      if (!work) return -1;
+      work->base = base; work->callback = cb; work->arg = arg;
+      int result = real_once(base, fd, events, held_poll_cb, work, tv);
+      if (result < 0) free(work);
+      return result;
+    }
+  }
   const char *arm = getenv("RAOP_FI_RESET_ARM_FILE");
   if (arm && access(arm, F_OK) == 0) {
     Dl_info info;

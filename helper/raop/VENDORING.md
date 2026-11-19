@@ -179,6 +179,19 @@ the shared process. Test-only dependency interposition checks rollback and faile
 release while B's exact partial input and schedule survive; the encoder observer
 confirms same-stream sharing and cross-stream separation without private ABI mirrors.
 
+Native acceptance also holds a loop-dispatched completion read after its storage
+reservation while typed close fences input and joins that read. Other streams
+continue emitting; no callback or test hold enters the shipping library.
+Stream-targeted dependency faults exercise encoder, cipher, packet allocation,
+send, sync and timer failure without crediting a failed source as complete.
+Long independently scheduled timelines force both RTP counters through wrap,
+retain 24 source receipts beyond lossy state-ring overflow, and verify exact real
+PCM plus zero-only declared transport silence. Delayed terminal writes and fresh
+stream incarnations cannot stop a foreign timeline. Encrypted and plaintext
+combinations use the real cipher observer and independent ALAC consumer.
+HTTP still enforces temporary capacity one; native concurrency is not permission
+to bypass core's speaker membership and release barriers.
+
 ## Exact stream admission
 
 `raop_stream_append` adds an epoch/segment-qualified, caller-owned receipt with

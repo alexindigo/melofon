@@ -10,10 +10,11 @@ import {
   until,
 } from './helpers/raop-isolation.ts';
 
-for (const concurrent of [false, true]) {
-  const name = `RAOP crypto: ${
-    concurrent ? 'concurrent' : 'dormant'
-  } keys survive foreign retirement with exact AES, OAEP, SDP and mixed-master PCM`;
+for (const mode of ['dormant', 'concurrent', 'concurrent B plaintext']) {
+  const concurrent = mode !== 'dormant';
+  const encryptedB = mode !== 'concurrent B plaintext';
+  const name =
+    `RAOP crypto: ${mode} keys survive foreign retirement with exact AES, OAEP, SDP and mixed-master PCM`;
   Deno.test({
     name,
     sanitizeOps: false,
@@ -139,7 +140,7 @@ for (const concurrent of [false, true]) {
         await a.attach(ra, 5, true);
         await a.attach(plain, 5, false);
         if (concurrent) {
-          await b.attach(rb, 5, true);
+          await b.attach(rb, 5, encryptedB);
           b.write(pcm(704, 920));
           await until(
             'concurrent B encrypted packets',
@@ -172,7 +173,10 @@ for (const concurrent of [false, true]) {
           'encrypted B packets',
           () => rb.sessions[0].audioPackets === 2,
         );
-        const db = decrypt(rb.sessions[0]);
+        const db = encryptedB
+          ? decrypt(rb.sessions[0])
+          : { index: -1, session: rb.sessions[0] };
+        assertEquals(rb.sessions[0].sdp.includes('a=rsaaeskey:'), encryptedB);
         assertNotEquals(
           da.index,
           db.index,
