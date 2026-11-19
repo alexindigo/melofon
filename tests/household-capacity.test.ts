@@ -1,9 +1,8 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals } from '@std/assert';
 import { createOutputs } from '../src/player.ts';
 import { createPlayers } from '../src/players.ts';
 import { createPersistence } from '../src/persistence.ts';
 import { createPlaybackReports } from '../src/playback-reports.ts';
-import { PlaybackError } from '../src/playback-errors.ts';
 import type { PlaybackCapacity } from '../src/playback-capacity.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
 import { recordingStream } from './helpers/airplay-devices.ts';
@@ -213,15 +212,6 @@ async function fixture() {
   };
 }
 
-async function busy(command: () => unknown, id = 1, name = 'Home') {
-  const error = await assertRejects(async () => {
-    await command();
-  }, PlaybackError);
-  assertEquals(error.code, 'airplay_busy');
-  assertEquals(error.owner, { id, name });
-  assertEquals(error.message, `AirPlay is busy in ${name}`);
-}
-
 async function independentPlayer(
   h: Awaited<ReturnType<typeof household>>,
   id: number,
@@ -240,37 +230,28 @@ async function independentPlayer(
   return speaker;
 }
 
-Deno.test('household simultaneous starts have one typed busy loser and one fixed-player PCM winner', async () => {
+// Track B b19 / section 3.1 row 25 replaces the temporary household singleton.
+Deno.test('household simultaneous starts have independent fixed-player PCM and default binding', async () => {
   const f = await fixture();
   try {
     const starts = await Promise.allSettled([1, 2].map(async (id) => {
       await f.players.get(id).play();
     }));
-    assertEquals(starts.filter((r) => r.status === 'fulfilled').length, 1);
-    const winner = starts.findIndex((r) => r.status === 'fulfilled') + 1;
-    const rejected = starts.find((r) =>
-      r.status === 'rejected'
-    ) as PromiseRejectedResult;
-    assert(rejected.reason instanceof PlaybackError);
-    assertEquals(rejected.reason.code, 'airplay_busy');
-    assertEquals(rejected.reason.owner, {
-      id: winner,
-      name: winner === 1 ? 'Home' : 'Kitchen',
-    });
-    await until(() => f.sessions.some((s) => s.bytes > 0));
-    assertEquals(f.sessions.length, 1);
-    assertEquals(f.sessions[0].port, 7000 + winner);
-    await f.players.rename(winner, 'Den');
-    await f.players.setDefault(3 - winner);
-    await busy(() => f.players.playback.play(), winner, 'Den');
-    assertEquals(f.players.get(winner).playerView().state, 'play');
-    assertEquals(f.sessions.length, 1);
+    assertEquals(starts.map((r) => r.status), ['fulfilled', 'fulfilled']);
+    await until(() => f.sessions.filter((s) => s.bytes > 0).length === 2);
+    assertEquals(f.sessions.map((s) => s.port).sort(), [7001, 7002]);
+    const first = f.players.get(1).playerView();
+    await f.players.rename(1, 'Den');
+    await f.players.setDefault(2);
+    await f.players.playback.play();
+    assertEquals(f.players.get(1).playerView(), first);
+    assertEquals(f.sessions.length, 2);
   } finally {
     await f.close();
   }
 });
 
-Deno.test('household native AirPlay sends RTP to exactly one fake receiver on simultaneous starts', async () => {
+Deno.test('household native AirPlay sends independent RTP on simultaneous starts', async () => {
   const receivers = [await startFakeRaop(), await startFakeRaop()];
   const dir = await dataDir(), store = await openStore(dir);
   const h = await household(store, [], receivers.map((r) => r.port));
@@ -278,21 +259,14 @@ Deno.test('household native AirPlay sends RTP to exactly one fake receiver on si
     const starts = await Promise.allSettled([1, 2].map(async (id) => {
       await h.players.get(id).play();
     }));
-    assertEquals(starts.filter((r) => r.status === 'fulfilled').length, 1);
-    const winner = starts.findIndex((r) => r.status === 'fulfilled');
-    const loser = starts[1 - winner] as PromiseRejectedResult;
-    assert(loser.reason instanceof PlaybackError);
-    assertEquals(loser.reason.code, 'airplay_busy');
-    assertEquals(loser.reason.owner, {
-      id: winner + 1,
-      name: winner === 0 ? 'Home' : 'Kitchen',
-    });
+    assertEquals(starts.map((r) => r.status), ['fulfilled', 'fulfilled']);
     await until(() =>
-      receivers[winner].sessions.some((s) => s.audioPackets > 0)
+      receivers.every((r) => r.sessions.some((s) => s.audioPackets > 0))
     );
-    assertEquals(receivers[1 - winner].sessions.length, 0);
-    assertEquals(h.players.get(winner + 1).playerView().state, 'play');
-    assertEquals(h.players.get(2 - winner).playerView().state, 'stop');
+    assertEquals([1, 2].map((id) => h.players.get(id).playerView().state), [
+      'play',
+      'play',
+    ]);
   } finally {
     await h.close();
     await store.close();
@@ -351,12 +325,13 @@ Deno.test('native AirPlay receivers get absolute speaker volumes at start and af
   }
 });
 
-Deno.test('household wiring refuses every competing start before queue or play-state mutation', async () => {
+Deno.test('household wiring admits every disjoint start path without changing the peer', async () => {
   const f = await fixture();
   try {
     await f.players.get(1).play();
     await until(() => f.sessions[0]?.bytes > 0);
-    const other = f.players.get(2), before = other.queueView();
+    const other = f.players.get(2), before = f.players.get(1).playerView();
+    const queue = f.players.get(1).queueView();
     for (
       const command of [
         () => other.play(),
@@ -371,18 +346,18 @@ Deno.test('household wiring refuses every competing start before queue or play-s
           }),
       ]
     ) {
-      await busy(command);
-      assertEquals(other.queueView(), before);
-      assertEquals(other.playerView().state, 'stop');
+      await command();
+      assertEquals(f.players.get(1).playerView(), before);
+      assertEquals(f.players.get(1).queueView(), queue);
     }
     assertEquals(f.players.get(1).playerView().state, 'play');
-    assertEquals(f.sessions.length, 1);
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
   } finally {
     await f.close();
   }
 });
 
-Deno.test('joining AirPlay to a second playing player refuses before either membership or bookmark changes', async () => {
+Deno.test('joining disjoint AirPlay to a playing player saves membership without changing its peer', async () => {
   const f = await fixture();
   const playbackState = async (id: number) => {
     const row = await f.store.playback.loadPlayerState(id);
@@ -395,27 +370,26 @@ Deno.test('joining AirPlay to a second playing player refuses before either memb
     await f.players.get(1).play();
     await until(() => f.sessions[0]?.bytes > 0);
     await f.persistence.drain();
-    const before = f.outputs.list(),
-      memberships = await f.store.speakers.loadMemberships();
+    const before = f.outputs.get('11');
     const states = [
       await playbackState(1),
       await playbackState(2),
     ];
-    const last = f.outputs.lastCommand(),
-      commands = await f.store.players.list();
     let changes = 0;
     const unsubscribe = f.notify.subscribe((types) => {
       if (types.includes('outputs')) changes++;
     });
-    await busy(() => f.players.join(2, '11'));
-    await busy(() => f.players.setSpeakers(2, ['11', '22']));
+    await f.players.join(2, '22');
     unsubscribe();
-    assertEquals(changes, 0);
-    assertEquals(f.outputs.list(), before);
-    assertEquals(f.outputs.lastCommand(), last);
+    assert(changes > 0);
+    assertEquals(f.outputs.get('11'), before);
     await f.persistence.drain();
-    assertEquals(await f.store.speakers.loadMemberships(), memberships);
-    assertEquals(await f.store.players.list(), commands);
+    assertEquals(
+      (await f.store.speakers.loadMemberships()).map((
+        r,
+      ) => [r.speakerId, r.playerId]),
+      [['11', 1], ['22', 2]],
+    );
     assertEquals([
       await playbackState(1),
       await playbackState(2),
@@ -424,7 +398,7 @@ Deno.test('joining AirPlay to a second playing player refuses before either memb
       'play',
       'play',
     ]);
-    assertEquals(f.sessions.length, 1);
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
     assertEquals(f.sessions[0].closing, false);
   } finally {
     await f.close();
@@ -438,11 +412,12 @@ Deno.test('membership hands the active demand to playback before asynchronous Ai
     f.startGates[0] = held.promise;
     await f.players.join(1, '11');
     await until(() => f.sessions.length === 1);
-    await busy(() => f.players.get(2).play());
+    await f.players.get(2).play();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
     assertEquals(f.sessions[0].bytes, 0);
     held.resolve();
     await until(() => f.sessions[0].bytes > 0);
-    await busy(() => f.players.get(2).play());
+    assertEquals(f.players.get(2).playerView().state, 'play');
     assertEquals(f.players.get(1).playerView().state, 'play');
   } finally {
     held.resolve();
@@ -457,15 +432,21 @@ Deno.test('transfer to a paused player preserves the old spot and cannot start u
     await f.players.get(1).seek({ positionMs: 200 });
     await until(() => f.sessions.some((s) => s.bytes > 0 && !s.closing));
     const active = f.sessions.findLast((s) => !s.closing)!;
+    const oldSessions = f.sessions.filter((s) => s.port === 7001).length;
     active.closeGate = held.promise;
     await f.players.setSpeakers(2, ['11', '22']);
     await until(() => active.closing);
     assertEquals(f.players.get(1).playerView().state, 'pause');
     assertEquals(f.players.get(1).playerView().itemProgressMs, 200);
-    await busy(() => f.players.get(2).play());
-    held.resolve();
-    await until(() => f.sessions.every((s) => s.closed));
     await f.players.get(2).play();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(f.sessions.filter((s) => s.port === 7001).length, oldSessions);
+    assertEquals(active.closed, false);
+    held.resolve();
+    await until(() =>
+      active.closed &&
+      f.sessions.filter((s) => s.port === 7001).length === oldSessions + 1
+    );
     // The fake transport observes the elected shared-feed writer, not native
     // fanout. Both receivers now belong to Kitchen; either may be that writer.
     await until(() => f.sessions.some((s) => !s.closed && s.bytes > 0));
@@ -476,8 +457,8 @@ Deno.test('transfer to a paused player preserves the old spot and cannot start u
   }
 });
 
-for (const mode of ['newest', 'unreachable', 'unknown'] as const) {
-  Deno.test(`household restore ${mode} uses command order, keeps losing queue and spot, and emits only winning PCM`, async () => {
+for (const mode of ['newest', 'unreachable', 'unknown', 'stale'] as const) {
+  Deno.test(`household restore ${mode} independently restores fresh reachable players and keeps queues and spots`, async () => {
     const dir = await dataDir();
     let store = await openStore(dir), h = await household(store);
     try {
@@ -505,7 +486,9 @@ for (const mode of ['newest', 'unreachable', 'unknown'] as const) {
         })),
       });
       await rawSql(store).run(
-        `UPDATE player_state SET updated_at = to_timestamp((${now} - (player_id - 1) * 500) / 1000.0)`,
+        `UPDATE player_state SET updated_at = to_timestamp((${now} - (player_id - 1) * ${
+          mode === 'stale' ? 600000 : 500
+        }) / 1000.0)`,
       );
       if (mode === 'unknown') {
         await rawSql(store).run('UPDATE players SET commanded_at_ms = NULL');
@@ -516,13 +499,17 @@ for (const mode of ['newest', 'unreachable', 'unknown'] as const) {
       await store.close();
       store = await openStore(dir);
       h = await household(store, mode === 'unreachable' ? [7002] : []);
-      const winner = mode === 'newest' ? 2 : 1;
-      await until(() => h.sessions.some((s) => s.bytes > 0));
-      assertEquals(h.sessions.length, 1);
-      assertEquals(h.sessions[0].port, 7000 + winner);
+      const onlyHome = mode === 'unreachable' || mode === 'stale';
+      await until(() =>
+        h.sessions.filter((s) => s.bytes > 0).length === (onlyHome ? 1 : 2)
+      );
+      assertEquals(
+        h.sessions.map((s) => s.port).sort(),
+        onlyHome ? [7001] : [7001, 7002],
+      );
       assertEquals(
         [1, 2].map((id) => h.players.get(id).playerView().state),
-        winner === 1 ? ['play', 'pause'] : ['pause', 'play'],
+        onlyHome ? ['play', 'pause'] : ['play', 'play'],
       );
       for (const id of [1, 2]) {
         assertEquals(h.players.get(id).playerView().itemProgressMs, id * 100);
@@ -542,7 +529,7 @@ for (const mode of ['newest', 'unreachable', 'unknown'] as const) {
   });
 }
 
-Deno.test('OwnTone playback routes report the owning player without changing either engine', async () => {
+Deno.test('OwnTone playback routes command the default player without changing another stream', async () => {
   let h!: Awaited<ReturnType<typeof household>>;
   const f = await apiFixture({
     storeDir: await dataDir(),
@@ -564,6 +551,7 @@ Deno.test('OwnTone playback routes report the owning player without changing eit
     await h.players.get(2).play();
     await until(() => h.sessions[0]?.bytes > 0);
     await h.persistence.drain();
+    const peer = h.players.get(2).playerView(), session = h.sessions[0];
     for (
       const path of [
         'play',
@@ -580,19 +568,19 @@ Deno.test('OwnTone playback routes report the owning player without changing eit
           signal: AbortSignal.timeout(5000),
         },
       );
-      assertEquals(response.status, 500, path);
-      assertEquals(await response.text(), 'AirPlay is busy in Kitchen');
-      assertEquals(h.players.get(1).playerView().state, 'stop');
-      assertEquals(h.players.get(2).playerView().state, 'play');
+      assertEquals(response.status, 204, path);
+      await response.arrayBuffer();
+      assertEquals(h.players.get(2).playerView(), peer);
+      assertEquals(session.closing, false);
     }
-    assertEquals(h.sessions.length, 1);
+    assertEquals(h.sessions.filter((s) => s.port === 7002).length, 1);
   } finally {
     await h.close();
     await f.close();
   }
 });
 
-Deno.test('every OwnTone membership route refuses busy before transfer or preference mutation', async () => {
+Deno.test('every OwnTone membership route transfers exclusive membership without a household busy refusal', async () => {
   let h!: Awaited<ReturnType<typeof household>>;
   const f = await apiFixture({
     storeDir: await dataDir(),
@@ -619,10 +607,6 @@ Deno.test('every OwnTone membership route refuses busy before transfer or prefer
     });
   try {
     const independent = await independentPlayer(h, 1);
-    await h.players.get(2).play();
-    await until(() => h.sessions[0]?.bytes > 0);
-    const before = h.outputs.list();
-    const saved = await f.store.speakers.loadMemberships();
     for (
       const [path, body] of [
         ['22', { selected: true, volume: 12 }],
@@ -630,19 +614,31 @@ Deno.test('every OwnTone membership route refuses busy before transfer or prefer
         ['set', { outputs: [independent, '22'] }],
       ] as const
     ) {
+      await h.players.setSpeakers(1, [independent]);
+      await h.players.setSpeakers(2, ['22']);
+      await h.players.get(2).play();
+      await until(() =>
+        h.sessions.some((s) => s.port === 7002 && s.bytes > 0 && !s.closed)
+      );
       const response = await call(path, body);
-      assertEquals(response.status, 500, path);
-      assertEquals(await response.text(), 'AirPlay is busy in Kitchen');
-      assertEquals(h.outputs.list(), before);
+      assertEquals(response.status, 204, path);
+      await response.arrayBuffer();
+      assertEquals(h.outputs.get('22')?.playerId, 1);
+      if (path === '22') assertEquals(h.outputs.get('22')?.volume, 12);
       await h.persistence.drain();
-      assertEquals(await f.store.speakers.loadMemberships(), saved);
+      assert(
+        (await f.store.speakers.loadMemberships()).some((r) =>
+          r.speakerId === '22' && r.playerId === 1
+        ),
+      );
       assertEquals([1, 2].map((id) => h.players.get(id).playerView().state), [
         'play',
-        'play',
+        'pause',
       ]);
-      assertEquals(h.sessions[0].closing, false);
     }
     // Off on another player's speaker never takes it or pauses its owner.
+    await h.players.setSpeakers(2, ['22']);
+    await h.players.get(2).play();
     const off = await call('22', { selected: false });
     assertEquals(off.status, 204);
     await off.arrayBuffer();

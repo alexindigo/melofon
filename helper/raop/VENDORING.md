@@ -125,7 +125,7 @@ stream on the loop. Failed native release retains its storage and runtime refere
 `tests/raop-stream.test.ts` exercises the shipping public FFI through real UDP,
 ALAC decoding and the independent scheduled receiver model, including both
 attachment-removal orders and concurrent compatibility/explicit contexts.
-Public household capacity remains one until core's separate admission change.
+Core demand/resource ports independently retain each fixed player's stream.
 
 ## Stream-local metadata and crypto
 
@@ -189,8 +189,8 @@ retain 24 source receipts beyond lossy state-ring overflow, and verify exact rea
 PCM plus zero-only declared transport silence. Delayed terminal writes and fresh
 stream incarnations cannot stop a foreign timeline. Encrypted and plaintext
 combinations use the real cipher observer and independent ALAC consumer.
-HTTP still enforces temporary capacity one; native concurrency is not permission
-to bypass core's speaker membership and release barriers.
+HTTP admits concurrent players with disjoint speakers. Native concurrency does
+not bypass core's exclusive speaker membership and receiver release barriers.
 
 ## Exact stream admission
 

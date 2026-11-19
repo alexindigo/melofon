@@ -10,7 +10,7 @@ export interface PlaybackReservation {
   release(): void;
 }
 
-/** A fixed player's port into a boot-declared, single-stream resource. */
+/** Demand and retained resources for one fixed-player stream incarnation. */
 export interface PlaybackCapacity {
   readonly protocol: string;
   reserve(): PlaybackReservation;
@@ -24,31 +24,26 @@ export interface PlaybackCapacity {
  * start can relinquish intent immediately without freeing a closing transport. */
 export function createPlaybackCapacity(deps: {
   protocol: string;
-  busy(owner: CapacityOwner): PlaybackError;
 }) {
   type Occupancy = {
-    owner: () => CapacityOwner;
     epoch: number;
     demands: Set<object>;
     resources: Set<object>;
   };
-  let occupied: Occupancy | undefined;
-  const collect = (slot: Occupancy) => {
-    if (occupied === slot && !slot.demands.size && !slot.resources.size) {
-      occupied = undefined;
-    }
-  };
   return {
-    forPlayer(owner: () => CapacityOwner): PlaybackCapacity {
-      const id = owner().id;
-      const owns = (slot: Occupancy | undefined): boolean =>
-        slot !== undefined && slot.owner().id === id;
+    forPlayer(_owner: () => CapacityOwner): PlaybackCapacity {
+      // The port, not the durable id, owns this incarnation. A deleted/recreated
+      // engine cannot revive an old demand or release its retained storage.
+      let occupied: Occupancy | undefined;
+      const collect = (slot: Occupancy) => {
+        if (occupied === slot && !slot.demands.size && !slot.resources.size) {
+          occupied = undefined;
+        }
+      };
       return {
         protocol: deps.protocol,
         reserve() {
-          if (occupied && !owns(occupied)) throw deps.busy(occupied.owner());
           const slot = occupied ??= {
-            owner,
             epoch: 0,
             demands: new Set(),
             resources: new Set(),
@@ -67,13 +62,13 @@ export function createPlaybackCapacity(deps: {
         authority() {
           const slot = occupied, epoch = slot?.epoch;
           return () =>
-            slot !== undefined && owns(slot) && occupied === slot &&
+            slot !== undefined && occupied === slot &&
             slot.epoch === epoch &&
             slot.demands.size > 0;
         },
         retain() {
           const slot = occupied;
-          if (!slot || !owns(slot) || !slot.demands.size) {
+          if (!slot || !slot.demands.size) {
             throw new PlaybackError(
               'playback_cancelled',
               'Playback reservation expired',

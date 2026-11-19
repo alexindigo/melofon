@@ -4,6 +4,7 @@ import { createOutputs, createPlayer } from '../src/player.ts';
 import { playerOutputs } from '../src/player-outputs.ts';
 import { createPlayback } from '../src/playback.ts';
 import { PlaybackError } from '../src/playback-errors.ts';
+import { createPlaybackCapacity } from '../src/playback-capacity.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
 import { recordingStream } from './helpers/airplay-devices.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
@@ -289,14 +290,31 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
   };
 }
 
-async function busy(command: () => unknown) {
-  const error = await assertRejects(async () => {
-    await command();
-  }, PlaybackError);
-  assertEquals(error.code, 'airplay_busy');
-  assertEquals(error.owner, { id: 1, name: 'Player 1' });
-  assertEquals(error.message, 'AirPlay is busy in Player 1');
-}
+Deno.test('fixed-player capacity ports separate demand epochs, resources and reused durable ids', () => {
+  const capacity = createPlaybackCapacity({ protocol: 'AirPlay' });
+  const a = capacity.forPlayer(() => ({ id: 1, name: 'A' }));
+  const b = capacity.forPlayer(() => ({ id: 2, name: 'B' }));
+  const recreated = capacity.forPlayer(() => ({ id: 1, name: 'A again' }));
+  const first = a.reserve(), other = b.reserve(), fresh = recreated.reserve();
+  const oldAuthority = a.authority(), otherAuthority = b.authority();
+  const resource = a.retain();
+  first.release();
+  assertEquals(oldAuthority(), false);
+  const second = a.reserve(), secondAuthority = a.authority();
+  assertEquals(
+    oldAuthority(),
+    false,
+    'retained resources cannot revive demand',
+  );
+  resource.release();
+  first.release();
+  assert(second.isCurrent() && secondAuthority());
+  assert(other.isCurrent() && otherAuthority() && fresh.isCurrent());
+  second.release();
+  assertEquals(secondAuthority(), false);
+  other.release();
+  fresh.release();
+});
 
 for (const kind of ['songs', 'sources', 'references'] as const) {
   Deno.test(`ordinary ${kind} additions keep request order across slow preparation and playback commands`, async () => {
@@ -408,20 +426,22 @@ Deno.test('pause cancels a queued add-and-play without canceling the ordinary ap
   }
 });
 
-Deno.test('capacity reserves before target preparation; simultaneous starts have one PCM winner', async () => {
+Deno.test('independent demand reserves before slow target preparation without blocking another player', async () => {
   const f = await fixture(), held = deferred();
   try {
     f.targetGates[0] = held.promise;
     const start = f.playback[0].play();
-    await busy(() => f.playback[1].play());
-    assertEquals(f.entered[1].includes('target'), false);
-    assertEquals(f.sessions.length, 0);
+    const authority = f.capacities[0].authority();
+    assert(authority());
+    await f.playback[1].play();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(f.entered[1].includes('target'), true);
+    assertEquals(f.sessions.map((s) => s.port), [7002]);
     held.resolve();
     await start;
-    await until(() => f.sessions[0]?.bytes > 0);
-    assertEquals(f.sessions.length, 1);
-    assertEquals(f.sessions[0].port, 7001);
-    assertEquals(f.playback[1].playerView().state, 'stop');
+    await until(() => f.sessions.some((s) => s.port === 7001 && s.bytes > 0));
+    assertEquals(f.sessions.length, 2);
+    assertEquals(f.playback[1].playerView().state, 'play');
   } finally {
     held.resolve();
     await f.close();
@@ -490,8 +510,10 @@ for (const preparation of ['resolve', 'media', 'ids'] as const) {
         }], { play: true, clear: true });
       const canceled = assertRejects(async () => await start, PlaybackError);
       await until(() => f.entered[0].includes(preparation));
-      await busy(() => f.playback[1].play());
+      const old = f.capacities[0].authority();
+      assert(old());
       f.playback[0].stop();
+      assertEquals(old(), false);
       await f.playback[1].play();
       await until(() => f.sessions[0]?.bytes > 0);
       held.resolve();
@@ -509,12 +531,14 @@ for (const preparation of ['resolve', 'media', 'ids'] as const) {
   });
 }
 
-Deno.test('all explicit start paths use the same typed capacity boundary without mutation', async () => {
+Deno.test('all explicit start paths use independent fixed-player demand without changing the peer', async () => {
   const f = await fixture();
   try {
     await f.playback[0].play();
     await until(() => f.sessions[0]?.bytes > 0);
     const other = f.playback[1], queue = other.queueView();
+    const peer = f.playback[0].playerView(),
+      peerQueue = f.playback[0].queueView();
     for (
       const command of [
         () => other.play(),
@@ -542,12 +566,12 @@ Deno.test('all explicit start paths use the same typed capacity boundary without
           }),
       ]
     ) {
-      await busy(command);
-      assertEquals(other.queueView(), queue);
-      assertEquals(other.playerView().state, 'stop');
+      await command();
+      assertEquals(f.playback[0].playerView(), peer);
+      assertEquals(f.playback[0].queueView(), peerQueue);
     }
     assertEquals(f.playback[0].playerView().state, 'play');
-    assertEquals(f.sessions.length, 1);
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
   } finally {
     await f.close();
   }
@@ -568,11 +592,12 @@ Deno.test('same-player next and seek retain ownership until actual close complet
     live.closeGate = held.promise;
     f.playback[0].pause();
     await until(() => live.closing);
-    await busy(() => f.playback[1].play());
-    held.resolve();
-    await until(() => live.closed);
     await f.playback[1].play();
     await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(live.closed, false);
+    held.resolve();
+    await until(() => live.closed);
+    assertEquals(f.playback[1].playerView().state, 'play');
   } finally {
     held.resolve();
     await f.close();
@@ -588,14 +613,14 @@ Deno.test('canceled activation retains occupancy through real cleanup and sends 
     f.sessions[0].closeGate = close.promise;
     f.playback[0].pause();
     await until(() => f.sessions[0].closing);
-    await busy(() => f.playback[1].play());
+    await f.playback[1].play();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
     start.resolve();
     await sleep(20);
     assertEquals(f.sessions[0].bytes, 0);
     close.resolve();
     await until(() => f.sessions[0].closed);
-    await f.playback[1].play();
-    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(f.playback[1].playerView().state, 'play');
   } finally {
     start.resolve();
     close.resolve();
@@ -603,7 +628,7 @@ Deno.test('canceled activation retains occupancy through real cleanup and sends 
   }
 });
 
-Deno.test('failed transport cleanup keeps shared-stream occupancy blocking other receivers', async () => {
+Deno.test('failed transport cleanup quarantines its stream without blocking other receivers', async () => {
   const f = await fixture();
   try {
     await f.playback[0].play();
@@ -613,14 +638,15 @@ Deno.test('failed transport cleanup keeps shared-stream occupancy blocking other
     await until(() =>
       f.devices.describe('11').session?.connection === 'failed'
     );
-    await busy(() => f.playback[1].play());
+    await f.playback[1].play();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
     await assertRejects(
       () => f.boots[0].close(),
       AggregateError,
       'AirPlay playback stream release failed',
     );
-    await busy(() => f.playback[1].play());
-    assertEquals(f.sessions.length, 1);
+    assertEquals(f.playback[1].playerView().state, 'play');
+    assertEquals(f.sessions.length, 2);
     assertEquals(f.sessions[0].closed, false);
   } finally {
     await assertRejects(
@@ -631,7 +657,7 @@ Deno.test('failed transport cleanup keeps shared-stream occupancy blocking other
   }
 });
 
-Deno.test('published forget succeeds while failed transport cleanup retains shared-stream occupancy', async () => {
+Deno.test('published forget succeeds while failed stream cleanup leaves the peer independent', async () => {
   const f = await fixture();
   try {
     await f.outputs.adopt('11');
@@ -641,14 +667,15 @@ Deno.test('published forget succeeds while failed transport cleanup retains shar
     await f.outputs.forget('11');
     assertEquals(f.outputs.get('11'), null);
     assertEquals(f.playback[0].playerView().state, 'pause');
-    await busy(() => f.playback[1].play());
+    await f.playback[1].play();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
     await assertRejects(
       () => f.boots[0].close(),
       AggregateError,
       'AirPlay playback stream release failed',
     );
-    await busy(() => f.playback[1].play());
-    assertEquals(f.sessions.length, 1);
+    assertEquals(f.playback[1].playerView().state, 'play');
+    assertEquals(f.sessions.length, 2);
     assertEquals(f.sessions[0].closed, false);
   } finally {
     await assertRejects(
@@ -659,25 +686,25 @@ Deno.test('published forget succeeds while failed transport cleanup retains shar
   }
 });
 
-Deno.test('held idle transport remains busy until its connection is released', async () => {
+Deno.test('held idle transport retains its connection without blocking a disjoint player', async () => {
   const f = await fixture();
   try {
     f.outputs.update('11', { connectionStrategy: 'owntone' });
     await f.playback[0].play();
     await until(() => f.sessions[0]?.bytes > 0);
     f.playback[0].pause();
-    await busy(() => f.playback[1].play());
+    await f.playback[1].play();
+    await until(() => f.sessions[1]?.bytes > 0);
     assertEquals(f.sessions[0].closing, false);
     f.outputs.setMembers(1, []);
     await until(() => f.sessions[0].closed);
-    await f.playback[1].play();
-    await until(() => f.sessions[1]?.bytes > 0);
+    assertEquals(f.playback[1].playerView().state, 'play');
   } finally {
     await f.close();
   }
 });
 
-Deno.test('retry resumption cannot steal capacity acquired by a different player', async () => {
+Deno.test('retry resumption reacquires only its own demand while another player keeps playing', async () => {
   const f = await fixture();
   try {
     await f.playback[0].play();
@@ -687,14 +714,11 @@ Deno.test('retry resumption cannot steal capacity acquired by a different player
     await f.playback[1].play();
     await until(() => f.sessions[1]?.bytes > 0);
     f.retry[0][0]();
-    await until(() => f.retry[0].length > 1);
-    assertEquals(f.playback[0].playerView().state, 'pause');
-    assertEquals(f.playback[1].playerView().state, 'play');
-    assertEquals(f.sessions.length, 2);
-    f.playback[1].pause();
-    await until(() => f.sessions[1].closed);
-    f.retry[0][1]();
     await until(() => f.sessions[2]?.bytes > 0);
+    assertEquals(f.playback[0].playerView().state, 'play');
+    assertEquals(f.playback[1].playerView().state, 'play');
+    assertEquals(f.sessions.length, 3);
+    assertEquals(f.sessions[1].closing, false);
     assertEquals(f.sessions[2].port, 7001);
   } finally {
     await f.close();
@@ -734,7 +758,7 @@ Deno.test('prepared activation cannot revive when its reservation is released an
   }
 });
 
-Deno.test('capacity waits for every receiver connection, not just the elected PCM writer', async () => {
+Deno.test('stream retirement waits for every receiver connection without blocking a disjoint stream', async () => {
   const f = await fixture(), held = deferred();
   try {
     f.outputs.register({
@@ -755,11 +779,14 @@ Deno.test('capacity waits for every receiver connection, not just the elected PC
     heldPeer.closeGate = held.promise;
     f.playback[0].stop();
     await until(() => heldPeer.closing && f.sessions.some((s) => s.closed));
-    await busy(() => f.playback[1].play());
-    held.resolve();
-    await until(() => f.sessions.every((s) => s.closed));
     await f.playback[1].play();
     await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(heldPeer.closed, false);
+    held.resolve();
+    await until(() =>
+      f.sessions.filter((s) => s.port !== 7002).every((s) => s.closed)
+    );
+    assertEquals(f.playback[1].playerView().state, 'play');
   } finally {
     held.resolve();
     await f.close();
@@ -780,35 +807,27 @@ Deno.test('natural advancement retains the stream and releases it after end-of-q
     assertEquals(f.playback[0].playerView().current!.id, first);
     assertEquals(f.sessions.length, 1);
     assertEquals(f.sessions[0].closed, false);
-    await busy(() => f.playback[1].play());
+    await f.playback[1].play();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(f.playback[0].playerView().current!.id, first);
     held.resolve();
     await until(() => f.sourceEnds[0].has(first));
     await until(() => f.sourceCompletions[0].has(first));
     await f.playback[0].advanceEnded();
-    await until(() => f.sessions[1]?.bytes > 0);
+    await until(() =>
+      f.sessions.filter((s) => s.port === 7001 && s.bytes > 0).length === 2
+    );
     const second = f.playback[0].playerView().current!.id;
     await until(() => f.sourceEnds[0].has(second));
-    await busy(() => f.playback[1].play());
+    assertEquals(f.playback[1].playerView().state, 'play');
     f.times[0] += f.playback[0].playerView().itemLengthMs + 1;
     await until(() => f.sourceCompletions[0].has(second));
     await f.playback[0].advanceEnded();
     assertEquals(f.playback[0].playerView().state, 'stop');
-    await until(() => f.sessions.every((s) => s.closed));
-    // Last attachment close is not stream-storage release. Observe the public
-    // capacity boundary before asking a different player to acquire it.
-    await until(() => {
-      try {
-        f.capacities[1].reserve().release();
-        return true;
-      } catch (error) {
-        if (
-          !(error instanceof PlaybackError) || error.code !== 'airplay_busy'
-        ) throw error;
-        return false;
-      }
-    });
-    await f.playback[1].play();
-    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    await until(() =>
+      f.sessions.filter((s) => s.port === 7001).every((s) => s.closed)
+    );
+    assertEquals(f.sessions.find((s) => s.port === 7002)!.closed, false);
   } finally {
     held.resolve();
     await f.close();

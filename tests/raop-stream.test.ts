@@ -629,9 +629,29 @@ function deviceFixture(
     },
     ...options,
   });
-  const capacities = [1, 2].map((id) =>
-    devices.capacity.forPlayer(() => ({ id, name: `Stream player ${id}` }))
-  );
+  const retained = [0, 0];
+  const capacities = [1, 2].map((id, index) => {
+    const port = devices.capacity.forPlayer(() => ({
+      id,
+      name: `Stream player ${id}`,
+    }));
+    return {
+      ...port,
+      retain() {
+        const token = port.retain();
+        retained[index]++;
+        let released = false;
+        return {
+          release() {
+            if (released) return;
+            released = true;
+            retained[index]--;
+            token.release();
+          },
+        };
+      },
+    };
+  });
   const prepare = (
     index: number,
     stream: AirplayPlaybackStream,
@@ -664,7 +684,7 @@ function deviceFixture(
     await until('admitted attachment connected', () => ready);
     return result.value;
   };
-  return { outputs, devices, capacities, prepare, activate };
+  return { outputs, devices, capacities, retained, prepare, activate };
 }
 
 for (const removed of [null, 0, 1]) {
@@ -735,10 +755,16 @@ for (const removed of [null, 0, 1]) {
         await libraryProof();
         await Promise.all(attachments.map((attachment) => attachment.close()));
         demand.release();
-        assertThrows(() => f.capacities[1].reserve(), Error, 'AirPlay is busy');
+        assertEquals(
+          f.retained,
+          [1, 0],
+          'last attachment is not native storage release',
+        );
+        f.capacities[1].reserve().release();
         const closing = stream.close();
         assertEquals(stream.close(), closing);
         await closing;
+        assertEquals(f.retained, [0, 0]);
         f.capacities[1].reserve().release();
         await assertRejects(() => stream.pcm(pcm(1)), Error, 'closed');
       } finally {
@@ -763,7 +789,7 @@ Deno.test({
       ),
     );
     const f = deviceFixture(receivers);
-    // Plan b17 removes native capacity only; public capacity assertions stay.
+    // Native stream binding remains independent without a core demand port too.
     const first = f.devices.createStream(), second = f.devices.createStream();
     try {
       await f.activate(0, first);
@@ -819,9 +845,11 @@ Deno.test({
       demand.release();
       const closing = stream.close();
       await until('native stream free entered', () => entered);
-      assertThrows(() => f.capacities[1].reserve(), Error, 'AirPlay is busy');
+      assertEquals(f.retained, [1, 0]);
+      f.capacities[1].reserve().release();
       gate.resolve();
       await closing;
+      assertEquals(f.retained, [0, 0]);
       f.capacities[1].reserve().release();
       await libraryProof();
     } finally {
@@ -878,7 +906,12 @@ Deno.test({
         'failure cannot become a new attempt',
       );
       assertEquals(attempts, 1);
-      assertThrows(() => f.capacities[1].reserve(), Error, 'AirPlay is busy');
+      assertEquals(
+        f.retained,
+        [1, 0],
+        'failed native close keeps its own resource token',
+      );
+      f.capacities[1].reserve().release();
       await assertRejects(() => stream.pcm(pcm(1)), Error, 'closed');
       const permit = await f.prepare(0, stream, f.capacities[0]);
       assert(!permit.ok);
@@ -1116,7 +1149,8 @@ Deno.test('RAOP device stream: failed attachment close still releases siblings a
     );
     assertEquals(nativeAttempts, 1, 'native release is still attempted');
     assertEquals(stream.close(), closing);
-    assertThrows(() => f.capacities[1].reserve(), Error, 'AirPlay is busy');
+    assertEquals(f.retained, [1, 0]);
+    f.capacities[1].reserve().release();
   } finally {
     demand.release();
     f.devices.close();
@@ -1311,9 +1345,8 @@ for (const explicit of [true, false]) {
       assert(closed);
       assertEquals(starts, 0, 'closed attachment cannot subsequently start');
       demand.release();
-      if (explicit) {
-        assertThrows(() => f.capacities[1].reserve(), Error, 'AirPlay is busy');
-      } else f.capacities[1].reserve().release();
+      assertEquals(f.retained, [explicit ? 1 : 0, 0]);
+      f.capacities[1].reserve().release();
       await stream.close();
       assertEquals(frees, explicit ? 1 : 0);
       f.capacities[1].reserve().release();

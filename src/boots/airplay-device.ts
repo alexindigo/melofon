@@ -10,7 +10,6 @@ import {
   createPlaybackCapacity,
   type PlaybackCapacity,
 } from '../playback-capacity.ts';
-import { PlaybackError } from '../playback-errors.ts';
 import { createMdnsResolver, type MdnsResolver } from '../mdns-resolver.ts';
 import type { MdnsService } from '../mdns.ts';
 import type { SpeakerAdapterView, SpeakerSessionView } from '../speakers.ts';
@@ -54,17 +53,9 @@ export function createAirplayDevices(deps: {
   changed?(): void;
 }) {
   const { outputs } = deps;
-  // The native backend has one household stream until independent streams land.
-  // Declaration lives with AirPlay; core only knows the supplied capacity port.
-  const capacity = createPlaybackCapacity({
-    protocol: 'AirPlay',
-    busy: (owner) =>
-      new PlaybackError(
-        'airplay_busy',
-        `AirPlay is busy in ${owner.name}`,
-        owner,
-      ),
-  });
+  // Native storage and demand belong to each fixed-player port. Physical
+  // receiver exclusivity remains with membership and the release chains below.
+  const capacity = createPlaybackCapacity({ protocol: 'AirPlay' });
   const admission = deps.admission ??
     createOutputAdmission({
       endpoint: (id) => {
