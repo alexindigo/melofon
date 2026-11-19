@@ -31,13 +31,14 @@ while (($#)); do
 done
 if [[ -f /run/.containerenv || -f /.dockerenv ]]; then
   export TMPDIR="$PWD/$run_dir"
-  deno run --allow-all scripts/test-runner.ts "${args[@]}"
+  deno run --frozen --allow-all scripts/test-runner.ts "${args[@]}"
   exit $?
 fi
-engine=${CONTAINER_ENGINE:-}
-if [[ -z "$engine" ]]; then
-  if command -v podman >/dev/null; then engine=podman; else engine=docker; fi
+if [[ -z "${CONTAINER_ENGINE:-}" ]]; then
+  if command -v podman >/dev/null; then CONTAINER_ENGINE=podman; else CONTAINER_ENGINE=docker; fi
 fi
+export CONTAINER_ENGINE
+engine="$PWD/.devcontainer/engine"
 image=${MELOFON_TEST_IMAGE:-localhost/melofon-dev:local}
 if [[ -z "${MELOFON_TEST_IMAGE:-}" ]]; then
   "$engine" build --target dev --memory=12g --memory-swap=12g \
@@ -46,13 +47,10 @@ else
   "$engine" image inspect "$image" >/dev/null
 fi
 network="melofon-test-$(basename "$run_dir" | tr '[:upper:]' '[:lower:]')-$$"
-CONTAINER_ENGINE="$engine" bash .devcontainer/network "$network"
+bash .devcontainer/network "$network"
 user_args=(--user="$(id -u):$(id -g)")
-if [[ "$("$engine" --version)" == *podman* ]]; then
-  user_args+=(--userns=keep-id)
-fi
 "$engine" run --rm --init --memory=12g --memory-swap=12g --pids-limit=4096 --cpus=8 \
   "${user_args[@]}" --network="$network" --network-alias=melofon.home \
   -v "$PWD:/app" -w /app -e "TMPDIR=/app/$run_dir" \
   -e "MELOFON_BROWSER_TESTS=${MELOFON_BROWSER_TESTS:-}" \
-  --entrypoint deno "$image" run --allow-all scripts/test-runner.ts "${args[@]}"
+  --entrypoint deno "$image" run --frozen --allow-all scripts/test-runner.ts "${args[@]}"

@@ -37,6 +37,55 @@ async function command(cmd: string, args: string[]) {
   }
 }
 
+async function nativeOutputs(directory: string): Promise<string> {
+  const files: string[] = [];
+  async function visit(path: string) {
+    for await (const entry of Deno.readDir(path)) {
+      const child = `${path}/${entry.name}`;
+      if (entry.isDirectory) await visit(child);
+      else if (
+        entry.isFile &&
+        (/\.(o|so)$/.test(entry.name) || child === `${directory}/test/driver`)
+      ) files.push(child);
+    }
+  }
+  await visit(directory);
+  const hashes = await Promise.all(
+    files.sort().map(async (path) => {
+      const hash = await crypto.subtle.digest(
+        'SHA-256',
+        await Deno.readFile(path),
+      );
+      return [path, Array.from(new Uint8Array(hash))];
+    }),
+  );
+  return JSON.stringify(hashes);
+}
+
+export async function buildNative(
+  directory = 'helper/raop',
+  imageIdFile = '/usr/local/share/melofon-native-build-id',
+  run = command,
+) {
+  const imageId = await Deno.readTextFile(imageIdFile);
+  const identity = () =>
+    nativeOutputs(directory).then((outputs) =>
+      JSON.stringify({ imageId, outputs })
+    );
+  const stamp = `${directory}/.dev-image-id`;
+  let previous: string | undefined;
+  try {
+    previous = await Deno.readTextFile(stamp);
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
+  if (previous !== await identity()) {
+    await run('make', ['-C', directory, 'clean']);
+  }
+  await run('make', ['-C', directory, '-j4', 'test']);
+  await Deno.writeTextFile(stamp, await identity());
+}
+
 async function main() {
   const started = performance.now();
   let count = 4, only: number | undefined, checkOnly = false;
@@ -69,7 +118,7 @@ async function main() {
   await command(Deno.execPath(), ['task', 'check']);
   await command(Deno.execPath(), ['check', 'scripts/test-runner.ts']);
   if (checkOnly) return;
-  await command('make', ['-C', 'helper/raop', '-j4', 'test']);
+  await buildNative();
   const files: string[] = [];
   for await (const entry of Deno.readDir('tests')) {
     if (entry.isFile && entry.name.endsWith('.ts')) {

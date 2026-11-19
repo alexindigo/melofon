@@ -47,7 +47,8 @@ WORKDIR /app
 FROM native-base AS dev
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ca-certificates ffmpeg python3 iproute2 util-linux \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/* \
+  && cat /proc/sys/kernel/random/uuid > /usr/local/share/melofon-native-build-id
 ENV DENO_DIR=/app/.test-tmp/deno
 ENV MELOFON_RAOP_LIB=/app/helper/raop/libmelofon_raop.so
 CMD ["sleep", "infinity"]

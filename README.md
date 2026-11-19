@@ -5,11 +5,19 @@ Greenfield replacement for Navidrome (OpenSubsonic stays so existing apps keep w
 
 ## Development and testing
 
-Open the checkout in its devcontainer using rootless Podman and run
-`scripts/test` there, or run it from the host (Podman preferred; `CONTAINER_ENGINE=docker`
+Open the checkout in its devcontainer and run `scripts/test` there, or run it
+from the host (Podman preferred; `CONTAINER_ENGINE=docker`
 also works). Both use the shared Dockerfile's `dev` target with Deno 2.9.6
 and native dependencies. The checkout is bind-mounted, never copied.
 No devcontainer CLI or host Deno installation is required for `scripts/test`.
+
+For Dev Containers, use `.devcontainer/engine` as the client's Docker executable
+(VS Code's `dev.containers.dockerPath`: the absolute path to that file), or run
+`devcontainer up --docker-path "$PWD/.devcontainer/engine" --workspace-folder .`.
+It defaults to Docker. For rootless Podman, launch that client with
+`CONTAINER_ENGINE=podman` in its environment. Network initialization and startup
+then share that selection; only Podman receives `keep-id`. The container user's
+UID/GID is updated to match the host so both engines can write the mounted tree.
 
 The runner checks formatting, lint and types, builds and probes the native
 helper, then runs all test files in four parallel, round-robin shards.
@@ -24,8 +32,11 @@ select no tests. Checks and native probes still run in selected mode.
 Each run uses a private bridge network with `melofon.home` resolving to the
 container itself, no published ports or host networking. Temp files and the
 Deno cache stay in the ignored `.test-tmp/` workspace directory; run-specific
-temp files are removed on exit. Limits are 8 CPUs, 12 GiB memory with no swap
+temp files are removed on exit. Limits are up to 8 host CPUs, 12 GiB memory with no swap
 and 4096 processes. GitHub CI uses the same image, checks and four shard commands.
+Dependency resolution is frozen to the committed lockfile. Native outputs are
+cleaned on the first run in a new dev image, then reused incrementally in that
+image; rebuilding its dependency layer invalidates the native build stamp.
 
 Chromium is not in the dev image. Browser media tests clearly report skipped
 when it is absent; `MELOFON_BROWSER_TESTS=1` makes absence a failure. The later

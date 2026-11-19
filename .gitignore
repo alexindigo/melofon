@@ -10,3 +10,4 @@ helper/raop/test/driver
 helper/raop/test/*.so
 helper/raop/test/probe_*
 !helper/raop/test/probe_*.c
+.dev-image-id

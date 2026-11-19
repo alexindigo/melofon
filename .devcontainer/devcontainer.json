@@ -8,7 +8,7 @@
   "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
   "workspaceFolder": "/app",
   "containerUser": "deno",
-  "updateRemoteUserUID": false,
+  "updateRemoteUserUID": true,
   "containerEnv": {
     "TMPDIR": "/app/.test-tmp/shell"
   },
@@ -23,7 +23,6 @@
     "--memory-swap=12g",
     "--pids-limit=4096",
     "--cpus=8",
-    "--userns=keep-id:uid=1993,gid=1993",
     "--network=melofon-dev-${localWorkspaceFolderBasename}",
     "--network-alias=melofon.home"
   ],
