@@ -2,6 +2,7 @@
 .env
 data/
 node_modules/
+.test-tmp/
 helper/raop/*.o
 helper/raop/**/*.o
 helper/raop/libmelofon_raop.so

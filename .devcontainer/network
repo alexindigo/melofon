@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# A user-defined bridge supplies DNS for the container's own test hostname.
+engine=${CONTAINER_ENGINE:-}
+if [[ -z "$engine" ]]; then
+  if command -v podman >/dev/null; then engine=podman; else engine=docker; fi
+fi
+if ! "$engine" network inspect "$1" >/dev/null 2>&1; then
+  "$engine" network create "$1" >/dev/null
+fi

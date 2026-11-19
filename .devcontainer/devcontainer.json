@@ -1,11 +1,31 @@
 {
   "name": "melofon",
-  "dockerFile": "Dockerfile",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "target": "dev"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
+  "workspaceFolder": "/app",
+  "containerUser": "deno",
+  "updateRemoteUserUID": false,
+  "containerEnv": {
+    "TMPDIR": "/app/.test-tmp/shell"
+  },
+  "postCreateCommand": "mkdir -p .test-tmp/shell",
+  "initializeCommand": [
+    "bash",
+    ".devcontainer/network",
+    "melofon-dev-${localWorkspaceFolderBasename}"
+  ],
   "runArgs": [
-    "--memory=4g",
-    "--memory-swap=4g",
-    "--pids-limit=256",
-    "--cpus=2"
+    "--memory=12g",
+    "--memory-swap=12g",
+    "--pids-limit=4096",
+    "--cpus=8",
+    "--userns=keep-id:uid=1993,gid=1993",
+    "--network=melofon-dev-${localWorkspaceFolderBasename}",
+    "--network-alias=melofon.home"
   ],
   "forwardPorts": [8000],
   "customizations": {

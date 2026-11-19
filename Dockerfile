@@ -32,8 +32,8 @@
 # default; PUT /_/config/airplay.mdns to toggle) needs LAN multicast: run
 # with --network host or a macvlan network, or turn discovery off.
 
-# --- Build stage: compile the RAOP FFI library (users never see a compiler).
-FROM denoland/deno:2.9.6 AS build
+# Shared native dependencies. The dev target stops before any source COPY.
+FROM denoland/deno:2.9.6 AS native-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config \
     libevent-dev \
@@ -42,6 +42,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libplist-dev libunistring-dev uuid-dev libcurl4-openssl-dev \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+
+# Development and CI use a bind-mounted checkout, not an image source snapshot.
+FROM native-base AS dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates ffmpeg python3 iproute2 util-linux \
+  && rm -rf /var/lib/apt/lists/*
+ENV DENO_DIR=/app/.test-tmp/deno
+ENV MELOFON_RAOP_LIB=/app/helper/raop/libmelofon_raop.so
+CMD ["sleep", "infinity"]
+
+# --- Build stage: compile the RAOP FFI library (users never see a compiler).
+FROM native-base AS build
 COPY . .
 RUN make -C helper/raop
 
