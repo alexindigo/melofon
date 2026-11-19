@@ -8,10 +8,53 @@ export function selectFiles(files: string[], changes?: string[]): string[] {
   return files.filter((path) => relevant.includes(path));
 }
 
-export function shardFiles(files: string[], count: number): string[][] {
+export function shardFiles(
+  files: string[],
+  count: number,
+  timings: Record<string, number> = {},
+): string[][] {
   const shards: string[][] = Array.from({ length: count }, () => []);
-  [...files].sort().forEach((file, i) => shards[i % count].push(file));
+  const measured = Object.values(timings).filter((time) =>
+    time > 0 && Number.isFinite(time)
+  );
+  const fallback = measured.length
+    ? measured.reduce((a, b) => a + b, 0) / measured.length
+    : 1;
+  const weight = (file: string) =>
+    timings[file] > 0 && Number.isFinite(timings[file])
+      ? timings[file]
+      : fallback;
+  const loads = Array<number>(count).fill(0);
+  [...files].sort((a, b) => weight(b) - weight(a) || a.localeCompare(b))
+    .forEach((file) => {
+      const index = loads.indexOf(Math.min(...loads));
+      shards[index].push(file);
+      loads[index] += weight(file);
+    });
   return shards;
+}
+
+// Advisory weights from top-level test durations, excluding indented steps.
+// Setup/typechecking overhead is included separately in shard wall times.
+export function parseFileTimes(text: string): Record<string, number> {
+  const times: Record<string, number> = {};
+  let file: string | undefined;
+  for (const line of text.split('\n')) {
+    const heading = /^running \d+ tests? from \.\/(tests\/[^\s]+\.ts)$/.exec(
+      line,
+    );
+    if (heading) {
+      file = heading[1];
+      times[file] = 0.01;
+    } else if (file && /^\S.* \.\.\. (?:ok|FAILED) \(/.test(line)) {
+      const duration = / \(([^()]*)\)$/.exec(line)?.[1] ?? '';
+      for (const part of duration.matchAll(/([\d.]+)(ms|µs|s|m|h)/g)) {
+        times[file] += +part[1] *
+          ({ ms: 0.001, 'µs': 0.000001, s: 1, m: 60, h: 3600 }[part[2]] ?? 0);
+      }
+    }
+  }
+  return times;
 }
 
 export function parseSummary(text: string) {
@@ -82,42 +125,22 @@ export async function buildNative(
   if (previous !== await identity()) {
     await run('make', ['-C', directory, 'clean']);
   }
-  await run('make', ['-C', directory, '-j4', 'test']);
+  await run('make', ['-C', directory, '-j1', 'test']);
   await Deno.writeTextFile(stamp, await identity());
 }
 
-async function main() {
-  const started = performance.now();
-  let count = 4, only: number | undefined, checkOnly = false;
-  let changes: string[] | undefined;
-  for (let i = 0; i < Deno.args.length; i++) {
-    const arg = Deno.args[i];
-    if (arg === '--check-only') checkOnly = true;
-    else if (arg === '--changed-file') {
-      changes = (await Deno.readTextFile(Deno.args[++i])).split('\0').filter(
-        Boolean,
-      );
-    } else if (arg === '--shards') {
-      const value = Deno.args[++i];
-      if (!/^[1-9]\d*$/.test(value ?? '')) {
-        throw new Error('Invalid shard count');
-      }
-      count = Number(value);
-    } else if (arg === '--shard') {
-      const match = /^(\d+)\/([1-9]\d*)$/.exec(Deno.args[++i] ?? '');
-      if (!match || +match[1] < 1 || +match[1] > +match[2]) {
-        throw new Error('Use --shard i/N with 1 <= i <= N');
-      }
-      only = +match[1] - 1;
-      count = +match[2];
-    } else throw new Error(`Unknown option: ${arg}`);
-  }
-  if (!Number.isSafeInteger(count) || (only !== undefined && only >= count)) {
-    throw new Error('Invalid shard count');
-  }
+type Plan = { shards: string[][]; started: number };
+type Result = {
+  success: boolean;
+  seconds: number;
+  summary?: ReturnType<typeof parseSummary>;
+  timings: Record<string, number>;
+};
+
+async function prepare(directory: string, count: number, changesFile?: string) {
   await command(Deno.execPath(), ['task', 'check']);
   await command(Deno.execPath(), ['check', 'scripts/test-runner.ts']);
-  if (checkOnly) return;
+  if (Deno.args.includes('--check-only')) return;
   await buildNative();
   const files: string[] = [];
   for await (const entry of Deno.readDir('tests')) {
@@ -125,20 +148,50 @@ async function main() {
       files.push(`tests/${entry.name}`);
     }
   }
+  const changes = changesFile
+    ? (await Deno.readTextFile(changesFile)).split('\0').filter(Boolean)
+    : undefined;
   const selected = selectFiles(files, changes);
   console.log(`Selected ${selected.length}/${files.length} test files`);
-  const shards = shardFiles(selected, count);
+  const timings = JSON.parse(
+    await Deno.readTextFile('scripts/test-timings.json'),
+  );
+  const shards = shardFiles(selected, count, timings);
   // Populate dependencies once before concurrent test processes share the cache.
   if (selected.length) {
     await command(Deno.execPath(), ['cache', '--frozen', ...selected]);
   }
-  const results = await Promise.all(shards.map(async (files, index) => {
-    if ((only !== undefined && index !== only) || !files.length) {
-      return undefined;
-    }
-    const tmp = `${Deno.env.get('TMPDIR')}/shard-${index + 1}`;
+  await Deno.writeTextFile(
+    `${directory}/plan.json`,
+    JSON.stringify({ shards, started: Date.now() }),
+  );
+  for (let i = 0; i < shards.length; i++) {
+    const estimate = shards[i].reduce(
+      (sum, file) => sum + (timings[file] ?? 0),
+      0,
+    );
+    console.log(
+      `Planned shard ${i + 1}/${count}: ${shards[i].length} files, ${
+        estimate.toFixed(2)
+      }s measured tests`,
+    );
+  }
+}
+
+async function runShard(directory: string, plan: Plan, index: number) {
+  const started = performance.now();
+  const files = plan.shards[index - 1];
+  if (!files) throw new Error('Invalid shard index');
+  let result: Result = {
+    success: true,
+    seconds: 0,
+    summary: { passed: 0, failed: 0, ignored: 0 },
+    timings: {},
+  };
+  if (files.length) {
+    const tmp = `${Deno.env.get('TMPDIR')}/shard-${index}`;
     await Deno.mkdir(tmp, { recursive: true });
-    console.log(`Shard ${index + 1}/${count}: ${files.length} files`);
+    console.log(`Shard ${index}/${plan.shards.length}: ${files.length} files`);
     const output = await new Deno.Command(Deno.execPath(), {
       args: [
         'test',
@@ -156,33 +209,102 @@ async function main() {
     }).output();
     const decoder = new TextDecoder();
     const stdout = decoder.decode(output.stdout);
-    console.log(`\n--- Shard ${index + 1}/${count} (exit ${output.code}) ---`);
+    console.log(
+      `\n--- Shard ${index}/${plan.shards.length} (exit ${output.code}) ---`,
+    );
     console.log(stdout);
     const stderr = decoder.decode(output.stderr);
     if (stderr) console.error(stderr);
     const summary = parseSummary(stdout);
-    if (!summary) console.error(`Shard ${index + 1}: no final test summary`);
-    return {
+    if (!summary) console.error(`Shard ${index}: no final test summary`);
+    result = {
       success: output.success && summary !== undefined && summary.failed === 0,
+      seconds: 0,
       summary,
+      timings: parseFileTimes(stdout),
     };
-  }));
+  }
+  result.seconds = (performance.now() - started) / 1000;
+  await Deno.writeTextFile(
+    `${directory}/shard-${index}.json`,
+    JSON.stringify(result),
+  );
+  console.log(
+    `Shard ${index}/${plan.shards.length}: ${
+      result.seconds.toFixed(2)
+    }s wall; ${result.success ? 'passed' : 'FAILED'}`,
+  );
+  if (!result.success) Deno.exitCode = 1;
+}
+
+async function summarize(directory: string, plan: Plan, only?: number) {
   const totals = { passed: 0, failed: 0, ignored: 0 };
-  for (const result of results) {
-    if (!result?.summary) continue;
-    for (const key of ['passed', 'failed', 'ignored'] as const) {
-      totals[key] += result.summary[key];
+  const timings: Record<string, number> = {};
+  let failed = 0;
+  for (let index = 1; index <= plan.shards.length; index++) {
+    if (only !== undefined && index !== only) continue;
+    try {
+      const result: Result = JSON.parse(
+        await Deno.readTextFile(`${directory}/shard-${index}.json`),
+      );
+      if (!result.success) failed++;
+      if (result.summary) {
+        for (const key of ['passed', 'failed', 'ignored'] as const) {
+          totals[key] += result.summary[key];
+        }
+      }
+      Object.assign(timings, result.timings);
+      console.log(
+        `Shard ${index}/${plan.shards.length}: ${
+          result.seconds.toFixed(2)
+        }s wall; ${result.success ? 'passed' : 'FAILED'}`,
+      );
+    } catch (error) {
+      console.error(`Shard ${index}: missing/invalid result`, error);
+      failed++;
     }
   }
-  console.log(
-    `\nCombined: ${totals.passed} passed | ${totals.failed} failed | ${totals.ignored} ignored; ${
-      results.filter((result) => result && !result.success).length
-    } failing shards; ${
-      ((performance.now() - started) / 1000).toFixed(2)
-    }s wall`,
+  const sorted = Object.fromEntries(
+    Object.keys(timings).sort().map((
+      file,
+    ) => [file, +timings[file].toFixed(3)]),
   );
-  if (results.some((result) => result && !result.success)) {
-    Deno.exitCode = 1;
+  await Deno.writeTextFile(
+    `${directory}/timings.json`,
+    JSON.stringify(sorted, null, 2) + '\n',
+  );
+  console.log(
+    `\nCombined: ${totals.passed} passed | ${totals.failed} failed | ${totals.ignored} ignored; ${failed} failing shards; ${
+      ((Date.now() - plan.started) / 1000).toFixed(2)
+    }s shard wall`,
+  );
+  if (failed) Deno.exitCode = 1;
+}
+
+async function main() {
+  const [mode, directory, ...args] = Deno.args;
+  if (!directory) throw new Error('A run directory is required');
+  if (mode === 'prepare') {
+    const count = Number(args[0]);
+    if (!Number.isSafeInteger(count) || count < 1) {
+      throw new Error('Invalid shard count');
+    }
+    await prepare(
+      directory,
+      count,
+      args[1] === '--check-only' ? undefined : args[1],
+    );
+  } else {
+    const plan: Plan = JSON.parse(
+      await Deno.readTextFile(`${directory}/plan.json`),
+    );
+    if (mode === 'run-shard' && plan.shards.length !== Number(args[1])) {
+      throw new Error('Prepared shard count differs from --shard i/N');
+    }
+    if (mode === 'run-shard') await runShard(directory, plan, Number(args[0]));
+    else if (mode === 'summarize') {
+      await summarize(directory, plan, args[0] ? Number(args[0]) : undefined);
+    } else throw new Error(`Unknown mode: ${mode}`);
   }
 }
 

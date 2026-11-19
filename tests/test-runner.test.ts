@@ -1,6 +1,7 @@
 import { assertEquals, assertMatch, assertRejects } from '@std/assert';
 import {
   buildNative,
+  parseFileTimes,
   parseSummary,
   selectFiles,
   shardFiles,
@@ -32,6 +33,24 @@ Deno.test('test runner: selection is conservative for shared changes', () => {
   ) {
     assertEquals(selectFiles(files, [path]), files);
   }
+});
+
+Deno.test('test runner: longest measured files are assigned to the lightest shard', () => {
+  const timings = { a: 10, b: 8, c: 4, d: 2 };
+  assertEquals(shardFiles(['d', 'c', 'b', 'a'], 2, timings), [['a', 'd'], [
+    'b',
+    'c',
+  ]]);
+  assertEquals(shardFiles(['new', 'a'], 2, timings), [['a'], ['new']]);
+  assertEquals(shardFiles(['a', 'b'], 4, timings), [['a'], ['b'], [], []]);
+});
+
+Deno.test('test runner: file timings exclude nested steps and parse duration units', () => {
+  const times = parseFileTimes(
+    'running 2 tests from ./tests/a.ts\nfirst ... ok (1m2s)\n  step ... ok (2s)\nsecond ... FAILED (500ms)\nrunning 1 test from ./tests/b.ts\nfast ... ok (100µs)\n',
+  );
+  assertEquals(+times['tests/a.ts'].toFixed(2), 62.51);
+  assertEquals(+times['tests/b.ts'].toFixed(4), 0.0101);
 });
 
 Deno.test('test runner: only the final summary counts, crashes lack a summary', () => {
@@ -200,6 +219,143 @@ Deno.test('test runner: launcher and check task reject incomplete locks without 
       assertEquals(output.success, false);
       assertMatch(new TextDecoder().decode(output.stderr), /lockfile.*frozen/s);
       assertEquals(await Deno.readTextFile(`${dir}/deno.lock`), text);
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('test runner: launcher isolates concurrent shards and propagates failures', async () => {
+  const dir = await Deno.makeTempDir({ dir: '.test-tmp', prefix: 'runner-' });
+  try {
+    const log = `${dir}/calls`;
+    const stub = `${dir}/podman`;
+    await Deno.writeTextFile(
+      stub,
+      `#!/bin/bash
+set -eu
+if [[ "$1" == --version ]]; then echo 'podman stub'; exit; fi
+printf '%s\\0' "$@" >> "$CALL_LOG"
+printf '\\n' >> "$CALL_LOG"
+if [[ "$1" == network && "$2" == inspect ]]; then exit 1; fi
+if [[ "$1" == image && "$2" == inspect ]]; then echo test-image-id; exit; fi
+if [[ "$1" != run ]]; then exit; fi
+while [[ "$1" != scripts/test-runner.ts ]]; do shift; done
+shift
+mode=$1; directory=$2
+case "$mode" in
+  prepare)
+    printf '{"shards":[[],[],[]],"started":0}' > "$directory/plan.json" ;;
+  run-shard)
+    index=$3
+    touch "$directory/started-$index"
+    for ((attempt=0; attempt<200; attempt++)); do
+      if [[ -f "$directory/started-1" && -f "$directory/started-2" && -f "$directory/started-3" ]]; then break; fi
+      sleep 0.05
+    done
+    [[ -f "$directory/started-1" && -f "$directory/started-2" && -f "$directory/started-3" ]] || exit 1
+    if [[ "\${FAIL_SHARD:-}" == "$index" ]]; then exit 1; fi
+    printf '{"success":true,"seconds":0.3,"summary":{"passed":1,"failed":0,"ignored":0},"timings":{}}' > "$directory/shard-$index.json" ;;
+  summarize) exec "$DENO_EXEC" run --frozen --allow-all scripts/test-runner.ts "$@" ;;
+esac
+`,
+    );
+    await Deno.chmod(stub, 0o755);
+    await Deno.writeTextFile(
+      `${dir}/nproc`,
+      '#!/bin/bash\necho "${CPU_COUNT:-3}"\n',
+    );
+    await Deno.chmod(`${dir}/nproc`, 0o755);
+    for (const fail of ['', '2']) {
+      const results = `${dir}/results`;
+      await Deno.writeTextFile(log, '');
+      const output = await new Deno.Command('bash', {
+        args: ['scripts/test', '--results', results],
+        env: {
+          PATH: `${Deno.cwd()}/${dir}:${Deno.env.get('PATH')}`,
+          CONTAINER_ENGINE: 'podman',
+          MELOFON_TEST_IMAGE: 'test-image',
+          CALL_LOG: `${Deno.cwd()}/${log}`,
+          DENO_EXEC: Deno.execPath(),
+          FAIL_SHARD: fail,
+        },
+      }).output();
+      assertEquals(
+        output.code,
+        fail ? 1 : 0,
+        new TextDecoder().decode(output.stderr),
+      );
+      const stdout = new TextDecoder().decode(output.stdout);
+      assertMatch(
+        stdout,
+        fail
+          ? /Combined: 2 passed.*1 failing shards/
+          : /Combined: 3 passed.*0 failing shards/,
+      );
+      const calls = (await Deno.readTextFile(log)).trim().split('\n').map((
+        line,
+      ) => line.split('\0').filter(Boolean));
+      const runs = calls.filter((call) => call[0] === 'run');
+      assertEquals(runs.length, 5); // one preparation, three shards, one summary
+      for (const run of runs) {
+        for (
+          const arg of [
+            '--cpus=1',
+            '--memory=2g',
+            '--memory-swap=2g',
+            '--pids-limit=512',
+            'test-image-id',
+          ]
+        ) {
+          assertEquals(run.includes(arg), true, arg);
+        }
+      }
+      const shards = runs.filter((run) => run.includes('run-shard'));
+      assertEquals(
+        new Set(
+          shards.map((run) => run.find((arg) => arg.startsWith('--network='))),
+        ).size,
+        3,
+      );
+      // Each stub waits for all three start markers before it can finish.
+      for (const i of [1, 2, 3]) await Deno.stat(`${results}/started-${i}`);
+    }
+    const results = `${dir}/results`;
+    for (
+      const [args, count] of [
+        [['--prepared', results, '--shard', '2/3'], undefined],
+        [['--prepare-only', results], '8'],
+        [['--prepare-only', results, '--shards', '2'], '2'],
+      ] as const
+    ) {
+      await Deno.writeTextFile(log, '');
+      const output = await new Deno.Command('bash', {
+        args: ['scripts/test', ...args],
+        env: {
+          PATH: `${Deno.cwd()}/${dir}:${Deno.env.get('PATH')}`,
+          CONTAINER_ENGINE: 'podman',
+          MELOFON_TEST_IMAGE: 'test-image',
+          CALL_LOG: `${Deno.cwd()}/${log}`,
+          DENO_EXEC: Deno.execPath(),
+          CPU_COUNT: '24',
+        },
+      }).output();
+      assertEquals(output.code, 0, new TextDecoder().decode(output.stderr));
+      const calls = (await Deno.readTextFile(log)).trim().split('\n').map((
+        line,
+      ) => line.split('\0').filter(Boolean));
+      const runs = calls.filter((call) => call[0] === 'run');
+      if (count) {
+        assertEquals(runs.length, 1);
+        assertEquals(runs[0].at(-1), count);
+      } else {
+        assertEquals(runs.length, 2);
+        assertEquals(runs.some((run) => run.includes('prepare')), false);
+        assertMatch(
+          new TextDecoder().decode(output.stdout),
+          /Combined: 1 passed.*0 failing shards/,
+        );
+      }
     }
   } finally {
     await Deno.remove(dir, { recursive: true });
