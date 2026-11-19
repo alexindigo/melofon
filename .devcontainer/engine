@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Use this entry point for both Dev Containers and network initialization.
+# Docker is the Dev Containers default; scripts/test explicitly selects its engine.
+engine=${CONTAINER_ENGINE:-docker}
+args=("$@")
+if [[ "${1:-}" == run || "${1:-}" == build ]]; then
+  cpus=$(nproc)
+  if (( cpus > 8 )); then cpus=8; fi
+  for i in "${!args[@]}"; do
+    case "${args[$i]}" in
+      --cpus=8) args[$i]="--cpus=$cpus" ;;
+      --cpu-quota=800000) args[$i]="--cpu-quota=$((cpus * 100000))" ;;
+    esac
+  done
+  if [[ "$1" == run && "$("$engine" --version)" == *[Pp]odman* ]]; then
+    # The devcontainer updates deno's UID/GID to the host; scripts/test uses
+    # the host UID/GID directly. Both therefore use the same keep-id mapping.
+    args=(run --userns=keep-id "${args[@]:1}")
+  fi
+fi
+exec "$engine" "${args[@]}"

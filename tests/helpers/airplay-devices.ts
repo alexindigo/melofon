@@ -1,6 +1,7 @@
 // Explicit acquired receiver facts for lifecycle tests; never production fallback.
 import type { Outputs } from '../../src/player.ts';
 import { createAirplayDevices } from '../../src/boots/airplay-device.ts';
+import { createOperationScope } from '../../src/operations.ts';
 import {
   type AirplayCompletionKey,
   type AirplayExactStream,
@@ -39,6 +40,9 @@ export function recordingStream(
   return () => {
     const id = ++incarnation;
     let epoch = 1n;
+    let writers = createOperationScope('recording stream input');
+    let barrier = Promise.resolve();
+    let closing: Promise<void> | undefined;
     type Peer = {
       id: bigint;
       transport: AirplayTransport;
@@ -64,6 +68,45 @@ export function recordingStream(
       required: BigInt(peers.size),
       attachments: [],
     });
+    function resetInput(control = () => Promise.resolve()) {
+      const previous = barrier;
+      const settled = Promise.withResolvers<void>();
+      barrier = settled.promise;
+      const old = writers;
+      writers = createOperationScope('recording stream input');
+      const joined = old.close();
+      cancelPcm();
+      // Submit control at the fence, as the real ordered stream does. Its ACK
+      // and all admitted writers still belong to the reset readiness receipt.
+      let applied: Promise<void>;
+      try {
+        applied = control();
+      } catch (error) {
+        applied = Promise.reject(error);
+      }
+      void Promise.allSettled([previous, joined, applied]).then((results) => {
+        const failed = results.find((result) => result.status === 'rejected');
+        if (failed?.status === 'rejected') settled.reject(failed.reason);
+        else settled.resolve();
+      });
+      return settled.promise;
+    }
+    function write(chunk: Uint8Array, captured = epoch) {
+      if (closing) {
+        return Promise.reject(new Error('recording stream is closed'));
+      }
+      const ready = barrier;
+      return writers.run(async (operation) => {
+        await ready;
+        if (operation.signal.aborted || captured !== epoch) return false;
+        const results = await Promise.allSettled(
+          [...peers].filter((p) => p.ready).map((p) => p.transport.pcm(chunk)),
+        );
+        const failed = results.find((result) => result.status === 'rejected');
+        if (failed?.status === 'rejected') throw failed.reason;
+        return !operation.signal.aborted && captured === epoch;
+      });
+    }
     const api: AirplayTimelineStream = {
       id,
       get epoch() {
@@ -79,17 +122,13 @@ export function recordingStream(
             status: 'canceled',
           };
         }
-        await Promise.all(
-          [...peers].filter((p) => p.ready).map((p) =>
-            p.transport.pcm(input.pcm)
-          ),
-        );
+        const accepted = await write(input.pcm, input.epoch);
         return {
           streamId: id,
           epoch: input.epoch,
           segment: input.segment,
-          acceptedFrames: BigInt(input.pcm.length / 4),
-          status: 'accepted',
+          acceptedFrames: accepted ? BigInt(input.pcm.length / 4) : 0n,
+          status: accepted ? 'accepted' : 'canceled',
         };
       },
       async appendSource(input) {
@@ -201,15 +240,16 @@ export function recordingStream(
         if (epoch !== captured) throw new Error('stale fixture epoch');
         epoch++;
         inputFrames = 0n;
-        cancelPcm();
-        await Promise.all(
-          [...peers].map((p) =>
-            retire.includes(p.id)
-              ? p.close()
-              : p.ready
-              ? p.transport.send({ cmd: 'flush' })
-              : Promise.resolve()
-          ),
+        await resetInput(() =>
+          Promise.all(
+            [...peers].map((p) =>
+              retire.includes(p.id)
+                ? p.close()
+                : p.ready
+                ? p.transport.send({ cmd: 'flush' })
+                : Promise.resolve()
+            ),
+          ).then(() => {})
         );
         return {
           streamId: id,
@@ -259,18 +299,31 @@ export function recordingStream(
         };
       },
       async pcm(chunk) {
-        await Promise.all(
-          [...peers].filter((p) => p.ready).map((p) => p.transport.pcm(chunk)),
-        );
+        await write(chunk);
       },
       cancelPcm,
       reset() {
-        cancelPcm();
-        return Promise.resolve();
+        return resetInput();
       },
-      async close() {
+      close() {
+        if (closing) return closing;
+        const settled = Promise.withResolvers<void>();
+        closing = settled.promise;
+        const joined = writers.close();
         cancelPcm();
-        await Promise.all([...peers].map((p) => p.close()));
+        void Promise.allSettled([
+          barrier,
+          joined,
+          ...[...peers].map((p) => p.close()),
+        ])
+          .then((results) => {
+            const failed = results.find((result) =>
+              result.status === 'rejected'
+            );
+            if (failed?.status === 'rejected') settled.reject(failed.reason);
+            else settled.resolve();
+          });
+        return closing;
       },
     };
     return api;

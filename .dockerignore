@@ -1,5 +1,6 @@
 .git
 node_modules
+.test-tmp
 data
 .env
 .envrc
@@ -7,3 +8,6 @@ helper/raop/*.o
 helper/raop/**/*.o
 helper/raop/libmelofon_raop.so
 helper/raop/test/driver
+helper/raop/test/*.so
+helper/raop/test/probe_*
+!helper/raop/test/probe_*.c

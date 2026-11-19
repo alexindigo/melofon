@@ -213,6 +213,55 @@ for (const refresh of ['sync', 'timing'] as const) {
   });
 }
 
+Deno.test('scheduled receiver: inconsistent refresh cannot move emitted presentation backward', () => {
+  const capture = fixture();
+  capture.wire.push({
+    kind: 'control',
+    atMs: START + 100.5 * 1000 / 44100,
+    data: sync(88000),
+    peer: endpoints.senderControl,
+    local: endpoints.control,
+  });
+  const actual = renderScheduledAudio(capture, 4000);
+  assertEquals(actual.issues, []);
+  assertEquals(actual.pcm, pcm(0, 704));
+  for (let i = 1; i < actual.ranges.length; i++) {
+    assert(actual.ranges[i].atMs >= actual.ranges[i - 1].endMs - 1e-7);
+  }
+});
+
+for (const refreshed of [false, true]) {
+  Deno.test(`scheduled receiver: presentation frontier cannot resurrect a missing earlier packet${refreshed ? ' after a forward refresh' : ''}`, () => {
+    const capture = fixture();
+    capture.wire[4].atMs = START + 500.5 * 1000 / 44100;
+    if (refreshed) {
+      capture.wire.push({
+        kind: 'control',
+        atMs: START + 452.5 * 1000 / 44100,
+        data: sync(88400),
+        peer: endpoints.senderControl,
+        local: endpoints.control,
+      });
+    }
+    const actual = renderScheduledAudio(capture, 4000);
+    assertEquals(actual.issues, []);
+    assertEquals(actual.pcm, pcm(352));
+    assertEquals(actual.discarded, [{
+      reason: 'late',
+      epoch: 1,
+      timestamp: FIRST,
+      frames: 352,
+    }]);
+    for (let i = 1; i < actual.ranges.length; i++) {
+      assertEquals(
+        actual.ranges[i].timestamp,
+        actual.ranges[i - 1].timestamp + actual.ranges[i - 1].frames,
+      );
+      assert(actual.ranges[i].atMs >= actual.ranges[i - 1].endMs - 1e-7);
+    }
+  });
+}
+
 for (const kind of ['flush', 'teardown', 'close'] as const) {
   Deno.test(`scheduled receiver: complete arrival still truncates at ${kind}`, () => {
     const capture = fixture();

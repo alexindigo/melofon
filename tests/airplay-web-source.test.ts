@@ -27,6 +27,76 @@ import { httpRadio, icyBlock } from './helpers/http-radio.ts';
 
 const command = { kind: 'internal' as const, via: 'web-source-consumer' };
 
+function receiverReadiness(count: number) {
+  const connected = new Set<symbol>();
+  return {
+    wrap: (
+      spawn: import('../src/boots/airplay-profile.ts').AirplaySpawn,
+    ): import('../src/boots/airplay-profile.ts').AirplaySpawn =>
+    (event) => {
+      const attachment = Symbol('attachment');
+      const driver = spawn((name, value) => {
+        if (name === 'state') {
+          if (value === 'connected') connected.add(attachment);
+          else connected.delete(attachment);
+        }
+        event(name, value);
+      });
+      return {
+        ...driver,
+        transport: {
+          send: (command) => driver.transport.send(command),
+          pcm: (chunk) => driver.transport.pcm(chunk),
+          cancelPcm: () => driver.transport.cancelPcm(),
+          ownsSharedFeed: () => driver.transport.ownsSharedFeed(),
+          close() {
+            connected.delete(attachment);
+            return driver.transport.close();
+          },
+        },
+      };
+    },
+    async wait() {
+      await until(() => connected.size >= count);
+    },
+  };
+}
+
+Deno.test('web source readiness permits reopening with the same connected attachments', async () => {
+  const gate = receiverReadiness(2);
+  const events: import('../src/boots/airplay-profile.ts').HelperEventFn[] = [];
+  const spawn: import('../src/boots/airplay-profile.ts').AirplaySpawn = (
+    event,
+  ) => {
+    events.push(event);
+    return {
+      start: () => Promise.resolve(),
+      transport: {
+        send: () => Promise.resolve(),
+        pcm: () => Promise.resolve(),
+        cancelPcm() {},
+        ownsSharedFeed: () => false,
+        close: () => Promise.resolve(),
+      },
+    };
+  };
+  const wrapped = gate.wrap(spawn);
+  wrapped(() => {});
+  wrapped(() => {});
+  events.forEach((event) => event('state', 'connected'));
+  await gate.wait();
+  await gate.wait();
+  events[0]('state', 'failed');
+  let ready = false;
+  const waiting = gate.wait().then(() => {
+    ready = true;
+  });
+  await new Promise((done) => setTimeout(done, 20));
+  assertEquals(ready, false, 'a failed attachment no longer counts');
+  events[0]('state', 'connected');
+  await waiting;
+});
+
 Deno.test('core station and URL sources deliver exact ICY-stripped audio to two native receivers with one connection', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'airplay-web-source-' });
   const pcm = (await speakerMedia(dir)).slice(0, 352 * 400 * 4);
@@ -80,7 +150,8 @@ Deno.test('core station and URL sources deliver exact ICY-stripped audio to two 
   let devices: ReturnType<typeof createTestAirplayDevices> | undefined;
   let playback: ReturnType<typeof createPlayback> | undefined;
   let resolve!: ReturnType<typeof createQueueResolver>;
-  let stationId = '', opens = 0, connected = 0;
+  let stationId = '', opens = 0;
+  const readiness = receiverReadiness(receivers.length);
   let f: Awaited<ReturnType<typeof apiFixture>> | undefined;
   try {
     f = await apiFixture({
@@ -122,11 +193,7 @@ Deno.test('core station and URL sources deliver exact ICY-stripped audio to two 
           undefined,
           mapStream(
             createFfiStream,
-            (spawn) => (event) =>
-              spawn((name, value) => {
-                if (name === 'state' && value === 'connected') connected++;
-                event(name, value);
-              }),
+            readiness.wrap,
           ),
         );
         playback = createPlayback({
@@ -156,7 +223,7 @@ Deno.test('core station and URL sources deliver exact ICY-stripped audio to two 
           sources: {
             async open(input, options) {
               opens++;
-              await until(() => connected >= opens * 2);
+              await readiness.wait();
               return sources.open(input, options);
             },
           },

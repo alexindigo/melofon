@@ -314,7 +314,10 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
   ret = read(p->timer_fd, &overrun, sizeof(overrun));
   if (ret <= 0)
     {
-      if (errno != EAGAIN) raop_player_failed(p, RAOP_PROGRESS_TRANSPORT);
+      if (errno != EAGAIN) {
+        raop_player_failed(p, RAOP_PROGRESS_TRANSPORT);
+        raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_TRANSPORT);
+      }
       return;
     }
   else if (overrun > 0)
@@ -363,6 +366,12 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           break;
         }
       size_t real = n / 4;
+      /* Establish the epoch coordinate before recording any transport range. */
+      if (!p->clock_started) {
+        clock_gettime(CLOCK_MONOTONIC, &p->pts_base);
+        p->pts_samples = 0;
+        p->clock_started = true;
+      }
       if (timeline) {
         /* A short real read is not a padded tick. B continues A's partial
          * packet; only final EOF or an actual empty-input underrun adds zeros. */
@@ -423,14 +432,6 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
       }
       pthread_mutex_unlock(&p->pcm_lock);
 
-      if (!p->clock_started)
-        {
-          /* OwnTone anchors start_ts on the first source_read — which is
-           * after the timer starts, never during the handshake. */
-          clock_gettime(CLOCK_MONOTONIC, &p->pts_base);
-          p->pts_samples = 0;
-          p->clock_started = true;
-        }
       if (!p->peak_logged)
         {
           helper_log_event(E_LOG, L_RAOP, "pcm_peak", &(struct helper_log_fields){
@@ -913,9 +914,9 @@ raop_player_flush(struct raop_player *p)
   memset(&p->failure, 0, sizeof(p->failure));
   if (p->timeline && p->timeline->enabled) {
     memset(p->timeline, 0, sizeof(*p->timeline));
-    p->pts_samples = 0;
-    p->clock_started = false;
   }
+  p->pts_samples = 0;
+  p->clock_started = false;
   pthread_mutex_unlock(&p->pcm_lock);
 }
 
@@ -986,20 +987,18 @@ raop_player_drain_complete(struct raop_player *p)
 {
   pthread_mutex_lock(&p->pcm_lock);
   struct timeline *t = p->timeline;
-  bool ready = t && t->ended && (!t->end_target || p->failure.error);
-  /* A terminal failed cohort is not an ended transport. Its healthy peers must
-   * still receive the queued tail while core observes/revises that receipt.
-   * Keep the exclusive end independently of reclaimable source/range markers. */
-  if (t && t->ended && t->tail_reached) {
-    struct raop_progress_snapshot progress;
+  struct raop_progress_snapshot progress;
+  bool complete = t && t->ended && t->tail_reached && !t->padding_left &&
+    !p->failure.error && !evbuffer_get_length(p->pcm);
+  if (complete) {
     raop_transport_progress(p->stream_id, 0, monotonic_ns(), &progress);
-    if (progress.participants && progress.status == 1 &&
-        progress.submitted_frames >= t->transport_end &&
-        progress.scheduled_frames >= t->transport_end) ready = true;
+    complete = progress.participants && progress.status == 1 &&
+      progress.submitted_frames >= t->transport_end &&
+      progress.scheduled_frames >= t->transport_end;
   }
-  if (ready) t->complete = true;
+  if (complete) t->complete = true;
   pthread_mutex_unlock(&p->pcm_lock);
-  if (ready) raop_player_session_stopped(p);
+  if (complete) raop_player_session_stopped(p);
 }
 
 /* Loop thread: the start command's item (title/artist/len) and the TXT

@@ -114,6 +114,8 @@ export function renderScheduledAudio(
   let originSequence = 0, originTimestamp = 0, highestSequence = 0;
   let ssrc: number | null = null;
   let latency = 0;
+  let presentationEnd: number | null = null;
+  let presentationFrame = 0;
 
   const startMs = (packet: Queued): number | null => {
     if (!clock || !sync) return null;
@@ -135,9 +137,26 @@ export function renderScheduledAudio(
   };
   const advance = (atMs: number) => {
     for (const packet of queued.sort((a, b) => a.timestamp - b.timestamp)) {
-      const start = startMs(packet);
-      if (start === null) continue;
       const frames = packet.pcm.length / 4;
+      // Emitted RTP coordinates cannot become audible again when a refreshed
+      // mapping moves their presentation into the future. Preserve continuation
+      // exactly at the frontier, including partially rendered packets.
+      if (presentationEnd !== null) {
+        discard(
+          packet,
+          Math.min(frames, presentationFrame - packet.timestamp) - packet.used,
+          'late',
+        );
+      }
+      if (packet.used >= frames) continue;
+      const mapped = startMs(packet);
+      if (mapped === null) continue;
+      // A refresh can refine future scheduling, never rewrite time already
+      // rendered. Carry one frontier across packets and fractional advances.
+      const start = presentationEnd === null ? mapped : Math.max(
+        mapped,
+        presentationEnd - (presentationFrame - packet.timestamp) * 1000 / RATE,
+      );
       result.lastPresentationAtMs = Math.max(
         result.lastPresentationAtMs ?? -Infinity,
         start + frames * 1000 / RATE,
@@ -180,6 +199,8 @@ export function renderScheduledAudio(
         pcm: packet.pcm.slice(packet.used * 4, due * 4),
       });
       packet.used = due;
+      presentationEnd = start + due * 1000 / RATE;
+      presentationFrame = packet.timestamp + due;
     }
   };
   const reset = (reason: string) => {
@@ -193,6 +214,7 @@ export function renderScheduledAudio(
     seen.clear();
     sync = null;
     ssrc = null;
+    presentationEnd = null;
   };
   const rtpInfo = (text: string): boolean => {
     const match = /^seq=(\d+);rtptime=(\d+)$/.exec(text);

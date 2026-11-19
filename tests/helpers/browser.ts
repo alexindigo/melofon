@@ -2,6 +2,26 @@ import { assert } from '@std/assert';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Skip only an absent browser, not a broken installed browser. */
+export async function browserTestsIgnored() {
+  try {
+    const output = await new Deno.Command('chromium', { args: ['--version'] })
+      .output();
+    assert(output.success, 'Installed Chromium failed its version check');
+    return false;
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+    assert(
+      Deno.env.get('MELOFON_BROWSER_TESTS') !== '1',
+      'MELOFON_BROWSER_TESTS=1 requires chromium on PATH',
+    );
+    console.log(
+      'SKIP browser media tests: chromium is not installed (MELOFON_BROWSER_TESTS=1 requires it)',
+    );
+    return true;
+  }
+}
+
 /** Raw CDP, like the existing Kosmozoo driver; no browser package dependency. */
 export async function chromium() {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-chromium-' });

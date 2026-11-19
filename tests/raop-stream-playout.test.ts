@@ -1,7 +1,11 @@
 // Ordered timeline ingress -> shipping native library -> independently scheduled
 // UDP/ALAC consumer. Scheduled progress is not a terminal completion receipt.
 import { assert, assertEquals, assertRejects } from '@std/assert';
-import { createFfiStream, raopFfiInternals } from '../src/boots/raop-ffi.ts';
+import {
+  createFfiSpawn,
+  createFfiStream,
+  raopFfiInternals,
+} from '../src/boots/raop-ffi.ts';
 import {
   type AirplayCompletionKey,
   type AirplayRangeSnapshot,
@@ -89,8 +93,10 @@ async function append(
   source: bigint,
   bytes: Uint8Array,
   segment = source,
+  timeoutMs = 15000,
 ) {
   let offset = 0;
+  const deadline = performance.now() + timeoutMs;
   do {
     const r = await stream.appendSource({
       epoch: stream.epoch,
@@ -103,6 +109,13 @@ async function append(
       JSON.stringify(r, (_, v) => typeof v === 'bigint' ? String(v) : v),
     );
     offset += Number(r.acceptedFrames) * 4;
+    if (offset < bytes.length && performance.now() >= deadline) {
+      throw new Error(
+        `stalled append source=${source} offset=${offset / 4} receipt=${
+          JSON.stringify(r, (_, v) => typeof v === 'bigint' ? String(v) : v)
+        }`,
+      );
+    }
     if (r.status === 'backpressure') await sleep();
   } while (offset < bytes.length);
 }
@@ -1815,7 +1828,7 @@ for (const heldFrames of [4410n, 110250n]) {
   });
 }
 
-test('completion revised failure cannot wait forever for an unsubmitted healthy suffix', async () => {
+test('completion revised receiver failure preserves the unsubmitted healthy suffix', async () => {
   const stream = createFfiStream();
   const healthy = await startFakeRaop({
     captureAudio: true,
@@ -1839,10 +1852,16 @@ test('completion revised failure cannot wait forever for an unsubmitted healthy 
     assertEquals((await stream.waitCompletion(identity)).status, 'failed');
     const revised = await stream.reviseCompletion(identity, [b.id]);
     const result = await stream.waitCompletion(revised);
-    assertEquals(result.status, 'failed');
+    assertEquals(result.status, 'complete');
     assertEquals(
       result.attachments.find((peer) => peer.attachment === a.id)!.outcome,
-      'failed',
+      'complete',
+    );
+    await rendered(
+      stream,
+      healthy,
+      Number(result.transportEnd),
+      new Map([[highSource, pcm(44100)]]),
     );
     assertEquals((await stream.cancel(stream.epoch)).status, 'ready');
     assertEquals(await stream.pollCompletion(revised), result);
@@ -1877,5 +1896,455 @@ test('completion failed RECORD settles the captured source before any PCM submis
   } finally {
     await stream.close();
     receiver.close();
+  }
+});
+
+test('review withdrawal cannot stop an ended source with queued real PCM', async () => {
+  const stream = createFfiStream();
+  const healthy = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const lost = await startFakeRaop({ captureAudio: true, captureWire: true });
+  const a = stream.attach(() => {}), b = stream.attach(() => {});
+  const bytes = pcm(88200, 31);
+  try {
+    // Capture the cohort before either attachment starts: withdrawal must not
+    // turn terminal receipt state into evidence of exhausted ingress.
+    await append(stream, highSource, bytes);
+    await stream.seal(stream.epoch, highSource, 88200n);
+    await stream.endStream(stream.epoch, 88200n);
+    const identity = key(stream, highSource, 88200n);
+    await b.transport.close();
+    const failed = await stream.waitCompletion(identity);
+    await a.start(profile(healthy), item);
+    await until(
+      'surviving receiver consumes every queued frame',
+      async () =>
+        (await stream.source(stream.epoch, highSource))!.fedFrames === 88200n,
+    );
+    const revised = await stream.reviseCompletion(identity, [b.id]);
+    assertEquals((await stream.waitCompletion(revised)).status, 'complete');
+    await rendered(stream, healthy, 88200, new Map([[highSource, bytes]]));
+    assertEquals(await stream.pollCompletion(identity), failed);
+    await libraryProof();
+  } finally {
+    await stream.close();
+    healthy.close();
+    lost.close();
+  }
+});
+
+for (const together of [false, true]) {
+  test(`review revisions refresh sequential withdrawals with ${together ? 'joint' : 'separate'} exclusions without changing old results`, async () => {
+    const stream = createFfiStream();
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const a = stream.attach(() => {}),
+      b = stream.attach(() => {}),
+      c = stream.attach(() => {});
+    const bytes = pcm(882, 49);
+    try {
+      await append(stream, highSource, bytes);
+      await stream.seal(stream.epoch, highSource, 882n);
+      const identity = key(stream, highSource, 882n);
+      await a.transport.close();
+      const failed = await stream.waitCompletion(identity);
+      assertEquals(
+        failed.attachments.find((p) => p.attachment === b.id)!.outcome,
+        'pending',
+      );
+      await b.transport.close();
+      // Refresh is needed both to permit excluding B now and to retain its loss
+      // when the caller excludes only A first.
+      const revised = await stream.reviseCompletion(
+        identity,
+        together ? [a.id, b.id] : [a.id],
+      );
+      const next = await stream.pollCompletion(revised);
+      assertEquals(
+        next!.attachments.find((p) => p.attachment === b.id)!.outcome,
+        'withdrawn',
+      );
+      if (!together) assertEquals(next!.status, 'failed');
+      const last = together
+        ? revised
+        : await stream.reviseCompletion(revised, [b.id]);
+      await stream.endStream(stream.epoch, 882n);
+      await c.start(profile(receiver), item);
+      assertEquals((await stream.waitCompletion(last)).status, 'complete');
+      await rendered(stream, receiver, 882, new Map([[highSource, bytes]]));
+      assertEquals(await stream.pollCompletion(identity), failed);
+      await libraryProof();
+    } finally {
+      await stream.close();
+      receiver.close();
+    }
+  });
+}
+
+test('progress review attachment startup failure cannot fail a healthy shared player', async () => {
+  const mode =
+    'review attachment startup failure cannot fail a healthy shared player';
+  if (Deno.env.get('RAOP_PROGRESS_CASE') !== mode) {
+    return await progressChild(mode);
+  }
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const a = stream.attach(() => {});
+  let failed = false;
+  const b = stream.attach((name, value) => {
+    if (name === 'state' && value === 'failed') failed = true;
+  });
+  const bytes = pcm(704, 92);
+  try {
+    await a.start(profile(receiver), item);
+    await append(stream, highSource, bytes.subarray(0, 352 * 4));
+    await until(
+      'healthy prefix submitted',
+      () => receiver.sessions[0]?.audioPackets > 0,
+    );
+    await b.start({ ...profile(receiver), host: 'invalid host' }, item);
+    await until('only bad attachment fails', () => failed);
+    assertEquals((await stream.progress(stream.epoch))!.error, 'none');
+    await append(stream, highSource, bytes.subarray(352 * 4));
+    await stream.seal(stream.epoch, highSource, 704n);
+    await stream.endStream(stream.epoch, 704n);
+    const identity = key(stream, highSource, 704n);
+    const failure = await stream.waitCompletion(identity);
+    assertEquals(
+      failure.attachments.find((p) => p.attachment === b.id)!.outcome,
+      'failed',
+    );
+    const revised = await stream.reviseCompletion(identity, [b.id]);
+    assertEquals((await stream.waitCompletion(revised)).status, 'complete');
+    const end = (await stream.pollCompletion(revised))!.transportEnd;
+    await rendered(
+      stream,
+      receiver,
+      Number(end),
+      new Map([[highSource, bytes]]),
+    );
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+test('review exact playback cancel starts contiguous timeline ranges at zero', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const a = stream.attach(() => {});
+  const bytes = pcm(882, 81);
+  try {
+    await a.start(profile(receiver), item);
+    await stream.append({ epoch: stream.epoch, segment: 1n, pcm: pcm(704) });
+    await until(
+      'exact input dispatched',
+      () => receiver.sessions[0]?.audioPackets >= 2,
+    );
+    const old = stream.epoch;
+    await stream.cancel(old);
+    await append(stream, highSource, bytes);
+    await stream.seal(stream.epoch, highSource, 882n);
+    await stream.endStream(stream.epoch, 882n);
+    await until(
+      'new source dispatched',
+      async () =>
+        (await stream.source(stream.epoch, highSource))!.fedFrames === 882n,
+    );
+    const all = await ranges(stream);
+    assertEquals(all[0].transportStart, 0n);
+    assertEquals(
+      (await stream.waitCompletion(key(stream, highSource, 882n))).status,
+      'complete',
+    );
+    await until(
+      'replacement is independently rendered',
+      () =>
+        renderScheduledAudio(receiver.sessions[0], receiver.nowMs()).ranges
+          .filter((r) => r.epoch === 2).reduce((n, r) => n + r.frames, 0) >=
+          1056,
+    );
+    const replay = renderScheduledAudio(receiver.sessions[0], receiver.nowMs());
+    assertEquals(replay.issues, []);
+    const actual = new Uint8Array(
+      replay.ranges.filter((r) => r.epoch === 2).flatMap((r) => [...r.pcm]),
+    );
+    accounted(actual, await ranges(stream), new Map([[highSource, bytes]]));
+    await stream.ackCancel(old);
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+for (
+  const mode of [
+    'review timer',
+    'review compatibility fanout',
+    'review shared failure',
+  ]
+) {
+  test(`progress ${mode}`, async () => {
+    if (Deno.env.get('RAOP_PROGRESS_CASE') !== mode) {
+      return await progressChild(mode);
+    }
+    const stream = mode !== 'review compatibility fanout'
+      ? createFfiStream()
+      : undefined;
+    const receiver = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const second = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const arm = `${Deno.env.get('RAOP_PROGRESS_DIRECTORY')}/arm`;
+    let connected = 0;
+    const event = (name: string, value?: string) => {
+      if (name === 'state' && value === 'connected') connected++;
+    };
+    const spawn = createFfiSpawn();
+    const a = stream ? stream.attach(event) : spawn(event);
+    const secondAttachment = mode === 'review shared failure'
+      ? stream?.attach(event)
+      : undefined;
+    const b = stream ? secondAttachment : spawn(event);
+    try {
+      if (stream && mode === 'review shared failure') {
+        await a.start(profile(receiver), item);
+        await b!.start(profile(second), item);
+        await until('both attachments ready', () => connected === 2);
+        await append(stream, highSource, pcm(88200));
+        await stream.seal(stream.epoch, highSource, 88200n);
+        const identity = key(stream, highSource, 88200n);
+        await until(
+          'initial packet before shared encoder failure',
+          () =>
+            receiver.sessions[0].audioPackets > 0 &&
+            second.sessions[0].audioPackets > 0,
+        );
+        Deno.env.set('RAOP_PROGRESS_FAULT', 'encoder');
+        await Deno.writeTextFile(
+          arm,
+          'fail shared encoder with unsubmitted suffix',
+        );
+        const failed = await stream.waitCompletion(identity);
+        assertEquals(failed.status, 'failed');
+        assert(
+          failed.attachments.every((p) =>
+            p.outcome === 'failed' && p.error === 'encoder'
+          ),
+        );
+        const revised = await stream.reviseCompletion(identity, [
+          secondAttachment!.id,
+        ]);
+        assertEquals((await stream.waitCompletion(revised)).status, 'failed');
+        assertEquals(await stream.pollCompletion(identity), failed);
+      } else if (stream) {
+        await append(stream, highSource, pcm(704));
+        await stream.seal(stream.epoch, highSource, 704n);
+        Deno.env.set('RAOP_PROGRESS_FAULT', 'timer');
+        await Deno.writeTextFile(arm, 'fail next timer read');
+        await a.start(profile(receiver), item);
+        await until(
+          'timer failure settles source receipt',
+          async () =>
+            (await stream.pollCompletion(key(stream, highSource, 704n)))!
+              .status === 'failed',
+        );
+        assertEquals((await stream.progress(stream.epoch))!.error, 'transport');
+        assertEquals(receiver.sessions[0].audioPackets, 0);
+      } else {
+        await a.start(profile(receiver), item);
+        await b!.start(profile(second), item);
+        await until('two compatibility sessions ready', () => connected === 2);
+        Deno.env.set('RAOP_PROGRESS_FAULT', 'send');
+        Deno.env.set('RAOP_PROGRESS_SEND_SKIP', '1');
+        await Deno.writeTextFile(arm, 'fail later fanout peer only');
+        const bytes = pcm(352 * 20, 54);
+        await b!.transport.pcm(bytes);
+        await until(
+          'successful compatibility peer receives full suffix',
+          () => second.sessions[0].audioPackets >= 20,
+        );
+        assertEquals(
+          decodeReceiverAudio(
+            second.sessions[0].sdp,
+            second.sessions[0].audioPayloads,
+          ),
+          bytes,
+        );
+        await until(
+          'successful compatibility suffix reaches presentation',
+          () =>
+            renderScheduledAudio(second.sessions[0], second.nowMs()).pcm
+              .length === bytes.length,
+        );
+        const replay = renderScheduledAudio(second.sessions[0], second.nowMs());
+        assertEquals(replay.issues, []);
+        assertEquals(replay.pcm, bytes);
+      }
+      await libraryProof();
+    } finally {
+      await a.transport.close();
+      await b?.transport.close();
+      await stream?.close();
+      receiver.close();
+      second.close();
+    }
+  });
+}
+
+for (const compatibility of [false, true]) {
+  const mode = `review mixed masters ${
+    compatibility ? 'compatibility' : 'timeline'
+  }`;
+  test(`progress ${mode}`, async () => {
+    if (Deno.env.get('RAOP_PROGRESS_CASE') !== mode) {
+      return await progressChild(mode);
+    }
+    const stream = compatibility ? undefined : createFfiStream();
+    const healthy = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const lost = await startFakeRaop({ captureAudio: true, captureWire: true });
+    let connected = 0, failed = false;
+    const event = (name: string, value?: string) => {
+      if (name === 'state' && value === 'connected') connected++;
+      if (name === 'state' && value === 'failed') failed = true;
+    };
+    const spawn = createFfiSpawn();
+    const a = stream ? stream.attach(event) : spawn(event);
+    const lostAttachment = stream?.attach(event);
+    const b = lostAttachment ?? spawn(event);
+    const bytes = pcm(352 * 20, 67);
+    try {
+      // A distinct encryption master is prepended to the native master list.
+      // Its only peer fails before the older healthy master sees this PCM.
+      await a.start(profile(healthy), item);
+      await b.start(
+        { ...profile(lost), encrypt: true, devtype: 'other' },
+        item,
+      );
+      await until('mixed master attachments ready', () => connected === 2);
+      Deno.env.set('RAOP_PROGRESS_FAULT', 'send');
+      await Deno.writeTextFile(
+        `${Deno.env.get('RAOP_PROGRESS_DIRECTORY')}/arm`,
+        'fail first master send',
+      );
+      if (stream) {
+        await append(stream, highSource, bytes);
+        await stream.seal(stream.epoch, highSource, BigInt(bytes.length / 4));
+        await stream.endStream(stream.epoch, BigInt(bytes.length / 4));
+      } else await a.transport.pcm(bytes);
+      await until('encrypted attachment alone fails', () => failed);
+      assertEquals(lost.sessions[0].audioPackets, 0);
+      assert(lost.sessions[0].sdp.includes('a=aesiv:'));
+      await until(
+        'healthy master receives every input packet',
+        () => healthy.sessions[0].audioPackets >= 20,
+      );
+      assertEquals(
+        decodeReceiverAudio(
+          healthy.sessions[0].sdp,
+          healthy.sessions[0].audioPayloads,
+        ).subarray(0, 4),
+        bytes.subarray(0, 4),
+        'healthy master retains the first source frame',
+      );
+      if (stream) {
+        const identity = key(stream, highSource, BigInt(bytes.length / 4));
+        const failedReceipt = await stream.waitCompletion(identity);
+        assertEquals(failedReceipt.status, 'failed');
+        const revised = await stream.reviseCompletion(identity, [
+          lostAttachment!.id,
+        ]);
+        assertEquals((await stream.waitCompletion(revised)).status, 'complete');
+        await rendered(
+          stream,
+          healthy,
+          bytes.length / 4,
+          new Map([[highSource, bytes]]),
+        );
+        assertEquals(await stream.pollCompletion(identity), failedReceipt);
+      } else {
+        assertEquals(
+          decodeReceiverAudio(
+            healthy.sessions[0].sdp,
+            healthy.sessions[0].audioPayloads,
+          ),
+          bytes,
+        );
+        await until(
+          'healthy master schedules every input frame',
+          () =>
+            renderScheduledAudio(healthy.sessions[0], healthy.nowMs()).pcm
+              .length === bytes.length,
+        );
+        const replay = renderScheduledAudio(
+          healthy.sessions[0],
+          healthy.nowMs(),
+        );
+        assertEquals(replay.issues, []);
+        assertEquals(replay.discarded, []);
+        assertEquals(replay.pcm, bytes);
+        for (let i = 1; i < replay.ranges.length; i++) {
+          assertEquals(
+            replay.ranges[i].timestamp,
+            replay.ranges[i - 1].timestamp + replay.ranges[i - 1].frames,
+          );
+        }
+      }
+      await libraryProof();
+    } finally {
+      await a.transport.close();
+      await b.transport.close();
+      await stream?.close();
+      healthy.close();
+      lost.close();
+    }
+  });
+}
+
+test('review append helper bounds stalled admission and reports source offset and receipt', async () => {
+  let release = false;
+  const fake = {
+    epoch: 1n,
+    appendSource: () =>
+      Promise.resolve({
+        status: release ? 'accepted' : 'backpressure',
+        acceptedFrames: release ? 1n : 0n,
+      }),
+  } as unknown as Stream;
+  const pending = append(fake, 91n, pcm(1), 92n, 20);
+  try {
+    await assertRejects(
+      () =>
+        Promise.race([
+          pending,
+          sleep(100).then(() => {
+            throw new Error('unbounded helper');
+          }),
+        ]),
+      Error,
+      'source=91 offset=0',
+    );
+  } finally {
+    release = true;
+    await pending.catch(() => {});
   }
 });
