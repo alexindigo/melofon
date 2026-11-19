@@ -41,9 +41,14 @@ GitHub CI prepares checks/native outputs once, then runs eight separate shard jo
 with the same limits and a combined summary. `MELOFON_CI_RUNNER` is the repository
 variable for switching every job's runner label (default `ubuntu-24.04`). CI transfers
 the exact prepared dev image and native binaries, not source snapshots.
-Dependency resolution is frozen to the committed lockfile. Native outputs are
-cleaned on the first run in a new dev image, then reused incrementally in that
-image; rebuilding its dependency layer invalidates the native build stamp.
+Dependency resolution is frozen to the committed lockfile.
+Prepared dependencies include every checked-in TypeScript entry (including
+subprocess fixtures, Workers and dynamically discovered routes), with an offline
+resolution check before any shard starts. CI transfers the Deno cache and npm
+modules alongside native outputs; shards run with `--cached-only`.
+Native outputs are cleaned on the first run in a new dev image, then reused
+incrementally in that image; rebuilding its dependency layer invalidates the native
+build stamp.
 
 Chromium is not in the dev image. Browser media tests clearly report skipped
 when it is absent; `MELOFON_BROWSER_TESTS=1` makes absence a failure. The later
