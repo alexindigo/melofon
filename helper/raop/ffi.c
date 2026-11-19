@@ -198,6 +198,8 @@ typedef struct raop_handle raop_t;
 
 struct cancel_receipt {
   struct raop_cancel_result result;
+  uint64_t source;
+  struct raop_progress_snapshot source_cutoff;
   size_t retire_count;
   uint64_t *retire_ids;
   cmd **retire_commands;
@@ -1433,6 +1435,18 @@ raop_stream_end(raop_stream_t *stream, uint64_t epoch, uint64_t target,
 }
 
 int
+raop_stream_compatibility_silence(raop_stream_t *stream, uint64_t epoch, uint64_t source)
+{
+  if (!stream || !epoch || !source) return -1;
+  uint64_t status = RAOP_APPEND_ERROR, error = RAOP_APPEND_ERROR_INVALID;
+  pthread_mutex_lock(&rt.lock);
+  int rc = timeline_admit_locked(stream, epoch, &status, &error)
+    ? raop_player_compatibility_silence(stream->player, source) : -1;
+  pthread_mutex_unlock(&rt.lock);
+  return rc;
+}
+
+int
 raop_stream_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
                    struct raop_source_snapshot *result)
 {
@@ -1477,6 +1491,9 @@ stream_progress_cb(evutil_socket_t fd, short what, void *arg)
   raop_stream_t *s = work->stream;
   if (work->completion && !s->closing) {
     completion_update_locked(s);
+    /* Polling may be the first observation across the final presentation
+     * boundary. Retire ended pacing on this same loop before returning it. */
+    raop_player_drain_complete(s->player);
     struct completion_receipt *c = completion_find(s, work->epoch, work->source, work->revision);
     if (c) { *work->completion = c->result; work->found = 1; }
   } else if (!s->closing && !s->resetting && s->epoch == work->epoch) {
@@ -1708,6 +1725,12 @@ stream_cancel_cb(evutil_socket_t fd, short what, void *arg)
     while (c && c->applied) c = c->next;
     pthread_mutex_unlock(&rt.lock);
     if (!c) break;
+    if (c->source) {
+      raop_player_progress_at(stream->player, c->source, 0,
+                              c->result.admitted_ns, &c->source_cutoff);
+      c->source_cutoff.epoch = c->result.epoch;
+      c->source_cutoff.captured_ns = c->result.admitted_ns;
+    }
     raop_player_session_stopped(stream->player);
     raop_player_flush(stream->player);
     uint64_t cutoff = raop_cancel_stream(stream->id, c->result.admitted_ns,
@@ -1735,7 +1758,7 @@ stream_cancel_cb(evutil_socket_t fd, short what, void *arg)
       }
     }
     pthread_mutex_lock(&rt.lock);
-    c->result.cutoff_frames = cutoff;
+    c->result.cutoff_frames = c->source ? c->source_cutoff.scheduled_frames : cutoff;
     c->result.local_reset = 1;
     if (failed && !c->result.status) c->result.status = 3;
     c->applied = true;
@@ -1769,8 +1792,8 @@ raop_stream_cancel(raop_stream_t *stream, uint64_t epoch)
   return raop_stream_cancel_v2(stream, epoch, NULL, 0);
 }
 
-int
-raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
+static int
+stream_cancel_admit(raop_stream_t *stream, uint64_t epoch, uint64_t source,
                       const uint64_t *retire_ids, size_t retire_count)
 {
   if (!stream || !epoch || (retire_count && !retire_ids) ||
@@ -1797,6 +1820,12 @@ raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
       (stream->resetting && !stream->canceling)) {
     pthread_mutex_unlock(&rt.lock); cancel_receipt_free(receipt); return -1;
   }
+  if (source) {
+    struct raop_source_snapshot retained;
+    if (stream->resetting || !raop_player_source(stream->player, source, &retained)) {
+      pthread_mutex_unlock(&rt.lock); cancel_receipt_free(receipt); return -1;
+    }
+  }
   for (size_t i = 0; i < retire_count; i++) {
     raop_t *h;
     for (h = rt.handles_list; h && h->id != retire_ids[i]; h = h->next) {}
@@ -1812,6 +1841,7 @@ raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
     .epoch = epoch, .next_epoch = epoch + 1,
     .admitted_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec,
   };
+  receipt->source = source;
   struct cancel_receipt **tail = &stream->cancels;
   for (; *tail; tail = &(*tail)->next)
     if (!(*tail)->result.status) (*tail)->result.status = 2;
@@ -1824,6 +1854,37 @@ raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
   event_active(stream->cancel_event, EV_TIMEOUT, 1);
   pthread_mutex_unlock(&rt.lock);
   return 0;
+}
+
+int
+raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
+                       const uint64_t *retire_ids, size_t retire_count)
+{
+  return stream_cancel_admit(stream, epoch, 0, retire_ids, retire_count);
+}
+
+int
+raop_stream_cancel_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+                          const uint64_t *retire_ids, size_t retire_count)
+{
+  return source ? stream_cancel_admit(stream, epoch, source, retire_ids, retire_count) : -1;
+}
+
+int
+raop_stream_cancel_source_poll(raop_stream_t *stream, uint64_t epoch,
+   uint64_t source, struct raop_progress_snapshot *result)
+{
+  if (!stream || !epoch || !source || !result) return -1;
+  int found = 0;
+  pthread_mutex_lock(&rt.lock);
+  for (struct cancel_receipt *c = stream->cancels; c; c = c->next) {
+    if (c->result.epoch != epoch) continue;
+    if (c->source != source) found = -1;
+    else if (c->applied) { *result = c->source_cutoff; found = 1; }
+    break;
+  }
+  pthread_mutex_unlock(&rt.lock);
+  return found;
 }
 
 int

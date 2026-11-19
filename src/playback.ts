@@ -31,6 +31,10 @@ import {
 export type { NowPlayingViewRow, ReportPlaying } from './playback-reports.ts';
 import { type Log, scopedLog } from './logging.ts';
 import { createOperationScope } from './operations.ts';
+import {
+  createSourcePlanOwner,
+  type SourcePreparation,
+} from './playback-source-plan.ts';
 import { type CommandHandle, createCommandLane } from './command-authority.ts';
 import {
   PlaybackError,
@@ -43,6 +47,18 @@ import type {
 } from './playback-capacity.ts';
 import { planSourceFailure } from './source-recovery.ts';
 import {
+  planPlaybackSuccessor,
+  reconcilePlaybackSuccessor,
+  type SuccessorPlan,
+} from './playback-successor.ts';
+import {
+  createPlaybackTimeline,
+  type TimelineCompletion,
+  type TimelineCutoff,
+  type TimelineProgress,
+  type TimelineSource,
+} from './playback-timeline.ts';
+import {
   catalogMedia,
   createQueueResolver,
   type QueueAddReference,
@@ -52,6 +68,7 @@ import {
   type SourceMetadata,
 } from './queue-source.ts';
 import type {
+  AdvanceResult,
   CommandSource,
   LastCommand,
   Outputs,
@@ -72,6 +89,27 @@ export interface PlaybackAuthority {
   isCurrent(): boolean;
 }
 
+/** Injected sink control. Admission fences input synchronously; its immutable
+ * source projection may settle after intent publication, never from a JS clock. */
+export interface PlaybackSink {
+  /** Fence future accepted input and join readiness; cutoff is immutable and
+   * may arrive earlier. This is a deliberate reanchor, not pause intent. */
+  reanchor?(
+    source: TimelineSource,
+    commit: (cutoff: TimelineCutoff) => void,
+  ): Promise<void> | null;
+  cutoff(
+    source: TimelineSource,
+    intent: 'pause' | 'stop',
+    commit: (cutoff: TimelineCutoff) => void,
+  ): Promise<void> | null;
+}
+
+export interface PlaybackRead {
+  readonly source: PlaybackSource;
+  readonly entry: QueueEntry;
+}
+
 type PlannedOccurrence =
   | { kind: 'existing'; entryId: number; media: QueueMedia }
   | { kind: 'new'; offset: number; media: QueueMedia };
@@ -79,22 +117,30 @@ interface ActivationPlan {
   entry: PlannedOccurrence | undefined;
   items: PlannedOccurrence[];
   direction?: number;
-  wrap?: boolean;
-  excluded?: ReadonlySet<number>;
+  successor?: SuccessorPlan;
 }
-const existingOccurrences = (entries: QueueEntry[]): PlannedOccurrence[] =>
+const existingOccurrences = (
+  entries: readonly QueueEntry[],
+): PlannedOccurrence[] =>
   entries.map(({ id, ...media }) => ({ kind: 'existing', entryId: id, media }));
 const newOccurrences = (media: QueueMedia[]): PlannedOccurrence[] =>
   media.map((item, offset) => ({ kind: 'new', offset, media: item }));
 const existingActivation = (
-  entries: QueueEntry[],
+  entries: readonly QueueEntry[],
   index: number,
-  options: Pick<ActivationPlan, 'direction' | 'wrap' | 'excluded'> = {},
+  options: Pick<ActivationPlan, 'direction'> = {},
 ): ActivationPlan => {
   const items = existingOccurrences(entries);
   return { entry: items[index], items, ...options };
 };
-type Activate = (added?: QueueEntry[]) => void;
+const successorActivation = (plan: SuccessorPlan): ActivationPlan => ({
+  ...existingActivation(
+    plan.items,
+    plan.items.findIndex((item) => item.id === plan.entryId),
+  ),
+  successor: plan,
+});
+type Activate = (added?: QueueEntry[]) => AdvanceResult | void;
 type PrepareNew = (media: QueueMedia[]) => QueueMedia[];
 
 export interface QueueAddOptions {
@@ -145,9 +191,9 @@ export interface Playback {
   next(source?: CommandSource): void | Promise<void>;
   previous(source?: CommandSource): void | Promise<void>;
   restart(source?: CommandSource): void | Promise<void>;
-  setShuffle(on: boolean, source?: CommandSource): void;
-  setConsume(on: boolean, source?: CommandSource): void;
-  setRepeat(mode: RepeatMode, source?: CommandSource): void;
+  setShuffle(on: boolean, source?: CommandSource): void | Promise<void>;
+  setConsume(on: boolean, source?: CommandSource): void | Promise<void>;
+  setRepeat(mode: RepeatMode, source?: CommandSource): void | Promise<void>;
   setVolume(
     opts: { volume?: number; step?: number },
     source?: CommandSource,
@@ -188,7 +234,7 @@ export interface Playback {
     position: number,
     expectedVersion?: number,
     source?: CommandSource,
-  ): void;
+  ): void | Promise<void>;
   queueCopyView(): QueueCopySnapshot;
   /** Source-side receipt only: does not cancel or change playback/queue. */
   queueCopied(targetId: number, source?: CommandSource): void;
@@ -204,14 +250,46 @@ export interface Playback {
    * item length (main.ts drives it on an interval; tests drive it directly).
    * Emits player (+queue when consume dropped the finished item). */
   advanceEnded(): void | Promise<void>;
-  /** Elected boot source lifetime; engine transitions synchronously revoke it. */
+  /** Core-owned stream source lifetime; transitions synchronously revoke it. */
+  attachSink(sink?: PlaybackSink): () => void;
   openSource(entryId: number, generation: number): PlaybackSource | null;
+  /** Resolve the next ordered read without changing public current. */
+  prepareNextSource(
+    after: PlaybackSource,
+  ): PlaybackRead | null | Promise<PlaybackRead | null>;
+  admitSource(read: PlaybackRead): boolean;
+  sourceAccepted(source: PlaybackSource, frames: bigint): boolean;
+  /** Reader has established final exhaustion, separately from decoder EOF. */
+  finishSources(after: PlaybackSource): boolean;
+  /** Core read/preparation and scheduled-playing incarnations, never hat state. */
+  sourcePlanView(): {
+    reading: PlaybackSource | null;
+    playing: PlaybackSource | null;
+  };
+  bindSource(
+    source: PlaybackSource,
+    streamId: bigint,
+    epoch: bigint,
+  ): TimelineSource | null;
+  sealSource(source: PlaybackSource, target: bigint): boolean;
+  sourceProgress(source: PlaybackSource, progress: TimelineProgress): boolean;
+  sourceCompatibilityRemaining(source: PlaybackSource): number;
+  /** Resolves after this source's matching core transition/cancellation commits,
+   * not when the receipt is first observed. The boot can then acknowledge it. */
+  completeSource(
+    source: PlaybackSource,
+    receipt: TimelineCompletion,
+  ): Promise<boolean>;
   cancelSource(source: PlaybackSource): void;
   sourceAudio(source: PlaybackSource, durationMs: number): void;
   /** One bounded source retry, cancelled with the lease. Not a speaker retry. */
-  retrySource(source: PlaybackSource, reason: SourceOutcome): Promise<boolean>;
+  retrySource(
+    source: PlaybackSource,
+    reason: SourceOutcome,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   reportSourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
-  /** Raw facts from the currently elected lease; no commands or hat labels. */
+  /** Raw facts from the current source lease; no commands or hat labels. */
   reportSourceMetadata(
     source: PlaybackSource,
     metadata: SourceMetadata,
@@ -292,6 +370,21 @@ export function createPlayback(deps: {
 }): Playback {
   const { player, library, outputs, notify, persistence } = deps;
   const operations = createOperationScope('Player');
+  const timeline = createPlaybackTimeline();
+  const timelineSources = new WeakMap<PlaybackSource, TimelineSource>();
+  const reads = new WeakMap<PlaybackRead, SourcePreparation>();
+  const futureOutcomes = new WeakMap<PlaybackSource, SourceOutcome>();
+  let continuous = false;
+  let continuousGeneration = -1;
+  let inputEnded: PlaybackSource | null = null;
+  let reanchoring: {
+    generation: number;
+    position: Promise<number>;
+    ready: Promise<void>;
+  } | undefined;
+  const sinks = new Set<PlaybackSink>();
+  let cutting: TimelineSource | undefined;
+  let bookmark: { generation: number; position: Promise<number> } | undefined;
   let closeWork: Promise<void> | undefined;
   let activeReservation: PlaybackReservation | undefined;
   const needsCapacity = () =>
@@ -355,7 +448,6 @@ export function createPlayback(deps: {
       throw new QueueLimitError(limit);
     }
   };
-  let openedSource: PlaybackSource | null = null;
   const recoverySettings = {
     retryBackoffMs: {
       type: 'array',
@@ -385,7 +477,9 @@ export function createPlayback(deps: {
     return recovery;
   };
   const ownsSource = (source: PlaybackSource) =>
-    !operations.closed && openedSource === source && !source.signal.aborted;
+    !operations.closed && player.hasSource(source) &&
+    (sourcePlans.playing === source ||
+      sourcePlans.admitted.some((record) => record.source === source));
   let failedSource: PlaybackSource | null = null;
   let failureWork:
     | { source: PlaybackSource; promise: Promise<void> }
@@ -419,7 +513,7 @@ export function createPlayback(deps: {
       startedAtMs: status.clock.startedAtMs,
       reportedAtMs: status.clock.reportedAtMs,
       state: status.state === 'play' ? 'playing' : 'paused',
-      playbackRate: 1,
+      playbackRate: status.playbackRate,
     };
   };
   let serverPresent = hasServerRow();
@@ -429,6 +523,7 @@ export function createPlayback(deps: {
   // changes on clock/current transitions and on external attribution changes,
   // including commands (volume/options/queue edits) without a player event.
   const emit = (types: string[]) => {
+    reconcileFuture();
     const version = player.queue().version;
     if (version !== announcedQueueVersion) {
       announcedQueueVersion = version;
@@ -456,6 +551,71 @@ export function createPlayback(deps: {
   // output facts which do not appear in this view. Drop the subscription on close.
   let speakers = JSON.stringify(selectedSpeakers());
   const commands = createCommandLane();
+  const successorPlan = (
+    reason: SuccessorPlan['reason'],
+    after?: PlaybackSource,
+  ): SuccessorPlan | null => {
+    const view = player.status(), queue = player.queue();
+    let items = queue.items, currentEntryId = view.current?.id;
+    if (after && after !== sourcePlans.playing) {
+      let found = false;
+      for (const record of sourcePlans.admitted) {
+        const current = planPlaybackSuccessor({
+          reason: 'natural',
+          revision: queue.version,
+          items,
+          currentEntryId,
+          repeat: view.repeat,
+          consume: view.consume,
+        });
+        const plan = reconcilePlaybackSuccessor(
+          record.plan,
+          current,
+          record.through,
+        );
+        if (!plan || !record.source || record.source.signal.aborted) {
+          return null;
+        }
+        items = [...plan.items];
+        currentEntryId = record.source.entryId;
+        if (record.source === after) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return null;
+    }
+    return planPlaybackSuccessor({
+      reason,
+      revision: queue.version,
+      items,
+      currentEntryId,
+      repeat: view.repeat,
+      consume: view.consume,
+      failed: failedSources,
+    });
+  };
+  const needsPreparation = (item: QueueMedia) =>
+    deps.prepareQueueMedia && item.facts.kind === 'web' &&
+    item.facts.mode === 'unknown';
+  const sourcePlans = createSourcePlanOwner({
+    player,
+    current: successorPlan,
+    afterCurrent: successorPlan,
+    resolve(item, signal) {
+      const resolved = (media: QueueMedia | null) => {
+        signal.throwIfAborted();
+        return media && needsPreparation(media)
+          ? deps.prepareQueueMedia!(media, signal)
+          : media;
+      };
+      const media =
+        item.reference.kind === 'station' && deps.resolveQueueReference
+          ? deps.resolveQueueReference(item.reference)
+          : item;
+      return media instanceof Promise ? media.then(resolved) : resolved(media);
+    },
+  });
   let pendingStart: CommandHandle | undefined;
   const submitCommand = () => {
     pendingStart = undefined;
@@ -492,31 +652,124 @@ export function createPlayback(deps: {
       const before = player.queue().items;
       const items = activation?.items ?? [];
       const candidate = activation?.entry;
-      const needsPreparation = (item: QueueMedia) =>
-        deps.prepareQueueMedia &&
-        item.facts.kind === 'web' && item.facts.mode === 'unknown';
       const needsResolution = starts && activation && candidate &&
         (deps.resolveQueueReference &&
             candidate.media.reference.kind === 'station' ||
           needsPreparation(candidate.media));
-      if (!starts || !deps.targets && !needsResolution) {
+      const pendingBookmark =
+        bookmark?.generation === player.status().generation
+          ? bookmark.position
+          : undefined;
+      if (activation?.successor) {
+        const generation = player.status().generation;
+        const controller = new AbortController();
+        const reservation = reserveStart(starts, controller);
+        const abort = () => controller.abort();
+        operation.signal.addEventListener('abort', abort, { once: true });
+        authority?.signal.addEventListener('abort', abort, { once: true });
+        command.signal.addEventListener('abort', abort, { once: true });
+        pendingStart = command;
+        const authoritative = () =>
+          current() && !controller.signal.aborted &&
+          player.status().generation === generation;
+        const finish = () => {
+          reservation?.release();
+          operation.signal.removeEventListener('abort', abort);
+          authority?.signal.removeEventListener('abort', abort);
+          command.signal.removeEventListener('abort', abort);
+          if (pendingStart === command) pendingStart = undefined;
+        };
+        const prepare = (plan: SuccessorPlan): T | Promise<T> => {
+          if (!authoritative()) throw cancelled();
+          const record = sourcePlans.prepare(plan, command);
+          const retry = (): T | Promise<T> => {
+            if (!authoritative()) throw cancelled();
+            return prepare(successorPlan(plan.reason)!);
+          };
+          const publish = (
+            selected: Awaited<SourcePreparation['ready']>,
+          ): T | Promise<T> => {
+            if (!authoritative()) throw cancelled();
+            if (!sourcePlans.validate(record)) return retry();
+            const entryId = selected?.source.entryId ?? null;
+            return commitStart(reservation, () =>
+              commit(() => {
+                let result: AdvanceResult = 'none';
+                sourcePlans.commit(record, (current) => {
+                  result = player.applySuccessor(
+                    current,
+                    entryId,
+                    sourcePlans.playing && !sourcePlans.playing.signal.aborted
+                      ? record.source ?? undefined
+                      : undefined,
+                  );
+                  if (result !== 'none' && selected?.refreshed) {
+                    player.replaceOccurrence(entryId!, selected.media);
+                  }
+                  return result !== 'none';
+                });
+                return result;
+              }, (media) => media));
+          };
+          const prepared = (selected: Awaited<SourcePreparation['ready']>) => {
+            // Even exhaustion retains the existing natural target preflight.
+            // An append can create a destination while this boundary is held.
+            const targets = starts
+              ? deps.targets?.preparePlayback(controller.signal)
+              : undefined;
+            return targets instanceof Promise
+              ? targets.then(() => publish(selected))
+              : publish(selected);
+          };
+          const failed = (error: unknown): T | Promise<T> => {
+            if (!authoritative()) throw cancelled();
+            if (!sourcePlans.validate(record)) return retry();
+            throw error;
+          };
+          const ready = record.ready;
+          return ready instanceof Promise
+            ? ready.then(prepared, failed)
+            : prepared(ready);
+        };
+        try {
+          const result = pendingBookmark
+            ? pendingBookmark.then(() => prepare(activation.successor!))
+            : prepare(activation.successor);
+          if (result instanceof Promise) return result.finally(finish);
+          finish();
+          return result;
+        } catch (error) {
+          finish();
+          throw error;
+        }
+      }
+      if (
+        (!starts || !deps.targets && !needsResolution) && !pendingBookmark
+      ) {
         const reservation = reserveStart(starts);
         try {
-          return commitStart(reservation, () =>
-            commit(() => {}, (media) => media));
+          return commitStart(
+            reservation,
+            () =>
+              commit(
+                () => undefined,
+                (media) => media,
+              ),
+          );
         } finally {
           reservation?.release();
         }
       }
       const controller = new AbortController();
       const reservation = reserveStart(starts, controller);
-      const abort = () =>
-        controller.abort();
+      const abort = () => controller.abort();
       operation.signal.addEventListener('abort', abort, { once: true });
       authority?.signal.addEventListener('abort', abort, { once: true });
       command.signal.addEventListener('abort', abort, { once: true });
       pendingStart = command;
       const prepare = async () => {
+        await pendingBookmark;
+        if (!current() || controller.signal.aborted) throw cancelled();
         let selected:
           | { occurrence: PlannedOccurrence; media: QueueMedia }
           | null
@@ -524,16 +777,17 @@ export function createPlayback(deps: {
         if (needsResolution) {
           selected = null;
           let index = items.indexOf(candidate);
-          for (let visited = 0; visited < items.length; visited++) {
+          for (
+            let visited = 0;
+            visited < items.length;
+            visited++
+          ) {
             if (index < 0 || index >= items.length) break;
             const item = items[index];
-            let media =
-              item.kind === 'existing' && activation.excluded?.has(item.entryId)
-                ? null
-                : item.media.reference.kind === 'station' &&
-                    deps.resolveQueueReference
-                ? await deps.resolveQueueReference!(item.media.reference)
-                : item.media;
+            let media = item.media.reference.kind === 'station' &&
+                deps.resolveQueueReference
+              ? await deps.resolveQueueReference!(item.media.reference)
+              : item.media;
             if (media && needsPreparation(media)) {
               media = await deps.prepareQueueMedia!(media, controller.signal);
             }
@@ -543,10 +797,9 @@ export function createPlayback(deps: {
               break;
             }
             index += activation.direction ?? 1;
-            if (activation.wrap) index = (index + items.length) % items.length;
           }
         }
-        if (selected !== null) {
+        if (starts && selected !== null) {
           await deps.targets?.preparePlayback(controller.signal);
         }
         return selected;
@@ -634,7 +887,7 @@ export function createPlayback(deps: {
         !deps.targets.hasPlaybackTarget()
       ) {
         cancelStart();
-        player.pause();
+        pauseAtCutoff();
         record('pause', undefined, {
           kind: 'internal',
           via: 'playback-target-loss',
@@ -701,9 +954,221 @@ export function createPlayback(deps: {
       consume: status.consume,
     };
   };
-  const flushQueue = () =>
-    persistence?.saveQueue(player.queueSnapshot(), stateSnapshot());
-  const flushState = () => persistence?.saveState(stateSnapshot());
+  const bookmarkPosition = () =>
+    bookmark?.generation === player.status().generation
+      ? bookmark.position
+      : undefined;
+  const flushQueue = () => (reconcileFuture(),
+    persistence?.saveQueue(
+      player.queueSnapshot(),
+      stateSnapshot(),
+      bookmarkPosition(),
+    ));
+  const flushState =
+    () => (reconcileFuture(),
+      persistence?.saveState(stateSnapshot(), bookmarkPosition()));
+  // All explicit and induced pauses share the same capture. The engine publishes
+  // intent immediately; saves capture this command's immutable position receipt
+  // in their existing ordered batch, including membership publications.
+  const pauseAtCutoff = (intent: 'pause' | 'stop' = 'pause') => {
+    const view = player.status();
+    const source = sourcePlans.playing;
+    const mapping = source ? timelineSources.get(source) : undefined;
+    let cutoff: Promise<void> | null = null;
+    let generation = view.generation;
+    let positionMs = view.itemProgressMs;
+    if (view.state === 'play' && mapping) {
+      for (const sink of sinks) {
+        cutoff = sink.cutoff(mapping, intent, (result) => {
+          if (!timeline.cancel(mapping, result)) {
+            throw new Error('Native source cutoff did not match its bookmark');
+          }
+          positionMs = timeline.position(mapping)!.positionMs;
+          player.freezePosition(generation, positionMs);
+          timeline.retire(mapping);
+        });
+        if (cutoff) break;
+      }
+    }
+    cutting = cutoff ? mapping : undefined;
+    player.pause();
+    cutting = undefined;
+    if (!cutoff || !mapping) return;
+    generation = player.status().generation;
+    const position = operations.run(async () => {
+      await cutoff;
+      timeline.retire(mapping);
+      return positionMs;
+    });
+    bookmark = { generation, position };
+    void position.catch((error) =>
+      log.event('media_failed', {
+        operation: 'source-cutoff',
+        path: String(mapping.entryId),
+        error,
+      })
+    );
+  };
+  const reconcileFuture = () => {
+    const lostReader = sourcePlans.playing?.signal.aborted === true;
+    if (
+      lostReader &&
+      (!continuous || player.status().generation !== continuousGeneration)
+    ) {
+      sourcePlans.discardFuture();
+      continuous = false;
+      inputEnded = null;
+      return;
+    }
+    const invalid = lostReader ? 0 : sourcePlans.reconcile();
+    if (invalid < 0) return;
+    const discarded = sourcePlans.admitted.slice(invalid);
+    const accepted = discarded.some((record) => {
+      const mapping = record.source && timelineSources.get(record.source);
+      return mapping && timeline.accepted(mapping) > 0n;
+    });
+    if (!accepted) {
+      sourcePlans.discardFuture(invalid);
+      inputEnded = null;
+      return;
+    }
+    const primary = sourcePlans.playing;
+    const mapping = primary && timelineSources.get(primary);
+    const view = player.status();
+    if (!primary || !mapping || view.state !== 'play') return;
+    if (reanchoring) return;
+    const position = Promise.withResolvers<number>();
+    const ready = Promise.withResolvers<void>();
+    const work = {
+      generation: view.generation,
+      position: position.promise,
+      ready: ready.promise,
+    };
+    reanchoring = work;
+    bookmark = { generation: view.generation, position: work.position };
+    let captured = false;
+    let replacementGeneration: number | undefined;
+    let pending: Promise<void> | null = null;
+    const capture = (cutoff: TimelineCutoff) => {
+      if (captured) throw new Error('Duplicate future-input cutoff');
+      captured = true;
+      // A newer explicit command may already have retired this old mapping.
+      // Its native fence is still joined, but cannot replace the newer intent.
+      if (timeline.position(mapping)) {
+        if (!timeline.cancel(mapping, cutoff)) {
+          throw new Error('Invalid future-input cutoff');
+        }
+        const value = timeline.position(mapping)!.positionMs;
+        if (player.reanchorSource(view.generation, primary.entryId, value)) {
+          replacementGeneration = player.status().generation;
+          if (bookmark?.position === work.position) {
+            bookmark.generation = replacementGeneration;
+          }
+        }
+        position.resolve(value);
+        timeline.retire(mapping);
+      } else position.resolve(view.itemProgressMs);
+    };
+    try {
+      for (const sink of sinks) {
+        pending = sink.reanchor?.(mapping, capture) ?? null;
+        if (pending) break;
+      }
+      if (!pending) {
+        throw new Error('Accepted future input has no reanchor owner');
+      }
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    sourcePlans.discardFuture();
+    player.cancelSource(primary);
+    continuous = false;
+    inputEnded = null;
+    void operations.run(async () => {
+      try {
+        await pending;
+        if (!captured) {
+          throw new Error('Future-input reset had no atomic cutoff');
+        }
+        if (replacementGeneration === player.status().generation) {
+          flushState();
+          emit(['player']);
+        }
+      } catch (error) {
+        position.reject(error);
+        log.event('media_failed', {
+          operation: 'future-input-reanchor',
+          path: String(primary.entryId),
+          error,
+        });
+        if (
+          player.status().generation ===
+            (replacementGeneration ?? view.generation)
+        ) {
+          player.pause();
+          flushState();
+          emit(['player']);
+        }
+      } finally {
+        if (reanchoring === work) reanchoring = undefined;
+        ready.resolve();
+      }
+    });
+    void position.promise.catch(() => {});
+  };
+  const afterMutation = <T>(result: T): T | Promise<T> =>
+    reanchoring ? reanchoring.ready.then(() => result) : result;
+  const advanceContinuous = () => {
+    if (!continuous) return false;
+    reconcileFuture();
+    while (continuous && player.canAdvanceEnded()) {
+      const record = sourcePlans.admitted[0];
+      if (!record) {
+        if (inputEnded !== sourcePlans.playing) return true;
+        const plan = successorPlan('natural');
+        if (!plan || plan.entryId !== null) {
+          inputEnded = null;
+          return true;
+        }
+        const result = player.applySuccessor(plan, null);
+        if (result !== 'none') {
+          continuous = false;
+          inputEnded = null;
+          if (result === 'player+queue') flushQueue();
+          else flushState();
+          emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+        }
+        return true;
+      }
+      let result: AdvanceResult = 'none';
+      sourcePlans.commit(record, (plan) => {
+        result = player.applySuccessor(
+          plan,
+          record.source!.entryId,
+          record.source!,
+          true,
+        );
+        if (result !== 'none' && record.refreshed && record.media) {
+          player.replaceOccurrence(record.source!.entryId, record.media);
+        }
+        return result !== 'none';
+      });
+      if (result === 'none') return true;
+      continuousGeneration = player.status().generation;
+      failedSources.clear();
+      if (result === 'player+queue') flushQueue();
+      else flushState();
+      emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
+      const promoted = sourcePlans.playing;
+      const outcome = promoted && futureOutcomes.get(promoted);
+      if (promoted && outcome) {
+        futureOutcomes.delete(promoted);
+        applySourceOutcome(promoted, outcome);
+        if (outcome !== 'eof') return true;
+      }
+    }
+    return true;
+  };
   const checkVersion = (expectedVersion?: number) => {
     if (
       expectedVersion !== undefined &&
@@ -826,9 +1291,9 @@ export function createPlayback(deps: {
     // never a later command waiting behind this addition's slow work.
     if (!opts.play) {
       if (opts.clear && replacedStart) cancelStart(replacedStart);
-      return commit(() => {});
+      return afterMutation(commit(() => {}));
     }
-    return transition(
+    const result = transition(
       size > 0,
       commit,
       undefined,
@@ -838,6 +1303,9 @@ export function createPlayback(deps: {
         : undefined,
       submitted,
     );
+    return result instanceof Promise
+      ? result.then(afterMutation)
+      : afterMutation(result);
   };
   const resolveReference = deps.resolveQueueReference ?? createQueueResolver({
     getSong: (id) => library.getSong(id),
@@ -985,47 +1453,48 @@ export function createPlayback(deps: {
       failedSource = null;
       return Promise.resolve();
     }
-    const view = player.status();
-    const plan = planSourceFailure(
-      player.queue().items,
-      view.current?.id,
-      failedSources,
-      view.repeat,
-      view.consume,
-    );
-    const commit = (activate: () => void) => {
-      if (
-        !ownsSource(source) || player.status().generation !== view.generation
-      ) return;
-      failedSource = null;
-      const result = player.advanceFailed(failedSources);
-      activate();
-      record('sourceSkip', undefined, {
-        kind: 'internal',
-        via: 'source-outcome',
-      }, player.status().state);
-      if (result === 'player+queue') flushQueue();
-      else flushState();
-      emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
-    };
     const work = { source, promise: Promise.resolve() };
     failureWork = work;
     work.promise = operations.run(async () => {
       try {
-        await transition(
-          plan.index !== null,
-          commit,
-          {
-            signal: source.signal,
-            isCurrent: () => ownsSource(source),
-          },
-          plan.index === null
-            ? undefined
-            : existingActivation(plan.items, plan.index, {
-              wrap: view.repeat === 'all',
-              excluded: failedSources,
-            }),
-        );
+        const command = submitCommand();
+        const advance = async (): Promise<void> => {
+          const view = player.status();
+          const queue = player.queue();
+          const plan = planSourceFailure(
+            queue.items,
+            view.current?.id,
+            failedSources,
+            view.repeat,
+            view.consume,
+            queue.version,
+          );
+          await transition(
+            plan.entryId !== null,
+            (activate) => {
+              if (
+                !ownsSource(source) ||
+                player.status().generation !== view.generation
+              ) return;
+              const result = activate();
+              if (!result || result === 'none') return;
+              failedSource = null;
+              record('sourceSkip', undefined, {
+                kind: 'internal',
+                via: 'source-outcome',
+              }, player.status().state);
+              if (result === 'player+queue') flushQueue();
+              else flushState();
+              emit(
+                result === 'player+queue' ? ['queue', 'player'] : ['player'],
+              );
+            },
+            { signal: source.signal, isCurrent: () => ownsSource(source) },
+            successorActivation(plan),
+            command,
+          );
+        };
+        await advance();
       } catch (error) {
         if (
           error instanceof PlaybackError && error.code === 'playback_cancelled'
@@ -1037,7 +1506,7 @@ export function createPlayback(deps: {
           reason: 'activation-failed',
           attempts: recoveryForRun().attempts,
         });
-        player.pause();
+        pauseAtCutoff();
         record(
           'pause',
           undefined,
@@ -1057,33 +1526,213 @@ export function createPlayback(deps: {
       throw new PlaybackError('playback_cancelled', 'Player is closed');
     }
   };
+  const applySourceOutcome = (
+    source: PlaybackSource,
+    outcome: SourceOutcome,
+  ) => {
+    const view = player.status();
+    if (
+      outcome !== 'eof' || view.current?.facts.kind === 'web' &&
+        view.current.facts.mode !== 'finite'
+    ) {
+      cancelStart();
+      if (view.current?.facts.kind === 'web') {
+        failedSources.add(view.current.id);
+        failedSource = source;
+        void advanceFailedSource();
+        return;
+      }
+      pauseAtCutoff();
+      record(
+        'pause',
+        undefined,
+        { kind: 'internal', via: 'source-outcome' },
+        'pause',
+      );
+      flushState();
+      emit(['player']);
+    }
+  };
   return {
+    attachSink(sink) {
+      requireOpen();
+      if (sink) sinks.add(sink);
+      const detach = player.attachSink();
+      return () => {
+        if (sink) sinks.delete(sink);
+        detach();
+      };
+    },
+    prepareNextSource: (after) =>
+      operations.runImmediate(() => {
+        requireOpen();
+        const tail = sourcePlans.admitted.at(-1)?.source ?? sourcePlans.playing;
+        const command = commands.capture();
+        if (
+          tail !== after || !ownsSource(after) || !command?.isCurrent()
+        ) return null;
+        const plan = successorPlan('natural', after);
+        if (!plan) return null;
+        const record = sourcePlans.prepare(plan, command, after);
+        const resolved = (selected: Awaited<SourcePreparation['ready']>) => {
+          if (!sourcePlans.validate(record)) {
+            throw new PlaybackError(
+              'playback_cancelled',
+              'Read source superseded',
+            );
+          }
+          if (!selected) return null;
+          const read = Object.freeze({
+            source: selected.source,
+            entry: Object.freeze({
+              ...selected.media,
+              id: selected.source.entryId,
+            }),
+          });
+          reads.set(read, record);
+          return read;
+        };
+        return record.ready instanceof Promise
+          ? record.ready.then(resolved)
+          : resolved(record.ready);
+      }),
+    admitSource(read) {
+      const record = reads.get(read);
+      if (!record || !sourcePlans.admit(record)) return false;
+      reads.delete(read);
+      if (!continuous) continuousGeneration = player.status().generation;
+      continuous = true;
+      inputEnded = null;
+      return true;
+    },
+    sourceAccepted(source, frames) {
+      const mapping = timelineSources.get(source);
+      return ownsSource(source) && !!mapping &&
+        timeline.accept(mapping, frames);
+    },
+    finishSources(after) {
+      const tail = sourcePlans.admitted.at(-1)?.source ?? sourcePlans.playing;
+      if (
+        tail !== after || !ownsSource(after) ||
+        successorPlan('natural', after)?.entryId !== null
+      ) return false;
+      if (!continuous) continuousGeneration = player.status().generation;
+      continuous = true;
+      inputEnded = after;
+      advanceContinuous();
+      return true;
+    },
+    bindSource(source, streamId, epoch) {
+      if (!ownsSource(source) || timelineSources.has(source)) return null;
+      if (source !== sourcePlans.playing) {
+        const primary = sourcePlans.playing &&
+          timelineSources.get(sourcePlans.playing);
+        if (
+          !primary || primary.streamId !== streamId || primary.epoch !== epoch
+        ) return null;
+      }
+      const mapping = timeline.begin({
+        streamId,
+        epoch,
+        entryId: source.entryId,
+        generation: source.generation,
+        originMs: source.startMs,
+      });
+      timelineSources.set(source, mapping);
+      const generation = player.status().generation;
+      source.signal.addEventListener('abort', () => {
+        // Reader cleanup does not retire the sink's run-wide bookmark authority.
+        if (
+          cutting !== mapping &&
+          (operations.closed || player.status().generation !== generation)
+        ) {
+          timeline.retire(mapping);
+        }
+      }, { once: true });
+      return mapping;
+    },
+    sourceProgress(source, progress) {
+      const mapping = timelineSources.get(source);
+      if (!ownsSource(source) || !mapping) return false;
+      const previous = timeline.position(mapping)!;
+      if (!timeline.observe(mapping, progress)) return false;
+      const rate = player.status().playbackRate;
+      const accepted = player.sourcePosition(
+        source,
+        timeline.position(mapping)!.positionMs,
+        progress.status === 'scheduled' &&
+          progress.sourceFrames > previous.sourceFrames
+          ? 1
+          : 0,
+      );
+      if (accepted && rate !== player.status().playbackRate) emit(['player']);
+      return accepted;
+    },
+    sealSource(source, target) {
+      const mapping = timelineSources.get(source);
+      return ownsSource(source) && !!mapping && timeline.seal(mapping, target);
+    },
+    sourceCompatibilityRemaining: (source) =>
+      player.sourceCompatibilityRemaining(source),
+    completeSource: (source, receipt) =>
+      operations.run(async () => {
+        const mapping = timelineSources.get(source);
+        if (
+          !ownsSource(source) || !mapping ||
+          !timeline.complete(mapping, receipt) ||
+          !player.sourceComplete(source)
+        ) return false;
+        advanceContinuous();
+        await new Promise<void>((resolve) => {
+          source.signal.addEventListener('abort', () => resolve(), {
+            once: true,
+          });
+          if (source.signal.aborted) resolve();
+        });
+        // Abort fires within the synchronous core mutation. This continuation
+        // follows its persistence publication and notification, never precedes it.
+        return true;
+      }),
     openSource: (entryId, generation) => {
       if (operations.closed) return null;
       if (needsCapacity() && !deps.capacity!.authority()()) return null;
       const source = player.openSource(entryId, generation);
-      if (source) openedSource = source;
+      if (source) {
+        sourcePlans.playingSource(source);
+      }
       return source;
     },
+    sourcePlanView: () => ({
+      reading: sourcePlans.reading?.source ?? null,
+      playing: sourcePlans.playing?.signal.aborted ? null : sourcePlans.playing,
+    }),
     cancelSource(source) {
       if (operations.closed) return;
       const version = player.queue().version;
+      const rate = player.status().playbackRate;
       player.cancelSource(source);
       if (player.queue().version !== version) {
         flushQueue();
         emit(['queue', 'nowPlaying']);
       }
+      if (rate !== player.status().playbackRate) emit(['player']);
     },
     sourceAudio(source, durationMs) {
       if (operations.closed) return;
-      if (player.sourceAudio(source, durationMs)) {
+      if (
+        player.sourceAudio(source, durationMs) && sourcePlans.playing === source
+      ) {
         recoveryForRun().audioMs += durationMs;
       }
     },
-    retrySource: (source, reason) =>
+    retrySource: (source, reason, cancellation) =>
       operations.run(async () => {
+        const signal = cancellation
+          ? AbortSignal.any([source.signal, cancellation])
+          : source.signal;
         if (
-          !ownsSource(source) || player.status().current?.facts.kind !== 'web'
+          signal.aborted || !ownsSource(source) ||
+          player.status().current?.facts.kind !== 'web'
         ) return false;
         const run = recoveryForRun();
         const backoff =
@@ -1093,7 +1742,9 @@ export function createPlayback(deps: {
           await deps.state?.getTyped('playback.source.retryResetAudioMs') ??
             recoverySettings.retryResetAudioMs.default,
         );
-        if (!ownsSource(source) || recovery !== run) return false;
+        if (
+          signal.aborted || !ownsSource(source) || recovery !== run
+        ) return false;
         if (run.audioMs >= reset) {
           run.attempts = 0;
           failedSources.clear();
@@ -1118,14 +1769,14 @@ export function createPlayback(deps: {
         await new Promise<void>((resolve) => {
           const finish = () => {
             clearTimeout(timer);
-            source.signal.removeEventListener('abort', finish);
+            signal.removeEventListener('abort', finish);
             resolve();
           };
           const timer = setTimeout(finish, waitMs);
-          source.signal.addEventListener('abort', finish, { once: true });
-          if (source.signal.aborted) finish();
+          signal.addEventListener('abort', finish, { once: true });
+          if (signal.aborted) finish();
         });
-        return ownsSource(source) && recovery === run;
+        return !signal.aborted && ownsSource(source) && recovery === run;
       }),
     reportSourceMetadata(source, metadata) {
       if (operations.closed || !player.sourceMetadata(source, metadata)) {
@@ -1139,28 +1790,10 @@ export function createPlayback(deps: {
       if (operations.closed || !player.sourceOutcome(source, outcome)) {
         return false;
       }
-      const view = player.status();
-      if (
-        outcome !== 'eof' || view.current?.facts.kind === 'web' &&
-          view.current.facts.mode !== 'finite'
-      ) {
-        cancelStart();
-        if (view.current?.facts.kind === 'web') {
-          failedSources.add(view.current.id);
-          failedSource = source;
-          void advanceFailedSource();
-          return true;
-        }
-        player.pause();
-        record(
-          'pause',
-          undefined,
-          { kind: 'internal', via: 'source-outcome' },
-          'pause',
-        );
-        flushState();
-        emit(['player']);
-      }
+      // A speculative failure is retained on its incarnation. It cannot pause,
+      // skip, consume or discard healthy primary audio before becoming due.
+      if (sourcePlans.playing !== source) futureOutcomes.set(source, outcome);
+      else applySourceOutcome(source, outcome);
       return true;
     },
     expireReports: reports.expireReports,
@@ -1193,7 +1826,7 @@ export function createPlayback(deps: {
     pause(source) {
       requireOpen();
       submitCommand();
-      player.pause();
+      pauseAtCutoff();
       record('pause', undefined, source, 'pause');
       flushState();
       emit(['player']);
@@ -1203,13 +1836,22 @@ export function createPlayback(deps: {
       submitCommand();
       // Explicit stop releases transport intent, not the bookmark. Engine stop
       // remains the terminal operation for exhaustion and end-of-queue.
-      player.pause();
+      pauseAtCutoff('stop');
       record('stop', undefined, source, 'stop');
       flushState();
       emit(['player']);
     },
     toggle(source) {
       const view = player.status();
+      if (view.state === 'play') {
+        requireOpen();
+        submitCommand();
+        pauseAtCutoff();
+        record('toggle', undefined, source, 'pause');
+        flushState();
+        emit(['player']);
+        return;
+      }
       const index = view.current
         ? player.queue().items.findIndex((e) => e.id === view.current!.id)
         : 0;
@@ -1293,6 +1935,7 @@ export function createPlayback(deps: {
       });
       flushState();
       emit(['options']);
+      return afterMutation(undefined);
     },
     setConsume(on, source) {
       requireOpen();
@@ -1303,6 +1946,7 @@ export function createPlayback(deps: {
       });
       flushState();
       emit(['options']);
+      return afterMutation(undefined);
     },
     setRepeat(mode, source) {
       requireOpen();
@@ -1313,6 +1957,7 @@ export function createPlayback(deps: {
       });
       flushState();
       emit(['options']);
+      return afterMutation(undefined);
     },
     setVolume: (opts, source) =>
       operations.runImmediate(() => {
@@ -1471,6 +2116,18 @@ export function createPlayback(deps: {
       const future = player.queue().items.filter((entry) =>
         entry.id !== entryId
       );
+      if (!current) {
+        if (pendingStart && sourcePlans.reading?.command !== pendingStart) {
+          cancelStart(pendingStart);
+        }
+        player.queueRemove(entryId);
+        record('queueRemove', `entryId=${entryId}`, source, 'none', false, {
+          entryId,
+        });
+        flushQueue();
+        emit(['queue']);
+        return afterMutation(undefined);
+      }
       return transition(
         current && view.state === 'play' && index < future.length,
         (activate) => {
@@ -1499,7 +2156,9 @@ export function createPlayback(deps: {
       requireOpen();
       checkVersion(expectedVersion);
       requireEntry(entryId);
-      submitCommand();
+      if (pendingStart && sourcePlans.reading?.command !== pendingStart) {
+        cancelStart(pendingStart);
+      }
       player.queueMove(entryId, position);
       record(
         'queueMove',
@@ -1511,6 +2170,7 @@ export function createPlayback(deps: {
       );
       flushQueue();
       emit(['queue']);
+      return afterMutation(undefined);
     },
     queueClear(source, expectedVersion) {
       requireOpen();
@@ -1668,6 +2328,7 @@ export function createPlayback(deps: {
               : commit(() => {}, (media) => media);
             reservation?.release();
             await work;
+            await afterMutation(undefined);
           });
         } catch (error) {
           if (controller.signal.aborted) {
@@ -1689,40 +2350,42 @@ export function createPlayback(deps: {
     advanceEnded() {
       if (operations.closed) return;
       return operations.runImmediate(() => {
+        if (advanceContinuous()) return;
         if (failedSource) {
+          // Source outcomes start this work before the next tick. Its captured
+          // receipt, not the pending-start flag, represents publication/cleanup.
+          if (failureWork?.source === failedSource) return failureWork.promise;
           if (!pendingStart) return advanceFailedSource();
           return;
         }
-        if (pendingStart || !player.canAdvanceEnded()) return;
-        const command = submitCommand();
+        if (pendingStart) return;
+        const view = player.status();
+        const captured = commands.capture();
+        if (
+          captured?.isCurrent() && sourcePlans.playing &&
+          ownsSource(sourcePlans.playing) &&
+          view.current && !view.capabilities.live
+        ) {
+          sourcePlans.prepare(successorPlan('natural')!, captured);
+        }
+        if (!player.canAdvanceEnded()) return;
+        const command = sourcePlans.reading?.command ?? submitCommand();
         const advance = (): void | Promise<void> => {
           const view = player.status();
           const queue = player.queue();
-          const items = queue.items;
-          const current = items.findIndex((e) => e.id === view.current?.id);
-          const index = view.repeat === 'single'
-            ? current
-            : view.repeat === 'all'
-            ? (current + 1) % items.length
-            : view.consume
-            ? current
-            : current + 1;
-          const future = view.consume && view.repeat === 'off'
-            ? items.filter((_, i) => i !== current)
-            : items;
-          let replan = false;
-          const commit = (activate: () => void) => {
+          const plan = planPlaybackSuccessor({
+            reason: 'natural',
+            revision: queue.version,
+            items: queue.items,
+            currentEntryId: view.current?.id,
+            repeat: view.repeat,
+            consume: view.consume,
+          });
+          const commit = (activate: Activate) => {
             if (player.status().generation !== view.generation) return;
-            // FIFO additions can create a destination while targets are preparing.
-            // Never let the engine advance to an occurrence absent from this plan.
-            if (player.queue().version !== queue.version) {
-              replan = true;
-              return;
-            }
-            const result = player.advanceEnded();
-            if (result === 'none') return;
+            const result = activate();
+            if (!result || result === 'none') return;
             failedSources.clear();
-            activate();
             if (result === 'player+queue') flushQueue();
             else flushState();
             emit(result === 'player+queue' ? ['queue', 'player'] : ['player']);
@@ -1732,16 +2395,10 @@ export function createPlayback(deps: {
               true,
               commit,
               undefined,
-              existingActivation(future, index, {
-                wrap: view.repeat !== 'off',
-              }),
+              successorActivation(plan),
               command,
             ),
-          ).then(() => {
-            if (replan && command.isCurrent() && !operations.closed) {
-              return advance();
-            }
-          });
+          );
         };
         return Promise.resolve(advance()).catch((error) => {
           // Internal transitions have no HTTP caller. Keep the bookmark/queue and
@@ -1754,7 +2411,7 @@ export function createPlayback(deps: {
             !operations.closed && player.status().state === 'play' &&
             !pendingStart
           ) {
-            player.pause();
+            pauseAtCutoff();
             record('pause', undefined, {
               kind: 'internal',
               via: 'playback-target-loss',
@@ -1860,18 +2517,23 @@ export function createPlayback(deps: {
       closeWork = completion.promise;
       // Fence intake before cancellation can synchronously reenter the player.
       const settled = operations.close();
+      const prepared = sourcePlans.close();
       cancelStart();
       cancelAdditions();
       activeReservation?.release();
       activeReservation = undefined;
       // Revoke a parked source even if its boot is being closed separately.
-      if (openedSource) player.cancelSource(openedSource);
+      if (sourcePlans.playing) player.cancelSource(sourcePlans.playing);
       unsubscribeOutputs?.();
       if (tick !== null) clearInterval(tick);
       void Promise.all([
         settled,
+        prepared,
         deps.reports === undefined ? reports.close() : undefined,
-      ]).then(() => completion.resolve(), completion.reject);
+      ]).then(() => {
+        timeline.close();
+        completion.resolve();
+      }, completion.reject);
       return closeWork;
     },
   };

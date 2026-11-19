@@ -94,7 +94,8 @@ struct input_range {
 };
 struct timeline {
   bool enabled, ended, tail_reached, complete;
-  uint64_t accepted, end_target, padding_left, end_transport;
+  uint64_t accepted, end_target, padding_left, transport_end;
+  uint64_t compatibility_source, last_real_end;
   size_t sources, inputs, next_input, ranges;
   struct source_record source[TIMELINE_MARKERS];
   struct input_range input[TIMELINE_MARKERS];
@@ -379,12 +380,13 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           in->fed += take;
           if (in->fed == in->frames) t->next_input++;
           transport += take;
+          t->last_real_end = transport;
           left -= take;
         }
         size_t silence = TICK_SAMPLES - real;
         if (t->ended && t->next_input == t->inputs && !t->tail_reached) {
           t->tail_reached = true;
-          t->end_transport = transport;
+          t->transport_end = t->last_real_end;
           t->padding_left = (352 - transport % 352) % 352;
         }
         size_t padding = t->padding_left;
@@ -393,7 +395,9 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         for (int pass = 0; pass < 2; pass++) {
           size_t count = pass ? silence - padding : padding;
           if (!count) continue;
-          uint64_t kind = pass ? (t->ended ? RAOP_RANGE_DRAIN : RAOP_RANGE_UNDERRUN)
+          uint64_t kind = pass ? (t->ended ? RAOP_RANGE_DRAIN :
+            (t->compatibility_source && t->last_source == t->compatibility_source
+              ? RAOP_RANGE_COMPATIBILITY : RAOP_RANGE_UNDERRUN))
                                : RAOP_RANGE_PADDING;
           struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1] : NULL;
           if (!r || r->kind != kind || r->transport_start + r->frames != transport) {
@@ -657,11 +661,32 @@ raop_player_end(struct raop_player *p, uint64_t target, struct raop_marker_resul
              (!t->sources || t->source[t->sources - 1].sealed)) {
     t->ended = true;
     t->end_target = target;
+    if (t->next_input == t->inputs) {
+      /* A delayed end may follow already packetized compatibility/underrun
+       * silence. Its exclusive real boundary never moves to that silence. */
+      t->tail_reached = true;
+      t->transport_end = t->last_real_end;
+    }
     result->input_end = target;
     result->status = RAOP_APPEND_ACCEPTED;
     result->error = RAOP_APPEND_ERROR_NONE;
   }
   pthread_mutex_unlock(&p->pcm_lock);
+}
+
+int
+raop_player_compatibility_silence(struct raop_player *p, uint64_t source)
+{
+  int rc = -1;
+  pthread_mutex_lock(&p->pcm_lock);
+  struct timeline *t = p->timeline;
+  if (t && !t->ended && t->sources && t->source[t->sources - 1].id == source &&
+      t->source[t->sources - 1].sealed) {
+    t->compatibility_source = source;
+    rc = 0;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+  return rc;
 }
 
 int
@@ -725,11 +750,31 @@ raop_player_failed(struct raop_player *p, uint64_t error)
 
 int
 raop_player_progress(struct raop_player *p, uint64_t source, uint64_t attachment,
-                      struct raop_progress_snapshot *result)
+                       struct raop_progress_snapshot *result)
+{
+  return raop_player_progress_at(p, source, attachment, monotonic_ns(), result);
+}
+
+/* Same range projection for polling and an admitted cancellation. The caller
+ * supplies the original admission time, not the later FLUSH/readiness time. */
+int
+raop_player_progress_at(struct raop_player *p, uint64_t source, uint64_t attachment,
+                        uint64_t captured_ns, struct raop_progress_snapshot *result)
 {
   pthread_mutex_lock(&p->pcm_lock);
-  if (p->failure.error) *result = p->failure;
-  else raop_transport_progress(p->stream_id, attachment, monotonic_ns(), result);
+  if (p->failure.error) {
+    *result = p->failure;
+    /* A dependency may fail after cancel admission but before its loop callback.
+     * Keep failure explicit, but never credit presentation after that cutoff. */
+    if (captured_ns < result->captured_ns) {
+      uint64_t elapsed = captured_ns > result->schedule_origin_ns && result->schedule_origin_ns
+        ? captured_ns - result->schedule_origin_ns : 0;
+      uint64_t frames = elapsed / 1000000000ULL * 44100 +
+                        elapsed % 1000000000ULL * 44100 / 1000000000ULL;
+      if (frames < result->scheduled_frames) result->scheduled_frames = frames;
+    }
+  }
+  else raop_transport_progress(p->stream_id, attachment, captured_ns, result);
   result->source = source;
   result->attachment = attachment;
   result->fed_frames = p->pts_samples;
@@ -922,13 +967,15 @@ raop_player_drain_complete(struct raop_player *p)
   pthread_mutex_lock(&p->pcm_lock);
   struct timeline *t = p->timeline;
   struct raop_progress_snapshot progress;
-  bool complete = t && t->ended && t->tail_reached && !t->padding_left &&
-    !p->failure.error && !evbuffer_get_length(p->pcm);
-  if (complete) {
+  bool complete = t && t->ended && (!t->end_target || p->failure.error);
+  /* Keep lane 1's last-real boundary for delayed end/compatibility silence.
+   * A failed receipt alone never stops viable peers with queued real input. */
+  if (!complete && t && t->ended && t->tail_reached && !t->padding_left &&
+      !evbuffer_get_length(p->pcm)) {
     raop_transport_progress(p->stream_id, 0, monotonic_ns(), &progress);
     complete = progress.participants && progress.status == 1 &&
-      progress.submitted_frames >= t->end_transport &&
-      progress.scheduled_frames >= t->end_transport;
+      progress.submitted_frames >= t->transport_end &&
+      progress.scheduled_frames >= t->transport_end;
   }
   if (complete) t->complete = true;
   pthread_mutex_unlock(&p->pcm_lock);

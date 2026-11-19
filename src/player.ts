@@ -7,10 +7,11 @@
 // drive this engine; they never hold player state themselves. The engine
 // emits nothing itself — app.playback commands do (core owns the hub).
 //
-// No audio means progress is wall-clock: while state is 'play' the position
-// advances in real time from the last seek/start base, clamped for finite
-// media, unbounded for live sources. An attached source additionally gates
-// completion on EOF and playout of accepted PCM. advanceEnded()
+// Physical sinks project only scheduled real-source frames, holding the commanded
+// origin before first presentation and across starvation. Without a physical sink
+// the existing monotonic engine clock remains. Completion requires EOF plus
+// matching native scheduled completion. Engine-only source callers retain their
+// legacy accepted-duration clock. advanceEnded()
 // (driven by the playback core's clock) replays/advances/drops/stops per the
 // repeat/consume modes — "no auto-advance" was fine for a queue-less mirror,
 // it is a lie with boots attached (HA extrapolates past the end).
@@ -32,6 +33,10 @@ import type { State } from './state.ts';
 import { SpeakerError } from './speaker-errors.ts';
 import { outputPlayerId } from './player-outputs.ts';
 import { planSourceFailure } from './source-recovery.ts';
+import {
+  planPlaybackSuccessor,
+  type SuccessorPlan,
+} from './playback-successor.ts';
 import { type Log, scopedLog } from './logging.ts';
 import {
   CONNECTION_STRATEGIES,
@@ -118,6 +123,8 @@ export interface PlayerStatus {
   current: QueueEntry | null;
   itemLengthMs: number;
   itemProgressMs: number;
+  /** Observed source progress, not playback intent. Zero during sink buffering. */
+  playbackRate: number;
   /** Retained engine clock facts, absent when stopped. A restored run's
    * historical start is unknown; reportedAtMs is the observed transition,
    * never the time of a status read. Progress still uses a monotonic clock. */
@@ -145,9 +152,13 @@ export interface PlayerStateSnapshot {
  * 1 Hz position tick while playing). */
 export interface PlayerPersistence {
   /** Atomically save occurrence references/allocator/revision and bookmark. */
-  saveQueue(snapshot: QueueSnapshot, state: PlayerStateSnapshot): void;
+  saveQueue(
+    snapshot: QueueSnapshot,
+    state: PlayerStateSnapshot,
+    position?: Promise<number>,
+  ): void;
   /** Upsert this player's state row (updated_at = now). */
-  saveState(snapshot: PlayerStateSnapshot): void;
+  saveState(snapshot: PlayerStateSnapshot, position?: Promise<number>): void;
   /** Operator command time, separate from periodic position bookmarks. */
   saveCommand?(atMs: number): void;
   /** Player slider, independent of the playback bookmark and speaker levels. */
@@ -269,8 +280,31 @@ export async function planRestore(opts: {
 
 export interface Player {
   status(): PlayerStatus;
+  /** A physical sink requires native completion even before/after its reader.
+   * Releasing the binding never reopens the current run's clock-only end gate. */
+  attachSink(): () => void;
   openSource(entryId: number, generation: number): PlaybackSource | null;
+  /** Reserve a future read incarnation without changing current or its gate. */
+  prepareSource(entryId: number, generation: number): PlaybackSource | null;
+  /** Claim a reserved future reader without publishing it as current. */
+  admitSource(source: PlaybackSource): boolean;
+  hasSource(source: PlaybackSource): boolean;
+  /** Reopen the surviving current occurrence after a native future-input fence. */
+  reanchorSource(
+    generation: number,
+    entryId: number,
+    positionMs: number,
+  ): boolean;
   cancelSource(source: PlaybackSource): void;
+  sourceComplete(source: PlaybackSource): boolean;
+  sourceCompatibilityRemaining(source: PlaybackSource): number;
+  sourcePosition(
+    source: PlaybackSource,
+    positionMs: number,
+    playbackRate: number,
+  ): boolean;
+  /** Only the captured paused incarnation may adopt an asynchronous cutoff. */
+  freezePosition(generation: number, positionMs: number): boolean;
   /** Accepted PCM duration, reported after the sink write resolves. */
   sourceAudio(source: PlaybackSource, durationMs: number): boolean;
   sourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
@@ -330,6 +364,13 @@ export interface Player {
   advanceEnded(): AdvanceResult;
   /** Exhausted sources bypass repeat-single; failed occurrences cannot wrap. */
   advanceFailed(failed: ReadonlySet<number>): AdvanceResult;
+  /** Apply exactly the prepared occurrence/effects, only in its captured revision. */
+  applySuccessor(
+    plan: SuccessorPlan,
+    entryId?: number | null,
+    prepared?: PlaybackSource,
+    continuous?: boolean,
+  ): AdvanceResult;
   /** Boot-time restore (plan restart-transparency): load the rehydrated
    * queue plus the persisted snapshot in one shot. main.ts decides
    * play-vs-pause per shouldAutoResume. Emits nothing and persists nothing
@@ -501,16 +542,44 @@ export function createPlayer(options: {
   let startedAt = 0;
   let clock: PlayerStatus['clock'] = null;
   let generation = 0, sourceGeneration = 0;
+  const sinks = new Set<object>();
+  let sinkRequired = false;
+  let scheduledProgressMs: number | null = null;
+  let playbackRate = 0;
   let deliveredGeneration = -1;
-  let source: {
+  type SourceRecord = {
     token: PlaybackSource;
     controller: AbortController;
+    claimed: boolean;
     outcome?: SourceOutcome;
-    drainAt: number;
-  } | null = null;
+    complete: boolean;
+    legacyDrainAt: number;
+    positionMs: number;
+    playbackRate: number;
+  };
+  let source: SourceRecord | null = null;
+  const preparedSources = new Map<PlaybackSource, SourceRecord>();
+  const makeSource = (entryId: number, startMs: number): SourceRecord => {
+    const controller = new AbortController();
+    return {
+      token: Object.freeze({
+        entryId,
+        generation: ++sourceGeneration,
+        startMs,
+        signal: controller.signal,
+      }),
+      controller,
+      claimed: false,
+      complete: false,
+      legacyDrainAt: monotonicNow(),
+      positionMs: startMs,
+      playbackRate: 0,
+    };
+  };
   const cancelSource = () => {
     const old = source;
     source = null;
+    playbackRate = 0;
     if (old) {
       items = items.map((entry) => {
         if (
@@ -531,6 +600,12 @@ export function createPlayer(options: {
   const discontinuity = () => {
     generation++;
     cancelSource();
+    const prepared = [...preparedSources.values()];
+    preparedSources.clear();
+    for (const record of prepared) record.controller.abort();
+    sinkRequired = sinks.size > 0;
+    scheduledProgressMs = null;
+    playbackRate = 0;
   };
   const anchor = (restart = false) => {
     const at = now();
@@ -546,6 +621,7 @@ export function createPlayer(options: {
   const progressMs = (): number => {
     const entry = currentEntry();
     if (entry === null) return 0;
+    if (sinkRequired) return scheduledProgressMs ?? baseProgressMs;
     const length = queueDuration(entry);
     const elapsed = state === 'play'
       ? baseProgressMs + (monotonicNow() - startedAt)
@@ -637,21 +713,74 @@ export function createPlayer(options: {
     if (!entry || entry.facts.kind === 'web' && entry.facts.mode !== 'finite') {
       return false;
     }
-    // An attached source must finish delivering and play out its accepted PCM.
-    // Decoder read-ahead is never permission to flush buffered tail audio.
-    if (
+    // A physical sink owns the gate for the entire run, not the reader's life.
+    // Missing/cleaned-up readers, EOF and accepted durations cannot open it.
+    if (sinkRequired) {
+      if (!source || source.outcome !== 'eof' || !source.complete) return false;
+    } else if (
       source && (source.outcome !== 'eof' ||
-        monotonicNow() < source.drainAt)
+        monotonicNow() < source.legacyDrainAt)
     ) return false;
     const length = queueDuration(entry) ?? 0;
     if (entry.facts.kind === 'web' && source) {
       return source.outcome === 'eof';
     }
     // Preserve library duration-clock behavior, including unknown lengths.
-    return length > 0 && progressMs() >= length;
+    return length > 0 && baseProgressMs + monotonicNow() - startedAt >= length;
+  };
+
+  const applySuccessor = (
+    plan: SuccessorPlan,
+    entryId = plan.entryId,
+    prepared?: PlaybackSource,
+    continuous = false,
+  ): AdvanceResult => {
+    const reading = prepared ? preparedSources.get(prepared) : undefined;
+    if (
+      plan.revision !== version || plan.currentEntryId !== currentEntry()?.id ||
+      plan.repeat !== repeat || plan.consume !== consume ||
+      plan.reason === 'natural' && !canAdvanceEnded() ||
+      entryId !== null && !plan.candidates.includes(entryId) ||
+      prepared &&
+        (!reading || prepared.signal.aborted || prepared.entryId !== entryId) ||
+      continuous && (!reading?.claimed || plan.reason !== 'natural')
+    ) return 'none';
+    // Transfer the exact reserved incarnation through the discontinuity. Other
+    // future reads are revoked; the previous playing record still owns its EOF
+    // and completion until this synchronous publication.
+    if (prepared) preparedSources.delete(prepared);
+    if (plan.removedEntryId !== null) {
+      items = items.filter((item) => item.id !== plan.removedEntryId);
+      version++;
+    }
+    if (continuous && reading) {
+      const previous = source;
+      source = reading;
+      currentIndex = items.findIndex((item) => item.id === entryId);
+      generation++;
+      baseProgressMs = reading.token.startMs;
+      scheduledProgressMs = reading.positionMs;
+      playbackRate = reading.playbackRate;
+      startedAt = monotonicNow();
+      anchor(true);
+      // Publication revokes only the completed primary. Later admitted readers
+      // and their accepted native prefixes belong to this same transport epoch.
+      previous?.controller.abort();
+    } else if (entryId === null) doStop();
+    else startAt(items.findIndex((item) => item.id === entryId));
+    if (reading) source = reading;
+    return plan.removedEntryId === null ? 'player' : 'player+queue';
   };
 
   return {
+    attachSink() {
+      const binding = {};
+      sinks.add(binding);
+      sinkRequired = true;
+      return () => {
+        sinks.delete(binding);
+      };
+    },
     status(): PlayerStatus {
       // Stopped means no current — not the queue head. A queue-head-as-
       // current fallback makes a stale item look played everywhere the
@@ -666,6 +795,7 @@ export function createPlayer(options: {
         current: entry,
         itemLengthMs: entry === null ? 0 : queueDuration(entry) ?? 0,
         itemProgressMs: state === 'stop' ? 0 : progressMs(),
+        playbackRate: state !== 'play' ? 0 : sinkRequired ? playbackRate : 1,
         clock: clock === null ? null : { ...clock },
         generation,
         capabilities: queueCapabilities(entry),
@@ -675,38 +805,125 @@ export function createPlayer(options: {
     openSource(entryId, expectedGeneration) {
       if (
         state !== 'play' || currentEntry()?.id !== entryId ||
-        generation !== expectedGeneration || source
+        generation !== expectedGeneration || source?.claimed
       ) return null;
-      const controller = new AbortController();
-      const token = Object.freeze({
+      source ??= makeSource(
         entryId,
-        generation: ++sourceGeneration,
-        startMs: queueCapabilities(currentEntry()).seekable
+        queueCapabilities(currentEntry()).seekable
           ? deliveredGeneration === generation ? progressMs() : baseProgressMs
           : 0,
-        signal: controller.signal,
-      });
-      source = { token, controller, drainAt: monotonicNow() };
-      return token;
+      );
+      source.claimed = true;
+      return source.token;
+    },
+    prepareSource(entryId, expectedGeneration) {
+      if (
+        state !== 'play' || generation !== expectedGeneration ||
+        !items.some((item) => item.id === entryId)
+      ) return null;
+      const record = makeSource(entryId, 0);
+      preparedSources.set(record.token, record);
+      return record.token;
+    },
+    admitSource(token) {
+      const record = preparedSources.get(token);
+      if (!record || token.signal.aborted || record.claimed) return false;
+      record.claimed = true;
+      return true;
+    },
+    hasSource(token) {
+      return !token.signal.aborted &&
+        (source?.token === token || preparedSources.has(token));
+    },
+    reanchorSource(expectedGeneration, entryId, positionMs) {
+      if (
+        generation !== expectedGeneration || currentEntry()?.id !== entryId ||
+        state !== 'play' || !Number.isSafeInteger(positionMs) || positionMs < 0
+      ) return false;
+      discontinuity();
+      baseProgressMs = positionMs;
+      scheduledProgressMs = positionMs;
+      startedAt = monotonicNow();
+      anchor();
+      return true;
     },
     cancelSource(token) {
       if (source?.token === token) cancelSource();
+      const prepared = preparedSources.get(token);
+      preparedSources.delete(token);
+      prepared?.controller.abort();
+    },
+    sourceComplete(token) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
+      if (
+        !record?.claimed || record.outcome !== 'eof' ||
+        record.complete || token.signal.aborted
+      ) return false;
+      record.complete = true;
+      return true;
+    },
+    sourceCompatibilityRemaining(token) {
+      if (source?.token !== token || !sinkRequired) return 0;
+      const entry = currentEntry();
+      if (entry?.facts.kind !== 'song') return 0;
+      const length = queueDuration(entry) ?? 0;
+      return length > 0
+        ? Math.max(0, length - baseProgressMs - (monotonicNow() - startedAt))
+        : 0;
+    },
+    sourcePosition(token, positionMs, rate) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
+      if (
+        !record?.claimed || token.signal.aborted || !sinkRequired ||
+        !Number.isSafeInteger(positionMs) || positionMs < 0
+      ) return false;
+      record.positionMs = positionMs;
+      record.playbackRate = rate;
+      if (source !== record) return true;
+      scheduledProgressMs = positionMs;
+      playbackRate = rate;
+      if (clock) clock = { ...clock, reportedAtMs: now() };
+      return true;
+    },
+    freezePosition(expectedGeneration, positionMs) {
+      if (
+        generation !== expectedGeneration || state !== 'pause' ||
+        !Number.isSafeInteger(positionMs) || positionMs < 0
+      ) return false;
+      baseProgressMs = positionMs;
+      scheduledProgressMs = positionMs;
+      playbackRate = 0;
+      return true;
     },
     sourceAudio(token, durationMs) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
       if (
-        source?.token !== token || source.outcome ||
+        !record?.claimed || record.outcome || token.signal.aborted ||
         !Number.isFinite(durationMs) || durationMs <= 0
       ) return false;
+      if (source !== record) return true;
       deliveredGeneration = generation;
-      source.drainAt = Math.max(monotonicNow(), source.drainAt) + durationMs;
+      if (!sinkRequired) {
+        source.legacyDrainAt = Math.max(monotonicNow(), source.legacyDrainAt) +
+          durationMs;
+      }
       return true;
     },
     sourceOutcome(token, outcome) {
+      const record = source?.token === token
+        ? source
+        : preparedSources.get(token);
       if (
-        source?.token !== token || source.outcome || state !== 'play' ||
-        currentEntry()?.id !== token.entryId
+        !record?.claimed || record.outcome || state !== 'play' ||
+        token.signal.aborted
       ) return false;
-      source.outcome = outcome;
+      record.outcome = outcome;
       return true;
     },
     sourceMetadata(token, metadata) {
@@ -897,53 +1114,27 @@ export function createPlayer(options: {
 
     advanceEnded() {
       if (!canAdvanceEnded()) return 'none';
-
-      if (repeat === 'single') {
-        // Replay the same item: reset the clock, keep playing.
-        startAt(currentIndex!);
-        return 'player';
-      }
-      if (repeat === 'all') {
-        // Next, wrapping to the head past the last item.
-        startAt((currentIndex! + 1) % items.length);
-        return 'player';
-      }
-      if (consume) {
-        // Drop the finished item; whatever lands at the index plays.
-        const at = currentIndex!;
-        items = [...items.slice(0, at), ...items.slice(at + 1)];
-        version++;
-        if (at >= items.length) {
-          doStop();
-          return 'player+queue';
-        }
-        startAt(at);
-        return 'player+queue';
-      }
-      // repeat off: next; past the last item stops (next() semantics).
-      if (currentIndex! + 1 >= items.length) {
-        doStop();
-        return 'player';
-      }
-      startAt(currentIndex! + 1);
-      return 'player';
+      return applySuccessor(planPlaybackSuccessor({
+        reason: 'natural',
+        revision: version,
+        items,
+        currentEntryId: currentEntry()?.id,
+        repeat,
+        consume,
+      }));
     },
 
     advanceFailed(failed) {
-      const plan = planSourceFailure(
+      return applySuccessor(planSourceFailure(
         items,
         currentEntry()?.id,
         failed,
         repeat,
         consume,
-      );
-      const changed = plan.items.length !== items.length;
-      items = plan.items;
-      if (changed) version++;
-      if (plan.index === null) doStop();
-      else startAt(plan.index);
-      return changed ? 'player+queue' : 'player';
+        version,
+      ));
     },
+    applySuccessor,
 
     restore(snapshot) {
       discontinuity();
@@ -966,11 +1157,9 @@ export function createPlayer(options: {
         return;
       }
       currentIndex = Math.min(Math.max(0, index), items.length - 1);
-      const length = queueDuration(items[currentIndex]) ?? 0;
-      baseProgressMs = Math.min(
-        Math.max(0, Math.round(snapshot.positionMs)),
-        length,
-      );
+      // A declared catalog duration is not an upper bound on decoded media.
+      // Keep the saved native bookmark even for longer/unknown decodes.
+      baseProgressMs = Math.max(0, Math.round(snapshot.positionMs));
       startedAt = monotonicNow();
       state = snapshot.state;
       // The snapshot stores position/state, not the original start time.

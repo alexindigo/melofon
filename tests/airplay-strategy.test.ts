@@ -1,5 +1,6 @@
 // Behavioral intent/strategy regressions, no devices, DB or native library.
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import { createNotify } from '../src/notify.ts';
 import { createOutputs, createPlayer } from '../src/player.ts';
 import { createPlayback } from '../src/playback.ts';
@@ -116,14 +117,18 @@ function setup(backoff = [0, 20], finite = false, opts: {
     decodePcm: opts.decode ?? ((path: string, opts?: { startMs?: number }) => {
       decoded.push({ path, start: opts?.startMs });
       const tag = decoded.length;
-      return Promise.resolve({
-        async *[Symbol.asyncIterator]() {
-          for (let n = 0; n < (finite ? 2 : 100000); n++) {
-            await sleep(2);
-            yield new Uint8Array(64).fill(tag);
-          }
+      return Promise.resolve(fixturePcm(
+        {
+          async *[Symbol.asyncIterator]() {
+            for (let n = 0; n < (finite ? 2 : 100000); n++) {
+              await sleep(2);
+              yield new Uint8Array(64).fill(tag);
+            }
+          },
         },
-      });
+        undefined,
+        opts,
+      ));
     }),
   } as unknown as Media;
   const transports: Transport[] = [];
@@ -224,7 +229,7 @@ Deno.test('boot close awaits late PCM acquisition and returns its unstarted iter
   const s = setup([], false, {
     decode: () => {
       entered();
-      return held;
+      return held.then((stream) => fixturePcm(stream));
     },
   });
   try {
@@ -269,7 +274,7 @@ Deno.test('stream ownership precedes acquisition: two connected outputs open onl
   const s = setup([], false, {
     decode: () => {
       acquisitions++;
-      return held;
+      return held.then((stream) => fixturePcm(stream));
     },
   });
   try {
@@ -308,7 +313,7 @@ Deno.test('one shared source failure retires both outputs without reopening or s
   const s = setup([0], false, {
     decode: () => {
       acquisitions++;
-      return held;
+      return held.then((stream) => fixturePcm(stream));
     },
   });
   try {
@@ -813,13 +818,13 @@ Deno.test('current decoder null/empty/creation/iterator errors release without c
   const decoders: Media['decodePcm'][] = [
     () => Promise.resolve(null),
     () => Promise.reject(new Error('decoder creation failed')),
-    () => Promise.resolve({ async *[Symbol.asyncIterator]() {} }),
+    () => Promise.resolve(fixturePcm({ async *[Symbol.asyncIterator]() {} })),
     () =>
-      Promise.resolve({
+      Promise.resolve(fixturePcm({
         async *[Symbol.asyncIterator]() {
           yield await Promise.reject(new Error('iterator failed'));
         },
-      }),
+      })),
   ];
   for (const decode of decoders) {
     const s = setup([0], false, { decode });
@@ -843,13 +848,17 @@ Deno.test('stale decoder rejection cannot pause or retire its replacement', asyn
   let reject!: (error: Error) => void;
   let calls = 0;
   const s = setup([0], false, {
-    decode: () => {
+    decode: (_path, options) => {
       if (++calls === 1) return new Promise((_, no) => reject = no);
-      return Promise.resolve({
-        async *[Symbol.asyncIterator]() {
-          yield new Uint8Array([9, 0, 0, 0]);
+      return Promise.resolve(fixturePcm(
+        {
+          async *[Symbol.asyncIterator]() {
+            yield new Uint8Array([9, 0, 0, 0]);
+          },
         },
-      });
+        undefined,
+        options,
+      ));
     },
   });
   try {

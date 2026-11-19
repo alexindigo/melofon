@@ -22,6 +22,24 @@ import type { State } from './state.ts';
 import type { PublishedCommandPort } from './save-receipt.ts';
 import { outputPlayerId } from './player-outputs.ts';
 
+type CapturedPlayerSave = PlayerSave & { position?: Promise<number> };
+// Capture all ordinary facts synchronously. Only the identified native cutoff
+// remains pending; retries reuse its resolved value, never re-read live state.
+const capturePlayer = (row: CapturedPlayerSave): Promise<PlayerSave> => {
+  const { position, ...facts } = row;
+  const copy = structuredClone(facts);
+  const captured = position && copy.state
+    ? position.then((positionMs) => ({
+      ...copy,
+      state: { ...copy.state!, positionMs },
+    }))
+    : Promise.resolve(copy);
+  // The ordered writer may still be behind an older batch when this settles.
+  // Retain rejection for that writer without an unhandled intermediate promise.
+  void captured.catch(() => {});
+  return captured;
+};
+
 export type { PersistedPlayerState } from './store/playback.ts';
 
 export interface EnginePersistence extends PlayerPersistence {
@@ -211,14 +229,14 @@ export function createPersistence(
   const outputRevisions = new Map<string, number>();
   const ignored = new Set<string>();
   let publication: {
-    players: Map<number, PlayerSave>;
+    players: Map<number, CapturedPlayerSave>;
     outputs: Map<string, AdoptedSpeakerSnapshot>;
   } | undefined;
   const playerTarget = (row: PlayerSave) =>
     `${row.playerId}(${
       Object.keys(row).filter((key) => key !== 'playerId').sort().join(',')
     })`;
-  const savePlayer = (row: PlayerSave, save = enqueue) => {
+  const savePlayer = (row: CapturedPlayerSave, save = enqueue) => {
     if (publication) {
       publication.players.set(row.playerId, {
         ...publication.players.get(row.playerId),
@@ -226,8 +244,9 @@ export function createPersistence(
       });
     } else {
       requireOpen();
+      const captured = capturePlayer(row);
       save(
-        () => store.players.saveChanges({ players: [row] }),
+        async () => store.players.saveChanges({ players: [await captured] }),
         `player:${playerTarget(row)}`,
       );
     }
@@ -247,24 +266,37 @@ export function createPersistence(
         }
       }, target);
     return {
-      saveQueue(snapshot, state) {
+      saveQueue(snapshot, state, position) {
         if (!active) return;
         const copy = structuredClone(snapshot);
-        if (publication) savePlayer({ playerId, queue: copy, state });
+        if (publication) savePlayer({ playerId, queue: copy, state, position });
         else {
+          const captured = capturePlayer({
+            playerId,
+            queue: copy,
+            state,
+            position,
+          });
           save(
-            () => store.playback.saveQueue(playerId, copy, state),
+            async () =>
+              store.playback.saveQueue(playerId, copy, (await captured).state!),
             `player:${playerId}:queue`,
           );
         }
       },
-      saveState(snapshot) {
+      saveState(snapshot, position) {
         if (!active) return;
         if (publication) {
-          savePlayer({ playerId, state: structuredClone(snapshot) });
+          savePlayer({ playerId, state: structuredClone(snapshot), position });
         } else {
+          const captured = capturePlayer({
+            playerId,
+            state: snapshot,
+            position,
+          });
           save(
-            () => store.playback.saveState(playerId, snapshot),
+            async () =>
+              store.playback.saveState(playerId, (await captured).state!),
             `player:${playerId}:state`,
           );
         }
@@ -301,7 +333,7 @@ export function createPersistence(
       // Closing intake cannot turn an already-admitted publication into failure.
       const receipt = admit();
       const batch = {
-        players: new Map<number, PlayerSave>(),
+        players: new Map<number, CapturedPlayerSave>(),
         outputs: new Map<string, AdoptedSpeakerSnapshot>(),
       };
       publication = batch;
@@ -316,15 +348,14 @@ export function createPersistence(
       }
       // Capture without an await. Retried values cannot follow later mutation
       // of a caller's state object, nor replay any runtime command.
-      const changes = structuredClone({
-        players: [...batch.players.values()],
-        outputs: [...batch.outputs.values()],
-      });
+      const players = [...batch.players.values()].map(capturePlayer);
+      const outputs = structuredClone([...batch.outputs.values()]);
       const save = enqueue(
-        () => saveChanges(changes),
-        `players:${changes.players.map(playerTarget).join(',')} speakers:${
-          changes.outputs.map((row) => row.id).join(',')
-        }`,
+        async () =>
+          saveChanges({ players: await Promise.all(players), outputs }),
+        `players:${
+          [...batch.players.values()].map(playerTarget).join(',')
+        } speakers:${outputs.map((row) => row.id).join(',')}`,
         receipt,
       );
       return { command: save.attempted.then(() => value), saved: save.saved };

@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { startServer } from '../../src/server.ts';
 import { openStore } from '../../src/store/index.ts';
 import { reservePorts } from '../helpers/ports.ts';
@@ -43,6 +43,9 @@ for (
     let listenFailed = false;
     const serve = Deno.serve;
     Deno.serve = ((...args: Parameters<typeof Deno.serve>) => {
+      // Keep unused numbers reserved across startup awaits. A listener takes
+      // ownership only when it is actually about to bind.
+      ports.release();
       const handle = serve(...args);
       const close = handle.shutdown.bind(handle);
       handle.shutdown = async () => {
@@ -55,7 +58,6 @@ for (
       return handle;
     }) as typeof Deno.serve;
     try {
-      ports.release();
       const starting = startServer({
         exit: (code) => exits.push(code),
         env: {
@@ -69,12 +71,29 @@ for (
         },
         acquired(name) {
           acquired.push(name);
-          if (name === fail) throw new Error(`fault after ${name}`);
+          if (name === fail) {
+            if (fail === 'lookups') {
+              for (const at of [port, own, ws]) {
+                assertThrows(() => {
+                  const contender = Deno.listen({
+                    hostname: '0.0.0.0',
+                    port: at,
+                  });
+                  contender.close();
+                }, Deno.errors.AddrInUse);
+              }
+            }
+            throw new Error(`fault after ${name}`);
+          }
         },
         openStore: async (...args) => {
           const store = await openStore(...args);
           const close = store.close;
           store.close = async () => {
+            // Early failure may precede every real listener. Transfer the held
+            // reservations straight to this synchronous rebind probe, with no
+            // await where an unrelated socket could claim their numbers.
+            ports.release();
             for (const at of [port, own, ws]) {
               const socket = Deno.listen({ hostname: '0.0.0.0', port: at });
               socket.close();

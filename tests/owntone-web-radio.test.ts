@@ -5,6 +5,7 @@ import { speakerMedia, until } from './helpers/speaker-consumer.ts';
 import { httpRadio, icyBlock } from './helpers/http-radio.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
+import { traceTimelineAudio } from './helpers/raop-timeline-audio.ts';
 import { createTestAirplayDevices } from './helpers/airplay-devices.ts';
 import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
@@ -30,6 +31,7 @@ async function fixture(receiverPort?: number) {
   let devices: ReturnType<typeof createTestAirplayDevices> | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let songId = '';
+  const audio = traceTimelineAudio(createFfiStream);
   const f = await apiFixture({
     hats: {
       layersRoot: 'layers',
@@ -83,7 +85,7 @@ async function fixture(receiverPort?: number) {
         prepareQueueMedia: sources.prepare,
       });
       if (receiverPort) {
-        devices = createTestAirplayDevices(outputs, undefined, createFfiStream);
+        devices = createTestAirplayDevices(outputs, undefined, audio.stream);
         boot = createAirplayBoot({
           outputs,
           playback,
@@ -117,6 +119,7 @@ async function fixture(receiverPort?: number) {
     own,
     response,
     addPath,
+    audio,
     songUri: `library:track:${wireInt(songId)}`,
     add: (uris: string, options: Record<string, string> = {}) =>
       own(addPath(uris, options), 'POST'),
@@ -351,7 +354,10 @@ Deno.test('HA-shaped HTTP finite URL adds deliver complete native receiver audio
     headers: { 'content-type': 'audio/wav' },
     body: [wav],
   }));
-  const receiver = await startFakeRaop({ captureAudio: true });
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
   const t = await fixture(receiver.port);
   try {
     const url = `${server.origin}/speech?announcement=true`;
@@ -368,12 +374,12 @@ Deno.test('HA-shaped HTTP finite URL adds deliver complete native receiver audio
     await until(() =>
       t.playback.playerView().current?.id === added.items[1].id
     );
-    const received = () =>
-      decodeReceiverAudio(
-        receiver.sessions[0].sdp,
-        receiver.sessions[0].audioPayloads,
-      );
+    const received = () => t.audio.realAudio(receiver.sessions[0]);
     const first = received();
+    assertEquals(
+      t.audio.scheduledRealAudio(receiver.sessions[0], receiver.nowMs()),
+      pcm,
+    );
     assertEquals(
       first.length,
       pcm.length,
@@ -396,6 +402,10 @@ Deno.test('HA-shaped HTTP finite URL adds deliver complete native receiver audio
       received(),
       expected,
       'both complete finite sources reach the ALAC consumer before natural stop',
+    );
+    assertEquals(
+      t.audio.scheduledRealAudio(receiver.sessions[0], receiver.nowMs()),
+      expected,
     );
     assertEquals(receiver.sessions.length, 1, 'natural next retains the sink');
     assertEquals(

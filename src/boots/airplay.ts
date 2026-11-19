@@ -17,6 +17,7 @@ import type {
   PlaybackSource,
 } from '../player.ts';
 import type { Playback } from '../playback.ts';
+import type { TimelineSource } from '../playback-timeline.ts';
 import type { PlaybackCapacity } from '../playback-capacity.ts';
 import type { State } from '../state.ts';
 import {
@@ -26,6 +27,7 @@ import {
 import type { AirplayDevices } from './airplay-device.ts';
 import type {
   AirplayCancelResult,
+  AirplayCompletionKey,
   AirplayPlaybackStream,
   AirplayTransport,
 } from './airplay-profile.ts';
@@ -130,6 +132,54 @@ export function createAirplayBoot(
   const operations = createOperationScope('AirPlay boot');
   let closeWork: Promise<void> | undefined;
   const sources = deps.sources ?? createPlaybackSource({ media });
+  const detachSink = playback.attachSink({
+    reanchor(mapping, commit) {
+      const owner = stream;
+      if (
+        !owner || streamClosing || owner.mapping !== mapping ||
+        !owner.sourceStarted
+      ) return null;
+      return cancelStream(owner, true, mapping, false, commit);
+    },
+    cutoff(mapping, intent, commit) {
+      const owner = stream;
+      if (
+        !owner || streamClosing || owner.mapping !== mapping ||
+        !owner.sourceStarted
+      ) return null;
+      // Capture idle intent before a native admission can wait on its lock.
+      // Readiness/cutoff settlement must not extend the existing idle hold.
+      owner.idleAt = performance.now();
+      const captured = Promise.withResolvers<void>();
+      const admitted = owner.admitted;
+      const ready = cancelStream(
+        owner,
+        false,
+        admitted ? mapping : undefined,
+        intent === 'stop',
+        (cutoff) => {
+          try {
+            commit(cutoff);
+            captured.resolve();
+          } catch (error) {
+            captured.reject(error);
+            throw error;
+          }
+        },
+      );
+      // No native source exists before its first append admission. Its bookmark
+      // is the commanded origin, independent of an unrelated receiver retirement.
+      if (!admitted) captured.resolve();
+      void ready.then(
+        () =>
+          captured.reject(
+            new Error('AirPlay cancellation had no source cutoff'),
+          ),
+        captured.reject,
+      );
+      return captured.promise;
+    },
+  });
   const capacityCurrent = () => deps.capacity?.authority() ?? (() => true);
   // Keep the existing permissive off/list parser (including clamping) at its owner.
   deps.state?.declare(AIRPLAY_RETRY_KEY, {
@@ -191,6 +241,10 @@ export function createAirplayBoot(
     segment: bigint;
     cutoff?: AirplayCancelResult;
     sourceStarted: boolean;
+    sourceOperations: ReturnType<typeof createOperationScope>;
+    mapping?: TimelineSource;
+    admitted?: boolean;
+    idleAt?: number;
   };
   let stream: StreamOwner | null = null;
   let streamClosing: Promise<void> | undefined;
@@ -391,7 +445,6 @@ export function createAirplayBoot(
         ) => [id, leaseEntry(id, value.generation)]),
       ),
     };
-    cancelPump();
     playback.pause(ownedSource);
   };
   const resume = (out: Output, permission?: Grant, r?: Runtime) => {
@@ -502,8 +555,19 @@ export function createAirplayBoot(
       throw new Error('Connected AirPlay stream has no epoch');
     }
     const authority = { stream: owner, lease: sourceLease };
+    const mapping = playback.bindSource(
+      sourceLease,
+      owner.sink.id!,
+      nativeEpoch,
+    );
+    if (!mapping) {
+      playback.cancelSource(sourceLease);
+      return;
+    }
     source = authority;
     owner.sourceStarted = true;
+    owner.mapping = mapping;
+    owner.admitted = false;
     const current = view.current, startMs = sourceLease.startMs;
     const path = current.facts.kind === 'song'
       ? current.facts.song.path
@@ -512,7 +576,41 @@ export function createAirplayBoot(
       source === authority && !sourceLease.signal.aborted && !closed &&
       stream === owner && streamCurrent();
     void operations.run(async () => {
+      while (owns()) {
+        const progress = await owner.sink.progress(nativeEpoch, mapping.source);
+        if (progress && owns()) playback.sourceProgress(sourceLease, progress);
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            clearTimeout(timer);
+            sourceLease.signal.removeEventListener('abort', finish);
+            resolve();
+          };
+          const timer = setTimeout(finish, 25);
+          sourceLease.signal.addEventListener('abort', finish, { once: true });
+          if (sourceLease.signal.aborted) finish();
+        });
+      }
+    }).catch((error) => {
+      if (owns()) {
+        for (const [id, r] of [...runtimes]) {
+          sessionFailed(id, r, 'progress', error);
+        }
+      }
+    });
+    const readSource = async () => {
       let bytes = 0;
+      let key: AirplayCompletionKey | undefined;
+      const wait = (ms: number) =>
+        new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            sourceLease.signal.removeEventListener('abort', done);
+            resolve();
+          };
+          const timer = setTimeout(done, ms);
+          sourceLease.signal.addEventListener('abort', done, { once: true });
+          if (sourceLease.signal.aborted) done();
+        });
       try {
         const stream = await sources.open(current, {
           signal: sourceLease.signal,
@@ -520,7 +618,8 @@ export function createAirplayBoot(
           onMetadata: (metadata) => {
             if (owns()) playback.reportSourceMetadata(sourceLease, metadata);
           },
-          retry: (reason) => playback.retrySource(sourceLease, reason),
+          retry: (reason, signal) =>
+            playback.retrySource(sourceLease, reason, signal),
         });
         if (!stream) {
           if (!owns()) return;
@@ -528,6 +627,9 @@ export function createAirplayBoot(
         }
         const iterator = stream[Symbol.asyncIterator]();
         try {
+          if (stream.originFrame !== mapping.originFrame) {
+            throw new Error('Playback source differs from its timeline origin');
+          }
           if (!owns()) return;
           for await (
             const chunk of { [Symbol.asyncIterator]: () => iterator }
@@ -545,17 +647,21 @@ export function createAirplayBoot(
               const segment = ++owner.segment;
               let offset = 0;
               while (offset < chunk.length && owns()) {
-                const receipt = await owner.sink.append({
+                owner.admitted = true;
+                const receipt = await owner.sink.appendSource({
                   epoch: nativeEpoch,
+                  source: mapping.source,
                   segment,
                   pcm: chunk.subarray(offset),
                 });
                 // Only this copied prefix belongs to the source. Never account
                 // a refused suffix or retry a prefix after cancellation.
                 const accepted = Number(receipt.acceptedFrames) * 4;
+                if (owns()) stream.accept(chunk, receipt.acceptedFrames);
                 offset += accepted;
                 bytes += accepted;
                 if (owns() && accepted) {
+                  playback.sourceAccepted(sourceLease, receipt.acceptedFrames);
                   playback.sourceAudio(sourceLease, accepted / 176400 * 1000);
                 }
                 if (!owns()) return;
@@ -566,18 +672,7 @@ export function createAirplayBoot(
                   throw new Error('Current AirPlay source epoch canceled');
                 }
                 if (offset < chunk.length) {
-                  await new Promise<void>((resolve) => {
-                    const done = () => {
-                      clearTimeout(timer);
-                      sourceLease.signal.removeEventListener('abort', done);
-                      resolve();
-                    };
-                    const timer = setTimeout(done, 10);
-                    sourceLease.signal.addEventListener('abort', done, {
-                      once: true,
-                    });
-                    if (sourceLease.signal.aborted) done();
-                  });
+                  await wait(10);
                 }
               }
             } catch (error) {
@@ -591,9 +686,14 @@ export function createAirplayBoot(
             if (!owns()) return;
           }
         } finally {
-          await iterator.return?.();
+          try {
+            await iterator.return?.();
+          } finally {
+            await stream.completion;
+          }
         }
         if (!owns()) return;
+        if (!stream.eof) throw new Error('Playback decoder closed before EOF');
         if (!bytes) throw new Error('empty decoder stream');
         if (DEBUG && path !== undefined) {
           log.event('pump_end', {
@@ -605,6 +705,70 @@ export function createAirplayBoot(
         }
         // Nonempty EOF is decoder completion, not audible/drained completion.
         playback.reportSourceOutcome(sourceLease, 'eof');
+        if (!owns()) return; // Live EOF is failure, never a natural seal.
+        const target = BigInt(bytes / 4);
+        if (!playback.sealSource(sourceLease, target)) return;
+        try {
+          let marker;
+          do {
+            marker = await owner.sink.seal(nativeEpoch, mapping.source, target);
+            if (
+              marker.status === 'backpressure' || marker.status === 'not-ready'
+            ) await wait(10);
+            else break;
+          } while (owns());
+          if (marker.status !== 'accepted') {
+            if (!owns()) return;
+            throw new Error(`RAOP seal failed: ${marker.status}`);
+          }
+          key = {
+            epoch: nativeEpoch,
+            source: mapping.source,
+            target,
+            revision: 1n,
+          };
+          // Catalog logical eligibility remains core policy, separate from native
+          // real-source progress. Its shorter decode keeps a labelled paced gap.
+          if (playback.sourceCompatibilityRemaining(sourceLease) > 0) {
+            await owner.sink.compatibilitySilence(nativeEpoch, mapping.source);
+            while (owns()) {
+              const remaining = playback.sourceCompatibilityRemaining(
+                sourceLease,
+              );
+              if (remaining <= 0) break;
+              await wait(remaining);
+            }
+          }
+          if (!owns()) return;
+          const ended = await owner.sink.endStream(
+            nativeEpoch,
+            marker.inputEnd,
+          );
+          if (ended.status !== 'accepted') {
+            throw new Error(`RAOP end failed: ${ended.status}`);
+          }
+          const completion = await owner.sink.waitCompletion(key);
+          if (!owns()) return;
+          if (completion.status !== 'complete') {
+            throw new Error(
+              `RAOP source did not complete: ${completion.status}/${completion.error}`,
+            );
+          }
+          const progress = await owner.sink.progress(
+            nativeEpoch,
+            mapping.source,
+          );
+          if (progress && owns()) {
+            playback.sourceProgress(sourceLease, progress);
+          }
+          await playback.completeSource(sourceLease, completion);
+        } catch (error) {
+          if (owns()) {
+            for (const [id, r] of [...runtimes]) {
+              sessionFailed(id, r, 'completion', error);
+            }
+          }
+        }
       } catch (error) {
         if (!owns()) return;
         if (current.facts.kind === 'web') {
@@ -638,13 +802,32 @@ export function createAirplayBoot(
         for (const [peerId, peer] of [...runtimes]) {
           void retire(peerId, peer, 'content');
         }
+      } finally {
+        // The reader's return/cleanup did not release this authority. Retire the
+        // native result only after the matching core transition or cancellation.
+        if (key) {
+          try {
+            await owner.sink.waitCompletion(key);
+            if (sourceLease.signal.aborted) await owner.sink.ackCompletion(key);
+          } catch (error) {
+            if (!closed && !streamClosing) {
+              streamBlocked = true;
+              log.event('retirement_failed', {
+                player: deps.playerId ?? 1,
+                error,
+              });
+            }
+          }
+        }
       }
-    }).catch((error) =>
-      log.event('content_failed', {
-        player: deps.playerId ?? 1,
-        generation: view.generation,
-        error,
-      })
+    };
+    void operations.run(() => owner.sourceOperations.run(readSource)).catch(
+      (error) =>
+        log.event('content_failed', {
+          player: deps.playerId ?? 1,
+          generation: view.generation,
+          error,
+        }),
     );
   };
   const drainPumps = () => {
@@ -656,6 +839,59 @@ export function createAirplayBoot(
     r.entry = view.current?.id ?? null;
     r.playbackGeneration = view.generation;
     drainPumps();
+  };
+  const cancelStream = (
+    owner: StreamOwner,
+    playing: boolean,
+    mapping?: TimelineSource,
+    stop = false,
+    commit?: Parameters<
+      NonNullable<Parameters<Playback['attachSink']>[0]>['cutoff']
+    >[2],
+  ) => {
+    const epoch = owner.sink.epoch;
+    if (epoch === null) throw new Error('Started AirPlay source has no epoch');
+    // Native cancellation advances the epoch before the first await and owns
+    // local reset plus every attachment's FLUSH/destruction readiness barrier.
+    const previous = owner.reset;
+    const cancellation = operations.run(async () => {
+      const retiring = [...runtimes].flatMap(([id, r]) => {
+        if (!r.transport) return [];
+        const choice = outputs.get(id)?.connectionStrategy ?? r.strategy;
+        const retire = stop || forceRelease.has(id) ||
+          (!playing
+            ? CONNECTION_STRATEGIES[choice].idle === 'retire'
+            : CONNECTION_STRATEGIES[choice].discontinuity === 'retire');
+        return retire ? [r.transport] : [];
+      });
+      const pending = mapping
+        ? owner.sink.cancelSource(epoch, mapping.source, retiring, commit)
+        : owner.sink.cancel(epoch, retiring);
+      owner.sourceStarted = false;
+      const result = await pending;
+      if (result.status === 'failed') throw new Error('AirPlay cancel failed');
+      if (closed || stream !== owner) return;
+      // The source transition was committed above. Keep its exact cutoff for
+      // later timeline projection; this is not yet a public media bookmark.
+      if (!owner.cutoff || owner.cutoff.epoch < result.epoch) {
+        owner.cutoff = result;
+      }
+      await owner.sink.ackCancel(result.epoch);
+    });
+    // Fence the new command immediately, but retain every older cancel/ack in
+    // the release barrier. A superseding fast cancel cannot close the lazy
+    // owner while an older retirement is still settling its retained receipt.
+    const resetting = Promise.all([previous, cancellation]).then(() => {})
+      .catch((error) => {
+        streamBlocked = true;
+        log.event('retirement_failed', { player: deps.playerId ?? 1, error });
+      })
+      .finally(() => {
+        if (owner.reset === resetting) owner.reset = undefined;
+        reconcile();
+      });
+    owner.reset = resetting;
+    return cancellation;
   };
   const syncStream = (view: View) => {
     const owner = stream;
@@ -669,60 +905,27 @@ export function createAirplayBoot(
     owner.entry = entry;
     owner.generation = view.generation;
     owner.playing = playing;
+    if (playing) owner.idleAt = undefined;
+    else owner.idleAt ??= performance.now();
     cancelPump();
-    // Before a source lifetime exists, there is no old input/schedule to cancel.
-    // Connecting/auth sessions can absorb the newest intent without destroying
-    // their handshake. Once a source starts (even unresolved acquisition), its
-    // discontinuity must fence native input. Further intent changes while that
-    // fence waits can share its still-empty replacement epoch.
+    // A core cutoff already fenced this source before intent publication.
     if (!owner.sourceStarted) return;
-    const epoch = owner.sink.epoch;
-    if (epoch === null) return; // No native audio/session exists to cancel yet.
-    // Native cancellation advances the epoch before the first await and owns
-    // local reset plus every attachment's FLUSH/destruction readiness barrier.
-    const previous = owner.reset;
-    const cancellation = operations.run(async () => {
-      const retiring = [...runtimes].flatMap(([id, r]) => {
-        if (!r.transport) return [];
-        const choice = outputs.get(id)?.connectionStrategy ?? r.strategy;
-        const retire = forceRelease.has(id) ||
-          (!playing
-            ? CONNECTION_STRATEGIES[choice].idle === 'retire'
-            : CONNECTION_STRATEGIES[choice].discontinuity === 'retire');
-        return retire ? [r.transport] : [];
-      });
-      const pending = owner.sink.cancel(epoch, retiring);
-      owner.sourceStarted = false;
-      const result = await pending;
-      if (result.status === 'failed') throw new Error('AirPlay cancel failed');
-      if (closed || stream !== owner) return;
-      // The source transition was committed above. Keep its exact cutoff for
-      // later timeline projection; this is not yet a public media bookmark.
-      if (!owner.cutoff || owner.cutoff.epoch < result.epoch) {
-        owner.cutoff = result;
-      }
-      await owner.sink.ackCancel(result.epoch);
-    }).catch(
-      (error) => {
-        streamBlocked = true;
-        log.event('retirement_failed', { player: deps.playerId ?? 1, error });
-      },
-    );
-    // Fence the new command immediately, but retain every older cancel/ack in
-    // the release barrier. A superseding fast cancel cannot close the lazy
-    // owner while an older retirement is still settling its retained receipt.
-    const resetting = Promise.all([previous, cancellation]).then(() => {})
-      .finally(() => {
-        if (owner.reset === resetting) owner.reset = undefined;
-        reconcile();
-      });
-    owner.reset = resetting;
+    void cancelStream(owner, playing).catch(() => {});
   };
   const releaseStream = () => {
     if (!stream || streamClosing) return streamClosing;
     const owner = stream;
     cancelPump();
-    streamClosing = owner.sink.close().then(() => {
+    // Fence pending native completion before joining its source, but keep sink
+    // admission open for that source's finally-owned receipt ACK. The same C1
+    // scope covers older sources still unwinding after a newer incarnation.
+    if (owner.sourceStarted) {
+      void cancelStream(owner, false, undefined, true).catch(() => {});
+    }
+    const sourcesSettled = owner.sourceOperations.close();
+    streamClosing = Promise.all([sourcesSettled, owner.reset]).then(() =>
+      owner.sink.close()
+    ).then(() => {
       if (stream === owner) stream = null;
     }).catch((error) => {
       streamBlocked = true;
@@ -746,7 +949,6 @@ export function createAirplayBoot(
     r.connected = false;
     r.transport = null;
     runtimes.delete(id);
-    if (!usable()) cancelPump();
     if (reason !== 'failed' && reason !== 'content') {
       devices.sessionChanged(id, {
         connection: 'disconnected',
@@ -903,6 +1105,7 @@ export function createAirplayBoot(
       playing: true,
       segment: 0n,
       sourceStarted: false,
+      sourceOperations: createOperationScope('AirPlay stream sources'),
     };
     let activated: Runtime | undefined;
     const current = () => {
@@ -1042,7 +1245,6 @@ export function createAirplayBoot(
                 // The stream owns input independently of this control session.
                 // Healthy peers continue while this attachment authenticates;
                 // capacity remains retained through eventual stream free.
-                if (!usable()) cancelPump();
                 outputs.update(id, { needsAuthKey: true }, ownedSource);
                 devices.sessionChanged(id, {
                   connection: 'connecting',
@@ -1127,13 +1329,6 @@ export function createAirplayBoot(
     const enteredAt = performance.now();
     const view = playback.playerView(), snapshot = outputs.list();
     syncStream(view);
-    if (
-      stream && !stream.reset && !streamClosing && !runtimes.size &&
-      !preparing.size &&
-      !retiring.size
-    ) {
-      void releaseStream()?.catch(() => {});
-    }
     const known = new Set(
       snapshot.filter((o) => o.type === 'AirPlay' && o.host).map((o) => o.id),
     );
@@ -1201,7 +1396,9 @@ export function createAirplayBoot(
         if (r) {
           // OwnTone may keep a current-null Stop transport; clear/deselect
           // were handled above and always release immediately.
-          actions.push(() => idle(id, r, out.connectionStrategy, enteredAt));
+          actions.push(() =>
+            idle(id, r, out.connectionStrategy, stream?.idleAt ?? enteredAt)
+          );
         } else if (grants.has(id)) {
           actions.push(() => spawnSession(outputs.get(id) ?? out));
         }
@@ -1275,6 +1472,15 @@ export function createAirplayBoot(
       action();
     }
     collecting = false;
+    // Reconcile attachment demand before deciding the player stream is unused.
+    // A planned replacement can outlive its retired attachment and must retain
+    // the same stream/epoch even when cancellation ACK settles before close.
+    if (
+      !rerun && stream && !stream.reset && !streamClosing && !runtimes.size &&
+      !preparing.size && !retiring.size
+    ) {
+      void releaseStream()?.catch(() => {});
+    }
     drainPumps();
   };
   const reconcile = () => {
@@ -1650,7 +1856,6 @@ export function createAirplayBoot(
       const completion = Promise.withResolvers<void>();
       closeWork = completion.promise;
       closed = true;
-      const settled = operations.close();
       for (const id of pairings.keys()) cancelPairing(id);
       for (const id of resuming.keys()) cancelResume(id);
       unsubscribe();
@@ -1665,9 +1870,10 @@ export function createAirplayBoot(
       for (const [id, r] of [...runtimes]) {
         void retire(id, r, 'boot close');
       }
-      // Revoke native cancel waiters now, before joining boot work which may
-      // itself be waiting for a held FLUSH. Decoder cleanup remains joined.
+      // Admit the stream's final native fence before stopping boot admission.
+      // Source cleanup and transport readiness stay joined before sink close.
       const releasing = releaseStream();
+      const settled = operations.close();
       void releasing?.catch(() => {});
       void (async () => {
         // Starts can acquire a child while unwinding a canceled await. Join the
@@ -1677,6 +1883,7 @@ export function createAirplayBoot(
         await Promise.all(retiring.values());
         await releaseStream();
         await releasing;
+        detachSink();
       })().then(() => completion.resolve(), completion.reject);
       return closeWork;
     },

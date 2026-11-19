@@ -650,7 +650,7 @@ export interface PlayerPlayback {
     position: number,
     expectedVersion?: number,
     source?: Source,
-  ): void;
+  ): void | Promise<void>;
   queueClear(source?: Source, expectedVersion?: number): void;
   queueAddReferences(
     references: PlayerQueueReference[],
@@ -683,8 +683,11 @@ export interface PlayerPlayback {
     options: { positionMs?: number; seekMs?: number },
     source?: Source,
   ): boolean | Promise<boolean>;
-  setRepeat(mode: 'off' | 'all' | 'single', source?: Source): void;
-  setConsume(on: boolean, source?: Source): void;
+  setRepeat(
+    mode: 'off' | 'all' | 'single',
+    source?: Source,
+  ): void | Promise<void>;
+  setConsume(on: boolean, source?: Source): void | Promise<void>;
   setVolume(options: { volume: number }, source?: Source): Promise<void>;
   playerView(): {
     state: 'play' | 'pause' | 'stop';
@@ -694,6 +697,7 @@ export interface PlayerPlayback {
     volume: number;
     itemLengthMs: number;
     itemProgressMs: number;
+    playbackRate: number;
     capabilities: { live: boolean; seekable: boolean };
   };
   serverNowPlayingView():

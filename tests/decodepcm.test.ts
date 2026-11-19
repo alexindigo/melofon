@@ -80,15 +80,14 @@ Deno.test('decodePcm on the fixture mp3: s16le 44100 stereo, full length', async
   }
 });
 
-Deno.test('decodePcm startMs seeks (keyframe granularity)', async () => {
+Deno.test('decodePcm startMs trims backward overlap to the exact output-frame origin', async () => {
   const media = createMedia();
   const pcm = await media.decodePcm(FIXTURE_MP3, { startMs: 500 });
   assert(pcm !== null);
   const { bytes } = await collect(pcm);
-  // Backward keyframe seek lands at or before 500 ms — strictly less audio
-  // than the full decode, never more.
-  assert(bytes < 176400, `seek shrinks the stream, got ${bytes}`);
-  assert(bytes > 0);
+  // Track B b06a: the public decoder contract is exact normalized frames,
+  // not the native seek's earlier packet/keyframe prefix.
+  assertEquals(bytes, 88200);
 });
 
 Deno.test('decodePcm WAV seeks return the requested PCM suffix', async () => {
@@ -121,7 +120,6 @@ Deno.test('decodePcm WAV seeks return the requested PCM suffix', async () => {
 });
 
 Deno.test('decodePcm rejects a failed native seek', async () => {
-  const fixture = await positionWav();
   const seekFrame = FormatContext.prototype.seekFrame;
   let attempts = 0;
   try {
@@ -131,7 +129,9 @@ Deno.test('decodePcm rejects a failed native seek', async () => {
       attempts++;
       return Promise.resolve(AVERROR_EINVAL);
     };
-    const pcm = await createMedia().decodePcm(fixture.path, { startMs: 500 });
+    // MP3 carries a known stream start; WAV without that fact deliberately uses
+    // decode-and-skip under the exact media-origin contract (Track B b06a).
+    const pcm = await createMedia().decodePcm(FIXTURE_MP3, { startMs: 500 });
     if (pcm !== null) {
       // Enter/unwind the old generator so the behavioral red assertion
       // cannot strand its input/decoder when it incorrectly returns a stream.
@@ -146,7 +146,6 @@ Deno.test('decodePcm rejects a failed native seek', async () => {
     assertEquals(pcm, null, 'failed seeking must not return unintended audio');
   } finally {
     FormatContext.prototype.seekFrame = seekFrame;
-    await Deno.remove(fixture.dir, { recursive: true });
   }
 });
 

@@ -9,6 +9,7 @@ import { createOutputs } from '../src/player.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import type { HelperEventFn } from '../src/boots/airplay.ts';
 import type { Media } from '../src/media.ts';
+import { fixturePcm } from './helpers/decoded-pcm.ts';
 import {
   createTestAirplayDevices,
   recordingSpawn,
@@ -502,16 +503,20 @@ Deno.test('two-sink boot fences stale decoder EOF after a same-position seek', a
     devices,
     retryBackoffMs: [],
     media: {
-      decodePcm() {
+      decodePcm(_path: string, options?: { startMs?: number }) {
         const end = new Promise<void>((resolve) => ends.push(resolve));
-        return Promise.resolve((async function* () {
-          try {
-            yield new Uint8Array(1764);
-            await end;
-          } finally {
-            finished++;
-          }
-        })());
+        return Promise.resolve(fixturePcm(
+          (async function* () {
+            try {
+              yield new Uint8Array(1764);
+              await end;
+            } finally {
+              finished++;
+            }
+          })(),
+          undefined,
+          options,
+        ));
       },
     } as unknown as Media,
   });

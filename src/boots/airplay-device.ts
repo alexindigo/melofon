@@ -36,6 +36,7 @@ import {
   type AirplayProfile,
   type AirplaySpawn,
   type AirplayStream,
+  type AirplayTimelineStream,
   type AirplayTransport,
   type PairingCredentialConsumer,
   passwordRequiredFromTxt,
@@ -150,7 +151,55 @@ export function createAirplayDevices(deps: {
       }
       return native;
     };
-    const stream: AirplayPlaybackStream = Object.freeze({
+    const timeline = (): AirplayTimelineStream => {
+      const input = acquire();
+      // Transitional exact-only injected adapters can still serve their old
+      // callers. Never synthesize timeline success/progress for such a backend.
+      for (
+        const method of [
+          'appendSource',
+          'seal',
+          'endStream',
+          'compatibilitySilence',
+          'source',
+          'range',
+          'progress',
+          'pollCompletion',
+          'waitCompletion',
+          'reviseCompletion',
+          'ackCompletion',
+          'cancelSource',
+        ]
+      ) {
+        if (typeof Reflect.get(input, method) !== 'function') {
+          throw new Error('AirPlay timeline backend unavailable');
+        }
+      }
+      return input as AirplayTimelineStream;
+    };
+    const retirementIds = (retire: readonly AirplayTransport[]) =>
+      retire.flatMap((transport) => {
+        if (!attachments.has(transport)) {
+          throw new Error('Foreign AirPlay retirement attachment');
+        }
+        const id = attachments.get(transport)?.();
+        return id === undefined ? [] : [id];
+      });
+    const cancelable = <T>(run: () => Promise<T>) =>
+      operations.run(async ({ signal }) => {
+        // Revoke native polls before C1 joins them. C3 memoizes and joins the
+        // same native release, including quarantine on failure.
+        const abort = () => {
+          void closeNative().catch(() => {});
+        };
+        signal.addEventListener('abort', abort, { once: true });
+        try {
+          return await run();
+        } finally {
+          signal.removeEventListener('abort', abort);
+        }
+      });
+    const stream = Object.freeze<AirplayPlaybackStream>({
       get id() {
         return native?.id ?? null;
       },
@@ -160,30 +209,30 @@ export function createAirplayDevices(deps: {
       append: (input: AirplayAppendInput) =>
         operations.run(() => acquire().append(input)),
       cancel: (epoch: bigint, retire: readonly AirplayTransport[] = []) =>
-        operations.run(async ({ signal }) => {
-          // Close must revoke native polling before joining it. Native close owns
-          // session destruction and memoizes failures; C3 still joins that release.
-          const abort = () => {
-            void closeNative().catch(() => {});
-          };
-          signal.addEventListener('abort', abort, { once: true });
-          try {
-            const ids = retire.flatMap((transport) => {
-              if (!attachments.has(transport)) {
-                throw new Error('Foreign AirPlay retirement attachment');
-              }
-              const id = attachments.get(transport)?.();
-              // Publication may precede native acquisition. Revoked activation
-              // owns its cleanup; there is no native identity to cancel yet.
-              return id === undefined ? [] : [id];
-            });
-            return await acquire().cancel(epoch, ids);
-          } finally {
-            signal.removeEventListener('abort', abort);
-          }
-        }),
+        cancelable(() => acquire().cancel(epoch, retirementIds(retire))),
       ackCancel: (epoch: bigint) =>
         operations.run(() => acquire().ackCancel(epoch)),
+      appendSource: (input) =>
+        operations.run(() => timeline().appendSource(input)),
+      seal: (...args) => operations.run(() => timeline().seal(...args)),
+      endStream: (...args) =>
+        operations.run(() => timeline().endStream(...args)),
+      compatibilitySilence: (...args) =>
+        operations.run(() => timeline().compatibilitySilence(...args)),
+      source: (...args) => operations.run(() => timeline().source(...args)),
+      range: (...args) => operations.run(() => timeline().range(...args)),
+      progress: (...args) => operations.run(() => timeline().progress(...args)),
+      pollCompletion: (key) =>
+        operations.run(() => timeline().pollCompletion(key)),
+      waitCompletion: (key) => cancelable(() => timeline().waitCompletion(key)),
+      reviseCompletion: (...args) =>
+        operations.run(() => timeline().reviseCompletion(...args)),
+      ackCompletion: (key) =>
+        operations.run(() => timeline().ackCompletion(key)),
+      cancelSource: (epoch, source, retire = [], capture) =>
+        cancelable(() =>
+          timeline().cancelSource(epoch, source, retirementIds(retire), capture)
+        ),
       pcm: (chunk: Uint8Array) => operations.run(() => acquire().pcm(chunk)),
       cancelPcm: () => native?.cancelPcm(),
       reset: () => operations.run(() => native?.reset()),

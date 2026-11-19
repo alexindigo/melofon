@@ -28,7 +28,8 @@ struct raop_source_snapshot {
   uint64_t epoch, source, accepted_frames, fed_frames, sealed, target, input_end;
 };
 enum raop_range_kind { RAOP_RANGE_REAL = 0, RAOP_RANGE_UNDERRUN = 1,
-                       RAOP_RANGE_PADDING = 2, RAOP_RANGE_DRAIN = 3 };
+                       RAOP_RANGE_PADDING = 2, RAOP_RANGE_DRAIN = 3,
+                       RAOP_RANGE_COMPATIBILITY = 4 };
 struct raop_range_snapshot {
   uint64_t epoch, index, kind, source, segment, source_offset, transport_start, frames;
 };

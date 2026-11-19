@@ -118,10 +118,18 @@ export interface AirplayCancelResult {
   readonly cutoffFrames: bigint | null;
   readonly admittedNs: bigint;
 }
-/** Ordered transport timeline, additive until boot/core adoption. Source targets
+/** Ordered transport timeline used by the production boot/core. Source targets
  * are exclusive source-local real frames; endStream targets epoch-wide accepted
  * real frames. Pacer snapshots are distinct from scheduled progress/completion. */
 export interface AirplayTimelineStream extends AirplayExactStream {
+  /** Same ordered cancellation, with the named old source's immutable native
+   * projection captured before reset. Ack together through ackCancel(epoch). */
+  cancelSource(
+    epoch: bigint,
+    source: bigint,
+    retire?: readonly bigint[],
+    capture?: (cutoff: AirplaySourceCutoff) => void,
+  ): Promise<AirplaySourceCancelResult>;
   /** Legacy local reset is refused after timeline admission. Use cancel(epoch)
    * so identities and immutable targets cannot be erased within an epoch. */
   reset(): Promise<void>;
@@ -140,6 +148,7 @@ export interface AirplayTimelineStream extends AirplayExactStream {
     target: bigint,
   ): Promise<AirplayMarkerResult>;
   endStream(epoch: bigint, target: bigint): Promise<AirplayMarkerResult>;
+  compatibilitySilence(epoch: bigint, source: bigint): Promise<void>;
   source(epoch: bigint, source: bigint): Promise<AirplaySourceSnapshot | null>;
   range(epoch: bigint, index: bigint): Promise<AirplayRangeSnapshot | null>;
   progress(
@@ -159,6 +168,22 @@ export interface AirplayTimelineStream extends AirplayExactStream {
     exclude: readonly bigint[],
   ): Promise<AirplayCompletionKey>;
   ackCompletion(key: AirplayCompletionKey): Promise<void>;
+}
+/** Immutable local cutoff, observed after admission applies but independently of
+ * remote FLUSH/retirement readiness. Publishing it never permits input or ACK.
+ * The optional capture runs once, asynchronously, inside the owned cancel poll. */
+export interface AirplaySourceCutoff {
+  readonly streamId: bigint;
+  readonly epoch: bigint;
+  readonly nextEpoch: bigint;
+  readonly source: bigint;
+  readonly admittedNs: bigint;
+  readonly progress: AirplayProgressSnapshot;
+}
+export interface AirplaySourceCancelResult extends AirplayCancelResult {
+  readonly source: bigint;
+  /** Null only if supersession/close returned before local cutoff capture. */
+  readonly progress: AirplayProgressSnapshot | null;
 }
 export interface AirplayCompletionKey {
   readonly epoch: bigint;
@@ -243,7 +268,7 @@ export interface AirplayRangeSnapshot {
   readonly streamId: bigint;
   readonly epoch: bigint;
   readonly index: bigint;
-  readonly kind: 'real' | 'underrun' | 'padding' | 'drain';
+  readonly kind: 'real' | 'underrun' | 'padding' | 'drain' | 'compatibility';
   readonly source: bigint;
   readonly segment: bigint;
   readonly sourceOffset: bigint;
@@ -254,7 +279,21 @@ export interface AirplayRangeSnapshot {
  * attachment authority; producers cannot construct or rebind receiver handles.
  * Closing joins admitted preparation, activation and PCM before releasing native
  * storage and capacity. A failed close remains quarantined. */
-export interface AirplayPlaybackStream {
+export interface AirplayPlaybackStream extends
+  Pick<
+    AirplayTimelineStream,
+    | 'appendSource'
+    | 'seal'
+    | 'endStream'
+    | 'compatibilitySilence'
+    | 'source'
+    | 'range'
+    | 'progress'
+    | 'pollCompletion'
+    | 'waitCompletion'
+    | 'reviseCompletion'
+    | 'ackCompletion'
+  > {
   readonly id: bigint | null;
   /** Null until an attachment or input allocates the native stream. */
   readonly epoch: bigint | null;
@@ -264,7 +303,13 @@ export interface AirplayPlaybackStream {
     retire?: readonly AirplayTransport[],
   ): Promise<AirplayCancelResult>;
   ackCancel(epoch: bigint): Promise<void>;
-  /** Transitional callers only; production uses exact append/cancel. */
+  cancelSource(
+    epoch: bigint,
+    source: bigint,
+    retire?: readonly AirplayTransport[],
+    capture?: (cutoff: AirplaySourceCutoff) => void,
+  ): Promise<AirplaySourceCancelResult>;
+  /** Transitional callers only; production uses source-labelled append/cancel. */
   pcm(chunk: Uint8Array): Promise<void>;
   cancelPcm(): void;
   /** Same writer-fenced local reset contract as AirplayStream. */

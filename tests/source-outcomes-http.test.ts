@@ -3,7 +3,7 @@ import { assert, assertEquals } from '@std/assert';
 import { apiFixture } from './helpers/api.ts';
 import { speakerMedia, until } from './helpers/speaker-consumer.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
-import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
+import { traceTimelineAudio } from './helpers/raop-timeline-audio.ts';
 import {
   createTestAirplayDevices,
   mapStream,
@@ -31,9 +31,10 @@ Deno.test('HTTP clock and source EOF preserve every buffered tail sample at two 
   header.setUint32(40, pcm.length, true);
   await Deno.writeFile(`${dir}/media/signal.wav`, wav);
   const receivers = [
-    await startFakeRaop({ captureAudio: true }),
-    await startFakeRaop({ captureAudio: true }),
+    await startFakeRaop({ captureAudio: true, captureWire: true }),
+    await startFakeRaop({ captureAudio: true, captureWire: true }),
   ];
+  const audio = traceTimelineAudio(createFfiStream);
   let f: Awaited<ReturnType<typeof apiFixture>> | undefined;
   let playback: ReturnType<typeof createPlayback> | undefined;
   let boot: ReturnType<typeof createAirplayBoot> | undefined;
@@ -72,7 +73,7 @@ Deno.test('HTTP clock and source EOF preserve every buffered tail sample at two 
           outputs,
           undefined,
           mapStream(
-            createFfiStream,
+            audio.stream,
             (spawn) => (event) =>
               spawn((name, value) => {
                 if (name === 'state' && value === 'connected') connected++;
@@ -139,10 +140,11 @@ Deno.test('HTTP clock and source EOF preserve every buffered tail sample at two 
     for (const receiver of receivers) {
       const session = receiver.sessions[0];
       assertEquals(
-        decodeReceiverAudio(session.sdp, session.audioPayloads),
+        audio.realAudio(session),
         pcm,
         'every sample, including the final packet, precedes natural stop/flush',
       );
+      assertEquals(audio.scheduledRealAudio(session, receiver.nowMs()), pcm);
     }
   } finally {
     release();

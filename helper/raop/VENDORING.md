@@ -359,7 +359,7 @@ port reclaims markers after terminal acknowledgement in the completion layer.
 Polling source/range records
 observes admission and pacer dispatch only, not successful submission, scheduled
 playout or completion. Timeline input refuses unlabelled writes in that epoch.
-The existing production boot still uses exact append/cancel, not this port.
+The production boot uses source-labelled append/seal/end and retained completion.
 The legacy local reset is refused once timeline input starts: only ordered cancel
 can retire those identities and admit replacement input in a new epoch.
 
@@ -398,7 +398,7 @@ reset and require ordered cancel; this adds neither FLUSH nor receiver reopen.
 It controls dependency failures and actual timer expirations, exercises the
 existing backend offset field and forces wire counter wrap. None of its controls
 or symbols enters production. Scheduled progress is not a retained source
-completion. The boot/core have not adopted this timeline port.
+completion. Public scheduled position is a separate core projection.
 
 ## Retained source completion
 
@@ -439,3 +439,39 @@ wait, revision and ack use the existing C1 operation owner. Close first fences
 native input and settles pending results as canceled, then joins all readers and
 waiters before C3 attachment/stream release. Native reader reservations prevent
 raw free from reclaiming queued poll readers. Failed-free quarantine is unchanged.
+
+## Source-cutoff bridge
+
+`raop_stream_cancel_source` adds an identified source projection to the ordered
+cancel boundary. Before the old range ledger is cleared, its real-source frames
+are projected at the captured admission timestamp, excluding underrun/padding/
+drain silence. `raop_stream_cancel_source_poll` retains this immutable observation
+with the existing cancel receipt until its exact epoch ack. Waiting/no-peer and
+failed prefixes remain explicit; failure cannot credit a later presentation time.
+Legacy exact cancel and its transport-cutoff receipt remain unchanged. The lazy
+device owner now forwards timeline ports with the existing operation/release
+lifetime; core public position adoption remains separate from the end gate.
+
+Failed source receipts do not by themselves finish an ended transport. The pacer
+retains its exclusive final real transport boundary independently of reclaimable
+source markers, and continues healthy queued audio/padding until that scheduled
+boundary passes. A later explicit cohort revision therefore cannot strand an
+unsubmitted healthy tail behind a prematurely stopped pacer. Irreversible epoch
+failure remains explicit and requires ordered cancellation/recovery.
+
+## Production end-gate adoption
+
+Core binds each opened reader to an immutable native source, retains sink
+authority after reader cleanup and requires matching sealed EOF plus native
+completion before natural advance/consume/stop. Exact ack follows the committed
+core transition or cancellation, not EOF or receipt polling. Explicit commands
+still cancel; source completion does not release speakers or public capacity.
+
+Catalog logical eligibility stays separate from native source progress. The
+additive `raop_stream_compatibility_silence` labels paced zeros after sealed
+catalog EOF while core waits for that deadline. It shares epoch/source admission
+fencing and never credits media frames. A delayed stream end retains the last
+real transport boundary rather than moving it across those zeros. Native-loop
+completion polling also applies ended-pacer retirement before returning the
+terminal result; required real coverage and scheduled presentation remain the
+retirement proof. Finite web EOF and live EOF failure keep their distinct policy.

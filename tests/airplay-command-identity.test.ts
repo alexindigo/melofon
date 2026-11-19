@@ -5,6 +5,7 @@ import { createNotify } from '../src/notify.ts';
 import { createAirplayBoot } from '../src/boots/airplay.ts';
 import { createAirplayDevices } from '../src/boots/airplay-device.ts';
 import { recordingStream } from './helpers/airplay-devices.ts';
+import { fixturePlaybackPcm } from './helpers/decoded-pcm.ts';
 import type { HelperEventFn } from '../src/boots/airplay-profile.ts';
 import type { Media } from '../src/media.ts';
 import type { NowPlaying } from '../src/nowplaying.ts';
@@ -95,7 +96,7 @@ Deno.test('AirPlay failed connected resume retries unchanged demand through PCM 
     },
     sources: {
       open: (_entry, { signal }) =>
-        Promise.resolve({
+        Promise.resolve(fixturePlaybackPcm({
           async *[Symbol.asyncIterator]() {
             yield new Uint8Array(64).fill(9);
             await new Promise<void>((done) => {
@@ -103,7 +104,7 @@ Deno.test('AirPlay failed connected resume retries unchanged demand through PCM 
               if (signal.aborted) done();
             });
           },
-        }),
+        })),
     },
   });
   try {
@@ -229,7 +230,7 @@ for (const mode of ['append', 'explicit-off'] as const) {
       media: {} as Media,
       sources: {
         open: (_entry, { signal }) =>
-          Promise.resolve({
+          Promise.resolve(fixturePlaybackPcm({
             async *[Symbol.asyncIterator]() {
               yield new Uint8Array(64).fill(7);
               await new Promise<void>((done) => {
@@ -237,7 +238,7 @@ for (const mode of ['append', 'explicit-off'] as const) {
                 if (signal.aborted) done();
               });
             },
-          }),
+          })),
       },
     });
     let newer: Promise<unknown> | undefined;

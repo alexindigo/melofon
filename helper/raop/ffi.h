@@ -78,6 +78,9 @@ int raop_stream_seal(raop_stream_t *, uint64_t epoch, uint64_t source,
                      uint64_t target, struct raop_marker_result *);
 int raop_stream_end(raop_stream_t *, uint64_t epoch, uint64_t target,
                     struct raop_marker_result *);
+/* After sealed catalog EOF, pace explicitly labelled compatibility silence until
+ * core's separate eligibility deadline. Does not credit media or end a stream. */
+int raop_stream_compatibility_silence(raop_stream_t *, uint64_t epoch, uint64_t source);
 /* Coherent pacer facts only, NOT scheduled/successful submission/completion.
  * source/range: 1 found, 0 absent/stale, -1 invalid. index starts at 0 and is a
  * view index, not an incarnation; ack compacts it. After ack, historical source
@@ -135,7 +138,18 @@ int raop_stream_cancel(raop_stream_t *stream, uint64_t epoch);
  * FLUSH. Others retain the default FLUSH disposition. Reject foreign/duplicate
  * identities before advancing epoch; capture cutoff before any retirement. */
 int raop_stream_cancel_v2(raop_stream_t *stream, uint64_t epoch,
-                           const uint64_t *retire_ids, size_t retire_count);
+                            const uint64_t *retire_ids, size_t retire_count);
+/* Source-aware cancellation on the same boundary. The source must be retained
+ * in this epoch, and no earlier reset may be pending. Before resetting the old
+ * ledger, capture its scheduled REAL-source projection at admitted_ns (including
+ * explicit waiting/failure facts). Transport silence never becomes media credit.
+ * The projection and legacy cancel receipt share one lifetime/ack. */
+int raop_stream_cancel_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+                               const uint64_t *retire_ids, size_t retire_count);
+/* 1 immutable projection found, 0 not yet applied/absent, -1 invalid identity.
+ * Retained across newer epochs, even after the source ledger is reset. */
+int raop_stream_cancel_source_poll(raop_stream_t *stream, uint64_t epoch,
+   uint64_t source, struct raop_progress_snapshot *result);
 int raop_stream_cancel_poll(raop_stream_t *stream, uint64_t epoch,
                             struct raop_cancel_result *result);
 int raop_stream_cancel_ack(raop_stream_t *stream, uint64_t epoch);

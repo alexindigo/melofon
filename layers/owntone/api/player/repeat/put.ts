@@ -3,11 +3,11 @@
 import { badRequest, noContent, sourceFrom } from '#owntone/payloads.ts';
 import type { HatContext, HatRequest } from '#owntone/types.ts';
 
-export default (request: HatRequest, context: HatContext) => {
+export default async (request: HatRequest, context: HatContext) => {
   const state = request.query.get('state');
   if (state !== 'off' && state !== 'all' && state !== 'single') {
     return badRequest();
   }
-  context.app.playback.setRepeat(state, sourceFrom(request));
+  await context.app.playback.setRepeat(state, sourceFrom(request));
   return noContent();
 };
