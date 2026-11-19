@@ -3,6 +3,52 @@
 Household music server: library + HTTP streamer + speaker control.
 Greenfield replacement for Navidrome (OpenSubsonic stays so existing apps keep working).
 
+## Development and testing
+
+Run `scripts/test` from the host (Podman preferred; `CONTAINER_ENGINE=docker`
+also works). It uses the shared Dockerfile's `dev` target with Deno 2.9.6
+and native dependencies. The checkout is bind-mounted, never copied.
+No devcontainer CLI or host Deno installation is required for `scripts/test`.
+
+For Dev Containers, use `.devcontainer/engine` as the client's Docker executable
+(VS Code's `dev.containers.dockerPath`: the absolute path to that file), or run
+`devcontainer up --docker-path "$PWD/.devcontainer/engine" --workspace-folder .`.
+It defaults to Docker. For rootless Podman, launch that client with
+`CONTAINER_ENGINE=podman` in its environment. Network initialization and startup
+then share that selection; only Podman receives `keep-id`. The container user's
+UID/GID is updated to match the host so both engines can write the mounted tree.
+
+The runner checks formatting, lint and types, builds and probes the native
+helper once, then runs test groups in separate parallel containers. The default
+shard count is the host CPU count capped at 8; each shard has 1 CPU, 2 GiB memory,
+no swap and a 512-process limit. File groups are balanced longest-first using
+`scripts/test-timings.json` (seconds of measured top-level tests per file).
+Tests have full Deno permissions inside their resource-limited containers,
+including the native identity probes' `/proc/self/maps` inspection.
+`scripts/test --check-only` runs checks alone; `--shards N` changes the local
+parallelism; `--shard 1/8` runs one CI shard. `--select BASE` selects changed
+top-level test files since BASE; shared source, helper, fixture or configuration
+changes conservatively run the full suite. Markdown-only documentation changes
+select no tests. Checks and native probes still run in selected mode.
+
+Each shard uses its own private bridge network with `melofon.home` resolving to the
+container itself, no published ports or host networking. Temp files and the
+Deno cache stay in the ignored `.test-tmp/` workspace directory; run-specific
+temp files are removed on success. `--results .test-tmp/NAME` retains logs, results,
+per-shard wall times and `timings.json`; copy the latter to `scripts/test-timings.json`
+after a full run to refresh weights. Failed runs retain their receipts automatically.
+GitHub CI prepares checks/native outputs once, then runs eight separate shard jobs
+with the same limits and a combined summary. `MELOFON_CI_RUNNER` is the repository
+variable for switching every job's runner label (default `ubuntu-24.04`). CI transfers
+the exact prepared dev image and native binaries, not source snapshots.
+Dependency resolution is frozen to the committed lockfile. Native outputs are
+cleaned on the first run in a new dev image, then reused incrementally in that
+image; rebuilding its dependency layer invalidates the native build stamp.
+
+Chromium is not in the dev image. Browser media tests clearly report skipped
+when it is absent; `MELOFON_BROWSER_TESTS=1` makes absence a failure. The later
+browser CI job needs its own browser/ingress environment and is not enabled here.
+
 ## Start
 
 ```bash

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [[ "${1:-}" == --help ]]; then
+  echo 'Usage: scripts/test [--check-only] [--shards N | --shard i/N] [--select BASE]'
+  echo 'CI: --prepare-only DIR, then --prepared DIR --shard i/N; --results DIR keeps receipts.'
+  echo 'One 1-CPU/2-GiB container per shard. Default shards: min(host CPUs, 8).'
+  exit 0
+fi
+started=$SECONDS
+count=$(nproc)
+if (( count > 8 )); then count=8; fi
+only=""; check_only=""; select=""; prepared=""; prepare_only=""; results=""; summary_only=""
+while (($#)); do
+  case "$1" in
+    --check-only) check_only=--check-only; shift ;;
+    --shards|--shard|--select|--prepared|--prepare-only|--results|--summarize)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "$1 requires a value" >&2; exit 2; }
+      case "$1" in
+        --shards) count=$2 ;;
+        --shard)
+          [[ "$2" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] || { echo 'Use --shard i/N' >&2; exit 2; }
+          only=${BASH_REMATCH[1]}; count=${BASH_REMATCH[2]} ;;
+        --select) select=$2 ;;
+        --prepared) prepared=$2 ;;
+        --prepare-only) prepare_only=$2 ;;
+        --results) results=$2 ;;
+        --summarize) prepared=$2; summary_only=1 ;;
+      esac
+      shift 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+[[ "$count" =~ ^[1-9][0-9]*$ ]] && (( count <= 9007199254740991 )) || { echo 'Invalid shard count' >&2; exit 2; }
+[[ -z "$only" ]] || (( only <= count )) || { echo 'Use --shard i/N with i <= N' >&2; exit 2; }
+mkdir -p .test-tmp
+run_dir=${prepared:-${prepare_only:-${results:-}}}
+if [[ -z "$run_dir" ]]; then run_dir=$(mktemp -d .test-tmp/run.XXXXXX); fi
+[[ "$run_dir" == .test-tmp/* && "$run_dir" != *..* ]] || { echo 'Run directories must be inside .test-tmp/' >&2; exit 2; }
+mkdir -p "$run_dir"
+networks=(); pids=()
+cleanup() {
+  local status=$?
+  trap - EXIT
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+  for network in "${networks[@]}"; do "$engine" network rm "$network" >/dev/null || status=1; done
+  echo "Runner wall: $((SECONDS - started))s"
+  if [[ -n "$results$prepared$prepare_only" || "$status" != 0 ]]; then
+    echo "Receipts: $run_dir"
+  else
+    rm -r -- "$run_dir" || status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+if [[ -z "${CONTAINER_ENGINE:-}" ]]; then
+  if command -v podman >/dev/null; then CONTAINER_ENGINE=podman; else CONTAINER_ENGINE=docker; fi
+fi
+export CONTAINER_ENGINE
+command -v "$CONTAINER_ENGINE" >/dev/null || { echo "Container engine not found: $CONTAINER_ENGINE; run scripts/test on the host" >&2; exit 2; }
+engine="$PWD/.devcontainer/engine"
+image=${MELOFON_TEST_IMAGE:-localhost/melofon-dev:local}
+if [[ -z "${MELOFON_TEST_IMAGE:-}" ]]; then
+  "$engine" build --target dev --memory=2g --memory-swap=2g \
+    --cpu-period=100000 --cpu-quota=100000 -t "$image" .
+fi
+# Pin the build once; another checkout may retag the shared local image.
+image=$("$engine" image inspect --format '{{.Id}}' "$image")
+prefix="melofon-test-$$-$(basename "$run_dir" | tr '[:upper:]' '[:lower:]')"
+container() {
+  local name=$1 network=$2
+  shift 2
+  "$engine" run --rm --init --name="$name" --memory=2g --memory-swap=2g --pids-limit=512 --cpus=1 \
+    --user="$(id -u):$(id -g)" --network="$network" --network-alias=melofon.home \
+    -v "$PWD:/app" -w /app -e "TMPDIR=/app/$run_dir" \
+    -e "MELOFON_BROWSER_TESTS=${MELOFON_BROWSER_TESTS:-}" \
+    --entrypoint deno "$image" run --frozen --allow-all scripts/test-runner.ts "$@"
+}
+new_network() {
+  networks+=("$1")
+  bash .devcontainer/network "$1"
+}
+new_network "$prefix-prep"
+if [[ -n "$summary_only" ]]; then
+  container "$prefix-summary" "$prefix-prep" summarize "$run_dir"
+  exit $?
+fi
+if [[ -z "$prepared" ]]; then
+  args=()
+  if [[ -n "$select" ]]; then
+    git diff --name-only -z "$select" -- > "$run_dir/changes"
+    git ls-files --others --exclude-standard -z >> "$run_dir/changes"
+    args+=("$run_dir/changes")
+  fi
+  if [[ -n "$check_only" ]]; then args+=("$check_only"); fi
+  container "$prefix-prep" "$prefix-prep" prepare "$run_dir" "$count" "${args[@]}"
+fi
+if [[ -n "$check_only$prepare_only" ]]; then exit 0; fi
+for ((index=1; index<=count; index++)); do
+  if [[ -n "$only" && "$index" != "$only" ]]; then continue; fi
+  name="$prefix-shard-$index"
+  new_network "$name"
+  # A failed container must never inherit a previous invocation's receipt.
+  rm -f -- "$run_dir/shard-$index.json"
+  container "$name" "$name" run-shard "$run_dir" "$index" "$count" > "$run_dir/shard-$index.log" 2>&1 &
+  pids+=("$!")
+done
+status=0
+for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+pids=()
+for ((index=1; index<=count; index++)); do
+  if [[ -n "$only" && "$index" != "$only" ]]; then continue; fi
+  cat "$run_dir/shard-$index.log"
+done
+container "$prefix-summary" "$prefix-prep" summarize "$run_dir" ${only:+"$only"} || status=1
+exit "$status"

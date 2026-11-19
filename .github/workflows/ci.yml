@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CONTAINER_ENGINE: docker
+  MELOFON_TEST_IMAGE: localhost/melofon-dev:ci
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Checks and native probes
+    # Change the repository variable to switch every job's runner type.
+    runs-on: &runner ${{ vars.MELOFON_CI_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the shared dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev
+          tags: localhost/melofon-dev:ci
+          load: true
+          push: false
+          cache-from: type=gha,scope=melofon-dev
+          cache-to: type=gha,scope=melofon-dev,mode=max
+      - name: Check and build once
+        run: scripts/test --shards 8 --prepare-only .test-tmp/ci
+      - name: Save the exact image and native outputs for all shards
+        run: |
+          docker save "$MELOFON_TEST_IMAGE" -o .test-tmp/ci/dev-image.tar
+          find helper/raop -type f \( -name '*.o' -o -name '*.so' -o -name driver -o -name .dev-image-id \) -print0 |
+            tar --null -T - -cf .test-tmp/ci/native.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-preparation
+          path: |
+            .test-tmp/ci/plan.json
+            .test-tmp/ci/dev-image.tar
+            .test-tmp/ci/native.tar
+          include-hidden-files: true
+          compression-level: 1
+          retention-days: 1
+
+  test:
+    name: Test shard ${{ matrix.shard }}/8 (1 CPU, 2 GiB)
+    needs: prepare
+    runs-on: *runner
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-preparation
+          path: .test-tmp/ci
+      - name: Restore prepared image and native outputs
+        run: |
+          docker load -i .test-tmp/ci/dev-image.tar
+          tar -xf .test-tmp/ci/native.tar
+          rm .test-tmp/ci/dev-image.tar .test-tmp/ci/native.tar
+      - name: Test in a single-CPU container
+        run: scripts/test --prepared .test-tmp/ci --shard "${{ matrix.shard }}/8"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}
+          path: |
+            .test-tmp/ci/shard-${{ matrix.shard }}.json
+            .test-tmp/ci/shard-${{ matrix.shard }}.log
+          include-hidden-files: true
+          retention-days: 3
+
+  summary:
+    name: Combined test summary
+    needs: [prepare, test]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: *runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-preparation
+          path: .test-tmp/ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          merge-multiple: true
+          path: .test-tmp/ci
+      - name: Summarize all shard results (missing results fail)
+        run: |
+          docker load -i .test-tmp/ci/dev-image.tar
+          scripts/test --summarize .test-tmp/ci | tee -a "$GITHUB_STEP_SUMMARY"
