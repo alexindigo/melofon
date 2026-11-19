@@ -1,7 +1,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { decodeBase64 } from '@std/encoding/base64';
 import { apiFixture } from './helpers/api.ts';
-import { chromium } from './helpers/browser.ts';
+import { browserTestsIgnored, chromium } from './helpers/browser.ts';
 import { videoFixture } from './helpers/video-fixture.ts';
 import { createLibraries } from '../src/libraries.ts';
 import { createLibrary } from '../src/library.ts';
@@ -75,8 +75,15 @@ http {
   };
 }
 
+const ignore = await browserTestsIgnored();
 for (const prefix of ['', '/music']) {
-  Deno.test(`API browser media: native Chromium HTTP cookie audio/HLS/captions and household observer at ${prefix || '/'}`, async () => {
+  Deno.test({
+    name:
+      `API browser media: native Chromium HTTP cookie audio/HLS/captions and household observer at ${
+        prefix || '/'
+      }`,
+    ignore,
+  }, async () => {
     // Per-test media paths are not eligible for prepared DB reuse.
     const root = await Deno.makeTempDir({ prefix: 'melofon-browser-media-' });
     let playback!: Playback;
@@ -164,7 +171,9 @@ for (const prefix of ['', '/music']) {
         `audio.src = api + '/songs/${song.id}/stream'; audio.play()`,
       );
       await player.poll('audio.currentTime > 0.25 && audio.readyState >= 2');
-      await player.evaluate(`audio.pause(); report('${song.id}', 1, 0, audio)`);
+      await player.evaluate(
+        `audio.pause(); report('${song.id}', 1, 0, audio)`,
+      );
       await observer.poll(`frames.some(f => f.events?.nowPlaying)`);
       const row = await observer.evaluate<{
         nowPlaying: {
@@ -273,7 +282,12 @@ for (const prefix of ['', '/music']) {
       const log = await Deno.readTextFile(`${root}/requests.log`);
       const lines = log.split('\n');
       for (
-        const part of ['/songs/', '/hls.m3u8?', '/hls/segments/', '/captions?']
+        const part of [
+          '/songs/',
+          '/hls.m3u8?',
+          '/hls/segments/',
+          '/captions?',
+        ]
       ) {
         assert(
           lines.some((line) =>

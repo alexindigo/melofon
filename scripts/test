@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [[ "${1:-}" == --help ]]; then
+  echo 'Usage: scripts/test [--check-only] [--shards N | --shard i/N] [--select BASE]'
+  echo 'Podman is preferred; set CONTAINER_ENGINE=docker to use Docker.'
+  exit 0
+fi
+mkdir -p .test-tmp
+run_dir=$(mktemp -d .test-tmp/run.XXXXXX)
+network=""
+cleanup() {
+  local status=$?
+  if [[ -n "$network" ]]; then "$engine" network rm "$network" >/dev/null || status=1; fi
+  rm -r -- "$run_dir" || status=1
+  exit "$status"
+}
+trap cleanup EXIT
+args=()
+while (($#)); do
+  if [[ "$1" == --select ]]; then
+    [[ $# -ge 2 ]] || { echo '--select requires a base ref' >&2; exit 2; }
+    git diff --name-only -z "$2" -- > "$run_dir/changes"
+    git ls-files --others --exclude-standard -z >> "$run_dir/changes"
+    args+=(--changed-file "$run_dir/changes")
+    shift 2
+  else
+    args+=("$1")
+    shift
+  fi
+done
+if [[ -f /run/.containerenv || -f /.dockerenv ]]; then
+  export TMPDIR="$PWD/$run_dir"
+  deno run --allow-all scripts/test-runner.ts "${args[@]}"
+  exit $?
+fi
+engine=${CONTAINER_ENGINE:-}
+if [[ -z "$engine" ]]; then
+  if command -v podman >/dev/null; then engine=podman; else engine=docker; fi
+fi
+image=${MELOFON_TEST_IMAGE:-localhost/melofon-dev:local}
+if [[ -z "${MELOFON_TEST_IMAGE:-}" ]]; then
+  "$engine" build --target dev --memory=12g --memory-swap=12g \
+    --cpu-period=100000 --cpu-quota=800000 -t "$image" .
+else
+  "$engine" image inspect "$image" >/dev/null
+fi
+network="melofon-test-$(basename "$run_dir" | tr '[:upper:]' '[:lower:]')-$$"
+CONTAINER_ENGINE="$engine" bash .devcontainer/network "$network"
+user_args=(--user="$(id -u):$(id -g)")
+if [[ "$("$engine" --version)" == *podman* ]]; then
+  user_args+=(--userns=keep-id)
+fi
+"$engine" run --rm --init --memory=12g --memory-swap=12g --pids-limit=4096 --cpus=8 \
+  "${user_args[@]}" --network="$network" --network-alias=melofon.home \
+  -v "$PWD:/app" -w /app -e "TMPDIR=/app/$run_dir" \
+  -e "MELOFON_BROWSER_TESTS=${MELOFON_BROWSER_TESTS:-}" \
+  --entrypoint deno "$image" run --allow-all scripts/test-runner.ts "${args[@]}"

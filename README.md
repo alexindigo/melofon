@@ -3,6 +3,34 @@
 Household music server: library + HTTP streamer + speaker control.
 Greenfield replacement for Navidrome (OpenSubsonic stays so existing apps keep working).
 
+## Development and testing
+
+Open the checkout in its devcontainer using rootless Podman and run
+`scripts/test` there, or run it from the host (Podman preferred; `CONTAINER_ENGINE=docker`
+also works). Both use the shared Dockerfile's `dev` target with Deno 2.9.6
+and native dependencies. The checkout is bind-mounted, never copied.
+No devcontainer CLI or host Deno installation is required for `scripts/test`.
+
+The runner checks formatting, lint and types, builds and probes the native
+helper, then runs all test files in four parallel, round-robin shards.
+Tests have full Deno permissions inside the resource-limited container,
+including the native identity probes' `/proc/self/maps` inspection.
+`scripts/test --check-only` runs checks alone; `--shards N` changes the local
+parallelism; `--shard 1/4` runs one CI shard. `--select BASE` selects changed
+top-level test files since BASE; shared source, helper, fixture or configuration
+changes conservatively run the full suite. Markdown-only documentation changes
+select no tests. Checks and native probes still run in selected mode.
+
+Each run uses a private bridge network with `melofon.home` resolving to the
+container itself, no published ports or host networking. Temp files and the
+Deno cache stay in the ignored `.test-tmp/` workspace directory; run-specific
+temp files are removed on exit. Limits are 8 CPUs, 12 GiB memory with no swap
+and 4096 processes. GitHub CI uses the same image, checks and four shard commands.
+
+Chromium is not in the dev image. Browser media tests clearly report skipped
+when it is absent; `MELOFON_BROWSER_TESTS=1` makes absence a failure. The later
+browser CI job needs its own browser/ingress environment and is not enabled here.
+
 ## Start
 
 ```bash
