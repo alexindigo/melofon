@@ -62,6 +62,7 @@ export interface TimelineWriter {
     inputEnd: bigint;
   }>;
   endStream(epoch: bigint, target: bigint): Promise<{ status: string }>;
+  waitDrain(epoch: bigint): Promise<void>;
   compatibilitySilence(epoch: bigint, source: bigint): Promise<void>;
   progress(epoch: bigint, source: bigint): Promise<TimelineProgress | null>;
   waitCompletion(key: {

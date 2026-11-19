@@ -201,6 +201,57 @@ async function rendered(
   return { all, result };
 }
 
+test('late end joins pacer quiescence after a source completed in compatibility silence', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const source = pcm(353);
+  const attachment = stream.attach(() => {});
+  try {
+    await append(stream, highSource, source);
+    await stream.seal(stream.epoch, highSource, 353n);
+    await stream.compatibilitySilence(stream.epoch, highSource);
+    await attachment.start(profile(receiver), item);
+    await stream.waitCompletion(key(stream, highSource, 353n));
+    let drained = false;
+    const pending = stream.waitDrain(stream.epoch).then(() => drained = true);
+    await sleep(30);
+    assertEquals(
+      drained,
+      false,
+      'source completion cannot settle stream drain',
+    );
+    await stream.endStream(stream.epoch, 353n);
+    await pending;
+    const frozen = await ranges(stream);
+    await sleep(50);
+    assertEquals(
+      await ranges(stream),
+      frozen,
+      'no tick follows drain observation',
+    );
+    const decoded = decodeReceiverAudio(
+      receiver.sessions[0].sdp,
+      receiver.sessions[0].audioPayloads,
+    );
+    const sources = new Map([[highSource, source]]);
+    accounted(decoded, frozen, sources);
+    assert(frozen.some((range) => range.kind === 'compatibility'));
+    const replay = renderScheduledAudio(receiver.sessions[0], receiver.nowMs());
+    assertEquals(replay.issues, []);
+    assertEquals(replay.pcm.subarray(0, source.length), source);
+    accounted(replay.pcm, frozen, sources);
+    await stream.ackCompletion(key(stream, highSource, 353n));
+    await libraryProof();
+  } finally {
+    await attachment.transport.close();
+    await stream.close();
+    receiver.close();
+  }
+});
+
 for (const frames of [1, 351, 352, 353, 441, 44100 + 137]) {
   test(`seal/end renders ${frames} real frames and exact zero transport padding`, async () => {
     const stream = createFfiStream();

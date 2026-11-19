@@ -29,6 +29,7 @@ int raop_player_completion_progress(struct raop_player *, uint64_t source,
   uint64_t attachment, struct raop_progress_snapshot *, uint64_t *transport_end);
 void raop_player_ack_source(struct raop_player *, uint64_t source);
 int raop_player_ended(struct raop_player *);
+int raop_player_drained(struct raop_player *);
 void raop_player_drain_complete(struct raop_player *);
 void raop_ffi_completion_update(uint64_t stream_id);
 void raop_ffi_attachment_failed(uint64_t stream_id, uint64_t attachment, uint64_t error);

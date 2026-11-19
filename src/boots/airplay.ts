@@ -718,6 +718,12 @@ export function createAirplayBoot(
       }
       return;
     }
+    // Natural exhaustion has already ended and presented the final source.
+    // Retire attachments without cancel/reset: completion observations remain
+    // owned until the reader has acknowledged them and joined its cleanup.
+    const drained = view.state === 'stop' && source?.stream === owner &&
+      source.reader.drained;
+    if (drained) owner.sourceStarted = false;
     cancelPump();
     // A core cutoff already fenced this source before intent publication.
     if (!owner.sourceStarted) return;

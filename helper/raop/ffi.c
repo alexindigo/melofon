@@ -1441,6 +1441,17 @@ raop_stream_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
 }
 
 int
+raop_stream_drained(raop_stream_t *stream, uint64_t epoch)
+{
+  if (!stream || !epoch) return -1;
+  pthread_mutex_lock(&rt.lock);
+  int result = !stream->closing && !stream->input_closed && !stream->resetting &&
+    epoch == stream->epoch ? raop_player_drained(stream->player) : -1;
+  pthread_mutex_unlock(&rt.lock);
+  return result;
+}
+
+int
 raop_stream_range(raop_stream_t *stream, uint64_t epoch, uint64_t index,
                   struct raop_range_snapshot *result)
 {

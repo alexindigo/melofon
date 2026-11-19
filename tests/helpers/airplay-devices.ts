@@ -185,6 +185,7 @@ export function recordingStream(
           status: 'accepted',
         }),
       compatibilitySilence: () => Promise.resolve(),
+      waitDrain: () => Promise.resolve(),
       source: (_epoch, source) => Promise.resolve(sources.get(source) ?? null),
       range: () => Promise.resolve(null),
       progress: () => Promise.resolve(null),

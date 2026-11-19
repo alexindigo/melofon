@@ -207,7 +207,15 @@ export async function speakerConsumer(
         media: {
           ...media,
           decodePcm(path, opts) {
-            decodedStart = opts?.startMs ?? 0;
+            const playing = playback.sourcePlanView().playing;
+            const current = playback.playerView().current;
+            if (
+              current?.facts.kind === 'song' &&
+              current.facts.song.path === path &&
+              playing?.startMs === (opts?.startMs ?? 0)
+            ) {
+              decodedStart = opts?.startMs ?? 0;
+            }
             return media.decodePcm(path, opts);
           },
         },

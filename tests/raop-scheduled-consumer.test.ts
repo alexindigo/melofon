@@ -210,6 +210,13 @@ for (const refresh of ['sync', 'timing'] as const) {
     assertEquals(actual.issues, []);
     assertEquals(actual.discarded, []);
     assertEquals(actual.pcm, pcm(0, 704));
+    if (refresh === 'timing') {
+      assertEquals(
+        actual.clockUncertaintyMs,
+        1,
+        'a refined clock cannot shrink the uncertainty of an already rendered frontier',
+      );
+    }
   });
 }
 

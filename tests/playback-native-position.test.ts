@@ -1385,49 +1385,65 @@ test('atomic source cutoff excludes underrun and survives held FLUSH plus replac
   }
 });
 
-test('mid-source cutoff matches the independent schedule at cancel admission not delayed readiness', async () => {
-  const flush = Promise.withResolvers<void>(),
-    f = await fixture({ beforeFlushReply: () => flush.promise });
-  const bytes = pcm(44100);
-  try {
-    await f.activate();
-    const epoch = f.stream.epoch!;
-    await f.stream.appendSource({ epoch, source: 7n, segment: 1n, pcm: bytes });
-    await until(
-      'mid-source scheduled watermark',
-      async () => (await f.stream.progress(epoch, 7n))!.sourceFrames > 4410n,
-    );
-    const receiver = f.receivers[0], before = receiver.nowMs();
-    const pending = f.stream.cancelSource(epoch, 7n);
-    const after = receiver.nowMs();
-    await until('held FLUSH', () => receiver.sessions[0].flushes === 1);
-    await sleep(300);
-    flush.resolve();
-    const cutoff = await pending;
-    assert(cutoff.progress && cutoff.progress.sourceFrames < 44100n);
-    const replay = renderScheduledAudio(receiver.sessions[0], after);
-    assert(replay.clockUncertaintyMs !== null);
-    const low = renderScheduledAudio(
-      receiver.sessions[0],
-      Math.max(0, before - replay.clockUncertaintyMs),
-    ).pcm.length / 4;
-    const high = renderScheduledAudio(
-      receiver.sessions[0],
-      after + replay.clockUncertaintyMs,
-    ).pcm.length / 4;
-    assert(
-      Number(cutoff.progress.sourceFrames) >= low &&
-        Number(cutoff.progress.sourceFrames) <= high,
-      `atomic source cutoff ${cutoff.progress.sourceFrames} lies in independent schedule ${low}..${high}`,
-    );
-    assertEquals(replay.pcm, bytes.subarray(0, replay.pcm.length));
-    await f.stream.ackCancel(epoch);
-    await libraryProof();
-  } finally {
-    flush.resolve();
-    await f.close();
-  }
-});
+for (const timingReplyDelayMs of [0, 20]) {
+  test(`mid-source cutoff matches the independent schedule at cancel admission not delayed readiness (timing delay ${timingReplyDelayMs} ms)`, async () => {
+    const flush = Promise.withResolvers<void>(),
+      f = await fixture({
+        beforeFlushReply: () => flush.promise,
+        timingReplyDelayMs,
+      });
+    const bytes = pcm(44100);
+    try {
+      await f.activate();
+      const epoch = f.stream.epoch!;
+      await f.stream.appendSource({
+        epoch,
+        source: 7n,
+        segment: 1n,
+        pcm: bytes,
+      });
+      await until(
+        'mid-source scheduled watermark',
+        async () => (await f.stream.progress(epoch, 7n))!.sourceFrames > 4410n,
+      );
+      const receiver = f.receivers[0], before = receiver.nowMs();
+      const pending = f.stream.cancelSource(epoch, 7n);
+      const after = receiver.nowMs();
+      await until('held FLUSH', () => receiver.sessions[0].flushes === 1);
+      await sleep(300);
+      flush.resolve();
+      const cutoff = await pending;
+      assert(cutoff.progress && cutoff.progress.sourceFrames < 44100n);
+      const replay = renderScheduledAudio(receiver.sessions[0], after);
+      assert(replay.clockUncertaintyMs !== null);
+      // Bound the schedule at admission, not the later control history. A FLUSH
+      // inside the timing-error interval must not clip its upper endpoint.
+      const admitted = {
+        ...receiver.sessions[0],
+        wire: receiver.sessions[0].wire.filter((event) => event.atMs <= after),
+      };
+      const low = renderScheduledAudio(
+        admitted,
+        Math.max(0, before - replay.clockUncertaintyMs),
+      ).pcm.length / 4;
+      const high = renderScheduledAudio(
+        admitted,
+        after + replay.clockUncertaintyMs,
+      ).pcm.length / 4;
+      assert(
+        Number(cutoff.progress.sourceFrames) >= low &&
+          Number(cutoff.progress.sourceFrames) <= high,
+        `atomic source cutoff ${cutoff.progress.sourceFrames} lies in independent schedule ${low}..${high}`,
+      );
+      assertEquals(replay.pcm, bytes.subarray(0, replay.pcm.length));
+      await f.stream.ackCancel(epoch);
+      await libraryProof();
+    } finally {
+      flush.resolve();
+      await f.close();
+    }
+  });
+}
 
 async function cohortPacerChild(
   filter = 'lazy completion cohort revision',

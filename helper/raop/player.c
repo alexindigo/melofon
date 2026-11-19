@@ -863,6 +863,16 @@ raop_player_ended(struct raop_player *p)
   return ended;
 }
 
+int
+raop_player_drained(struct raop_player *p)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  int result = p->failure.error ? -1 :
+    (p->timeline && p->timeline->complete ? 1 : 0);
+  pthread_mutex_unlock(&p->pcm_lock);
+  return result;
+}
+
 /* Ack ends source/range observation lifetime. Compact all three bounded ledgers
  * together, including already dispatched inputs. Never erase a queued suffix.
  * Remaining transport/source offsets stay absolute, not rebased after reclaim. */

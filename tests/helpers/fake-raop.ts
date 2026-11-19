@@ -138,6 +138,8 @@ export function startFakeRaop(
     captureAudio?: boolean;
     /** Lossless raw scheduling evidence, separate from legacy arrival capture. */
     captureWire?: boolean;
+    /** Delay receiver-side timing observation, preserving measured RTT bounds. */
+    timingReplyDelayMs?: number;
     refuseRecord?: () => boolean;
     digest?: { password: string; realm?: string };
     /** Test barrier for inspecting restored native input before fake rejection.
@@ -253,7 +255,13 @@ export function startFakeRaop(
       'message',
       (msg, peer) => {
         recordPeer(session.timingSenders, peer);
-        capture('timing-reply', msg, peer, timing);
+        if (opts.timingReplyDelayMs) {
+          const timer = setTimeout(
+            () => capture('timing-reply', msg, peer, timing),
+            opts.timingReplyDelayMs,
+          );
+          sockets.push({ close: () => clearTimeout(timer) });
+        } else capture('timing-reply', msg, peer, timing);
       },
     );
     const audioPort = udp.address().port;
