@@ -51,6 +51,7 @@ export async function nativeHttpFixture(options: {
   receiverCount?: number;
   receiverSelection?: boolean[];
   beforeDecode?: (path: string, startMs: number) => Promise<void>;
+  afterDecodedChunk?: (path: string, frames: bigint) => Promise<void>;
   persist?: boolean;
   directory?: string;
   storeDir?: string;
@@ -404,12 +405,20 @@ export async function nativeHttpFixture(options: {
             await options.acquisition;
             await options.beforeDecode?.(path, settings?.startMs ?? 0);
             const decoded = await media.decodePcm(path, settings);
-            if (!decoded || !options.afterFirstChunk) return decoded;
+            if (
+              !decoded || !options.afterFirstChunk && !options.afterDecodedChunk
+            ) {
+              return decoded;
+            }
             return fixturePcm(
               (async function* () {
                 let first = true;
                 for await (const chunk of decoded) {
                   yield chunk;
+                  await options.afterDecodedChunk?.(
+                    path,
+                    BigInt(chunk.length / 4),
+                  );
                   if (first) {
                     first = false;
                     await options.afterFirstChunk;

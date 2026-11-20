@@ -36,6 +36,7 @@ import {
   type SourcePreparation,
 } from './playback-source-plan.ts';
 import { type CommandHandle, createCommandLane } from './command-authority.ts';
+import { crossfadeFrames } from './playback-mix.ts';
 import {
   PlaybackError,
   QueueConflictError,
@@ -194,6 +195,7 @@ export interface Playback {
   setShuffle(on: boolean, source?: CommandSource): void | Promise<void>;
   setConsume(on: boolean, source?: CommandSource): void | Promise<void>;
   setRepeat(mode: RepeatMode, source?: CommandSource): void | Promise<void>;
+  setCrossfade(ms: number, source?: CommandSource): void | Promise<void>;
   setVolume(
     opts: { volume?: number; step?: number },
     source?: CommandSource,
@@ -1626,8 +1628,15 @@ export function createPlayback(deps: {
     },
     overlapSource(source, frames) {
       const mapping = timelineSources.get(source);
-      return ownsSource(source) && source !== sourcePlans.playing &&
-        !!mapping && timeline.overlap(mapping, frames);
+      if (
+        !ownsSource(source) || source === sourcePlans.playing ||
+        !mapping || !timeline.overlap(mapping, frames)
+      ) return false;
+      return player.sourcePosition(
+        source,
+        timeline.position(mapping)!.positionMs,
+        0,
+      );
     },
     beginSourceInput(source) {
       const mapping = timelineSources.get(source);
@@ -2004,6 +2013,22 @@ export function createPlayback(deps: {
       emit(['options']);
       return afterMutation(undefined);
     },
+    setCrossfade: (ms, source) =>
+      operations.runImmediate(() => {
+        requireOpen();
+        crossfadeFrames(ms);
+        const change = () => {
+          player.setCrossfade(ms);
+          persistence?.saveCrossfade?.(ms);
+          record('crossfade', `crossfade_ms=${ms}`, source, 'none', false, {
+            crossfadeMs: ms,
+          });
+          emit(['options', 'player']);
+        };
+        return persistence?.publishedCommands
+          ? persistence.publishedCommands.publish(change).command
+          : change();
+      }),
     setVolume: (opts, source) =>
       operations.runImmediate(() => {
         requireOpen();

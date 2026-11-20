@@ -154,7 +154,11 @@ export async function createPlayers(deps: {
       const persistence = deps.persistence.forPlayer(row.id);
       owned.add('persistence', () => persistence.close(), 2);
       const outputs = playerOutputs(deps.outputs, row.id);
-      const player = createPlayer({ ...deps.clock, volume: row.volume });
+      const player = createPlayer({
+        ...deps.clock,
+        volume: row.volume,
+        crossfadeMs: row.crossfadeMs,
+      });
       const capacity = deps.capacity?.forPlayer(() => ({
         id: row.id,
         name: row.name,
@@ -175,6 +179,10 @@ export async function createPlayers(deps: {
           saveVolume(volume) {
             row.volume = volume;
             persistence.saveVolume?.(volume);
+          },
+          saveCrossfade(ms) {
+            row.crossfadeMs = ms;
+            persistence.saveCrossfade?.(ms);
           },
         },
         reserveQueueIds: (count) => deps.store.players.reserveQueueIds(count),
@@ -368,6 +376,7 @@ export async function createPlayers(deps: {
     setShuffle: (...args) => current().setShuffle(...args),
     setConsume: (...args) => current().setConsume(...args),
     setRepeat: (...args) => current().setRepeat(...args),
+    setCrossfade: (...args) => current().setCrossfade(...args),
     setVolume: (...args) => current().setVolume(...args),
     seek: (...args) => current().seek(...args),
     queueAdd: (...args) => current().queueAdd(...args),

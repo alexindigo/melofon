@@ -59,6 +59,7 @@ export function playerPayload(context: HatContext, id: number) {
     repeat: status.repeat,
     consume: status.consume,
     shuffle: status.shuffle,
+    crossfadeMs: status.crossfadeMs,
     volume: status.volume,
     positionMs: status.itemProgressMs,
     durationMs: status.itemLengthMs,

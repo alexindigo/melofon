@@ -14,6 +14,7 @@ import {
 import { pcmOrigin } from './pcm-origin.ts';
 import type { TimelineSource, TimelineWriter } from './playback-timeline.ts';
 import type { PlaybackPcm } from './playback-source.ts';
+import { createPlaybackHead } from './playback-head.ts';
 import {
   createTailHold,
   crossfadePlan,
@@ -41,6 +42,9 @@ export function createPlaybackReader(deps: {
    * input (its tail hold) and again at its boundary. Absent means 0. */
   crossfadeFrames?(): bigint;
   crossfadeObserved?(record: CrossfadeRecord): void;
+  /** Conservative monotonic deadline derived from currently queued sink input,
+   * not an extra fade wait. Absent means the outgoing tail must be supplied now. */
+  inputWindow?(sources: readonly TimelineSource[]): Promise<number>;
   transportFailed(error: unknown): void;
   contentFailed(entry: QueueEntry, error: unknown): void;
   retirementFailed(error: unknown): void;
@@ -173,7 +177,13 @@ export function createPlaybackReader(deps: {
     });
     return mapping;
   };
-  const acquire = (read: PlaybackRead) =>
+  type Input = {
+    pcm: PlaybackPcm;
+    head: IteratorResult<Uint8Array>;
+    ready: Uint8Array;
+    prefetch?: ReturnType<typeof createPlaybackHead>;
+  };
+  const acquire = (read: PlaybackRead): Promise<Input | null> =>
     operations.run(async () => {
       const pcm = await deps.sources.open(read.entry, {
         signal: read.source.signal,
@@ -226,7 +236,9 @@ export function createPlaybackReader(deps: {
         const mapping = bind(read);
         if (!mapping) return null;
         try {
-          return { read, mapping, input: await acquire(read) };
+          const input = await acquire(read);
+          if (input && finite(read.entry)) prefetch(input, requestedFrames());
+          return { read, mapping, input };
         } catch (error) {
           if (owns(read.source)) {
             playback.reportSourceOutcome(read.source, 'decode-error');
@@ -391,7 +403,7 @@ export function createPlaybackReader(deps: {
         throw new Error('Playback source differs from its timeline origin');
       }
       if (input.ready.length && !await feed(input.ready, false)) return null;
-      let part = input.head;
+      let part = input.prefetch ? await input.prefetch.next() : input.head;
       while (!part.done && owns(source)) {
         if (!await feed(part.value, true)) return null;
         part = await pcm.next();
@@ -439,26 +451,16 @@ export function createPlaybackReader(deps: {
     observeCompletion(source, mapping, target);
     return { inputEnd: marker.inputEnd, frames: target };
   };
-  // Decode the incoming head into memory up to `frames` plus one, so a short
-  // incoming source keeps at least one frame of its own.
-  const gather = async (input: NonNullable<Acquired>, frames: bigint) => {
-    const parts = [input.ready];
-    let have = BigInt(input.ready.length / 4);
-    while (!input.head.done && have <= frames) {
-      const chunk = input.head.value;
-      input.pcm.accept(chunk, BigInt(chunk.length / 4));
-      parts.push(chunk.slice());
-      have += BigInt(chunk.length / 4);
-      input.head = await input.pcm.next();
+  const prefetch = (input: Input, frames: bigint) => {
+    if (!input.prefetch && frames > 0n) {
+      input.prefetch = createPlaybackHead(
+        input.pcm,
+        input.head,
+        frames,
+        (work) => operations.run(work),
+      );
     }
-    const ready = new Uint8Array(Number(have) * 4);
-    let at = 0;
-    for (const part of parts) {
-      ready.set(part, at);
-      at += part.length;
-    }
-    input.ready = ready;
-    return { frames: have, ended: !!input.head.done && input.pcm.eof };
+    return input.prefetch;
   };
   const natural = (entry: QueueEntry) =>
     entry.facts.kind === 'song'
@@ -485,7 +487,13 @@ export function createPlaybackReader(deps: {
       while (owns(read.source)) {
         // Preparation and one incoming head run concurrently with the outgoing
         // decoder, while the core keeps public current at the playing cursor.
-        const pending = natural(read.entry) ? future(read.source) : null;
+        let pendingReady = false;
+        const pending = natural(read.entry)
+          ? future(read.source).then((next) => {
+            pendingReady = true;
+            return next;
+          })
+          : null;
         void pending?.catch(() => {});
         input ??= await acquire(read);
         if (!input) return;
@@ -505,6 +513,18 @@ export function createPlaybackReader(deps: {
         const compatibility = read.entry.facts.kind === 'song' &&
           Math.round(Number(decoded) * 1000 / 44100) + read.source.startMs <
             length;
+        const requested = requestedFrames();
+        let skippedReason: CrossfadeRecord['reason'] = 'compatibility';
+        let inputDeadline: number | undefined;
+        const withinInputWindow = async (ready: Promise<unknown>) => {
+          inputDeadline ??= deps.inputWindow
+            ? await transport(() => deps.inputWindow!([...mappings.values()]))
+            : 0;
+          const remaining = inputDeadline - performance.now();
+          if (remaining > 0) {
+            await Promise.race([ready, wait(remaining, read.source)]);
+          }
+        };
         let end: Awaited<ReturnType<typeof finalize>> = null;
         const plain = async () => (end ??= await finalize(body));
         if (compatibility) {
@@ -532,6 +552,19 @@ export function createPlaybackReader(deps: {
           const sealed = await plain();
           if (sealed) await endStream(read.source, sealed.inputEnd);
         };
+        if (pending && !pendingReady && !end) {
+          if (requested > 0n && body.hold.frames >= 2n) {
+            await withinInputWindow(pending);
+          }
+          // The next decoder cannot withhold healthy outgoing audio. Its head
+          // may arrive later, but this boundary is now committed as solo PCM.
+          if (!pendingReady) {
+            skippedReason = body.hold.frames < 2n
+              ? 'short-outgoing'
+              : 'incoming-not-ready';
+            if (!await plain()) return;
+          }
+        }
         let next = await pending;
         // EOF may follow an earlier exhausted prefetch and a later ordinary
         // append. Recheck that relationship before committing final input end.
@@ -573,7 +606,27 @@ export function createPlaybackReader(deps: {
           await endInput();
           return;
         }
-        const requested = requestedFrames();
+        if (finite(next.read.entry)) prefetch(next.input, requested);
+        const headInput = next.input.prefetch;
+        const wanted =
+          (requested < body.hold.frames ? requested : body.hold.frames) + 1n;
+        while (
+          !end && headInput && !headInput.finished &&
+          headInput.frames < wanted && owns(read.source)
+        ) {
+          await withinInputWindow(headInput.changed);
+          if (performance.now() >= (inputDeadline ?? 0)) break;
+        }
+        const ready = next.input.prefetch?.freeze();
+        if (ready) next.input.ready = ready.bytes;
+        if (ready?.failed) {
+          if (owns(next.read.source)) {
+            playback.reportSourceOutcome(next.read.source, 'decode-error');
+          }
+          await next.input.pcm.return();
+          await endInput();
+          return;
+        }
         let incoming: Uint8Array | undefined;
         if (end && requested > 0n) {
           deps.crossfadeObserved?.({
@@ -581,34 +634,25 @@ export function createPlaybackReader(deps: {
             incomingEntryId: next.read.source.entryId,
             requestedFrames: requested,
             appliedFrames: 0n,
-            reason: 'compatibility',
+            reason: skippedReason,
           });
         } else if (requested > 0n) {
           let plan: ReturnType<typeof crossfadePlan> = {
             appliedFrames: 0n,
             reason: 'ineligible',
           };
-          if (finite(next.read.entry)) {
-            let ready;
-            try {
-              ready = await gather(
-                next.input,
-                requested < body.hold.frames ? requested : body.hold.frames,
-              );
-            } catch {
-              if (owns(next.read.source)) {
-                playback.reportSourceOutcome(next.read.source, 'decode-error');
-              }
-              await next.input.pcm.return();
-              await endInput();
-              return;
-            }
+          if (finite(next.read.entry) && ready) {
             plan = crossfadePlan({
               requestedFrames: requested,
               outgoingFrames: body.hold.frames,
               incomingFrames: ready.frames,
-              incomingEnded: ready.ended,
+              // A pending read may be EOF: never consume the incoming source's
+              // entire available head and leave it without its own marker.
+              incomingEnded: true,
             });
+            if (!ready.ended && plan.reason === 'short-incoming') {
+              plan = { ...plan, reason: 'incoming-not-ready' };
+            }
           }
           // Bind before the mix enters native input: a later edit of the
           // incoming item is then an accepted-future discontinuity.

@@ -573,8 +573,23 @@ export function createAirplayBoot(
       initial: { source: sourceLease, entry: view.current },
       current: () => !closed && stream === owner && streamCurrent(),
       segment: () => ++owner.segment,
-      crossfadeFrames: () => crossfadeFrames(deps.crossfadeMs?.() ?? 0),
+      crossfadeFrames: () =>
+        crossfadeFrames(
+          deps.crossfadeMs?.() ?? playback.playerView().crossfadeMs,
+        ),
       crossfadeObserved: deps.crossfadeObserved,
+      async inputWindow(sources) {
+        const captured = performance.now();
+        let ahead = 0n;
+        for (const mapping of sources) {
+          const source = await owner.sink.source(nativeEpoch, mapping.source);
+          if (source) ahead += source.acceptedFrames - source.fedFrames;
+        }
+        // Native feeds one 352-frame packet per tick. Keep that quantum in
+        // reserve; only spend already queued PCM while preparing a fade head.
+        return captured +
+          Number(ahead > 352n ? ahead - 352n : 0n) * 1000 / 44100;
+      },
       mapping(lease, mapping) {
         if (playback.sourcePlanView().playing === lease) {
           owner.mapping = mapping;

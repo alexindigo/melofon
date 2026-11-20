@@ -91,6 +91,7 @@ export type CrossfadeReason =
   | 'applied'
   | 'ineligible'
   | 'compatibility'
+  | 'incoming-not-ready'
   | 'short-outgoing'
   | 'short-incoming';
 

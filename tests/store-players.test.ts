@@ -10,6 +10,7 @@ const home = {
   id: 1,
   name: 'Home',
   volume: 50,
+  crossfadeMs: 0,
   isDefault: true,
   commandedAtMs: null,
 };

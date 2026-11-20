@@ -16,11 +16,13 @@ import {
   type SpeakerMembership,
 } from './speakers.ts';
 import type { QueueSnapshot } from '../queue-source.ts';
+import { crossfadeFrames } from '../playback-mix.ts';
 
 export interface StoredPlayer {
   id: number;
   name: string;
   volume: number;
+  crossfadeMs: number;
   isDefault: boolean;
   commandedAtMs: number | null;
 }
@@ -30,6 +32,7 @@ export interface PlayerSave {
   queue?: QueueSnapshot;
   state?: PlayerSnapshot;
   volume?: number;
+  crossfadeMs?: number;
   commandedAtMs?: number;
 }
 
@@ -96,6 +99,13 @@ export async function migratePlayers(q: Queries): Promise<void> {
   }
 }
 
+/** Separate preference migration: never touch playback freshness or bookmarks. */
+export async function migrateCrossfade(q: Queries): Promise<void> {
+  await q.run(
+    'ALTER TABLE players ADD COLUMN IF NOT EXISTS crossfade_ms BIGINT DEFAULT 0',
+  );
+}
+
 function volumeValue(volume: number): number {
   if (!Number.isInteger(volume) || volume < 0 || volume > 100) {
     throw new Error('Invalid player volume');
@@ -113,16 +123,18 @@ export function createPlayersStore(engine: Engine) {
             id: number;
             name: string;
             volume: number;
+            crossfade_ms: number;
             is_default: boolean;
             commanded_at_ms: number | null;
           }
         >(
-          'SELECT id, name, volume, is_default, commanded_at_ms FROM players ORDER BY id',
+          'SELECT id, name, volume, crossfade_ms, is_default, commanded_at_ms FROM players ORDER BY id',
         );
         return rows.map((r) => ({
           id: r.id,
           name: r.name,
           volume: r.volume,
+          crossfadeMs: r.crossfade_ms,
           isDefault: r.is_default,
           commandedAtMs: r.commanded_at_ms,
         }));
@@ -145,6 +157,7 @@ export function createPlayersStore(engine: Engine) {
           id: row.id,
           name,
           volume,
+          crossfadeMs: 0,
           isDefault: false,
           commandedAtMs: null,
         };
@@ -214,6 +227,12 @@ export function createPlayersStore(engine: Engine) {
               `UPDATE players SET volume = ${
                 volumeValue(row.volume)
               } WHERE id = ${row.playerId}`,
+            );
+          }
+          if (row.crossfadeMs !== undefined) {
+            crossfadeFrames(row.crossfadeMs);
+            await q.run(
+              `UPDATE players SET crossfade_ms = ${row.crossfadeMs} WHERE id = ${row.playerId}`,
             );
           }
           if (row.commandedAtMs !== undefined) {
