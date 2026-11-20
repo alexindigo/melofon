@@ -2679,6 +2679,16 @@ static void
 raop_metadata_rtptimes_get(uint32_t *start, uint32_t *display, uint32_t *pos, uint32_t *end, struct raop_master_session *rms, struct output_metadata *metadata)
 {
   struct rtp_session *rtp_session = rms->rtp_session;
+  if (metadata->timeline) {
+    uint32_t target = rtp_session->pos - (uint32_t)rms->epoch_frames + (uint32_t)metadata->timeline_frame;
+    *start = target - (uint32_t)metadata->media_frame;
+    *display = *start;
+    *pos = *start + (uint32_t)metadata->position_frames;
+    uint64_t end_frames = metadata->duration_frames > metadata->position_frames
+      ? metadata->duration_frames : metadata->position_frames;
+    *end = *start + (uint32_t)end_frames;
+    return;
+  }
   // All the calculations with long ints to avoid surprises
   int64_t sample_rate;
   int64_t diff_ms;
@@ -2817,6 +2827,10 @@ raop_metadata_send_generic(struct raop_session *rs, struct output_metadata *meta
 
   raop_metadata_rtptimes_get(&start, &display, &pos, &end, rs->master_session, metadata);
 
+  if (metadata->timeline)
+    start = rs->master_session->rtp_session->pos - (uint32_t)rs->master_session->epoch_frames +
+      (uint32_t)metadata->timeline_frame;
+
   ret = snprintf(rtptime, sizeof(rtptime), "rtptime=%u", start);
   if ((ret < 0) || (ret >= sizeof(rtptime)))
     {
@@ -2858,7 +2872,7 @@ raop_metadata_send_generic(struct raop_session *rs, struct output_metadata *meta
 static int
 raop_metadata_startup_send(struct raop_session *rs)
 {
-  if (!rs->wanted_metadata || !raop_cur_metadata)
+  if (!rs->wanted_metadata || !raop_cur_metadata || raop_cur_metadata->stream_id != rs->stream_id)
     return 0;
 
   raop_cur_metadata->startup = true;
@@ -2869,7 +2883,7 @@ raop_metadata_startup_send(struct raop_session *rs)
 static int
 raop_metadata_keep_alive_send(struct raop_session *rs)
 {
-  if (!rs->wanted_metadata || !raop_cur_metadata)
+  if (!rs->wanted_metadata || !raop_cur_metadata || raop_cur_metadata->stream_id != rs->stream_id)
     return 0;
 
   raop_cur_metadata->startup = false;
@@ -2888,7 +2902,7 @@ raop_metadata_send(struct output_metadata *metadata)
     {
       next = rs->next;
 
-      if (!(rs->state & RAOP_STATE_F_CONNECTED) || !rs->wanted_metadata)
+      if (rs->stream_id != metadata->stream_id || !(rs->state & RAOP_STATE_F_CONNECTED) || !rs->wanted_metadata)
 	continue;
 
       ret = raop_metadata_send_generic(rs, metadata, false);
@@ -2902,6 +2916,13 @@ raop_metadata_send(struct output_metadata *metadata)
   // Replace current metadata with the new stuff
   raop_metadata_purge();
   raop_cur_metadata = metadata;
+}
+
+void
+raop_timeline_metadata_progress(uint64_t stream_id, uint64_t frames)
+{
+  if (raop_cur_metadata && raop_cur_metadata->stream_id == stream_id && raop_cur_metadata->timeline)
+    raop_cur_metadata->position_frames = frames;
 }
 
 
@@ -3124,6 +3145,7 @@ uint64_t
 raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns,
                    const uint64_t *retire_ids, size_t retire_count)
 {
+  if (raop_cur_metadata && raop_cur_metadata->stream_id == stream_id) raop_metadata_purge();
   uint64_t cutoff = UINT64_MAX;
   for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
     if (rs->stream_id != stream_id || rs->retiring || rs->failure_pending)

@@ -1452,6 +1452,18 @@ raop_stream_drained(raop_stream_t *stream, uint64_t epoch)
 }
 
 int
+raop_stream_metadata(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+  uint64_t frame, uint64_t origin, uint64_t duration, const char *title, const char *artist)
+{
+  if (!stream || !epoch || !source || !title || !artist || origin > UINT64_MAX - frame) return -1;
+  pthread_mutex_lock(&rt.lock);
+  int result = stream->closing || stream->input_closed || stream->resetting || epoch != stream->epoch
+    ? 2 : raop_player_metadata(stream->player, source, frame, origin, duration, title, artist);
+  pthread_mutex_unlock(&rt.lock);
+  return result;
+}
+
+int
 raop_stream_range(raop_stream_t *stream, uint64_t epoch, uint64_t index,
                   struct raop_range_snapshot *result)
 {
@@ -1479,6 +1491,7 @@ stream_progress_cb(evutil_socket_t fd, short what, void *arg)
 {
   (void)fd; (void)what;
   struct progress_work *work = arg;
+  raop_player_metadata_update(work->stream->player);
   pthread_mutex_lock(&rt.lock);
   raop_stream_t *s = work->stream;
   if (work->completion && !s->closing) {

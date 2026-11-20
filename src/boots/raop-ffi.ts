@@ -71,6 +71,19 @@ const SYMBOLS = {
     result: 'i32',
   },
   raop_stream_drained: { parameters: ['pointer', 'u64'], result: 'i32' },
+  raop_stream_metadata: {
+    parameters: [
+      'pointer',
+      'u64',
+      'u64',
+      'u64',
+      'u64',
+      'u64',
+      'buffer',
+      'buffer',
+    ],
+    result: 'i32',
+  },
   raop_stream_compatibility_silence: {
     parameters: ['pointer', 'u64', 'u64'],
     result: 'i32',
@@ -987,6 +1000,31 @@ export function createFfiStream(
     },
     seal: (captured, source, target) => marker(captured, source, target, false),
     endStream: (captured, target) => marker(captured, 0n, target, true),
+    metadata(input) {
+      return operations.run(() => {
+        u64(
+          input.epoch,
+          input.source,
+          input.sourceFrame,
+          input.originFrame,
+          input.durationFrames,
+        );
+        const result = lib.symbols.raop_stream_metadata(
+          handle,
+          input.epoch,
+          input.source,
+          input.sourceFrame,
+          input.originFrame,
+          input.durationFrames,
+          cstr(input.title),
+          cstr(input.artist),
+        );
+        if (result === 1) return 'accepted' as const;
+        if (result === 0) return 'backpressure' as const;
+        if (result === 2) return 'canceled' as const;
+        throw new Error(`RAOP metadata admission failed: ${result}`);
+      });
+    },
     waitDrain(captured) {
       return operations.run(async ({ signal }) => {
         u64(captured);

@@ -122,6 +122,15 @@ export interface AirplayCancelResult {
  * are exclusive source-local real frames; endStream targets epoch-wide accepted
  * real frames. Pacer snapshots are distinct from scheduled progress/completion. */
 export interface AirplayTimelineStream extends AirplayExactStream {
+  metadata(input: {
+    epoch: bigint;
+    source: bigint;
+    sourceFrame: bigint;
+    originFrame: bigint;
+    durationFrames: bigint;
+    title: string;
+    artist: string;
+  }): Promise<'accepted' | 'backpressure' | 'canceled'>;
   /** Same ordered cancellation, with the named old source's immutable native
    * projection captured before reset. Ack together through ackCancel(epoch). */
   cancelSource(
@@ -286,6 +295,7 @@ export interface AirplayPlaybackStream extends
   Pick<
     AirplayTimelineStream,
     | 'appendSource'
+    | 'metadata'
     | 'seal'
     | 'endStream'
     | 'waitDrain'

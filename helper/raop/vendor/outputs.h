@@ -160,6 +160,9 @@ struct output_device
 
 struct output_metadata
 {
+  uint64_t stream_id;
+  bool timeline;
+  uint64_t timeline_frame, media_frame, duration_frames, position_frames;
   enum output_types type;
   uint32_t item_id;
 

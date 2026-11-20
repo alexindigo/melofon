@@ -27,6 +27,8 @@ import { createPlaybackSource } from '../../src/playback-source.ts';
 import { createRadioSource } from '../../src/radio-source.ts';
 import { createNetwork } from '../../src/lookups/net.ts';
 import { httpRadio } from './http-radio.ts';
+import type { RadioReply } from './http-radio.ts';
+import type { SourceMetadata } from '../../src/queue-source.ts';
 import { createPersistence } from '../../src/persistence.ts';
 import type {
   AirplaySourceCancelResult,
@@ -36,6 +38,11 @@ import type {
 export async function nativeHttpFixture(options: {
   pcm: Uint8Array;
   additionalPcm?: Uint8Array[];
+  titles?: string[];
+  durations?: (number | null)[];
+  metadata?: boolean;
+  radioReply?: (wav: Uint8Array) => RadioReply;
+  metadataObserved?: (metadata: SourceMetadata, sourceFrame: bigint) => void;
   declaredMs?: number | null;
   acquisition?: Promise<void>;
   web?: 'finite' | 'live';
@@ -181,15 +188,17 @@ export async function nativeHttpFixture(options: {
     };
   });
   const radio = options.web
-    ? httpRadio(() => ({
-      headers: {
-        'content-type': 'audio/wav',
-        ...(options.web === 'live'
-          ? { 'icy-name': 'Finite live response' }
-          : {}),
-      },
-      body: [wav],
-    }))
+    ? httpRadio(() =>
+      options.radioReply?.(wav) ?? ({
+        headers: {
+          'content-type': 'audio/wav',
+          ...(options.web === 'live'
+            ? { 'icy-name': 'Finite live response' }
+            : {}),
+        },
+        body: [wav],
+      })
+    )
     : undefined;
   const f = await apiFixture({
     storeDir: options.storeDir,
@@ -218,9 +227,20 @@ export async function nativeHttpFixture(options: {
         ...catalog,
         async getSong(id: string) {
           const song = await catalog.getSong(id);
-          return song && options.declaredMs !== undefined
-            ? { ...song, durationMs: options.declaredMs }
-            : song;
+          return song
+            ? {
+              ...song,
+              ...(options.declaredMs !== undefined
+                ? { durationMs: options.declaredMs }
+                : {}),
+              ...(options.durations?.[songIds.indexOf(id)] !== undefined
+                ? { durationMs: options.durations[songIds.indexOf(id)] }
+                : {}),
+              ...(options.titles?.[songIds.indexOf(id)]
+                ? { title: options.titles[songIds.indexOf(id)] }
+                : {}),
+            }
+            : null;
         },
       };
       if (options.persist) persistence = createPersistence(f.store);
@@ -242,7 +262,7 @@ export async function nativeHttpFixture(options: {
         if (options.persist) await outputs.adopt(String(index + 1));
       }
       const media = createMedia();
-      const sources = createPlaybackSource({
+      const sourceOwner = createPlaybackSource({
         media,
         state: f.state,
         radio: createRadioSource({
@@ -250,6 +270,21 @@ export async function nativeHttpFixture(options: {
           state: f.state,
         }),
       });
+      const sources = {
+        ...sourceOwner,
+        open(
+          media: Parameters<typeof sourceOwner.open>[0],
+          settings: Parameters<typeof sourceOwner.open>[1],
+        ) {
+          return sourceOwner.open(media, {
+            ...settings,
+            onMetadata(metadata, frame) {
+              options.metadataObserved?.(metadata, frame);
+              settings.onMetadata?.(metadata, frame);
+            },
+          });
+        },
+      };
       const engine = createPlayback({
         player: createPlayer(),
         library,
@@ -342,7 +377,12 @@ export async function nativeHttpFixture(options: {
         });
         if (snapshot) await playback.restore(snapshot);
       }
-      devices = createTestAirplayDevices(outputs, undefined, audio.stream);
+      devices = createTestAirplayDevices(
+        outputs,
+        undefined,
+        audio.stream,
+        options.metadata ? { md: '0,2' } : {},
+      );
       boot = createAirplayBoot({
         outputs,
         playback,

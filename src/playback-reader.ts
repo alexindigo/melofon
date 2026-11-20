@@ -5,7 +5,13 @@ import type { Playback, PlaybackRead } from './playback.ts';
 import type { PlaybackSource } from './player.ts';
 import type { PlaybackSources } from './playback-source.ts';
 import type { QueueEntry } from './queue-source.ts';
-import { queueDuration } from './queue-source.ts';
+import {
+  queueDisplay,
+  queueDuration,
+  type QueueMedia,
+  type SourceMetadata,
+} from './queue-source.ts';
+import { pcmOrigin } from './pcm-origin.ts';
 import type { TimelineSource, TimelineWriter } from './playback-timeline.ts';
 
 export function createPlaybackReader(deps: {
@@ -33,6 +39,11 @@ export function createPlaybackReader(deps: {
   const controller = new AbortController();
   const mappings = new Map<PlaybackSource, TimelineSource>();
   const acceptedMappings = new WeakSet<TimelineSource>();
+  type Metadata = Parameters<TimelineWriter['metadata']>[0];
+  const metadataWrites = new WeakMap<
+    PlaybackSource,
+    { media: QueueMedia; pending: Metadata[] }
+  >();
   const leases = new Set<PlaybackSource>([deps.initial.source]);
   const publications = new Map<
     PlaybackSource,
@@ -42,6 +53,35 @@ export function createPlaybackReader(deps: {
   let continuous = false;
   const live = () => !controller.signal.aborted && deps.current();
   const owns = (source: PlaybackSource) => live() && !source.signal.aborted;
+  const queueMetadata = (
+    source: PlaybackSource,
+    mapping: TimelineSource,
+    frame: bigint,
+    facts?: SourceMetadata,
+  ) => {
+    const state = metadataWrites.get(source)!;
+    if (facts && state.media.facts.kind === 'web') {
+      state.media = {
+        ...state.media,
+        facts: { ...state.media.facts, ...facts },
+      } as QueueMedia;
+    }
+    const display = queueDisplay(state.media);
+    const marker: Metadata = {
+      epoch,
+      source: mapping.source,
+      sourceFrame: frame,
+      originFrame: mapping.originFrame,
+      durationFrames: pcmOrigin({ startMs: queueDuration(state.media) ?? 0 }),
+      title: state.media.facts.kind === 'web'
+        ? state.media.facts.streamTitle ?? display.title ?? ''
+        : display.title ?? '',
+      artist: display.artistName ?? '',
+    };
+    if (state.pending.at(-1)?.sourceFrame === frame) {
+      state.pending[state.pending.length - 1] = marker;
+    } else state.pending.push(marker);
+  };
   // Native errors retain their transport owner even when they race decoder EOF.
   // A drain/seal/append rejection must never enter catalog content-failure policy.
   class TransportFailure extends Error {}
@@ -72,6 +112,8 @@ export function createPlaybackReader(deps: {
     if (!mapping) return null;
     leases.add(source);
     mappings.set(source, mapping);
+    metadataWrites.set(source, { media: read.entry, pending: [] });
+    queueMetadata(source, mapping, 0n);
     const publication = Promise.withResolvers<void>();
     publications.set(source, publication);
     source.signal.addEventListener('abort', () => publication.resolve(), {
@@ -98,9 +140,11 @@ export function createPlaybackReader(deps: {
       const pcm = await deps.sources.open(read.entry, {
         signal: read.source.signal,
         startMs: read.source.startMs,
-        onMetadata: (metadata) => {
+        onMetadata: (metadata, sourceFrame) => {
           if (owns(read.source)) {
-            playback.reportSourceMetadata(read.source, metadata);
+            const mapping = mappings.get(read.source)!;
+            queueMetadata(read.source, mapping, sourceFrame, metadata);
+            playback.reportSourceMetadata(read.source, metadata, sourceFrame);
           }
         },
         retry: (reason, signal) =>
@@ -239,6 +283,18 @@ export function createPlaybackReader(deps: {
             if (owns(source) && accepted) {
               playback.sourceAccepted(source, receipt.acceptedFrames);
               playback.sourceAudio(source, accepted / 176400 * 1000);
+            }
+            const pendingMetadata = metadataWrites.get(source)!.pending;
+            while (
+              owns(source) && bytes > 0 && pendingMetadata.length &&
+              pendingMetadata[0].sourceFrame <= BigInt(bytes / 4)
+            ) {
+              const status = await transport(() =>
+                sink.metadata(pendingMetadata[0])
+              );
+              if (status === 'accepted') pendingMetadata.shift();
+              else if (status === 'canceled') return null;
+              else await wait(10, source);
             }
             if (!owns(source)) return null;
             if (receipt.status === 'error' || receipt.status === 'canceled') {

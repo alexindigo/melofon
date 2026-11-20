@@ -308,7 +308,11 @@ export interface Player {
   /** Accepted PCM duration, reported after the sink write resolves. */
   sourceAudio(source: PlaybackSource, durationMs: number): boolean;
   sourceOutcome(source: PlaybackSource, outcome: SourceOutcome): boolean;
-  sourceMetadata(source: PlaybackSource, metadata: SourceMetadata): boolean;
+  sourceMetadata(
+    source: PlaybackSource,
+    metadata: SourceMetadata,
+    scheduled?: boolean,
+  ): boolean;
   canAdvanceEnded(): boolean;
   /** No-op on an empty queue (state stays 'stop'). `fromPosition` starts
    * the queue item at that 0-based index (OwnTone playback_from_position),
@@ -926,10 +930,11 @@ export function createPlayer(options: {
       record.outcome = outcome;
       return true;
     },
-    sourceMetadata(token, metadata) {
+    sourceMetadata(token, metadata, scheduled = false) {
       const entry = currentEntry();
       if (
-        source?.token !== token || source.outcome || state !== 'play' ||
+        source?.token !== token || token.signal.aborted ||
+        source.outcome && !scheduled || state !== 'play' ||
         entry?.id !== token.entryId || entry.facts.kind !== 'web' ||
         entry.reference.kind === 'song'
       ) return false;

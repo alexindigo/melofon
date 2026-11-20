@@ -299,6 +299,7 @@ export interface Playback {
   reportSourceMetadata(
     source: PlaybackSource,
     metadata: SourceMetadata,
+    sourceFrame?: bigint,
   ): boolean;
 
   /** Boot-time restore (main.ts): delegates to player.restore and records
@@ -1676,6 +1677,13 @@ export function createPlayback(deps: {
       if (!ownsSource(source) || !mapping) return false;
       const previous = timeline.position(mapping)!;
       if (!timeline.observe(mapping, progress)) return false;
+      let metadataChanged = false;
+      if (sourcePlans.playing === source) {
+        for (const metadata of timeline.scheduledMetadata(mapping)) {
+          metadataChanged = player.sourceMetadata(source, metadata, true) ||
+            metadataChanged;
+        }
+      }
       const rate = player.status().playbackRate;
       const accepted = player.sourcePosition(
         source,
@@ -1685,7 +1693,12 @@ export function createPlayback(deps: {
           ? 1
           : 0,
       );
-      if (accepted && rate !== player.status().playbackRate) emit(['player']);
+      if (accepted && metadataChanged) {
+        flushQueue();
+        emit(['queue', 'nowPlaying', 'player']);
+      } else if (accepted && rate !== player.status().playbackRate) {
+        emit(['player']);
+      }
       return accepted;
     },
     sealSource(source, target) {
@@ -1798,7 +1811,11 @@ export function createPlayback(deps: {
         });
         return !signal.aborted && ownsSource(source) && recovery === run;
       }),
-    reportSourceMetadata(source, metadata) {
+    reportSourceMetadata(source, metadata, sourceFrame) {
+      const mapping = timelineSources.get(source);
+      if (sourceFrame !== undefined && mapping && ownsSource(source)) {
+        return timeline.metadata(mapping, sourceFrame, metadata);
+      }
       if (operations.closed || !player.sourceMetadata(source, metadata)) {
         return false;
       }
