@@ -146,7 +146,8 @@ export function createAirplayBoot(
       // Readiness/cutoff settlement must not extend the existing idle hold.
       owner.idleAt = performance.now();
       const captured = Promise.withResolvers<void>();
-      const admitted = owner.admitted;
+      const admitted = source?.stream === owner &&
+        source.reader.admitted(mapping);
       const ready = cancelStream(
         owner,
         false,
@@ -236,6 +237,7 @@ export function createAirplayBoot(
     segment: bigint;
     cutoff?: AirplayCancelResult;
     sourceStarted: boolean;
+    drained?: boolean;
     sourceOperations: ReturnType<typeof createOperationScope>;
     mapping?: TimelineSource;
     admitted?: boolean;
@@ -665,6 +667,7 @@ export function createAirplayBoot(
         ? owner.sink.cancelSource(epoch, mapping.source, retiring, commit)
         : owner.sink.cancel(epoch, retiring);
       owner.sourceStarted = false;
+      owner.drained = false;
       const result = await pending;
       if (result.status === 'failed') throw new Error('AirPlay cancel failed');
       if (closed || stream !== owner) return;
@@ -723,10 +726,13 @@ export function createAirplayBoot(
     // owned until the reader has acknowledged them and joined its cleanup.
     const drained = view.state === 'stop' && source?.stream === owner &&
       source.reader.drained;
-    if (drained) owner.sourceStarted = false;
+    if (drained) {
+      owner.sourceStarted = false;
+      owner.drained = true;
+    }
     cancelPump();
     // A core cutoff already fenced this source before intent publication.
-    if (!owner.sourceStarted) return;
+    if (!owner.sourceStarted && !(playing && owner.drained)) return;
     void cancelStream(owner, playing).catch(() => {});
   };
   const releaseStream = () => {

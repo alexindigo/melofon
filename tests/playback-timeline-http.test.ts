@@ -450,7 +450,11 @@ for (const edit of ['remove', 'move', 'append', 'unrelated-move'] as const) {
           'promote the prepared incarnation, do not reopen it',
         );
       }
-      assertEquals(waits, 1, 'unrelated edits never redo B acquisition');
+      assertEquals(
+        waits,
+        edit === 'move' ? 2 : 1,
+        'unrelated edits never redo B; a moved B is read again only in its new relationship',
+      );
       assertEquals((await c.current()).current.entryId, opened[1].entryId);
       assertEquals(
         f.audio.scheduledRealAudio(

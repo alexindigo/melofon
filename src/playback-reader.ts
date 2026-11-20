@@ -32,6 +32,7 @@ export function createPlaybackReader(deps: {
   const operations = createOperationScope('Playback reader');
   const controller = new AbortController();
   const mappings = new Map<PlaybackSource, TimelineSource>();
+  const acceptedMappings = new WeakSet<TimelineSource>();
   const leases = new Set<PlaybackSource>([deps.initial.source]);
   const publications = new Map<
     PlaybackSource,
@@ -123,37 +124,54 @@ export function createPlaybackReader(deps: {
   type Acquired = Awaited<ReturnType<typeof acquire>>;
   const future = (after: PlaybackSource) =>
     operations.run(async () => {
-      let read: PlaybackRead | null;
-      try {
-        read = await playback.prepareNextSource(after);
-      } catch (error) {
-        if (!owns(after)) return null;
-        // Preparation has its own retained failure. The due transition applies
-        // existing source policy after A's native completion, never at read EOF.
-        return { preparationFailed: true as const, error };
-      }
-      if (!live() || !read || !playback.admitSource(read)) return null;
-      continuous = true;
-      const mapping = bind(read);
-      if (!mapping) return null;
-      try {
-        return { read, mapping, input: await acquire(read) };
-      } catch (error) {
-        if (owns(read.source)) {
-          playback.reportSourceOutcome(read.source, 'decode-error');
+      while (owns(after)) {
+        let read: PlaybackRead | null;
+        try {
+          read = await playback.prepareNextSource(after);
+        } catch (error) {
+          if (!owns(after)) return null;
+          if (
+            error instanceof Error && 'code' in error &&
+            error.code === 'playback_cancelled'
+          ) continue;
+          // Preparation has its own retained failure. The due transition applies
+          // existing source policy after A's native completion, never at read EOF.
+          return { preparationFailed: true as const, error };
         }
-        return { read, mapping, input: null, error };
+        if (!live() || !read) return null;
+        if (!playback.admitSource(read)) continue;
+        continuous = true;
+        const mapping = bind(read);
+        if (!mapping) return null;
+        try {
+          return { read, mapping, input: await acquire(read) };
+        } catch (error) {
+          if (owns(read.source)) {
+            playback.reportSourceOutcome(read.source, 'decode-error');
+          }
+          return { read, mapping, input: null, error };
+        }
       }
+      return null;
     });
   const observeCompletion = (
     source: PlaybackSource,
     mapping: TimelineSource,
     target: bigint,
   ) => {
-    const key = { epoch, source: mapping.source, target, revision: 1n };
+    let key = { epoch, source: mapping.source, target, revision: 1n };
+    const revisions = [key];
     void operations.run(async () => {
       try {
-        const completion = await sink.waitCompletion(key);
+        let completion = await sink.waitCompletion(key);
+        if (!owns(source)) return;
+        while (completion.status === 'failed' && owns(source)) {
+          const exclude = playback.reviseSourceCompletion(source, completion);
+          if (!exclude) break;
+          key = await sink.reviseCompletion(key, exclude);
+          revisions.push(key);
+          completion = await sink.waitCompletion(key);
+        }
         if (!owns(source)) return;
         if (completion.status !== 'complete') {
           throw new Error(`Source completion failed: ${completion.status}`);
@@ -171,8 +189,10 @@ export function createPlaybackReader(deps: {
         if (owns(source)) deps.transportFailed(error);
       } finally {
         try {
-          await sink.waitCompletion(key);
-          await sink.ackCompletion(key);
+          for (const revision of revisions) {
+            await sink.waitCompletion(revision);
+            await sink.ackCompletion(revision);
+          }
         } catch (error) {
           deps.retirementFailed(error);
         }
@@ -199,29 +219,40 @@ export function createPlaybackReader(deps: {
         if (!bytes) deps.inputObserved?.('first', read, chunk.length);
         let offset = 0;
         while (offset < chunk.length && owns(source)) {
-          deps.admitted();
-          const receipt = await transport(() =>
-            sink.appendSource({
-              epoch,
-              source: mapping.source,
-              segment,
-              pcm: chunk.subarray(offset),
-            })
-          );
-          const accepted = Number(receipt.acceptedFrames) * 4;
-          if (owns(source)) pcm.accept(chunk, receipt.acceptedFrames);
-          offset += accepted;
-          bytes += accepted;
-          if (owns(source) && accepted) {
-            playback.sourceAccepted(source, receipt.acceptedFrames);
-            playback.sourceAudio(source, accepted / 176400 * 1000);
-          }
-          if (!owns(source)) return null;
-          if (receipt.status === 'error' || receipt.status === 'canceled') {
-            deps.transportFailed(
-              new Error(`RAOP append failed: ${receipt.status}`),
+          const settled = playback.beginSourceInput(source);
+          if (!settled) return null;
+          try {
+            deps.admitted();
+            const receipt = await transport(() =>
+              sink.appendSource({
+                epoch,
+                source: mapping.source,
+                segment,
+                pcm: chunk.subarray(offset),
+              })
             );
-            return null;
+            const accepted = Number(receipt.acceptedFrames) * 4;
+            if (accepted) acceptedMappings.add(mapping);
+            if (owns(source)) pcm.accept(chunk, receipt.acceptedFrames);
+            offset += accepted;
+            bytes += accepted;
+            if (owns(source) && accepted) {
+              playback.sourceAccepted(source, receipt.acceptedFrames);
+              playback.sourceAudio(source, accepted / 176400 * 1000);
+            }
+            if (!owns(source)) return null;
+            if (receipt.status === 'error' || receipt.status === 'canceled') {
+              deps.transportFailed(
+                new Error(
+                  `RAOP append failed: ${receipt.status}/${
+                    receipt.error ?? 'none'
+                  }`,
+                ),
+              );
+              return null;
+            }
+          } finally {
+            settled();
           }
           if (offset < chunk.length) await wait(10, source);
         }
@@ -311,31 +342,39 @@ export function createPlaybackReader(deps: {
           }
         }
         let next = await pending;
-        if (next && 'preparationFailed' in next) {
-          await endInput(read.source, end.inputEnd);
-          return;
+        // EOF may follow an earlier exhausted prefetch and a later ordinary
+        // append. Recheck that relationship before committing final input end.
+        if (!next && !continuous && natural(read.entry) && owns(read.source)) {
+          next = await future(read.source);
         }
-        while (
-          live() && next?.read.source.signal.aborted && owns(read.source)
-        ) {
-          await next.input?.pcm.return();
-          const replacement = await future(read.source);
-          if (replacement && 'preparationFailed' in replacement) {
+        for (;;) {
+          if (next && 'preparationFailed' in next) {
             await endInput(read.source, end.inputEnd);
             return;
           }
-          next = replacement;
-        }
-        if (!live()) return;
-        if (!next) {
-          if (
-            continuous && natural(read.entry) &&
-            !playback.finishSources(read.source)
-          ) {
+          if (live() && next?.read.source.signal.aborted && owns(read.source)) {
+            await next.input?.pcm.return();
+            const replacement = await future(read.source);
+            if (replacement && 'preparationFailed' in replacement) {
+              await endInput(read.source, end.inputEnd);
+              return;
+            }
+            next = replacement;
+            continue;
+          }
+          if (!live()) return;
+          if (!next) {
+            if (
+              continuous && natural(read.entry) &&
+              !playback.finishSources(read.source)
+            ) {
+              next = await future(read.source);
+              continue;
+            }
+            await endInput(read.source, end.inputEnd);
             return;
           }
-          await endInput(read.source, end.inputEnd);
-          return;
+          break;
         }
         if (!next.input) {
           // Its failure is due-only core policy. End the healthy prefix so its
@@ -368,6 +407,9 @@ export function createPlaybackReader(deps: {
     settled: work.then(() => operations.close()),
     mapping(source: PlaybackSource) {
       return mappings.get(source);
+    },
+    admitted(mapping: TimelineSource) {
+      return acceptedMappings.has(mapping);
     },
     cancel() {
       controller.abort();

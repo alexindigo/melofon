@@ -391,6 +391,9 @@ export async function createPlayers(deps: {
     prepareNextSource: (...args) => current().prepareNextSource(...args),
     admitSource: (...args) => current().admitSource(...args),
     sourceAccepted: (...args) => current().sourceAccepted(...args),
+    beginSourceInput: (...args) => current().beginSourceInput(...args),
+    reviseSourceCompletion: (...args) =>
+      current().reviseSourceCompletion(...args),
     finishSources: (...args) => current().finishSources(...args),
     sourcePlanView: () => current().sourcePlanView(),
     cancelSource: (...args) => current().cancelSource(...args),
