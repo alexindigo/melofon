@@ -391,6 +391,7 @@ export async function createPlayers(deps: {
     prepareNextSource: (...args) => current().prepareNextSource(...args),
     admitSource: (...args) => current().admitSource(...args),
     sourceAccepted: (...args) => current().sourceAccepted(...args),
+    overlapSource: (...args) => current().overlapSource(...args),
     beginSourceInput: (...args) => current().beginSourceInput(...args),
     reviseSourceCompletion: (...args) =>
       current().reviseSourceCompletion(...args),

@@ -13,6 +13,13 @@ import {
 } from './queue-source.ts';
 import { pcmOrigin } from './pcm-origin.ts';
 import type { TimelineSource, TimelineWriter } from './playback-timeline.ts';
+import type { PlaybackPcm } from './playback-source.ts';
+import {
+  createTailHold,
+  crossfadePlan,
+  type CrossfadeRecord,
+  mixCrossfade,
+} from './playback-mix.ts';
 
 export function createPlaybackReader(deps: {
   playback: Playback;
@@ -30,6 +37,10 @@ export function createPlaybackReader(deps: {
     read: PlaybackRead,
     bytes: number,
   ): void;
+  /** Requested natural-boundary overlap; read when an outgoing source begins
+   * input (its tail hold) and again at its boundary. Absent means 0. */
+  crossfadeFrames?(): bigint;
+  crossfadeObserved?(record: CrossfadeRecord): void;
   transportFailed(error: unknown): void;
   contentFailed(entry: QueueEntry, error: unknown): void;
   retirementFailed(error: unknown): void;
@@ -45,6 +56,8 @@ export function createPlaybackReader(deps: {
     { media: QueueMedia; pending: Metadata[] }
   >();
   const leases = new Set<PlaybackSource>([deps.initial.source]);
+  // Incoming heads already mixed into the previous source's native frames.
+  const heads = new WeakMap<PlaybackSource, bigint>();
   const publications = new Map<
     PlaybackSource,
     ReturnType<typeof Promise.withResolvers<void>>
@@ -60,6 +73,8 @@ export function createPlaybackReader(deps: {
     facts?: SourceMetadata,
   ) => {
     const state = metadataWrites.get(source)!;
+    const head = heads.get(source) ?? 0n;
+    frame = frame > head ? frame - head : 0n;
     if (facts && state.media.facts.kind === 'web') {
       state.media = {
         ...state.media,
@@ -71,7 +86,7 @@ export function createPlaybackReader(deps: {
       epoch,
       source: mapping.source,
       sourceFrame: frame,
-      originFrame: mapping.originFrame,
+      originFrame: mapping.originFrame + head,
       durationFrames: pcmOrigin({ startMs: queueDuration(state.media) ?? 0 }),
       title: state.media.facts.kind === 'web'
         ? state.media.facts.streamTitle ?? display.title ?? ''
@@ -81,6 +96,29 @@ export function createPlaybackReader(deps: {
     if (state.pending.at(-1)?.sourceFrame === frame) {
       state.pending[state.pending.length - 1] = marker;
     } else state.pending.push(marker);
+  };
+  // Native frames of an overlapped source start after its head; pending
+  // decoder-frame markers move with it, keeping the latest facts per frame.
+  const overlap = (
+    source: PlaybackSource,
+    mapping: TimelineSource,
+    frames: bigint,
+  ) => {
+    heads.set(source, frames);
+    const state = metadataWrites.get(source)!;
+    const pending = state.pending.splice(0);
+    for (const marker of pending) {
+      const moved = {
+        ...marker,
+        sourceFrame: marker.sourceFrame > frames
+          ? marker.sourceFrame - frames
+          : 0n,
+        originFrame: mapping.originFrame + frames,
+      };
+      if (state.pending.at(-1)?.sourceFrame === moved.sourceFrame) {
+        state.pending[state.pending.length - 1] = moved;
+      } else state.pending.push(moved);
+    }
   };
   // Native errors retain their transport owner even when they race decoder EOF.
   // A drain/seal/append rejection must never enter catalog content-failure policy.
@@ -159,7 +197,7 @@ export function createPlaybackReader(deps: {
       // At most one decoded head is retained outside the bounded native ingress.
       try {
         const head = await pcm.next();
-        return { pcm, head };
+        return { pcm, head, ready: new Uint8Array(0) };
       } catch (error) {
         await pcm.return();
         throw error;
@@ -246,108 +284,187 @@ export function createPlaybackReader(deps: {
       }
     });
   };
-  const write = async (
+  type Body = {
+    read: PlaybackRead;
+    mapping: TimelineSource;
+    /** Bytes natively accepted for this source, excluding any overlapped head. */
+    written: number;
+    hold: ReturnType<typeof createTailHold>;
+  };
+  // Append one range under its source until fully accepted. A decoder chunk
+  // reports exact native acceptance; held or pre-copied ranges were already
+  // taken from the decoder.
+  const append = async (
+    body: Body,
+    data: Uint8Array,
+    decoder?: { pcm: PlaybackPcm; chunk: Uint8Array },
+  ) => {
+    const { read: { source }, mapping } = body;
+    const segment = deps.segment();
+    let offset = 0;
+    while (offset < data.length && owns(source)) {
+      const settled = playback.beginSourceInput(source);
+      if (!settled) return false;
+      try {
+        deps.admitted();
+        const receipt = await transport(() =>
+          sink.appendSource({
+            epoch,
+            source: mapping.source,
+            segment,
+            pcm: data.subarray(offset),
+          })
+        );
+        const accepted = Number(receipt.acceptedFrames) * 4;
+        if (accepted) acceptedMappings.add(mapping);
+        if (owns(source) && decoder) {
+          decoder.pcm.accept(decoder.chunk, receipt.acceptedFrames);
+        }
+        offset += accepted;
+        body.written += accepted;
+        if (owns(source) && accepted) {
+          playback.sourceAccepted(source, receipt.acceptedFrames);
+          playback.sourceAudio(source, accepted / 176400 * 1000);
+        }
+        const pendingMetadata = metadataWrites.get(source)!.pending;
+        while (
+          owns(source) && body.written > 0 && pendingMetadata.length &&
+          pendingMetadata[0].sourceFrame <= BigInt(body.written / 4)
+        ) {
+          const status = await transport(() =>
+            sink.metadata(pendingMetadata[0])
+          );
+          if (status === 'accepted') pendingMetadata.shift();
+          else if (status === 'canceled') return false;
+          else await wait(10, source);
+        }
+        if (!owns(source)) return false;
+        if (receipt.status === 'error' || receipt.status === 'canceled') {
+          deps.transportFailed(
+            new Error(
+              `RAOP append failed: ${receipt.status}/${
+                receipt.error ?? 'none'
+              }`,
+            ),
+          );
+          return false;
+        }
+      } finally {
+        settled();
+      }
+      if (offset < data.length) await wait(10, source);
+    }
+    return owns(source);
+  };
+  // Decoder input through decoder EOF. With a requested crossfade, the last
+  // frames stay in a rolling tail until the boundary is decided.
+  const writeBody = async (
     read: PlaybackRead,
     mapping: TimelineSource,
     input: NonNullable<Acquired>,
-  ) => {
+    holdFrames: bigint,
+  ): Promise<Body | null> => {
     const { source } = read, { pcm } = input;
-    let bytes = 0;
+    const body: Body = {
+      read,
+      mapping,
+      written: 0,
+      hold: createTailHold(holdFrames),
+    };
+    let observed = false;
+    const feed = async (chunk: Uint8Array, decoded: boolean) => {
+      if (!observed && chunk.length) {
+        observed = true;
+        deps.inputObserved?.('first', read, chunk.length);
+      }
+      if (!holdFrames) {
+        return await append(body, chunk, decoded ? { pcm, chunk } : undefined);
+      }
+      if (decoded) pcm.accept(chunk, BigInt(chunk.length / 4));
+      for (const part of body.hold.push(chunk)) {
+        if (!await append(body, part)) return false;
+      }
+      return owns(source);
+    };
     try {
       if (pcm.originFrame !== mapping.originFrame) {
         throw new Error('Playback source differs from its timeline origin');
       }
+      if (input.ready.length && !await feed(input.ready, false)) return null;
       let part = input.head;
       while (!part.done && owns(source)) {
-        const chunk = part.value, segment = deps.segment();
-        if (!bytes) deps.inputObserved?.('first', read, chunk.length);
-        let offset = 0;
-        while (offset < chunk.length && owns(source)) {
-          const settled = playback.beginSourceInput(source);
-          if (!settled) return null;
-          try {
-            deps.admitted();
-            const receipt = await transport(() =>
-              sink.appendSource({
-                epoch,
-                source: mapping.source,
-                segment,
-                pcm: chunk.subarray(offset),
-              })
-            );
-            const accepted = Number(receipt.acceptedFrames) * 4;
-            if (accepted) acceptedMappings.add(mapping);
-            if (owns(source)) pcm.accept(chunk, receipt.acceptedFrames);
-            offset += accepted;
-            bytes += accepted;
-            if (owns(source) && accepted) {
-              playback.sourceAccepted(source, receipt.acceptedFrames);
-              playback.sourceAudio(source, accepted / 176400 * 1000);
-            }
-            const pendingMetadata = metadataWrites.get(source)!.pending;
-            while (
-              owns(source) && bytes > 0 && pendingMetadata.length &&
-              pendingMetadata[0].sourceFrame <= BigInt(bytes / 4)
-            ) {
-              const status = await transport(() =>
-                sink.metadata(pendingMetadata[0])
-              );
-              if (status === 'accepted') pendingMetadata.shift();
-              else if (status === 'canceled') return null;
-              else await wait(10, source);
-            }
-            if (!owns(source)) return null;
-            if (receipt.status === 'error' || receipt.status === 'canceled') {
-              deps.transportFailed(
-                new Error(
-                  `RAOP append failed: ${receipt.status}/${
-                    receipt.error ?? 'none'
-                  }`,
-                ),
-              );
-              return null;
-            }
-          } finally {
-            settled();
-          }
-          if (offset < chunk.length) await wait(10, source);
-        }
-        if (!owns(source)) return null;
+        if (!await feed(part.value, true)) return null;
         part = await pcm.next();
       }
       if (!owns(source)) return null;
-      if (!pcm.eof || !bytes) {
+      if (!pcm.eof || !(body.written + Number(body.hold.frames) * 4)) {
         throw new Error('Empty or incomplete decoder stream');
       }
-      deps.inputObserved?.('end', read, bytes);
+      deps.inputObserved?.(
+        'end',
+        read,
+        body.written + Number(body.hold.frames) * 4,
+      );
       playback.reportSourceOutcome(source, 'eof');
-      if (!owns(source)) return null;
-      const target = BigInt(bytes / 4);
-      if (!playback.sealSource(source, target)) return null;
-      let marker;
-      do {
-        marker = await transport(() =>
-          sink.seal(epoch, mapping.source, target)
-        );
-        if (marker.status === 'accepted') break;
-        if (!['backpressure', 'not-ready'].includes(marker.status)) {
-          throw new TransportFailure(`RAOP seal failed: ${marker.status}`);
-        }
-        await wait(10, source);
-      } while (owns(source));
-      if (!owns(source)) return null;
-      observeCompletion(source, mapping, target);
-      return { inputEnd: marker.inputEnd, frames: target };
+      return owns(source) ? body : null;
     } finally {
       await pcm.return();
       await pcm.completion;
     }
   };
+  // Append the held tail (optionally its overlap with the incoming head) and
+  // seal the source behind it.
+  const finalize = async (body: Body, incomingHead?: Uint8Array) => {
+    const { read: { source }, mapping } = body;
+    const tail = body.hold.take();
+    const split = tail.length - (incomingHead?.length ?? 0);
+    if (split && !await append(body, tail.subarray(0, split))) return null;
+    if (
+      incomingHead &&
+      !await append(body, mixCrossfade(tail.subarray(split), incomingHead))
+    ) return null;
+    const target = BigInt(body.written / 4);
+    if (!target) throw new Error('Empty or incomplete decoder stream');
+    if (!playback.sealSource(source, target)) return null;
+    let marker;
+    do {
+      marker = await transport(() => sink.seal(epoch, mapping.source, target));
+      if (marker.status === 'accepted') break;
+      if (!['backpressure', 'not-ready'].includes(marker.status)) {
+        throw new TransportFailure(`RAOP seal failed: ${marker.status}`);
+      }
+      await wait(10, source);
+    } while (owns(source));
+    if (!owns(source)) return null;
+    observeCompletion(source, mapping, target);
+    return { inputEnd: marker.inputEnd, frames: target };
+  };
+  // Decode the incoming head into memory up to `frames` plus one, so a short
+  // incoming source keeps at least one frame of its own.
+  const gather = async (input: NonNullable<Acquired>, frames: bigint) => {
+    const parts = [input.ready];
+    let have = BigInt(input.ready.length / 4);
+    while (!input.head.done && have <= frames) {
+      const chunk = input.head.value;
+      input.pcm.accept(chunk, BigInt(chunk.length / 4));
+      parts.push(chunk.slice());
+      have += BigInt(chunk.length / 4);
+      input.head = await input.pcm.next();
+    }
+    const ready = new Uint8Array(Number(have) * 4);
+    let at = 0;
+    for (const part of parts) {
+      ready.set(part, at);
+      at += part.length;
+    }
+    input.ready = ready;
+    return { frames: have, ended: !!input.head.done && input.pcm.eof };
+  };
   const natural = (entry: QueueEntry) =>
     entry.facts.kind === 'song'
       ? (queueDuration(entry) ?? 0) > 0
       : entry.facts.mode === 'finite';
-  const endInput = async (source: PlaybackSource, target: bigint) => {
+  const endStream = async (source: PlaybackSource, target: bigint) => {
     const result = await transport(() => sink.endStream(epoch, target));
     if (result.status !== 'accepted') {
       throw new TransportFailure(`RAOP end failed: ${result.status}`);
@@ -357,6 +474,9 @@ export function createPlaybackReader(deps: {
     drained = true;
     publications.get(source)?.resolve();
   };
+  const finite = (entry: QueueEntry) =>
+    entry.facts.kind === 'song' || entry.facts.mode === 'finite';
+  const requestedFrames = () => deps.crossfadeFrames?.() ?? 0n;
   const work = operations.run(async () => {
     let read = deps.initial, mapping = bind(read);
     if (!mapping) return;
@@ -369,15 +489,26 @@ export function createPlaybackReader(deps: {
         void pending?.catch(() => {});
         input ??= await acquire(read);
         if (!input) return;
-        const end = await write(read, mapping, input);
+        // The outgoing tail hold is captured when this source begins input;
+        // already accepted audio never changes with a later setting.
+        const body = await writeBody(
+          read,
+          mapping,
+          input,
+          pending ? requestedFrames() : 0n,
+        );
         input = null;
-        if (!end || !live()) return;
+        if (!body || !live()) return;
+        const head = heads.get(read.source) ?? 0n;
+        const decoded = head + BigInt(body.written / 4) + body.hold.frames;
         const length = queueDuration(read.entry) ?? 0;
-        if (
-          read.entry.facts.kind === 'song' &&
-          Math.round(Number(end.frames) * 1000 / 44100) + read.source.startMs <
-            length
-        ) {
+        const compatibility = read.entry.facts.kind === 'song' &&
+          Math.round(Number(decoded) * 1000 / 44100) + read.source.startMs <
+            length;
+        let end: Awaited<ReturnType<typeof finalize>> = null;
+        const plain = async () => (end ??= await finalize(body));
+        if (compatibility) {
+          if (!await plain()) return;
           await transport(() =>
             sink.compatibilitySilence(epoch, mapping!.source)
           );
@@ -397,6 +528,10 @@ export function createPlaybackReader(deps: {
             );
           }
         }
+        const endInput = async () => {
+          const sealed = await plain();
+          if (sealed) await endStream(read.source, sealed.inputEnd);
+        };
         let next = await pending;
         // EOF may follow an earlier exhausted prefetch and a later ordinary
         // append. Recheck that relationship before committing final input end.
@@ -405,14 +540,14 @@ export function createPlaybackReader(deps: {
         }
         for (;;) {
           if (next && 'preparationFailed' in next) {
-            await endInput(read.source, end.inputEnd);
+            await endInput();
             return;
           }
           if (live() && next?.read.source.signal.aborted && owns(read.source)) {
             await next.input?.pcm.return();
             const replacement = await future(read.source);
             if (replacement && 'preparationFailed' in replacement) {
-              await endInput(read.source, end.inputEnd);
+              await endInput();
               return;
             }
             next = replacement;
@@ -427,7 +562,7 @@ export function createPlaybackReader(deps: {
               next = await future(read.source);
               continue;
             }
-            await endInput(read.source, end.inputEnd);
+            await endInput();
             return;
           }
           break;
@@ -435,7 +570,69 @@ export function createPlaybackReader(deps: {
         if (!next.input) {
           // Its failure is due-only core policy. End the healthy prefix so its
           // exact tail can complete before that failure is published.
-          await endInput(read.source, end.inputEnd);
+          await endInput();
+          return;
+        }
+        const requested = requestedFrames();
+        let incoming: Uint8Array | undefined;
+        if (end && requested > 0n) {
+          deps.crossfadeObserved?.({
+            outgoingEntryId: read.source.entryId,
+            incomingEntryId: next.read.source.entryId,
+            requestedFrames: requested,
+            appliedFrames: 0n,
+            reason: 'compatibility',
+          });
+        } else if (requested > 0n) {
+          let plan: ReturnType<typeof crossfadePlan> = {
+            appliedFrames: 0n,
+            reason: 'ineligible',
+          };
+          if (finite(next.read.entry)) {
+            let ready;
+            try {
+              ready = await gather(
+                next.input,
+                requested < body.hold.frames ? requested : body.hold.frames,
+              );
+            } catch {
+              if (owns(next.read.source)) {
+                playback.reportSourceOutcome(next.read.source, 'decode-error');
+              }
+              await next.input.pcm.return();
+              await endInput();
+              return;
+            }
+            plan = crossfadePlan({
+              requestedFrames: requested,
+              outgoingFrames: body.hold.frames,
+              incomingFrames: ready.frames,
+              incomingEnded: ready.ended,
+            });
+          }
+          // Bind before the mix enters native input: a later edit of the
+          // incoming item is then an accepted-future discontinuity.
+          if (
+            plan.appliedFrames &&
+            playback.overlapSource(next.read.source, plan.appliedFrames)
+          ) {
+            const bytes = Number(plan.appliedFrames) * 4;
+            incoming = next.input.ready.subarray(0, bytes);
+            next.input.ready = next.input.ready.subarray(bytes);
+            overlap(next.read.source, next.mapping, plan.appliedFrames);
+          } else if (plan.appliedFrames) {
+            plan = { appliedFrames: 0n, reason: 'ineligible' };
+          }
+          deps.crossfadeObserved?.({
+            outgoingEntryId: read.source.entryId,
+            incomingEntryId: next.read.source.entryId,
+            requestedFrames: requested,
+            appliedFrames: plan.appliedFrames,
+            reason: plan.reason,
+          });
+        }
+        if (!end && !(end = await finalize(body, incoming))) {
+          await next.input.pcm.return();
           return;
         }
         publications.get(read.source)?.resolve();

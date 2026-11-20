@@ -13,6 +13,7 @@ import type { Notify } from '../notify.ts';
 import type { CommandSource, Output, Outputs } from '../player.ts';
 import type { Playback } from '../playback.ts';
 import { createPlaybackReader } from '../playback-reader.ts';
+import { crossfadeFrames, type CrossfadeRecord } from '../playback-mix.ts';
 import type { TimelineSource } from '../playback-timeline.ts';
 import type { PlaybackCapacity } from '../playback-capacity.ts';
 import type { State } from '../state.ts';
@@ -42,6 +43,9 @@ export interface AirplayBootDeps {
   state?: State;
   log?: Log;
   retryBackoffMs?: number[];
+  /** Internal natural-boundary crossfade, in milliseconds; default 0. */
+  crossfadeMs?: () => number;
+  crossfadeObserved?: (record: CrossfadeRecord) => void;
   retryTimer?: {
     set(callback: () => void, delayMs: number): { cancel(): void };
   };
@@ -569,6 +573,8 @@ export function createAirplayBoot(
       initial: { source: sourceLease, entry: view.current },
       current: () => !closed && stream === owner && streamCurrent(),
       segment: () => ++owner.segment,
+      crossfadeFrames: () => crossfadeFrames(deps.crossfadeMs?.() ?? 0),
+      crossfadeObserved: deps.crossfadeObserved,
       mapping(lease, mapping) {
         if (playback.sourcePlanView().playing === lease) {
           owner.mapping = mapping;

@@ -259,6 +259,9 @@ export interface Playback {
   ): PlaybackRead | null | Promise<PlaybackRead | null>;
   admitSource(read: PlaybackRead): boolean;
   sourceAccepted(source: PlaybackSource, frames: bigint): boolean;
+  /** Bind an admitted incoming head before its overlap mix enters native input.
+   * Its source then counts as future input for edit reconciliation. */
+  overlapSource(source: PlaybackSource, frames: bigint): boolean;
   /** Reserve possible native input before an async append; settle after its receipt. */
   beginSourceInput(source: PlaybackSource): (() => void) | null;
   reviseSourceCompletion(
@@ -1620,6 +1623,11 @@ export function createPlayback(deps: {
       const mapping = timelineSources.get(source);
       return ownsSource(source) && !!mapping &&
         timeline.accept(mapping, frames);
+    },
+    overlapSource(source, frames) {
+      const mapping = timelineSources.get(source);
+      return ownsSource(source) && source !== sourcePlans.playing &&
+        !!mapping && timeline.overlap(mapping, frames);
     },
     beginSourceInput(source) {
       const mapping = timelineSources.get(source);

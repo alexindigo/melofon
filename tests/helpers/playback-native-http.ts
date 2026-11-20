@@ -65,6 +65,10 @@ export async function nativeHttpFixture(options: {
     reference: QueueReference,
     resolve: () => Promise<QueueMedia | null>,
   ) => Promise<QueueMedia | null>;
+  crossfadeMs?: () => number;
+  crossfadeObserved?: Parameters<
+    typeof createAirplayBoot
+  >[0]['crossfadeObserved'];
   append?: (
     request: Parameters<AirplayTimelineStream['appendSource']>[0],
     append: AirplayTimelineStream['appendSource'],
@@ -389,6 +393,8 @@ export async function nativeHttpFixture(options: {
         notify: f.notify,
         devices,
         retryBackoffMs: [],
+        crossfadeMs: options.crossfadeMs,
+        crossfadeObserved: options.crossfadeObserved,
         ...(options.web ? { sources } : {}),
         media: {
           ...media,

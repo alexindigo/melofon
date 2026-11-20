@@ -127,6 +127,8 @@ export function createPlaybackTimeline() {
     revision: bigint;
     exclusions: { attachment: bigint; outcome: string; error: string }[];
     metadata: { frame: bigint; facts: SourceMetadata }[];
+    /** Incoming head already rendered inside the previous source's overlap. */
+    head: bigint;
     target?: bigint;
     completed?: boolean;
   }>();
@@ -135,7 +137,11 @@ export function createPlaybackTimeline() {
     const record = records.get(source.source);
     return record?.source === source ? record : undefined;
   };
-  const project = (source: TimelineSource, progress: TimelineProgress) => {
+  const project = (
+    source: TimelineSource,
+    progress: TimelineProgress,
+    head: bigint,
+  ) => {
     if (
       progress.streamId !== source.streamId ||
       progress.epoch !== source.epoch ||
@@ -143,7 +149,7 @@ export function createPlaybackTimeline() {
     ) return null;
     u64(progress.sourceFrames);
     u64(progress.capturedNs);
-    const elapsedMs = progress.sourceFrames * 1000n / 44100n;
+    const elapsedMs = (head + progress.sourceFrames) * 1000n / 44100n;
     if (elapsedMs > BigInt(Number.MAX_SAFE_INTEGER - source.originMs)) {
       throw new RangeError('Timeline media position is not representable');
     }
@@ -191,6 +197,7 @@ export function createPlaybackTimeline() {
         revision: 1n,
         exclusions: [],
         metadata: [],
+        head: 0n,
         position: Object.freeze({
           positionMs: source.originMs,
           sourceFrames: 0n,
@@ -213,6 +220,7 @@ export function createPlaybackTimeline() {
       u64(frame);
       const record = owned(source);
       if (!record || record.position.canceled) return false;
+      frame = frame > record.head ? frame - record.head : 0n;
       const last = record.metadata.at(-1);
       if (last && frame < last.frame) {
         throw new Error('Metadata frames must be ordered');
@@ -242,7 +250,40 @@ export function createPlaybackTimeline() {
     hasInput(source: TimelineSource): boolean {
       const record = owned(source);
       return !!record &&
-        (record.acceptedFrames > 0n || record.pendingAppends > 0);
+        (record.acceptedFrames > 0n || record.pendingAppends > 0 ||
+          record.head > 0n);
+    },
+    /** Bind an incoming head mixed into the outgoing source. Its own native
+     * frames start after it; media position and decoder metadata include it. */
+    overlap(source: TimelineSource, frames: bigint): boolean {
+      u64(frames);
+      const record = owned(source);
+      if (
+        !record || record.position.canceled || record.head ||
+        record.acceptedFrames || record.pendingAppends ||
+        record.position.capturedNs !== null || frames < 2n
+      ) return false;
+      u64(source.originFrame + frames);
+      record.head = frames;
+      for (const entry of record.metadata) {
+        entry.frame = entry.frame > frames ? entry.frame - frames : 0n;
+      }
+      const merged: typeof record.metadata = [];
+      for (const entry of record.metadata) {
+        const last = merged.at(-1);
+        if (last?.frame === entry.frame) {
+          last.facts = { ...last.facts, ...entry.facts };
+        } else merged.push(entry);
+      }
+      record.metadata = merged;
+      record.position = Object.freeze({
+        ...record.position,
+        positionMs: source.originMs + Number(frames * 1000n / 44100n),
+      });
+      return true;
+    },
+    head(source: TimelineSource): bigint {
+      return owned(source)?.head ?? 0n;
     },
     admitting(source: TimelineSource): (() => void) | null {
       const record = owned(source);
@@ -335,7 +376,7 @@ export function createPlaybackTimeline() {
     observe(source: TimelineSource, progress: TimelineProgress): boolean {
       const record = owned(source);
       if (!record || record.position.canceled) return false;
-      const position = project(source, progress);
+      const position = project(source, progress, record.head);
       if (
         !position || record.position.capturedNs !== null &&
           position.capturedNs < record.position.capturedNs
@@ -354,7 +395,7 @@ export function createPlaybackTimeline() {
         cutoff.nextEpoch !== source.epoch + 1n || !cutoff.progress ||
         cutoff.progress.capturedNs !== cutoff.admittedNs
       ) return false;
-      const position = project(source, cutoff.progress);
+      const position = project(source, cutoff.progress, record.head);
       if (!position) return false;
       record.position = position;
       const previous = canceledThrough.get(source.streamId) ?? 0n;
