@@ -73,7 +73,11 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
   }
   const receivers = await Promise.all(
     [0, 1, 2].map(() =>
-      startFakeRaop({ captureAudio: true, captureWire: true })
+      startFakeRaop({
+        captureAudio: true,
+        captureWire: true,
+        recoverAudioGaps: true,
+      })
     ),
   );
   const traces: {

@@ -34,6 +34,17 @@ first sync matches RTSP without rewinding the master or changing other peers.
 Both sides of the live RTP/NTP correlation are translated by the same frame
 interval; periodic sync and native scheduled progress retain the live clock.
 
+For every joining receiver, RECORD selects the oldest contiguous committed
+packet whose presentation deadline leaves the receiver's 250 ms buffering
+interval for the RECORD/first-sync round trip. Sequence and timestamp both name
+that cached packet. This is receiver-local: the master keeps pacing for ready
+peers, without waiting for a startup cohort or rewinding its RTP cursor.
+
+The first sync backfills the contiguous cached suffix from that anchor
+whose presentation deadlines remain in the future. Only the first delivered
+packet carries the marker; successful, on-time sends establish coverage from
+the first backfilled epoch frame, never from audio already presented.
+
 This follows upstream `rtp_common.c`'s documented first-sync/RTSP compatibility
 requirement (Eufy Genie) and the RECORD and sync definitions in sections 5.1-5.2
 of <https://nto.github.io/AirPlay.html>. Deterministic delayed-RECORD proofs cover

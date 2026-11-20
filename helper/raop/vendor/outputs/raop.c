@@ -388,6 +388,9 @@ raop_device_start(struct output_device *rd, int callback_id);
 static void
 deferred_session_failure(struct raop_session *rs);
 
+static void
+record_anchor_set(struct raop_session *rs, uint16_t *seqnum);
+
 /* Numeric-only socket/address operations. No DNS, sends, interface mutation or
  * net_connect() in observation. This observes preferred source, not liveness. */
 static int
@@ -1590,8 +1593,8 @@ raop_send_req_set_parameter(struct raop_session *rs, struct evbuffer *evbuf, cha
 static int
 raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
 {
-  struct raop_master_session *rms = rs->master_session;
   struct evrtsp_request *req;
+  uint16_t seqnum;
   char buf[64];
   int ret;
 
@@ -1614,10 +1617,10 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_
 
   evrtsp_add_header(req->output_headers, "Range", "npt=0-");
 
-  /* The shared master can advance before this receiver's RECORD reply. */
-  rs->sync_start_pos = rms->rtp_session->pos;
+  /* A new receiver may recover committed audio that is still in the future. */
+  record_anchor_set(rs, &seqnum);
   rs->sync_start_pending = true;
-  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rs->sync_start_pos);
+  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", seqnum, rs->sync_start_pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
@@ -3431,6 +3434,118 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
       rs->devname, seqnum, len, rtp_session->seqnum, rtp_session->pktbuf_len);
 }
 
+static uint64_t
+packet_deadline_ns(uint64_t origin_ns, uint64_t frame)
+{
+  return origin_ns + frame / 44100 * 1000000000ULL +
+    frame % 44100 * 1000000000ULL / 44100;
+}
+
+/* Use the same live RTP/NTP correlation at RECORD and successful first sync. */
+static bool
+schedule_origin_get(struct raop_session *rs, uint64_t *origin_ns)
+{
+  struct raop_master_session *rms = rs->master_session;
+  int64_t lead = (int32_t)(rms->rtp_session->pos -
+    (rms->cur_stamp.pos - rs->offset_samples));
+  lead += RAOP_AUDIO_LATENCY_MS * 44100 / 1000;
+  int64_t ns = (int64_t)rms->cur_stamp.ts.tv_sec * 1000000000LL +
+    rms->cur_stamp.ts.tv_nsec + lead * 1000000000LL / 44100 -
+    (int64_t)(rms->epoch_frames / 44100) * 1000000000LL -
+    (int64_t)(rms->epoch_frames % 44100) * 1000000000LL / 44100;
+  if (ns < 0) return false;
+  *origin_ns = ns;
+  return true;
+}
+
+static size_t
+packets_future_suffix(struct raop_master_session *rms, size_t count,
+                      uint64_t origin_ns, uint64_t after_ns)
+{
+  struct rtp_session *rtp = rms->rtp_session;
+  size_t suffix = 0;
+
+  if (count > rtp->pktbuf_len) count = rtp->pktbuf_len;
+  if (count > rms->epoch_frames / rms->samples_per_packet)
+    count = rms->epoch_frames / rms->samples_per_packet;
+  for (size_t i = 1; i <= count; i++) {
+    struct rtp_packet *pkt = rtp_packet_get(rtp, rtp->seqnum - i);
+    uint64_t distance = (uint64_t)i * rms->samples_per_packet;
+    uint32_t pos;
+    if (!pkt || pkt->samples != rms->samples_per_packet) break;
+    memcpy(&pos, pkt->header + 4, sizeof(pos));
+    if (be32toh(pos) != (uint32_t)(rtp->pos - distance) ||
+        after_ns >= packet_deadline_ns(origin_ns, rms->epoch_frames - distance)) break;
+    suffix = i;
+  }
+  return suffix;
+}
+
+static void
+record_anchor_set(struct raop_session *rs, uint16_t *seqnum)
+{
+  struct raop_master_session *rms = rs->master_session;
+  struct rtp_session *rtp = rms->rtp_session;
+  size_t suffix = 0;
+  uint64_t origin_ns;
+  if (rtp->pktbuf_len && schedule_origin_get(rs, &origin_ns)) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    /* Reserve the receiver's minimum buffering interval for the remaining
+     * RECORD/first-sync round trip. First sync rechecks the actual deadlines. */
+    uint64_t margin_ns = RAOP_AUDIO_LATENCY_MS * 1000000ULL;
+    suffix = packets_future_suffix(rms, rtp->pktbuf_len, origin_ns, now + margin_ns);
+  }
+  rs->sync_start_pos = rtp->pos - (uint64_t)suffix * rms->samples_per_packet;
+  *seqnum = rtp->seqnum - suffix;
+}
+
+/* RECORD/FLUSH owns the receiver's start, not the time its reply arrives. Find
+ * the contiguous committed suffix that can still meet that receiver's schedule.
+ * Never move the shared RTP cursor or credit packets before actual submission. */
+static int
+packets_backfill(struct raop_session *rs)
+{
+  struct raop_master_session *rms = rs->master_session;
+  struct rtp_session *rtp = rms->rtp_session;
+  size_t count = (uint32_t)(rtp->pos - rs->sync_start_pos) / rms->samples_per_packet;
+  struct timespec ts;
+  bool sent = false;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  size_t suffix = packets_future_suffix(rms, count, rs->schedule_origin_ns, now);
+
+  for (size_t i = suffix; i > 0; i--) {
+    struct rtp_packet *pkt = rtp_packet_get(rtp, rtp->seqnum - i);
+    uint64_t frame = rms->epoch_frames - (uint64_t)i * rms->samples_per_packet;
+    uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, frame);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    if (now >= deadline) {
+      if (!sent) continue; /* The deliverable suffix may shrink before sending. */
+      goto overdue;
+    }
+    if (!sent) pkt->header[1] |= RTP_MARKER_BIT;
+    int ret = packet_send(rs, pkt);
+    pkt->header[1] &= ~RTP_MARKER_BIT;
+    if (ret < 0) return -1;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    if (now >= deadline) goto overdue;
+    if (!sent) rs->coverage_start = frame;
+    rs->submitted_frames = frame + rms->samples_per_packet;
+    sent = true;
+  }
+  return 0;
+
+ overdue:
+  rs->coverage_failed = true;
+  raop_ffi_attachment_failed(rms->stream_id, rs->device_id, RAOP_PROGRESS_OVERDUE);
+  deferred_session_failure(rs);
+  return -1;
+}
+
 static int
 packets_send(struct raop_master_session *rms)
 {
@@ -3483,9 +3598,7 @@ packets_send(struct raop_master_session *rms)
       struct timespec submitted;
       clock_gettime(CLOCK_MONOTONIC, &submitted);
       uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
-      uint64_t deadline = rs->schedule_origin_ns +
-        rms->epoch_frames / 44100 * 1000000000ULL +
-        rms->epoch_frames % 44100 * 1000000000ULL / 44100;
+      uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, rms->epoch_frames);
       if (!rs->schedule_valid || rs->coverage_failed || rs->submitted_frames != rms->epoch_frames) {
         raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_SYNC);
         return -1;
@@ -3506,22 +3619,19 @@ packets_send(struct raop_master_session *rms)
           rs->failure_pending || (rs->state != RAOP_STATE_CONNECTED &&
           rs->state != RAOP_STATE_STREAMING)) continue;
       struct timespec submitted;
-      uint64_t deadline = rs->schedule_origin_ns +
-        rms->epoch_frames / 44100 * 1000000000ULL +
-        rms->epoch_frames % 44100 * 1000000000ULL / 44100;
+      uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, rms->epoch_frames);
 
       // Device just joined
-      if (rs->state == RAOP_STATE_CONNECTED)
+      if (rs->state == RAOP_STATE_CONNECTED && rs->submitted_frames == rs->coverage_start)
 	{
 	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
 	  ret = packet_send(rs, pkt);
 	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
 	}
-      else if (rs->state == RAOP_STATE_STREAMING)
+      else
 	{
 	  ret = packet_send(rs, pkt);
 	}
-      else continue;
       clock_gettime(CLOCK_MONOTONIC, &submitted);
       uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
       /* A late burst is not scheduled coverage. Preserve the known contiguous
@@ -3613,14 +3723,7 @@ packets_sync_send(struct raop_master_session *rms)
 
       if (!rs->schedule_valid && !rs->cancel_pending &&
           rs->state == RAOP_STATE_CONNECTED) {
-        int64_t lead = (int32_t)(rms->rtp_session->pos - cur_stamp.pos);
-        lead += RAOP_AUDIO_LATENCY_MS * 44100 / 1000;
-        int64_t ns = (int64_t)cur_stamp.ts.tv_sec * 1000000000LL +
-          cur_stamp.ts.tv_nsec + lead * 1000000000LL / 44100 -
-          (int64_t)(rms->epoch_frames / 44100) * 1000000000LL -
-          (int64_t)(rms->epoch_frames % 44100) * 1000000000LL / 44100;
-        if (ns >= 0) rs->schedule_origin_ns = (uint64_t)ns;
-        else {
+        if (!schedule_origin_get(rs, &rs->schedule_origin_ns)) {
           raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_SYNC);
           return -1;
         }
@@ -3636,7 +3739,7 @@ packets_sync_send(struct raop_master_session *rms)
             start_pos = rs->sync_start_pos;
             /* Translate both sides of the live RTP/NTP correlation equally.
              * Even a RECORD delay longer than the buffer lead cannot alter the
-             * presentation clock or give the joining receiver missed audio. */
+             * presentation clock or credit already presented audio. */
             uint32_t elapsed = rms->rtp_session->pos - start_pos;
             struct timespec delta = { .tv_sec = elapsed / rms->quality.sample_rate,
               .tv_nsec = (uint64_t)(elapsed % rms->quality.sample_rate) * 1000000000ULL /
@@ -3650,8 +3753,9 @@ packets_sync_send(struct raop_master_session *rms)
             return -1;
           }
           if (control_packet_send(rs, sync_pkt) < 0) continue;
-          rs->sync_start_pending = false;
           rs->schedule_valid = !rs->coverage_failed;
+          if (rs->sync_start_pending && packets_backfill(rs) < 0) continue;
+          rs->sync_start_pending = false;
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);

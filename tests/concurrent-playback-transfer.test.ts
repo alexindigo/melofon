@@ -100,6 +100,11 @@ for (const sealed of [false, true]) {
       await until(() =>
         f.receivers.every((r) => (r.sessions[0]?.audioPackets ?? 0) >= 50)
       );
+      // Cached, not-yet-presented audio is recoverable at RECORD. Exercise an
+      // actually missed prefix, not just a later local packet submission.
+      await until(() =>
+        [1, 2].every((id) => f.players.get(id).playerView().itemProgressMs > 0)
+      );
       const a = f.traces.find((t) => t.ports.has(f.receivers[1].port))!;
       const b = f.traces.find((t) => t.ports.has(f.receivers[2].port))!;
       assertEquals(a.seals.length > 0, sealed);

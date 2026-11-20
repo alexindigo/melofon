@@ -25,6 +25,13 @@ const key = (
 ): AirplayCompletionKey => ({ epoch: stream.epoch, source, target, revision });
 const highSource = 0xfedcba9876543210n;
 const sleep = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
+function rtpInfo(session: Receiver['sessions'][number]) {
+  const record = session.wire.find((e) => e.kind === 'record');
+  assert(record?.kind === 'record');
+  const match = /^seq=(\d+);rtptime=(\d+)$/.exec(record.rtpInfo);
+  assert(match, 'RECORD has RTP-Info');
+  return { seq: Number(match[1]), rtptime: Number(match[2]) };
+}
 async function until(
   what: string,
   predicate: () => boolean | Promise<boolean>,
@@ -1589,10 +1596,15 @@ for (const loss of ['withdrawal', 'transport failure'] as const) {
         const joined = stream.attach(() => {});
         await joined.start(profile(late), item);
         await until(
-          'late join has suffix coverage',
+          'late join has a successful schedule',
           async () =>
             (await stream.progress(stream.epoch, highSource, joined.id))!
-              .coverageStart > 353n,
+              .status === 'scheduled',
+        );
+        assertEquals(
+          (await stream.progress(stream.epoch, highSource, joined.id))!
+            .coverageStart,
+          0n,
         );
         assertEquals(
           (await stream.progress(stream.epoch, highSource, joined.id))!
@@ -1632,6 +1644,9 @@ for (const loss of ['withdrawal', 'transport failure'] as const) {
         'original failed revision is immutable',
       );
       await rendered(stream, healthy, 353, new Map([[highSource, bytes]]));
+      if (late) {
+        await rendered(stream, late, 353, new Map([[highSource, bytes]]));
+      }
       assertEquals(
         renderScheduledAudio(lost.sessions[0], lost.nowMs()).pcm.length,
         0,
@@ -1739,10 +1754,12 @@ test('completion late-join captured at seal fails missing prefix instead of cred
     await original.start(profile(healthy), item);
     await append(stream, highSource, bytes);
     await until(
-      'source dispatched before late receiver starts',
+      'timeline advances beyond its lead before the late RECORD request',
       async () =>
-        (await stream.source(stream.epoch, highSource))!.fedFrames === 353n,
+        (await stream.progress(stream.epoch, highSource))!.fedFrames >= 110250n,
     );
+    const committedBeforeRecord =
+      (await stream.progress(stream.epoch))!.submittedFrames;
     await joined.start(profile(late), item);
     await until(
       'late receiver has an explicit suffix anchor',
@@ -1767,6 +1784,21 @@ test('completion late-join captured at seal fails missing prefix instead of cred
     const joinedOutcome = failed.attachments.find((a) =>
       a.attachment === joined.id
     )!;
+    const record = rtpInfo(late.sessions[0]);
+    const anchor = BigInt(
+      (record.rtptime - rtpInfo(healthy.sessions[0]).rtptime + 2 ** 32) %
+        2 ** 32,
+    );
+    assert(
+      anchor > 353n,
+      'a late RECORD cannot replay already presented source',
+    );
+    assert(
+      anchor < committedBeforeRecord,
+      'later joins also recover a cached future suffix',
+    );
+    assertEquals(joinedOutcome.coverageStart, anchor);
+    assertEquals(suffix.discarded, []);
     const expected = new Uint8Array(suffix.pcm.length);
     if (joinedOutcome.coverageStart < 353n) {
       expected.set(bytes.subarray(Number(joinedOutcome.coverageStart) * 4));
@@ -1844,18 +1876,52 @@ for (const heldFrames of [4410n, 110250n]) {
       await stream.seal(stream.epoch, highSource, 353n);
       await stream.endStream(stream.epoch, 353n);
       const identity = key(stream, highSource, 353n);
-      const failed = await stream.waitCompletion(identity);
-      assertEquals(failed.status, 'failed');
-      const outcome = failed.attachments.find((a) =>
+      const result = await stream.waitCompletion(identity);
+      const expectedOutcome = heldFrames === 4410n ? 'complete' : 'failed';
+      assertEquals(result.status, expectedOutcome);
+      const outcome = result.attachments.find((a) =>
         a.attachment === joined.id
       )!;
-      assertEquals(outcome.outcome, 'failed');
-      assert(
-        outcome.coverageStart >= 353n,
-        'late receiver cannot credit missed source',
+      assertEquals(outcome.outcome, expectedOutcome);
+      // The RECORD anchor is this receiver's own future schedule. Packets the
+      // master committed while RECORD was held are delivered from the
+      // retransmit buffer while still presentable; earlier ones never are.
+      const anchor = (Number(/rtptime=(\d+)/.exec(record.rtpInfo)![1]) -
+        rtpInfo(healthy.sessions[0]).rtptime + 2 ** 32) % 2 ** 32;
+      assertEquals(
+        anchor,
+        0,
+        'RECORD recovers the still-future committed prefix',
       );
-      const revised = await stream.reviseCompletion(identity, [joined.id]);
-      assertEquals((await stream.waitCompletion(revised)).status, 'complete');
+      const lateRtp = rtpInfo(late.sessions[0]);
+      const firstAudio = late.sessions[0].wire.find((e) => e.kind === 'audio');
+      assert(firstAudio?.kind === 'audio');
+      const firstSeq = new DataView(
+        firstAudio.data.buffer,
+        firstAudio.data.byteOffset,
+      ).getUint16(2);
+      const sentFrom = BigInt(anchor) +
+        BigInt(((firstSeq - lateRtp.seq + 65536) % 65536) * 352);
+      assertEquals(
+        outcome.coverageStart,
+        sentFrom,
+        'credit starts exactly at the first delivered packet',
+      );
+      if (heldFrames === 4410n) {
+        assertEquals(
+          outcome.coverageStart,
+          BigInt(anchor),
+          'a hold within the lead delivers from the RECORD anchor',
+        );
+      } else {
+        assert(
+          outcome.coverageStart > BigInt(anchor) &&
+            outcome.coverageStart >= 353n,
+          'a hold beyond the lead sends and credits only the deliverable suffix',
+        );
+        const revised = await stream.reviseCompletion(identity, [joined.id]);
+        assertEquals((await stream.waitCompletion(revised)).status, 'complete');
+      }
       await rendered(stream, healthy, 353, new Map([[highSource, bytes]]));
       await until(
         'late packet is independently scheduled',
@@ -1866,8 +1932,12 @@ for (const heldFrames of [4410n, 110250n]) {
       const suffix = renderScheduledAudio(late.sessions[0], late.nowMs());
       assertEquals(suffix.issues, []);
       assertEquals(suffix.discarded, []);
-      assertEquals(suffix.pcm, new Uint8Array(suffix.pcm.length));
-      assertEquals(await stream.pollCompletion(identity), failed);
+      const expected = new Uint8Array(suffix.pcm.length);
+      if (outcome.coverageStart < 353n) {
+        expected.set(bytes.subarray(Number(outcome.coverageStart) * 4));
+      }
+      assertEquals(suffix.pcm, expected);
+      assertEquals(await stream.pollCompletion(identity), result);
       await libraryProof();
     } finally {
       reply.resolve();
@@ -1875,6 +1945,102 @@ for (const heldFrames of [4410n, 110250n]) {
       await stream.close();
       healthy.close();
       late.close();
+    }
+  });
+}
+
+for (const delay of ['request', 'reply']) {
+  test(`two speakers both render from transport zero when one RECORD ${delay} is late`, async () => {
+    const stream = createFfiStream();
+    const reply = Promise.withResolvers<void>();
+    let entered = false;
+    const first = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+    });
+    const slow = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+      beforeRecordReply: () => {
+        entered = true;
+        return reply.promise;
+      },
+    });
+    const a = stream.attach(() => {}), b = stream.attach(() => {});
+    const frames = 22050 + 351, bytes = pcm(frames, 73);
+    let starting: Promise<void> | undefined;
+    try {
+      const firstStarting = a.start(profile(first), item);
+      if (delay === 'reply') starting = b.start(profile(slow), item);
+      await firstStarting;
+      if (delay === 'reply') {
+        await until('slow RECORD reply is held', () => entered);
+      }
+      await append(stream, highSource, bytes);
+      await until(
+        'first speaker plays while the slow RECORD reply is held',
+        () => first.sessions[0]?.audioPackets >= 6,
+      );
+      assertEquals(slow.sessions[0]?.audioPackets ?? 0, 0);
+      if (delay === 'request') {
+        starting = b.start(profile(slow), item);
+        await until('late RECORD request arrives', () => entered);
+      }
+      reply.resolve();
+      await starting;
+      if (delay === 'request') {
+        const record = slow.sessions[0].wire.find((e) => e.kind === 'record');
+        const sixth = first.sessions[0].wire.filter((e) =>
+          e.kind === 'audio'
+        )[5];
+        assert(record?.kind === 'record' && sixth?.kind === 'audio');
+        assert(
+          record.atMs > sixth.atMs,
+          'RECORD itself follows six committed packets',
+        );
+        assertEquals(rtpInfo(slow.sessions[0]), rtpInfo(first.sessions[0]));
+      }
+      await stream.seal(stream.epoch, highSource, BigInt(frames));
+      await stream.endStream(stream.epoch, BigInt(frames));
+      const completion = await stream.waitCompletion(
+        key(stream, highSource, BigInt(frames)),
+      );
+      assertEquals(completion.status, 'complete');
+      assertEquals(completion.attachments.map((x) => x.coverageStart), [
+        0n,
+        0n,
+      ]);
+      const sources = new Map([[highSource, bytes]]);
+      await rendered(stream, first, frames, sources);
+      await rendered(stream, slow, frames, sources);
+      const firstAudio = slow.sessions[0].wire.find((e) => e.kind === 'audio');
+      assert(firstAudio?.kind === 'audio');
+      assertEquals(
+        new DataView(firstAudio.data.buffer, firstAudio.data.byteOffset)
+          .getUint16(2),
+        rtpInfo(slow.sessions[0]).seq,
+        'the late speaker receives its RECORD anchor packet',
+      );
+      for (const receiver of [first, slow]) {
+        const audio = receiver.sessions[0].wire.filter((e) =>
+          e.kind === 'audio'
+        );
+        assert(audio[0]?.kind === 'audio');
+        assertEquals(audio[0].data[1] & 0x80, 0x80);
+        assert(
+          audio.slice(1).every((e) =>
+            e.kind === 'audio' && (e.data[1] & 0x80) === 0
+          ),
+          'only the first delivered packet carries the marker, including backfill',
+        );
+      }
+      await libraryProof();
+    } finally {
+      reply.resolve();
+      await starting?.catch(() => {});
+      await stream.close();
+      first.close();
+      slow.close();
     }
   });
 }

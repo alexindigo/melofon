@@ -133,6 +133,10 @@ test('late join has explicit suffix coverage and cannot enlarge an already seale
       'original seal and packet coverage',
       () => !!f.key && (f.receiver.sessions[0]?.audioPackets ?? 0) >= 50,
     );
+    await timelineUntil(
+      'a real prefix is already presented before the suffix-only join',
+      () => f.playback.playerView().itemProgressMs > 0,
+    );
     await f.own('/outputs/2', 'PUT', { selected: true });
     await timelineUntil(
       'late peer renders a suffix',
