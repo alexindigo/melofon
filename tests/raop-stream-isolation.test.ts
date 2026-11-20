@@ -115,10 +115,17 @@ for (
           'B active before A fault',
           () => rb.sessions[0].audioPackets >= 2,
         );
-        await Deno.writeTextFile(Deno.env.get('RAOP_PROGRESS_ARM')!, 'arm');
+        // Output faults require real A input, but the timer can fail while A
+        // is idle. Admit and seal A before arming that independent fault.
+        if (mode !== 'timer') {
+          await Deno.writeTextFile(Deno.env.get('RAOP_PROGRESS_ARM')!, 'arm');
+        }
         a.source(1n, pcm(704, 800));
         a.seal(1n, 704n);
         a.end(704n);
+        if (mode === 'timer') {
+          await Deno.writeTextFile(Deno.env.get('RAOP_PROGRESS_ARM')!, 'arm');
+        }
         await until(
           'A explicit terminal failure',
           async () => (await a.completion(1n))[6] !== 0n,
