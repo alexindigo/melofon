@@ -27,7 +27,11 @@ export function pcm(frames: number, seed = 0) {
   return bytes;
 }
 export const text = (s: string) => new TextEncoder().encode(`${s}\0`);
-export async function faultChild(name: string) {
+export async function faultChild(
+  name: string,
+  testFile =
+    new URL('../raop-stream-isolation.test.ts', import.meta.url).pathname,
+) {
   if (Deno.env.get('RAOP_ISOLATION_FAULT_CHILD') === name) return false;
   const directory = await Deno.makeTempDir({ prefix: 'raop-isolation-fault-' });
   const path = `${directory}/fault.so`;
@@ -55,13 +59,14 @@ export async function faultChild(name: string) {
         '-A',
         '--filter',
         name,
-        new URL('../raop-stream-isolation.test.ts', import.meta.url).pathname,
+        testFile,
       ],
       env: {
         LD_PRELOAD: path,
         RAOP_ISOLATION_FAULT_CHILD: name,
         RAOP_ISOLATION_FAULT_LIB: path,
         RAOP_FI_RELEASE_ALLOC_ARM_FILE: `${directory}/release`,
+        RAOP_FI_FREE_ALLOC_ARM_FILE: `${directory}/free-alloc`,
         RAOP_FI_CALLOC_ARM_FILE: `${directory}/calloc`,
         RAOP_FI_WRITE_BLOCK_ARM_FILE: `${directory}/write-block`,
         RAOP_FI_POLL_ARM_FILE: `${directory}/poll`,
@@ -75,7 +80,10 @@ export async function faultChild(name: string) {
     );
     assert(/1 passed.*0 failed/.test(output));
     for (const line of output.split('\n')) {
-      if (line.startsWith('isolation native library:')) console.log(line);
+      if (
+        line.startsWith('isolation native library:') ||
+        line.startsWith('concurrent native library:')
+      ) console.log(line);
     }
     return true;
   } finally {

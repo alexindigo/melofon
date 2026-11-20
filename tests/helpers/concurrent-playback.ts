@@ -21,6 +21,11 @@ import { createAirplayDevices } from '../../src/boots/airplay-device.ts';
 import { createAirplayBoot } from '../../src/boots/airplay.ts';
 import { createFfiStream } from '../../src/boots/raop-ffi.ts';
 import { createMedia } from '../../src/media.ts';
+import type {
+  AirplayCompletionKey,
+  AirplayCompletionResult,
+} from '../../src/boots/airplay-profile.ts';
+import { createReleaseSet, releaseOrThrow } from '../../src/releases.ts';
 
 export async function until(check: () => boolean | Promise<boolean>) {
   const deadline = performance.now() + 20000;
@@ -74,7 +79,14 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
   const traces: {
     audio: ReturnType<typeof traceTimelineAudio>;
     ports: Set<number>;
+    native: ReturnType<typeof createFfiStream>;
+    seals: AirplayCompletionKey[];
+    completions: AirplayCompletionResult[];
   }[] = [];
+  const closeGates = new Map<
+    number,
+    { wait: Promise<void>; entered: boolean }
+  >();
   let players!: Awaited<ReturnType<typeof createPlayers>>;
   let devices!: ReturnType<typeof createAirplayDevices>;
   let persistence!: ReturnType<typeof createPersistence>;
@@ -121,8 +133,27 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
           },
           stream() {
             const native = createFfiStream(), ports = new Set<number>();
-            const audio = traceTimelineAudio(() => native);
-            traces.push({ audio, ports });
+            const seals: AirplayCompletionKey[] = [],
+              completions: AirplayCompletionResult[] = [];
+            const audio = traceTimelineAudio(() => ({
+              ...native,
+              get epoch() {
+                return native.epoch;
+              },
+              async seal(epoch, source, target) {
+                const marker = await native.seal(epoch, source, target);
+                if (marker.status === 'accepted') {
+                  seals.push({ epoch, source, target, revision: 1n });
+                }
+                return marker;
+              },
+              async waitCompletion(key) {
+                const result = await native.waitCompletion(key);
+                completions.push(result);
+                return result;
+              },
+            }));
+            traces.push({ audio, ports, native, seals, completions });
             return {
               ...audio.stream(),
               get epoch() {
@@ -130,9 +161,29 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
               },
               attach(...args) {
                 const driver = native.attach(...args);
+                let port: number | undefined,
+                  closing: Promise<void> | undefined;
                 return {
                   ...driver,
+                  transport: {
+                    send: (command) => driver.transport.send(command),
+                    pcm: (chunk) => driver.transport.pcm(chunk),
+                    ownsSharedFeed: () => driver.transport.ownsSharedFeed(),
+                    cancelPcm: () => driver.transport.cancelPcm(),
+                    close: () =>
+                      closing ??= (async () => {
+                        await driver.transport.close();
+                        const gate = port === undefined
+                          ? undefined
+                          : closeGates.get(port);
+                        if (gate) {
+                          gate.entered = true;
+                          await gate.wait;
+                        }
+                      })(),
+                  },
                   start(profile, ...input) {
+                    port = profile.port;
                     ports.add(profile.port);
                     return driver.start(profile, ...input);
                   },
@@ -204,6 +255,12 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
         };
       },
     });
+    const owned = createReleaseSet();
+    owned.add('players', players.close);
+    owned.add('reports', reports.close, 1);
+    owned.add('devices', devices.close, 1);
+    owned.add('persistence', persistence.close, 2);
+    owned.add('http/store', f.close, 3);
     const { credential } = await f.login('bearer');
     const call = async (path: string, method = 'GET', body?: unknown) => {
       const r = method === 'GET'
@@ -216,13 +273,8 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
     return {
       f,
       call,
-      async close() {
-        await players.close();
-        await reports.close();
-        devices.close();
-        await persistence.close();
-        await f.close();
-      },
+      close: () =>
+        releaseOrThrow(owned, 'Concurrent household fixture release failed'),
     };
   };
   let server = await start();
@@ -233,6 +285,10 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
     traces,
     boots,
     failSources,
+    closeGates,
+    get devices() {
+      return devices;
+    },
     get players() {
       return players;
     },
@@ -299,9 +355,12 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
       );
     },
     async close() {
-      await server.close();
-      for (const r of receivers) r.close();
-      await Deno.remove(dir, { recursive: true });
+      try {
+        await server.close();
+      } finally {
+        for (const r of receivers) r.close();
+        await Deno.remove(dir, { recursive: true });
+      }
     },
   };
 }
