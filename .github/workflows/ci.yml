@@ -38,11 +38,12 @@ jobs:
           cache-to: type=gha,scope=melofon-dev,mode=max
       - name: Check and build once
         run: scripts/test --shards 8 --prepare-only .test-tmp/ci
-      - name: Save the exact image and native outputs for all shards
+      - name: Save the exact image, native outputs and offline dependencies
         run: |
           docker save "$MELOFON_TEST_IMAGE" -o .test-tmp/ci/dev-image.tar
           find helper/raop -type f \( -name '*.o' -o -name '*.so' -o -name driver -o -name .dev-image-id \) -print0 |
             tar --null -T - -cf .test-tmp/ci/native.tar
+          tar -cf .test-tmp/ci/dependencies.tar .test-tmp/deno node_modules
       - uses: actions/upload-artifact@v4
         with:
           name: test-preparation
@@ -50,6 +51,7 @@ jobs:
             .test-tmp/ci/plan.json
             .test-tmp/ci/dev-image.tar
             .test-tmp/ci/native.tar
+            .test-tmp/ci/dependencies.tar
           include-hidden-files: true
           compression-level: 1
           retention-days: 1
@@ -70,11 +72,12 @@ jobs:
         with:
           name: test-preparation
           path: .test-tmp/ci
-      - name: Restore prepared image and native outputs
+      - name: Restore prepared image, native outputs and offline dependencies
         run: |
           docker load -i .test-tmp/ci/dev-image.tar
           tar -xf .test-tmp/ci/native.tar
-          rm .test-tmp/ci/dev-image.tar .test-tmp/ci/native.tar
+          tar -xf .test-tmp/ci/dependencies.tar
+          rm .test-tmp/ci/dev-image.tar .test-tmp/ci/native.tar .test-tmp/ci/dependencies.tar
       - name: Test in a single-CPU container
         run: scripts/test --prepared .test-tmp/ci --shard "${{ matrix.shard }}/8"
       - uses: actions/upload-artifact@v4

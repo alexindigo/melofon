@@ -5,49 +5,90 @@ Greenfield replacement for Navidrome (OpenSubsonic stays so existing apps keep w
 
 ## Development and testing
 
-Run `scripts/test` from the host (Podman preferred; `CONTAINER_ENGINE=docker`
-also works). It uses the shared Dockerfile's `dev` target with Deno 2.9.6
-and native dependencies. The checkout is bind-mounted, never copied.
-No devcontainer CLI or host Deno installation is required for `scripts/test`.
+### Prerequisites
 
-For Dev Containers, use `.devcontainer/engine` as the client's Docker executable
-(VS Code's `dev.containers.dockerPath`: the absolute path to that file), or run
-`devcontainer up --docker-path "$PWD/.devcontainer/engine" --workspace-folder .`.
-It defaults to Docker. For rootless Podman, launch that client with
-`CONTAINER_ENGINE=podman` in its environment. Network initialization and startup
-then share that selection; only Podman receives `keep-id`. The container user's
-UID/GID is updated to match the host so both engines can write the mounted tree.
+Use Linux with Git, Bash and a working Podman or Docker installation. Rootless
+Podman is recommended; `scripts/test` prefers it when both engines are installed.
+Set `CONTAINER_ENGINE=docker` to choose Docker explicitly. The shared Dockerfile's
+`dev` image supplies Deno, compilers and native libraries; you do not need those
+installed on the host. The checkout is bind-mounted at `/app`, not copied.
 
-The runner checks formatting, lint and types, builds and probes the native
-helper once, then runs test groups in separate parallel containers. The default
-shard count is the host CPU count capped at 8; each shard has 1 CPU, 2 GiB memory,
-no swap and a 512-process limit. File groups are balanced longest-first using
-`scripts/test-timings.json` (seconds of measured top-level tests per file).
-Tests have full Deno permissions inside their resource-limited containers,
-including the native identity probes' `/proc/self/maps` inspection.
-`scripts/test --check-only` runs checks alone; `--shards N` changes the local
-parallelism; `--shard 1/8` runs one CI shard. `--select BASE` selects changed
-top-level test files since BASE; shared source, helper, fixture or configuration
-changes conservatively run the full suite. Markdown-only documentation changes
-select no tests. Checks and native probes still run in selected mode.
+### Open the devcontainer (optional)
 
-Each shard uses its own private bridge network with `melofon.home` resolving to the
-container itself, no published ports or host networking. Temp files and the
-Deno cache stay in the ignored `.test-tmp/` workspace directory; run-specific
-temp files are removed on success. `--results .test-tmp/NAME` retains logs, results,
-per-shard wall times and `timings.json`; copy the latter to `scripts/test-timings.json`
-after a full run to refresh weights. Failed runs retain their receipts automatically.
-GitHub CI prepares checks/native outputs once, then runs eight separate shard jobs
-with the same limits and a combined summary. `MELOFON_CI_RUNNER` is the repository
-variable for switching every job's runner label (default `ubuntu-24.04`). CI transfers
-the exact prepared dev image and native binaries, not source snapshots.
-Dependency resolution is frozen to the committed lockfile. Native outputs are
-cleaned on the first run in a new dev image, then reused incrementally in that
-image; rebuilding its dependency layer invalidates the native build stamp.
+Install VS Code's Dev Containers extension and open the checkout. Set
+`dev.containers.dockerPath` to the absolute path of `.devcontainer/engine`, then
+choose **Dev Containers: Reopen in Container**. The wrapper defaults to Docker;
+for Podman, launch VS Code with `CONTAINER_ENGINE=podman` in its environment.
+The workspace opens at `/app` with the same tools used by the test runner.
 
-Chromium is not in the dev image. Browser media tests clearly report skipped
-when it is absent; `MELOFON_BROWSER_TESTS=1` makes absence a failure. The later
-browser CI job needs its own browser/ingress environment and is not enabled here.
+Run the launcher commands below in a **host terminal**, from the checkout root,
+not the devcontainer terminal: the launcher needs the host engine to start
+separate test containers. Opening a devcontainer is not required to run tests.
+
+### Run tests
+
+Start with the full suite:
+
+```bash
+scripts/test
+```
+
+Formatting, lint and type checks run first. The native RAOP helper is built
+incrementally and its probes run once. Test groups then run in parallel, each
+in a separate **1-CPU, 2-GiB container**, with no swap and a 512-process limit.
+The default group count is the host CPU count, capped at eight. Groups are
+balanced using committed file timings. Expect roughly 15-20 minutes for an
+eight-group run; the first image build/downloads and smaller machines take longer.
+
+| # | Option                     | Use                                                                                                                                                                                                               |
+| - | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 | `--check-only`             | Formatting, lint and types only; no native build, probes or tests.                                                                                                                                                |
+| 2 | `--shards N`               | Choose the number of parallel groups.                                                                                                                                                                             |
+| 3 | `--shard i/N`              | Run only group `i` of `N`, after checks and native preparation.                                                                                                                                                   |
+| 4 | `--select BASE`            | Select changed top-level test files since `BASE`. Shared source, helper, fixture or configuration changes run the full suite; documentation-only changes can select no tests. Checks and native probes still run. |
+| 5 | `--results .test-tmp/NAME` | Keep successful-run logs, results and timings. Failed-run folders are kept automatically.                                                                                                                         |
+
+For a quick check, use `scripts/test --check-only`. To match CI's eight groups,
+or reproduce one failed CI group:
+
+```bash
+scripts/test --shards 8
+scripts/test --shard 3/8  # Just group 3, instead of the full run above
+```
+
+For tests affected by your branch, fetch the latest remote refs first, then:
+
+```bash
+scripts/test --select origin/master
+```
+
+### CI and browser coverage
+
+Pull requests run the same image, checks, native build and probes. CI prepares
+dependencies once, verifies they resolve offline, then restores the helper and
+Deno/npm caches into eight separate shard jobs. Shards use `--cached-only`;
+the combined summary fails if any shard fails or has no result. Use
+`scripts/test --shards 8` locally to match the grouping and resource limits.
+
+The shared image does not include Chromium, so normal local and current CI runs
+skip the two browser media cases. To require browser coverage, set
+`MELOFON_BROWSER_TESTS=1` in a test environment with Chromium and the tests'
+Nginx HTTP ingress setup. Chromium must be available inside that environment,
+not just on the host; the flag makes an absent browser fail instead of skip.
+A separate browser CI job is planned, not enabled yet.
+
+### Temporary files and troubleshooting
+
+Temporary files, dependency caches and retained test logs live in the ignored
+`.test-tmp/` directory. Successful runs remove their own scratch files unless
+`--results` is set. With no tests or devcontainer using the checkout, run
+`rm -rf -- .test-tmp/` from the checkout root to clean it; the next run downloads
+dependencies again. This does not remove your `data/` directory.
+
+| # | Problem                                                       | What to do                                                                                                                                                                                                                                                                                                   |
+| - | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1 | CPU-limit errors or too much parallel work on a small machine | Use `.devcontainer/engine` for Dev Containers so its CPU request is capped to available CPUs. Use `scripts/test --shards 1` to reduce test concurrency; keep the per-container limits unchanged.                                                                                                             |
+| 2 | `Specifier not found in cache` with `--cached-only`           | Rerun normal `scripts/test` so preparation downloads and validates the complete graph, including server subprocesses and Workers. If needed, clean `.test-tmp/` first. A CI shard needs both the prepared Deno cache and `node_modules`; do not work around missing preparation by dropping `--cached-only`. |
 
 ## Start
 
