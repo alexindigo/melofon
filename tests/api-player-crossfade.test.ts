@@ -397,3 +397,86 @@ for (const phase of ['first head', 'next chunk'] as const) {
     }
   });
 }
+
+test('manual next with a saved setting has a solo new prefix then a natural fade', async () => {
+  const bytes = [
+    timelinePcm(44100 + 137),
+    timelinePcm(44100 + 19, 2),
+    timelinePcm(44100 + 73, 3),
+  ];
+  const f = await nativeHttpFixture({
+    pcm: bytes[0],
+    additionalPcm: bytes.slice(1),
+    persist: true,
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.modes({ crossfadeMs: 100 });
+    await c.command('play');
+    await timelineUntil(
+      'old future is accepted',
+      () => !!f.key && f.key.source >= 2n,
+    );
+    await c.command('next');
+    assertEquals((await c.current()).crossfadeMs, 100);
+    await timelineUntil(
+      'new natural suffix drains',
+      () => f.playback.playerView().state === 'stop',
+    );
+    const session = f.receiver.sessions[0];
+    assertEquals(session.flushes, 1);
+    assertEquals(
+      f.audio.scheduledRealAudio(session, f.receiver.nowMs(), 1),
+      crossfadeReference(bytes.slice(1), 4410).pcm,
+    );
+    assertEquals((await f.fixture.store.players.list())[0].crossfadeMs, 100);
+  } finally {
+    await f.close();
+  }
+});
+
+test('OwnTone previous counts the already played overlap head', async () => {
+  const bytes = [timelinePcm(44100 * 4), timelinePcm(44100 * 4, 2)];
+  const f = await nativeHttpFixture({
+    pcm: bytes[0],
+    additionalPcm: [bytes[1]],
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.modes({ crossfadeMs: 3200 });
+    const b = f.playback.queueView().items[1].id;
+    await c.command('play');
+    await timelineUntil(
+      'B is current after its 3.2-second overlap head',
+      () => f.playback.playerView().current?.id === b,
+    );
+    assert((await c.current()).positionMs >= 3200);
+    await f.own('/player/previous', 'PUT');
+    assertEquals(
+      (await c.current()).current.entryId,
+      b,
+      'OwnTone restarts B, not A',
+    );
+    await timelineUntil(
+      'restarted B drains',
+      () => f.playback.playerView().state === 'stop',
+    );
+    const expected = concatenate([
+      crossfadeReference(bytes, 141120).pcm.subarray(0, bytes[0].length),
+      bytes[1],
+    ]);
+    assertEquals(
+      f.audio.scheduledRealAudio(
+        f.receiver.sessions[0],
+        f.receiver.nowMs(),
+        0,
+        true,
+      ),
+      expected,
+    );
+  } finally {
+    await f.close();
+  }
+});

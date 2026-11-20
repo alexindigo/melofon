@@ -68,6 +68,7 @@ export function createPlaybackReader(deps: {
   >();
   let drained = false;
   let continuous = false;
+  let acceptedInput = 0n;
   const live = () => !controller.signal.aborted && deps.current();
   const owns = (source: PlaybackSource) => live() && !source.signal.aborted;
   const queueMetadata = (
@@ -134,6 +135,10 @@ export function createPlaybackReader(deps: {
       throw new TransportFailure('Playback transport failed', { cause });
     }
   };
+  const inputWindow = () =>
+    deps.inputWindow
+      ? transport(() => deps.inputWindow!([...mappings.values()]))
+      : Promise.resolve(0);
   const wait = (ms: number, source?: PlaybackSource) =>
     new Promise<void>((resolve) => {
       const signal = source
@@ -328,6 +333,7 @@ export function createPlaybackReader(deps: {
           })
         );
         const accepted = Number(receipt.acceptedFrames) * 4;
+        acceptedInput += receipt.acceptedFrames;
         if (accepted) acceptedMappings.add(mapping);
         if (owns(source) && decoder) {
           decoder.pcm.accept(decoder.chunk, receipt.acceptedFrames);
@@ -398,15 +404,37 @@ export function createPlaybackReader(deps: {
       }
       return owns(source);
     };
+    const nextPart = async (
+      next: () => Promise<IteratorResult<Uint8Array>>,
+    ): Promise<IteratorResult<Uint8Array>> => {
+      if (!body.hold.frames || !acceptedInput) return await next();
+      let settled = false;
+      const pending = next().finally(() => settled = true);
+      void pending.catch(() => {});
+      const remaining = await inputWindow() - performance.now();
+      if (!settled && remaining > 0) {
+        await Promise.race([pending, wait(remaining, source)]);
+      }
+      if (!settled && owns(source)) {
+        // Retained PCM is still valid outgoing audio. A slow decoder cannot
+        // starve an established stream just to preserve a possible future fade.
+        if (!await append(body, body.hold.take())) {
+          return { done: true, value: undefined };
+        }
+      }
+      return await pending;
+    };
     try {
       if (pcm.originFrame !== mapping.originFrame) {
         throw new Error('Playback source differs from its timeline origin');
       }
       if (input.ready.length && !await feed(input.ready, false)) return null;
-      let part = input.prefetch ? await input.prefetch.next() : input.head;
+      let part = input.prefetch
+        ? await nextPart(() => input.prefetch!.next())
+        : input.head;
       while (!part.done && owns(source)) {
         if (!await feed(part.value, true)) return null;
-        part = await pcm.next();
+        part = await nextPart(() => pcm.next());
       }
       if (!owns(source)) return null;
       if (!pcm.eof || !(body.written + Number(body.hold.frames) * 4)) {
@@ -517,9 +545,7 @@ export function createPlaybackReader(deps: {
         let skippedReason: CrossfadeRecord['reason'] = 'compatibility';
         let inputDeadline: number | undefined;
         const withinInputWindow = async (ready: Promise<unknown>) => {
-          inputDeadline ??= deps.inputWindow
-            ? await transport(() => deps.inputWindow!([...mappings.values()]))
-            : 0;
+          inputDeadline ??= await inputWindow();
           const remaining = inputDeadline - performance.now();
           if (remaining > 0) {
             await Promise.race([ready, wait(remaining, read.source)]);

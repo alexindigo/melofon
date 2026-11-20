@@ -212,6 +212,13 @@ test('full-scale opposite signals never wrap or clip incorrectly', async () => {
   }
 });
 
+test('correlated full-scale samples keep unity gain throughout the overlap', async () => {
+  await exact([
+    pcm(44100 + 137, () => [32767, -32768]),
+    pcm(22050 + 19, () => [32767, -32768]),
+  ], 100);
+});
+
 test('antiphase overlap cancels to the rounded ramp', async () => {
   const f = 441, a = pcm(5000, (i) => [(i * 37) % 20000 - 10000, 0]);
   const tail = new DataView(a.buffer, (5000 - f) * 4);
