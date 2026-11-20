@@ -828,13 +828,16 @@ Deno.test({
       for (let round = 1; round <= 5; round++) {
         const sessionsBefore = it.fakeA.sessions.length;
         const expectPath = `/music/rec-a-first-${round + 1}.mp3`;
+        const decodesBefore = it.decodeCalls.length;
         it.playback.next();
         await until(
           `track ${round}: current entry streaming on the affected output`,
           () => {
-            const last = it.decodeCalls[it.decodeCalls.length - 1];
             const lastSession = it.fakeA.sessions[it.fakeA.sessions.length - 1];
-            return last?.path === expectPath &&
+            return it.fakeA.sessions.length === sessionsBefore + 1 &&
+              it.decodeCalls.slice(decodesBefore).some((call) =>
+                call.path === expectPath
+              ) &&
               (lastSession?.audioPackets ?? 0) > 2;
           },
         );

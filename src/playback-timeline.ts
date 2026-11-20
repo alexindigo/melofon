@@ -44,6 +44,61 @@ export interface TimelineCompletion {
   readonly target: bigint;
   readonly revision: bigint;
   readonly status: 'pending' | 'complete' | 'canceled' | 'failed';
+  readonly attachments?: readonly {
+    readonly attachment: bigint;
+    readonly outcome:
+      | 'pending'
+      | 'complete'
+      | 'withdrawn'
+      | 'failed'
+      | 'canceled';
+    readonly excluded: boolean;
+    readonly error: string;
+  }[];
+}
+/** The reader consumes an injected timeline port, not a protocol adapter. */
+export interface TimelineWriter {
+  appendSource(input: {
+    epoch: bigint;
+    source: bigint;
+    segment: bigint;
+    pcm: Uint8Array;
+  }): Promise<{
+    acceptedFrames: bigint;
+    status: 'accepted' | 'backpressure' | 'not-ready' | 'canceled' | 'error';
+    error?: string;
+  }>;
+  seal(epoch: bigint, source: bigint, target: bigint): Promise<{
+    status: string;
+    inputEnd: bigint;
+  }>;
+  endStream(epoch: bigint, target: bigint): Promise<{ status: string }>;
+  waitDrain(epoch: bigint): Promise<void>;
+  compatibilitySilence(epoch: bigint, source: bigint): Promise<void>;
+  progress(epoch: bigint, source: bigint): Promise<TimelineProgress | null>;
+  waitCompletion(key: {
+    epoch: bigint;
+    source: bigint;
+    target: bigint;
+    revision: bigint;
+  }): Promise<TimelineCompletion>;
+  reviseCompletion(key: {
+    epoch: bigint;
+    source: bigint;
+    target: bigint;
+    revision: bigint;
+  }, exclude: readonly bigint[]): Promise<{
+    epoch: bigint;
+    source: bigint;
+    target: bigint;
+    revision: bigint;
+  }>;
+  ackCompletion(key: {
+    epoch: bigint;
+    source: bigint;
+    target: bigint;
+    revision: bigint;
+  }): Promise<void>;
 }
 const u64 = (n: bigint) => {
   if (typeof n !== 'bigint' || n < 0n || n > 0xffffffffffffffffn) {
@@ -58,6 +113,9 @@ export function createPlaybackTimeline() {
     source: TimelineSource;
     position: TimelinePosition;
     acceptedFrames: bigint;
+    pendingAppends: number;
+    revision: bigint;
+    exclusions: { attachment: bigint; outcome: string; error: string }[];
     target?: bigint;
     completed?: boolean;
   }>();
@@ -118,6 +176,9 @@ export function createPlaybackTimeline() {
       records.set(source.source, {
         source,
         acceptedFrames: 0n,
+        pendingAppends: 0,
+        revision: 1n,
+        exclusions: [],
         position: Object.freeze({
           positionMs: source.originMs,
           sourceFrames: 0n,
@@ -134,6 +195,24 @@ export function createPlaybackTimeline() {
     },
     accepted(source: TimelineSource): bigint {
       return owned(source)?.acceptedFrames ?? 0n;
+    },
+    hasInput(source: TimelineSource): boolean {
+      const record = owned(source);
+      return !!record &&
+        (record.acceptedFrames > 0n || record.pendingAppends > 0);
+    },
+    admitting(source: TimelineSource): (() => void) | null {
+      const record = owned(source);
+      if (!record || record.position.canceled || record.target !== undefined) {
+        return null;
+      }
+      record.pendingAppends++;
+      let settled = false;
+      return () => {
+        if (settled) return;
+        settled = true;
+        record.pendingAppends--;
+      };
     },
     accept(source: TimelineSource, frames: bigint): boolean {
       u64(frames);
@@ -161,10 +240,54 @@ export function createPlaybackTimeline() {
         receipt.streamId !== source.streamId ||
         receipt.epoch !== source.epoch ||
         receipt.source !== source.source || receipt.target !== record.target ||
-        receipt.revision !== 1n || receipt.status !== 'complete'
+        receipt.revision !== record.revision || receipt.status !== 'complete'
       ) return false;
       record.completed = true;
       return true;
+    },
+    revise(
+      source: TimelineSource,
+      receipt: TimelineCompletion,
+    ): readonly bigint[] | null {
+      const record = owned(source);
+      if (
+        !record || record.completed || record.position.canceled ||
+        receipt.streamId !== source.streamId ||
+        receipt.epoch !== source.epoch ||
+        receipt.source !== source.source || receipt.target !== record.target ||
+        receipt.revision !== record.revision || receipt.status !== 'failed' ||
+        !receipt.attachments
+      ) return null;
+      const captured = receipt.attachments.filter((attachment) =>
+        !attachment.excluded
+      );
+      const excluded = captured.filter((attachment) =>
+        attachment.outcome === 'withdrawn' || attachment.outcome === 'failed'
+      );
+      if (
+        !excluded.length ||
+        !captured.some((attachment) =>
+          attachment.outcome === 'pending' || attachment.outcome === 'complete'
+        )
+      ) return null;
+      record.exclusions.push(
+        ...excluded.map(({ attachment, outcome, error }) => ({
+          attachment,
+          outcome,
+          error,
+        })),
+      );
+      record.revision++;
+      return excluded.map((attachment) => attachment.attachment);
+    },
+    cohort(source: TimelineSource) {
+      const record = owned(source);
+      return record
+        ? {
+          revision: record.revision,
+          exclusions: record.exclusions.map((e) => ({ ...e })),
+        }
+        : null;
     },
     observe(source: TimelineSource, progress: TimelineProgress): boolean {
       const record = owned(source);

@@ -212,6 +212,22 @@ async function scenario(
           media: {
             ...media,
             async decodePcm(path, options) {
+              // This fixture isolates explicit cancellation. Keep speculative B
+              // before decoder acquisition; it must be canceled and joined, not
+              // mistaken for the replacement admitted after reset readiness.
+              const current = playback!.playerView().current;
+              if (
+                path.endsWith('/b.wav') && current?.facts.kind === 'song' &&
+                current.facts.song.path !== path
+              ) {
+                await new Promise<void>((resolve) => {
+                  options!.signal!.addEventListener('abort', () => resolve(), {
+                    once: true,
+                  });
+                  if (options!.signal!.aborted) resolve();
+                });
+                options!.signal!.throwIfAborted();
+              }
               opens.push(path);
               const decoded = await media.decodePcm(path, options);
               assert(decoded);
@@ -252,7 +268,8 @@ async function scenario(
     };
     const added = await fetch(
       `http://melofon.home:${f.extraPorts[0]}/api/queue/items/add?uris=${
-        ids.map((id) => `library:track:${wireInt(id)}`).join(',')
+        (mode === 'backpressure' ? ids.slice(0, 1) : ids)
+          .map((id) => `library:track:${wireInt(id)}`).join(',')
       }&playback=start`,
       { method: 'POST', signal: AbortSignal.timeout(5000) },
     );

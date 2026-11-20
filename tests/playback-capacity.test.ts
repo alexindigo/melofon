@@ -814,8 +814,11 @@ Deno.test('natural advancement retains the stream and releases it after end-of-q
     await until(() => f.sourceEnds[0].has(first));
     await until(() => f.sourceCompletions[0].has(first));
     await f.playback[0].advanceEnded();
-    await until(() =>
-      f.sessions.filter((s) => s.port === 7001 && s.bytes > 0).length === 2
+    await until(() => f.playback[0].playerView().current?.id !== first);
+    assertEquals(
+      f.sessions.filter((s) => s.port === 7001).length,
+      1,
+      'natural succession retains the receiver',
     );
     const second = f.playback[0].playerView().current!.id;
     await until(() => f.sourceEnds[0].has(second));

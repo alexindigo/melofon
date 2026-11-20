@@ -201,6 +201,57 @@ async function rendered(
   return { all, result };
 }
 
+test('late end joins pacer quiescence after a source completed in compatibility silence', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const source = pcm(353);
+  const attachment = stream.attach(() => {});
+  try {
+    await append(stream, highSource, source);
+    await stream.seal(stream.epoch, highSource, 353n);
+    await stream.compatibilitySilence(stream.epoch, highSource);
+    await attachment.start(profile(receiver), item);
+    await stream.waitCompletion(key(stream, highSource, 353n));
+    let drained = false;
+    const pending = stream.waitDrain(stream.epoch).then(() => drained = true);
+    await sleep(30);
+    assertEquals(
+      drained,
+      false,
+      'source completion cannot settle stream drain',
+    );
+    await stream.endStream(stream.epoch, 353n);
+    await pending;
+    const frozen = await ranges(stream);
+    await sleep(50);
+    assertEquals(
+      await ranges(stream),
+      frozen,
+      'no tick follows drain observation',
+    );
+    const decoded = decodeReceiverAudio(
+      receiver.sessions[0].sdp,
+      receiver.sessions[0].audioPayloads,
+    );
+    const sources = new Map([[highSource, source]]);
+    accounted(decoded, frozen, sources);
+    assert(frozen.some((range) => range.kind === 'compatibility'));
+    const replay = renderScheduledAudio(receiver.sessions[0], receiver.nowMs());
+    assertEquals(replay.issues, []);
+    assertEquals(replay.pcm.subarray(0, source.length), source);
+    accounted(replay.pcm, frozen, sources);
+    await stream.ackCompletion(key(stream, highSource, 353n));
+    await libraryProof();
+  } finally {
+    await attachment.transport.close();
+    await stream.close();
+    receiver.close();
+  }
+});
+
 for (const frames of [1, 351, 352, 353, 441, 44100 + 137]) {
   test(`seal/end renders ${frames} real frames and exact zero transport padding`, async () => {
     const stream = createFfiStream();
@@ -409,6 +460,95 @@ test('same-epoch 353/351 seals concatenate inside a packet without padding or FL
   }
 });
 
+test('a paced partial packet survives an asynchronous same-stream source boundary', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {});
+  const a = pcm(353), b = pcm(351, 777);
+  try {
+    await attachment.start(profile(receiver), item);
+    await append(stream, 1n, a);
+    await until(
+      'outgoing partial packet fed',
+      async () => (await stream.source(stream.epoch, 1n))?.fedFrames === 353n,
+    );
+    await stream.seal(stream.epoch, 1n, 353n);
+    // The next source is supplied after multiple pacer callbacks, but well
+    // before the actual wire presentation deadline. A seal is not stream EOF.
+    await sleep(50);
+    await append(stream, 2n, b);
+    await stream.seal(stream.epoch, 2n, 351n);
+    await stream.endStream(stream.epoch, 704n);
+    const { all, result } = await rendered(
+      stream,
+      receiver,
+      704,
+      new Map([[1n, a], [2n, b]]),
+    );
+    assertEquals(
+      all.filter((r) => r.kind === 'real').map((
+        r,
+      ) => [r.source, r.transportStart, r.frames]),
+      [[1n, 0n, 353n], [2n, 353n, 351n]],
+    );
+    const expected = new Uint8Array(704 * 4);
+    expected.set(a);
+    expected.set(b, a.length);
+    assertEquals(result.pcm.subarray(0, expected.length), expected);
+    assertEquals(
+      all.filter((r) => r.kind === 'padding' || r.kind === 'underrun'),
+      [],
+    );
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
+test('delayed stream end pads only the final incomplete packet', async () => {
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {});
+  const bytes = pcm(351);
+  try {
+    await attachment.start(profile(receiver), item);
+    await append(stream, 1n, bytes);
+    await until(
+      'real tail retained before EOF',
+      async () => (await stream.source(stream.epoch, 1n))?.fedFrames === 351n,
+    );
+    await stream.seal(stream.epoch, 1n, 351n);
+    await sleep(50);
+    assertEquals(receiver.sessions[0].audioPackets, 0);
+    await stream.endStream(stream.epoch, 351n);
+    const { all, result } = await rendered(
+      stream,
+      receiver,
+      351,
+      new Map([[1n, bytes]]),
+    );
+    assertEquals(result.pcm.subarray(0, bytes.length), bytes);
+    assertEquals(
+      all.filter((r) => r.kind === 'padding').map((
+        r,
+      ) => [r.transportStart, r.frames]),
+      [[351n, 1n]],
+    );
+    assertEquals(all.filter((r) => r.kind === 'underrun'), []);
+    await libraryProof();
+  } finally {
+    await stream.close();
+    receiver.close();
+  }
+});
+
 test('real underrun advances labeled transport silence but freezes source accounting', async () => {
   const stream = createFfiStream();
   const receiver = await startFakeRaop({
@@ -431,7 +571,13 @@ test('real underrun advances labeled transport silence but freezes source accoun
       'first source fed',
       async () => (await stream.source(stream.epoch, 1n))?.fedFrames === 353n,
     );
-    await sleep(100);
+    await until(
+      'actual presentation underrun',
+      async () =>
+        (await ranges(stream)).some((r) =>
+          r.kind === 'underrun' && r.frames >= 4410n
+        ),
+    );
     const frozen = await stream.source(stream.epoch, 1n);
     assertEquals([frozen!.acceptedFrames, frozen!.fedFrames, frozen!.sealed], [
       353n,

@@ -10,7 +10,11 @@ import { decodeReceiverAudio } from './raop-audio-consumer.ts';
 import { renderScheduledAudio } from './raop-scheduled-consumer.ts';
 
 export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
-  const epochs: { id: bigint; ranges: AirplayRangeSnapshot[] }[] = [];
+  const epochs: {
+    id: bigint;
+    ranges: AirplayRangeSnapshot[];
+    completedThrough: bigint;
+  }[] = [];
   return {
     epochs,
     stream() {
@@ -24,23 +28,37 @@ export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
           key: Parameters<AirplayTimelineStream['waitCompletion']>[0],
         ) {
           const result = await native.waitCompletion(key);
-          if (
-            result.status === 'complete' &&
-            !epochs.some((e) => e.id === key.epoch)
-          ) {
-            const ranges: AirplayRangeSnapshot[] = [];
+          if (result.status === 'complete') {
+            let epoch = epochs.find((e) => e.id === key.epoch);
+            if (!epoch) {
+              epoch = { id: key.epoch, ranges: [], completedThrough: 0n };
+              epochs.push(epoch);
+            }
+            if (result.transportEnd > epoch.completedThrough) {
+              epoch.completedThrough = result.transportEnd;
+            }
             for (let i = 0n;; i++) {
               const range = await native.range(key.epoch, i);
               if (!range) break;
-              ranges.push(range);
+              const existing = epoch.ranges.findIndex((r) =>
+                r.transportStart === range.transportStart
+              );
+              if (existing < 0) epoch.ranges.push(range);
+              else epoch.ranges[existing] = range;
             }
-            epochs.push({ id: key.epoch, ranges });
+            epoch.ranges.sort((a, b) =>
+              a.transportStart < b.transportStart
+                ? -1
+                : a.transportStart > b.transportStart
+                ? 1
+                : 0
+            );
           }
           return result;
         },
       };
     },
-    realAudio(session: FakeRaopSession, firstEpoch = 0) {
+    realAudio(session: FakeRaopSession, firstEpoch = 0, completedOnly = false) {
       // RTSP and UDP are independently delivered. Arrival after FLUSH does not
       // grant an old datagram authority in the replacement epoch. Attribute by
       // RTP location, retaining hole/conflicting-duplicate checks before decode.
@@ -90,12 +108,28 @@ export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
         for (const [index, [offset]] of packets.entries()) {
           assertEquals(offset, index * 352, 'arrival coverage has no RTP hole');
         }
-        const received = decodeReceiverAudio(
+        const decoded = decodeReceiverAudio(
           session.sdp,
           packets.map(([, bytes]) => bytes),
         );
+        // A continuous epoch also contains accepted future audio. A completed
+        // source proof stops at its exact retained native boundary, not at an
+        // arbitrary suffix allowance or an arrival-time guess.
+        const received = completedOnly
+          ? decoded.subarray(0, Number(epoch.completedThrough) * 4)
+          : decoded;
         let accounted = 0;
-        for (const range of epoch.ranges) {
+        for (const original of epoch.ranges) {
+          const range = completedOnly
+            ? {
+              ...original,
+              frames: original.transportStart + original.frames >
+                  epoch.completedThrough
+                ? epoch.completedThrough - original.transportStart
+                : original.frames,
+            }
+            : original;
+          if (range.frames <= 0n) break;
           const start = Number(range.transportStart) * 4;
           const end = Math.min(
             received.length,
@@ -136,6 +170,7 @@ export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
       session: FakeRaopSession,
       throughMs: number,
       firstEpoch = 0,
+      completedOnly = false,
     ) {
       const replay = renderScheduledAudio(session, throughMs);
       assertEquals(replay.issues, []);
@@ -152,7 +187,17 @@ export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
           ...r,
           offset: (r.timestamp - anchors[firstEpoch + i] + 2 ** 32) % 2 ** 32,
         }));
-        for (const range of epoch.ranges) {
+        for (const original of epoch.ranges) {
+          const range = completedOnly
+            ? {
+              ...original,
+              frames: original.transportStart + original.frames >
+                  epoch.completedThrough
+                ? epoch.completedThrough - original.transportStart
+                : original.frames,
+            }
+            : original;
+          if (range.frames <= 0n) break;
           const start = Number(range.transportStart),
             end = start + Number(range.frames);
           let real = start;

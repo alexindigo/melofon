@@ -151,6 +151,7 @@ export function createAirplayDevices(deps: {
           'appendSource',
           'seal',
           'endStream',
+          'waitDrain',
           'compatibilitySilence',
           'source',
           'range',
@@ -208,6 +209,7 @@ export function createAirplayDevices(deps: {
       seal: (...args) => operations.run(() => timeline().seal(...args)),
       endStream: (...args) =>
         operations.run(() => timeline().endStream(...args)),
+      waitDrain: (epoch) => cancelable(() => timeline().waitDrain(epoch)),
       compatibilitySilence: (...args) =>
         operations.run(() => timeline().compatibilitySilence(...args)),
       source: (...args) => operations.run(() => timeline().source(...args)),

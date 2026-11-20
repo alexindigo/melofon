@@ -35,7 +35,7 @@ function web(
   };
 }
 const song = (id = 'song', durationMs: number | null = 1000) =>
-  catalogMedia({ id, path: '/audio', durationMs } as SongRow);
+  catalogMedia({ id, path: `/audio/${id}`, durationMs } as SongRow);
 
 function fixture(options: {
   resolveQueueReference?: Parameters<
@@ -495,6 +495,7 @@ Deno.test('two-sink boot fences stale decoder EOF after a same-position seek', a
     }),
   );
   const ends: (() => void)[] = [];
+  const allEnds: (() => void)[] = [];
   let finished = 0;
   const boot = createAirplayBoot({
     playback,
@@ -503,15 +504,21 @@ Deno.test('two-sink boot fences stale decoder EOF after a same-position seek', a
     devices,
     retryBackoffMs: [],
     media: {
-      decodePcm(_path: string, options?: { startMs?: number }) {
-        const end = new Promise<void>((resolve) => ends.push(resolve));
+      decodePcm(path: string, options?: { startMs?: number }) {
+        const current = playback.playerView().current;
+        const primary = current?.facts.kind === 'song' &&
+          current.facts.song.path === path;
+        const end = new Promise<void>((resolve) => {
+          allEnds.push(resolve);
+          if (primary) ends.push(resolve);
+        });
         return Promise.resolve(fixturePcm(
           (async function* () {
             try {
               yield new Uint8Array(1764);
               await end;
             } finally {
-              finished++;
+              if (primary) finished++;
             }
           })(),
           undefined,
@@ -573,7 +580,7 @@ Deno.test('two-sink boot fences stale decoder EOF after a same-position seek', a
     );
   } finally {
     // Unpark every owned generator, including a next-item pump begun by the tick.
-    for (const end of ends) end();
+    for (const end of allEnds) end();
     await boot.close();
     devices.close();
     await playback.close();

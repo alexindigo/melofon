@@ -20,6 +20,7 @@ import type { PlaybackSource } from '../../src/player.ts';
 import type { QueueMedia, QueueReference } from '../../src/queue-source.ts';
 import type {
   AirplayCompletionKey,
+  AirplayCompletionResult,
   AirplayTimelineStream,
 } from '../../src/boots/airplay-profile.ts';
 import { createPlaybackSource } from '../../src/playback-source.ts';
@@ -34,11 +35,15 @@ import type {
 
 export async function nativeHttpFixture(options: {
   pcm: Uint8Array;
+  additionalPcm?: Uint8Array[];
   declaredMs?: number | null;
   acquisition?: Promise<void>;
   web?: 'finite' | 'live';
   afterFirstChunk?: Promise<void>;
   receiver?: Parameters<typeof startFakeRaop>[0];
+  receiverCount?: number;
+  receiverSelection?: boolean[];
+  beforeDecode?: (path: string, startMs: number) => Promise<void>;
   persist?: boolean;
   directory?: string;
   storeDir?: string;
@@ -82,17 +87,33 @@ export async function nativeHttpFixture(options: {
       `${directory}/media/source.${options.sourcePath.split('.').pop()}`,
     );
   } else await Deno.writeFile(`${directory}/media/source.wav`, wav);
-  const receiver = await startFakeRaop({
-    captureAudio: true,
-    captureWire: true,
-    ...options.receiver,
-  });
+  for (const [i, pcm] of (options.additionalPcm ?? []).entries()) {
+    const file = new Uint8Array(44 + pcm.length);
+    file.set(wav.subarray(0, 44));
+    const header = new DataView(file.buffer);
+    header.setUint32(4, file.length - 8, true);
+    header.setUint32(40, pcm.length, true);
+    file.set(pcm, 44);
+    await Deno.writeFile(`${directory}/media/next-${i}.wav`, file);
+  }
+  const receivers = await Promise.all(
+    Array.from({ length: options.receiverCount ?? 1 }, () =>
+      startFakeRaop({
+        captureAudio: true,
+        captureWire: true,
+        ...options.receiver,
+      })),
+  );
+  const receiver = receivers[0];
   let playback!: ReturnType<typeof createPlayback>;
   let boot!: ReturnType<typeof createAirplayBoot>;
   let devices!: ReturnType<typeof createTestAirplayDevices>;
   let outputOwner!: ReturnType<typeof createOutputs>;
   let timer: ReturnType<typeof setInterval> | undefined;
   let opens = 0, songId = '';
+  let songIds: string[] = [];
+  const published = new Set<PlaybackSource>();
+  let unsubscribePlaying: (() => void) | undefined;
   const origins: number[] = [], cutoffs: AirplaySourceCancelResult[] = [];
   const capturedCutoffs: AirplaySourceCutoff[] = [], cancelAcks: bigint[] = [];
   const cancelTimes: { before: number; after: number }[] = [];
@@ -100,6 +121,7 @@ export async function nativeHttpFixture(options: {
   let native!: AirplayTimelineStream, token: PlaybackSource | undefined;
   let key: AirplayCompletionKey | undefined;
   const ackStates: { state: string; generation: number }[] = [];
+  const completions: AirplayCompletionResult[] = [];
   const audio = traceTimelineAudio(() => {
     native = createFfiStream();
     return {
@@ -108,6 +130,11 @@ export async function nativeHttpFixture(options: {
         options.append
           ? options.append(request, native.appendSource)
           : native.appendSource(request),
+      async waitCompletion(key) {
+        const result = await native.waitCompletion(key);
+        completions.push(result);
+        return result;
+      },
       async progress(epoch, source) {
         const result = await native.progress(epoch, source);
         if (
@@ -179,7 +206,14 @@ export async function nativeHttpFixture(options: {
       }
       await scanLibrary(f.store);
       const catalog = createLibrary(f.store);
-      songId = (await catalog.listSongs({ offset: 0, size: 1 }))[0].id;
+      const songs = await catalog.listSongs({ offset: 0, size: 100 });
+      songId = songs.find((s) => /\/source\./.test(s.path))!.id;
+      songIds = [
+        songId,
+        ...(options.additionalPcm ?? []).map((_, i) =>
+          songs.find((s) => s.path.endsWith(`/next-${i}.wav`))!.id
+        ),
+      ];
       const library = {
         ...catalog,
         async getSong(id: string) {
@@ -194,17 +228,19 @@ export async function nativeHttpFixture(options: {
         notify: f.notify,
         persistence,
       });
-      outputs.register({
-        id: '1',
-        name: 'Scheduled gate',
-        type: 'AirPlay',
-        host: '127.0.0.1',
-        port: receiver.port,
-        selected: true,
-        volume: 100,
-        connectionStrategy: 'owntone',
-      });
-      if (options.persist) await outputs.adopt('1');
+      for (const [index, peer] of receivers.entries()) {
+        outputs.register({
+          id: String(index + 1),
+          name: 'Scheduled gate',
+          type: 'AirPlay',
+          host: '127.0.0.1',
+          port: peer.port,
+          selected: options.receiverSelection?.[index] ?? true,
+          volume: 100,
+          connectionStrategy: 'owntone',
+        });
+        if (options.persist) await outputs.adopt(String(index + 1));
+      }
       const media = createMedia();
       const sources = createPlaybackSource({
         media,
@@ -276,10 +312,20 @@ export async function nativeHttpFixture(options: {
         },
         openSource(...args) {
           token = engine.openSource(...args) ?? undefined;
-          if (token) options.sourceOpened?.(token);
+          if (token && !published.has(token)) {
+            published.add(token);
+            options.sourceOpened?.(token);
+          }
           return token ?? null;
         },
       };
+      unsubscribePlaying = f.notify.subscribe(() => {
+        const playing = engine.sourcePlanView().playing;
+        if (!playing || published.has(playing)) return;
+        token = playing;
+        published.add(playing);
+        options.sourceOpened?.(playing);
+      });
       if (options.restore && persistence) {
         const snapshot = await planRestore({
           queue: await persistence.loadQueue(),
@@ -310,6 +356,7 @@ export async function nativeHttpFixture(options: {
             opens++;
             origins.push(settings?.startMs ?? 0);
             await options.acquisition;
+            await options.beforeDecode?.(path, settings?.startMs ?? 0);
             const decoded = await media.decodePcm(path, settings);
             if (!decoded || !options.afterFirstChunk) return decoded;
             return fixturePcm(
@@ -359,10 +406,12 @@ export async function nativeHttpFixture(options: {
   };
   return {
     receiver,
+    receivers,
     playback,
     own,
     audio,
     ackStates,
+    completions,
     origins,
     cutoffs,
     capturedCutoffs,
@@ -370,6 +419,7 @@ export async function nativeHttpFixture(options: {
     cancelTimes,
     fixture: f,
     outputs: outputOwner,
+    songIds,
     publish(change: () => void) {
       assert(persistence);
       return persistence.publishedCommands.publish(change);
@@ -403,11 +453,12 @@ export async function nativeHttpFixture(options: {
       ),
     async close() {
       clearInterval(timer);
+      unsubscribePlaying?.();
       await boot.close();
       devices.close();
       await playback.close();
       await persistence?.close();
-      receiver.close();
+      for (const peer of receivers) peer.close();
       await f.close();
       await radio?.close();
       if (!options.directory) await Deno.remove(directory, { recursive: true });

@@ -78,6 +78,9 @@ int raop_stream_seal(raop_stream_t *, uint64_t epoch, uint64_t source,
                      uint64_t target, struct raop_marker_result *);
 int raop_stream_end(raop_stream_t *, uint64_t epoch, uint64_t target,
                     struct raop_marker_result *);
+/* Pacer quiescence, distinct from source completion and end admission:
+ * 1 drained, 0 pending, -1 failed/canceled/closing. No receiver release claim. */
+int raop_stream_drained(raop_stream_t *, uint64_t epoch);
 /* After sealed catalog EOF, pace explicitly labelled compatibility silence until
  * core's separate eligibility deadline. Does not credit media or end a stream. */
 int raop_stream_compatibility_silence(raop_stream_t *, uint64_t epoch, uint64_t source);

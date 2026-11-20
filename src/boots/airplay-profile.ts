@@ -148,6 +148,9 @@ export interface AirplayTimelineStream extends AirplayExactStream {
     target: bigint,
   ): Promise<AirplayMarkerResult>;
   endStream(epoch: bigint, target: bigint): Promise<AirplayMarkerResult>;
+  /** Join native end/drain and pacer quiescence, not just input acceptance.
+   * Reject on cancellation, transport failure or close. No release claim. */
+  waitDrain(epoch: bigint): Promise<void>;
   compatibilitySilence(epoch: bigint, source: bigint): Promise<void>;
   source(epoch: bigint, source: bigint): Promise<AirplaySourceSnapshot | null>;
   range(epoch: bigint, index: bigint): Promise<AirplayRangeSnapshot | null>;
@@ -285,6 +288,7 @@ export interface AirplayPlaybackStream extends
     | 'appendSource'
     | 'seal'
     | 'endStream'
+    | 'waitDrain'
     | 'compatibilitySilence'
     | 'source'
     | 'range'

@@ -75,6 +75,7 @@ const SYMBOLS = {
     parameters: ['pointer', 'u64', 'u64', 'buffer'],
     result: 'i32',
   },
+  raop_stream_drained: { parameters: ['pointer', 'u64'], result: 'i32' },
   raop_stream_compatibility_silence: {
     parameters: ['pointer', 'u64', 'u64'],
     result: 'i32',
@@ -991,6 +992,20 @@ export function createFfiStream(
     },
     seal: (captured, source, target) => marker(captured, source, target, false),
     endStream: (captured, target) => marker(captured, 0n, target, true),
+    waitDrain(captured) {
+      return operations.run(async ({ signal }) => {
+        u64(captured);
+        for (;;) {
+          const result = lib.symbols.raop_stream_drained(handle, captured);
+          if (signal.aborted || result < 0) {
+            throw new Error('RAOP drain failed or canceled');
+          }
+          if (result === 1) return;
+          if (result !== 0) throw new Error('Invalid RAOP drain observation');
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      });
+    },
     compatibilitySilence: (captured, source) =>
       operations.run(() => {
         u64(captured, source);

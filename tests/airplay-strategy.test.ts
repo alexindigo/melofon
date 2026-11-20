@@ -720,10 +720,15 @@ Deno.test('OwnTone Stop retains current but releases transport; Play creates a n
     assertEquals(s.playback.playerView().state, 'pause');
     await until(() => t.closed);
     assertEquals(t.commands.filter((c) => c.cmd === 'teardown').length, 1);
+    const decodedBeforeResume = s.decoded.length;
     s.playback.play();
     await until(() => s.transports.length === 2);
     s.transports[1].event('state', 'connected');
-    await until(() => s.decoded.length === 2);
+    await until(() =>
+      s.decoded.slice(decodedBeforeResume).some((d) =>
+        d.path === '/fixture/song'
+      )
+    );
     assertEquals(s.transports.length, 2);
   } finally {
     await s.close();

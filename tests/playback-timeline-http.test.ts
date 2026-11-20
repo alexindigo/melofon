@@ -1,8 +1,9 @@
 // Successor policy through real plain HTTP, decoder, boot and shipping FFI.
-// Continuous A/B transport belongs to b08; these are the existing boundaries.
+// Natural boundaries keep the same transport epoch and attachment sessions.
 import { assert, assertEquals } from '@std/assert';
 import type { PlaybackSource } from '../src/player.ts';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
+import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 
 async function until(predicate: () => boolean | Promise<boolean>) {
   const deadline = performance.now() + 15000;
@@ -76,10 +77,106 @@ function test(name: string, fn: () => Promise<void>) {
     fn,
   });
 }
+for (const frames of [[353, 351], [44100 + 137, 22050 + 19], [441, 351, 353]]) {
+  test(`production gapless ${frames.join('/')} uses one session and no inter-item silence`, async () => {
+    const parts = frames.map((count, i) => {
+      const bytes = pcm(count);
+      new DataView(bytes.buffer).setInt16(0, 7000 + i * 997, true);
+      return bytes;
+    });
+    const acceptedSources = new Set<bigint>();
+    const f = await nativeHttpFixture({
+      pcm: parts[0],
+      additionalPcm: parts.slice(1),
+      async append(request, append) {
+        const receipt = await append(request);
+        if (receipt.acceptedFrames) acceptedSources.add(request.source);
+        return receipt;
+      },
+    });
+    try {
+      const c = await control(f);
+      const added = await f.fixture.json(
+        '/api/v1/players/1/queue/items',
+        'POST',
+        {
+          references: f.songIds.map((id) => ({ kind: 'song', id })),
+        },
+        c.credential,
+      );
+      assertEquals(added.status, 200, await added.text());
+      const entries = f.playback.queueView().items;
+      await c.command('play');
+      await until(() => acceptedSources.size === frames.length && !!f.key);
+      assertEquals(
+        (await c.current()).current.entryId,
+        entries[0].id,
+        'accept/EOF never publish the read cursor as current',
+      );
+      await until(() => f.playback.playerView().state === 'stop');
+      assertEquals(f.receiver.sessions.length, 1);
+      const expected = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      let at = 0;
+      for (const part of parts) {
+        expected.set(part, at);
+        at += part.length;
+      }
+      assertEquals(f.audio.realAudio(f.receiver.sessions[0]), expected);
+      assertEquals(
+        f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+        expected,
+      );
+      const real = f.audio.epochs.flatMap((e) => e.ranges).filter((r) =>
+        r.kind === 'real'
+      );
+      assertEquals(
+        real.reduce((n, r) => n + Number(r.frames), 0),
+        expected.length / 4,
+      );
+      let boundary = 0n;
+      for (const range of real) {
+        assertEquals(
+          range.transportStart,
+          boundary,
+          'no silence between real-source ranges',
+        );
+        boundary += range.frames;
+      }
+      const replay = renderScheduledAudio(
+        f.receiver.sessions[0],
+        f.receiver.nowMs(),
+      );
+      assertEquals(replay.issues, []);
+      assertEquals(
+        replay.pcm.subarray(0, expected.length),
+        expected,
+        'the final real tail rendered before terminal stop',
+      );
+      let remaining = expected.length / 4, lastRealEnd = 0;
+      for (const range of replay.ranges) {
+        const frames = Math.min(remaining, range.frames);
+        lastRealEnd = range.atMs + frames * 1000 / 44100;
+        remaining -= frames;
+        if (!remaining) break;
+      }
+      for (const request of f.receiver.sessions[0].requests) {
+        if (request.method === 'FLUSH' || request.method === 'TEARDOWN') {
+          assert(
+            request.atMs >= lastRealEnd,
+            'no natural reset before the final real tail',
+          );
+        }
+      }
+      await libraryProof();
+    } finally {
+      await f.close();
+    }
+  });
+}
 for (const repeat of ['off', 'all', 'single'] as const) {
   for (const consume of [false, true]) {
     test(`natural ${repeat} consume=${consume} preserves duplicate occurrences and rendered tails`, async () => {
-      const opened: PlaybackSource[] = [], bytes = pcm();
+      const opened: PlaybackSource[] = [], bytes = pcm(44100 + 353);
       const f = await nativeHttpFixture({
         pcm: bytes,
         sourceOpened: (source) => opened.push(source),
@@ -120,18 +217,23 @@ for (const repeat of ['off', 'all', 'single'] as const) {
         const completed = repeat === 'single' ? 1 : 2;
         assertEquals(
           f.audio.epochs.length,
-          completed,
-          'one retained completion per natural boundary',
+          1,
+          'natural boundaries share one continuous transport epoch',
         );
         const expectedPcm = new Uint8Array(completed * bytes.length);
         for (let i = 0; i < completed; i++) {
           expectedPcm.set(bytes, i * bytes.length);
         }
-        assertEquals(f.audio.realAudio(f.receiver.sessions[0]), expectedPcm);
+        assertEquals(
+          f.audio.realAudio(f.receiver.sessions[0], 0, true),
+          expectedPcm,
+        );
         assertEquals(
           f.audio.scheduledRealAudio(
             f.receiver.sessions[0],
             f.receiver.nowMs(),
+            0,
+            true,
           ),
           expectedPcm,
         );
@@ -177,6 +279,54 @@ for (const repeat of ['off', 'all', 'single'] as const) {
     });
   }
 }
+test('failed speculative preparation preserves the healthy primary tail until its scheduled completion', async () => {
+  const entered = Promise.withResolvers<void>();
+  let armed = false;
+  const bytes = pcm(44100 + 137);
+  const f = await nativeHttpFixture({
+    pcm: bytes,
+    web: 'finite',
+    async resolveSource(reference, resolve) {
+      if (armed && reference.kind === 'station') {
+        entered.resolve();
+        throw new Error('Speculative B preparation failed');
+      }
+      return await resolve();
+    },
+  });
+  try {
+    const c = await control(f);
+    await f.play(false);
+    const added = await f.fixture.json(
+      '/api/v1/players/1/queue/items',
+      'POST',
+      {
+        references: [{ kind: 'station', id: 'B' }],
+      },
+      c.credential,
+    );
+    assertEquals(added.status, 200, await added.text());
+    const primary = f.playback.queueView().items[0].id;
+    armed = true;
+    await c.command('play');
+    await entered.promise;
+    assertEquals((await c.current()).current.entryId, primary);
+    assertEquals(
+      f.audio.epochs.length,
+      0,
+      'failure cannot satisfy the sink gate',
+    );
+    await until(() => f.audio.epochs.length === 1);
+    assertEquals(f.audio.realAudio(f.receiver.sessions[0]), bytes);
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      bytes,
+    );
+    await libraryProof();
+  } finally {
+    await f.close();
+  }
+});
 test('manual next, previous and restart remain separate under repeat-single and consume', async () => {
   const f = await nativeHttpFixture({ pcm: pcm(4410), declaredMs: 60000 });
   try {
@@ -221,7 +371,9 @@ for (const edit of ['remove', 'move', 'append', 'unrelated-move'] as const) {
       entered = Promise.withResolvers<void>();
     let armed = false, waits = 0;
     const opened: PlaybackSource[] = [];
-    const bytes = pcm();
+    // B must remain observable over HTTP after its scheduled publication. The
+    // separate short-track cases prove sub-packet boundaries without a poll.
+    const bytes = pcm(44100 + 353);
     const f = await nativeHttpFixture({
       pcm: bytes,
       web: 'finite',
@@ -298,10 +450,19 @@ for (const edit of ['remove', 'move', 'append', 'unrelated-move'] as const) {
           'promote the prepared incarnation, do not reopen it',
         );
       }
-      assertEquals(waits, 1, 'unrelated edits never redo B acquisition');
+      assertEquals(
+        waits,
+        edit === 'move' ? 2 : 1,
+        'unrelated edits never redo B; a moved B is read again only in its new relationship',
+      );
       assertEquals((await c.current()).current.entryId, opened[1].entryId);
       assertEquals(
-        f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+        f.audio.scheduledRealAudio(
+          f.receiver.sessions[0],
+          f.receiver.nowMs(),
+          0,
+          true,
+        ),
         bytes,
       );
       await libraryProof();

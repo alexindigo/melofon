@@ -22,7 +22,10 @@ int raop_player_compatibility_silence(struct raop_player *, uint64_t source);
 int raop_player_source(struct raop_player *, uint64_t source, struct raop_source_snapshot *);
 int raop_player_range(struct raop_player *, uint64_t index, struct raop_range_snapshot *);
 void raop_transport_progress(uint64_t stream_id, uint64_t attachment, uint64_t now_ns,
-                              struct raop_progress_snapshot *);
+                               struct raop_progress_snapshot *);
+/* Earliest input deadline of an incomplete/next packet, including receiver lead.
+ * Zero means no established healthy schedule yet. Loop thread only. */
+uint64_t raop_transport_input_deadline(uint64_t stream_id);
 int raop_player_progress(struct raop_player *, uint64_t source, uint64_t attachment,
                            struct raop_progress_snapshot *);
 int raop_player_progress_at(struct raop_player *, uint64_t source, uint64_t attachment,
@@ -33,6 +36,7 @@ int raop_player_completion_progress(struct raop_player *, uint64_t source,
   uint64_t attachment, struct raop_progress_snapshot *, uint64_t *transport_end);
 void raop_player_ack_source(struct raop_player *, uint64_t source);
 int raop_player_ended(struct raop_player *);
+int raop_player_drained(struct raop_player *);
 void raop_player_drain_complete(struct raop_player *);
 void raop_ffi_completion_update(uint64_t stream_id);
 void raop_ffi_attachment_failed(uint64_t stream_id, uint64_t attachment, uint64_t error);

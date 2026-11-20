@@ -956,7 +956,7 @@ Deno.test('ATV3 seek: retires and replaces with the latest state — no FLUSH', 
     assertEquals(start.host, HOST, 'replacement re-read the output record');
     t2.onEvent('state', 'connected');
     await until('pcm', () => t2.pcmBytes() > 0);
-    const last = decodeCalls[decodeCalls.length - 1];
+    const last = decodeCalls.findLast((call) => call.path.includes('long-a'))!;
     assert(
       Math.abs((last.startMs ?? 0) - 120_000) < 1500,
       `replacement decodes at the requested position: ${last.startMs}`,
@@ -1377,12 +1377,15 @@ Deno.test('ATV3: an entry change during the handshake is absorbed by the connect
       `the connected session decodes the LATEST entry: ${last.path}`,
     );
     // And a settled track change after connected recycles normally.
+    const decodesBefore = decodeCalls.length;
     playback.previous(); // back to long-b: a full recycle
     await until('recycled', () => spawned.length === 2);
     spawned[1].onEvent('state', 'connected');
     await until('pcm2', () => spawned[1].pcmBytes() > 0);
     assert(
-      decodeCalls[decodeCalls.length - 1].path.includes('long-b'),
+      decodeCalls.slice(decodesBefore).some((call) =>
+        call.path.includes('long-b')
+      ),
       'the settled recycle decodes the current entry',
     );
   } finally {

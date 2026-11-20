@@ -1253,15 +1253,21 @@ completion_update_locked(raop_stream_t *s)
   }
 }
 
+static void
+completion_retire_locked(raop_stream_t *s)
+{
+  /* Completion is not receiver release. Stop only the ended stream's pacer,
+   * after actual surviving transport playout, not receipt settlement/ack. */
+  raop_player_drain_complete(s->player);
+}
+
 void
 raop_ffi_completion_update(uint64_t stream_id)
 {
   pthread_mutex_lock(&rt.lock);
   for (raop_stream_t *s = rt.streams; s; s = s->next) if (s->id == stream_id) {
     completion_update_locked(s);
-    /* Completion is not receiver release. Stop only the ended stream's pacer,
-     * after actual surviving transport playout, not receipt settlement/ack. */
-    raop_player_drain_complete(s->player);
+    completion_retire_locked(s);
     break;
   }
   pthread_mutex_unlock(&rt.lock);
@@ -1457,6 +1463,17 @@ raop_stream_source(raop_stream_t *stream, uint64_t epoch, uint64_t source,
   if (found) result->epoch = epoch;
   pthread_mutex_unlock(&rt.lock);
   return found;
+}
+
+int
+raop_stream_drained(raop_stream_t *stream, uint64_t epoch)
+{
+  if (!stream || !epoch) return -1;
+  pthread_mutex_lock(&rt.lock);
+  int result = !stream->closing && !stream->input_closed && !stream->resetting &&
+    epoch == stream->epoch ? raop_player_drained(stream->player) : -1;
+  pthread_mutex_unlock(&rt.lock);
+  return result;
 }
 
 int

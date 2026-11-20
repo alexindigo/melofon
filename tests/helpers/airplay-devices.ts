@@ -55,6 +55,19 @@ export function recordingStream(
     const cancelPcm = () => {
       for (const peer of peers) peer.transport.cancelPcm();
     };
+    // Explicit lifecycle recorder, not native scheduled-consumer evidence. Its
+    // fake attachments accept synchronously and have no transport schedule.
+    const completion = (key: AirplayCompletionKey) => ({
+      ...key,
+      streamId: id,
+      inputEnd: sources.get(key.source)?.inputEnd ?? 0n,
+      status: key.epoch === epoch ? 'complete' as const : 'canceled' as const,
+      error: 'none' as const,
+      transportEnd: inputFrames,
+      capturedNs: 0n,
+      required: BigInt(peers.size),
+      attachments: [],
+    });
     function resetInput(control = () => Promise.resolve()) {
       const previous = barrier;
       const settled = Promise.withResolvers<void>();
@@ -94,19 +107,6 @@ export function recordingStream(
         return !operation.signal.aborted && captured === epoch;
       });
     }
-    // Explicit lifecycle recorder, not native scheduled-consumer evidence. Its
-    // fake attachments accept synchronously and have no transport schedule.
-    const completion = (key: AirplayCompletionKey) => ({
-      ...key,
-      streamId: id,
-      inputEnd: sources.get(key.source)?.inputEnd ?? 0n,
-      status: key.epoch === epoch ? 'complete' as const : 'canceled' as const,
-      error: 'none' as const,
-      transportEnd: inputFrames,
-      capturedNs: 0n,
-      required: BigInt(peers.size),
-      attachments: [],
-    });
     const api: AirplayTimelineStream = {
       id,
       get epoch() {
@@ -185,6 +185,7 @@ export function recordingStream(
           status: 'accepted',
         }),
       compatibilitySilence: () => Promise.resolve(),
+      waitDrain: () => Promise.resolve(),
       source: (_epoch, source) => Promise.resolve(sources.get(source) ?? null),
       range: () => Promise.resolve(null),
       progress: () => Promise.resolve(null),

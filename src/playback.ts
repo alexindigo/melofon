@@ -259,6 +259,12 @@ export interface Playback {
   ): PlaybackRead | null | Promise<PlaybackRead | null>;
   admitSource(read: PlaybackRead): boolean;
   sourceAccepted(source: PlaybackSource, frames: bigint): boolean;
+  /** Reserve possible native input before an async append; settle after its receipt. */
+  beginSourceInput(source: PlaybackSource): (() => void) | null;
+  reviseSourceCompletion(
+    source: PlaybackSource,
+    receipt: TimelineCompletion,
+  ): readonly bigint[] | null;
   /** Reader has established final exhaustion, separately from decoder EOF. */
   finishSources(after: PlaybackSource): boolean;
   /** Core read/preparation and scheduled-playing incarnations, never hat state. */
@@ -1025,7 +1031,7 @@ export function createPlayback(deps: {
     const discarded = sourcePlans.admitted.slice(invalid);
     const accepted = discarded.some((record) => {
       const mapping = record.source && timelineSources.get(record.source);
-      return mapping && timeline.accepted(mapping) > 0n;
+      return mapping && timeline.hasInput(mapping);
     });
     if (!accepted) {
       sourcePlans.discardFuture(invalid);
@@ -1127,8 +1133,12 @@ export function createPlayback(deps: {
         if (inputEnded !== sourcePlans.playing) return true;
         const plan = successorPlan('natural');
         if (!plan || plan.entryId !== null) {
+          // Input exhaustion was committed before this later addition. The
+          // completed primary still owns its full native tail; hand the new
+          // successor to ordinary activation only after that sink gate passes.
+          continuous = false;
           inputEnded = null;
-          return true;
+          return false;
         }
         const result = player.applySuccessor(plan, null);
         if (result !== 'none') {
@@ -1609,6 +1619,16 @@ export function createPlayback(deps: {
       const mapping = timelineSources.get(source);
       return ownsSource(source) && !!mapping &&
         timeline.accept(mapping, frames);
+    },
+    beginSourceInput(source) {
+      const mapping = timelineSources.get(source);
+      return ownsSource(source) && mapping ? timeline.admitting(mapping) : null;
+    },
+    reviseSourceCompletion(source, receipt) {
+      const mapping = timelineSources.get(source);
+      return ownsSource(source) && mapping
+        ? timeline.revise(mapping, receipt)
+        : null;
     },
     finishSources(after) {
       const tail = sourcePlans.admitted.at(-1)?.source ?? sourcePlans.playing;

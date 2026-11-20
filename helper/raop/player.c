@@ -292,6 +292,8 @@ pcm_peak(const uint8_t *pcm, size_t n)
   return peak;
 }
 
+static uint64_t monotonic_ns(void);
+
 /* The 10 ms playback tick (OwnTone playback_cb, player.c:1272-1372): read
  * the timer overrun, then write 1+overrun frames from the PCM buffer into
  * the RAOP sessions, advancing the stream clock per sample written. */
@@ -341,6 +343,23 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           break;
         }
       n = avail > TICK_BYTES ? TICK_BYTES : (avail & ~(size_t)3);
+      /* An empty producer queue is not a presentation underrun. Preserve the
+       * backend's partial ALAC packet while the existing receiver lead still
+       * permits a successor to continue it. Check the actual earliest packet
+       * deadline, allowing the next timer interval to complete that packet.
+       * Explicit compatibility silence and stream end intentionally pace zeros. */
+      if (timeline && !n && !t->ended &&
+          !(t->compatibility_source && t->last_source == t->compatibility_source)) {
+        uint64_t deadline = raop_transport_input_deadline(p->stream_id);
+        /* A tick may leave an incomplete 352-frame packet. Reserve that
+         * packet's duration as well as the next timer interval, otherwise the
+         * next tick could arrive after its first frame's deadline. */
+        uint64_t dispatch_horizon = TICK_MS * 1000000ULL + 352 * 1000000000ULL / 44100;
+        if (deadline && monotonic_ns() + dispatch_horizon < deadline) {
+          pthread_mutex_unlock(&p->pcm_lock);
+          break;
+        }
+      }
       if (evbuffer_remove(p->pcm, scratch, n) < 0)
         {
           pthread_mutex_unlock(&p->pcm_lock);
@@ -354,8 +373,9 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         p->clock_started = true;
       }
       if (timeline) {
-        /* Dispatch every tick on the same clock. A source seal is not involved:
-         * only genuinely absent ingress (or explicit stream end) emits zeros. */
+        /* A short real read is not a padded tick. B continues A's partial
+         * packet; only final EOF or an actual empty-input underrun adds zeros. */
+        size_t output_frames = real && !t->ended ? real : TICK_SAMPLES;
         memset(scratch + n, 0, TICK_BYTES - n);
         uint64_t transport = p->pts_samples;
         size_t left = real;
@@ -383,7 +403,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           t->last_real_end = transport;
           left -= take;
         }
-        size_t silence = TICK_SAMPLES - real;
+        size_t silence = output_frames - real;
         if (t->ended && t->next_input == t->inputs && !t->tail_reached) {
           t->tail_reached = true;
           t->transport_end = t->last_real_end;
@@ -408,7 +428,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           r->frames += count;
           transport += count;
         }
-        n = TICK_BYTES;
+        n = output_frames * 4;
       }
       pthread_mutex_unlock(&p->pcm_lock);
 
@@ -666,6 +686,7 @@ raop_player_end(struct raop_player *p, uint64_t target, struct raop_marker_resul
        * silence. Its exclusive real boundary never moves to that silence. */
       t->tail_reached = true;
       t->transport_end = t->last_real_end;
+      t->padding_left = (352 - p->pts_samples % 352) % 352;
     }
     result->input_end = target;
     result->status = RAOP_APPEND_ACCEPTED;
@@ -840,6 +861,16 @@ raop_player_ended(struct raop_player *p)
   int ended = p->timeline && p->timeline->ended;
   pthread_mutex_unlock(&p->pcm_lock);
   return ended;
+}
+
+int
+raop_player_drained(struct raop_player *p)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  int result = p->failure.error ? -1 :
+    (p->timeline && p->timeline->complete ? 1 : 0);
+  pthread_mutex_unlock(&p->pcm_lock);
+  return result;
 }
 
 /* Ack ends source/range observation lifetime. Compact all three bounded ledgers

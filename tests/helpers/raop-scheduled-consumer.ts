@@ -104,6 +104,7 @@ export function renderScheduledAudio(
   const seen = new Map<number, Queued>();
   const timing = new Map<bigint, Datagram>();
   let clock: { sender: bigint; localMs: number; readyMs: number } | null = null;
+  let clockUncertainty = Infinity;
   let sync: {
     ntp: bigint;
     timestamp: number;
@@ -292,14 +293,19 @@ export function renderScheduledAudio(
       }
       // Minimum observed RTT is the least-uncertain independent clock sample.
       if (
-        !clock || networkMs / 2 < (result.clockUncertaintyMs ?? Infinity)
+        !clock || networkMs / 2 < clockUncertainty
       ) {
         clock = {
           sender: (receive + transmit) / 2n,
           localMs: (request.atMs + event.atMs) / 2,
           readyMs: event.atMs,
         };
-        result.clockUncertaintyMs = Math.max(0, networkMs / 2);
+        clockUncertainty = Math.max(0, networkMs / 2);
+        // Refine future mapping without shrinking the error envelope of audio
+        // already rendered under the previous clock/frontier.
+        result.clockUncertaintyMs = result.ranges.length
+          ? Math.max(result.clockUncertaintyMs ?? 0, clockUncertainty)
+          : clockUncertainty;
       }
       continue;
     }

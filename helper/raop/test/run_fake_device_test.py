@@ -81,7 +81,10 @@ def standard_scenario():
     span = report['last_rtp_at'] - report['first_rtp_at']
     assert 0.5 < span < 1.9, span
     seqs = report['seqs']
-    assert all(b - a == 1 for a, b in zip(seqs, seqs[1:])), 'RTP seq gap'
+    # RTP sequence numbers are 16-bit and start randomly. A wrap is contiguous;
+    # a lost, duplicate or reordered packet must still fail this exact step.
+    assert all((b - a) & 0xFFFF == 1 for a, b in zip(seqs, seqs[1:])), \
+        f'RTP seq gap: {seqs}'
 
     # Volume mapping: 80% -> -6.0 dB, 42% -> ~-17.4 dB (RAOP -30..0 range).
     assert 'volume: -6.000000' in report['volume_params'], report['volume_params']
