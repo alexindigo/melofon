@@ -25,14 +25,22 @@ import { outputPlayerId } from './player-outputs.ts';
 type CapturedPlayerSave = PlayerSave & { position?: Promise<number> };
 // Capture all ordinary facts synchronously. Only the identified native cutoff
 // remains pending; retries reuse its resolved value, never re-read live state.
-const capturePlayer = (row: CapturedPlayerSave): Promise<PlayerSave> => {
+const capturePlayerSnapshot = (
+  row: CapturedPlayerSave,
+  failed: (error: unknown) => void,
+): Promise<PlayerSave> => {
   const { position, ...facts } = row;
   const copy = structuredClone(facts);
   const captured = position && copy.state
     ? position.then((positionMs) => ({
       ...copy,
       state: { ...copy.state!, positionMs },
-    }))
+    }), (error) => {
+      // Capture cannot be retried by storage. Keep this publication's observed
+      // position; storage errors still retry the immutable whole batch in order.
+      failed(error);
+      return copy;
+    })
     : Promise.resolve(copy);
   // The ordered writer may still be behind an older batch when this settles.
   // Retain rejection for that writer without an unhandled intermediate promise.
@@ -94,6 +102,11 @@ export function createPersistence(
     },
   },
 ): Persistence {
+  const capturePlayer = (row: CapturedPlayerSave) =>
+    capturePlayerSnapshot(
+      row,
+      (error) => log.event('persistence_failed', { error }),
+    );
   let tail: Promise<void> = Promise.resolve();
   let closed = false;
   let closeWork: Promise<void> | undefined;

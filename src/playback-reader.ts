@@ -32,6 +32,7 @@ export function createPlaybackReader(deps: {
   ): void;
   transportFailed(error: unknown): void;
   contentFailed(entry: QueueEntry, error: unknown): void;
+  sourceCleanupFailed(entry: QueueEntry, error: unknown): void;
   retirementFailed(error: unknown): void;
 }) {
   const { playback, sink, epoch } = deps;
@@ -166,6 +167,13 @@ export function createPlaybackReader(deps: {
       }
     });
   type Acquired = Awaited<ReturnType<typeof acquire>>;
+  const releaseInput = async (pcm: NonNullable<Acquired>['pcm']) => {
+    try {
+      await pcm.return();
+    } finally {
+      await pcm.completion;
+    }
+  };
   const future = (after: PlaybackSource) =>
     operations.run(async () => {
       while (owns(after)) {
@@ -250,6 +258,7 @@ export function createPlaybackReader(deps: {
     read: PlaybackRead,
     mapping: TimelineSource,
     input: NonNullable<Acquired>,
+    committed: () => void,
   ) => {
     const { source } = read, { pcm } = input;
     let bytes = 0;
@@ -281,6 +290,7 @@ export function createPlaybackReader(deps: {
             offset += accepted;
             bytes += accepted;
             if (owns(source) && accepted) {
+              committed();
               playback.sourceAccepted(source, receipt.acceptedFrames);
               playback.sourceAudio(source, accepted / 176400 * 1000);
             }
@@ -339,8 +349,7 @@ export function createPlaybackReader(deps: {
       observeCompletion(source, mapping, target);
       return { inputEnd: marker.inputEnd, frames: target };
     } finally {
-      await pcm.return();
-      await pcm.completion;
+      await releaseInput(pcm);
     }
   };
   const natural = (entry: QueueEntry) =>
@@ -361,16 +370,54 @@ export function createPlaybackReader(deps: {
     let read = deps.initial, mapping = bind(read);
     if (!mapping) return;
     let input: Acquired = null;
+    type End = NonNullable<Awaited<ReturnType<typeof write>>>;
+    let end: End | null = null;
+    let handoff:
+      | { read: PlaybackRead; mapping: TimelineSource; end: End }
+      | undefined;
     try {
-      while (owns(read.source)) {
+      while (live()) {
+        if (!owns(read.source)) {
+          if (!handoff || !owns(handoff.read.source)) return;
+          try {
+            if (input) await releaseInput(input.pcm);
+          } catch (error) {
+            deps.sourceCleanupFailed(read.entry, error);
+          }
+          input = null;
+          read = handoff.read;
+          mapping = handoff.mapping;
+          end = handoff.end;
+          handoff = undefined;
+        }
         // Preparation and one incoming head run concurrently with the outgoing
         // decoder, while the core keeps public current at the playing cursor.
         const pending = natural(read.entry) ? future(read.source) : null;
         void pending?.catch(() => {});
-        input ??= await acquire(read);
-        if (!input) return;
-        const end = await write(read, mapping, input);
-        input = null;
+        if (!end) {
+          input ??= await acquire(read);
+          if (!input) return;
+          const writing = input;
+          input = null;
+          try {
+            end = await write(read, mapping, writing, () => {
+              if (!handoff) return;
+              publications.get(handoff.read.source)?.resolve();
+              handoff = undefined;
+            });
+          } catch (error) {
+            if (owns(read.source) || !live() || !handoff) throw error;
+            deps.sourceCleanupFailed(read.entry, error);
+          }
+          if (!end && live() && handoff && owns(handoff.read.source)) {
+            // No replacement frame committed: the previous seal still owns
+            // the input endpoint and publication until a valid handoff/end.
+            read = handoff.read;
+            mapping = handoff.mapping;
+            end = handoff.end;
+            handoff = undefined;
+          }
+        }
         if (!end || !live()) return;
         const length = queueDuration(read.entry) ?? 0;
         if (
@@ -405,13 +452,19 @@ export function createPlaybackReader(deps: {
         }
         for (;;) {
           if (next && 'preparationFailed' in next) {
+            playback.finishSources(read.source);
             await endInput(read.source, end.inputEnd);
             return;
           }
           if (live() && next?.read.source.signal.aborted && owns(read.source)) {
-            await next.input?.pcm.return();
+            try {
+              if (next.input) await releaseInput(next.input.pcm);
+            } catch (error) {
+              deps.sourceCleanupFailed(next.read.entry, error);
+            }
             const replacement = await future(read.source);
             if (replacement && 'preparationFailed' in replacement) {
+              playback.finishSources(read.source);
               await endInput(read.source, end.inputEnd);
               return;
             }
@@ -438,10 +491,11 @@ export function createPlaybackReader(deps: {
           await endInput(read.source, end.inputEnd);
           return;
         }
-        publications.get(read.source)?.resolve();
+        handoff = { read, mapping, end };
         read = next.read;
         mapping = next.mapping;
         input = next.input;
+        end = null;
       }
     } catch (error) {
       if (owns(read.source)) {
@@ -452,7 +506,7 @@ export function createPlaybackReader(deps: {
         }
       }
     } finally {
-      await input?.pcm.return();
+      if (input) await releaseInput(input.pcm);
     }
   });
   void work.catch(deps.transportFailed);
@@ -460,7 +514,7 @@ export function createPlaybackReader(deps: {
     get drained() {
       return drained;
     },
-    settled: work.then(() => operations.close()),
+    settled: work.finally(() => operations.close()),
     mapping(source: PlaybackSource) {
       return mappings.get(source);
     },

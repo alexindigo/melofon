@@ -9,7 +9,7 @@ import {
 import { createPlayback, type PlaybackSink } from '../src/playback.ts';
 import { createNotify } from '../src/notify.ts';
 import type { NowPlaying } from '../src/nowplaying.ts';
-import type { QueueMedia } from '../src/queue-source.ts';
+import { catalogMedia, type QueueMedia } from '../src/queue-source.ts';
 import type { TimelineSource } from '../src/playback-timeline.ts';
 import { createMedia } from '../src/media.ts';
 import { createFfiStream } from '../src/boots/raop-ffi.ts';
@@ -17,6 +17,7 @@ import { profileFromService } from '../src/boots/airplay-profile.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 import { traceTimelineAudio } from './helpers/raop-timeline-audio.ts';
+import type { State } from '../src/state.ts';
 
 const media: QueueMedia = {
   reference: { kind: 'url', url: 'http://media.home/finite' },
@@ -57,6 +58,7 @@ async function core(
     resolve?: () => Promise<QueueMedia | null>;
     persistence?: PlayerPersistence;
     identity?: () => { id: bigint; epoch: bigint };
+    state?: Pick<State, 'declare' | 'getTyped'>;
   } = {},
 ) {
   const player = createPlayer(), notify = createNotify();
@@ -68,6 +70,7 @@ async function core(
     nowPlaying: {} as NowPlaying,
     resolveQueueReference: options.resolve,
     persistence: options.persistence,
+    state: options.state,
   });
   const detach = playback.attachSink(options.sink);
   const entries = await playback.queueAddSources(
@@ -209,6 +212,142 @@ test('final exhaustion waits for the final native completion, not read EOF', asy
     await f.complete(c.source, c.mapping);
     assertEquals(f.player.status().state, 'stop');
     assertEquals(f.player.status().current, null);
+  } finally {
+    await f.close();
+  }
+});
+test('rejected cutoff retains the observed bookmark and allows later Play', async () => {
+  const saves: { positionMs: number; position?: Promise<number> }[] = [];
+  const f = await core({
+    persistence: {
+      saveQueue() {},
+      saveState(state, position) {
+        saves.push({ positionMs: state.positionMs, position });
+      },
+    },
+    sink: { cutoff: () => Promise.reject(new Error('native cutoff fault')) },
+  });
+  try {
+    f.playback.sourceProgress(f.primary, {
+      ...f.mapping,
+      capturedNs: 1n,
+      sourceFrames: 13230n,
+      status: 'scheduled',
+      error: 'none',
+    });
+    f.playback.pause();
+    assertEquals(await saves.at(-1)!.position, 300);
+    await f.playback.play();
+    assertEquals(f.playback.playerView().state, 'play');
+    assertEquals(f.playback.playerView().itemProgressMs, 300);
+  } finally {
+    await f.close();
+  }
+});
+
+test('future web retries own independent budgets retained after promotion', async () => {
+  const f = await core({
+    state: {
+      declare() {},
+      getTyped(key) {
+        return Promise.resolve(
+          key === 'playback.source.retryBackoffMs' ? [0] : undefined,
+        );
+      },
+    },
+  });
+  try {
+    const b = await f.next();
+    assert(await f.playback.retrySource(b.source, 'decode-error'));
+    assert(await f.playback.retrySource(f.primary, 'decode-error'));
+    assertEquals(await f.playback.retrySource(b.source, 'decode-error'), false);
+    f.sealed(f.primary);
+    await f.complete(f.primary, f.mapping);
+    assertEquals(f.playback.sourcePlanView().playing, b.source);
+    assertEquals(await f.playback.retrySource(b.source, 'decode-error'), false);
+  } finally {
+    await f.close();
+  }
+});
+test('pre-capture reanchor rejection settles edit saves from the observed position', async () => {
+  const positions: (Promise<number> | undefined)[] = [];
+  const f = await core({
+    persistence: {
+      saveQueue(_queue, _state, position) {
+        positions.push(position);
+      },
+      saveState(_state, position) {
+        positions.push(position);
+      },
+    },
+    sink: {
+      cutoff: () => null,
+      reanchor: () => Promise.reject(new Error('pre-capture reanchor fault')),
+    },
+  });
+  try {
+    const b = await f.next();
+    f.sealed(b.source);
+    f.playback.sourceProgress(f.primary, {
+      ...f.mapping,
+      capturedNs: 1n,
+      sourceFrames: 13230n,
+      status: 'scheduled',
+      error: 'none',
+    });
+    await f.playback.queueRemove(b.source.entryId);
+    const captures = positions.filter((position) => position !== undefined);
+    assert(captures.length > 0);
+    assertEquals(await Promise.all(captures), captures.map(() => 300));
+    assertEquals(f.playback.playerView().state, 'pause');
+    await f.playback.play();
+    assertEquals(f.playback.playerView().state, 'play');
+  } finally {
+    await f.close();
+  }
+});
+test('a catalog primary does not disqualify its finite web successor retries', async () => {
+  const catalog = catalogMedia({
+    id: 'catalog',
+    path: '/music/catalog.wav',
+    fileName: 'catalog.wav',
+    libraryId: null,
+    libraryPath: null,
+    title: 'Catalog',
+    albumId: null,
+    albumName: null,
+    albumFolderName: null,
+    artistId: null,
+    artistName: null,
+    track: null,
+    disc: null,
+    durationMs: 1000,
+    size: 1,
+    genre: null,
+    year: null,
+    firstSeenMs: null,
+    isVideo: false,
+    suffix: 'wav',
+    contentType: 'audio/wav',
+  });
+  const f = await core({
+    items: [catalog, media],
+    state: {
+      declare() {},
+      getTyped(key) {
+        return Promise.resolve(
+          key === 'playback.source.retryBackoffMs' ? [0] : undefined,
+        );
+      },
+    },
+  });
+  try {
+    const b = await f.next();
+    assert(await f.playback.retrySource(b.source, 'decode-error'));
+    assertEquals(
+      await f.playback.retrySource(f.primary, 'decode-error'),
+      false,
+    );
   } finally {
     await f.close();
   }
@@ -408,12 +547,15 @@ test('accepted-future edit save captures the same atomic bookmark promise once',
   const captured = Promise.withResolvers<void>(),
     ready = Promise.withResolvers<void>();
   const saves: { ids: number[]; position?: Promise<number> }[] = [];
+  const states: { positionMs: number; position?: Promise<number> }[] = [];
   const f = await core({
     persistence: {
       saveQueue(snapshot, _state, position) {
         saves.push({ ids: snapshot.items.map((item) => item.id), position });
       },
-      saveState() {},
+      saveState(state, position) {
+        states.push({ positionMs: state.positionMs, position });
+      },
     },
     sink: {
       cutoff: () => null,
@@ -463,6 +605,25 @@ test('accepted-future edit save captures the same atomic bookmark promise once',
       'later readiness cannot resample the save',
     );
     assertEquals(saves.length, before + 1);
+    const replacement = f.playback.openSource(
+      f.primary.entryId,
+      f.player.status().generation,
+    )!;
+    const mapping = f.playback.bindSource(replacement, 1n, 2n)!;
+    assert(f.playback.sourceProgress(replacement, {
+      ...mapping,
+      capturedNs: 100n,
+      sourceFrames: 22050n,
+      status: 'scheduled',
+      error: 'none',
+    }));
+    await until(() => states.at(-1)?.positionMs === 800);
+    const latest = states.at(-1)!;
+    assertEquals(
+      await (latest.position ?? Promise.resolve(latest.positionMs)),
+      800,
+      'later periodic saves do not reuse the edit cutoff',
+    );
   } finally {
     captured.resolve();
     ready.resolve();

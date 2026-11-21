@@ -5,6 +5,23 @@ import type { PlaybackSource } from '../src/player.ts';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 
+async function resolverEntry(pending: Promise<void>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('timed out: speculative resolver entry')),
+          15000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function until(predicate: () => boolean | Promise<boolean>) {
   const deadline = performance.now() + 15000;
   while (!await predicate()) {
@@ -309,7 +326,7 @@ test('failed speculative preparation preserves the healthy primary tail until it
     const primary = f.playback.queueView().items[0].id;
     armed = true;
     await c.command('play');
-    await entered.promise;
+    await resolverEntry(entered.promise);
     assertEquals((await c.current()).current.entryId, primary);
     assertEquals(
       f.audio.epochs.length,
@@ -410,7 +427,7 @@ for (const edit of ['remove', 'move', 'append', 'unrelated-move'] as const) {
       );
       armed = true;
       await c.command('play');
-      await entered.promise;
+      await resolverEntry(entered.promise);
       const reading = f.playback.sourcePlanView().reading!;
       const playing = f.playback.sourcePlanView().playing!;
       assertEquals(reading.entryId, entries[1].id);
@@ -500,7 +517,7 @@ for (const command of ['seek', 'restart', 'stop', 'next'] as const) {
       const entries = f.playback.queueView().items;
       armed = true;
       await c.command('play');
-      await entered.promise;
+      await resolverEntry(entered.promise);
       const old = f.playback.sourcePlanView().reading!;
       const playing = f.playback.sourcePlanView().playing!;
       await c.command(command, command === 'seek' ? { positionMs: 0 } : {});
@@ -560,7 +577,7 @@ test('owner close joins held read acquisition and retains the playing identity u
     const current = f.playback.queueView().items[0].id;
     armed = true;
     await c.command('play');
-    await entered.promise;
+    await resolverEntry(entered.promise);
     const read = f.playback.sourcePlanView().reading!, play = f.token!;
     let closed = false;
     const close = f.playback.close().then(() => {
@@ -607,7 +624,7 @@ test('ordinary HTTP additions retain FIFO across held source resolution', async 
         references: [{ kind: 'station', id }],
       }, c.credential);
     const first = add('first');
-    await entered.promise;
+    await resolverEntry(entered.promise);
     const second = add('second');
     assertEquals(f.playback.queueView().items.length, 0);
     held.resolve();
@@ -659,7 +676,7 @@ test('held failure successor acquisition is joined and cannot override a newer S
     const entryId = f.playback.queueView().items[0].id;
     armed = true;
     await c.command('play');
-    await entered.promise;
+    await resolverEntry(entered.promise);
     const read = f.playback.sourcePlanView().reading!;
     assert(read && read.entryId !== entryId);
     assertEquals((await c.current()).current.entryId, entryId);
