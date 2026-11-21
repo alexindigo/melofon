@@ -460,6 +460,69 @@ test('same-epoch 353/351 seals concatenate inside a packet without padding or FL
   }
 });
 
+test('progress stream end during prepared backend write retains exact packet padding', async () => {
+  const mode =
+    'stream end during prepared backend write retains exact packet padding';
+  if (Deno.env.get('RAOP_PROGRESS_CASE') !== mode) {
+    return await progressChild(mode);
+  }
+  const controls = Deno.dlopen(
+    `${Deno.env.get('RAOP_PROGRESS_DIRECTORY')}/progress.so`,
+    {
+      raop_fi_hold_write: { parameters: ['u64'], result: 'void' },
+      raop_fi_write_held: { parameters: [], result: 'i32' },
+      raop_fi_release_write: { parameters: [], result: 'void' },
+    },
+  );
+  const stream = createFfiStream();
+  const receiver = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+  });
+  const attachment = stream.attach(() => {}), bytes = pcm(353);
+  try {
+    controls.symbols.raop_fi_hold_write(stream.id);
+    await attachment.start(profile(receiver), item);
+    await append(stream, highSource, bytes);
+    await until(
+      'prepared PCM is parked before backend submission',
+      () => controls.symbols.raop_fi_write_held() !== 0,
+    );
+    assertEquals(
+      (await stream.source(stream.epoch, highSource))!.fedFrames,
+      353n,
+    );
+    assertEquals(receiver.sessions[0].audioPackets, 0);
+    await stream.seal(stream.epoch, highSource, 353n);
+    await stream.endStream(stream.epoch, 353n);
+    controls.symbols.raop_fi_release_write();
+    const { all, result } = await rendered(
+      stream,
+      receiver,
+      353,
+      new Map([[highSource, bytes]]),
+    );
+    assertEquals(
+      all.filter((r) => r.kind === 'padding').reduce(
+        (n, r) => n + r.frames,
+        0n,
+      ),
+      351n,
+    );
+    assertEquals(result.pcm.subarray(0, bytes.length), bytes);
+    assertEquals(
+      result.pcm.subarray(bytes.length),
+      new Uint8Array(result.pcm.length - bytes.length),
+    );
+    await libraryProof();
+  } finally {
+    controls.symbols.raop_fi_release_write();
+    await stream.close();
+    receiver.close();
+    controls.close();
+  }
+});
+
 test('a paced partial packet survives an asynchronous same-stream source boundary', async () => {
   const stream = createFfiStream();
   const receiver = await startFakeRaop({

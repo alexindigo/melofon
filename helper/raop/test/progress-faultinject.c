@@ -12,6 +12,7 @@
 #include <sys/timerfd.h>
 #include <gcrypt.h>
 #include <netdb.h>
+#include <stdatomic.h>
 #include "outputs.h"
 #include "transcode.h"
 
@@ -22,6 +23,33 @@ static void *symbol(const char *name, const char *library)
   if (!p) abort();
   return p;
 }
+static _Atomic uint64_t target_stream;
+static _Atomic int held_write;
+static _Thread_local uint64_t writing_stream;
+static void (*write_original)(struct output_buffer *);
+static void target_write(struct output_buffer *buffer)
+{
+  writing_stream = buffer->stream_id;
+  int armed = 1;
+  if (writing_stream == atomic_load(&target_stream) &&
+      atomic_compare_exchange_strong(&held_write, &armed, 2))
+    while (atomic_load(&held_write) == 2) usleep(100);
+  write_original(buffer);
+  writing_stream = 0;
+}
+void raop_fi_target_stream(uint64_t id)
+{
+  struct output_definition *backend = dlsym(dlopen(getenv("MELOFON_RAOP_LIB"), RTLD_NOW | RTLD_LOCAL), "output_raop");
+  if (!write_original) { write_original = backend->write; backend->write = target_write; }
+  atomic_store(&target_stream, id);
+}
+void raop_fi_hold_write(uint64_t id)
+{
+  raop_fi_target_stream(id);
+  atomic_store(&held_write, 1);
+}
+int raop_fi_write_held(void) { return atomic_load(&held_write) == 2; }
+void raop_fi_release_write(void) { atomic_store(&held_write, 0); }
 static int arm(const char *kind)
 {
   const char *mode = getenv("RAOP_PROGRESS_FAULT");
