@@ -132,9 +132,13 @@ MELOFON_RAOP_LIB="$PWD/helper/raop/libmelofon_raop.so" \
 MELOFON_QUALIFY_REAL=1 \
 MELOFON_QUALIFICATION_CONFIG=/home/tester/qualification/private/qualification.json \
 deno test --frozen --node-modules-dir=manual \
-  --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys --allow-run \
+  --allow-all \
   tests/airplay-real-qualification.test.ts
 ```
+
+Deno requires `--allow-all` for the final `/proc/self/maps` assertion that proves
+the shipping native library is mapped; enumerating read/FFI/sys permissions is
+not sufficient. Keep this invocation restricted to the dedicated test guest.
 
 Each run creates a new external evidence subdirectory containing
 `qualification.json` and exact expected/accepted s16le stereo PCM. Scenarios cover

@@ -1,6 +1,6 @@
 // No imports with runtime/device side effects before the explicit opt-in. This
 // is a real-speaker test, not another fake receiver or a normal scripts/test job.
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertThrows } from '@std/assert';
 import { isAbsolute, relative } from 'node:path';
 import type {
   AirplayCompletionResult,
@@ -105,6 +105,63 @@ async function reachable(hostname: string, port: number) {
     return false;
   }
 }
+
+// Native completion is retained until acknowledgment. Reading it again is not
+// another completion; preserve the identity and reject conflicting observations.
+function rememberCompletion(
+  receipts: Map<string, AirplayCompletionResult>,
+  result: AirplayCompletionResult,
+) {
+  const key = [
+    result.streamId,
+    result.epoch,
+    result.source,
+    result.target,
+    result.revision,
+  ].join('/');
+  const previous = receipts.get(key);
+  if (previous) assertEquals(result, previous, 'Retained receipt changed');
+  else receipts.set(key, result);
+}
+
+Deno.test('real qualification counts immutable receipt identities, not reads', () => {
+  const receipts = new Map<string, AirplayCompletionResult>();
+  const result: AirplayCompletionResult = {
+    streamId: 1n,
+    epoch: 1n,
+    source: 1n,
+    target: 353n,
+    revision: 1n,
+    inputEnd: 353n,
+    status: 'complete',
+    error: 'none',
+    transportEnd: 353n,
+    capturedNs: 100n,
+    required: 1n,
+    attachments: [],
+  };
+  rememberCompletion(receipts, result);
+  rememberCompletion(receipts, structuredClone(result));
+  assertEquals(receipts.size, 1);
+  for (
+    const field of [
+      'streamId',
+      'epoch',
+      'source',
+      'target',
+      'revision',
+    ] as const
+  ) {
+    rememberCompletion(receipts, { ...result, [field]: result[field] + 1n });
+  }
+  assertEquals(receipts.size, 6);
+  assertThrows(
+    () => rememberCompletion(receipts, { ...result, capturedNs: 101n }),
+    Error,
+    'Retained receipt changed',
+  );
+  assertEquals(receipts.get('1/1/1/353/1'), result);
+});
 
 Deno.test({
   name:
@@ -298,7 +355,7 @@ Deno.test({
       const traces: {
         stream: AirplayTimelineStream;
         epochs: Map<bigint, Uint8Array[]>;
-        completions: AirplayCompletionResult[];
+        completions: Map<string, AirplayCompletionResult>;
         cutoffs: AirplaySourceCutoff[];
         drained: Set<bigint>;
         origins: { epoch: bigint; originFrame: bigint }[];
@@ -341,7 +398,7 @@ Deno.test({
               const trace = {
                 stream: native,
                 epochs: new Map<bigint, Uint8Array[]>(),
-                completions: [] as AirplayCompletionResult[],
+                completions: new Map<string, AirplayCompletionResult>(),
                 cutoffs: [] as AirplaySourceCutoff[],
                 drained: new Set<bigint>(),
                 origins: [] as { epoch: bigint; originFrame: bigint }[],
@@ -414,7 +471,7 @@ Deno.test({
                     epoch: key.epoch,
                     ranges,
                   });
-                  trace.completions.push(result);
+                  rememberCompletion(trace.completions, result);
                   observe('native-completion', result);
                   return result;
                 },
@@ -574,7 +631,9 @@ Deno.test({
             (await current()).state === 'stop' && tr.drained.has(epoch),
           30000,
         );
-        const receipts = tr.completions.filter((r) => r.epoch === epoch);
+        const receipts = [...tr.completions.values()].filter((r) =>
+          r.epoch === epoch
+        );
         assertEquals(receipts.length, count);
         for (const receipt of receipts) {
           assertEquals(receipt.status, 'complete');
