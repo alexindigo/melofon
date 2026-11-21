@@ -1477,7 +1477,7 @@ raop_stream_drained(raop_stream_t *stream, uint64_t epoch)
 }
 
 int
-raop_stream_metadata(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+raop_stream_timeline_metadata(raop_stream_t *stream, uint64_t epoch, uint64_t source,
   uint64_t frame, uint64_t origin, uint64_t duration, const char *title, const char *artist)
 {
   if (!stream || !epoch || !source || !title || !artist || origin > UINT64_MAX - frame) return -1;

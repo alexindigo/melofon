@@ -83,7 +83,7 @@ int raop_stream_end(raop_stream_t *, uint64_t epoch, uint64_t target,
 int raop_stream_drained(raop_stream_t *, uint64_t epoch);
 /* Copied source-frame metadata. 1 accepted, 0 bounded-marker backpressure,
  * 2 canceled/stale, -1 invalid, -2 allocation failure. No read-time publication. */
-int raop_stream_metadata(raop_stream_t *, uint64_t epoch, uint64_t source,
+int raop_stream_timeline_metadata(raop_stream_t *, uint64_t epoch, uint64_t source,
   uint64_t source_frame, uint64_t media_origin, uint64_t duration_frames,
   const char *title, const char *artist);
 /* After sealed catalog EOF, pace explicitly labelled compatibility silence until
