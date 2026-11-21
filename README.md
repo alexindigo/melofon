@@ -77,6 +77,83 @@ Nginx HTTP ingress setup. Chromium must be available inside that environment,
 not just on the host; the flag makes an absent browser fail instead of skip.
 A separate browser CI job is planned, not enabled yet.
 
+### Real AirPlay qualification (opt-in, VM only)
+
+`tests/airplay-real-qualification.test.ts` is ignored unless
+`MELOFON_QUALIFY_REAL=1`. Ordinary `scripts/test` runs do not forward this flag
+or the private configuration and never select a household speaker. Do not run
+the enabled test on a physical host or in the ordinary devcontainer. Use a
+dedicated real-device VM with this checkout bind-mounted, the normal native/media
+dependencies installed, and `melofon.home` resolving to the VM's non-loopback IP.
+There is no provisioned real-device VM yet; hardware qualification is pending.
+
+The enabled test takes exclusive control of **one explicitly named receiver**,
+plays generated low-amplitude patterns at your chosen absolute `volume`, then
+releases it. Arrange the listening window and safe volume locally first.
+It uses real HTTP controls, the production decoder/native library and the
+existing speaker credential owner. It does not launch the household server or
+auto-resume its saved queues. Other speakers are not restored into the test graph.
+
+Prepare a separate, stopped **private test server data directory** with that
+receiver already adopted and its credentials configured through the normal
+speaker API. Never point this test at the live server's database. Supply the
+same `MELOFON_SECRET` locally when encrypted credentials are present; do not put
+secrets in commands, receipts, or the config. An authentication requirement must
+be declared as `none`, `password`, or `pairing-key`; missing required credentials
+fail separately from unreachable hardware. The test uses the retained-session
+`owntone` strategy to exercise natural A/B session reuse.
+
+Create the evidence directory outside the checkout and separate from private
+data. Put this JSON in a private file outside the checkout, mode `0600` (all
+paths refer to the VM, and the model/firmware are operator-supplied facts):
+
+```json
+{
+  "dataDir": "/home/tester/qualification/private/data",
+  "evidenceDir": "/home/tester/qualification/evidence",
+  "receiverId": "YOUR-ADOPTED-SPEAKER-ID",
+  "receiverHost": "YOUR-RECEIVER-IP",
+  "receiverPort": 7000,
+  "receiverModel": "YOUR-APPLE-TV-MODEL",
+  "firmware": "YOUR-FIRMWARE-VERSION",
+  "credentialRequirement": "pairing-key",
+  "volume": 10
+}
+```
+
+Run **inside that VM**, from the mounted checkout, after configuring credentials
+locally. This is deliberately separate from `scripts/test`:
+
+```bash
+export TMPDIR="$PWD/.test-tmp/real-qualification"
+mkdir -p "$TMPDIR"
+make -C helper/raop
+MELOFON_RAOP_LIB="$PWD/helper/raop/libmelofon_raop.so" \
+MELOFON_QUALIFY_REAL=1 \
+MELOFON_QUALIFICATION_CONFIG=/home/tester/qualification/private/qualification.json \
+deno test --frozen --node-modules-dir=manual \
+  --allow-net --allow-env --allow-read --allow-write --allow-ffi --allow-sys --allow-run \
+  tests/airplay-real-qualification.test.ts
+```
+
+Each run creates a new external evidence subdirectory containing
+`qualification.json` and exact expected/accepted s16le stereo PCM. Scenarios cover
+1/351/352/353/441-frame tails after a packet-aligned intro, gapless A/B, a 100 ms natural crossfade, manual Next
+after accepted overlap, seek, held Stop bookmarks and fresh solo resume prefixes.
+The report preserves native per-attachment session identities, frame coverage,
+scheduled completion/cutoff timing, public position and the mapped production
+library's SHA256. No raw credentials or authentication packets are saved.
+
+DNS/TCP unavailability is recorded as `unverified-unreachable`, with the hardware
+step ignored, **not qualified**. Once reachable, protocol, preparation, decoding,
+assertion and cleanup failures fail the test and retain evidence. A successful
+run proves exact PCM **at native admission** and scheduled submission to the real
+receiver, not what its DAC rendered. Receiver-rendered prefix preservation,
+audible tails/crossfade and multi-room synchronization remain explicitly
+unverified without separately authorized listening/capture evidence. One Apple TV
+cannot qualify two physical rooms. Keep such observations in a qualification
+report outside the repository, referencing the run's evidence directory.
+
 ### Temporary files and troubleshooting
 
 Temporary files, dependency caches and retained test logs live in the ignored
