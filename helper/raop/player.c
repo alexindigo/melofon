@@ -244,14 +244,11 @@ pts_now(const struct raop_player *p)
 /* OwnTone event_play_start: after output_buffer_samples written, send
  * metadata with the live stream pts. That object is what keep-alive
  * progress then uses. */
-static void
+static int
 metadata_send_now(struct raop_player *p)
 {
   struct output_metadata *md;
   struct raop_metadata_mirror *rmd;
-
-  if (p->wanted_metadata == 0)
-    return;
 
   md = calloc(1, sizeof(*md));
   rmd = calloc(1, sizeof(*rmd));
@@ -259,13 +256,15 @@ metadata_send_now(struct raop_player *p)
     {
       free(md);
       free(rmd);
-      return;
+      return -1;
     }
   rmd->metadata = evbuffer_new();
+  if (!rmd->metadata) { free(rmd); free(md); return -1; }
   rmd->artwork = NULL; /* skip artwork unless we have bytes (plan: optional) */
   rmd->artwork_fmt = -1;
-  if (p->wanted_metadata & RAOP_MD_WANTS_TEXT)
-    dmap_encode_text(rmd->metadata, p->title, p->artist);
+  /* Build stream content, not the first receiver's wishes. Each attachment
+   * filters its own request types, including a later text-capable join. */
+  dmap_encode_text(rmd->metadata, p->title, p->artist);
   md->type = OUTPUT_TYPE_RAOP;
   md->stream_id = p->stream_id;
   md->pos_ms = p->pos_ms;
@@ -273,8 +272,9 @@ metadata_send_now(struct raop_player *p)
   md->pts = pts_now(p);
   md->startup = true;
   md->priv = rmd;
-  output_raop.metadata_send(md);
-  p->metadata_sent = true;
+  int ret = raop_metadata_send_stream(p->stream_id, md);
+  if (!ret) p->metadata_sent = p->clock_started;
+  return ret;
 }
 
 static uint64_t
@@ -577,7 +577,7 @@ raop_player_metadata_update(struct raop_player *p)
     md->timeline_frame = transport; md->media_frame = m->origin + m->frame;
     md->position_frames = md->media_frame; md->duration_frames = m->duration;
     md->priv = rmd;
-    output_raop.metadata_send(md);
+    raop_metadata_send_stream(p->stream_id, md);
     metadata_marker_free(m);
   }
   if (p->metadata_source) {
@@ -1133,9 +1133,11 @@ raop_player_drain_complete(struct raop_player *p)
   pthread_mutex_lock(&p->pcm_lock);
   struct timeline *t = p->timeline;
   struct raop_progress_snapshot progress;
-  bool complete = t && t->ended && t->tail_reached && !t->padding_left &&
-    !p->failure.error && !evbuffer_get_length(p->pcm);
-  if (complete) {
+  bool complete = t && t->ended && (!t->end_target || p->failure.error);
+  /* Keep lane 1's last-real boundary for delayed end/compatibility silence.
+   * A failed receipt alone never stops viable peers with queued real input. */
+  if (!complete && t && t->ended && t->tail_reached && !t->padding_left &&
+      !evbuffer_get_length(p->pcm)) {
     raop_transport_progress(p->stream_id, 0, monotonic_ns(), &progress);
     complete = progress.participants && progress.status == 1 &&
       progress.submitted_frames >= t->transport_end &&
@@ -1162,4 +1164,14 @@ raop_player_item_set(struct raop_player *p, const char *title,
   p->len_ms = len_ms;
   p->wanted_metadata = wanted_metadata;
   p->metadata_sent = false;
+}
+
+/* Current transport metadata, not a source-boundary scheduling policy. Before
+ * the first clock anchor, retain the content and refresh its PTS on playback. */
+int
+raop_player_metadata_now(struct raop_player *p, const char *title, const char *artist,
+                      uint32_t pos_ms, uint32_t len_ms)
+{
+  raop_player_item_set(p, title, artist, pos_ms, len_ms, p->wanted_metadata);
+  return metadata_send_now(p);
 }

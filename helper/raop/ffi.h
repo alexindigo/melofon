@@ -18,16 +18,21 @@ typedef struct raop_stream raop_stream_t;
 /* Additive explicit-stream API. A stream owns one PCM ingress/pacer/PTS clock;
  * attachments own device control and release only. Identities are nonzero,
  * monotonically allocated 64-bit incarnations, never RTP or reusable player ids.
- * Dormant streams are allowed; start/probe/write reserves the one active stream
- * BEFORE session allocation. A different stream (including the legacy group)
- * is refused with -2 until the owner's resources are proven released.
- * Metadata/crypto/control-service isolation is not yet multi-stream capable. */
+ * Streams may activate concurrently on the shared runtime. Each owns its PCM,
+ * masters, metadata, crypto and control service. Compatibility handles share
+ * group 1; public household capacity is enforced separately by core. */
 raop_stream_t *raop_stream_new(void);
+/* Replace this stream's current transport metadata, including while dormant.
+ * This is not a source-marker scheduler. Text is copied before return; the
+ * callback-free call joins loop dispatch and reserves storage against free.
+ * Returns 0 on success, -1 on closed input, scheduling or allocation failure. */
+int raop_stream_metadata_now(raop_stream_t *stream, const char *title, const char *artist,
+                         uint32_t position_ms, uint32_t length_ms);
 uint64_t raop_stream_id(raop_stream_t *stream);
 raop_t *raop_stream_attach(raop_stream_t *stream);
 uint64_t raop_attachment_id(raop_t *attachment);
-/* Whole-frame bytes accepted, 0 = bounded ingress full, -1 = invalid/closing,
- * -2 = another stream owns the runtime. Device-oriented raop_write refuses
+/* Whole-frame bytes accepted, 0 = bounded ingress full, -1 = invalid/closing.
+ * Device-oriented raop_write refuses
  * explicit attachments: there is exactly one input port per stream. */
 int raop_stream_write(raop_stream_t *stream, const uint8_t *pcm, size_t len);
 /* Exact admission, additive to the transitional whole-chunk write port. The

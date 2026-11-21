@@ -335,25 +335,25 @@ test('held Pause keeps its admission bookmark and resume renders the exact suffi
   }
 });
 
-async function busy(f: Awaited<ReturnType<typeof concurrentFixture>>) {
-  const { credential } = await f.server.f.login('bearer');
-  const response = await f.server.f.json(
-    '/api/v1/players/2/play',
-    'POST',
-    {},
-    credential,
+// b19 / plan section 3.1 row 25 replaces b11's temporary singleton premise.
+// Keep the pending/failed-release cases, now proving disjoint B independence.
+async function independent(f: Awaited<ReturnType<typeof concurrentFixture>>) {
+  if (f.receivers[2].sessions.length === 0) {
+    await f.server.call('/players/2/play', 'POST', {});
+  }
+  await timelineUntil(
+    'independent B emits',
+    () => f.receivers[2].sessions[0]?.audioPackets > 0,
   );
-  const text = await response.text();
-  assertEquals(response.status, 409, text);
-  assertEquals(JSON.parse(text).code, 'airplay_busy');
-  assertEquals(f.players.get(2).playerView().state, 'stop');
-  assertEquals(f.receivers[2].sessions.length, 0);
+  assertEquals((await f.server.call('/players/2')).player.state, 'play');
+  assertEquals(f.receivers[2].sessions.length, 1);
+  assertEquals(f.receivers[2].sessions[0].flushes, 0);
 }
 
-test('capacity stays one through natural drain, held Pause and pending retirement', async () => {
+test('B stays independent through A natural drain, Pause and pending retirement', async () => {
   const close = Promise.withResolvers<void>();
   let entered = false;
-  const f = await concurrentFixture([44100 + 353, 44100 + 351], {
+  const f = await concurrentFixture([44100 + 353, 44100 * 20 + 351], {
     async closeStream(release) {
       entered = true;
       await close.promise;
@@ -370,31 +370,28 @@ test('capacity stays one through natural drain, held Pause and pending retiremen
           (r.sessions[0]?.audioPackets ?? 0) >= 20
         ),
     );
-    await busy(f);
+    await independent(f);
     await f.server.call('/players/1/pause', 'POST', {});
-    await busy(f);
+    await independent(f);
     await f.server.call('/players/1/play', 'POST', {});
     await timelineUntil(
       'natural end with native retirement held',
       () => entered && f.players.get(1).playerView().state === 'stop',
     );
-    await busy(f);
+    await independent(f);
     close.resolve();
-    const { credential } = await f.server.f.login('bearer');
-    await timelineUntil('B admitted only after release', async () => {
-      const response = await f.server.f.json(
-        '/api/v1/players/2/play',
-        'POST',
-        {},
-        credential,
-      );
-      const text = await response.text();
-      assert(response.status === 204 || response.status === 409, text);
-      return response.status === 204;
-    });
+    await independent(f);
     await timelineUntil(
-      'B emits after proven release',
-      () => (f.receivers[2].sessions[0]?.audioPackets ?? 0) > 0,
+      'B complete scheduled tail',
+      () => f.players.get(2).playerView().state === 'stop',
+    );
+    const b = f.traces.find((t) => t.ports.has(f.receivers[2].port))!;
+    exact(
+      b.audio.scheduledRealAudio(
+        f.receivers[2].sessions[0],
+        f.receivers[2].nowMs(),
+      ),
+      f.waves[1].subarray(44),
     );
     await f.libraryProof();
   } finally {
@@ -403,10 +400,11 @@ test('capacity stays one through natural drain, held Pause and pending retiremen
   }
 });
 
-test('failed native release is quarantined and never frees capacity', async () => {
+test('failed A native release remains quarantined without blocking disjoint B', async () => {
   let raw: (() => Promise<void>) | undefined;
   const f = await concurrentFixture([44100 + 353, 44100 + 351], {
     closeStream(release) {
+      if (raw) return release();
       raw = release;
       return Promise.reject(new Error('acceptance native free failure'));
     },
@@ -421,14 +419,26 @@ test('failed native release is quarantined and never frees capacity', async () =
     );
     await f.server.call('/players/1/stop', 'POST', {});
     await timelineUntil('release attempted', () => raw !== undefined);
-    await busy(f);
+    await independent(f);
     await sleep(300);
-    await busy(f);
+    await independent(f);
     assertEquals(f.players.get(1).playerView().state, 'pause');
     assertEquals(
-      f.traces[0].audio.epochs,
+      f.traces.find((t) => t.ports.has(f.receivers[0].port))!.audio.epochs,
       [],
       'canceled partial source is never a completion',
+    );
+    await timelineUntil(
+      'B completes despite failed A free',
+      () => f.players.get(2).playerView().state === 'stop',
+    );
+    const b = f.traces.find((t) => t.ports.has(f.receivers[2].port))!;
+    exact(
+      b.audio.scheduledRealAudio(
+        f.receivers[2].sessions[0],
+        f.receivers[2].nowMs(),
+      ),
+      f.waves[1].subarray(44),
     );
     await f.libraryProof();
     failed = true;
@@ -438,9 +448,5 @@ test('failed native release is quarantined and never frees capacity', async () =
     // quarantined public owner.
     await raw?.();
     if (!failed) await f.close().catch(() => {});
-    else {
-      for (const r of f.receivers) r.close();
-      await Deno.remove(f.dir, { recursive: true });
-    }
   }
 });

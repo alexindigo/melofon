@@ -123,7 +123,7 @@ export interface FakeRaop {
   port: number;
   sessions: FakeRaopSession[];
   close(): void;
-  requestRetransmit(id: string, sequence?: number): void;
+  requestRetransmit(id: string, sequence?: number, target?: RaopEndpoint): void;
   requestTiming(id: string): void;
   /** Same clock as wire.atMs, for scheduled snapshots. */
   nowMs(): number;
@@ -141,6 +141,8 @@ export function startFakeRaop(
     beforeFlushReply?: () => Promise<void>;
     refuseFlush?: boolean;
     captureAudio?: boolean;
+    /** A real receiver requests missing datagrams inside its observed suffix. */
+    recoverAudioGaps?: boolean;
     /** Lossless raw scheduling evidence, separate from legacy arrival capture. */
     captureWire?: boolean;
     /** Delay receiver-side timing observation, preserving measured RTT bounds. */
@@ -155,7 +157,10 @@ export function startFakeRaop(
   const sessions: FakeRaopSession[] = [];
   const sockets: { close(): void }[] = [];
   const conns: Deno.TcpConn[] = [];
-  const retransmits = new Map<string, (sequence?: number) => void>();
+  const retransmits = new Map<
+    string,
+    (sequence?: number, target?: RaopEndpoint) => void
+  >();
   const timingRequests = new Map<string, () => void>();
   const bindAddress = '127.0.0.1';
   const started = performance.now();
@@ -169,6 +174,7 @@ export function startFakeRaop(
   const respond = async (conn: Deno.TcpConn) => {
     const nonce = randomBytes(16).toString('hex');
     let recording = false;
+    let nextAudioSequence: number | undefined;
     sessionSeq++;
     const session: FakeRaopSession = {
       id: `FAKE${sessionSeq.toString(16).toUpperCase().padStart(8, '0')}`,
@@ -276,6 +282,20 @@ export function startFakeRaop(
       if (msg.length < 12 || (msg[1] & 0x7f) !== 96) return;
       recordPeer(session.rtpSenders, peer);
       session.audioPackets++;
+      if (opts.recoverAudioGaps && recording) {
+        const sequence = msg.readUInt16BE(2);
+        const gap = nextAudioSequence === undefined
+          ? 0
+          : (sequence - nextAudioSequence + 65536) % 65536;
+        if (gap < 32768) {
+          // Start at the first delivered packet, not RECORD: a slow handshake
+          // can legitimately trim already expired packets from that anchor.
+          for (let i = 0; i < gap; i++) {
+            retransmits.get(session.id)?.((nextAudioSequence! + i) % 65536);
+          }
+          nextAudioSequence = (sequence + 1) % 65536;
+        }
+      }
       if (session.firstRtpAtMs === null) session.firstRtpAtMs = now();
       session.lastRtpAtMs = now();
       if (opts.captureAudio && session.audioPayloads.length < 8192) {
@@ -406,6 +426,7 @@ export function startFakeRaop(
           session.volumeParams.push(body.trim());
         }
         if (method === 'FLUSH') {
+          nextAudioSequence = undefined;
           session.flushes++;
           if (opts.captureWire) {
             session.wire.push({
@@ -477,16 +498,21 @@ export function startFakeRaop(
             }
             timing.send(request, timingPort, session.rtspPeer.address);
           });
-          retransmits.set(session.id, (requested) => {
+          retransmits.set(session.id, (requested, target) => {
             const sequence = requested ?? session.rtpSequences.at(-1);
             if (!controlPort || sequence === undefined) return;
             const request = new Uint8Array([0x80, 0xd5, 0, 1, 0, 0, 0, 1]);
             new DataView(request.buffer).setUint16(4, sequence);
-            control.send(request, controlPort, session.rtspPeer.address);
+            control.send(
+              request,
+              target?.port ?? controlPort,
+              target?.address ?? session.rtspPeer.address,
+            );
           });
           extra =
             `Session: ${session.id}\r\nTransport: RTP/AVP/UDP;unicast;mode=record;server_port=${audioPort};control_port=${control.address().port};timing_port=${timing.address().port}\r\n`;
         } else if (method === 'RECORD') {
+          nextAudioSequence = undefined;
           recording = !opts.refuseRecord?.();
           extra = 'Audio-Latency: 11025\r\n';
           if (opts.captureWire && recording) {
@@ -533,8 +559,8 @@ export function startFakeRaop(
   return Promise.resolve({
     port,
     sessions,
-    requestRetransmit(id, sequence) {
-      retransmits.get(id)?.(sequence);
+    requestRetransmit(id, sequence, target) {
+      retransmits.get(id)?.(sequence, target);
     },
     requestTiming(id) {
       timingRequests.get(id)?.();

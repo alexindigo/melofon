@@ -34,6 +34,17 @@ first sync matches RTSP without rewinding the master or changing other peers.
 Both sides of the live RTP/NTP correlation are translated by the same frame
 interval; periodic sync and native scheduled progress retain the live clock.
 
+For every joining receiver, RECORD selects the oldest contiguous committed
+packet whose presentation deadline leaves the receiver's 250 ms buffering
+interval for the RECORD/first-sync round trip. Sequence and timestamp both name
+that cached packet. This is receiver-local: the master keeps pacing for ready
+peers, without waiting for a startup cohort or rewinding its RTP cursor.
+
+The first sync backfills the contiguous cached suffix from that anchor
+whose presentation deadlines remain in the future. Only the first delivered
+packet carries the marker; successful, on-time sends establish coverage from
+the first backfilled epoch frame, never from audio already presented.
+
 This follows upstream `rtp_common.c`'s documented first-sync/RTSP compatibility
 requirement (Eufy Genie) and the RECORD and sync definitions in sections 5.1-5.2
 of <https://nto.github.io/AirPlay.html>. Deterministic delayed-RECORD proofs cover
@@ -115,19 +126,82 @@ the addressed stream; removing one attachment never stops a healthy peer's
 pacer or clears its partial ALAC input.
 
 The compatibility device API retains device-local pacers and exclusive legacy
-input; production playback uses one fixed-player stream producer. Both paths reserve one native
-active-stream guard before session allocation or PCM acceptance. A competing
-explicit/compatibility context returns an error, not accepted-and-dropped PCM.
+input in group 1; production playback uses one fixed-player stream producer.
+Explicit contexts activate concurrently without sharing PCM or native masters.
 Dormant streams retain a runtime reference; native free refuses while any
 attachment is still owned, including during terminal release. The typed port
 joins its C1 producers, attempts all C3 attachment releases, then frees the
-stream on the loop. Failed native release retains storage and the guard.
+stream on the loop. Failed native release retains its storage and runtime reference.
 
-This is not concurrent-stream qualification: metadata/crypto/control-service
-isolation and retained source completion remain separate work.
 `tests/raop-stream.test.ts` exercises the shipping public FFI through real UDP,
 ALAC decoding and the independent scheduled receiver model, including both
-attachment-removal orders and compatibility/explicit guard competition.
+attachment-removal orders and concurrent compatibility/explicit contexts.
+Core demand/resource ports independently retain each fixed player's stream.
+
+## Stream-local metadata and crypto
+
+`outputs/raop.c` lazily owns one backend context per stream incarnation. It
+retains metadata, AES key/IV/cipher and matching RSA-OAEP/base64 SDP material
+across attachment/master retirement. Stream free, after all device joins,
+purges only that context and erases its key copies. Runtime crypto bootstrap,
+the timing service and the 25-second keepalive scheduler remain shared.
+
+Metadata sends filter by stream; startup and keepalive select the session's
+context without mutating another receiver's startup projection. Content is
+built independently of the first receiver's metadata wishes. The additive,
+callback-free `raop_stream_metadata` port retains current transport metadata
+even for a dormant stream and reserves storage through loop dispatch. It is
+not a source-marker scheduling API; natural-boundary policy remains in core.
+
+`tests/raop-stream-isolation.test.ts` exercises dormant/current replacement,
+purge, retirement, receiver wishes and the real keepalive interval. The
+test-only `test/crypto-observer.c` observes libgcrypt in memory, independently
+unmasks RSA-OAEP input, matches it to the cipher key and SDP output, and decrypts
+actual receiver ciphertext for exact ALAC/scheduled assertions. It never
+exports or logs keys and is not linked into the shipping library. Encrypted
+and unencrypted masters remain distinct within one stream. Sequential and
+concurrent proofs retain independent keys through foreign retirement; neither
+qualifies physical hardware.
+
+## Stream control endpoints
+
+Each backend context owns a dynamically bound control/sync service, advertised
+by that stream's SETUP and retained until stream free. Timing replies remain
+stateless on the shared timing service. Retransmit lookup matches the receiving
+service, stream incarnation, normalized receiver address (including IPv4-mapped
+IPv6 and link-local scope) and negotiated control source port. Unknown, retiring
+or ambiguous endpoints cannot select a session/cache. IP-only lookup is removed.
+
+The existing ordered-cancel fence and `rtp_session_flush` revoke old cache
+authority before replacement input; receiver ACK/destruction still gates the
+new epoch. Same-IP public-FFI tests force overlapping sequence numbers and wrap,
+check exact retransmitted packet identity at each destination, reject spoofed
+and old endpoints, and independently render the retained/replacement schedules.
+
+## Concurrent native lifetime
+
+One runtime reference belongs to every stream and device, including dormant and
+probe-only owners. Removing A cannot deinitialize B's loop or timing service.
+Every stream-affecting iteration selects a stream, exact master or unique device;
+only final runtime shutdown visits all contexts. Native admission has no global
+active-stream slot. A failed close retains its own reference and resources.
+Partial master/session construction unwinds owned allocations without aborting
+the shared process. Test-only dependency interposition checks rollback and failed
+release while B's exact partial input and schedule survive; the encoder observer
+confirms same-stream sharing and cross-stream separation without private ABI mirrors.
+
+Native acceptance also holds a loop-dispatched completion read after its storage
+reservation while typed close fences input and joins that read. Other streams
+continue emitting; no callback or test hold enters the shipping library.
+Stream-targeted dependency faults exercise encoder, cipher, packet allocation,
+send, sync and timer failure without crediting a failed source as complete.
+Long independently scheduled timelines force both RTP counters through wrap,
+retain 24 source receipts beyond lossy state-ring overflow, and verify exact real
+PCM plus zero-only declared transport silence. Delayed terminal writes and fresh
+stream incarnations cannot stop a foreign timeline. Encrypted and plaintext
+combinations use the real cipher observer and independent ALAC consumer.
+HTTP admits concurrent players with disjoint speakers. Native concurrency does
+not bypass core's exclusive speaker membership and receiver release barriers.
 
 ## Exact stream admission
 
@@ -135,7 +209,7 @@ attachment-removal orders and compatibility/explicit guard competition.
 an exact accepted stereo-frame count and accepted/backpressure/canceled/error/
 not-ready status. The fixed-width layout is declared in `ffi.h`; missing symbols
 fail library loading rather than falling back to a byte-only ABI. The existing
-two-second ingress bound and active-stream guard remain. Allocation failure is
+two-second per-stream ingress bound remains. Allocation failure is
 distinct from a full ingress. PCM is copied before return; only the unaccepted
 suffix may be retried. Segment identity is opaque, not native queue policy.
 

@@ -756,37 +756,27 @@ Deno.test('controls cold HTTP: edit up next, resume stopped bookmark after resta
     const starts = await Promise.all(
       paths.map((path) => server!.nativeResponse(`${path}/play`, 'POST', {})),
     );
-    assertEquals(starts.map((response) => response.status).sort(), [204, 409]);
-    const winner = starts.findIndex((response) => response.status === 204);
-    const loser = 1 - winner;
-    await starts[winner].body?.cancel();
-    const busy = await starts[loser].json();
-    assertEquals(busy.code, 'airplay_busy');
-    assertEquals(busy.owner, {
-      id: winner === 0 ? 1 : kitchen.id,
-      name: winner === 0 ? 'Home' : 'Kitchen',
-    });
+    // Track B b19 removes only the temporary one-player AirPlay limit.
+    assertEquals(starts.map((response) => response.status), [204, 204]);
+    for (const response of starts) await response.body?.cancel();
     await until(() =>
-      receivers[winner].sessions.slice(sessionCounts[winner]).some(
-        (s) => s.audioPayloads.length >= 8,
+      receivers.every((receiver, i) =>
+        receiver.sessions.slice(sessionCounts[i]).some((s) =>
+          s.audioPayloads.length >= 8
+        )
       )
     );
-    const winningSession = receivers[winner].sessions.slice(
-      sessionCounts[winner],
-    ).find(
-      (s) => s.audioPayloads.length >= 8,
-    )!;
-    assert(
-      decodeReceiverAudio(
-        winningSession.sdp,
-        winningSession.audioPayloads.slice(0, 8),
-      )
-        .some((sample) => sample !== 0),
-    );
-    assertEquals(receivers[loser].sessions.length, sessionCounts[loser]);
-    assertEquals((await server.native(paths[winner])).player.state, 'play');
-    assertEquals((await server.native(paths[loser])).player.state, 'pause');
-    await server.native(`${paths[winner]}/stop`, 'POST', {});
+    for (const [i, receiver] of receivers.entries()) {
+      const session = receiver.sessions.slice(sessionCounts[i]).find((s) =>
+        s.audioPayloads.length >= 8
+      )!;
+      assert(
+        decodeReceiverAudio(session.sdp, session.audioPayloads.slice(0, 8))
+          .some((sample) => sample !== 0),
+      );
+      assertEquals((await server.native(paths[i])).player.state, 'play');
+    }
+    for (const path of paths) await server.native(`${path}/stop`, 'POST', {});
     await until(() =>
       receivers.every((receiver) =>
         receiver.sessions.every(

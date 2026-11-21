@@ -4,6 +4,7 @@ import type { CrossfadeRecord } from '../src/playback-mix.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 import { crossfadeReference } from './helpers/crossfade-proof.ts';
+import { exact } from './helpers/concurrent-playback.ts';
 import {
   concatenate,
   timelineControl,
@@ -484,12 +485,15 @@ test('removing a successor already mixed into A discards that future before reop
 
 test('late join declares suffix coverage of the same mixed stream', async () => {
   const parts = [timelinePcm(88200 + 137), timelinePcm(44100 + 19, 2)];
+  const records: CrossfadeRecord[] = [];
   const f = await nativeHttpFixture({
     pcm: parts[0],
     additionalPcm: [parts[1]],
     crossfadeMs: () => 200,
+    crossfadeObserved: (record) => records.push(record),
     receiverCount: 2,
     receiverSelection: [true, false],
+    receiver: { recoverAudioGaps: true },
   });
   try {
     const c = await timelineControl(f);
@@ -498,6 +502,12 @@ test('late join declares suffix coverage of the same mixed stream', async () => 
     await timelineUntil(
       'outgoing prefix sent',
       () => (f.receiver.sessions[0]?.audioPackets ?? 0) >= 30,
+    );
+    // b20 backfills still-schedulable cached PCM. Arrival alone is not a
+    // missed prefix; join only once a real prefix has actually played.
+    await timelineUntil(
+      'outgoing prefix presented before late join',
+      () => f.playback.playerView().itemProgressMs > 100,
     );
     await f.own('/outputs/2', 'PUT', { selected: true });
     await timelineUntil(
@@ -513,7 +523,8 @@ test('late join declares suffix coverage of the same mixed stream', async () => 
     const expected = crossfadeReference(parts, 8820).pcm.subarray(offset * 4);
     const replay = renderScheduledAudio(joined, f.receivers[1].nowMs());
     assertEquals(replay.issues, []);
-    assertEquals(replay.pcm.subarray(0, expected.length), expected);
+    assertEquals(records.map((r) => r.appliedFrames), [8820n]);
+    exact(replay.pcm.subarray(0, expected.length), expected);
     assert(offset > 0, 'join never claims the earlier prefix');
   } finally {
     await f.close();

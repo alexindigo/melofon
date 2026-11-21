@@ -193,8 +193,10 @@ Signed-in clients send `POST /api/v1/players/{id}/{command}` with `{}` for
 (relative). Commands return 204; read `GET /api/v1/players/{id}` for state.
 `PATCH` that player with `{"repeat": "off"|"all"|"single", "consume": true|false, "crossfadeMs": 0}`
 to change saved modes or crossfade, optionally alongside `name`; it returns
-the updated player. Starting without a speaker returns `no_target`; another
-player holding AirPlay returns `airplay_busy` with its owning player's id/name.
+the updated player. Starting without a speaker returns `no_target`. Players with
+disjoint AirPlay speakers play independently, including after a fresh restore.
+A speaker still belongs to only one player; transferring it waits for the old
+connection to release before attaching it to the new player's stream.
 
 `crossfadeMs` is a saved per-player duration in nonnegative integer milliseconds;
 it defaults to 0 (gapless). Enabled crossfade mixes natural finite-song changes

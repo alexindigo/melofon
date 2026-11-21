@@ -12,6 +12,8 @@
 #include <sys/timerfd.h>
 #include <gcrypt.h>
 #include <netdb.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include "outputs.h"
 #include "transcode.h"
 
@@ -22,8 +24,25 @@ static void *symbol(const char *name, const char *library)
   if (!p) abort();
   return p;
 }
+static _Atomic uint64_t target_stream;
+static _Thread_local uint64_t writing_stream;
+static void (*write_original)(struct output_buffer *);
+static void target_write(struct output_buffer *buffer)
+{
+  writing_stream = buffer->stream_id;
+  write_original(buffer);
+  writing_stream = 0;
+}
+void raop_fi_target_stream(uint64_t id)
+{
+  struct output_definition *backend = dlsym(dlopen(getenv("MELOFON_RAOP_LIB"), RTLD_NOW | RTLD_LOCAL), "output_raop");
+  if (!write_original) { write_original = backend->write; backend->write = target_write; }
+  atomic_store(&target_stream, id);
+}
 static int arm(const char *kind)
 {
+  uint64_t target = atomic_load(&target_stream);
+  if (target && strcmp(kind, "timer") && writing_stream != target) return 0;
   const char *mode = getenv("RAOP_PROGRESS_FAULT");
   const char *path = getenv("RAOP_PROGRESS_ARM");
   return mode && path && !strcmp(mode, kind) && unlink(path) == 0;
@@ -85,8 +104,23 @@ ssize_t sendto(int fd, const void *buffer, size_t size, int flags,
     symbol("sendto", "libc.so.6");
   return real(fd, buffer, size, flags, address, length);
 }
+static pthread_mutex_t encoder_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct encode_ctx *encoders[16];
+static unsigned encoder_count;
+unsigned raop_fi_encoder_count(void)
+{
+  pthread_mutex_lock(&encoder_lock);
+  unsigned count = encoder_count;
+  pthread_mutex_unlock(&encoder_lock);
+  return count;
+}
 int transcode_encode(struct evbuffer *buffer, struct encode_ctx *ctx, transcode_frame *frame, int eof)
 {
+  pthread_mutex_lock(&encoder_lock);
+  unsigned i;
+  for (i = 0; i < encoder_count && encoders[i] != ctx; i++) {}
+  if (i == encoder_count && encoder_count < 16) encoders[encoder_count++] = ctx;
+  pthread_mutex_unlock(&encoder_lock);
   if (arm("encoder")) return -1;
   int (*real)(struct evbuffer *, struct encode_ctx *, transcode_frame *, int) =
     symbol("transcode_encode", getenv("MELOFON_RAOP_LIB"));

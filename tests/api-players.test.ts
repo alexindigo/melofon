@@ -14,7 +14,6 @@ import { createOutputs } from '../src/player.ts';
 import { outputPlayerId } from '../src/player-outputs.ts';
 import { createSpeakers } from '../src/speakers.ts';
 import { createPlaybackCapacity } from '../src/playback-capacity.ts';
-import { PlaybackError } from '../src/playback-errors.ts';
 import { createQueueResolver } from '../src/queue-source.ts';
 import { createUserService } from '../src/user.ts';
 import { createAnnotation } from '../src/annotation.ts';
@@ -79,15 +78,7 @@ async function setup(beforePrepare?: () => Promise<void>) {
         notify: f.notify!,
         clock: { monotonicNow: () => 0 },
         maxResumeAgeMs: 300000,
-        capacity: createPlaybackCapacity({
-          protocol: 'AirPlay',
-          busy: (owner) =>
-            new PlaybackError(
-              'airplay_busy',
-              `AirPlay is busy in ${owner.name}`,
-              owner,
-            ),
-        }),
+        capacity: createPlaybackCapacity({ protocol: 'AirPlay' }),
         playback: {
           library,
           nowPlaying,
@@ -934,7 +925,7 @@ Deno.test('queue copy HTTP adds the whole ordered queue at end, next or position
   }
 });
 
-Deno.test('queue copy HTTP refuses limit, stale version, no target and busy AirPlay before either player changes', async () => {
+Deno.test('queue copy HTTP refuses invalid starts but admits disjoint AirPlay without changing the source', async () => {
   const t = await setup();
   try {
     const { credential } = await t.f.login('bearer');
@@ -970,9 +961,6 @@ Deno.test('queue copy HTTP refuses limit, stale version, no target and busy AirP
       if (code === 'queue_conflict') {
         assertEquals(reply.version, target.queueView().version);
       }
-      if (code === 'airplay_busy') {
-        assertEquals(reply.owner, { id: 1, name: 'Home' });
-      }
       assertEquals([
         home.queueView(),
         target.queueView(),
@@ -996,7 +984,17 @@ Deno.test('queue copy HTTP refuses limit, stale version, no target and busy AirP
     const old = home.playerView();
     const lease = home.openSource(old.current!.id, old.generation)!;
     for (const mode of ['replace', 'add']) {
-      await unchanged(mode, { startPlaying: true }, 'airplay_busy');
+      await t.command(
+        `/api/v1/players/1/queue/copy/${mode}`,
+        'POST',
+        credential,
+        {
+          targetPlayerId: kitchen.id,
+          startPlaying: true,
+        },
+      );
+      assertEquals(target.playerView().state, 'play');
+      assertEquals(home.playerView(), old);
     }
     assert(!lease.signal.aborted);
     await t.command(
@@ -1006,7 +1004,7 @@ Deno.test('queue copy HTTP refuses limit, stale version, no target and busy AirP
       { targetPlayerId: kitchen.id },
     );
     assertEquals(home.playerView(), old);
-    assertEquals(target.playerView().state, 'pause');
+    assertEquals(target.playerView().state, 'play');
     assert(!lease.signal.aborted);
     await home.queueAdd(t.songs);
     await t.f.state.set('playback.queueLimit', '3');
@@ -2076,7 +2074,7 @@ Deno.test('queue limit defaults to exactly 8192 even without a settings adapter'
   }
 });
 
-Deno.test('queue add HTTP start refusals preserve both queues and provenance', async () => {
+Deno.test('queue add HTTP no-target refusal and independent AirPlay start preserve the peer', async () => {
   const t = await setup();
   try {
     const { credential } = await t.f.login(
@@ -2087,7 +2085,7 @@ Deno.test('queue add HTTP start refusals preserve both queues and provenance', a
     const home = t.players.get(1);
     await home.queueAdd(t.songs);
     const body = {
-      references: [{ kind: 'song', id: t.songs[1].id }],
+      references: [{ kind: 'song' as const, id: t.songs[1].id }],
       clear: true,
       startPlaying: true,
     };
@@ -2106,7 +2104,6 @@ Deno.test('queue add HTTP start refusals preserve both queues and provenance', a
     await t.players.join(kitchen.id, 'add-kitchen-airplay');
     const other = t.players.get(kitchen.id);
     await other.queueAdd(t.songs);
-    const otherBefore = other.queueView();
     const last = other.lastCommand();
     const response = await t.f.json(
       `/api/v1/players/${kitchen.id}/queue/items`,
@@ -2114,12 +2111,14 @@ Deno.test('queue add HTTP start refusals preserve both queues and provenance', a
       body,
       credential,
     );
-    assertEquals(response.status, 409);
-    const refusal = await response.json();
-    assertEquals(refusal.code, 'airplay_busy');
-    assertEquals(refusal.owner, { id: 1, name: 'Home' });
-    assertEquals(other.queueView(), otherBefore);
-    assertEquals(other.lastCommand(), last);
+    assertEquals(response.status, 200, await response.clone().text());
+    await response.json();
+    assertEquals(
+      other.queueView().items.map((r) => r.reference),
+      body.references,
+    );
+    assertEquals(other.playerView().state, 'play');
+    assert(other.lastCommand() !== last);
     assertEquals(home.queueView(), before);
     assertEquals(home.playerView().state, 'play');
   } finally {
@@ -2735,7 +2734,7 @@ Deno.test('players HTTP moves and releases adopted and temporary speakers, retai
   }
 });
 
-Deno.test('players HTTP translates AirPlay membership refusal with the live owner id and name', async () => {
+Deno.test('players HTTP admits disjoint AirPlay membership while another player is active', async () => {
   const t = await setup();
   try {
     const { credential } = await t.f.login(
@@ -2760,11 +2759,9 @@ Deno.test('players HTTP translates AirPlay membership refusal with the live owne
       {},
       credential,
     );
-    assertEquals(response.status, 409);
-    const body = await response.json();
-    assertEquals(body.code, 'airplay_busy');
-    assertEquals(body.owner, { id: 1, name: 'Living room' });
-    assertEquals(outputPlayerId(t.outputs.get('free-air')!), null);
+    assertEquals(response.status, 204, await response.text());
+    assertEquals(outputPlayerId(t.outputs.get('free-air')!), kitchen.id);
+    assertEquals(outputPlayerId(t.outputs.get('air')!), 1);
     assertEquals(t.players.get(1).playerView().state, 'play');
     assertEquals(t.players.get(kitchen.id).playerView().state, 'play');
   } finally {
@@ -3296,7 +3293,7 @@ Deno.test('player modes HTTP validates the whole PATCH, persists modes per playe
   }
 });
 
-Deno.test('player command HTTP returns no_target and airplay_busy without mutating either player', async () => {
+Deno.test('player command HTTP returns no_target then commands disjoint AirPlay without mutating the peer', async () => {
   const t = await setup();
   try {
     const { credential } = await t.f.login(
@@ -3335,9 +3332,8 @@ Deno.test('player command HTTP returns no_target and airplay_busy without mutati
     await t.command('/api/v1/players/1', 'PATCH', credential, {
       name: 'Living room',
     }, 200);
-    const before = playback.playerView();
+    const before = t.players.get(1).playerView();
     const queue = playback.queueView();
-    const last = playback.lastCommand();
     for (
       const [action, body] of [['play', {}], ['next', {}], ['previous', {}], [
         'seek',
@@ -3350,16 +3346,10 @@ Deno.test('player command HTTP returns no_target and airplay_busy without mutati
         body,
         credential,
       );
-      assertEquals(response.status, 409);
-      assertEquals(await response.json(), {
-        code: 'airplay_busy',
-        message: 'AirPlay is busy in Living room',
-        owner: { id: 1, name: 'Living room' },
-      });
-      assertEquals(playback.playerView(), before);
+      assertEquals(response.status, 204, await response.text());
+      assertEquals(playback.playerView().state, 'play');
       assertEquals(playback.queueView(), queue);
-      assertEquals(playback.lastCommand(), last);
-      assertEquals(t.players.get(1).playerView().state, 'play');
+      assertEquals(t.players.get(1).playerView(), before);
     }
     await t.command('/api/v1/players/1/stop', 'POST', credential, {});
     await t.command(

@@ -162,6 +162,7 @@ struct raop_extra
 struct raop_master_session
 {
   uint64_t stream_id;
+  struct raop_stream_context *context;
   uint64_t epoch_frames; /* wide frame origin, independent of wrapping RTP */
   struct evbuffer *input_buffer;
   uint32_t input_buffer_samples;
@@ -201,6 +202,7 @@ struct raop_session
 {
   uint64_t device_id;
   uint64_t stream_id;
+  struct raop_stream_context *context;
   int callback_id;
 
   struct raop_master_session *master_session;
@@ -281,6 +283,7 @@ struct raop_metadata
 
 struct raop_service
 {
+  uint64_t stream_id; /* control ownership; stateless timing uses zero */
   struct net_socket socket;
   unsigned short port;
   struct event *ev4;
@@ -349,23 +352,23 @@ static struct media_quality raop_quality_default =
 /* From player.c */
 extern struct event_base *evbase_player;
 
-/* RAOP AES stream key */
-static uint8_t raop_aes_key[16];
-static uint8_t raop_aes_iv[16];
-static gcry_cipher_hd_t raop_aes_ctx;
-
-/* Base64-encoded AES key and IV for SDP */
-static char *raop_aes_key_b64;
-static char *raop_aes_iv_b64;
+/* Loop-owned stream state outlives its sessions and masters. Dormant contexts
+ * retain their metadata and crypto until the FFI stream is actually freed. */
+struct raop_stream_context
+{
+  uint64_t id;
+  uint8_t aes_key[16], aes_iv[16];
+  gcry_cipher_hd_t aes_ctx;
+  char *aes_key_b64, *aes_iv_b64;
+  struct output_metadata *metadata;
+  struct raop_service control;
+  struct raop_stream_context *next;
+};
+static struct raop_stream_context *raop_stream_contexts;
+static struct raop_stream_context *stream_context_get(uint64_t id);
 
 /* AirTunes v2 time synchronization */
 static struct raop_service raop_timing_svc;
-
-/* AirTunes v2 playback synchronization / control */
-static struct raop_service raop_control_svc;
-
-/* Metadata */
-static struct output_metadata *raop_cur_metadata;
 
 /* Keep-alive timer - hack for ATV's with tvOS 10 */
 static struct event *keep_alive_timer;
@@ -384,6 +387,9 @@ raop_device_start(struct output_device *rd, int callback_id);
 
 static void
 deferred_session_failure(struct raop_session *rs);
+
+static void
+record_anchor_set(struct raop_session *rs, uint16_t *seqnum);
 
 /* Numeric-only socket/address operations. No DNS, sends, interface mutation or
  * net_connect() in observation. This observes preferred source, not liveness. */
@@ -905,7 +911,7 @@ raop_crypt_add_oaep_padding(uint8_t *em, const size_t emlen, const uint8_t *m, c
 }
 
 static char *
-raop_crypt_encrypt_aes_key_base64(void)
+raop_crypt_encrypt_aes_key_base64(const uint8_t key[16])
 {
   char ebuf[64];
   uint8_t padded_key[256];
@@ -926,7 +932,7 @@ raop_crypt_encrypt_aes_key_base64(void)
   result = NULL;
 
   /* Add RSA-OAES-SHA1 padding */
-  ret = raop_crypt_add_oaep_padding(padded_key, sizeof(padded_key), raop_aes_key, sizeof(raop_aes_key), NULL, 0);
+  ret = raop_crypt_add_oaep_padding(padded_key, sizeof(padded_key), key, 16, NULL, 0);
   if (ret < 0)
     return NULL;
 
@@ -1389,7 +1395,7 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
   if (rs->encrypt)
     ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT,
 			      session_id, af, address, rs_af, rs->address, RAOP_SAMPLES_PER_PACKET,
-			      raop_aes_key_b64, raop_aes_iv_b64);
+                              rs->context->aes_key_b64, rs->context->aes_iv_b64);
   else
     ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT_NO_ENC,
 			      session_id, af, address, rs_af, rs->address, RAOP_SAMPLES_PER_PACKET);
@@ -1587,8 +1593,8 @@ raop_send_req_set_parameter(struct raop_session *rs, struct evbuffer *evbuf, cha
 static int
 raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
 {
-  struct raop_master_session *rms = rs->master_session;
   struct evrtsp_request *req;
+  uint16_t seqnum;
   char buf[64];
   int ret;
 
@@ -1611,10 +1617,10 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_
 
   evrtsp_add_header(req->output_headers, "Range", "npt=0-");
 
-  /* The shared master can advance before this receiver's RECORD reply. */
-  rs->sync_start_pos = rms->rtp_session->pos;
+  /* A new receiver may recover committed audio that is still in the future. */
+  record_anchor_set(rs, &seqnum);
   rs->sync_start_pending = true;
-  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rs->sync_start_pos);
+  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", seqnum, rs->sync_start_pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
@@ -2087,7 +2093,8 @@ master_session_make(uint64_t stream_id, struct media_quality *quality, bool encr
       return NULL;
     }
 
-  CHECK_NULL(L_RAOP, rms = calloc(1, sizeof(struct raop_master_session)));
+  rms = calloc(1, sizeof(struct raop_master_session));
+  if (!rms) { outputs_quality_unsubscribe(quality); return NULL; }
 
   rms->rtp_session = rtp_session_new(quality, RAOP_PACKET_BUFFER_SIZE, 0, 0);
   if (!rms->rtp_session)
@@ -2120,15 +2127,17 @@ master_session_make(uint64_t stream_id, struct media_quality *quality, bool encr
     }
 
   rms->stream_id = stream_id;
+  rms->context = stream_context_get(stream_id);
   rms->encrypt = encrypt;
   rms->quality = *quality;
   rms->samples_per_packet = RAOP_SAMPLES_PER_PACKET;
   rms->rawbuf_size = STOB(rms->samples_per_packet, quality->bits_per_sample, quality->channels);
   rms->output_buffer_samples = (buffer_duration_ms - RAOP_AUDIO_LATENCY_MS) * quality->sample_rate / 1000;
 
-  CHECK_NULL(L_RAOP, rms->rawbuf = malloc(rms->rawbuf_size));
-  CHECK_NULL(L_RAOP, rms->input_buffer = evbuffer_new());
-  CHECK_NULL(L_RAOP, rms->encoded_buffer = evbuffer_new());
+  rms->rawbuf = malloc(rms->rawbuf_size);
+  rms->input_buffer = evbuffer_new();
+  rms->encoded_buffer = evbuffer_new();
+  if (!rms->rawbuf || !rms->input_buffer || !rms->encoded_buffer) goto error;
 
   rms->next = raop_master_sessions;
   raop_master_sessions = rms;
@@ -2446,32 +2455,28 @@ session_connection_setup(struct raop_session *rs, struct output_device *rd, int 
 }
 
 static struct raop_session *
-session_find_by_address(union net_sockaddr *peer_addr)
+session_find_by_control_endpoint(struct raop_service *svc,
+                                union net_sockaddr *peer_addr, socklen_t length)
 {
-  struct raop_session *rs;
-  uint32_t *addr_ptr;
-  int family = peer_addr->sa.sa_family;
-
-  for (rs = raop_sessions; rs; rs = rs->next)
-    {
-      if (family == rs->family)
-	{
-	  if (family == AF_INET && peer_addr->sin.sin_addr.s_addr == rs->naddr.sin.sin_addr.s_addr)
-	    break;
-
-	  if (family == AF_INET6 && IN6_ARE_ADDR_EQUAL(&peer_addr->sin6.sin6_addr, &rs->naddr.sin6.sin6_addr))
-	    break;
-	}
-      else if (family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&peer_addr->sin6.sin6_addr))
-	{
-	  // ipv4 mapped to ipv6 consists of 16 bytes/4 words: 0x00000000 0x00000000 0x0000ffff 0x[IPv4]
-	  addr_ptr = (uint32_t *)(&peer_addr->sin6.sin6_addr);
-	  if (addr_ptr[3] == rs->naddr.sin.sin_addr.s_addr)
-	    break;
-	}
-    }
-
-  return rs;
+  struct raop_source peer;
+  struct raop_session *found = NULL;
+  if (source_normalize(&peer, peer_addr, length) < 0) return NULL;
+  unsigned short port = ntohs(peer_addr->sa.sa_family == AF_INET ?
+    peer_addr->sin.sin_port : peer_addr->sin6.sin6_port);
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != svc->stream_id || rs->control_svc != svc ||
+        rs->retiring || rs->failure_pending || rs->cancel_pending ||
+        (rs->state != RAOP_STATE_CONNECTED && rs->state != RAOP_STATE_STREAMING) || !rs->control_port ||
+        rs->control_port != port) continue;
+    struct raop_source receiver;
+    socklen_t n = rs->naddr.sa.sa_family == AF_INET ? sizeof(rs->naddr.sin) : sizeof(rs->naddr.sin6);
+    if (source_normalize(&receiver, &rs->naddr, n) < 0 ||
+        !source_equal(&peer, &receiver)) continue;
+    /* An ambiguous negotiated endpoint cannot choose an arbitrary cache. */
+    if (found) return NULL;
+    found = rs;
+  }
+  return found;
 }
 
 static struct raop_session *
@@ -2483,11 +2488,17 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
 
   re = rd->extra_device_info;
 
+  struct raop_stream_context *context = stream_context_get(rd->stream_id);
+  if (!context) return NULL;
 
-  CHECK_NULL(L_RAOP, rs = calloc(1, sizeof(struct raop_session)));
-  CHECK_NULL(L_RAOP, rs->deferredev = evtimer_new(evbase_player, deferredev_cb, rs));
+  rs = calloc(1, sizeof(struct raop_session));
+  if (!rs) return NULL;
+  rs->server_fd = -1;
+  rs->deferredev = evtimer_new(evbase_player, deferredev_cb, rs);
+  if (!rs->deferredev) goto error;
 
   rs->devname = strdup(rd->name);
+  if (!rs->devname) goto error;
   rs->volume = rd->volume;
   rs->offset_samples = rd->offset_ms * rd->quality.sample_rate / 1000;
 
@@ -2498,6 +2509,7 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
 
   rs->device_id = rd->id;
   rs->stream_id = rd->stream_id;
+  rs->context = context;
   rs->callback_id = callback_id;
 
   rs->server_fd = -1;
@@ -2540,7 +2552,7 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
     }
 
   rs->timing_svc = &raop_timing_svc;
-  rs->control_svc = &raop_control_svc;
+  rs->control_svc = &context->control;
 
   ret = session_connection_setup(rs, rd, AF_INET6);
   if (ret < 0)
@@ -2589,15 +2601,15 @@ raop_metadata_free(struct raop_metadata *rmd)
   free(rmd);
 }
 
-static void
-raop_metadata_purge(void)
+void
+raop_metadata_purge_stream(uint64_t stream_id)
 {
-  if (!raop_cur_metadata)
-    return;
-
-  raop_metadata_free(raop_cur_metadata->priv);
-  free(raop_cur_metadata);
-  raop_cur_metadata = NULL;
+  struct raop_stream_context *s;
+  for (s = raop_stream_contexts; s && s->id != stream_id; s = s->next) {}
+  if (!s || !s->metadata) return;
+  raop_metadata_free(s->metadata->priv);
+  free(s->metadata);
+  s->metadata = NULL;
 }
 
 // *** Thread: worker ***
@@ -2872,37 +2884,46 @@ raop_metadata_send_generic(struct raop_session *rs, struct output_metadata *meta
 static int
 raop_metadata_startup_send(struct raop_session *rs)
 {
-  if (!rs->wanted_metadata || !raop_cur_metadata || raop_cur_metadata->stream_id != rs->stream_id)
+  struct output_metadata *metadata = rs->context->metadata;
+  if (!rs->wanted_metadata || !metadata)
     return 0;
 
-  raop_cur_metadata->startup = true;
-
-  return raop_metadata_send_generic(rs, raop_cur_metadata, false);
+  struct output_metadata startup = *metadata;
+  startup.startup = true;
+  return raop_metadata_send_generic(rs, &startup, false);
 }
 
 static int
 raop_metadata_keep_alive_send(struct raop_session *rs)
 {
-  if (!rs->wanted_metadata || !raop_cur_metadata || raop_cur_metadata->stream_id != rs->stream_id)
+  struct output_metadata *metadata = rs->context->metadata;
+  if (!rs->wanted_metadata || !metadata)
     return 0;
 
-  raop_cur_metadata->startup = false;
-
-  return raop_metadata_send_generic(rs, raop_cur_metadata, true);
+  struct output_metadata keepalive = *metadata;
+  keepalive.startup = false;
+  return raop_metadata_send_generic(rs, &keepalive, true);
 }
 
-static void
-raop_metadata_send(struct output_metadata *metadata)
+int
+raop_metadata_send_stream(uint64_t stream_id, struct output_metadata *metadata)
 {
+  struct raop_stream_context *s = stream_context_get(stream_id);
   struct raop_session *rs;
   struct raop_session *next;
   int ret;
+
+  if (!s) {
+    raop_metadata_free(metadata->priv);
+    free(metadata);
+    return -1;
+  }
 
   for (rs = raop_sessions; rs; rs = next)
     {
       next = rs->next;
 
-      if (rs->stream_id != metadata->stream_id || !(rs->state & RAOP_STATE_F_CONNECTED) || !rs->wanted_metadata)
+      if (rs->stream_id != stream_id || !(rs->state & RAOP_STATE_F_CONNECTED) || !rs->wanted_metadata)
 	continue;
 
       ret = raop_metadata_send_generic(rs, metadata, false);
@@ -2914,15 +2935,17 @@ raop_metadata_send(struct output_metadata *metadata)
     }
 
   // Replace current metadata with the new stuff
-  raop_metadata_purge();
-  raop_cur_metadata = metadata;
+  raop_metadata_purge_stream(stream_id);
+  s->metadata = metadata;
+  return 0;
 }
 
 void
 raop_timeline_metadata_progress(uint64_t stream_id, uint64_t frames)
 {
-  if (raop_cur_metadata && raop_cur_metadata->stream_id == stream_id && raop_cur_metadata->timeline)
-    raop_cur_metadata->position_frames = frames;
+  struct raop_stream_context *s = stream_context_get(stream_id);
+  if (s && s->metadata && s->metadata->timeline)
+    s->metadata->position_frames = frames;
 }
 
 
@@ -3145,7 +3168,7 @@ uint64_t
 raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns,
                    const uint64_t *retire_ids, size_t retire_count)
 {
-  if (raop_cur_metadata && raop_cur_metadata->stream_id == stream_id) raop_metadata_purge();
+  raop_metadata_purge_stream(stream_id);
   uint64_t cutoff = UINT64_MAX;
   for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
     if (rs->stream_id != stream_id || rs->retiring || rs->failure_pending)
@@ -3221,13 +3244,13 @@ raop_keep_alive_timer_cb(int fd, short what, void *arg)
 /* -------------------- Creation and sending of RTP packets  ---------------- */
 
 static int
-packet_encrypt(struct rtp_packet *pkt)
+packet_encrypt(struct rtp_packet *pkt, struct raop_stream_context *s)
 {
   char ebuf[64];
   gpg_error_t gc_err;
 
   // Reset cipher
-  gc_err = gcry_cipher_reset(raop_aes_ctx);
+  gc_err = gcry_cipher_reset(s->aes_ctx);
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
@@ -3236,7 +3259,7 @@ packet_encrypt(struct rtp_packet *pkt)
     }
 
   // Set IV
-  gc_err = gcry_cipher_setiv(raop_aes_ctx, raop_aes_iv, sizeof(raop_aes_iv));
+  gc_err = gcry_cipher_setiv(s->aes_ctx, s->aes_iv, sizeof(s->aes_iv));
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
@@ -3245,7 +3268,7 @@ packet_encrypt(struct rtp_packet *pkt)
     }
 
   // Encrypt in blocks of 16 bytes
-  gc_err = gcry_cipher_encrypt(raop_aes_ctx, pkt->payload, (pkt->payload_len / 16) * 16, NULL, 0);
+  gc_err = gcry_cipher_encrypt(s->aes_ctx, pkt->payload, (pkt->payload_len / 16) * 16, NULL, 0);
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
@@ -3434,6 +3457,118 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
       rs->devname, seqnum, len, rtp_session->seqnum, rtp_session->pktbuf_len);
 }
 
+static uint64_t
+packet_deadline_ns(uint64_t origin_ns, uint64_t frame)
+{
+  return origin_ns + frame / 44100 * 1000000000ULL +
+    frame % 44100 * 1000000000ULL / 44100;
+}
+
+/* Use the same live RTP/NTP correlation at RECORD and successful first sync. */
+static bool
+schedule_origin_get(struct raop_session *rs, uint64_t *origin_ns)
+{
+  struct raop_master_session *rms = rs->master_session;
+  int64_t lead = (int32_t)(rms->rtp_session->pos -
+    (rms->cur_stamp.pos - rs->offset_samples));
+  lead += RAOP_AUDIO_LATENCY_MS * 44100 / 1000;
+  int64_t ns = (int64_t)rms->cur_stamp.ts.tv_sec * 1000000000LL +
+    rms->cur_stamp.ts.tv_nsec + lead * 1000000000LL / 44100 -
+    (int64_t)(rms->epoch_frames / 44100) * 1000000000LL -
+    (int64_t)(rms->epoch_frames % 44100) * 1000000000LL / 44100;
+  if (ns < 0) return false;
+  *origin_ns = ns;
+  return true;
+}
+
+static size_t
+packets_future_suffix(struct raop_master_session *rms, size_t count,
+                      uint64_t origin_ns, uint64_t after_ns)
+{
+  struct rtp_session *rtp = rms->rtp_session;
+  size_t suffix = 0;
+
+  if (count > rtp->pktbuf_len) count = rtp->pktbuf_len;
+  if (count > rms->epoch_frames / rms->samples_per_packet)
+    count = rms->epoch_frames / rms->samples_per_packet;
+  for (size_t i = 1; i <= count; i++) {
+    struct rtp_packet *pkt = rtp_packet_get(rtp, rtp->seqnum - i);
+    uint64_t distance = (uint64_t)i * rms->samples_per_packet;
+    uint32_t pos;
+    if (!pkt || pkt->samples != rms->samples_per_packet) break;
+    memcpy(&pos, pkt->header + 4, sizeof(pos));
+    if (be32toh(pos) != (uint32_t)(rtp->pos - distance) ||
+        after_ns >= packet_deadline_ns(origin_ns, rms->epoch_frames - distance)) break;
+    suffix = i;
+  }
+  return suffix;
+}
+
+static void
+record_anchor_set(struct raop_session *rs, uint16_t *seqnum)
+{
+  struct raop_master_session *rms = rs->master_session;
+  struct rtp_session *rtp = rms->rtp_session;
+  size_t suffix = 0;
+  uint64_t origin_ns;
+  if (rtp->pktbuf_len && schedule_origin_get(rs, &origin_ns)) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    /* Reserve the receiver's minimum buffering interval for the remaining
+     * RECORD/first-sync round trip. First sync rechecks the actual deadlines. */
+    uint64_t margin_ns = RAOP_AUDIO_LATENCY_MS * 1000000ULL;
+    suffix = packets_future_suffix(rms, rtp->pktbuf_len, origin_ns, now + margin_ns);
+  }
+  rs->sync_start_pos = rtp->pos - (uint64_t)suffix * rms->samples_per_packet;
+  *seqnum = rtp->seqnum - suffix;
+}
+
+/* RECORD/FLUSH owns the receiver's start, not the time its reply arrives. Find
+ * the contiguous committed suffix that can still meet that receiver's schedule.
+ * Never move the shared RTP cursor or credit packets before actual submission. */
+static int
+packets_backfill(struct raop_session *rs)
+{
+  struct raop_master_session *rms = rs->master_session;
+  struct rtp_session *rtp = rms->rtp_session;
+  size_t count = (uint32_t)(rtp->pos - rs->sync_start_pos) / rms->samples_per_packet;
+  struct timespec ts;
+  bool sent = false;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  size_t suffix = packets_future_suffix(rms, count, rs->schedule_origin_ns, now);
+
+  for (size_t i = suffix; i > 0; i--) {
+    struct rtp_packet *pkt = rtp_packet_get(rtp, rtp->seqnum - i);
+    uint64_t frame = rms->epoch_frames - (uint64_t)i * rms->samples_per_packet;
+    uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, frame);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    if (now >= deadline) {
+      if (!sent) continue; /* The deliverable suffix may shrink before sending. */
+      goto overdue;
+    }
+    if (!sent) pkt->header[1] |= RTP_MARKER_BIT;
+    int ret = packet_send(rs, pkt);
+    pkt->header[1] &= ~RTP_MARKER_BIT;
+    if (ret < 0) return -1;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    if (now >= deadline) goto overdue;
+    if (!sent) rs->coverage_start = frame;
+    rs->submitted_frames = frame + rms->samples_per_packet;
+    sent = true;
+  }
+  return 0;
+
+ overdue:
+  rs->coverage_failed = true;
+  raop_ffi_attachment_failed(rms->stream_id, rs->device_id, RAOP_PROGRESS_OVERDUE);
+  deferred_session_failure(rs);
+  return -1;
+}
+
 static int
 packets_send(struct raop_master_session *rms)
 {
@@ -3464,7 +3599,7 @@ packets_send(struct raop_master_session *rms)
 
   if (rms->encrypt)
     {
-      ret = packet_encrypt(pkt);
+      ret = packet_encrypt(pkt, rms->context);
       if (ret < 0)
         {
           for (rs = raop_sessions; rs; rs = rs->next)
@@ -3486,9 +3621,7 @@ packets_send(struct raop_master_session *rms)
       struct timespec submitted;
       clock_gettime(CLOCK_MONOTONIC, &submitted);
       uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
-      uint64_t deadline = rs->schedule_origin_ns +
-        rms->epoch_frames / 44100 * 1000000000ULL +
-        rms->epoch_frames % 44100 * 1000000000ULL / 44100;
+      uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, rms->epoch_frames);
       if (!rs->schedule_valid || rs->coverage_failed || rs->submitted_frames != rms->epoch_frames) {
         raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_SYNC);
         return -1;
@@ -3509,22 +3642,19 @@ packets_send(struct raop_master_session *rms)
           rs->failure_pending || (rs->state != RAOP_STATE_CONNECTED &&
           rs->state != RAOP_STATE_STREAMING)) continue;
       struct timespec submitted;
-      uint64_t deadline = rs->schedule_origin_ns +
-        rms->epoch_frames / 44100 * 1000000000ULL +
-        rms->epoch_frames % 44100 * 1000000000ULL / 44100;
+      uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, rms->epoch_frames);
 
       // Device just joined
-      if (rs->state == RAOP_STATE_CONNECTED)
+      if (rs->state == RAOP_STATE_CONNECTED && rs->submitted_frames == rs->coverage_start)
 	{
 	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
 	  ret = packet_send(rs, pkt);
 	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
 	}
-      else if (rs->state == RAOP_STATE_STREAMING)
+      else
 	{
 	  ret = packet_send(rs, pkt);
 	}
-      else continue;
       clock_gettime(CLOCK_MONOTONIC, &submitted);
       uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
       /* A late burst is not scheduled coverage. Preserve the known contiguous
@@ -3616,14 +3746,7 @@ packets_sync_send(struct raop_master_session *rms)
 
       if (!rs->schedule_valid && !rs->cancel_pending &&
           rs->state == RAOP_STATE_CONNECTED) {
-        int64_t lead = (int32_t)(rms->rtp_session->pos - cur_stamp.pos);
-        lead += RAOP_AUDIO_LATENCY_MS * 44100 / 1000;
-        int64_t ns = (int64_t)cur_stamp.ts.tv_sec * 1000000000LL +
-          cur_stamp.ts.tv_nsec + lead * 1000000000LL / 44100 -
-          (int64_t)(rms->epoch_frames / 44100) * 1000000000LL -
-          (int64_t)(rms->epoch_frames % 44100) * 1000000000LL / 44100;
-        if (ns >= 0) rs->schedule_origin_ns = (uint64_t)ns;
-        else {
+        if (!schedule_origin_get(rs, &rs->schedule_origin_ns)) {
           raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_SYNC);
           return -1;
         }
@@ -3639,7 +3762,7 @@ packets_sync_send(struct raop_master_session *rms)
             start_pos = rs->sync_start_pos;
             /* Translate both sides of the live RTP/NTP correlation equally.
              * Even a RECORD delay longer than the buffer lead cannot alter the
-             * presentation clock or give the joining receiver missed audio. */
+             * presentation clock or credit already presented audio. */
             uint32_t elapsed = rms->rtp_session->pos - start_pos;
             struct timespec delta = { .tv_sec = elapsed / rms->quality.sample_rate,
               .tv_nsec = (uint64_t)(elapsed % rms->quality.sample_rate) * 1000000000ULL /
@@ -3653,8 +3776,9 @@ packets_sync_send(struct raop_master_session *rms)
             return -1;
           }
           if (control_packet_send(rs, sync_pkt) < 0) continue;
-          rs->sync_start_pending = false;
           rs->schedule_valid = !rs->coverage_failed;
+          if (rs->sync_start_pending && packets_backfill(rs) < 0) continue;
+          rs->sync_start_pending = false;
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
@@ -3818,6 +3942,7 @@ timing_svc_cb(int fd, short what, void *arg)
 static void
 control_svc_cb(int fd, short what, void *arg)
 {
+  struct raop_service *svc = arg;
   union net_sockaddr peer_addr = { 0 };
   socklen_t peer_addrlen = sizeof(peer_addr);
   char address[INET6_ADDRSTRLEN];
@@ -3846,7 +3971,7 @@ control_svc_cb(int fd, short what, void *arg)
       return;
     }
 
-  rs = session_find_by_address(&peer_addr);
+  rs = session_find_by_control_endpoint(svc, &peer_addr, peer_addrlen);
   if (!rs)
     {
       net_address_get(address, sizeof(address), &peer_addr);
@@ -5262,64 +5387,110 @@ raop_write(struct output_buffer *obuf)
     }
 }
 
-static int
-raop_init(void)
+/* Explicitly erase owned key copies before releasing a context. */
+static void
+stream_context_clear(struct raop_stream_context *s)
 {
+  service_stop(&s->control);
+  if (s->aes_ctx) gcry_cipher_close(s->aes_ctx);
+  free(s->aes_key_b64);
+  free(s->aes_iv_b64);
+  volatile uint8_t *key = s->aes_key, *iv = s->aes_iv;
+  for (size_t i = 0; i < 16; i++) key[i] = iv[i] = 0;
+  free(s);
+}
+
+void
+raop_backend_stream_free(uint64_t stream_id)
+{
+  struct raop_stream_context **slot = &raop_stream_contexts;
+  while (*slot && (*slot)->id != stream_id) slot = &(*slot)->next;
+  if (!*slot) return;
+  struct raop_stream_context *s = *slot;
+  raop_metadata_purge_stream(stream_id);
+  *slot = s->next;
+  stream_context_clear(s);
+}
+
+static struct raop_stream_context *
+stream_context_get(uint64_t id)
+{
+  struct raop_stream_context *s;
+  for (s = raop_stream_contexts; s; s = s->next)
+    if (s->id == id) return s;
+  s = calloc(1, sizeof(*s));
+  if (!s) return NULL;
+  s->id = id;
+  s->control.socket.fd4 = s->control.socket.fd6 = -1;
   char ebuf[64];
   char *ptr;
   gpg_error_t gc_err;
-  int ret;
 
   // Generate AES key and IV
-  gcry_randomize(raop_aes_key, sizeof(raop_aes_key), GCRY_STRONG_RANDOM);
-  gcry_randomize(raop_aes_iv, sizeof(raop_aes_iv), GCRY_STRONG_RANDOM);
+  gcry_randomize(s->aes_key, sizeof(s->aes_key), GCRY_STRONG_RANDOM);
+  gcry_randomize(s->aes_iv, sizeof(s->aes_iv), GCRY_STRONG_RANDOM);
 
   // Setup AES
-  gc_err = gcry_cipher_open(&raop_aes_ctx, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC, 0);
+  gc_err = gcry_cipher_open(&s->aes_ctx, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC, 0);
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not open AES cipher: %s\n", ebuf);
 
-      return -1;
+      goto error;
     }
 
   // Set key
-  gc_err = gcry_cipher_setkey(raop_aes_ctx, raop_aes_key, sizeof(raop_aes_key));
+  gc_err = gcry_cipher_setkey(s->aes_ctx, s->aes_key, sizeof(s->aes_key));
   if (gc_err != GPG_ERR_NO_ERROR)
     {
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not set AES key: %s\n", ebuf);
 
-      goto out_close_cipher;
+      goto error;
     }
 
   // Prepare Base64-encoded key & IV for SDP
-  raop_aes_key_b64 = raop_crypt_encrypt_aes_key_base64();
-  if (!raop_aes_key_b64)
+  s->aes_key_b64 = raop_crypt_encrypt_aes_key_base64(s->aes_key);
+  if (!s->aes_key_b64)
     {
       DPRINTF(E_LOG, L_RAOP, "Couldn't encrypt and encode AES session key\n");
 
-      goto out_close_cipher;
+      goto error;
     }
 
-  raop_aes_iv_b64 = b64_encode(raop_aes_iv, sizeof(raop_aes_iv));
-  if (!raop_aes_iv_b64)
+  s->aes_iv_b64 = b64_encode(s->aes_iv, sizeof(s->aes_iv));
+  if (!s->aes_iv_b64)
     {
       DPRINTF(E_LOG, L_RAOP, "Couldn't encode AES IV\n");
 
-      goto out_free_b64_key;
+      goto error;
     }
 
   // Remove base64 padding
-  ptr = strchr(raop_aes_key_b64, '=');
+  ptr = strchr(s->aes_key_b64, '=');
   if (ptr)
     *ptr = '\0';
 
-  ptr = strchr(raop_aes_iv_b64, '=');
+  ptr = strchr(s->aes_iv_b64, '=');
   if (ptr)
     *ptr = '\0';
 
+  if (service_start(&s->control, control_svc_cb, 0, "RAOP stream control") < 0)
+    goto error;
+  s->control.stream_id = id;
+  s->next = raop_stream_contexts;
+  raop_stream_contexts = s;
+  return s;
+ error:
+  stream_context_clear(s);
+  return NULL;
+}
+
+static int
+raop_init(void)
+{
+  int ret;
   CHECK_NULL(L_RAOP, keep_alive_timer = evtimer_new(evbase_player, raop_keep_alive_timer_cb, NULL));
 
   ret = service_start(&raop_timing_svc, timing_svc_cb, 0, "RAOP timing");
@@ -5330,14 +5501,6 @@ raop_init(void)
       goto out_free_timer;
     }
 
-  ret = service_start(&raop_control_svc, control_svc_cb, 0, "RAOP control");
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "AirPlay playback control failed to start\n");
-
-      goto out_stop_timing;
-    }
-
   raop_uncompressed_alac = cfg_getbool(cfg_getsec(cfg, "airplay_shared"), "uncompressed_alac");
 
   ret = mdns_browse("_raop._tcp", raop_device_cb, MDNS_CONNECTION_TEST);
@@ -5345,22 +5508,15 @@ raop_init(void)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not add mDNS browser for AirPlay devices\n");
 
-      goto out_stop_control;
+      goto out_stop_timing;
     }
 
   return 0;
 
- out_stop_control:
-  service_stop(&raop_control_svc);
  out_stop_timing:
   service_stop(&raop_timing_svc);
  out_free_timer:
   event_free(keep_alive_timer);
-  free(raop_aes_iv_b64);
- out_free_b64_key:
-  free(raop_aes_key_b64);
- out_close_cipher:
-  gcry_cipher_close(raop_aes_ctx);
 
   return -1;
 }
@@ -5370,7 +5526,6 @@ raop_deinit(void)
 {
   struct raop_session *rs;
 
-  service_stop(&raop_control_svc);
   service_stop(&raop_timing_svc);
 
   event_free(keep_alive_timer);
@@ -5382,10 +5537,8 @@ raop_deinit(void)
       session_free(rs);
     }
 
-  gcry_cipher_close(raop_aes_ctx);
-
-  free(raop_aes_key_b64);
-  free(raop_aes_iv_b64);
+  while (raop_stream_contexts)
+    raop_backend_stream_free(raop_stream_contexts->id);
 }
 
 struct output_definition output_raop =
@@ -5411,7 +5564,5 @@ struct output_definition output_raop =
   .device_volume_to_pct = raop_volume_to_pct,
   .write = raop_write,
   .metadata_prepare = raop_metadata_prepare,
-  .metadata_send = raop_metadata_send,
-  .metadata_purge = raop_metadata_purge,
   .device_authorize = raop_device_authorize,
 };

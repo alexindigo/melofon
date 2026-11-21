@@ -15,7 +15,6 @@ import {
   type Playback,
   type QueueCopyOptions,
 } from './playback.ts';
-import { PlaybackError } from './playback-errors.ts';
 import type { PlaybackReports } from './playback-reports.ts';
 import type {
   createPlaybackCapacity,
@@ -232,12 +231,9 @@ export async function createPlayers(deps: {
   };
   try {
     for (const row of await deps.store.players.list()) await add(row);
-    // Command time, not periodic bookmark time, chooses a conflicting restore.
-    // Unknown/equal command times retain the stable stored player order.
-    const restoreOrder = [...engines.values()].sort((a, b) =>
-      (b.row.commandedAtMs ?? -Infinity) - (a.row.commandedAtMs ?? -Infinity)
-    );
-    for (const engine of restoreOrder) {
+    // Each fixed player restores independently. Eligibility still depends on
+    // its own freshness, media and selected/reachable speakers, not a winner.
+    for (const engine of engines.values()) {
       const snapshot = await planRestore({
         queue: await engine.persistence.loadQueue(),
         saved: await engine.persistence.loadPlayerState(),
@@ -249,18 +245,7 @@ export async function createPlayers(deps: {
         ),
       });
       if (snapshot) {
-        try {
-          await engine.playback.restore(snapshot);
-        } catch (error) {
-          if (
-            !(error instanceof PlaybackError) || error.code !== 'airplay_busy'
-          ) {
-            throw error;
-          }
-          // Startup resolves competing durable intentions without commanding or
-          // pausing the winner. Explicit start paths still return the refusal.
-          await engine.playback.restore({ ...snapshot, state: 'pause' });
-        }
+        await engine.playback.restore(snapshot);
         log.event('restore_complete', {
           queued: snapshot.queue.length,
           state: engine.playback.playerView().state,
