@@ -21,9 +21,12 @@ import { createAirplayDevices } from '../../src/boots/airplay-device.ts';
 import { createAirplayBoot } from '../../src/boots/airplay.ts';
 import { createFfiStream } from '../../src/boots/raop-ffi.ts';
 import { createMedia } from '../../src/media.ts';
+import type { Media, PcmOptions } from '../../src/media.ts';
+import type { CrossfadeRecord } from '../../src/playback-mix.ts';
 import type {
   AirplayCompletionKey,
   AirplayCompletionResult,
+  AirplaySourceCutoff,
 } from '../../src/boots/airplay-profile.ts';
 import { createReleaseSet, releaseOrThrow } from '../../src/releases.ts';
 
@@ -66,7 +69,16 @@ export function wave(frames: number, seed: number) {
 
 export async function concurrentFixture(
   frames = [44100 + 353, 88200 + 351],
-  hooks: { closeStream?(close: () => Promise<void>): Promise<void> } = {},
+  hooks: {
+    closeStream?(close: () => Promise<void>): Promise<void>;
+    decodePcm?(
+      playerId: number,
+      path: string,
+      options: PcmOptions | undefined,
+      decode: () => ReturnType<Media['decodePcm']>,
+    ): ReturnType<Media['decodePcm']>;
+    crossfadeObserved?(playerId: number, record: CrossfadeRecord): void;
+  } = {},
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'concurrent-http-' });
   await Deno.mkdir(`${dir}/media`);
@@ -89,6 +101,7 @@ export async function concurrentFixture(
     native: ReturnType<typeof createFfiStream>;
     seals: AirplayCompletionKey[];
     completions: AirplayCompletionResult[];
+    cutoffs: AirplaySourceCutoff[];
   }[] = [];
   const closeGates = new Map<
     number,
@@ -142,10 +155,17 @@ export async function concurrentFixture(
             const native = createFfiStream(), ports = new Set<number>();
             const seals: AirplayCompletionKey[] = [],
               completions: AirplayCompletionResult[] = [];
+            const cutoffs: AirplaySourceCutoff[] = [];
             const audio = traceTimelineAudio(() => ({
               ...native,
               get epoch() {
                 return native.epoch;
+              },
+              cancelSource(epoch, source, retire, capture) {
+                return native.cancelSource(epoch, source, retire, (cutoff) => {
+                  cutoffs.push(cutoff);
+                  capture?.(cutoff);
+                });
               },
               async seal(epoch, source, target) {
                 const marker = await native.seal(epoch, source, target);
@@ -160,7 +180,7 @@ export async function concurrentFixture(
                 return result;
               },
             }));
-            traces.push({ audio, ports, native, seals, completions });
+            traces.push({ audio, ports, native, seals, completions, cutoffs });
             return {
               ...audio.stream(),
               get epoch() {
@@ -246,11 +266,17 @@ export async function concurrentFixture(
               media: {
                 ...createMedia(),
                 decodePcm(path, options) {
-                  return failSources.has(path.split('/').at(-1)!)
-                    ? Promise.resolve(null)
-                    : createMedia().decodePcm(path, options);
+                  const decode = () =>
+                    failSources.has(path.split('/').at(-1)!)
+                      ? Promise.resolve(null)
+                      : createMedia().decodePcm(path, options);
+                  return hooks.decodePcm
+                    ? hooks.decodePcm(playerId, path, options, decode)
+                    : decode();
                 },
               },
+              crossfadeObserved: (record) =>
+                hooks.crossfadeObserved?.(playerId, record),
               retryBackoffMs: [],
             });
             boots.set(playerId, boot);
