@@ -390,17 +390,21 @@ test('per-player stream retention through Pause and natural retirement leaves a 
       'natural end with native retirement held',
       () => entered && f.players.get(1).playerView().state === 'stop',
     );
-    await peerContinues(f, session);
     assertEquals(f.traces.length, 2, 'retirement retains the existing owners');
-    close.resolve();
     await timelineUntil(
-      'B completes its independent schedule',
+      'B completes while A native retirement remains held',
       () => f.players.get(2).playerView().state === 'stop',
     );
     exact(
       peer.audio.scheduledRealAudio(session, f.receivers[2].nowMs()),
       f.waves[1].subarray(44),
     );
+    assertEquals([session.flushes, session.teardowns, session.closedAtMs], [
+      0,
+      0,
+      null,
+    ]);
+    close.resolve();
     await f.libraryProof();
   } finally {
     close.resolve();
@@ -465,9 +469,5 @@ test('failed native release quarantines its owner without blocking a disjoint pl
     // quarantined public owner.
     await raw?.();
     if (!failed) await f.close().catch(() => {});
-    else {
-      for (const r of f.receivers) r.close();
-      await Deno.remove(f.dir, { recursive: true });
-    }
   }
 });
