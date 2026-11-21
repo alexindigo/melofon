@@ -95,7 +95,7 @@ struct input_range {
 struct timeline {
   bool enabled, ended, tail_reached, complete;
   uint64_t accepted, end_target, padding_left, transport_end;
-  uint64_t compatibility_source, last_real_end;
+  uint64_t compatibility_source, last_real_end, prepared_frames;
   size_t sources, inputs, next_input, ranges;
   struct source_record source[TIMELINE_MARKERS];
   struct input_range input[TIMELINE_MARKERS];
@@ -439,6 +439,10 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           r->frames += count;
           transport += count;
         }
+        /* Publish the full prepared transport extent under pcm_lock. The
+         * loop-owned PTS advances only after backend submission, so an API
+         * end marker cannot use that lagging cursor for packet alignment. */
+        t->prepared_frames = transport;
         n = output_frames * 4;
       }
       pthread_mutex_unlock(&p->pcm_lock);
@@ -812,7 +816,7 @@ raop_player_end(struct raop_player *p, uint64_t target, struct raop_marker_resul
        * silence. Its exclusive real boundary never moves to that silence. */
       t->tail_reached = true;
       t->transport_end = t->last_real_end;
-      t->padding_left = (352 - p->pts_samples % 352) % 352;
+      t->padding_left = (352 - t->prepared_frames % 352) % 352;
     }
     result->input_end = target;
     result->status = RAOP_APPEND_ACCEPTED;
