@@ -51,7 +51,7 @@ void raop_fi_allocation_stage(int stage) {
 char *strdup(const char *s)
 {
   if (atomic_load(&allocation_stage) == 3 && !strcmp(s, "Fault metadata") &&
-      atomic_fetch_add(&metadata_copies, 1) == 1) {
+      atomic_fetch_add(&metadata_copies, 1) == 0) {
     atomic_store(&allocation_stage, 0); return NULL;
   }
   char *(*real)(const char *) = dlsym(RTLD_NEXT, "strdup");

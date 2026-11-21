@@ -5,6 +5,7 @@ import { createOperationScope } from '../../src/operations.ts';
 import {
   type AirplayCompletionKey,
   type AirplayExactStream,
+  airplayOutputId,
   type AirplaySourceSnapshot,
   type AirplaySpawn,
   airplayStartFields,
@@ -378,7 +379,6 @@ export function createTestAirplayDevices(
   stream?: () => AirplayExactStream,
   txt: Record<string, string> = {},
 ) {
-  const identities = new Map<string, string>();
   return createAirplayDevices({
     outputs,
     ...(spawn === undefined ? {} : { spawn }),
@@ -392,17 +392,9 @@ export function createTestAirplayDevices(
           o.host === host && (port === undefined || o.port === port)
         );
         const key = row?.id ?? `${host}:${port}`;
-        if (!identities.has(key)) {
-          identities.set(
-            key,
-            (0x001122334455n + BigInt(identities.size)).toString(16).padStart(
-              12,
-              '0',
-            ),
-          );
-        }
         const hardware = row?.receiverIdentity === undefined
-          ? identities.get(key)!
+          ? (BigInt(airplayOutputId(key)) & 0xffffffffffffn).toString(16)
+            .padStart(12, '0')
           : BigInt(row.receiverIdentity).toString(16).padStart(12, '0');
         return Promise.resolve({
           name: `${hardware}@${row?.name ?? 'test'}._raop._tcp.local`,

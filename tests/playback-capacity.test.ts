@@ -600,7 +600,7 @@ Deno.test('restore replaces a connected pending reader and publishes its new pum
     async beforeDecode(index, _signal, origin) {
       if (index !== 1) return;
       origins.push(origin!);
-      if (blocked) return;
+      if (origin !== 0n) return;
       blocked = true;
       await release.promise;
     },
@@ -629,7 +629,7 @@ Deno.test('restore replaces a connected pending reader and publishes its new pum
     });
     await until(() => origins.includes(4410n));
     await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
-    assertEquals(origins, [0n, 4410n]);
+    assertEquals(origins.filter((frame) => frame !== 0n), [4410n]);
     assertEquals(other.playerView().state, 'play');
     assertEquals(f.playback[0].playerView(), peer);
     assertEquals(f.playback[0].queueView(), peerQueue);

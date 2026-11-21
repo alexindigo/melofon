@@ -295,12 +295,21 @@ export function createAirplayDevices(deps: {
     { event: string; value?: string }
   >('AirPlay', {
     async prepare(endpoint, signal) {
+      const receiverRevisions = new Map(configurationRevisions);
       const service = await resolver.resolve(
         endpoint.address,
         endpoint.port,
         signal,
       );
       const identity = receiverIdentity(endpoint.id, service);
+      if (
+        receiverRevisions.get(identity) !== configurationRevisions.get(identity)
+      ) {
+        throw new PreparationError(
+          'cancelled',
+          'Receiver configuration changed during lookup',
+        );
+      }
       const current = outputs.get(endpoint.id, { includeIgnored: true });
       const hasPassword = passwordRequiredFromTxt(service.txt);
       if (
@@ -760,7 +769,8 @@ export function createAirplayDevices(deps: {
         airplayOutputId(
           input.port === undefined ? host : `${host}:${input.port}`,
         );
-      outputs.restore({
+      const requestedId = id;
+      id = outputs.restore({
         ...existing,
         id,
         name: input.name ?? existing?.name ?? host,
@@ -773,26 +783,9 @@ export function createAirplayDevices(deps: {
           ? {}
           : { connectionStrategy: input.connectionStrategy }),
       }, source);
-      let revision = outputs.revision(id);
-      const isCurrent = () =>
-        outputs.get(id, { includeIgnored: true }) !== null &&
-        outputs.revision(id) === revision;
-      const controller = new AbortController();
-      // Catalog preparation has no playback authority; permits are discarded.
-      await protocol.prepare({
-        id,
-        targetRevision: admission.describe(id).targetRevision,
-        signal: controller.signal,
-        refresh: true,
-        isCurrent,
-      });
-      const resolved = outputs.identity({ id, type: 'AirPlay' });
-      if (resolved !== id) {
-        admission.invalidate(id);
-        id = resolved;
-        const canonical = outputs.get(id, { includeIgnored: true })!;
+      const configureAddress = () =>
         outputs.restore({
-          ...canonical,
+          ...outputs.get(id, { includeIgnored: true })!,
           host,
           ...(input.port === undefined ? {} : { port: input.port }),
           ...(input.name === undefined ? {} : { name: input.name }),
@@ -800,8 +793,45 @@ export function createAirplayDevices(deps: {
             ? {}
             : { connectionStrategy: input.connectionStrategy }),
         }, source);
+      if (id !== requestedId) configureAddress();
+      let revision = outputs.revision(id);
+      const isCurrent = () =>
+        outputs.get(id, { includeIgnored: true }) !== null &&
+        outputs.revision(id) === revision;
+      const controller = new AbortController();
+      // Catalog preparation has no playback authority; permits are discarded.
+      // In particular, an ignored receiver can be explicitly adopted without
+      // granting it the playback authority that ignore revokes.
+      const prepared = await admitted.prepare({
+        id,
+        targetRevision: admission.describe(id).targetRevision,
+        signal: controller.signal,
+        refresh: true,
+        isCurrent,
+      });
+      const resolved = outputs.identity({ id, type: 'AirPlay' });
+      // Acquiring a known hardware ID retires the provisional row and its
+      // permit. Follow that identity, rather than treating resolution as a
+      // cancelled address command. Actual forget/ignore cancellation never
+      // binds the identity (prepare fences it before registration).
+      if (
+        !prepared.ok && prepared.error.code === 'cancelled' && resolved === id
+      ) {
+        if (
+          isCurrent() && !outputs.lifetime(id).adopted &&
+          !outputs.ignored().includes(id)
+        ) {
+          admission.invalidate(id);
+          outputs.unregister(id, source);
+        }
+        return null;
+      }
+      if (resolved !== id) {
+        admission.invalidate(id);
+        id = resolved;
+        configureAddress();
         revision = outputs.revision(id);
-        await protocol.prepare({
+        await admitted.prepare({
           id,
           targetRevision: admission.describe(id).targetRevision,
           signal: controller.signal,
