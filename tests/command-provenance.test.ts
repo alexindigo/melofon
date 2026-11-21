@@ -197,7 +197,7 @@ Deno.test('restore is recorded with via restore and keeps engine purity', async 
     assertEquals(records.length, 1);
     assertEquals(records[0].command, 'restore');
     assertEquals(records[0].via, 'restore');
-    // The restore emits nothing itself (boot-time behavior unchanged).
+    // Core publishes the installed state without changing command provenance.
     const status = playback.playerView();
     assertEquals(status.state, 'pause');
     assert(status.itemProgressMs >= 71033416);

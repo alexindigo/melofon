@@ -28,7 +28,10 @@ function deferred() {
 }
 
 /** Explicitly composed engine/boot consumers. Registry wiring is f04b. */
-async function fixture(options: { eofGate?: Promise<void> } = {}) {
+async function fixture(options: {
+  eofGate?: Promise<void>;
+  beforeDecode?(playerIndex: number, signal?: AbortSignal): Promise<void>;
+} = {}) {
   const dir = await restored('playback-capacity', async (dir) => {
     const store = await openStore(dir);
     try {
@@ -207,12 +210,15 @@ async function fixture(options: { eofGate?: Promise<void> } = {}) {
       outputs: playerOutputs(outputs, index + 1),
       devices,
       notify,
-      media: options.eofGate
+      media: options.eofGate || options.beforeDecode
         ? {
           ...media,
           async decodePcm(path, opts) {
+            if (options.beforeDecode) {
+              await options.beforeDecode(index, opts?.signal);
+            }
             const stream = await media.decodePcm(path, opts);
-            if (!stream) return null;
+            if (!stream || !options.eofGate) return stream;
             return fixturePcm(
               (async function* () {
                 for await (const chunk of stream) yield chunk;
@@ -573,6 +579,49 @@ Deno.test('all explicit start paths use independent fixed-player demand without 
     assertEquals(f.playback[0].playerView().state, 'play');
     await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('restore replaces a connected pending reader and publishes its new pump without changing the peer', async () => {
+  const release = deferred();
+  let blocked = false;
+  const f = await fixture({
+    async beforeDecode(index) {
+      if (index !== 1 || blocked) return;
+      blocked = true;
+      await release.promise;
+    },
+  });
+  try {
+    await f.playback[0].play();
+    await until(() => f.sessions[0]?.bytes > 0);
+    const peer = f.playback[0].playerView(),
+      peerQueue = f.playback[0].queueView();
+    const other = f.playback[1], queue = other.queueView();
+    await other.play();
+    await until(() => blocked);
+    assertEquals(f.devices.describe('22').session?.connection, 'connected');
+    assertEquals(f.sessions.findLast((s) => s.port === 7002)!.bytes, 0);
+    await other.restore({
+      queue: queue.items,
+      version: queue.version,
+      nextId: 100,
+      state: 'play',
+      currentIndex: 0,
+      positionMs: 0,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+      queueChanged: false,
+    });
+    release.resolve();
+    await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(other.playerView().state, 'play');
+    assertEquals(f.playback[0].playerView(), peer);
+    assertEquals(f.playback[0].queueView(), peerQueue);
+  } finally {
+    release.resolve();
     await f.close();
   }
 });
