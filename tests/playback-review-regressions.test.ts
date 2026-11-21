@@ -255,3 +255,85 @@ for (const outcome of ['failure', 'missing'] as const) {
     }
   });
 }
+
+for (const edit of ['remove', 'move'] as const) {
+  test(`stale failed successor ${edit} replans before ending native input`, async () => {
+    const held = Promise.withResolvers<void>();
+    let failed = false, cleanupEntered = false;
+    const parts = [pcm(4410, 1000), pcm(4410, 2000), pcm(4410, 3000)];
+    const f = await nativeHttpFixture({
+      pcm: parts[0],
+      additionalPcm: parts.slice(1),
+      async resolveSource(reference, resolve) {
+        if (reference.kind === 'station' && reference.id === 'C') {
+          failed = true;
+          throw new Error('obsolete C preparation failure');
+        }
+        return await resolve();
+      },
+      decoderReturn(path) {
+        if (path.endsWith('/next-0.wav')) {
+          cleanupEntered = true;
+          return held.promise;
+        }
+        return Promise.resolve();
+      },
+    });
+    try {
+      await f.playback.queueAddReferences(
+        f.songIds.slice(0, 2).map((id) => ({ kind: 'song' as const, id })),
+      );
+      const [c] = await f.playback.queueAddSources([{
+        reference: { kind: 'station', id: 'C' },
+        facts: {
+          kind: 'web',
+          url: 'http://media.home/C',
+          title: 'C',
+          artistName: null,
+          durationMs: 100,
+          mode: 'finite',
+          seekable: true,
+          streamTitle: null,
+          streamUrl: null,
+        },
+      }]);
+      await f.playback.queueAddReferences([{ kind: 'song', id: f.songIds[2] }]);
+      await f.playback.play();
+      await until(
+        'failed C retained while B cleanup is held',
+        () => failed && cleanupEntered,
+      );
+      const generation = f.playback.playerView().generation;
+      if (edit === 'remove') await f.playback.queueRemove(c.id);
+      else await f.playback.queueMove(c.id, 3);
+      assertEquals(f.playback.playerView().generation, generation);
+      held.resolve();
+      await until(
+        'valid replacement D reaches its terminal state',
+        () =>
+          f.playback.playerView().state ===
+            (edit === 'remove' ? 'stop' : 'pause'),
+      );
+      await until(
+        'A/B/D completion acknowledgements',
+        () => f.ackStates.length === 3,
+      );
+      const expected = new Uint8Array(
+        parts.reduce((size, part) => size + part.length, 0),
+      );
+      let offset = 0;
+      for (const part of parts) {
+        expected.set(part, offset);
+        offset += part.length;
+      }
+      assertEquals(
+        f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+        expected,
+      );
+      assertEquals(f.receiver.sessions.length, 1);
+    } finally {
+      held.resolve();
+      await f.close();
+    }
+  });
+}

@@ -452,7 +452,12 @@ export function createPlaybackReader(deps: {
         }
         for (;;) {
           if (next && 'preparationFailed' in next) {
-            playback.finishSources(read.source);
+            // The failure is retained, but its queue relationship can have
+            // changed while the outgoing reader was finishing cleanup.
+            if (!playback.finishSources(read.source)) {
+              next = await future(read.source);
+              continue;
+            }
             await endInput(read.source, end.inputEnd);
             return;
           }
@@ -462,13 +467,7 @@ export function createPlaybackReader(deps: {
             } catch (error) {
               deps.sourceCleanupFailed(next.read.entry, error);
             }
-            const replacement = await future(read.source);
-            if (replacement && 'preparationFailed' in replacement) {
-              playback.finishSources(read.source);
-              await endInput(read.source, end.inputEnd);
-              return;
-            }
-            next = replacement;
+            next = await future(read.source);
             continue;
           }
           if (!live()) return;
