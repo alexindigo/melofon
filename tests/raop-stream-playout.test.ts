@@ -1804,35 +1804,66 @@ test('completion close cancels and joins admitted polls/waits before attachment 
   }
 });
 
-test('completion late-join captured at seal fails missing prefix instead of crediting past audio', async () => {
+async function lateJoinMissingPrefix(expireSnapshot: boolean) {
   const stream = createFfiStream();
   const healthy = await startFakeRaop({
     captureAudio: true,
     captureWire: true,
   });
-  const late = await startFakeRaop({ captureAudio: true, captureWire: true });
+  let committedAtRecord = 0n;
+  const late = await startFakeRaop({
+    captureAudio: true,
+    captureWire: true,
+    recoverAudioGaps: true,
+    async beforeRecordReply() {
+      committedAtRecord =
+        (await stream.progress(stream.epoch, highSource, original.id))!
+          .submittedFrames;
+    },
+  });
   const original = stream.attach(() => {}), joined = stream.attach(() => {});
-  const bytes = pcm(353, 67);
+  // Keep real input ahead of presentation. A starved 353-frame source is
+  // permitted to have no cached future packet at RECORD at all.
+  const bytes = new Uint8Array((353 + 44100 * 8) * 4);
+  bytes.set(pcm(353, 67));
+  const target = BigInt(bytes.length / 4);
+  const split = 44100 * 4 * 4;
   try {
     await original.start(profile(healthy), item);
-    await append(stream, highSource, bytes);
+    await append(stream, highSource, bytes.subarray(0, split));
     await until(
       'timeline advances beyond its lead before the late RECORD request',
       async () =>
-        (await stream.progress(stream.epoch, highSource))!.fedFrames >= 110250n,
+        (await stream.progress(stream.epoch, highSource))!.fedFrames >=
+          110250n,
     );
     const committedBeforeRecord =
       (await stream.progress(stream.epoch))!.submittedFrames;
+    if (expireSnapshot) {
+      await until(
+        'the earlier submitted snapshot is already presented before admission',
+        async () =>
+          (await stream.progress(stream.epoch))!.scheduledFrames >=
+            committedBeforeRecord,
+      );
+    }
     await joined.start(profile(late), item);
+    await until(
+      'RECORD-ordered committed snapshot captured',
+      () => committedAtRecord > 0n,
+    );
+    // A starved pacer deliberately retains a partial packet until more input
+    // is needed. Supply the remainder before waiting for its next write/sync.
+    await append(stream, highSource, bytes.subarray(split));
     await until(
       'late receiver has an explicit suffix anchor',
       async () =>
         (await stream.progress(stream.epoch, highSource, joined.id))!
           .coverageStart > 0n,
     );
-    await stream.seal(stream.epoch, highSource, 353n);
-    await stream.endStream(stream.epoch, 353n);
-    const identity = key(stream, highSource, 353n);
+    await stream.seal(stream.epoch, highSource, target);
+    await stream.endStream(stream.epoch, target);
+    const identity = key(stream, highSource, target);
     const failed = await stream.waitCompletion(identity);
     assertEquals(failed.status, 'failed');
     assertEquals(
@@ -1841,7 +1872,12 @@ test('completion late-join captured at seal fails missing prefix instead of cred
     );
     const revised = await stream.reviseCompletion(identity, [joined.id]);
     assertEquals((await stream.waitCompletion(revised)).status, 'complete');
-    await rendered(stream, healthy, 353, new Map([[highSource, bytes]]));
+    await rendered(
+      stream,
+      healthy,
+      bytes.length / 4,
+      new Map([[highSource, bytes]]),
+    );
     const suffix = renderScheduledAudio(late.sessions[0], late.nowMs());
     assertEquals(suffix.issues, []);
     const joinedOutcome = failed.attachments.find((a) =>
@@ -1857,11 +1893,21 @@ test('completion late-join captured at seal fails missing prefix instead of cred
       'a late RECORD cannot replay already presented source',
     );
     assert(
-      anchor < committedBeforeRecord,
-      'later joins also recover a cached future suffix',
+      anchor < committedAtRecord,
+      `later joins also recover a cached future suffix: anchor=${anchor} atRecord=${committedAtRecord} beforeStart=${committedBeforeRecord} coverage=${joinedOutcome.coverageStart}`,
     );
+    if (expireSnapshot) {
+      assert(
+        anchor >= committedBeforeRecord,
+        'a snapshot before admission cannot bound the later RECORD anchor',
+      );
+    }
     assertEquals(joinedOutcome.coverageStart, anchor);
     assertEquals(suffix.discarded, []);
+    assert(
+      suffix.pcm.length >= bytes.length - Number(anchor) * 4,
+      'the entire cached real suffix is scheduled before completion',
+    );
     const expected = new Uint8Array(suffix.pcm.length);
     if (joinedOutcome.coverageStart < 353n) {
       expected.set(bytes.subarray(Number(joinedOutcome.coverageStart) * 4));
@@ -1878,7 +1924,12 @@ test('completion late-join captured at seal fails missing prefix instead of cred
     healthy.close();
     late.close();
   }
-});
+}
+
+test('completion late-join captured at seal fails missing prefix instead of crediting past audio', () =>
+  lateJoinMissingPrefix(false));
+test('completion late-join captured at seal after the earlier snapshot expires', () =>
+  lateJoinMissingPrefix(true));
 
 for (const heldFrames of [4410n, 110250n]) {
   test(`late-join first sync retains RECORD anchor while master advances ${heldFrames} frames`, async () => {
@@ -1995,6 +2046,16 @@ for (const heldFrames of [4410n, 110250n]) {
       const suffix = renderScheduledAudio(late.sessions[0], late.nowMs());
       assertEquals(suffix.issues, []);
       assertEquals(suffix.discarded, []);
+      if (heldFrames === 110250n) {
+        const firstPresentation = suffix.ranges[0];
+        assert(firstPresentation);
+        assert(
+          firstPresentation.atMs - firstAudio.atMs >= 352 * 1000 / 44100,
+          `an expired RECORD needs fresh delivery lead, got ${
+            firstPresentation.atMs - firstAudio.atMs
+          } ms`,
+        );
+      }
       const expected = new Uint8Array(suffix.pcm.length);
       if (outcome.coverageStart < 353n) {
         expected.set(bytes.subarray(Number(outcome.coverageStart) * 4));

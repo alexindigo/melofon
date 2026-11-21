@@ -3537,7 +3537,15 @@ packets_backfill(struct raop_session *rs)
   bool sent = false;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-  size_t suffix = packets_future_suffix(rms, count, rs->schedule_origin_ns, now);
+  uint64_t distance = (uint64_t)count * rms->samples_per_packet;
+  uint64_t recorded_frame = distance <= rms->epoch_frames ? rms->epoch_frames - distance : 0;
+  uint64_t ready_after = now;
+  /* A held RECORD can exhaust its original delivery lead. Re-admit its
+   * remaining suffix with the same receiver/round-trip margin as RECORD,
+   * rather than crediting a packet only microseconds before presentation. */
+  if (now >= packet_deadline_ns(rs->schedule_origin_ns, recorded_frame))
+    ready_after += RAOP_AUDIO_LATENCY_MS * 1000000ULL;
+  size_t suffix = packets_future_suffix(rms, count, rs->schedule_origin_ns, ready_after);
 
   for (size_t i = suffix; i > 0; i--) {
     struct rtp_packet *pkt = rtp_packet_get(rtp, rtp->seqnum - i);
