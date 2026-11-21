@@ -175,7 +175,11 @@ for (
   const action of ['pause', 'stop', 'next', 'queueClear', 'close'] as const
 ) {
   Deno.test(`source retry delay is revoked by ${action} without stale metadata or advance`, async () => {
-    const f = fixture([600000]);
+    // Compare state, not elapsed wall time: next keeps playing, so two real
+    // clock reads can legitimately differ even when both stale callbacks fail.
+    const f = fixture([600000], {
+      player: createPlayer({ now: () => 1000, monotonicNow: () => 0 }),
+    });
     try {
       await f.playback.queueAddSources([web(1), web(2)], { play: true });
       const token = f.open();

@@ -26,8 +26,9 @@ Deno.test('reader rejection joins its outstanding completion ACK before settling
     originFrame: 0n,
   };
   const completion = Promise.withResolvers<TimelineCompletion>();
-  const fault = new Error('decoder return fault');
+  const fault = new Error('post-seal writer fault');
   let emitted = false, failed = false, acknowledged = false, settled = false;
+  let failures = 0;
   const pcm: PlaybackPcm = {
     originFrame: 0n,
     acceptedFrames: 0n,
@@ -43,7 +44,7 @@ Deno.test('reader rejection joins its outstanding completion ACK before settling
       return Promise.resolve({ done: false, value: new Uint8Array(4) });
     },
     return() {
-      return Promise.reject(fault);
+      return Promise.resolve({ done: true, value: undefined });
     },
   };
   const playback = {
@@ -63,7 +64,9 @@ Deno.test('reader rejection joins its outstanding completion ACK before settling
       Promise.resolve({ acceptedFrames: 1n, status: 'accepted' }),
     seal: () => Promise.resolve({ status: 'accepted', inputEnd: 1n }),
     endStream: () => Promise.resolve({ status: 'accepted' }),
-    waitDrain: () => Promise.resolve(),
+    // Crossfade finalizes/seals after decoder cleanup. Fail only after the
+    // completion observer exists, preserving this fixture's held-ACK premise.
+    waitDrain: () => Promise.reject(fault),
     compatibilitySilence: () => Promise.resolve(),
     progress: () => Promise.resolve(null),
     waitCompletion: () => completion.promise,
@@ -106,6 +109,7 @@ Deno.test('reader rejection joins its outstanding completion ACK before settling
     transportFailed() {
       failed = true;
       controller.abort();
+      if (failures++ === 0) throw fault;
     },
     contentFailed() {
       controller.abort();

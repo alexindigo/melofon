@@ -315,6 +315,7 @@ CREATE TABLE IF NOT EXISTS players (
   name VARCHAR NOT NULL,
   name_key VARCHAR UNIQUE NOT NULL,
   volume INTEGER NOT NULL CHECK (volume BETWEEN 0 AND 100),
+  crossfade_ms BIGINT NOT NULL DEFAULT 0 CHECK (crossfade_ms >= 0),
   is_default BOOLEAN NOT NULL,
   commanded_at_ms BIGINT
 );

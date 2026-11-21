@@ -36,6 +36,7 @@ import {
   type SourcePreparation,
 } from './playback-source-plan.ts';
 import { type CommandHandle, createCommandLane } from './command-authority.ts';
+import { crossfadeFrames } from './playback-mix.ts';
 import {
   PlaybackError,
   QueueConflictError,
@@ -195,6 +196,7 @@ export interface Playback {
   setShuffle(on: boolean, source?: CommandSource): void | Promise<void>;
   setConsume(on: boolean, source?: CommandSource): void | Promise<void>;
   setRepeat(mode: RepeatMode, source?: CommandSource): void | Promise<void>;
+  setCrossfade(ms: number, source?: CommandSource): void | Promise<void>;
   setVolume(
     opts: { volume?: number; step?: number },
     source?: CommandSource,
@@ -260,6 +262,9 @@ export interface Playback {
   ): PlaybackRead | null | Promise<PlaybackRead | null>;
   admitSource(read: PlaybackRead): boolean;
   sourceAccepted(source: PlaybackSource, frames: bigint): boolean;
+  /** Bind an admitted incoming head before its overlap mix enters native input.
+   * Its source then counts as future input for edit reconciliation. */
+  overlapSource(source: PlaybackSource, frames: bigint): boolean;
   /** Reserve possible native input before an async append; settle after its receipt. */
   beginSourceInput(source: PlaybackSource): (() => void) | null;
   reviseSourceCompletion(
@@ -1646,6 +1651,18 @@ export function createPlayback(deps: {
       return ownsSource(source) && !!mapping &&
         timeline.accept(mapping, frames);
     },
+    overlapSource(source, frames) {
+      const mapping = timelineSources.get(source);
+      if (
+        !ownsSource(source) || source === sourcePlans.playing ||
+        !mapping || !timeline.overlap(mapping, frames)
+      ) return false;
+      return player.sourcePosition(
+        source,
+        timeline.position(mapping)!.positionMs,
+        0,
+      );
+    },
     beginSourceInput(source) {
       const mapping = timelineSources.get(source);
       return ownsSource(source) && mapping ? timeline.admitting(mapping) : null;
@@ -2046,6 +2063,22 @@ export function createPlayback(deps: {
       emit(['options']);
       return afterMutation(undefined);
     },
+    setCrossfade: (ms, source) =>
+      operations.runImmediate(() => {
+        requireOpen();
+        crossfadeFrames(ms);
+        const change = () => {
+          player.setCrossfade(ms);
+          persistence?.saveCrossfade?.(ms);
+          record('crossfade', `crossfade_ms=${ms}`, source, 'none', false, {
+            crossfadeMs: ms,
+          });
+          emit(['options', 'player']);
+        };
+        return persistence?.publishedCommands
+          ? persistence.publishedCommands.publish(change).command
+          : change();
+      }),
     setVolume: (opts, source) =>
       operations.runImmediate(() => {
         requireOpen();

@@ -51,6 +51,11 @@ export async function nativeHttpFixture(options: {
   receiverCount?: number;
   receiverSelection?: boolean[];
   beforeDecode?: (path: string, startMs: number) => Promise<void>;
+  afterDecodedChunk?: (
+    path: string,
+    frames: bigint,
+    signal?: AbortSignal,
+  ) => Promise<void>;
   decoderReturn?: (path: string, startMs: number) => Promise<void>;
   decoderHead?: (path: string) => void;
   persist?: boolean;
@@ -67,6 +72,10 @@ export async function nativeHttpFixture(options: {
     reference: QueueReference,
     resolve: () => Promise<QueueMedia | null>,
   ) => Promise<QueueMedia | null>;
+  crossfadeMs?: () => number;
+  crossfadeObserved?: Parameters<
+    typeof createAirplayBoot
+  >[0]['crossfadeObserved'];
   append?: (
     request: Parameters<AirplayTimelineStream['appendSource']>[0],
     append: AirplayTimelineStream['appendSource'],
@@ -264,8 +273,61 @@ export async function nativeHttpFixture(options: {
         if (options.persist) await outputs.adopt(String(index + 1));
       }
       const media = createMedia();
+      const wrappedMedia: typeof media = {
+        ...media,
+        async decodePcm(path, settings) {
+          opens++;
+          origins.push(settings?.startMs ?? 0);
+          await options.acquisition;
+          await options.beforeDecode?.(path, settings?.startMs ?? 0);
+          let decoded = await media.decodePcm(path, settings);
+          if (decoded && (options.decoderReturn || options.decoderHead)) {
+            const original = decoded;
+            let returned: Promise<IteratorResult<Uint8Array>> | undefined;
+            decoded = {
+              ...original,
+              get eof() {
+                return original.eof;
+              },
+              async next() {
+                const result = await original.next();
+                if (!result.done) options.decoderHead?.(path);
+                return result;
+              },
+              return() {
+                return returned ??= original.return().finally(() =>
+                  options.decoderReturn?.(path, settings?.startMs ?? 0)
+                );
+              },
+            };
+          }
+          if (
+            !decoded || !options.afterFirstChunk && !options.afterDecodedChunk
+          ) {
+            return decoded;
+          }
+          return fixturePcm(
+            (async function* () {
+              let first = true;
+              for await (const chunk of decoded) {
+                yield chunk;
+                await options.afterDecodedChunk?.(
+                  path,
+                  BigInt(chunk.length / 4),
+                  settings?.signal,
+                );
+                if (first) {
+                  first = false;
+                  await options.afterFirstChunk;
+                }
+              }
+            })(),
+            decoded,
+          );
+        },
+      };
       const sourceOwner = createPlaybackSource({
-        media,
+        media: wrappedMedia,
         state: f.state,
         radio: createRadioSource({
           network: createNetwork({ state: f.state }),
@@ -391,51 +453,10 @@ export async function nativeHttpFixture(options: {
         notify: f.notify,
         devices,
         retryBackoffMs: [],
+        crossfadeMs: options.crossfadeMs,
+        crossfadeObserved: options.crossfadeObserved,
         ...(options.web ? { sources } : {}),
-        media: {
-          ...media,
-          async decodePcm(path, settings) {
-            opens++;
-            origins.push(settings?.startMs ?? 0);
-            await options.acquisition;
-            await options.beforeDecode?.(path, settings?.startMs ?? 0);
-            let decoded = await media.decodePcm(path, settings);
-            if (decoded && (options.decoderReturn || options.decoderHead)) {
-              const original = decoded;
-              let returned: Promise<IteratorResult<Uint8Array>> | undefined;
-              decoded = {
-                ...original,
-                get eof() {
-                  return original.eof;
-                },
-                async next() {
-                  const result = await original.next();
-                  if (!result.done) options.decoderHead?.(path);
-                  return result;
-                },
-                return() {
-                  return returned ??= original.return().finally(() =>
-                    options.decoderReturn?.(path, settings?.startMs ?? 0)
-                  );
-                },
-              };
-            }
-            if (!decoded || !options.afterFirstChunk) return decoded;
-            return fixturePcm(
-              (async function* () {
-                let first = true;
-                for await (const chunk of decoded) {
-                  yield chunk;
-                  if (first) {
-                    first = false;
-                    await options.afterFirstChunk;
-                  }
-                }
-              })(),
-              decoded,
-            );
-          },
-        },
+        media: wrappedMedia,
       });
       timer = setInterval(() => void playback.advanceEnded(), 10);
       return {

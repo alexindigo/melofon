@@ -17,6 +17,7 @@
 // it is a lie with boots attached (HA extrapolates past the end).
 import type { SongRow } from './library.ts';
 import type { PublishedCommandPort } from './save-receipt.ts';
+import { crossfadeFrames } from './playback-mix.ts';
 import {
   catalogMedia,
   queueCapabilities,
@@ -113,6 +114,7 @@ export type SourceOutcome = 'eof' | 'transport-error' | 'decode-error';
 
 export interface PlayerStatus {
   state: PlayerState;
+  crossfadeMs: number;
   repeat: RepeatMode;
   consume: boolean;
   shuffle: boolean;
@@ -163,6 +165,7 @@ export interface PlayerPersistence {
   saveCommand?(atMs: number): void;
   /** Player slider, independent of the playback bookmark and speaker levels. */
   saveVolume?(volume: number): void;
+  saveCrossfade?(crossfadeMs: number): void;
   /** Household publication and save receipts, shared with membership/copies. */
   publishedCommands?: PublishedCommandPort;
   /** Capture a synchronous slider/speaker publication in one durable write. */
@@ -331,6 +334,7 @@ export interface Player {
   setShuffle(on: boolean): void;
   setConsume(on: boolean): void;
   setRepeat(mode: RepeatMode): void;
+  setCrossfade(ms: number): void;
   /** Absolute `volume` wins over relative `step`; clamped 0–100. */
   setVolume(opts: { volume?: number; step?: number }): void;
   /** Absolute `positionMs` wins over relative `seekMs`; clamped to the item.
@@ -528,6 +532,7 @@ export function createPlayer(options: {
   now?: () => number;
   monotonicNow?: () => number;
   volume?: number;
+  crossfadeMs?: number;
 } = {}): Player {
   const now = options.now ?? Date.now;
   const monotonicNow = options.monotonicNow ?? (() => performance.now());
@@ -539,6 +544,8 @@ export function createPlayer(options: {
   let consume = false;
   let shuffle = false;
   let volume = clampVolume(options.volume ?? 50);
+  let crossfadeMs = options.crossfadeMs ?? 0;
+  crossfadeFrames(crossfadeMs);
   let currentIndex: number | null = null;
   // Wall-clock progress: base is the frozen position; when playing, progress
   // is base + (now - startedAt).
@@ -762,7 +769,7 @@ export function createPlayer(options: {
       source = reading;
       currentIndex = items.findIndex((item) => item.id === entryId);
       generation++;
-      baseProgressMs = reading.token.startMs;
+      baseProgressMs = reading.positionMs;
       scheduledProgressMs = reading.positionMs;
       playbackRate = reading.playbackRate;
       startedAt = monotonicNow();
@@ -796,6 +803,7 @@ export function createPlayer(options: {
         consume,
         shuffle,
         volume,
+        crossfadeMs,
         current: entry,
         itemLengthMs: entry === null ? 0 : queueDuration(entry) ?? 0,
         itemProgressMs: state === 'stop' ? 0 : progressMs(),
@@ -1016,6 +1024,11 @@ export function createPlayer(options: {
 
     setRepeat(mode) {
       repeat = mode;
+    },
+
+    setCrossfade(ms) {
+      crossfadeFrames(ms);
+      crossfadeMs = ms;
     },
 
     setVolume(opts) {

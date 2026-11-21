@@ -191,10 +191,20 @@ Signed-in clients send `POST /api/v1/players/{id}/{command}` with `{}` for
 /api/v1/players/{id}/seek` with exactly one integer millisecond field:
 `{"positionMs": 30000}` (absolute, nonnegative) or `{"seekMs": -10000}`
 (relative). Commands return 204; read `GET /api/v1/players/{id}` for state.
-`PATCH` that player with `{"repeat": "off"|"all"|"single", "consume": true|false}`
-to change either or both saved modes, optionally alongside `name`; it returns
+`PATCH` that player with `{"repeat": "off"|"all"|"single", "consume": true|false, "crossfadeMs": 0}`
+to change saved modes or crossfade, optionally alongside `name`; it returns
 the updated player. Starting without a speaker returns `no_target`; another
 player holding AirPlay returns `airplay_busy` with its owning player's id/name.
+
+`crossfadeMs` is a saved per-player duration in nonnegative integer milliseconds;
+it defaults to 0 (gapless). Enabled crossfade mixes natural finite-song changes
+once, before fanout to speakers, with complementary linear ramps. Explicit next,
+previous, restart, seek, pause and stop never fade into their target. Short or
+slow incoming sources can shorten or skip the overlap rather than delay outgoing
+audio. The outgoing song stays current through its last mixed frame; the next
+song's position includes the head already heard in that overlap. Changes apply
+at the next uncommitted boundary, never to accepted audio. OwnTone has no new
+crossfade field or route.
 
 `POST /api/v1/players/{id}/queue/items` adds a batch with a body such as
 `{"references":[{"kind":"album","id":"..."}],"where":"next","startPlaying":true}`.
@@ -242,7 +252,7 @@ the whole queue in order, accepting the same `where` choices as adding media.
 Both accept `startPlaying:true` and optional destination `expectedVersion`.
 Replace starts at the copied spot; add starts the first added entry. Copied
 occurrences have new ids. Empty replace clears/stops; empty add adds nothing.
-Volume, shuffle and speaker membership stay with their players. Limit, stale
+Volume, shuffle, crossfade and speaker membership stay with their players. Limit, stale
 version, no-speaker and AirPlay-busy refusals leave both players unchanged.
 An applied command succeeds even if saving fails afterward; the server logs
 the failure and retries the same whole transaction rather than asking the

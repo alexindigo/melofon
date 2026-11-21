@@ -688,6 +688,7 @@ export interface PlayerPlayback {
     source?: Source,
   ): void | Promise<void>;
   setConsume(on: boolean, source?: Source): void | Promise<void>;
+  setCrossfade(ms: number, source?: Source): void | Promise<void>;
   setVolume(options: { volume: number }, source?: Source): Promise<void>;
   playerView(): {
     state: 'play' | 'pause' | 'stop';
@@ -695,6 +696,7 @@ export interface PlayerPlayback {
     consume: boolean;
     shuffle: boolean;
     volume: number;
+    crossfadeMs: number;
     itemLengthMs: number;
     itemProgressMs: number;
     playbackRate: number;

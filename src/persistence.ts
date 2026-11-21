@@ -322,6 +322,9 @@ export function createPersistence(
       saveVolume(volume) {
         if (active) savePlayer({ playerId, volume }, save);
       },
+      saveCrossfade(crossfadeMs) {
+        if (active) savePlayer({ playerId, crossfadeMs }, save);
+      },
       publishedCommands,
       changeVolume: async (change) =>
         await publishedCommands.publish(change).command,
@@ -400,6 +403,7 @@ export function createPersistence(
     saveQueue: home.saveQueue,
     saveState: home.saveState,
     saveVolume: home.saveVolume,
+    saveCrossfade: home.saveCrossfade,
     changeVolume: home.changeVolume,
     loadQueue: home.loadQueue,
     loadPlayerState: home.loadPlayerState,
