@@ -335,25 +335,29 @@ test('held Pause keeps its admission bookmark and resume renders the exact suffi
   }
 });
 
-async function busy(f: Awaited<ReturnType<typeof concurrentFixture>>) {
-  const { credential } = await f.server.f.login('bearer');
-  const response = await f.server.f.json(
-    '/api/v1/players/2/play',
-    'POST',
-    {},
-    credential,
+async function peerContinues(
+  f: Awaited<ReturnType<typeof concurrentFixture>>,
+  session: FakeRaopSession,
+) {
+  const packets = session.audioPackets;
+  await timelineUntil(
+    'disjoint peer keeps emitting',
+    () => session.audioPackets >= packets + 8,
   );
-  const text = await response.text();
-  assertEquals(response.status, 409, text);
-  assertEquals(JSON.parse(text).code, 'airplay_busy');
-  assertEquals(f.players.get(2).playerView().state, 'stop');
-  assertEquals(f.receivers[2].sessions.length, 0);
+  assertEquals(f.players.get(2).playerView().state, 'play');
+  assertEquals(f.receivers[2].sessions.length, 1);
+  assert(f.receivers[2].sessions[0] === session);
+  assertEquals([session.flushes, session.teardowns, session.closedAtMs], [
+    0,
+    0,
+    null,
+  ]);
 }
 
-test('capacity stays one through natural drain, held Pause and pending retirement', async () => {
+test('per-player stream retention through Pause and natural retirement leaves a disjoint peer independent', async () => {
   const close = Promise.withResolvers<void>();
   let entered = false;
-  const f = await concurrentFixture([44100 + 353, 44100 + 351], {
+  const f = await concurrentFixture([44100 + 353, 44100 * 10 + 351], {
     async closeStream(release) {
       entered = true;
       await close.promise;
@@ -370,31 +374,32 @@ test('capacity stays one through natural drain, held Pause and pending retiremen
           (r.sessions[0]?.audioPackets ?? 0) >= 20
         ),
     );
-    await busy(f);
+    await f.server.call('/players/2/play', 'POST', {});
+    await timelineUntil(
+      'B emits while A owns its stream',
+      () => (f.receivers[2].sessions[0]?.audioPackets ?? 0) >= 20,
+    );
+    const session = f.receivers[2].sessions[0];
+    const peer = f.traces.find((t) => t.ports.has(f.receivers[2].port))!;
+    assertEquals(f.traces.length, 2);
+    assert(f.traces[0].native.id !== peer.native.id);
     await f.server.call('/players/1/pause', 'POST', {});
-    await busy(f);
+    await peerContinues(f, session);
     await f.server.call('/players/1/play', 'POST', {});
     await timelineUntil(
       'natural end with native retirement held',
       () => entered && f.players.get(1).playerView().state === 'stop',
     );
-    await busy(f);
+    await peerContinues(f, session);
+    assertEquals(f.traces.length, 2, 'retirement retains the existing owners');
     close.resolve();
-    const { credential } = await f.server.f.login('bearer');
-    await timelineUntil('B admitted only after release', async () => {
-      const response = await f.server.f.json(
-        '/api/v1/players/2/play',
-        'POST',
-        {},
-        credential,
-      );
-      const text = await response.text();
-      assert(response.status === 204 || response.status === 409, text);
-      return response.status === 204;
-    });
     await timelineUntil(
-      'B emits after proven release',
-      () => (f.receivers[2].sessions[0]?.audioPackets ?? 0) > 0,
+      'B completes its independent schedule',
+      () => f.players.get(2).playerView().state === 'stop',
+    );
+    exact(
+      peer.audio.scheduledRealAudio(session, f.receivers[2].nowMs()),
+      f.waves[1].subarray(44),
     );
     await f.libraryProof();
   } finally {
@@ -403,10 +408,11 @@ test('capacity stays one through natural drain, held Pause and pending retiremen
   }
 });
 
-test('failed native release is quarantined and never frees capacity', async () => {
+test('failed native release quarantines its owner without blocking a disjoint player', async () => {
   let raw: (() => Promise<void>) | undefined;
-  const f = await concurrentFixture([44100 + 353, 44100 + 351], {
+  const f = await concurrentFixture([44100 + 353, 44100 * 8 + 351], {
     closeStream(release) {
+      if (raw) return release();
       raw = release;
       return Promise.reject(new Error('acceptance native free failure'));
     },
@@ -421,14 +427,35 @@ test('failed native release is quarantined and never frees capacity', async () =
     );
     await f.server.call('/players/1/stop', 'POST', {});
     await timelineUntil('release attempted', () => raw !== undefined);
-    await busy(f);
+    await f.server.call('/players/2/play', 'POST', {});
+    await timelineUntil(
+      'B emits despite A release failure',
+      () => (f.receivers[2].sessions[0]?.audioPackets ?? 0) >= 20,
+    );
+    const session = f.receivers[2].sessions[0];
+    const peer = f.traces.find((t) => t.ports.has(f.receivers[2].port))!;
+    await assertRejects(
+      () => f.boots.get(1)!.close(),
+      AggregateError,
+      'stream release failed',
+    );
     await sleep(300);
-    await busy(f);
+    await peerContinues(f, session);
     assertEquals(f.players.get(1).playerView().state, 'pause');
+    assertEquals(f.traces.length, 2, 'quarantined owner is never replaced');
+    assertEquals(f.receivers.slice(0, 2).map((r) => r.sessions.length), [1, 1]);
     assertEquals(
       f.traces[0].audio.epochs,
       [],
       'canceled partial source is never a completion',
+    );
+    await timelineUntil(
+      'B completes despite A quarantine',
+      () => f.players.get(2).playerView().state === 'stop',
+    );
+    exact(
+      peer.audio.scheduledRealAudio(session, f.receivers[2].nowMs()),
+      f.waves[1].subarray(44),
     );
     await f.libraryProof();
     failed = true;
