@@ -74,6 +74,7 @@ test('failed speculative catalog decoder preserves A then pauses B under existin
   const f = await nativeHttpFixture({
     pcm: parts[0],
     additionalPcm: parts.slice(1),
+    crossfadeMs: () => 100,
     beforeDecode(path) {
       if (path.endsWith('next-0.wav')) {
         failed = true;

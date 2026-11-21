@@ -13,6 +13,7 @@ import type { Notify } from '../notify.ts';
 import type { CommandSource, Output, Outputs } from '../player.ts';
 import type { Playback } from '../playback.ts';
 import { createPlaybackReader } from '../playback-reader.ts';
+import { crossfadeFrames, type CrossfadeRecord } from '../playback-mix.ts';
 import type { TimelineSource } from '../playback-timeline.ts';
 import type { PlaybackCapacity } from '../playback-capacity.ts';
 import type { State } from '../state.ts';
@@ -42,6 +43,13 @@ export interface AirplayBootDeps {
   state?: State;
   log?: Log;
   retryBackoffMs?: number[];
+  /** Internal natural-boundary crossfade, in milliseconds; default 0. */
+  crossfadeMs?: () => number;
+  crossfadeObserved?: (record: CrossfadeRecord) => void;
+  crossfadeWaiting?: (
+    outgoingEntryId: number,
+    incomingEntryId: number,
+  ) => void | Promise<void>;
   retryTimer?: {
     set(callback: () => void, delayMs: number): { cancel(): void };
   };
@@ -571,6 +579,24 @@ export function createAirplayBoot(
         !closed && stream === owner && streamCurrent() &&
         owner.sink.epoch === nativeEpoch,
       segment: () => ++owner.segment,
+      crossfadeFrames: () =>
+        crossfadeFrames(
+          deps.crossfadeMs?.() ?? playback.playerView().crossfadeMs,
+        ),
+      crossfadeObserved: deps.crossfadeObserved,
+      crossfadeWaiting: deps.crossfadeWaiting,
+      async inputWindow(sources) {
+        const captured = performance.now();
+        let ahead = 0n;
+        for (const mapping of sources) {
+          const source = await owner.sink.source(nativeEpoch, mapping.source);
+          if (source) ahead += source.acceptedFrames - source.fedFrames;
+        }
+        // Native feeds one 352-frame packet per tick. Keep that quantum in
+        // reserve; only spend already queued PCM while preparing a fade head.
+        return captured +
+          Number(ahead > 352n ? ahead - 352n : 0n) * 1000 / 44100;
+      },
       mapping(lease, mapping) {
         if (playback.sourcePlanView().playing === lease) {
           owner.mapping = mapping;

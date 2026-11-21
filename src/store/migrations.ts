@@ -4,7 +4,7 @@ import { migrateUserNames } from './users.ts';
 import { migrateSettings } from './state.ts';
 import { migrateAdoptedSpeakers } from './speakers.ts';
 import { migrateQueueReferences } from './playback.ts';
-import { migratePlayers } from './players.ts';
+import { migrateCrossfade, migratePlayers } from './players.ts';
 import { retireArtworkFacts } from './hat-data.ts';
 
 /** Run each release migration and its receipt in the same transaction. */
@@ -31,6 +31,9 @@ export async function migrate(q: Queries): Promise<string[]> {
   }, {
     id: 'artwork-facts-001',
     apply: retireArtworkFacts,
+  }, {
+    id: 'players-crossfade-001',
+    apply: migrateCrossfade,
   }];
   for (const migration of migrations) {
     await q.run('BEGIN TRANSACTION');
