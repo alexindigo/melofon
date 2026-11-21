@@ -1,4 +1,4 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { crossfadeHttp } from './helpers/crossfade-http.ts';
 import { crossfadeReference } from './helpers/crossfade-proof.ts';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
@@ -21,6 +21,70 @@ function test(name: string, fn: () => Promise<void>) {
   });
 }
 const parts = [timelinePcm(22050 + 137), timelinePcm(22050 + 19, 2)];
+
+for (const supplied of [false, true]) {
+  test(`setup failure releases acquired receivers and ${supplied ? 'preserves caller' : 'removes owned'} directory`, async () => {
+    const directory = await Deno.makeTempDir({
+      prefix: 'crossfade-setup-failure-',
+    });
+    await Deno.writeTextFile(`${directory}/db`, 'not a store directory');
+    const ports: number[] = [];
+    const listen = Deno.listen, makeTempDir = Deno.makeTempDir;
+    Deno.listen = new Proxy(listen, {
+      apply(target, self, args) {
+        const listener: Deno.Listener = Reflect.apply(target, self, args);
+        if (listener.addr.transport === 'tcp') ports.push(listener.addr.port);
+        return listener;
+      },
+    });
+    Deno.makeTempDir = () => Promise.resolve(directory);
+    try {
+      await assertRejects(() =>
+        crossfadeHttp({ parts, ...(supplied ? { directory } : {}) })
+      );
+      assertEquals(
+        ports.length,
+        2,
+        'both receivers were acquired before setup failed',
+      );
+      for (const port of ports) {
+        using rebound = listen({ hostname: '127.0.0.1', port });
+        assertEquals((rebound.addr as Deno.NetAddr).port, port);
+      }
+      if (supplied) {
+        assertEquals(
+          await Deno.readTextFile(`${directory}/db`),
+          'not a store directory',
+        );
+      } else {
+        await assertRejects(() => Deno.stat(directory), Deno.errors.NotFound);
+      }
+    } finally {
+      Deno.listen = listen;
+      Deno.makeTempDir = makeTempDir;
+      if (supplied) await Deno.remove(directory, { recursive: true });
+    }
+  });
+}
+
+test('teardown attempts all later releases after persistence fails', async () => {
+  const t = await crossfadeHttp({ parts });
+  const close = t.persistence.close.bind(t.persistence);
+  const failure = new Error('injected persistence cleanup failure');
+  t.persistence.close = async () => {
+    await close();
+    throw failure;
+  };
+  const error = await assertRejects(() => t.close(), AggregateError);
+  assertEquals(error.errors.length, 1);
+  assertEquals(error.errors[0].cause, failure);
+  for (const receiver of t.receivers) {
+    using rebound = Deno.listen({ hostname: '127.0.0.1', port: receiver.port });
+    assertEquals((rebound.addr as Deno.NetAddr).port, receiver.port);
+  }
+  await assertRejects(() => fetch(t.f.origin));
+  await assertRejects(() => Deno.stat(t.directory), Deno.errors.NotFound);
+});
 
 test('fresh and upgrade default to zero without refreshing saved playback', async () => {
   const directory = await Deno.makeTempDir({ prefix: 'crossfade-upgrade-' });

@@ -115,7 +115,7 @@ for (const phase of ['before', 'during', 'after'] as const) {
     test(`${action} ${phase} overlap cancels old future and starts an exact solo prefix`, async () => {
       const resumeFuture = Promise.withResolvers<void>();
       let resuming = false;
-      const fadeFrames = 17640;
+      const records: CrossfadeRecord[] = [];
       const parts = [
         timelinePcm(44100 + 137),
         timelinePcm(44100 + 19, 2),
@@ -126,6 +126,7 @@ for (const phase of ['before', 'during', 'after'] as const) {
         additionalPcm: parts.slice(1),
         persist: true,
         crossfadeMs: () => 400,
+        crossfadeObserved: (record) => records.push(record),
         async beforeDecode(path) {
           // Keep the newly planned natural successor unavailable while checking
           // the resumed solo prefix, independently of any old accepted mix.
@@ -142,15 +143,26 @@ for (const phase of ['before', 'during', 'after'] as const) {
           'mixed future accepted',
           () => !!f.key && f.key.source >= 2n,
         );
+        const mixed = records.find((r) =>
+          r.outgoingEntryId === entries[0].id &&
+          r.incomingEntryId === entries[1].id
+        );
+        assert(
+          mixed && mixed.appliedFrames > 0n,
+          'old A/B boundary really mixed',
+        );
+        assertEquals(mixed.reason, 'applied');
+        const fadeFrames = Number(mixed.appliedFrames);
+        const overlapStart = BigInt(parts[0].length / 4) - mixed.appliedFrames;
+        const overlapEnd = BigInt(parts[0].length / 4);
         if (phase === 'during') {
           await timelineUntil(
             'primary is inside its scheduled overlap',
             async () => {
               const progress = await f.native.progress(f.native.epoch, 1n);
               return !!progress &&
-                progress.sourceFrames >
-                  BigInt(parts[0].length / 4 - fadeFrames) &&
-                progress.sourceFrames < BigInt(parts[0].length / 4);
+                progress.sourceFrames > overlapStart &&
+                progress.sourceFrames < overlapEnd;
             },
           );
           assertEquals(f.playback.playerView().current?.id, entries[0].id);
@@ -170,6 +182,7 @@ for (const phase of ['before', 'during', 'after'] as const) {
         if (action === 'next') index++;
         if (action === 'previous') index = Math.max(0, primary - 1);
         if (action === 'seek') offset = 13230;
+        const cutoffIndex = f.capturedCutoffs.length;
         if (action === 'clear') {
           await c.remove();
           assertEquals((await c.current()).state, 'stop');
@@ -190,6 +203,20 @@ for (const phase of ['before', 'during', 'after'] as const) {
             resuming = true;
             await c.command('play');
           }
+        }
+        const admission = f.capturedCutoffs[cutoffIndex]?.progress;
+        assert(admission, 'the control captures the old primary at admission');
+        if (phase === 'before') {
+          assert(
+            admission.sourceFrames < overlapStart,
+            'control precedes overlap',
+          );
+        } else if (phase === 'during') {
+          assert(
+            admission.sourceFrames > overlapStart &&
+              admission.sourceFrames < overlapEnd,
+            'control is admitted inside the measured overlap',
+          );
         }
         const replacement = () => {
           const session = f.receiver.sessions.at(-1);
@@ -510,7 +537,12 @@ test('late join declares suffix coverage of the same mixed stream', async () => 
     assert(first?.kind === 'record' && second?.kind === 'record');
     const offset = (Number(/rtptime=(\d+)/.exec(second.rtpInfo)![1]) -
       Number(/rtptime=(\d+)/.exec(first.rtpInfo)![1]) + 2 ** 32) % 2 ** 32;
-    const expected = crossfadeReference(parts, 8820).pcm.subarray(offset * 4);
+    const mixed = crossfadeReference(parts, 8820).pcm;
+    assert(
+      offset < mixed.length / 4,
+      'the joining receiver has a nonempty suffix',
+    );
+    const expected = mixed.subarray(offset * 4);
     const replay = renderScheduledAudio(joined, f.receivers[1].nowMs());
     assertEquals(replay.issues, []);
     assertEquals(replay.pcm.subarray(0, expected.length), expected);
@@ -668,6 +700,151 @@ test('ready outgoing samples play while their decoder is stalled', async () => {
     );
   } finally {
     held.resolve();
+    await f.close();
+  }
+});
+
+test('held startup PCM plays before a stalled second decoder read resumes', async () => {
+  const held = Promise.withResolvers<void>();
+  const parts = [timelinePcm(88200 + 137), timelinePcm(44100 + 19, 2)];
+  let available = 0n;
+  const f = await nativeHttpFixture({
+    pcm: parts[0],
+    additionalPcm: [parts[1]],
+    crossfadeMs: () => 400,
+    async afterDecodedChunk(path, frames) {
+      if (path.endsWith('next-0.wav') || available) return;
+      available = frames;
+      await held.promise;
+    },
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.command('play');
+    await timelineUntil(
+      'startup decoder stalls with a short held chunk',
+      () => available > 0n,
+    );
+    assert(available < 17640n, 'the first chunk fits entirely inside the hold');
+    await timelineUntil(
+      'ready startup PCM reaches its scheduled consumer',
+      async () => {
+        const progress = await f.native.progress(f.native.epoch, 1n);
+        return progress?.sourceFrames === available;
+      },
+    );
+    assertEquals(
+      f.audio.scheduledRealAudio(
+        f.receiver.sessions[0],
+        f.receiver.nowMs(),
+        0,
+        true,
+      ),
+      parts[0].subarray(0, Number(available) * 4),
+    );
+    held.resolve();
+    await timelineUntil(
+      'resumed startup and natural overlap drain',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      crossfadeReference(parts, 17640).pcm,
+    );
+  } finally {
+    held.resolve();
+    await f.close();
+  }
+});
+
+test('removing an incoming lease during its head wait selects the following track', async () => {
+  const held = Promise.withResolvers<void>();
+  let blocked = false;
+  const parts = [
+    timelinePcm(44100 + 137),
+    timelinePcm(44100 + 19, 2),
+    timelinePcm(44100 + 73, 3),
+  ];
+  const records: CrossfadeRecord[] = [];
+  const f = await nativeHttpFixture({
+    pcm: parts[0],
+    additionalPcm: parts.slice(1),
+    crossfadeMs: () => 100,
+    crossfadeObserved: (record) => records.push(record),
+    async afterDecodedChunk(path) {
+      if (path.endsWith('next-0.wav') && !blocked) {
+        blocked = true;
+        await held.promise;
+      }
+    },
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    const entries = f.playback.queueView().items;
+    await c.command('play');
+    await timelineUntil(
+      'A reaches the boundary while B head is stalled',
+      () => {
+        const accepted = f.audio.epochs[0]?.ranges.filter((r) =>
+          r.kind === 'real' && r.source === 1n
+        )
+          .reduce((n, r) =>
+            n + r.frames, 0n) ?? 0n;
+        return blocked && accepted === BigInt(parts[0].length / 4 - 4410);
+      },
+    );
+    const lease = f.playback.sourcePlanView().reading;
+    assertEquals(lease?.entryId, entries[1].id);
+    assert(lease);
+    const removing = c.remove(entries[1].id);
+    await timelineUntil(
+      'B lease revoked during the head wait',
+      () => lease.signal.aborted,
+    );
+    held.resolve();
+    await removing;
+    await timelineUntil(
+      'A and replacement C drain',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(records.map((r) => r.incomingEntryId), [entries[2].id]);
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      crossfadeReference([parts[0], parts[2]], 4410).pcm,
+    );
+  } finally {
+    held.resolve();
+    await f.close();
+  }
+});
+
+test('catalog decoder hooks also apply with explicit web sources', async () => {
+  let observed = 0n;
+  const bytes = timelinePcm(22050 + 137);
+  const f = await nativeHttpFixture({
+    pcm: bytes,
+    web: 'finite',
+    afterDecodedChunk(_path, frames) {
+      observed += frames;
+      return Promise.resolve();
+    },
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.command('play');
+    await timelineUntil(
+      'catalog source drains in web-enabled fixture',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(observed, BigInt(bytes.length / 4));
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      bytes,
+    );
+  } finally {
     await f.close();
   }
 });

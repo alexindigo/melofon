@@ -407,11 +407,16 @@ export function createPlaybackReader(deps: {
     const nextPart = async (
       next: () => Promise<IteratorResult<Uint8Array>>,
     ): Promise<IteratorResult<Uint8Array>> => {
-      if (!body.hold.frames || !acceptedInput) return await next();
+      if (!body.hold.frames) return await next();
       let settled = false;
       const pending = next().finally(() => settled = true);
       void pending.catch(() => {});
-      const remaining = await inputWindow() - performance.now();
+      // Before the first append there is no native input window. Spend at most
+      // the held chunk's own playing time on another read, so ready startup PCM
+      // cannot wait indefinitely while prompt decoders retain their fade tail.
+      const remaining = acceptedInput
+        ? await inputWindow() - performance.now()
+        : Number(body.hold.frames) * 1000 / 44100;
       if (!settled && remaining > 0) {
         await Promise.race([pending, wait(remaining, source)]);
       }
@@ -544,11 +549,14 @@ export function createPlaybackReader(deps: {
         const requested = requestedFrames();
         let skippedReason: CrossfadeRecord['reason'] = 'compatibility';
         let inputDeadline: number | undefined;
-        const withinInputWindow = async (ready: Promise<unknown>) => {
+        const withinInputWindow = async (
+          ready: Promise<unknown>,
+          source = read.source,
+        ) => {
           inputDeadline ??= await inputWindow();
           const remaining = inputDeadline - performance.now();
           if (remaining > 0) {
-            await Promise.race([ready, wait(remaining, read.source)]);
+            await Promise.race([ready, wait(remaining, source)]);
           }
         };
         let end: Awaited<ReturnType<typeof finalize>> = null;
@@ -624,24 +632,29 @@ export function createPlaybackReader(deps: {
             await endInput();
             return;
           }
+          if (!next.input) {
+            // Its failure is due-only core policy. End the healthy prefix so its
+            // exact tail can complete before that failure is published.
+            await endInput();
+            return;
+          }
+          if (finite(next.read.entry)) prefetch(next.input, requested);
+          const headInput = next.input.prefetch;
+          const wanted =
+            (requested < body.hold.frames ? requested : body.hold.frames) + 1n;
+          while (
+            !end && headInput && !headInput.finished &&
+            headInput.frames < wanted && owns(read.source) &&
+            owns(next.read.source)
+          ) {
+            await withinInputWindow(headInput.changed, next.read.source);
+            if (performance.now() >= (inputDeadline ?? 0)) break;
+          }
+          // Head preparation yields to queue edits. Re-enter the same lease
+          // selection boundary before freezing PCM or committing its handoff.
+          if (next.read.source.signal.aborted) continue;
+          if (!owns(read.source)) return;
           break;
-        }
-        if (!next.input) {
-          // Its failure is due-only core policy. End the healthy prefix so its
-          // exact tail can complete before that failure is published.
-          await endInput();
-          return;
-        }
-        if (finite(next.read.entry)) prefetch(next.input, requested);
-        const headInput = next.input.prefetch;
-        const wanted =
-          (requested < body.hold.frames ? requested : body.hold.frames) + 1n;
-        while (
-          !end && headInput && !headInput.finished &&
-          headInput.frames < wanted && owns(read.source)
-        ) {
-          await withinInputWindow(headInput.changed);
-          if (performance.now() >= (inputDeadline ?? 0)) break;
         }
         const ready = next.input.prefetch?.freeze();
         if (ready) next.input.ready = ready.bytes;
