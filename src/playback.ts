@@ -2555,8 +2555,9 @@ export function createPlayback(deps: {
         const candidate = snapshot.queue[index];
         const prepareUrl = deps.prepareQueueMedia &&
           candidate?.facts.kind === 'web' && candidate.facts.mode === 'unknown';
-        const commit = (restored = snapshot) => {
+        const commit = (restored = snapshot, activate?: Activate) => {
           player.restore(restored);
+          activate?.();
           record(
             'restore',
             undefined,
@@ -2567,6 +2568,7 @@ export function createPlayback(deps: {
           announcedCommander = commander;
           announcedQueueVersion = player.queue().version;
           if (restored.queueChanged) flushQueue();
+          emit(['queue', 'player', 'options']);
         };
         if (
           snapshot.state !== 'play' || !snapshot.queue.length ||
@@ -2578,8 +2580,7 @@ export function createPlayback(deps: {
           await transition(
             true,
             (activate) => {
-              commit();
-              activate();
+              commit(snapshot, activate);
             },
             undefined,
             existingActivation(snapshot.queue, index),
