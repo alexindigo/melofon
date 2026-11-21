@@ -38,6 +38,7 @@ function ownPlaybackPcm(options: {
   failureReason(): SourceOutcome;
   retry?: (reason: SourceOutcome, signal: AbortSignal) => Promise<boolean>;
   retrying(): void;
+  decoded?(frames: bigint): void;
 }) {
   const operations = createOperationScope('Playback PCM');
   const shutdown = new AbortController();
@@ -135,6 +136,7 @@ function ownPlaybackPcm(options: {
                 offered = read.value;
                 outstanding = BigInt(read.value.length / 4);
                 decodedFrames += outstanding;
+                options.decoded?.(decodedFrames);
                 return read;
               }
               if (!attempt!.pcm.eof) {
@@ -370,7 +372,7 @@ export function createPlaybackSource(deps: {
       media: QueueMedia,
       options: {
         signal: AbortSignal;
-        onMetadata?: (metadata: SourceMetadata) => void;
+        onMetadata?: (metadata: SourceMetadata, sourceFrame: bigint) => void;
         retry?: (
           reason: SourceOutcome,
           signal: AbortSignal,
@@ -429,6 +431,7 @@ export function createPlaybackSource(deps: {
         ]),
       );
       const finite = media.facts.mode === 'finite';
+      let decodedBoundary = 0n;
       let reason: SourceOutcome = 'transport-error';
       const decode = async (signal: AbortSignal, startFrame: bigint) => {
         reason = 'transport-error';
@@ -442,7 +445,7 @@ export function createPlaybackSource(deps: {
           | undefined;
         const metadata = (facts: SourceMetadata) => {
           if (active && !signal.aborted) {
-            options.onMetadata?.(facts);
+            options.onMetadata?.(facts, decodedBoundary);
             artwork?.observe(facts.streamUrl);
           }
         };
@@ -511,8 +514,12 @@ export function createPlaybackSource(deps: {
         },
         failureReason: () => reason,
         retry: options.retry,
+        decoded: (frames) => decodedBoundary = frames,
         retrying: () =>
-          options.onMetadata?.({ streamTitle: null, streamUrl: null }),
+          options.onMetadata?.(
+            { streamTitle: null, streamUrl: null },
+            decodedBoundary,
+          ),
       });
       // Preserve eager no-retry validation and lazy retry acquisition, but both
       // paths have an owner before their first await, including unread return.

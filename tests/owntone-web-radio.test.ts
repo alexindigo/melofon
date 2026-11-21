@@ -453,11 +453,16 @@ Deno.test('live ICY titles invalidate OwnTone WS queue reads while station ident
         let text: string | null = "StreamTitle='Artist A - Title A - Part 2';";
         let at = 0;
         while (!signal.aborted) {
-          yield wav.subarray(at, at + 65536);
-          at += 65536;
-          const block = text === null ? new Uint8Array([0]) : icyBlock(text);
-          yield block.subarray(0, 1);
-          yield block.subarray(1);
+          // Cross the decoder's 65536-byte probe boundary before parking input.
+          // One interval minus the WAV header cannot produce scheduled PCM;
+          // waiting for public metadata there would depend on read-time leakage.
+          for (let interval = 0; interval < 2; interval++) {
+            yield wav.subarray(at, at + 65536);
+            at += 65536;
+            const block = text === null ? new Uint8Array([0]) : icyBlock(text);
+            yield block.subarray(0, 1);
+            yield block.subarray(1);
+          }
           text = await new Promise<string | null>((done) => {
             channel.send = done;
             if (signal.aborted) done(null);

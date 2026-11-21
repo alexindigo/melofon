@@ -2691,6 +2691,16 @@ static void
 raop_metadata_rtptimes_get(uint32_t *start, uint32_t *display, uint32_t *pos, uint32_t *end, struct raop_master_session *rms, struct output_metadata *metadata)
 {
   struct rtp_session *rtp_session = rms->rtp_session;
+  if (metadata->timeline) {
+    uint32_t target = rtp_session->pos - (uint32_t)rms->epoch_frames + (uint32_t)metadata->timeline_frame;
+    *start = target - (uint32_t)metadata->media_frame;
+    *display = *start;
+    *pos = *start + (uint32_t)metadata->position_frames;
+    uint64_t end_frames = metadata->duration_frames > metadata->position_frames
+      ? metadata->duration_frames : metadata->position_frames;
+    *end = *start + (uint32_t)end_frames;
+    return;
+  }
   // All the calculations with long ints to avoid surprises
   int64_t sample_rate;
   int64_t diff_ms;
@@ -2829,6 +2839,10 @@ raop_metadata_send_generic(struct raop_session *rs, struct output_metadata *meta
 
   raop_metadata_rtptimes_get(&start, &display, &pos, &end, rs->master_session, metadata);
 
+  if (metadata->timeline)
+    start = rs->master_session->rtp_session->pos - (uint32_t)rs->master_session->epoch_frames +
+      (uint32_t)metadata->timeline_frame;
+
   ret = snprintf(rtptime, sizeof(rtptime), "rtptime=%u", start);
   if ((ret < 0) || (ret >= sizeof(rtptime)))
     {
@@ -2924,6 +2938,14 @@ raop_metadata_send_stream(uint64_t stream_id, struct output_metadata *metadata)
   raop_metadata_purge_stream(stream_id);
   s->metadata = metadata;
   return 0;
+}
+
+void
+raop_timeline_metadata_progress(uint64_t stream_id, uint64_t frames)
+{
+  struct raop_stream_context *s = stream_context_get(stream_id);
+  if (s && s->metadata && s->metadata->timeline)
+    s->metadata->position_frames = frames;
 }
 
 
@@ -3146,6 +3168,7 @@ uint64_t
 raop_cancel_stream(uint64_t stream_id, uint64_t admitted_ns,
                    const uint64_t *retire_ids, size_t retire_count)
 {
+  raop_metadata_purge_stream(stream_id);
   uint64_t cutoff = UINT64_MAX;
   for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
     if (rs->stream_id != stream_id || rs->retiring || rs->failure_pending)

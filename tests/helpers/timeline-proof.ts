@@ -21,8 +21,9 @@ export function concatenate(parts: Uint8Array[]) {
 export async function timelineUntil(
   what: string,
   predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 20000,
 ) {
-  const deadline = performance.now() + 20000;
+  const deadline = performance.now() + timeoutMs;
   while (!await predicate()) {
     assert(performance.now() < deadline, `timed out: ${what}`);
     await new Promise((resolve) => setTimeout(resolve, 5));

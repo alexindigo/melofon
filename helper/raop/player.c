@@ -95,12 +95,18 @@ struct input_range {
 struct timeline {
   bool enabled, ended, tail_reached, complete;
   uint64_t accepted, end_target, padding_left, transport_end;
-  uint64_t compatibility_source, last_real_end;
+  uint64_t compatibility_source, last_real_end, prepared_frames;
   size_t sources, inputs, next_input, ranges;
   struct source_record source[TIMELINE_MARKERS];
   struct input_range input[TIMELINE_MARKERS];
   struct raop_range_snapshot range[TRANSPORT_RANGES];
   uint64_t range_owner[TRANSPORT_RANGES], last_source;
+};
+
+struct metadata_marker {
+  uint64_t source, frame, origin, duration;
+  char *title, *artist;
+  struct metadata_marker *next;
 };
 
 struct raop_player
@@ -119,6 +125,9 @@ struct raop_player
   pthread_mutex_t pcm_lock;
   struct timeline *timeline;     /* pcm_lock; allocated before first admission */
   struct raop_progress_snapshot failure; /* pcm_lock; first failure is retained */
+  struct metadata_marker *metadata_head, *metadata_tail;
+  size_t metadata_count;
+  uint64_t metadata_source, metadata_origin, metadata_position;
 
   /* The pts stream clock, OwnTone's shape (player.c: pb_session.pts =
    * CLOCK_MONOTONIC at start + samples written): the sync packets' NTP
@@ -202,20 +211,21 @@ dmap_add_container(struct evbuffer *evbuf, const char *tag, size_t len)
 
 /* Minimal mlit { minm, asar } — enough for RAOP text; full dmap_common.c
  * waits for DAAP (M7). */
-static void
+static int
 dmap_encode_text(struct evbuffer *out, const char *title, const char *artist)
 {
   struct evbuffer *inner = evbuffer_new();
   size_t n;
 
   if (!inner)
-    return;
+    return -1;
   dmap_add_string(inner, "minm", title ? title : "");
   dmap_add_string(inner, "asar", artist ? artist : "");
   n = evbuffer_get_length(inner);
   dmap_add_container(out, "mlit", n);
   evbuffer_add_buffer(out, inner);
   evbuffer_free(inner);
+  return 0;
 }
 
 static struct timespec
@@ -256,6 +266,7 @@ metadata_send_now(struct raop_player *p)
    * filters its own request types, including a later text-capable join. */
   dmap_encode_text(rmd->metadata, p->title, p->artist);
   md->type = OUTPUT_TYPE_RAOP;
+  md->stream_id = p->stream_id;
   md->pos_ms = p->pos_ms;
   md->len_ms = p->len_ms;
   md->pts = pts_now(p);
@@ -428,6 +439,10 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
           r->frames += count;
           transport += count;
         }
+        /* Publish the full prepared transport extent under pcm_lock. The
+         * loop-owned PTS advances only after backend submission, so an API
+         * end marker cannot use that lagging cursor for packet alignment. */
+        t->prepared_frames = transport;
         n = output_frames * 4;
       }
       pthread_mutex_unlock(&p->pcm_lock);
@@ -456,12 +471,130 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
 
       p->fed_samples += (uint64_t)(n / 4);
       p->pts_samples += (uint64_t)(n / 4);
-      if (!p->metadata_sent && p->pts_samples >= output_buffer_samples())
+      if (!timeline && !p->metadata_sent && p->pts_samples >= output_buffer_samples())
         metadata_send_now(p);
     }
 
   player_debug(p);
+  raop_player_metadata_update(p);
   raop_ffi_completion_update(p->stream_id);
+}
+
+static void
+metadata_marker_free(struct metadata_marker *marker)
+{
+  free(marker->title); free(marker->artist); free(marker);
+}
+
+static void
+metadata_clear(struct raop_player *p)
+{
+  while (p->metadata_head) {
+    struct metadata_marker *next = p->metadata_head->next;
+    metadata_marker_free(p->metadata_head);
+    p->metadata_head = next;
+  }
+  p->metadata_tail = NULL; p->metadata_count = 0; p->metadata_source = 0;
+}
+
+int
+raop_player_timeline_metadata(struct raop_player *p, uint64_t source, uint64_t frame,
+  uint64_t origin, uint64_t duration, const char *title, const char *artist)
+{
+  pthread_mutex_lock(&p->pcm_lock);
+  struct timeline *t = p->timeline;
+  bool valid = false;
+  if (t && !p->fenced) for (size_t i = 0; i < t->sources; i++)
+    if (t->source[i].id == source && frame <= t->source[i].accepted) valid = true;
+  if (!valid) { pthread_mutex_unlock(&p->pcm_lock); return -1; }
+  struct metadata_marker *last = p->metadata_tail;
+  bool replace = last && last->source == source && last->frame == frame;
+  if (!replace && p->metadata_count == TIMELINE_MARKERS) {
+    pthread_mutex_unlock(&p->pcm_lock); return 0;
+  }
+  struct metadata_marker *m = calloc(1, sizeof(*m));
+  if (m) { m->title = strdup(title); m->artist = strdup(artist); }
+  if (!m || !m->title || !m->artist) {
+    if (m) metadata_marker_free(m);
+    pthread_mutex_unlock(&p->pcm_lock); return -2;
+  }
+  m->source = source; m->frame = frame; m->origin = origin; m->duration = duration;
+  if (replace) {
+    free(last->title); free(last->artist);
+    last->title = m->title; last->artist = m->artist;
+    last->origin = origin; last->duration = duration; free(m);
+  } else {
+    if (last) last->next = m; else p->metadata_head = m;
+    p->metadata_tail = m; p->metadata_count++;
+  }
+  pthread_mutex_unlock(&p->pcm_lock);
+  return 1;
+}
+
+/* Loop-only: both pacing and retained poll observations cross this boundary
+ * before completion can be returned/ACKed. Nothing publishes at decode time. */
+void
+raop_player_metadata_update(struct raop_player *p)
+{
+  for (;;) {
+    pthread_mutex_lock(&p->pcm_lock);
+    struct metadata_marker *m = p->metadata_head;
+    struct raop_progress_snapshot progress;
+    uint64_t transport = 0;
+    bool mapped = false;
+    if (!p->fenced && !p->failure.error && m && p->timeline) {
+      for (size_t i = 0; i < p->timeline->ranges; i++) {
+        struct raop_range_snapshot *r = &p->timeline->range[i];
+        if (r->kind == RAOP_RANGE_REAL && r->source == m->source &&
+            r->source_offset <= m->frame && m->frame < r->source_offset + r->frames) {
+          transport = r->transport_start + m->frame - r->source_offset;
+          mapped = true; break;
+        }
+      }
+      raop_transport_progress(p->stream_id, 0, monotonic_ns(), &progress);
+      mapped = mapped && progress.status == 1 && progress.scheduled_frames > transport;
+    }
+    if (!mapped) { pthread_mutex_unlock(&p->pcm_lock); break; }
+    p->metadata_head = m->next;
+    if (!p->metadata_head) p->metadata_tail = NULL;
+    p->metadata_count--;
+    p->metadata_source = m->source; p->metadata_origin = m->origin;
+    p->metadata_position = m->origin + m->frame;
+    pthread_mutex_unlock(&p->pcm_lock);
+
+    struct output_metadata *md = calloc(1, sizeof(*md));
+    struct raop_metadata_mirror *rmd = calloc(1, sizeof(*rmd));
+    if (rmd) rmd->metadata = evbuffer_new();
+    if (!md || !rmd || !rmd->metadata) {
+      if (rmd) { if (rmd->metadata) evbuffer_free(rmd->metadata); free(rmd); }
+      free(md); metadata_marker_free(m);
+      raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_ALLOCATION);
+      return;
+    }
+    if (dmap_encode_text(rmd->metadata, m->title, m->artist) < 0) {
+      evbuffer_free(rmd->metadata); free(rmd); free(md); metadata_marker_free(m);
+      raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_ALLOCATION);
+      return;
+    }
+    rmd->artwork_fmt = -1;
+    md->type = OUTPUT_TYPE_RAOP; md->stream_id = p->stream_id; md->timeline = true;
+    md->timeline_frame = transport; md->media_frame = m->origin + m->frame;
+    md->position_frames = md->media_frame; md->duration_frames = m->duration;
+    md->priv = rmd;
+    int ret = raop_metadata_send_stream(p->stream_id, md);
+    metadata_marker_free(m);
+    if (ret < 0) {
+      raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_ALLOCATION);
+      return;
+    }
+  }
+  if (p->metadata_source) {
+    struct raop_progress_snapshot progress;
+    raop_player_progress(p, p->metadata_source, 0, &progress);
+    uint64_t position = p->metadata_origin + progress.source_frames;
+    if (position > p->metadata_position) p->metadata_position = position;
+    raop_timeline_metadata_progress(p->stream_id, p->metadata_position);
+  }
 }
 
 struct raop_player *
@@ -517,6 +650,7 @@ raop_player_free(struct raop_player *p)
   if (p->timer_fd >= 0)
     close(p->timer_fd);
   evbuffer_free(p->pcm);
+  metadata_clear(p);
   free(p->timeline);
   pthread_mutex_destroy(&p->pcm_lock);
   free(p->title);
@@ -686,7 +820,7 @@ raop_player_end(struct raop_player *p, uint64_t target, struct raop_marker_resul
        * silence. Its exclusive real boundary never moves to that silence. */
       t->tail_reached = true;
       t->transport_end = t->last_real_end;
-      t->padding_left = (352 - p->pts_samples % 352) % 352;
+      t->padding_left = (352 - t->prepared_frames % 352) % 352;
     }
     result->input_end = target;
     result->status = RAOP_APPEND_ACCEPTED;
@@ -882,6 +1016,14 @@ raop_player_ack_source(struct raop_player *p, uint64_t source)
   pthread_mutex_lock(&p->pcm_lock);
   struct timeline *t = p->timeline;
   if (t) {
+    struct metadata_marker **slot = &p->metadata_head;
+    p->metadata_tail = NULL;
+    while (*slot) {
+      struct metadata_marker *m = *slot;
+      if (m->source == source) { *slot = m->next; metadata_marker_free(m); p->metadata_count--; }
+      else { p->metadata_tail = m; slot = &m->next; }
+    }
+    if (p->metadata_source == source) p->metadata_source = 0;
     for (size_t i = 0; i < t->sources; i++)
       if (t->source[i].id == source && t->source[i].fed != t->source[i].accepted) {
         pthread_mutex_unlock(&p->pcm_lock);
@@ -921,6 +1063,7 @@ raop_player_flush(struct raop_player *p)
 {
   pthread_mutex_lock(&p->pcm_lock);
   evbuffer_drain(p->pcm, evbuffer_get_length(p->pcm));
+  metadata_clear(p);
   memset(&p->failure, 0, sizeof(p->failure));
   if (p->timeline && p->timeline->enabled) {
     memset(p->timeline, 0, sizeof(*p->timeline));

@@ -1,10 +1,13 @@
 import { assertEquals, assertMatch, assertRejects } from '@std/assert';
 import {
   buildNative,
+  cacheEntries,
   parseFileTimes,
   parseSummary,
+  prepareCache,
   selectFiles,
   shardFiles,
+  verifyCache,
 } from '../scripts/test-runner.ts';
 
 Deno.test('test runner: shards are stable, disjoint and exhaustive', () => {
@@ -32,6 +35,78 @@ Deno.test('test runner: selection is conservative for shared changes', () => {
     ]
   ) {
     assertEquals(selectFiles(files, [path]), files);
+  }
+});
+
+Deno.test('test runner: offline preparation includes independent subprocess and worker entries', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const files = [
+      'main.ts',
+      'src/worker.ts',
+      'tests/fixtures/child.ts',
+      'layers/routes/get.ts',
+      '.test-tmp/generated.ts',
+      'node_modules/ambient.ts',
+      'data/runtime.ts',
+    ];
+    for (const path of files) {
+      await Deno.mkdir(`${root}/${path.slice(0, path.lastIndexOf('/') + 1)}`, {
+        recursive: true,
+      });
+      await Deno.writeTextFile(`${root}/${path}`, 'export {};');
+    }
+    const entries = await cacheEntries(root);
+    assertEquals(entries, [
+      'layers/routes/get.ts',
+      'main.ts',
+      'src/worker.ts',
+      'tests/fixtures/child.ts',
+    ]);
+    const calls: string[][] = [];
+    await prepareCache(entries, (_cmd, args) => {
+      calls.push(args);
+      return Promise.resolve();
+    });
+    assertEquals(calls, [
+      ['cache', '--frozen', ...entries],
+      [
+        'test',
+        '--frozen',
+        '--cached-only',
+        '--no-run',
+        '--no-check',
+        ...entries,
+      ],
+    ]);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('test runner: offline validation rejects an empty cache without network or lock changes', async () => {
+  const cache = await Deno.makeTempDir();
+  const lock = await Deno.readTextFile('deno.lock');
+  try {
+    await assertRejects(
+      () =>
+        verifyCache(['src/zip.ts'], async (cmd, args) => {
+          const output = await new Deno.Command(cmd, {
+            args,
+            env: { DENO_DIR: cache, NO_COLOR: '1' },
+            stdout: 'piped',
+            stderr: 'piped',
+          }).output();
+          if (!output.success) {
+            throw new Error(new TextDecoder().decode(output.stderr));
+          }
+        }),
+      Error,
+      'Specifier not found in cache',
+    );
+    assertEquals(await Deno.readTextFile('deno.lock'), lock);
+  } finally {
+    await Deno.remove(cache, { recursive: true });
   }
 });
 
@@ -298,6 +373,7 @@ esac
       const runs = calls.filter((call) => call[0] === 'run');
       assertEquals(runs.length, 5); // one preparation, three shards, one summary
       for (const run of runs) {
+        assertEquals(run.includes('--cached-only'), !run.includes('prepare'));
         for (
           const arg of [
             '--cpus=1',

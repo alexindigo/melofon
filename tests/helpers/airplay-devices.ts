@@ -185,6 +185,7 @@ export function recordingStream(
           status: 'accepted',
         }),
       compatibilitySilence: () => Promise.resolve(),
+      metadata: () => Promise.resolve('accepted'),
       waitDrain: () => Promise.resolve(),
       source: (_epoch, source) => Promise.resolve(sources.get(source) ?? null),
       range: () => Promise.resolve(null),
@@ -375,6 +376,7 @@ export function createTestAirplayDevices(
   outputs: Outputs,
   spawn?: AirplaySpawn,
   stream?: () => AirplayExactStream,
+  txt: Record<string, string> = {},
 ) {
   return createAirplayDevices({
     outputs,
@@ -400,6 +402,7 @@ export function createTestAirplayDevices(
             sr: '44100',
             ss: '16',
             ch: '2',
+            ...txt,
           },
         });
       },

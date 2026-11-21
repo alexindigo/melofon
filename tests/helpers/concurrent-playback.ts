@@ -64,7 +64,10 @@ export function wave(frames: number, seed: number) {
   return wav;
 }
 
-export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
+export async function concurrentFixture(
+  frames = [44100 + 353, 88200 + 351],
+  hooks: { closeStream?(close: () => Promise<void>): Promise<void> } = {},
+) {
   const dir = await Deno.makeTempDir({ prefix: 'concurrent-http-' });
   await Deno.mkdir(`${dir}/media`);
   const waves = frames.map((n, i) => wave(n, 1000 + i * 2000));
@@ -163,6 +166,10 @@ export async function concurrentFixture(frames = [44100 + 353, 88200 + 351]) {
               get epoch() {
                 return native.epoch;
               },
+              close: () =>
+                hooks.closeStream
+                  ? hooks.closeStream(() => native.close())
+                  : native.close(),
               attach(...args) {
                 const driver = native.attach(...args);
                 let port: number | undefined,

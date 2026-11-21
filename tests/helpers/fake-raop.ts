@@ -94,7 +94,12 @@ export interface FakeRaopSession {
   /** Wall-clock ms when the RTSP connection ended (either side), if yet. */
   closedAtMs: number | null;
   sdp: string;
-  parameters: { contentType: string; body: Uint8Array; atMs: number }[];
+  parameters: {
+    contentType: string;
+    body: Uint8Array;
+    atMs: number;
+    rtpInfo?: string;
+  }[];
   audioPayloads: Uint8Array[];
   rtspPeer: { address: string; port: number };
   rtpSenders: { address: string; port: number; atMs: number }[];
@@ -412,6 +417,9 @@ export function startFakeRaop(
             contentType: headers.get('content-type') ?? '',
             body: bodyBytes,
             atMs: now(),
+            ...(headers.has('rtp-info')
+              ? { rtpInfo: headers.get('rtp-info')! }
+              : {}),
           });
         }
         if (method === 'SET_PARAMETER' && body.startsWith('volume')) {

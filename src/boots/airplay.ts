@@ -554,7 +554,7 @@ export function createAirplayBoot(
     owner.sourceStarted = true;
     owner.admitted = false;
     const failed = (error: unknown) => {
-      if (!closed && stream === owner) {
+      if (!closed && stream === owner && owner.sink.epoch === nativeEpoch) {
         for (const [id, r] of [...runtimes]) {
           sessionFailed(id, r, 'source transport', error);
         }
@@ -567,7 +567,9 @@ export function createAirplayBoot(
       streamId: owner.sink.id!,
       epoch: nativeEpoch,
       initial: { source: sourceLease, entry: view.current },
-      current: () => !closed && stream === owner && streamCurrent(),
+      current: () =>
+        !closed && stream === owner && streamCurrent() &&
+        owner.sink.epoch === nativeEpoch,
       segment: () => ++owner.segment,
       mapping(lease, mapping) {
         if (playback.sourcePlanView().playing === lease) {
@@ -615,6 +617,13 @@ export function createAirplayBoot(
           streamBlocked = true;
           log.event('retirement_failed', { player: deps.playerId ?? 1, error });
         }
+      },
+      sourceCleanupFailed(entry, error) {
+        log.event('media_failed', {
+          operation: 'source-cleanup',
+          path: String(entry.id),
+          error,
+        });
       },
     });
     source = { stream: owner, reader };
@@ -724,7 +733,7 @@ export function createAirplayBoot(
     // Natural exhaustion has already ended and presented the final source.
     // Retire attachments without cancel/reset: completion observations remain
     // owned until the reader has acknowledged them and joined its cleanup.
-    const drained = view.state === 'stop' && source?.stream === owner &&
+    const drained = view.state !== 'play' && source?.stream === owner &&
       source.reader.drained;
     if (drained) {
       owner.sourceStarted = false;

@@ -70,11 +70,13 @@ prefix="melofon-test-$$-$(basename "$run_dir" | tr '[:upper:]' '[:lower:]')"
 container() {
   local name=$1 network=$2
   shift 2
+  local offline=()
+  if [[ "$1" != prepare ]]; then offline=(--cached-only); fi
   "$engine" run --rm --init --name="$name" --memory=2g --memory-swap=2g --pids-limit=512 --cpus=1 \
     --user="$(id -u):$(id -g)" --network="$network" --network-alias=melofon.home \
     -v "$PWD:/app" -w /app -e "TMPDIR=/app/$run_dir" \
     -e "MELOFON_BROWSER_TESTS=${MELOFON_BROWSER_TESTS:-}" \
-    --entrypoint deno "$image" run --frozen --allow-all scripts/test-runner.ts "$@"
+    --entrypoint deno "$image" run --frozen "${offline[@]}" --allow-all scripts/test-runner.ts "$@"
 }
 new_network() {
   networks+=("$1")

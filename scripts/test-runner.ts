@@ -80,6 +80,46 @@ async function command(cmd: string, args: string[]) {
   }
 }
 
+// Processes, Workers and discovered routes are independent module entries, not
+// necessarily imports of a test file. Include them all, never ambient caches or
+// generated fixtures, and let the frozen lock resolve their dependencies.
+export async function cacheEntries(root = '.'): Promise<string[]> {
+  const entries: string[] = [];
+  async function visit(directory: string) {
+    for await (const entry of Deno.readDir(`${root}/${directory}`)) {
+      if (
+        entry.name.startsWith('.') || entry.name === 'node_modules' ||
+        (directory === '' && entry.name === 'data')
+      ) continue;
+      const path = directory ? `${directory}/${entry.name}` : entry.name;
+      if (entry.isDirectory) await visit(path);
+      else if (entry.isFile && /\.(?:[cm]?ts|tsx)$/.test(entry.name)) {
+        entries.push(path);
+      }
+    }
+  }
+  await visit('');
+  return entries.sort();
+}
+
+export async function verifyCache(entries: string[], run = command) {
+  // Resolution only: no test/server execution or duplicate typecheck. A missing
+  // registry manifest, source or npm package fails preparation without a fetch.
+  await run(Deno.execPath(), [
+    'test',
+    '--frozen',
+    '--cached-only',
+    '--no-run',
+    '--no-check',
+    ...entries,
+  ]);
+}
+
+export async function prepareCache(entries: string[], run = command) {
+  await run(Deno.execPath(), ['cache', '--frozen', ...entries]);
+  await verifyCache(entries, run);
+}
+
 async function nativeOutputs(directory: string): Promise<string> {
   const files: string[] = [];
   async function visit(path: string) {
@@ -157,10 +197,9 @@ async function prepare(directory: string, count: number, changesFile?: string) {
     await Deno.readTextFile('scripts/test-timings.json'),
   );
   const shards = shardFiles(selected, count, timings);
-  // Populate dependencies once before concurrent test processes share the cache.
-  if (selected.length) {
-    await command(Deno.execPath(), ['cache', '--frozen', ...selected]);
-  }
+  const entries = await cacheEntries();
+  await prepareCache(entries);
+  console.log(`Offline cache verified: ${entries.length} module entries`);
   await Deno.writeTextFile(
     `${directory}/plan.json`,
     JSON.stringify({ shards, started: Date.now() }),
@@ -196,6 +235,7 @@ async function runShard(directory: string, plan: Plan, index: number) {
       args: [
         'test',
         '--frozen',
+        '--cached-only',
         '--env',
         // Native identity probes read /proc/self/maps, which requires -A.
         // The rootless container remains the execution boundary.

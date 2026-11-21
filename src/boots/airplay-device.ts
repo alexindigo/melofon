@@ -149,6 +149,7 @@ export function createAirplayDevices(deps: {
       for (
         const method of [
           'appendSource',
+          'metadata',
           'seal',
           'endStream',
           'waitDrain',
@@ -206,6 +207,7 @@ export function createAirplayDevices(deps: {
         operations.run(() => acquire().ackCancel(epoch)),
       appendSource: (input) =>
         operations.run(() => timeline().appendSource(input)),
+      metadata: (input) => operations.run(() => timeline().metadata(input)),
       seal: (...args) => operations.run(() => timeline().seal(...args)),
       endStream: (...args) =>
         operations.run(() => timeline().endStream(...args)),

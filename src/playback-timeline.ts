@@ -2,6 +2,7 @@
 // timers, protocol imports or inferred progress. Seal/completion authority stays
 // with the same immutable source until its core transition commits.
 import { pcmOrigin } from './pcm-origin.ts';
+import type { SourceMetadata } from './queue-source.ts';
 export interface TimelineSource {
   readonly streamId: bigint;
   readonly epoch: bigint;
@@ -58,6 +59,15 @@ export interface TimelineCompletion {
 }
 /** The reader consumes an injected timeline port, not a protocol adapter. */
 export interface TimelineWriter {
+  metadata(input: {
+    epoch: bigint;
+    source: bigint;
+    sourceFrame: bigint;
+    originFrame: bigint;
+    durationFrames: bigint;
+    title: string;
+    artist: string;
+  }): Promise<'accepted' | 'backpressure' | 'canceled'>;
   appendSource(input: {
     epoch: bigint;
     source: bigint;
@@ -116,6 +126,7 @@ export function createPlaybackTimeline() {
     pendingAppends: number;
     revision: bigint;
     exclusions: { attachment: bigint; outcome: string; error: string }[];
+    metadata: { frame: bigint; facts: SourceMetadata }[];
     target?: bigint;
     completed?: boolean;
   }>();
@@ -179,6 +190,7 @@ export function createPlaybackTimeline() {
         pendingAppends: 0,
         revision: 1n,
         exclusions: [],
+        metadata: [],
         position: Object.freeze({
           positionMs: source.originMs,
           sourceFrames: 0n,
@@ -192,6 +204,37 @@ export function createPlaybackTimeline() {
     },
     position(source: TimelineSource): TimelinePosition | null {
       return owned(source)?.position ?? null;
+    },
+    metadata(
+      source: TimelineSource,
+      frame: bigint,
+      facts: SourceMetadata,
+    ): boolean {
+      u64(frame);
+      const record = owned(source);
+      if (!record || record.position.canceled) return false;
+      const last = record.metadata.at(-1);
+      if (last && frame < last.frame) {
+        throw new Error('Metadata frames must be ordered');
+      }
+      if (last?.frame === frame) last.facts = { ...last.facts, ...facts };
+      else record.metadata.push({ frame, facts: { ...facts } });
+      return true;
+    },
+    scheduledMetadata(source: TimelineSource): SourceMetadata[] {
+      const record = owned(source);
+      if (
+        !record || record.position.canceled ||
+        record.position.status !== 'scheduled'
+      ) return [];
+      const facts: SourceMetadata[] = [];
+      while (
+        record.metadata.length &&
+        record.metadata[0].frame < record.position.sourceFrames
+      ) {
+        facts.push(record.metadata.shift()!.facts);
+      }
+      return facts;
     },
     accepted(source: TimelineSource): bigint {
       return owned(source)?.acceptedFrames ?? 0n;

@@ -482,9 +482,32 @@ Deno.test('players cold HTTP: v0.2.0 upgrade, Kitchen membership survives restar
       receivers[0].sessions.every((s) => s.closedAtMs !== null)
     );
     const kitchenSessions = receivers[1].sessions.length;
-    await server.native('/players/1/queue/copy/replace', 'POST', {
-      targetPlayerId: kitchen.id,
-      startPlaying: true,
+    // RTSP close precedes stream-storage free and its retained household slot.
+    // Observe the public admission boundary, not an estimated cleanup delay.
+    await eventually(async () => {
+      const response = await server!.nativeResponse(
+        '/players/1/queue/copy/replace',
+        'POST',
+        { targetPlayerId: kitchen.id, startPlaying: true },
+      );
+      if (response.status === 409) {
+        const busy = await response.json();
+        assertEquals(busy.code, 'airplay_busy');
+        assertEquals(busy.owner, { id: 1, name: 'Home' });
+        assertEquals(
+          await server!.native(`/players/${kitchen.id}/queue?view=all`),
+          kitchenQueue,
+          'a pending release refuses before changing the destination',
+        );
+        assertEquals(
+          (await server!.native(`/players/${kitchen.id}`)).player.state,
+          'pause',
+        );
+        return false;
+      }
+      assertEquals(response.status, 204, await response.text());
+      await response.body?.cancel();
+      return true;
     });
     await until(() =>
       receivers[1].sessions.slice(kitchenSessions).some((s) =>

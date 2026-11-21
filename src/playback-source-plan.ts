@@ -99,6 +99,11 @@ export function createSourcePlanOwner(deps: {
       return admitted.findIndex((record) => !reconcile(record));
     },
     validate: reconcile,
+    terminal(after: PlaybackSource) {
+      return !!reading && reading.after === after && !!reconcile(reading) &&
+        !reading.source &&
+        (reading.through === null || reading.error !== undefined);
+    },
     prepare(
       plan: SuccessorPlan,
       command: CommandHandle,
