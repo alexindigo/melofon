@@ -38,10 +38,15 @@ export function createPlaybackReader(deps: {
     read: PlaybackRead,
     bytes: number,
   ): void;
-  /** Requested natural-boundary overlap; read when an outgoing source begins
-   * input (its tail hold) and again at its boundary. Absent means 0. */
+  /** Requested natural-boundary overlap; read for each unsubmitted chunk and
+   * again before committing a boundary. Absent means 0. */
   crossfadeFrames?(): bigint;
   crossfadeObserved?(record: CrossfadeRecord): void;
+  /** Optional observer/barrier at the reader's incoming-head wait. */
+  crossfadeWaiting?(
+    outgoingEntryId: number,
+    incomingEntryId: number,
+  ): void | Promise<void>;
   /** Conservative monotonic deadline derived from currently queued sink input,
    * not an extra fade wait. Absent means the outgoing tail must be supplied now. */
   inputWindow?(sources: readonly TimelineSource[]): Promise<number>;
@@ -391,7 +396,7 @@ export function createPlaybackReader(deps: {
     read: PlaybackRead,
     mapping: TimelineSource,
     input: NonNullable<Acquired>,
-    holdFrames: bigint,
+    holdFrames: () => bigint,
     committed: () => void,
   ): Promise<Body | null> => {
     const { source } = read, { pcm } = input;
@@ -399,7 +404,7 @@ export function createPlaybackReader(deps: {
       read,
       mapping,
       written: 0,
-      hold: createTailHold(holdFrames),
+      hold: createTailHold(holdFrames()),
       committed,
     };
     let observed = false;
@@ -408,11 +413,12 @@ export function createPlaybackReader(deps: {
         observed = true;
         deps.inputObserved?.('first', read, chunk.length);
       }
-      if (!holdFrames) {
+      const frames = holdFrames();
+      if (!frames && !body.hold.frames) {
         return await append(body, chunk, decoded ? { pcm, chunk } : undefined);
       }
       if (decoded) pcm.accept(chunk, BigInt(chunk.length / 4));
-      for (const part of body.hold.push(chunk)) {
+      for (const part of body.hold.push(chunk, frames)) {
         if (!await append(body, part)) return false;
       }
       return owns(source);
@@ -570,7 +576,7 @@ export function createPlaybackReader(deps: {
               read,
               mapping,
               writing,
-              pending ? requestedFrames() : 0n,
+              () => pending ? requestedFrames() : 0n,
               () => {
                 if (!handoff) return;
                 publications.get(handoff.body.read.source)?.resolve();
@@ -600,7 +606,7 @@ export function createPlaybackReader(deps: {
         const compatibility = read.entry.facts.kind === 'song' &&
           Math.round(Number(decoded) * 1000 / 44100) + read.source.startMs <
             length;
-        const requested = requestedFrames();
+        let requested = requestedFrames();
         let skippedReason: CrossfadeRecord['reason'] = 'compatibility';
         let inputDeadline: number | undefined;
         const withinInputWindow = async (
@@ -696,15 +702,26 @@ export function createPlaybackReader(deps: {
             await endInput();
             return;
           }
+          requested = requestedFrames();
           if (finite(next.read.entry)) prefetch(next.input, requested);
           const headInput = next.input.prefetch;
-          const wanted =
-            (requested < body.hold.frames ? requested : body.hold.frames) + 1n;
+          const wanted = () => {
+            const frames = requestedFrames();
+            return (frames < outgoing.hold.frames
+              ? frames
+              : outgoing.hold.frames) + 1n;
+          };
           while (
             !end && headInput && !headInput.finished &&
-            headInput.frames < wanted && owns(read.source) &&
+            headInput.frames < wanted() && owns(read.source) &&
             owns(next.read.source)
           ) {
+            if (deps.crossfadeWaiting) {
+              await deps.crossfadeWaiting(
+                read.source.entryId,
+                next.read.source.entryId,
+              );
+            }
             await withinInputWindow(headInput.changed, next.read.source);
             if (performance.now() >= (inputDeadline ?? 0)) break;
           }
@@ -714,13 +731,20 @@ export function createPlaybackReader(deps: {
           if (!owns(read.source)) return;
           break;
         }
+        // No overlap has been bound or submitted while the head was pending.
+        // Capture its setting only now; accepted overlap PCM stays immutable.
+        requested = requestedFrames();
         const ready = next.input.prefetch?.freeze();
         if (ready) next.input.ready = ready.bytes;
         if (ready?.failed) {
           if (owns(next.read.source)) {
             playback.reportSourceOutcome(next.read.source, 'decode-error');
           }
-          await next.input.pcm.return();
+          try {
+            await releaseInput(next.input.pcm);
+          } catch (error) {
+            deps.sourceCleanupFailed(next.read.entry, error);
+          }
           await endInput();
           return;
         }

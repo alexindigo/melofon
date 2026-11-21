@@ -612,49 +612,75 @@ test('decoder starvation freezes the primary and resumes the exact mixed stream'
   }
 });
 
-test('a failed incoming head cannot contaminate A or consume B before it is due', async () => {
-  const parts = [timelinePcm(44100 + 137), timelinePcm(44100 + 19, 2)];
-  let failed = false;
-  const f = await nativeHttpFixture({
-    pcm: parts[0],
-    additionalPcm: [parts[1]],
-    crossfadeMs: () => 100,
-    afterDecodedChunk(path) {
-      if (path.endsWith('next-0.wav')) {
-        failed = true;
-        return Promise.reject(
-          new Error('incoming decoder failed after its first chunk'),
-        );
-      }
-      return Promise.resolve();
-    },
+for (const cleanupRejects of [false, true]) {
+  test(`a failed incoming head${cleanupRejects ? ' with failed cleanup' : ''} cannot contaminate A or consume B before it is due`, async () => {
+    const parts = [timelinePcm(44100 + 137), timelinePcm(44100 + 19, 2)];
+    let failed = false;
+    let cleanupCalls = 0;
+    const f = await nativeHttpFixture({
+      pcm: parts[0],
+      additionalPcm: [parts[1]],
+      crossfadeMs: () => 100,
+      decoderReturn(path) {
+        if (cleanupRejects && path.endsWith('next-0.wav')) {
+          cleanupCalls++;
+          return Promise.reject(new Error('B decoder cleanup rejected'));
+        }
+        return Promise.resolve();
+      },
+      afterDecodedChunk(path) {
+        if (path.endsWith('next-0.wav')) {
+          failed = true;
+          return Promise.reject(
+            new Error('incoming decoder failed after its first chunk'),
+          );
+        }
+        return Promise.resolve();
+      },
+    });
+    const outcomes: { entryId: number; outcome: string }[] = [];
+    const report = f.playback.reportSourceOutcome;
+    f.playback.reportSourceOutcome = (source, outcome) => {
+      outcomes.push({ entryId: source.entryId, outcome });
+      return report(source, outcome);
+    };
+    try {
+      const c = await timelineControl(f);
+      await c.add();
+      await c.modes({ consume: true });
+      const entries = f.playback.queueView().items;
+      await c.command('play');
+      await timelineUntil('incoming failure is retained', () => failed);
+      assertEquals((await c.current()).current.entryId, entries[0].id);
+      assertEquals(f.playback.queueView().items.length, 2);
+      await timelineUntil(
+        'failed B becomes due and pauses',
+        () => f.playback.playerView().state === 'pause',
+      );
+      assertEquals((await c.current()).current.entryId, entries[1].id);
+      assertEquals((await c.current()).positionMs, 0);
+      assert(
+        f.completions.some((r) => r.source === 1n && r.status === 'complete'),
+      );
+      assertEquals(
+        outcomes.filter((r) => r.outcome === 'decode-error').map((r) =>
+          r.entryId
+        ),
+        [entries[1].id],
+      );
+      assertEquals(cleanupCalls, cleanupRejects ? 1 : 0);
+      assertEquals(f.playback.queueView().items.map((e) => e.id), [
+        entries[1].id,
+      ]);
+      assertEquals(
+        f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+        parts[0],
+      );
+    } finally {
+      await f.close();
+    }
   });
-  try {
-    const c = await timelineControl(f);
-    await c.add();
-    await c.modes({ consume: true });
-    const entries = f.playback.queueView().items;
-    await c.command('play');
-    await timelineUntil('incoming failure is retained', () => failed);
-    assertEquals((await c.current()).current.entryId, entries[0].id);
-    assertEquals(f.playback.queueView().items.length, 2);
-    await timelineUntil(
-      'failed B becomes due and pauses',
-      () => f.playback.playerView().state === 'pause',
-    );
-    assertEquals((await c.current()).current.entryId, entries[1].id);
-    assertEquals((await c.current()).positionMs, 0);
-    assertEquals(f.playback.queueView().items.map((e) => e.id), [
-      entries[1].id,
-    ]);
-    assertEquals(
-      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
-      parts[0],
-    );
-  } finally {
-    await f.close();
-  }
-});
+}
 
 test('ready outgoing samples play while their decoder is stalled', async () => {
   const held = Promise.withResolvers<void>();
@@ -778,6 +804,8 @@ test('held startup PCM plays before a stalled second decoder read resumes', asyn
 
 test('removing an incoming lease during its head wait selects the following track', async () => {
   const held = Promise.withResolvers<void>();
+  const resumeWait = Promise.withResolvers<void>();
+  let waiting = false;
   let blocked = false;
   let incoming: AbortSignal | undefined;
   const parts = [
@@ -791,6 +819,10 @@ test('removing an incoming lease during its head wait selects the following trac
     additionalPcm: parts.slice(1),
     crossfadeMs: () => 100,
     crossfadeObserved: (record) => records.push(record),
+    async crossfadeWaiting() {
+      waiting = true;
+      await resumeWait.promise;
+    },
     async afterDecodedChunk(path, _frames, signal) {
       if (path.endsWith('next-0.wav') && !blocked) {
         incoming = signal;
@@ -805,19 +837,17 @@ test('removing an incoming lease during its head wait selects the following trac
     const entries = f.playback.queueView().items;
     await c.command('play');
     await timelineUntil(
-      'A reaches the boundary while B head is stalled',
-      async () => {
-        const source = await f.native.source(f.native.epoch, 1n);
-        return blocked &&
-          source?.acceptedFrames === BigInt(parts[0].length / 4 - 4410);
-      },
+      'the reader entered B head wait after its pre-wait lease guard',
+      () => waiting,
     );
+    assert(blocked);
     assert(incoming, 'the held incoming decoder has a cancellation signal');
     const removing = c.remove(entries[1].id);
     await timelineUntil(
       'B lease revoked during the head wait',
       () => incoming!.aborted,
     );
+    resumeWait.resolve();
     held.resolve();
     await removing;
     await timelineUntil(
@@ -830,6 +860,7 @@ test('removing an incoming lease during its head wait selects the following trac
       crossfadeReference([parts[0], parts[2]], 4410).pcm,
     );
   } finally {
+    resumeWait.resolve();
     held.resolve();
     await f.close();
   }

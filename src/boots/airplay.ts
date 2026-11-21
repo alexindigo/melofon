@@ -46,6 +46,10 @@ export interface AirplayBootDeps {
   /** Internal natural-boundary crossfade, in milliseconds; default 0. */
   crossfadeMs?: () => number;
   crossfadeObserved?: (record: CrossfadeRecord) => void;
+  crossfadeWaiting?: (
+    outgoingEntryId: number,
+    incomingEntryId: number,
+  ) => void | Promise<void>;
   retryTimer?: {
     set(callback: () => void, delayMs: number): { cancel(): void };
   };
@@ -580,6 +584,7 @@ export function createAirplayBoot(
           deps.crossfadeMs?.() ?? playback.playerView().crossfadeMs,
         ),
       crossfadeObserved: deps.crossfadeObserved,
+      crossfadeWaiting: deps.crossfadeWaiting,
       async inputWindow(sources) {
         const captured = performance.now();
         let ahead = 0n;

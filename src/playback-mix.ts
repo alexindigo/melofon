@@ -48,20 +48,25 @@ export function mixCrossfade(outgoing: Uint8Array, incoming: Uint8Array) {
 
 /** Rolling outgoing tail: releases everything except the last `frames`. */
 export function createTailHold(frames: bigint) {
-  if (typeof frames !== 'bigint' || frames < 0n) {
-    throw new RangeError('Tail hold requires nonnegative frames');
-  }
-  const limit = Number(frames) * FRAME;
+  const bytesFor = (frames: bigint) => {
+    if (typeof frames !== 'bigint' || frames < 0n) {
+      throw new RangeError('Tail hold requires nonnegative frames');
+    }
+    return Number(frames) * FRAME;
+  };
+  let limit = bytesFor(frames);
   const parts: Uint8Array[] = [];
   let held = 0;
   return {
     get frames() {
       return BigInt(held / FRAME);
     },
-    /** Copy a decoded chunk in; returns the prefix that must be appended now. */
-    push(chunk: Uint8Array): Uint8Array[] {
+    /** Copy a decoded chunk in; a new window affects only retained/new PCM,
+     * never a prefix already released to the sink. */
+    push(chunk: Uint8Array, frames?: bigint): Uint8Array[] {
       if (chunk.length % FRAME) throw new RangeError('Incomplete PCM frame');
-      if (!limit) return chunk.length ? [chunk] : [];
+      if (frames !== undefined) limit = bytesFor(frames);
+      if (!limit && !held) return chunk.length ? [chunk] : [];
       if (chunk.length) {
         parts.push(chunk.slice());
         held += chunk.length;

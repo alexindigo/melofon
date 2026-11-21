@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { crossfadeHttp } from './helpers/crossfade-http.ts';
 import { crossfadeReference } from './helpers/crossfade-proof.ts';
+import type { CrossfadeRecord } from '../src/playback-mix.ts';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 import {
   concatenate,
@@ -325,6 +326,105 @@ test('published setting has one command and a retained exact C4 save batch', asy
   } finally {
     fail = false;
     await t.close();
+  }
+});
+
+test('enabling crossfade during A holds only unsubmitted PCM for the next boundary', async () => {
+  const bytes = [timelinePcm(44100 + 137), timelinePcm(44100 + 19, 2)];
+  const resumeDecoder = Promise.withResolvers<void>();
+  let heldFrames = 0n;
+  const records: CrossfadeRecord[] = [];
+  const f = await nativeHttpFixture({
+    pcm: bytes[0],
+    additionalPcm: [bytes[1]],
+    crossfadeObserved: (record) => records.push(record),
+    async afterDecodedChunk(path, frames) {
+      if (!path.endsWith('source.wav') || heldFrames) return;
+      heldFrames = frames;
+      await resumeDecoder.promise;
+    },
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.command('play');
+    await timelineUntil(
+      'A stalls after submitting its first unfaded chunk',
+      () => heldFrames > 0n,
+    );
+    assertEquals(
+      (await f.native.source(f.native.epoch, 1n))?.acceptedFrames,
+      heldFrames,
+    );
+    await c.modes({ crossfadeMs: 100 });
+    resumeDecoder.resolve();
+    await timelineUntil(
+      'the newly enabled A/B overlap drains',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(records.map((r) => [r.requestedFrames, r.appliedFrames]), [[
+      4410n,
+      4410n,
+    ]]);
+    const expected = crossfadeReference(bytes, 4410).pcm;
+    assertEquals(
+      expected.subarray(0, Number(heldFrames) * 4),
+      bytes[0].subarray(0, Number(heldFrames) * 4),
+    );
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      expected,
+    );
+  } finally {
+    resumeDecoder.resolve();
+    await f.close();
+  }
+});
+
+test('disabling crossfade during B head wait leaves the uncommitted A/B boundary gapless', async () => {
+  const bytes = [timelinePcm(44100 + 137), timelinePcm(44100 + 19, 2)];
+  const resumeHead = Promise.withResolvers<void>();
+  const resumeWait = Promise.withResolvers<void>();
+  let waiting = false;
+  const records: CrossfadeRecord[] = [];
+  const f = await nativeHttpFixture({
+    pcm: bytes[0],
+    additionalPcm: [bytes[1]],
+    crossfadeObserved: (record) => records.push(record),
+    async afterDecodedChunk(path) {
+      if (path.endsWith('next-0.wav')) await resumeHead.promise;
+    },
+    async crossfadeWaiting() {
+      waiting = true;
+      await resumeWait.promise;
+    },
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.modes({ crossfadeMs: 400 });
+    await c.command('play');
+    await timelineUntil(
+      'the reader waits for B before binding an overlap',
+      () => waiting,
+    );
+    assertEquals(records, []);
+    await c.modes({ crossfadeMs: 0 });
+    resumeHead.resolve();
+    resumeWait.resolve();
+    await timelineUntil(
+      'the unfaded A/B boundary and both tails drain',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(records, [], 'no stale 400 ms overlap is committed');
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      concatenate(bytes),
+    );
+  } finally {
+    resumeHead.resolve();
+    resumeWait.resolve();
+    await f.close();
   }
 });
 
