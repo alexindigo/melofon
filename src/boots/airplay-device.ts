@@ -692,8 +692,12 @@ export function createAirplayDevices(deps: {
         o.type === 'AirPlay'
       );
       // An acquired identity wins over endpoint aliases, including after restart.
-      const known = rows.find((o) => o.receiverIdentity === parsed.id);
-      if (known) return known.id;
+      const known = outputs.identity({
+        id: parsed.id,
+        type: 'AirPlay',
+        receiverIdentity: parsed.id,
+      });
+      if (rows.some((row) => row.id === known)) return known;
       const provisional = rows.find((o) =>
         o.receiverIdentity === undefined &&
         sameAirplayAddress(o.host, service.address) &&
@@ -712,14 +716,14 @@ export function createAirplayDevices(deps: {
       source?: CommandSource,
       service?: MdnsService,
     ) {
-      const id = row.id;
+      let id = row.id;
       if (service) {
-        outputs.register({
+        id = outputs.register({
           ...row,
           hasPassword: passwordRequiredFromTxt(service.txt),
           receiverIdentity: receiverIdentity(id, service),
         }, source);
-      } else outputs.restore(row, source);
+      } else id = outputs.restore(row, source);
       if (service) {
         try {
           accept(id, service);
@@ -782,32 +786,11 @@ export function createAirplayDevices(deps: {
         refresh: true,
         isCurrent,
       });
-      if (!isCurrent()) return null;
-      const acquired = outputs.get(id, { includeIgnored: true });
-      if (
-        acquired?.receiverIdentity !== undefined &&
-        receiverRevisions.get(acquired.receiverIdentity) !==
-          configurationRevisions.get(acquired.receiverIdentity)
-      ) {
-        // An alias lookup begun before forget/ignore cannot re-adopt that receiver.
-        if (!outputs.lifetime(id).adopted) {
-          admission.invalidate(id);
-          outputs.unregister(id, source);
-        }
-        return null;
-      }
-      const canonical = acquired?.receiverIdentity === undefined
-        ? undefined
-        : outputs.list({ includeIgnored: true }).find((o) =>
-          o.id !== id && o.type === 'AirPlay' &&
-          o.receiverIdentity === acquired.receiverIdentity
-        );
-      if (canonical && !outputs.lifetime(id).adopted) {
-        // A new address alias resolved to an already known receiver. Keep its
-        // stable id/preferences, never move credentials or selection to an alias.
+      const resolved = outputs.identity({ id, type: 'AirPlay' });
+      if (resolved !== id) {
         admission.invalidate(id);
-        outputs.unregister(id, source);
-        id = canonical.id;
+        id = resolved;
+        const canonical = outputs.get(id, { includeIgnored: true })!;
         outputs.restore({
           ...canonical,
           host,
@@ -825,6 +808,20 @@ export function createAirplayDevices(deps: {
           refresh: true,
           isCurrent,
         });
+      }
+      if (!isCurrent()) return null;
+      const acquired = outputs.get(id, { includeIgnored: true });
+      if (
+        acquired?.receiverIdentity !== undefined &&
+        receiverRevisions.get(acquired.receiverIdentity) !==
+          configurationRevisions.get(acquired.receiverIdentity)
+      ) {
+        // An alias lookup begun before forget/ignore cannot re-adopt that receiver.
+        if (!outputs.lifetime(id).adopted) {
+          admission.invalidate(id);
+          outputs.unregister(id, source);
+        }
+        return null;
       }
       if (!isCurrent()) return null;
       return await outputs.adopt(id);

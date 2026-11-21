@@ -428,6 +428,10 @@ export interface OutputCommand {
 }
 
 export interface Outputs {
+  /** Acquired hardware identity owns the entry; endpoints are only aliases. */
+  identity(
+    output: Pick<OutputRegistration, 'id' | 'type' | 'receiverIdentity'>,
+  ): string;
   list(options?: { includeIgnored?: boolean }): Output[];
   get(id: string, options?: { includeIgnored?: boolean }): Output | null;
   ignored(): string[];
@@ -440,9 +444,9 @@ export interface Outputs {
     output: OutputRegistration,
     source?: CommandSource,
     lifetime?: 'observation' | 'restore',
-  ): void;
+  ): string;
   /** Restore identity/preferences without claiming a current observation. */
-  restore(output: OutputRegistration, source?: CommandSource): void;
+  restore(output: OutputRegistration, source?: CommandSource): string;
   /** Explicit configuration, never implied by selection or observation. */
   adopt(id: string): Promise<Output | null>;
   /** Cancel use and durably remove configuration. Observations may return later. */
@@ -1234,6 +1238,22 @@ export function createOutputs(
       ? persistence.savedOutput(id) !== undefined
       : adopted.has(id);
   const find = (id: string) => outputs.find((o) => o.id === id) ?? null;
+  const receiverIdentities = new Map<
+    string,
+    { type: string; hardware: string }
+  >();
+  const identity: Outputs['identity'] = (output) => {
+    const acquired = receiverIdentities.get(output.id);
+    const hardware = output.receiverIdentity ??
+      find(output.id)?.receiverIdentity ??
+      (acquired?.type === output.type ? acquired.hardware : undefined);
+    return hardware === undefined
+      ? output.id
+      : outputs.find((row) =>
+        row.type === output.type &&
+        row.receiverIdentity === hardware
+      )?.id ?? output.id;
+  };
   const owner = outputPlayerId;
   const member = (row: Output, playerId: number | null) => {
     if (owner(row) !== playerId) move(row.id);
@@ -1365,6 +1385,7 @@ export function createOutputs(
   };
 
   const api: Outputs = {
+    identity,
     ready: () => initialization,
     revision,
     membershipRevision,
@@ -1389,9 +1410,14 @@ export function createOutputs(
       withdrawn.has(id) ? 'gone' : discovered.has(id) ? 'observed' : 'unknown',
     restore(output, source) {
       // Restoration uses the adopted cache, never caller-supplied live facts.
-      api.register(output, source, 'restore');
+      return api.register(output, source, 'restore');
     },
     async adopt(id) {
+      const acquired = receiverIdentities.get(id);
+      const current = find(id);
+      if (current || acquired) {
+        id = identity(current ?? { id, type: acquired!.type });
+      }
       let row = find(id);
       if (row === null || forgetting.has(id)) return null;
       if (ignoring.has(id)) {
@@ -1465,7 +1491,7 @@ export function createOutputs(
       } else api.unregister(id, source);
     },
     register(output, source, lifetime = 'observation') {
-      if (forgetting.has(output.id)) return;
+      if (forgetting.has(output.id)) return output.id;
       if (output.connectionStrategy !== undefined) {
         requireConnectionStrategy(output.connectionStrategy);
       }
@@ -1473,6 +1499,37 @@ export function createOutputs(
         throw new Error(
           'output strategy default not initialized; await outputs.ready()',
         );
+      }
+      if (output.receiverIdentity !== undefined) {
+        receiverIdentities.set(output.id, {
+          type: output.type,
+          hardware: output.receiverIdentity,
+        });
+      }
+      const id = identity(output);
+      const resolved = id !== output.id;
+      if (id !== output.id) {
+        const alias = output.id;
+        const known = find(id)!;
+        const wasAdopted = isAdopted(alias);
+        // Learning an existing hardware ID resolves this registration to its
+        // owner. Do not transfer alias preferences, membership or credentials.
+        api.unregister(alias, source);
+        adopted.delete(alias);
+        discovered.delete(alias);
+        withdrawn.delete(alias);
+        if (wasAdopted) {
+          void persistence?.deleteOutput?.(alias).catch((error) =>
+            log.event('output_listener_failed', { error })
+          );
+        }
+        output = {
+          ...output,
+          ...known,
+          host: output.host ?? known.host,
+          port: output.port ?? known.port,
+          model: output.model ?? known.model,
+        };
       }
       const idx = outputs.findIndex((o) => o.id === output.id);
       const previousOwner = find(output.id) ? owner(find(output.id)!) : null;
@@ -1525,7 +1582,7 @@ export function createOutputs(
         };
       }
       if (owner(find(output.id)!) !== previousOwner) move(output.id);
-      if (lifetime === 'observation') saveRow(find(output.id)!);
+      if (lifetime === 'observation' || resolved) saveRow(find(output.id)!);
       record('register', source);
       log.event('command', {
         command: 'output.register',
@@ -1533,6 +1590,7 @@ export function createOutputs(
         source: source ?? { kind: 'internal' },
       });
       emit(['outputs']);
+      return output.id;
     },
     unregister(id, source) {
       const idx = outputs.findIndex((o) => o.id === id);

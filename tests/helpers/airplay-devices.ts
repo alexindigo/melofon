@@ -378,6 +378,7 @@ export function createTestAirplayDevices(
   stream?: () => AirplayExactStream,
   txt: Record<string, string> = {},
 ) {
+  const identities = new Map<string, string>();
   return createAirplayDevices({
     outputs,
     ...(spawn === undefined ? {} : { spawn }),
@@ -390,8 +391,21 @@ export function createTestAirplayDevices(
         const row = outputs.list().find((o) =>
           o.host === host && (port === undefined || o.port === port)
         );
+        const key = row?.id ?? `${host}:${port}`;
+        if (!identities.has(key)) {
+          identities.set(
+            key,
+            (0x001122334455n + BigInt(identities.size)).toString(16).padStart(
+              12,
+              '0',
+            ),
+          );
+        }
+        const hardware = row?.receiverIdentity === undefined
+          ? identities.get(key)!
+          : BigInt(row.receiverIdentity).toString(16).padStart(12, '0');
         return Promise.resolve({
-          name: `001122334455@${row?.name ?? 'test'}._raop._tcp.local`,
+          name: `${hardware}@${row?.name ?? 'test'}._raop._tcp.local`,
           host: 'fixture.local',
           address: host,
           port: port ?? 7000,
