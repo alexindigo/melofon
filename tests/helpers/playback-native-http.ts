@@ -51,7 +51,11 @@ export async function nativeHttpFixture(options: {
   receiverCount?: number;
   receiverSelection?: boolean[];
   beforeDecode?: (path: string, startMs: number) => Promise<void>;
-  afterDecodedChunk?: (path: string, frames: bigint) => Promise<void>;
+  afterDecodedChunk?: (
+    path: string,
+    frames: bigint,
+    signal?: AbortSignal,
+  ) => Promise<void>;
   persist?: boolean;
   directory?: string;
   storeDir?: string;
@@ -288,6 +292,7 @@ export async function nativeHttpFixture(options: {
                 await options.afterDecodedChunk?.(
                   path,
                   BigInt(chunk.length / 4),
+                  settings?.signal,
                 );
                 if (first) {
                   first = false;

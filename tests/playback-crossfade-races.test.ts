@@ -182,6 +182,19 @@ for (const phase of ['before', 'during', 'after'] as const) {
         if (action === 'next') index++;
         if (action === 'previous') index = Math.max(0, primary - 1);
         if (action === 'seek') offset = 13230;
+        const beforeCommand = await f.native.progress(
+          f.native.epoch,
+          BigInt(primary + 1),
+        );
+        assert(beforeCommand);
+        if (phase === 'before') {
+          assert(beforeCommand.sourceFrames < overlapStart);
+        } else if (phase === 'during') {
+          assert(
+            beforeCommand.sourceFrames > overlapStart &&
+              beforeCommand.sourceFrames < overlapEnd,
+          );
+        }
         const cutoffIndex = f.capturedCutoffs.length;
         if (action === 'clear') {
           await c.remove();
@@ -205,13 +218,18 @@ for (const phase of ['before', 'during', 'after'] as const) {
           }
         }
         const admission = f.capturedCutoffs[cutoffIndex]?.progress;
-        assert(admission, 'the control captures the old primary at admission');
-        if (phase === 'before') {
+        if (action === 'stop' || action === 'pause') {
+          assert(
+            admission,
+            'bookmark controls capture the primary at admission',
+          );
+        }
+        if (admission && phase === 'before') {
           assert(
             admission.sourceFrames < overlapStart,
             'control precedes overlap',
           );
-        } else if (phase === 'during') {
+        } else if (admission && phase === 'during') {
           assert(
             admission.sourceFrames > overlapStart &&
               admission.sourceFrames < overlapEnd,
@@ -734,13 +752,13 @@ test('held startup PCM plays before a stalled second decoder read resumes', asyn
         return progress?.sourceFrames === available;
       },
     );
+    const startup = renderScheduledAudio(
+      f.receiver.sessions[0],
+      f.receiver.nowMs(),
+    );
+    assertEquals(startup.issues, []);
     assertEquals(
-      f.audio.scheduledRealAudio(
-        f.receiver.sessions[0],
-        f.receiver.nowMs(),
-        0,
-        true,
-      ),
+      startup.pcm.subarray(0, Number(available) * 4),
       parts[0].subarray(0, Number(available) * 4),
     );
     held.resolve();
@@ -761,6 +779,7 @@ test('held startup PCM plays before a stalled second decoder read resumes', asyn
 test('removing an incoming lease during its head wait selects the following track', async () => {
   const held = Promise.withResolvers<void>();
   let blocked = false;
+  let incoming: AbortSignal | undefined;
   const parts = [
     timelinePcm(44100 + 137),
     timelinePcm(44100 + 19, 2),
@@ -772,8 +791,9 @@ test('removing an incoming lease during its head wait selects the following trac
     additionalPcm: parts.slice(1),
     crossfadeMs: () => 100,
     crossfadeObserved: (record) => records.push(record),
-    async afterDecodedChunk(path) {
+    async afterDecodedChunk(path, _frames, signal) {
       if (path.endsWith('next-0.wav') && !blocked) {
+        incoming = signal;
         blocked = true;
         await held.promise;
       }
@@ -786,22 +806,17 @@ test('removing an incoming lease during its head wait selects the following trac
     await c.command('play');
     await timelineUntil(
       'A reaches the boundary while B head is stalled',
-      () => {
-        const accepted = f.audio.epochs[0]?.ranges.filter((r) =>
-          r.kind === 'real' && r.source === 1n
-        )
-          .reduce((n, r) =>
-            n + r.frames, 0n) ?? 0n;
-        return blocked && accepted === BigInt(parts[0].length / 4 - 4410);
+      async () => {
+        const source = await f.native.source(f.native.epoch, 1n);
+        return blocked &&
+          source?.acceptedFrames === BigInt(parts[0].length / 4 - 4410);
       },
     );
-    const lease = f.playback.sourcePlanView().reading;
-    assertEquals(lease?.entryId, entries[1].id);
-    assert(lease);
+    assert(incoming, 'the held incoming decoder has a cancellation signal');
     const removing = c.remove(entries[1].id);
     await timelineUntil(
       'B lease revoked during the head wait',
-      () => lease.signal.aborted,
+      () => incoming!.aborted,
     );
     held.resolve();
     await removing;

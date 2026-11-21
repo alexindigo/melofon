@@ -28,12 +28,12 @@ for (const supplied of [false, true]) {
       prefix: 'crossfade-setup-failure-',
     });
     await Deno.writeTextFile(`${directory}/db`, 'not a store directory');
-    const ports: number[] = [];
+    const listeners: Deno.Listener[] = [];
     const listen = Deno.listen, makeTempDir = Deno.makeTempDir;
     Deno.listen = new Proxy(listen, {
       apply(target, self, args) {
         const listener: Deno.Listener = Reflect.apply(target, self, args);
-        if (listener.addr.transport === 'tcp') ports.push(listener.addr.port);
+        listeners.push(listener);
         return listener;
       },
     });
@@ -43,13 +43,12 @@ for (const supplied of [false, true]) {
         crossfadeHttp({ parts, ...(supplied ? { directory } : {}) })
       );
       assertEquals(
-        ports.length,
+        listeners.length,
         2,
         'both receivers were acquired before setup failed',
       );
-      for (const port of ports) {
-        using rebound = listen({ hostname: '127.0.0.1', port });
-        assertEquals((rebound.addr as Deno.NetAddr).port, port);
+      for (const listener of listeners) {
+        await assertRejects(() => listener.accept(), Deno.errors.BadResource);
       }
       if (supplied) {
         assertEquals(
