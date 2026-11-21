@@ -66,7 +66,10 @@ export function wave(frames: number, seed: number) {
 
 export async function concurrentFixture(
   frames = [44100 + 353, 88200 + 351],
-  hooks: { closeStream?(close: () => Promise<void>): Promise<void> } = {},
+  hooks: {
+    closeStream?(close: () => Promise<void>): Promise<void>;
+    beforeRecordReply?(): Promise<void>;
+  } = {},
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'concurrent-http-' });
   await Deno.mkdir(`${dir}/media`);
@@ -80,6 +83,7 @@ export async function concurrentFixture(
         captureAudio: true,
         captureWire: true,
         recoverAudioGaps: true,
+        beforeRecordReply: hooks.beforeRecordReply,
       })
     ),
   );

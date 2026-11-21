@@ -20,6 +20,7 @@ import { scanLibrary } from '../src/scan.ts';
 import { catalogMedia, type QueueMedia } from '../src/queue-source.ts';
 import { restored } from './helpers/prepared.ts';
 import { receiver, sleep, until } from './helpers/speaker-consumer.ts';
+import { pcmOrigin } from '../src/pcm-origin.ts';
 
 function deferred() {
   let resolve!: () => void;
@@ -30,7 +31,11 @@ function deferred() {
 /** Explicitly composed engine/boot consumers. Registry wiring is f04b. */
 async function fixture(options: {
   eofGate?: Promise<void>;
-  beforeDecode?(playerIndex: number, signal?: AbortSignal): Promise<void>;
+  beforeDecode?(
+    playerIndex: number,
+    signal?: AbortSignal,
+    origin?: bigint,
+  ): Promise<void>;
 } = {}) {
   const dir = await restored('playback-capacity', async (dir) => {
     const store = await openStore(dir);
@@ -215,7 +220,11 @@ async function fixture(options: {
           ...media,
           async decodePcm(path, opts) {
             if (options.beforeDecode) {
-              await options.beforeDecode(index, opts?.signal);
+              await options.beforeDecode(
+                index,
+                opts?.signal,
+                pcmOrigin(opts ?? {}),
+              );
             }
             const stream = await media.decodePcm(path, opts);
             if (!stream || !options.eofGate) return stream;
@@ -586,9 +595,12 @@ Deno.test('all explicit start paths use independent fixed-player demand without 
 Deno.test('restore replaces a connected pending reader and publishes its new pump without changing the peer', async () => {
   const release = deferred();
   let blocked = false;
+  const origins: bigint[] = [];
   const f = await fixture({
-    async beforeDecode(index) {
-      if (index !== 1 || blocked) return;
+    async beforeDecode(index, _signal, origin) {
+      if (index !== 1) return;
+      origins.push(origin!);
+      if (blocked) return;
       blocked = true;
       await release.promise;
     },
@@ -609,14 +621,15 @@ Deno.test('restore replaces a connected pending reader and publishes its new pum
       nextId: 100,
       state: 'play',
       currentIndex: 0,
-      positionMs: 0,
+      positionMs: 100,
       repeat: 'off',
       shuffle: false,
       consume: false,
       queueChanged: false,
     });
-    release.resolve();
+    await until(() => origins.includes(4410n));
     await until(() => f.sessions.some((s) => s.port === 7002 && s.bytes > 0));
+    assertEquals(origins, [0n, 4410n]);
     assertEquals(other.playerView().state, 'play');
     assertEquals(f.playback[0].playerView(), peer);
     assertEquals(f.playback[0].queueView(), peerQueue);

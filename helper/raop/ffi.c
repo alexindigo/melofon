@@ -75,7 +75,7 @@ void raop_player_fence(struct raop_player *p, bool fenced);
 int raop_player_append(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_session_started(struct raop_player *p);
 void raop_player_session_stopped(struct raop_player *p);
-void raop_player_item_set(struct raop_player *p, const char *title,
+int raop_player_item_set(struct raop_player *p, const char *title,
                           const char *artist, uint32_t pos_ms, uint32_t len_ms,
                           uint16_t wanted_metadata);
 
@@ -580,8 +580,11 @@ device_start(raop_t *h, cmd *c)
   event_push(h, "starting");
 
   if (!h->stream || !h->stream->item_set) {
-    raop_player_item_set(h->player, c->title, c->artist, c->pos_ms, c->len_ms,
-                         c->wanted_metadata);
+    if (raop_player_item_set(h->player, c->title, c->artist, c->pos_ms, c->len_ms,
+                         c->wanted_metadata) < 0) {
+      if (h->stream) raop_ffi_attachment_failed(h->stream->id, h->id, RAOP_PROGRESS_ALLOCATION);
+      device_free(h); h->state = OUTPUT_STATE_FAILED; event_push(h, "failed"); return -1;
+    }
     if (h->stream) h->stream->item_set = true;
   }
 

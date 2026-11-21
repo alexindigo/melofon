@@ -152,9 +152,13 @@ for (const mode of ['dormant', 'concurrent', 'concurrent B plaintext']) {
           'encrypted A packets',
           () => ra.sessions[0].audioPackets === 2,
         );
-        const da = decrypt(ra.sessions[0]);
+        let da!: ReturnType<typeof decrypt>;
         await Promise.all([
-          rendered(ra, pcm(704, 41), () => da.session),
+          rendered(
+            ra,
+            pcm(704, 41),
+            (session) => (da = decrypt(session)).session,
+          ),
           rendered(plain, pcm(704, 41)),
         ]);
         assertEquals(plain.sessions[0].sdp.includes('a=rsaaeskey:'), false);
@@ -173,16 +177,17 @@ for (const mode of ['dormant', 'concurrent', 'concurrent B plaintext']) {
           'encrypted B packets',
           () => rb.sessions[0].audioPackets === 2,
         );
-        const db = encryptedB
-          ? decrypt(rb.sessions[0])
-          : { index: -1, session: rb.sessions[0] };
+        let db!: ReturnType<typeof decrypt>;
+        await rendered(rb, pcm(704, 920), (session) => {
+          db = encryptedB ? decrypt(session) : { index: -1, session };
+          return db.session;
+        });
         assertEquals(rb.sessions[0].sdp.includes('a=rsaaeskey:'), encryptedB);
         assertNotEquals(
           da.index,
           db.index,
           'different streams cannot share cipher state',
         );
-        await rendered(rb, pcm(704, 920), () => db.session);
         assertEquals(
           [probe.raop_crypto_generated(), probe.raop_crypto_live()],
           [

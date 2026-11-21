@@ -2017,6 +2017,7 @@ for (const delay of ['request', 'reply']) {
     const stream = createFfiStream();
     const reply = Promise.withResolvers<void>();
     let entered = false;
+    let packetsAtRecord = 0;
     const first = await startFakeRaop({
       captureAudio: true,
       captureWire: true,
@@ -2026,6 +2027,7 @@ for (const delay of ['request', 'reply']) {
       captureWire: true,
       beforeRecordReply: () => {
         entered = true;
+        packetsAtRecord = first.sessions[0]?.audioPackets ?? 0;
         return reply.promise;
       },
     });
@@ -2052,13 +2054,8 @@ for (const delay of ['request', 'reply']) {
       reply.resolve();
       await starting;
       if (delay === 'request') {
-        const record = slow.sessions[0].wire.find((e) => e.kind === 'record');
-        const sixth = first.sessions[0].wire.filter((e) =>
-          e.kind === 'audio'
-        )[5];
-        assert(record?.kind === 'record' && sixth?.kind === 'audio');
         assert(
-          record.atMs > sixth.atMs,
+          packetsAtRecord >= 6,
           'RECORD itself follows six committed packets',
         );
         assertEquals(rtpInfo(slow.sessions[0]), rtpInfo(first.sessions[0]));

@@ -3,6 +3,7 @@
 #define MELOFON_RAOP_BRIDGE_H
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 #include "timeline.h"
 struct raop_player;
 struct output_metadata;
@@ -10,6 +11,7 @@ struct output_metadata;
  * takes ownership even on allocation failure. Free follows all device joins. */
 int raop_metadata_send_stream(uint64_t stream_id, struct output_metadata *);
 void raop_metadata_purge_stream(uint64_t stream_id);
+void raop_metadata_anchor_stream(uint64_t stream_id, struct timespec pts);
 void raop_backend_stream_free(uint64_t stream_id);
 int raop_player_metadata(struct raop_player *, const char *, const char *, uint32_t, uint32_t);
 int raop_player_timeline_active(struct raop_player *);

@@ -179,7 +179,7 @@ test('A pause/seek/Stop/next/EOF/failure/volume/default commands cannot disturb 
       [1, 2].map((id) => f.server.call(`/players/${id}/play`, 'POST', {})),
     );
     await until(() => f.receivers[2].sessions[0]?.audioPackets > 0);
-    const peer = (await f.server.call('/players/2')).player;
+    let peer = (await f.server.call('/players/2')).player;
     const session = f.receivers[2].sessions[0];
     const volume = session.volumeParams.at(-1);
     for (
@@ -206,6 +206,7 @@ test('A pause/seek/Stop/next/EOF/failure/volume/default commands cannot disturb 
         null,
       ]);
       assertEquals(session.volumeParams.at(-1), volume);
+      peer = current;
     }
     await until(() => f.players.get(1).playerView().state === 'stop');
     assertEquals((await f.server.call('/players/2')).player.state, 'play');

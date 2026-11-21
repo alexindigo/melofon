@@ -95,7 +95,9 @@ ssize_t send(int fd, const void *buffer, size_t size, int flags)
 {
   const uint8_t *bytes = buffer;
   static int countdown;
-  if (size >= 12 && (bytes[1] & 0x7f) == 0x60) {
+  uint64_t target = atomic_load(&target_stream);
+  if (size >= 12 && (bytes[1] & 0x7f) == 0x60 &&
+      (!target || writing_stream == target)) {
     if (arm("send")) {
       const char *skip = getenv("RAOP_PROGRESS_SEND_SKIP");
       countdown = 1 + (skip ? atoi(skip) : 0);

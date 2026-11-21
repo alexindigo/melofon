@@ -71,6 +71,22 @@ function scheduledSuffix(
     first !== undefined && first > 0,
     'late join never claims the missed prefix',
   );
+  const joinedRecord = joined.wire.find((event) => event.kind === 'record');
+  assert(joinedRecord?.kind === 'record');
+  const transportStart =
+    (Number(/rtptime=(\d+)/.exec(joinedRecord.rtpInfo)![1]) - anchor +
+      2 ** 32) % 2 ** 32;
+  const firstRange = ranges.find((range) =>
+    range.kind === 'real' &&
+    range.transportStart + range.frames > BigInt(transportStart)
+  );
+  assert(firstRange);
+  assertEquals(
+    first,
+    Number(firstRange.sourceOffset) +
+      Math.max(0, transportStart - Number(firstRange.transportStart)),
+    'the complete real suffix starts at the receiver RECORD anchor',
+  );
   assertEquals(
     next,
     expected.length / 4,
@@ -116,7 +132,7 @@ for (const sealed of [false, true]) {
       const held = { wait: release.promise, entered: false };
       f.closeGates.set(f.receivers[0].port, held);
       await f.server.call('/players/2/speakers/1', 'PUT', {});
-      await until(() => held.entered);
+      await until(() => held.entered && old.closedAtMs !== null);
       assert(
         old.closedAtMs !== null,
         'real native receiver close has completed',

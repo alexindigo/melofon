@@ -2564,7 +2564,6 @@ export function createPlayback(deps: {
             { kind: 'internal', via: 'restore' },
             restored.state,
           );
-          serverPresent = hasServerRow();
           announcedCommander = commander;
           announcedQueueVersion = player.queue().version;
           if (restored.queueChanged) flushQueue();

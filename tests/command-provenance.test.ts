@@ -71,16 +71,21 @@ async function setup() {
   const store = await openStore(dir);
   const db = store;
   const player = createPlayer();
+  const notify = createNotify();
+  const notifications: string[][] = [];
+  notify.subscribe((names) => notifications.push(names));
   const { log, lines: logs } = captureLogs();
   const playback = createPlayback({
     log,
     player,
+    notify,
     nowPlaying: createNowPlaying(store),
     library: createLibrary(store),
     cfg: {},
   });
   return {
     playback,
+    notifications,
     logs,
     close: async () => {
       playback.close();
@@ -201,6 +206,36 @@ Deno.test('restore is recorded with via restore and keeps engine purity', async 
     const status = playback.playerView();
     assertEquals(status.state, 'pause');
     assert(status.itemProgressMs >= 71033416);
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('restore invalidates aggregate nowPlaying when its current item disappears', async () => {
+  const { playback, notifications, close } = await setup();
+  try {
+    await playback.restore({
+      queue: songEntries([song()]),
+      state: 'pause',
+      currentIndex: 0,
+      positionMs: 0,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+    });
+    assert(notifications.some((names) => names.includes('nowPlaying')));
+    notifications.length = 0;
+    await playback.restore({
+      queue: [],
+      state: 'stop',
+      currentIndex: null,
+      positionMs: 0,
+      repeat: 'off',
+      shuffle: false,
+      consume: false,
+    });
+    assert(notifications.some((names) => names.includes('nowPlaying')));
+    assertEquals(await playback.nowPlayingView(), []);
   } finally {
     await close();
   }

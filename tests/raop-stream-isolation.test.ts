@@ -310,6 +310,10 @@ Deno.test({
       await replacement.attach(ra);
       replacement.write(pcm(704, 1011));
       await rendered({ ...ra, sessions: [ra.sessions[1]] }, pcm(704, 1011));
+      await until(
+        'recreated A metadata',
+        () => titles(ra.sessions[1]).length > 0,
+      );
       assert(
         titles(ra.sessions[1]).every((s) =>
           s.includes('Fresh A') && s.includes('New incarnation')
@@ -785,6 +789,10 @@ Deno.test({
           ),
         32000,
       );
+      await until(
+        'B text metadata independently of keepalive',
+        () => titles(rb.sessions[0]).length > 0,
+      );
       assert(
         titles(rb.sessions[0]).every((s) =>
           s.includes('Concurrent B') && s.includes('Artist B') &&
@@ -867,10 +875,16 @@ Deno.test({
       const dormant = nativeStream();
       await b.close();
       // Last device is gone; dormant stream still owns a working runtime.
-      await dormant.metadata('Retained runtime', 'No devices', 0, 1000);
+      assertEquals(
+        await dormant.metadata('Retained runtime', 'No devices', 0, 1000),
+        0,
+      );
       await dormant.close();
       const restarted = nativeStream();
-      await restarted.metadata('Fresh runtime', 'Restart', 0, 1000);
+      assertEquals(
+        await restarted.metadata('Fresh runtime', 'Restart', 0, 1000),
+        0,
+      );
       await restarted.close();
       await libraryProof();
     } finally {
@@ -960,6 +974,10 @@ Deno.test({
         32000,
       );
       const last = progress(rb.sessions[0]).at(-1)!;
+      assert(
+        ((last.pos - last.display) >>> 0) <= ((last.end - last.display) >>> 0),
+        'short pre-anchor input never turns host uptime into track progress',
+      );
       assertEquals(
         (last.end - last.display) >>> 0,
         Math.floor(3456 * 44100 / 1000) + 30720,

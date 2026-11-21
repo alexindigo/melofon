@@ -137,9 +137,13 @@ class ControlCollector(threading.Thread):
     def __init__(self, sock):
         super().__init__(daemon=True)
         self.sock = sock
+        self.stopping = threading.Event()
 
     def run(self):
-        while True:
+        while not self.stopping.is_set():
+            ready, _, _ = select.select([self.sock], [], [], 0.1)
+            if not ready:
+                continue
             data, _ = self.sock.recvfrom(4096)
             # 0x90 = init sync at session start, 0x80 = periodic.
             if len(data) >= 20 and data[0] in (0x80, 0x90) and data[1] == 0xD4:
@@ -158,7 +162,8 @@ class RTSPHandler(socketserver.BaseRequestHandler):
 
     def setup(self):
         self.control_sock, self.control_port = udp_socket()
-        ControlCollector(self.control_sock).start()
+        self.control_collector = ControlCollector(self.control_sock)
+        self.control_collector.start()
         self.chunks = queue.Queue()
         self.nonce = secrets.token_hex(16)
         self.connection = {'generation': len(state['connections']) + 1,
@@ -312,6 +317,12 @@ class RTSPHandler(socketserver.BaseRequestHandler):
 
     def finish(self):
         state['recordings'].discard(self.connection['generation'])
+        self.control_collector.stopping.set()
+        self.control_collector.join()
+        self.control_sock.close()
+        for key, sock in list(control_sockets.items()):
+            if sock is self.control_sock:
+                del control_sockets[key]
 
 
 class Server(socketserver.ThreadingTCPServer):
