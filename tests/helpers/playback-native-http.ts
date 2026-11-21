@@ -56,6 +56,8 @@ export async function nativeHttpFixture(options: {
     frames: bigint,
     signal?: AbortSignal,
   ) => Promise<void>;
+  decoderReturn?: (path: string, startMs: number) => Promise<void>;
+  decoderHead?: (path: string) => void;
   persist?: boolean;
   directory?: string;
   storeDir?: string;
@@ -278,7 +280,27 @@ export async function nativeHttpFixture(options: {
           origins.push(settings?.startMs ?? 0);
           await options.acquisition;
           await options.beforeDecode?.(path, settings?.startMs ?? 0);
-          const decoded = await media.decodePcm(path, settings);
+          let decoded = await media.decodePcm(path, settings);
+          if (decoded && (options.decoderReturn || options.decoderHead)) {
+            const original = decoded;
+            let returned: Promise<IteratorResult<Uint8Array>> | undefined;
+            decoded = {
+              ...original,
+              get eof() {
+                return original.eof;
+              },
+              async next() {
+                const result = await original.next();
+                if (!result.done) options.decoderHead?.(path);
+                return result;
+              },
+              return() {
+                return returned ??= original.return().finally(() =>
+                  options.decoderReturn?.(path, settings?.startMs ?? 0)
+                );
+              },
+            };
+          }
           if (
             !decoded || !options.afterFirstChunk && !options.afterDecodedChunk
           ) {
