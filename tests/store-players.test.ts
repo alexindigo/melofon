@@ -118,6 +118,41 @@ Deno.test('players fresh install has only Home, empty queue, no state or speaker
   }
 });
 
+Deno.test('players enforce the crossfade range on saves and reject legacy values on load', async () => {
+  const t = await domainFixture(createPlayersStore);
+  try {
+    for (const crossfadeMs of [0, 13_000]) {
+      await t.domain.saveChanges({ players: [{ playerId: 1, crossfadeMs }] });
+      assertEquals((await t.domain.list())[0].crossfadeMs, crossfadeMs);
+    }
+    for (const crossfadeMs of [-1, 13_001, 1.5, 1_000_000_000]) {
+      await assertRejects(
+        () =>
+          t.domain.saveChanges({
+            players: [{ playerId: 1, volume: 20, crossfadeMs }],
+          }),
+        RangeError,
+        '0 to 13000',
+      );
+      assertEquals((await t.domain.list())[0], {
+        ...home,
+        crossfadeMs: 13_000,
+      });
+    }
+    for (const crossfadeMs of [13_001, 1_000_000_000]) {
+      await t.run(
+        `UPDATE players SET crossfade_ms = ${crossfadeMs} WHERE id = 1`,
+      );
+      await assertRejects(() => t.domain.list(), RangeError, '0 to 13000');
+      assertEquals(await t.all('SELECT crossfade_ms FROM players'), [{
+        crossfade_ms: crossfadeMs,
+      }]);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('players empty legacy queue keeps its counter and revision exactly', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-players-empty-' });
   let store = await openStore(dir);

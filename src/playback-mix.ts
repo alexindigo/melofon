@@ -3,17 +3,24 @@
 import { PCM_RATE } from './pcm-origin.ts';
 
 const FRAME = 4;
+export const MAX_CROSSFADE_MS = 13_000;
+
+/** Validate settings before mutation or restoration, never cap a playing mix. */
+export function validateCrossfadeMs(ms: unknown): number {
+  if (
+    typeof ms !== 'number' || !Number.isInteger(ms) || ms < 0 ||
+    ms > MAX_CROSSFADE_MS
+  ) {
+    throw new RangeError(
+      `Crossfade must be integer milliseconds from 0 to ${MAX_CROSSFADE_MS}`,
+    );
+  }
+  return ms;
+}
 
 /** Requested overlap: floor(ms * 44100 / 1000) whole frames. */
 export function crossfadeFrames(ms: number): bigint {
-  if (!Number.isSafeInteger(ms) || ms < 0) {
-    throw new RangeError('Crossfade requires nonnegative integer milliseconds');
-  }
-  const frames = BigInt(ms) * BigInt(PCM_RATE) / 1000n;
-  if (frames > BigInt(Number.MAX_SAFE_INTEGER) / BigInt(FRAME)) {
-    throw new RangeError('Crossfade frames are not representable');
-  }
-  return frames;
+  return BigInt(validateCrossfadeMs(ms)) * BigInt(PCM_RATE) / 1000n;
 }
 
 /** Complementary linear ramps over F >= 2 frames: frame i uses incoming gain

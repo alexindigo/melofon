@@ -24,27 +24,25 @@ export default async function (request: HatRequest, context: HatContext) {
   if (consume !== undefined && typeof consume !== 'boolean') {
     fail(400, 'invalid_field', 'consume must be a boolean');
   }
-  if (
-    crossfadeMs !== undefined &&
-    (typeof crossfadeMs !== 'number' || !Number.isSafeInteger(crossfadeMs) ||
-      crossfadeMs < 0 ||
-      BigInt(crossfadeMs) * 44100n / 1000n >
-        BigInt(Number.MAX_SAFE_INTEGER) / 4n)
-  ) {
-    fail(
-      400,
-      'invalid_field',
-      'crossfadeMs must be representable nonnegative integer milliseconds',
-    );
-  }
   const player = await core(async () => {
-    if (name !== undefined) await context.app.players.rename(id, name);
     const playback = context.app.players.get(id);
+    let validatedCrossfade: number | undefined;
+    if (crossfadeMs !== undefined) {
+      try {
+        validatedCrossfade = playback.validateCrossfade(crossfadeMs);
+      } catch (error) {
+        if (error instanceof RangeError) {
+          fail(400, 'invalid_field', error.message);
+        }
+        throw error;
+      }
+    }
+    if (name !== undefined) await context.app.players.rename(id, name);
     const provenance = source(request, context);
     if (repeat !== undefined) await playback.setRepeat(repeat, provenance);
     if (consume !== undefined) await playback.setConsume(consume, provenance);
-    if (crossfadeMs !== undefined) {
-      await playback.setCrossfade(crossfadeMs, provenance);
+    if (validatedCrossfade !== undefined) {
+      await playback.setCrossfade(validatedCrossfade, provenance);
     }
     return playerPayload(context, id);
   });

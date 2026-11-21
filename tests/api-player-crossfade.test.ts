@@ -197,6 +197,8 @@ test('invalid whole bodies and rejected auth/Origin never mutate settings or mod
     for (
       const crossfadeMs of [
         -1,
+        13_001,
+        1_000_000_000,
         1.5,
         null,
         '100',
@@ -212,7 +214,9 @@ test('invalid whole bodies and rejected auth/Origin never mutate settings or mod
         consume: true,
         crossfadeMs,
       }, t.credential);
-      assertEquals(response.status, 400, await response.text());
+      const error = await response.json();
+      assertEquals(response.status, 400, JSON.stringify(error));
+      assertEquals(error.code, 'invalid_field');
       const current = await t.current();
       assertEquals([
         current.name,
@@ -235,17 +239,50 @@ test('invalid whole bodies and rejected auth/Origin never mutate settings or mod
     assertEquals(origin.status, 403, await origin.text());
     assertEquals((await t.current()).crossfadeMs, 0);
     const cookie = await t.f.login('cookie');
-    const accepted = await t.f.json('/api/v1/players/1', 'PATCH', {
-      crossfadeMs: 1_000_000_000,
-    }, cookie.credential);
-    assertEquals(accepted.status, 200, await accepted.text());
-    assertEquals(
-      (await t.current()).crossfadeMs,
-      1_000_000_000,
-      'no arbitrary duration cap',
-    );
+    for (const crossfadeMs of [13_000, 0]) {
+      const accepted = await t.f.json('/api/v1/players/1', 'PATCH', {
+        crossfadeMs,
+      }, cookie.credential);
+      assertEquals(accepted.status, 200, await accepted.text());
+      assertEquals((await t.current()).crossfadeMs, crossfadeMs);
+      assertEquals(
+        (await t.f.store.players.list())[0].crossfadeMs,
+        crossfadeMs,
+      );
+    }
   } finally {
     await t.close();
+  }
+});
+
+test('restore rejects a legacy out-of-range crossfade without rewriting saved data', async () => {
+  const directory = await Deno.makeTempDir({
+    prefix: 'crossfade-legacy-range-',
+  });
+  const db = `${directory}/db`;
+  let store = await openStore(db);
+  try {
+    await rawSql(store).run(
+      'UPDATE players SET crossfade_ms = 1000000000 WHERE id = 1',
+    );
+    await rawSql(store).run(
+      `INSERT INTO player_state VALUES (1, 'pause', NULL, 4321, 'all', false, true, TIMESTAMPTZ '2020-01-02 03:04:05.678+00')`,
+    );
+    const before = await store.playback.loadPlayerState(1);
+    await store.close();
+    await assertRejects(
+      () => crossfadeHttp({ parts, directory }),
+      RangeError,
+      '0 to 13000',
+    );
+    store = await openStore(db);
+    assertEquals(await rawSql(store).all('SELECT crossfade_ms FROM players'), [{
+      crossfade_ms: 1_000_000_000n,
+    }]);
+    assertEquals(await store.playback.loadPlayerState(1), before);
+  } finally {
+    await store.close();
+    await Deno.remove(directory, { recursive: true });
   }
 });
 

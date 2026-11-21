@@ -377,6 +377,7 @@ export async function createPlayers(deps: {
     setConsume: (...args) => current().setConsume(...args),
     setRepeat: (...args) => current().setRepeat(...args),
     setCrossfade: (...args) => current().setCrossfade(...args),
+    validateCrossfade: (...args) => current().validateCrossfade(...args),
     setVolume: (...args) => current().setVolume(...args),
     seek: (...args) => current().seek(...args),
     queueAdd: (...args) => current().queueAdd(...args),

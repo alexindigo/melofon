@@ -16,7 +16,7 @@ import {
   type SpeakerMembership,
 } from './speakers.ts';
 import type { QueueSnapshot } from '../queue-source.ts';
-import { crossfadeFrames } from '../playback-mix.ts';
+import { crossfadeFrames, validateCrossfadeMs } from '../playback-mix.ts';
 
 export interface StoredPlayer {
   id: number;
@@ -134,7 +134,7 @@ export function createPlayersStore(engine: Engine) {
           id: r.id,
           name: r.name,
           volume: r.volume,
-          crossfadeMs: r.crossfade_ms,
+          crossfadeMs: validateCrossfadeMs(r.crossfade_ms),
           isDefault: r.is_default,
           commandedAtMs: r.commanded_at_ms,
         }));

@@ -36,7 +36,7 @@ import {
   type SourcePreparation,
 } from './playback-source-plan.ts';
 import { type CommandHandle, createCommandLane } from './command-authority.ts';
-import { crossfadeFrames } from './playback-mix.ts';
+import { crossfadeFrames, validateCrossfadeMs } from './playback-mix.ts';
 import {
   PlaybackError,
   QueueConflictError,
@@ -197,6 +197,8 @@ export interface Playback {
   setConsume(on: boolean, source?: CommandSource): void | Promise<void>;
   setRepeat(mode: RepeatMode, source?: CommandSource): void | Promise<void>;
   setCrossfade(ms: number, source?: CommandSource): void | Promise<void>;
+  /** Pure validation for adapters that must validate a complete body first. */
+  validateCrossfade(ms: unknown): number;
   setVolume(
     opts: { volume?: number; step?: number },
     source?: CommandSource,
@@ -2063,6 +2065,7 @@ export function createPlayback(deps: {
       emit(['options']);
       return afterMutation(undefined);
     },
+    validateCrossfade: validateCrossfadeMs,
     setCrossfade: (ms, source) =>
       operations.runImmediate(() => {
         requireOpen();

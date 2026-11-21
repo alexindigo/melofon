@@ -196,8 +196,10 @@ to change saved modes or crossfade, optionally alongside `name`; it returns
 the updated player. Starting without a speaker returns `no_target`; another
 player holding AirPlay returns `airplay_busy` with its owning player's id/name.
 
-`crossfadeMs` is a saved per-player duration in nonnegative integer milliseconds;
-it defaults to 0 (gapless). Enabled crossfade mixes natural finite-song changes
+`crossfadeMs` is a saved per-player duration in integer milliseconds from 0 to
+13000 (13 seconds), inclusive; it defaults to 0 (gapless). PATCH rejects values
+outside that range with `400 invalid_field`. Legacy saved values outside the range
+are rejected on load, not clamped or rewritten. Enabled crossfade mixes natural finite-song changes
 once, before fanout to speakers, with complementary linear ramps. Explicit next,
 previous, restart, seek, pause and stop never fade into their target. Short or
 slow incoming sources can shorten or skip the overlap rather than delay outgoing
