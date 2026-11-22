@@ -1824,8 +1824,7 @@ async function lateJoinMissingPrefix(expireSnapshot: boolean) {
   const original = stream.attach(() => {}), joined = stream.attach(() => {});
   // Keep real input ahead of presentation. A starved 353-frame source is
   // permitted to have no cached future packet at RECORD at all.
-  const bytes = new Uint8Array((353 + 44100 * 8) * 4);
-  bytes.set(pcm(353, 67));
+  const bytes = pcm(353 + 44100 * 8, 67);
   const target = BigInt(bytes.length / 4);
   const split = 44100 * 4 * 4;
   try {
@@ -1908,14 +1907,16 @@ async function lateJoinMissingPrefix(expireSnapshot: boolean) {
       suffix.pcm.length >= bytes.length - Number(anchor) * 4,
       'the entire cached real suffix is scheduled before completion',
     );
-    const expected = new Uint8Array(suffix.pcm.length);
-    if (joinedOutcome.coverageStart < 353n) {
-      expected.set(bytes.subarray(Number(joinedOutcome.coverageStart) * 4));
-    }
+    const expected = bytes.subarray(Number(anchor) * 4);
     assertEquals(
-      suffix.pcm,
+      suffix.pcm.subarray(0, expected.length),
       expected,
       'only the declared packet suffix, never the missed prefix',
+    );
+    assertEquals(
+      suffix.pcm.subarray(expected.length),
+      new Uint8Array(suffix.pcm.length - expected.length),
+      'only zero padding follows the exact real suffix',
     );
     assertEquals(await stream.pollCompletion(identity), failed);
     await libraryProof();

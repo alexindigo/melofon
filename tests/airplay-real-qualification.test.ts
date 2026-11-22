@@ -124,6 +124,95 @@ function rememberCompletion(
   else receipts.set(key, result);
 }
 
+function assertRealTailCovered(
+  receipts: readonly {
+    transportEnd: bigint;
+    attachments: readonly {
+      scheduledFrames: bigint;
+      submittedFrames: bigint;
+    }[];
+  }[],
+  end: bigint,
+) {
+  assert(
+    receipts.some((receipt) =>
+      receipt.transportEnd >= end && receipt.attachments.length > 0 &&
+      receipt.attachments.every((peer) =>
+        peer.scheduledFrames >= end && peer.submittedFrames >= end
+      )
+    ),
+    'A terminal receipt and its peers must cover the full real tail',
+  );
+}
+
+function overlapAdmitted(
+  records: readonly CrossfadeRecord[],
+  chunks: readonly Uint8Array[],
+  expectedPrefix: Uint8Array,
+) {
+  if (
+    !records.some((r) => r.appliedFrames === 4410n) ||
+    chunks.reduce((n, chunk) => n + chunk.length, 0) < expectedPrefix.length
+  ) return false;
+  let offset = 0;
+  for (const chunk of chunks) {
+    const count = Math.min(chunk.length, expectedPrefix.length - offset);
+    assertEquals(
+      chunk.subarray(0, count),
+      expectedPrefix.subarray(offset, offset + count),
+    );
+    offset += count;
+    if (offset === expectedPrefix.length) break;
+  }
+  return true;
+}
+
+Deno.test('real qualification requires terminal coverage without extending earlier source receipts', () => {
+  const receipt = (
+    transportEnd: bigint,
+    scheduledFrames = transportEnd,
+    submittedFrames = transportEnd,
+  ) => ({
+    transportEnd,
+    attachments: [{ scheduledFrames, submittedFrames }],
+  });
+  assertRealTailCovered([receipt(5n), receipt(10n)], 10n);
+  for (
+    const clipped of [receipt(9n), receipt(10n, 9n), receipt(10n, 10n, 9n)]
+  ) {
+    assertThrows(() => assertRealTailCovered([receipt(5n), clipped], 10n));
+  }
+});
+
+Deno.test('real qualification waits for positive overlap and exact native prefix admission', () => {
+  const record: CrossfadeRecord = {
+    outgoingEntryId: 1,
+    incomingEntryId: 2,
+    requestedFrames: 4410n,
+    appliedFrames: 4410n,
+    reason: 'applied',
+  };
+  const prefix = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  assertEquals(overlapAdmitted([], [prefix], prefix), false);
+  assertEquals(
+    overlapAdmitted([{ ...record, appliedFrames: 0n }], [prefix], prefix),
+    false,
+  );
+  assertEquals(
+    overlapAdmitted([record], [prefix.subarray(0, 4)], prefix),
+    false,
+  );
+  assertEquals(
+    overlapAdmitted(
+      [record],
+      [prefix.subarray(0, 4), prefix.subarray(4)],
+      prefix,
+    ),
+    true,
+  );
+  assertThrows(() => overlapAdmitted([record], [new Uint8Array(8)], prefix));
+});
+
 Deno.test('real qualification counts immutable receipt identities, not reads', () => {
   const receipts = new Map<string, AirplayCompletionResult>();
   const result: AirplayCompletionResult = {
@@ -365,6 +454,7 @@ Deno.test({
       let players!: Awaited<ReturnType<typeof createPlayers>>;
       let songIds: string[] = [];
       const f = await apiFixture({
+        localOperator: true,
         services: async (f) => {
           assert(f.notify);
           const libraries = createLibraries(f.store);
@@ -687,6 +777,9 @@ Deno.test({
           BigInt(expected.length / 4),
           'Range accounting includes the full tail',
         );
+        // Earlier source receipts freeze before later audio is scheduled.
+        // The terminal receipt must independently cover the actual real end.
+        assertRealTailCovered(receipts, end);
         observe('scenario-passed', {
           name,
           expectedFrames: expected.length / 4,
@@ -732,11 +825,21 @@ Deno.test({
       ]);
       phase = 'manual-next-prefix';
       await queue([5, 6], 100);
+      const nextFades = fades.length;
       await command('play');
       const beforeNext = await active();
+      const mixedPrefix = crossfadeReference(
+        [waves[5].subarray(44), waves[6].subarray(44)],
+        4410,
+      ).pcm.subarray(0, lengths[5] * 4);
       await timelineUntil(
         'accepted future overlap',
-        () => fades.length > previousFades + 1,
+        () =>
+          overlapAdmitted(
+            fades.slice(nextFades),
+            beforeNext.tr.epochs.get(beforeNext.epoch) ?? [],
+            mixedPrefix,
+          ),
         30000,
       );
       await command('next');
@@ -833,6 +936,7 @@ Deno.test({
       try {
         await save();
       } catch (error) {
+        status = 'failed';
         failure = {
           error: new AggregateError([
             ...(failure ? [failure.error] : []),

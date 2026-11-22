@@ -131,7 +131,7 @@ make -C helper/raop
 MELOFON_RAOP_LIB="$PWD/helper/raop/libmelofon_raop.so" \
 MELOFON_QUALIFY_REAL=1 \
 MELOFON_QUALIFICATION_CONFIG=/home/tester/qualification/private/qualification.json \
-deno test --frozen --node-modules-dir=manual \
+deno test --frozen --node-modules-dir=auto \
   --allow-all \
   tests/airplay-real-qualification.test.ts
 ```
@@ -139,6 +139,9 @@ deno test --frozen --node-modules-dir=manual \
 Deno requires `--allow-all` for the final `/proc/self/maps` assertion that proves
 the shipping native library is mapped; enumerating read/FFI/sys permissions is
 not sufficient. Keep this invocation restricted to the dedicated test guest.
+The qualification API binds the guest's non-loopback NIC but rejects socket
+peers other than that NIC before routing. Each run replaces the fixture's shared
+administrator password with a random password before opening the listener.
 
 Each run creates a new external evidence subdirectory containing
 `qualification.json` and exact expected/accepted s16le stereo PCM. Scenarios cover

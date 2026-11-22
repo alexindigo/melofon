@@ -40,6 +40,7 @@ export async function apiFixture(
     status?: Logger;
     traceRequests?: boolean;
     storeDir?: string;
+    localOperator?: boolean;
   } = {},
 ) {
   const notify = createNotify();
@@ -83,6 +84,23 @@ export async function apiFixture(
     },
   };
   try {
+    let hostname = '0.0.0.0';
+    let adminPassword = 'password-admin';
+    if (options.localOperator) {
+      assert(!options.hats, 'local-operator fixture has one guarded listener');
+      const addresses = await Deno.resolveDns('melofon.home', 'A');
+      const local = new Set(Deno.networkInterfaces().map((i) => i.address));
+      hostname = addresses.find((ip) =>
+        !ip.startsWith('127.') && local.has(ip)
+      ) ?? '';
+      assert(hostname, 'melofon.home must resolve to a local non-loopback NIC');
+      adminPassword = crypto.randomUUID();
+      await f.auth.users.setPassword(f.admin.id, f.admin.id, {
+        current: f.cfg.password,
+        new: adminPassword,
+      });
+      f.cfg.password = adminPassword;
+    }
     Object.assign(bag, await options.services?.(f));
     if (options.status) {
       f.cfg.version = loadConfig().version!;
@@ -160,13 +178,20 @@ export async function apiFixture(
       shutdown = () => listens!.shutdown();
     } else {
       reserved.release();
+      const dispatch = facade(core, layers, {
+        debugLogRequests: options.traceRequests,
+        debugLogHeaders: options.traceRequests,
+        publicAddress: bag.publicAddress,
+      });
       const server = Deno.serve(
-        { hostname: '0.0.0.0', port, onListen() {}, ...tls },
-        facade(core, layers, {
-          debugLogRequests: options.traceRequests,
-          debugLogHeaders: options.traceRequests,
-          publicAddress: bag.publicAddress,
-        }),
+        { hostname, port, onListen() {}, ...tls },
+        (request, info) => {
+          // Use the socket peer, never caller-controlled forwarding headers.
+          if (options.localOperator && info.remoteAddr.hostname !== hostname) {
+            return new Response(null, { status: 403 });
+          }
+          return dispatch(request, info);
+        },
       );
       shutdown = () => server.shutdown();
     }
@@ -229,7 +254,7 @@ export async function apiFixture(
     const login = async (
       use: 'cookie' | 'bearer' = 'cookie',
       username = 'admin',
-      password = 'password-admin',
+      password = adminPassword,
       deviceName = 'Device',
     ) => {
       const response = await json(
