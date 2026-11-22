@@ -6,6 +6,33 @@ import { apiFixture } from './helpers/api.ts';
 import { stopped } from './helpers/queue.ts';
 import { until } from './helpers/speaker-consumer.ts';
 
+Deno.test('failed cutoff capture saves its captured snapshot without poisoning later household writes', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'persistence-cutoff-failure-' });
+  const store = await openStore(dir);
+  const persistence = createPersistence(store);
+  const capture = Promise.withResolvers<number>();
+  try {
+    const first = persistence.publishedCommands.publish(() =>
+      persistence.saveState({ ...stopped, positionMs: 300 }, capture.promise)
+    );
+    const second = persistence.publishedCommands.publish(() =>
+      persistence.saveState({ ...stopped, positionMs: 900 })
+    );
+    capture.reject(new Error('cutoff unavailable'));
+    await first.command;
+    await second.command;
+    await persistence.drain();
+    await first.saved;
+    await second.saved;
+    assertEquals((await persistence.loadPlayerState())?.positionMs, 900);
+    assertEquals(persistence.health(), { pendingWrites: 0 });
+  } finally {
+    await persistence.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('closed persistence rejects captured publications before their runtime or cached state changes', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'persistence-admission-' });
   const store = await openStore(dir);

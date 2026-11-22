@@ -1,9 +1,10 @@
 // Natural-boundary crossfade through real plain HTTP, file decoder, core
 // timeline mixer, shipping FFI and the scheduled receiver model.
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertThrows } from '@std/assert';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
-import type { CrossfadeRecord } from '../src/playback-mix.ts';
+import { crossfadeFrames, type CrossfadeRecord } from '../src/playback-mix.ts';
+import { createPlayer } from '../src/player.ts';
 
 type Sample = (i: number) => [number, number];
 
@@ -180,6 +181,25 @@ async function exact(parts: Uint8Array[], crossfadeMs: number) {
   );
   return { ...out, expected };
 }
+
+test('settings enter core only within the approved 0 to 13 second range', () => {
+  assertEquals(crossfadeFrames(0), 0n);
+  assertEquals(crossfadeFrames(13_000), 573300n);
+  const player = createPlayer({ crossfadeMs: 13_000 });
+  for (const ms of [-1, 13_001, 1_000_000_000, 1.5, NaN, Infinity]) {
+    assertThrows(() => crossfadeFrames(ms), RangeError, '0 to 13000');
+    assertThrows(
+      () => createPlayer({ crossfadeMs: ms }),
+      RangeError,
+      '0 to 13000',
+    );
+    assertThrows(() => player.setCrossfade(ms), RangeError, '0 to 13000');
+    assertEquals(player.status().crossfadeMs, 13_000);
+  }
+  player.setCrossfade(0);
+  assertEquals(player.status().crossfadeMs, 0);
+  return Promise.resolve();
+});
 
 test('constants mix with exact pure prefix, suffix and endpoints', async () => {
   const a = pcm(44100 + 137, () => [12000, -12000]);

@@ -16,7 +16,10 @@ function test(name: string, fn: () => Promise<void>) {
 }
 
 test('both fresh resumable players restore independent nonzero scheduled origins', async () => {
-  const f = await concurrentFixture();
+  const ready = Promise.withResolvers<void>();
+  const f = await concurrentFixture(undefined, {
+    beforeRecordReply: () => ready.promise,
+  });
   try {
     await f.initialize();
     await f.restart(async (store) => {
@@ -44,6 +47,7 @@ test('both fresh resumable players restore independent nonzero scheduled origins
         'hold the requested media origin before scheduled playout',
       );
     }
+    ready.resolve();
     await until(() =>
       [1, 2].every((id) => f.players.get(id).playerView().state === 'stop')
     );
@@ -57,6 +61,7 @@ test('both fresh resumable players restore independent nonzero scheduled origins
     }
     await f.libraryProof();
   } finally {
+    ready.resolve();
     await f.close();
   }
 });

@@ -17,6 +17,7 @@ import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import { profileFromService } from '../src/boots/airplay-profile.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { traceTimelineAudio } from './helpers/raop-timeline-audio.ts';
+import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 import { createPlaybackSource } from '../src/playback-source.ts';
 import { createRadioSource } from '../src/radio-source.ts';
@@ -165,10 +166,12 @@ async function render(
     chunk: Uint8Array,
     append: (part: Uint8Array) => Promise<AirplayAppendResult>,
   ) => Promise<bigint>,
+  timingReplyDelayMs = 0,
 ) {
   const receiver = await startFakeRaop({
     captureAudio: true,
     captureWire: true,
+    timingReplyDelayMs,
   });
   const audio = traceTimelineAudio(createFfiStream);
   const stream = audio.stream();
@@ -218,10 +221,24 @@ async function render(
       target: frames,
       revision: 1n,
     };
-    assertEquals((await stream.waitCompletion(key)).status, 'complete');
+    const completion = await stream.waitCompletion(key);
+    assertEquals(completion.status, 'complete');
     await until('independent receiver schedule', () => {
       const session = receiver.sessions[0];
       return !!session?.wire.some((e) => e.kind === 'timing-reply');
+    });
+    // Native completion uses the sender's schedule. This decoder proof samples
+    // the independent receiver, whose measured wire-clock mapping can lag it.
+    // Observe the real endpoint there, not an assumed sender/receiver clock
+    // equality or a sleep. Missing/discarded audio still fails exact coverage.
+    await until('independent receiver renders the final real frame', () => {
+      const replay = renderScheduledAudio(
+        receiver.sessions[0],
+        receiver.nowMs(),
+      );
+      assertEquals(replay.issues, []);
+      assertEquals(replay.discarded, []);
+      return replay.pcm.length >= Number(completion.transportEnd) * 4;
     });
     exactPcm(
       audio.scheduledRealAudio(receiver.sessions[0], receiver.nowMs()),
@@ -333,6 +350,18 @@ test('web decode-skip uses the exact output-frame origin and releases before nat
       );
     })(),
     bytes.subarray(44 + frame * 4),
+  );
+});
+
+test('receiver timing observation can lag native completion without losing media frames', async () => {
+  const bytes = wav();
+  await render(
+    (async function* () {
+      yield bytes.subarray(44 + 6055 * 4);
+    })(),
+    bytes.subarray(44 + 6055 * 4),
+    undefined,
+    100,
   );
 });
 

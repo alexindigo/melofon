@@ -235,6 +235,7 @@ struct raop_session
   uint64_t coverage_start;
   uint32_t sync_start_pos; /* exact RTP-Info sent by this receiver's RECORD/FLUSH */
   bool sync_start_pending;
+  bool marker_pending;
 
   int reqs_in_flight;
   int cseq;
@@ -1513,6 +1514,7 @@ raop_send_req_flush(struct raop_session *rs, evrtsp_req_cb cb, const char *log_c
   /* Restart sequence: the first sync retains this receiver's exact RTSP anchor. */
   rs->sync_start_pos = rms->rtp_session->pos;
   rs->sync_start_pending = true;
+  rs->marker_pending = true;
   ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rs->sync_start_pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
@@ -1620,6 +1622,7 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_
   /* A new receiver may recover committed audio that is still in the future. */
   record_anchor_set(rs, &seqnum);
   rs->sync_start_pending = true;
+  rs->marker_pending = true;
   ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", seqnum, rs->sync_start_pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
@@ -2715,7 +2718,9 @@ raop_metadata_rtptimes_get(uint32_t *start, uint32_t *display, uint32_t *pos, ui
   // - the time is now rms->cur_stamp.ts and the position is rms->cur_stamp.pos
   // -> time since item started is elapsed_ms = metadata->pos_ms + (rms->cur_stamp.ts - metadata->pts)
   // -> start must then be start = rms->cur_stamp.pos - elapsed_ms * sample_rate;
-  diff_ms         = (rms->cur_stamp.ts.tv_sec - metadata->pts.tv_sec) * 1000L + (rms->cur_stamp.ts.tv_nsec - metadata->pts.tv_nsec) / 1000000L;
+  diff_ms = metadata->pts.tv_sec || metadata->pts.tv_nsec
+    ? (rms->cur_stamp.ts.tv_sec - metadata->pts.tv_sec) * 1000L +
+      (rms->cur_stamp.ts.tv_nsec - metadata->pts.tv_nsec) / 1000000L : 0;
   elapsed_ms      = (int64_t)metadata->pos_ms + diff_ms;
   elapsed_samples = elapsed_ms * sample_rate / 1000;
   *start          = rms->cur_stamp.pos - elapsed_samples;
@@ -2948,6 +2953,15 @@ raop_timeline_metadata_progress(uint64_t stream_id, uint64_t frames)
     s->metadata->position_frames = frames;
 }
 
+void
+raop_metadata_anchor_stream(uint64_t stream_id, struct timespec pts)
+{
+  struct raop_stream_context *s = stream_context_get(stream_id);
+  if (s && s->metadata && !s->metadata->timeline &&
+      !s->metadata->pts.tv_sec && !s->metadata->pts.tv_nsec)
+    s->metadata->pts = pts;
+}
+
 
 /* ------------------------------ Volume handling --------------------------- */
 
@@ -3123,6 +3137,7 @@ raop_cb_flush(struct evrtsp_request *req, void *arg)
   rs->state = RAOP_STATE_CONNECTED;
 
   /* Let our user know */
+  rs->marker_pending = true;
   raop_status(rs);
 
   if (!rs->reqs_in_flight)
@@ -3150,6 +3165,7 @@ raop_cb_cancel(struct evrtsp_request *req, void *arg)
   }
   rs->cancel_pending = false;
   rs->state = RAOP_STATE_CONNECTED;
+  rs->marker_pending = true;
   raop_status(rs);
   if (!rs->reqs_in_flight)
     evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
@@ -3317,6 +3333,17 @@ packet_send(struct raop_session *rs, struct rtp_packet *pkt)
   return 0;
 }
 
+static int
+packet_send_first(struct raop_session *rs, struct rtp_packet *pkt)
+{
+  uint8_t type = pkt->header[1];
+  if (rs->marker_pending) pkt->header[1] |= RTP_MARKER_BIT;
+  int ret = packet_send(rs, pkt);
+  pkt->header[1] = type;
+  if (ret == 0) rs->marker_pending = false;
+  return ret;
+}
+
 /* Loop-only, wide epoch coordinates, independent of RTP timestamp/sequence wrap.
  * Successful wire sync establishes origin; packet submission only extends a
  * contiguous suffix. Clock passage alone can never extend that coverage. */
@@ -3379,6 +3406,7 @@ raop_reanchor_stream(uint64_t stream_id)
         rs->state != RAOP_STATE_STREAMING)) continue;
     rs->schedule_valid = false;
     rs->state = RAOP_STATE_CONNECTED; /* next write emits a new actual sync */
+    rs->marker_pending = true;
   }
 }
 
@@ -3557,9 +3585,7 @@ packets_backfill(struct raop_session *rs)
       if (!sent) continue; /* The deliverable suffix may shrink before sending. */
       goto overdue;
     }
-    if (!sent) pkt->header[1] |= RTP_MARKER_BIT;
-    int ret = packet_send(rs, pkt);
-    pkt->header[1] &= ~RTP_MARKER_BIT;
+    int ret = packet_send_first(rs, pkt);
     if (ret < 0) return -1;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
@@ -3653,16 +3679,7 @@ packets_send(struct raop_master_session *rms)
       uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, rms->epoch_frames);
 
       // Device just joined
-      if (rs->state == RAOP_STATE_CONNECTED && rs->submitted_frames == rs->coverage_start)
-	{
-	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
-	  ret = packet_send(rs, pkt);
-	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
-	}
-      else
-	{
-	  ret = packet_send(rs, pkt);
-	}
+      ret = packet_send_first(rs, pkt);
       clock_gettime(CLOCK_MONOTONIC, &submitted);
       uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
       /* A late burst is not scheduled coverage. Preserve the known contiguous
@@ -3805,6 +3822,39 @@ packets_sync_send(struct raop_master_session *rms)
 }
 
 
+static void
+packets_streaming_set(uint64_t stream_id)
+{
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != stream_id || rs->state != RAOP_STATE_CONNECTED ||
+        !rs->schedule_valid || rs->sync_start_pending || rs->retiring ||
+        rs->failure_pending || rs->cancel_pending) continue;
+    if (!event_pending(keep_alive_timer, EV_TIMEOUT, NULL))
+      evtimer_add(keep_alive_timer, &keep_alive_tv);
+    rs->state = RAOP_STATE_STREAMING;
+  }
+}
+
+/* Loop-owned readiness work, independent of producer ingress. Reuse the live
+ * clock coordinate without appending PCM or advancing the packet cursor. */
+void
+raop_sync_pending(uint64_t stream_id, struct timespec pts)
+{
+  for (struct raop_master_session *rms = raop_master_sessions; rms; rms = rms->next) {
+    if (rms->stream_id != stream_id || !rms->epoch_frames) continue;
+    bool pending = false;
+    for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+      if (rs->master_session == rms && rs->state == RAOP_STATE_CONNECTED &&
+          rs->sync_start_pending && !rs->retiring && !rs->failure_pending &&
+          !rs->cancel_pending) { pending = true; break; }
+    }
+    if (!pending) continue;
+    timestamp_set(rms, pts);
+    if (packets_sync_send(rms) < 0) return;
+  }
+  packets_streaming_set(stream_id);
+}
+
 /* ------------------------- Time and control service ----------------------- */
 
 static void
@@ -3845,7 +3895,7 @@ service_start(struct raop_service *svc, event_callback_fn cb, unsigned short por
     if (!svc->ev4)
       goto error;
 
-    event_add(svc->ev4, NULL);
+    if (event_add(svc->ev4, NULL) < 0) goto error;
   }
 
   if (svc->socket.fd6 >= 0) {
@@ -3853,7 +3903,7 @@ service_start(struct raop_service *svc, event_callback_fn cb, unsigned short por
     if (!svc->ev6)
       goto error;
 
-    event_add(svc->ev6, NULL);
+    if (event_add(svc->ev6, NULL) < 0) goto error;
   }
 
   svc->port = port;
@@ -5342,7 +5392,6 @@ static void
 raop_write(struct output_buffer *obuf)
 {
   struct raop_master_session *rms;
-  struct raop_session *rs;
   int i;
 
   for (rms = raop_master_sessions; rms; rms = rms->next)
@@ -5381,18 +5430,7 @@ raop_write(struct output_buffer *obuf)
 
   // Check for devices that have joined since last write (we have already sent them
   // initialization sync and rtp packets via packets_sync_send and packets_send)
-  for (rs = raop_sessions; rs; rs = rs->next)
-    {
-      if (rs->stream_id != obuf->stream_id || rs->state != RAOP_STATE_CONNECTED)
-	continue;
-
-      // Start sending progress to keep ATV's alive
-      if (!event_pending(keep_alive_timer, EV_TIMEOUT, NULL))
-	evtimer_add(keep_alive_timer, &keep_alive_tv);
-
-      rs->state = RAOP_STATE_STREAMING;
-      // Make a cb?
-    }
+  packets_streaming_set(obuf->stream_id);
 }
 
 /* Explicitly erase owned key copies before releasing a context. */

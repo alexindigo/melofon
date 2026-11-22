@@ -279,8 +279,15 @@ disjoint AirPlay speakers play independently, including after a fresh restore.
 A speaker still belongs to only one player; transferring it waits for the old
 connection to release before attaching it to the new player's stream.
 
-`crossfadeMs` is a saved per-player duration in nonnegative integer milliseconds;
-it defaults to 0 (gapless). Enabled crossfade mixes natural finite-song changes
+An acquired RAOP hardware ID (the hex prefix before `@` in its announced name)
+identifies one speaker entry across announcements, address aliases, adoption and
+restore. A known ID resolves to that existing entry; an address without acquired
+identity remains an address-only entry until its receiver is identified.
+
+`crossfadeMs` is a saved per-player duration in integer milliseconds from 0 to
+13000 (13 seconds), inclusive; it defaults to 0 (gapless). PATCH rejects values
+outside that range with `400 invalid_field`. Legacy saved values outside the range
+are rejected on load, not clamped or rewritten. Enabled crossfade mixes natural finite-song changes
 once, before fanout to speakers, with complementary linear ramps. Explicit next,
 previous, restart, seek, pause and stop never fade into their target. Short or
 slow incoming sources can shorten or skip the overlap rather than delay outgoing

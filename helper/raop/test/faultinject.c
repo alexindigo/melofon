@@ -43,7 +43,34 @@ static void *event_symbol(const char *name)
 
 /* Public-FFI lifetime tests fail construction after runtime acquisition. */
 static _Atomic int allocation_stage;
-void raop_fi_allocation_stage(int stage) { atomic_store(&allocation_stage, stage); }
+static _Atomic int metadata_copies;
+void raop_fi_allocation_stage(int stage) {
+  atomic_store(&metadata_copies, 0);
+  atomic_store(&allocation_stage, stage);
+}
+char *strdup(const char *s)
+{
+  if (atomic_load(&allocation_stage) == 3 && !strcmp(s, "Fault metadata") &&
+      atomic_fetch_add(&metadata_copies, 1) == 0) {
+    atomic_store(&allocation_stage, 0); return NULL;
+  }
+  char *(*real)(const char *) = dlsym(RTLD_NEXT, "strdup");
+  return real(s);
+}
+struct evbuffer *evbuffer_new(void)
+{
+  int expected = 4;
+  if (atomic_compare_exchange_strong(&allocation_stage, &expected, 0)) return NULL;
+  struct evbuffer *(*real)(void) = event_symbol("evbuffer_new");
+  return real();
+}
+int event_add(struct event *event, const struct timeval *timeout)
+{
+  int expected = 6;
+  if (atomic_compare_exchange_strong(&allocation_stage, &expected, 0)) return -1;
+  int (*real)(struct event *, const struct timeval *) = event_symbol("event_add");
+  return real(event, timeout);
+}
 int timerfd_create(int clock, int flags)
 {
   int expected = 1;
@@ -238,6 +265,8 @@ int evbuffer_write(struct evbuffer *buf, evutil_socket_t fd)
  * RTSP/encoder/logging buffers. No test knob is linked into the shipping .so. */
 int evbuffer_add(struct evbuffer *buf, const void *data, size_t size)
 {
+  int expected = 5;
+  if (atomic_compare_exchange_strong(&allocation_stage, &expected, 0)) return -1;
   static int (*real_add)(struct evbuffer *, const void *, size_t);
   if (!real_add) real_add = event_symbol("evbuffer_add");
   const char *arm = getenv("RAOP_FI_APPEND_ARM_FILE");

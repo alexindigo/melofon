@@ -6,6 +6,8 @@ import {
 } from './helpers/concurrent-playback.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 import type { FakeRaopSession } from './helpers/fake-raop.ts';
+import { crossfadeReference } from './helpers/crossfade-proof.ts';
+import { concatenate } from './helpers/timeline-proof.ts';
 
 function finalFlushAfterTail(session: FakeRaopSession, now: number) {
   const replay = renderScheduledAudio(session, now);
@@ -118,6 +120,53 @@ for (const restore of [false, true]) {
   });
 }
 
+test('saved A crossfade mixes only A while B keeps its independent gapless schedule', async () => {
+  const f = await concurrentFixture();
+  try {
+    await f.initialize();
+    const references = [1, 2].map((id) =>
+      f.players.get(id).queueView().items[0].reference
+    );
+    await f.server.call('/players/1/queue/items', 'POST', {
+      references: [references[1]],
+    });
+    await f.server.call('/players/2/queue/items', 'POST', {
+      references: [references[0]],
+    });
+    await f.server.call('/players/1', 'PATCH', { crossfadeMs: 100 });
+    await f.persistence.drain();
+    assertEquals(
+      (await f.server.f.store.players.list()).map((row) => row.crossfadeMs),
+      [100, 0],
+    );
+    await f.server.call('/players/2/default', 'POST', {});
+    await Promise.all(
+      [1, 2].map((id) => f.server.call(`/players/${id}/play`, 'POST', {})),
+    );
+    await until(() =>
+      [1, 2].every((id) => f.players.get(id).playerView().state === 'stop')
+    );
+    const parts = f.waves.map((wav) => wav.subarray(44));
+    const expected = [
+      crossfadeReference(parts, 4410).pcm,
+      concatenate([parts[1], parts[0]]),
+    ];
+    for (const [i, receiver] of f.receivers.entries()) {
+      assertEquals(receiver.sessions.length, 1);
+      const trace = f.traces.find((t) => t.ports.has(receiver.port))!;
+      exact(
+        trace.audio.scheduledRealAudio(receiver.sessions[0], receiver.nowMs()),
+        expected[i === 2 ? 1 : 0],
+      );
+    }
+    assertEquals(f.traces.length, 2);
+    assert(f.traces[0].native.id !== f.traces[1].native.id);
+    await f.libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
 test('A pause/seek/Stop/next/EOF/failure/volume/default commands cannot disturb B scheduled audio', async () => {
   const f = await concurrentFixture([44100 + 353, 44100 * 12 + 351]);
   try {
@@ -130,7 +179,7 @@ test('A pause/seek/Stop/next/EOF/failure/volume/default commands cannot disturb 
       [1, 2].map((id) => f.server.call(`/players/${id}/play`, 'POST', {})),
     );
     await until(() => f.receivers[2].sessions[0]?.audioPackets > 0);
-    const peer = (await f.server.call('/players/2')).player;
+    let peer = (await f.server.call('/players/2')).player;
     const session = f.receivers[2].sessions[0];
     const volume = session.volumeParams.at(-1);
     for (
@@ -157,6 +206,7 @@ test('A pause/seek/Stop/next/EOF/failure/volume/default commands cannot disturb 
         null,
       ]);
       assertEquals(session.volumeParams.at(-1), volume);
+      peer = current;
     }
     await until(() => f.players.get(1).playerView().state === 'stop');
     assertEquals((await f.server.call('/players/2')).player.state, 'play');

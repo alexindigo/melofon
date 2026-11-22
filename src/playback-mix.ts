@@ -3,17 +3,24 @@
 import { PCM_RATE } from './pcm-origin.ts';
 
 const FRAME = 4;
+export const MAX_CROSSFADE_MS = 13_000;
+
+/** Validate settings before mutation or restoration, never cap a playing mix. */
+export function validateCrossfadeMs(ms: unknown): number {
+  if (
+    typeof ms !== 'number' || !Number.isInteger(ms) || ms < 0 ||
+    ms > MAX_CROSSFADE_MS
+  ) {
+    throw new RangeError(
+      `Crossfade must be integer milliseconds from 0 to ${MAX_CROSSFADE_MS}`,
+    );
+  }
+  return ms;
+}
 
 /** Requested overlap: floor(ms * 44100 / 1000) whole frames. */
 export function crossfadeFrames(ms: number): bigint {
-  if (!Number.isSafeInteger(ms) || ms < 0) {
-    throw new RangeError('Crossfade requires nonnegative integer milliseconds');
-  }
-  const frames = BigInt(ms) * BigInt(PCM_RATE) / 1000n;
-  if (frames > BigInt(Number.MAX_SAFE_INTEGER) / BigInt(FRAME)) {
-    throw new RangeError('Crossfade frames are not representable');
-  }
-  return frames;
+  return BigInt(validateCrossfadeMs(ms)) * BigInt(PCM_RATE) / 1000n;
 }
 
 /** Complementary linear ramps over F >= 2 frames: frame i uses incoming gain
@@ -41,20 +48,25 @@ export function mixCrossfade(outgoing: Uint8Array, incoming: Uint8Array) {
 
 /** Rolling outgoing tail: releases everything except the last `frames`. */
 export function createTailHold(frames: bigint) {
-  if (typeof frames !== 'bigint' || frames < 0n) {
-    throw new RangeError('Tail hold requires nonnegative frames');
-  }
-  const limit = Number(frames) * FRAME;
+  const bytesFor = (frames: bigint) => {
+    if (typeof frames !== 'bigint' || frames < 0n) {
+      throw new RangeError('Tail hold requires nonnegative frames');
+    }
+    return Number(frames) * FRAME;
+  };
+  let limit = bytesFor(frames);
   const parts: Uint8Array[] = [];
   let held = 0;
   return {
     get frames() {
       return BigInt(held / FRAME);
     },
-    /** Copy a decoded chunk in; returns the prefix that must be appended now. */
-    push(chunk: Uint8Array): Uint8Array[] {
+    /** Copy a decoded chunk in; a new window affects only retained/new PCM,
+     * never a prefix already released to the sink. */
+    push(chunk: Uint8Array, frames?: bigint): Uint8Array[] {
       if (chunk.length % FRAME) throw new RangeError('Incomplete PCM frame');
-      if (!limit) return chunk.length ? [chunk] : [];
+      if (frames !== undefined) limit = bytesFor(frames);
+      if (!limit && !held) return chunk.length ? [chunk] : [];
       if (chunk.length) {
         parts.push(chunk.slice());
         held += chunk.length;

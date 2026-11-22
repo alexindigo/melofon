@@ -51,13 +51,19 @@ export async function nativeHttpFixture(options: {
   receiverCount?: number;
   receiverSelection?: boolean[];
   beforeDecode?: (path: string, startMs: number) => Promise<void>;
-  afterDecodedChunk?: (path: string, frames: bigint) => Promise<void>;
+  afterDecodedChunk?: (
+    path: string,
+    frames: bigint,
+    signal?: AbortSignal,
+  ) => Promise<void>;
+  decoderReturn?: (path: string, startMs: number) => Promise<void>;
+  decoderHead?: (path: string) => void;
   persist?: boolean;
   directory?: string;
   storeDir?: string;
   restore?: boolean;
   targetChecks?: boolean;
-  completionProgress?: () => Promise<void>;
+  completionPublication?: () => Promise<void>;
   cutoffCapture?: Promise<void>;
   seekAdmitted?: (positionMs: number) => void;
   sourcePath?: string;
@@ -70,6 +76,9 @@ export async function nativeHttpFixture(options: {
   crossfadeObserved?: Parameters<
     typeof createAirplayBoot
   >[0]['crossfadeObserved'];
+  crossfadeWaiting?: Parameters<
+    typeof createAirplayBoot
+  >[0]['crossfadeWaiting'];
   append?: (
     request: Parameters<AirplayTimelineStream['appendSource']>[0],
     append: AirplayTimelineStream['appendSource'],
@@ -145,14 +154,6 @@ export async function nativeHttpFixture(options: {
       async waitCompletion(key) {
         const result = await native.waitCompletion(key);
         completions.push(result);
-        return result;
-      },
-      async progress(epoch, source) {
-        const result = await native.progress(epoch, source);
-        if (
-          options.completionProgress && key &&
-          (await native.pollCompletion(key))?.status === 'complete'
-        ) await options.completionProgress();
         return result;
       },
       get epoch() {
@@ -267,8 +268,61 @@ export async function nativeHttpFixture(options: {
         if (options.persist) await outputs.adopt(String(index + 1));
       }
       const media = createMedia();
+      const wrappedMedia: typeof media = {
+        ...media,
+        async decodePcm(path, settings) {
+          opens++;
+          origins.push(settings?.startMs ?? 0);
+          await options.acquisition;
+          await options.beforeDecode?.(path, settings?.startMs ?? 0);
+          let decoded = await media.decodePcm(path, settings);
+          if (decoded && (options.decoderReturn || options.decoderHead)) {
+            const original = decoded;
+            let returned: Promise<IteratorResult<Uint8Array>> | undefined;
+            decoded = {
+              ...original,
+              get eof() {
+                return original.eof;
+              },
+              async next() {
+                const result = await original.next();
+                if (!result.done) options.decoderHead?.(path);
+                return result;
+              },
+              return() {
+                return returned ??= original.return().finally(() =>
+                  options.decoderReturn?.(path, settings?.startMs ?? 0)
+                );
+              },
+            };
+          }
+          if (
+            !decoded || !options.afterFirstChunk && !options.afterDecodedChunk
+          ) {
+            return decoded;
+          }
+          return fixturePcm(
+            (async function* () {
+              let first = true;
+              for await (const chunk of decoded) {
+                yield chunk;
+                await options.afterDecodedChunk?.(
+                  path,
+                  BigInt(chunk.length / 4),
+                  settings?.signal,
+                );
+                if (first) {
+                  first = false;
+                  await options.afterFirstChunk;
+                }
+              }
+            })(),
+            decoded,
+          );
+        },
+      };
       const sourceOwner = createPlaybackSource({
-        media,
+        media: wrappedMedia,
         state: f.state,
         radio: createRadioSource({
           network: createNetwork({ state: f.state }),
@@ -385,7 +439,27 @@ export async function nativeHttpFixture(options: {
       devices = createTestAirplayDevices(
         outputs,
         undefined,
-        audio.stream,
+        () => {
+          const traced = audio.stream();
+          if (!options.completionPublication) return traced;
+          return {
+            ...traced,
+            get epoch() {
+              return traced.epoch;
+            },
+            async waitCompletion(
+              key: Parameters<AirplayTimelineStream['waitCompletion']>[0],
+            ) {
+              const result = await traced.waitCompletion(key);
+              // Trace the terminal receipt, then hold its publication to the
+              // reader. A periodic progress poll cannot consume this barrier.
+              if (result.status === 'complete') {
+                await options.completionPublication!();
+              }
+              return result;
+            },
+          };
+        },
         options.metadata ? { md: '0,2' } : {},
       );
       boot = createAirplayBoot({
@@ -396,39 +470,9 @@ export async function nativeHttpFixture(options: {
         retryBackoffMs: [],
         crossfadeMs: options.crossfadeMs,
         crossfadeObserved: options.crossfadeObserved,
+        crossfadeWaiting: options.crossfadeWaiting,
         ...(options.web ? { sources } : {}),
-        media: {
-          ...media,
-          async decodePcm(path, settings) {
-            opens++;
-            origins.push(settings?.startMs ?? 0);
-            await options.acquisition;
-            await options.beforeDecode?.(path, settings?.startMs ?? 0);
-            const decoded = await media.decodePcm(path, settings);
-            if (
-              !decoded || !options.afterFirstChunk && !options.afterDecodedChunk
-            ) {
-              return decoded;
-            }
-            return fixturePcm(
-              (async function* () {
-                let first = true;
-                for await (const chunk of decoded) {
-                  yield chunk;
-                  await options.afterDecodedChunk?.(
-                    path,
-                    BigInt(chunk.length / 4),
-                  );
-                  if (first) {
-                    first = false;
-                    await options.afterFirstChunk;
-                  }
-                }
-              })(),
-              decoded,
-            );
-          },
-        },
+        media: wrappedMedia,
       });
       timer = setInterval(() => void playback.advanceEnded(), 10);
       return {

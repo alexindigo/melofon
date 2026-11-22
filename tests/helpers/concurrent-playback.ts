@@ -78,6 +78,7 @@ export async function concurrentFixture(
       decode: () => ReturnType<Media['decodePcm']>,
     ): ReturnType<Media['decodePcm']>;
     crossfadeObserved?(playerId: number, record: CrossfadeRecord): void;
+    beforeRecordReply?(): Promise<void>;
   } = {},
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'concurrent-http-' });
@@ -92,6 +93,7 @@ export async function concurrentFixture(
         captureAudio: true,
         captureWire: true,
         recoverAudioGaps: true,
+        beforeRecordReply: hooks.beforeRecordReply,
       })
     ),
   );

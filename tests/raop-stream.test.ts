@@ -292,19 +292,34 @@ Deno.test({
         'independent contexts ready',
         () => otherReady && legacyReady,
       );
-      const otherPcm = new Uint8Array(704 * 4).fill(0x35);
+      const otherPcm = new Uint8Array(352 * 500 * 4).fill(0x35);
       const legacyPcm = new Uint8Array(704 * 4).fill(0x61);
       await a.pcm(pcm(704));
       await b.pcm(otherPcm);
       await legacy.transport.pcm(legacyPcm);
       await Promise.all([
         rendered(first, pcm(704)),
-        rendered(refused, otherPcm),
         rendered(compatibility, legacyPcm),
       ]);
+      await until(
+        'B initial PCM before A close',
+        () => refused.sessions[0].audioPayloads.length >= 2,
+      );
+      assertEquals(
+        decodeReceiverAudio(
+          refused.sessions[0].sdp,
+          refused.sessions[0].audioPayloads.slice(0, 2),
+        ),
+        otherPcm.subarray(0, 704 * 4),
+      );
       await owner.transport.close();
       await a.close();
-      await rendered(refused, otherPcm);
+      const continuation = new Uint8Array(704 * 4).fill(0x72);
+      await b.pcm(continuation);
+      const combined = new Uint8Array(otherPcm.length + continuation.length);
+      combined.set(otherPcm);
+      combined.set(continuation, otherPcm.length);
+      await rendered(refused, combined);
       assertEquals(refused.sessions.length, 1);
       await libraryProof();
     } finally {

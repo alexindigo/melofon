@@ -36,7 +36,7 @@ import {
   type SourcePreparation,
 } from './playback-source-plan.ts';
 import { type CommandHandle, createCommandLane } from './command-authority.ts';
-import { crossfadeFrames } from './playback-mix.ts';
+import { crossfadeFrames, validateCrossfadeMs } from './playback-mix.ts';
 import {
   PlaybackError,
   QueueConflictError,
@@ -64,6 +64,7 @@ import {
   createQueueResolver,
   type QueueAddReference,
   queueCapabilities,
+  queueDuration,
   type QueueMedia,
   type QueueReference,
   type SourceMetadata,
@@ -196,6 +197,8 @@ export interface Playback {
   setConsume(on: boolean, source?: CommandSource): void | Promise<void>;
   setRepeat(mode: RepeatMode, source?: CommandSource): void | Promise<void>;
   setCrossfade(ms: number, source?: CommandSource): void | Promise<void>;
+  /** Pure validation for adapters that must validate a complete body first. */
+  validateCrossfade(ms: unknown): number;
   setVolume(
     opts: { volume?: number; step?: number },
     source?: CommandSource,
@@ -480,13 +483,27 @@ export function createPlayback(deps: {
     deps.state?.declare(`playback.source.${key}`, schema);
   }
   let recovery = { generation: -1, attempts: 0, audioMs: 0 };
+  const sourceRecovery = new WeakMap<PlaybackSource, typeof recovery>();
   const failedSources = new Set<number>();
   const recoveryForRun = () => {
     const generation = player.status().generation;
     if (recovery.generation !== generation) {
-      recovery = { generation, attempts: 0, audioMs: 0 };
+      recovery = sourcePlans.playing && player.hasSource(sourcePlans.playing) &&
+          sourceRecovery.get(sourcePlans.playing) ||
+        { generation, attempts: 0, audioMs: 0 };
+      recovery.generation = generation;
     }
     return recovery;
+  };
+  const recoveryForSource = (source: PlaybackSource) => {
+    let run = sourceRecovery.get(source);
+    if (!run) {
+      run = source === sourcePlans.playing
+        ? recoveryForRun()
+        : { generation: source.generation, attempts: 0, audioMs: 0 };
+      sourceRecovery.set(source, run);
+    }
+    return run;
   };
   const ownsSource = (source: PlaybackSource) =>
     !operations.closed && player.hasSource(source) &&
@@ -1008,8 +1025,17 @@ export function createPlayback(deps: {
     if (!cutoff || !mapping) return;
     generation = player.status().generation;
     const position = operations.run(async () => {
-      await cutoff;
-      timeline.retire(mapping);
+      try {
+        await cutoff;
+      } catch (error) {
+        log.event('media_failed', {
+          operation: 'source-cutoff',
+          path: String(mapping.entryId),
+          error,
+        });
+      } finally {
+        timeline.retire(mapping);
+      }
       return positionMs;
     });
     bookmark = { generation, position };
@@ -1074,7 +1100,7 @@ export function createPlayback(deps: {
         if (player.reanchorSource(view.generation, primary.entryId, value)) {
           replacementGeneration = player.status().generation;
           if (bookmark?.position === work.position) {
-            bookmark.generation = replacementGeneration;
+            bookmark = undefined;
           }
         }
         position.resolve(value);
@@ -1107,7 +1133,7 @@ export function createPlayback(deps: {
           emit(['player']);
         }
       } catch (error) {
-        position.reject(error);
+        position.resolve(view.itemProgressMs);
         log.event('media_failed', {
           operation: 'future-input-reanchor',
           path: String(primary.entryId),
@@ -1122,6 +1148,7 @@ export function createPlayback(deps: {
           emit(['player']);
         }
       } finally {
+        timeline.retire(mapping);
         if (reanchoring === work) reanchoring = undefined;
         ready.resolve();
       }
@@ -1652,7 +1679,8 @@ export function createPlayback(deps: {
       const tail = sourcePlans.admitted.at(-1)?.source ?? sourcePlans.playing;
       if (
         tail !== after || !ownsSource(after) ||
-        successorPlan('natural', after)?.entryId !== null
+        successorPlan('natural', after)?.entryId !== null &&
+          !sourcePlans.terminal(after)
       ) return false;
       if (!continuous) continuousGeneration = player.status().generation;
       continuous = true;
@@ -1682,7 +1710,8 @@ export function createPlayback(deps: {
         // Reader cleanup does not retire the sink's run-wide bookmark authority.
         if (
           cutting !== mapping &&
-          (operations.closed || player.status().generation !== generation)
+          (source !== sourcePlans.playing || operations.closed ||
+            player.status().generation !== generation)
         ) {
           timeline.retire(mapping);
         }
@@ -1732,6 +1761,23 @@ export function createPlayback(deps: {
           !timeline.complete(mapping, receipt) ||
           !player.sourceComplete(source)
         ) return false;
+        const current = player.status().current;
+        if (
+          sourcePlans.playing === source && current?.facts.kind === 'song' &&
+          (queueDuration(current) ?? 0) <= 0
+        ) {
+          // Matching sink completion terminates an unknown-length catalog
+          // source, but never grants natural advancement or consumes it.
+          player.pause();
+          record(
+            'stop',
+            undefined,
+            { kind: 'internal', via: 'source-end' },
+            'stop',
+          );
+          flushState();
+          emit(['player']);
+        }
         advanceContinuous();
         await new Promise<void>((resolve) => {
           source.signal.addEventListener('abort', () => resolve(), {
@@ -1770,9 +1816,9 @@ export function createPlayback(deps: {
     sourceAudio(source, durationMs) {
       if (operations.closed) return;
       if (
-        player.sourceAudio(source, durationMs) && sourcePlans.playing === source
+        player.sourceAudio(source, durationMs) && ownsSource(source)
       ) {
-        recoveryForRun().audioMs += durationMs;
+        recoveryForSource(source).audioMs += durationMs;
       }
     },
     retrySource: (source, reason, cancellation) =>
@@ -1780,11 +1826,15 @@ export function createPlayback(deps: {
         const signal = cancellation
           ? AbortSignal.any([source.signal, cancellation])
           : source.signal;
+        const media = source === sourcePlans.playing
+          ? player.status().current
+          : sourcePlans.admitted.find((record) => record.source === source)
+            ?.media;
         if (
           signal.aborted || !ownsSource(source) ||
-          player.status().current?.facts.kind !== 'web'
+          media?.facts.kind !== 'web'
         ) return false;
-        const run = recoveryForRun();
+        const run = recoveryForSource(source);
         const backoff =
           await deps.state?.getTyped('playback.source.retryBackoffMs') ??
             recoverySettings.retryBackoffMs.default;
@@ -1793,11 +1843,12 @@ export function createPlayback(deps: {
             recoverySettings.retryResetAudioMs.default,
         );
         if (
-          signal.aborted || !ownsSource(source) || recovery !== run
+          signal.aborted || !ownsSource(source) ||
+          sourceRecovery.get(source) !== run
         ) return false;
         if (run.audioMs >= reset) {
           run.attempts = 0;
-          failedSources.clear();
+          if (sourcePlans.playing === source) failedSources.clear();
         }
         run.audioMs = 0;
         const delays = backoff as number[];
@@ -1826,7 +1877,8 @@ export function createPlayback(deps: {
           signal.addEventListener('abort', finish, { once: true });
           if (signal.aborted) finish();
         });
-        return !signal.aborted && ownsSource(source) && recovery === run;
+        return !signal.aborted && ownsSource(source) &&
+          sourceRecovery.get(source) === run;
       }),
     reportSourceMetadata(source, metadata, sourceFrame) {
       const mapping = timelineSources.get(source);
@@ -2013,6 +2065,7 @@ export function createPlayback(deps: {
       emit(['options']);
       return afterMutation(undefined);
     },
+    validateCrossfade: validateCrossfadeMs,
     setCrossfade: (ms, source) =>
       operations.runImmediate(() => {
         requireOpen();
@@ -2511,7 +2564,6 @@ export function createPlayback(deps: {
             { kind: 'internal', via: 'restore' },
             restored.state,
           );
-          serverPresent = hasServerRow();
           announcedCommander = commander;
           announcedQueueVersion = player.queue().version;
           if (restored.queueChanged) flushQueue();

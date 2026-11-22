@@ -27,6 +27,29 @@ export function pcm(frames: number, seed = 0) {
   return bytes;
 }
 export const text = (s: string) => new TextEncoder().encode(`${s}\0`);
+async function faultOutput(command: Deno.Command, name: string) {
+  const child = command.spawn();
+  let expired = false;
+  const timeout = setTimeout(() => {
+    expired = true;
+    try {
+      child.kill('SIGKILL');
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+  }, 120000);
+  try {
+    const result = await child.output();
+    if (expired) {
+      throw new Error(
+        `native fault subprocess timed out and was reaped: ${name}`,
+      );
+    }
+    return result;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 export async function faultChild(
   name: string,
   testFile =
@@ -50,28 +73,33 @@ export async function faultChild(
       ],
     }).output();
     assertEquals(build.code, 0, new TextDecoder().decode(build.stderr));
-    const child = await new Deno.Command(Deno.execPath(), {
-      args: [
-        'test',
-        '--frozen',
-        '--cached-only',
-        '--node-modules-dir=manual',
-        '-A',
-        '--filter',
-        name,
-        testFile,
-      ],
-      env: {
-        LD_PRELOAD: path,
-        RAOP_ISOLATION_FAULT_CHILD: name,
-        RAOP_ISOLATION_FAULT_LIB: path,
-        RAOP_FI_RELEASE_ALLOC_ARM_FILE: `${directory}/release`,
-        RAOP_FI_FREE_ALLOC_ARM_FILE: `${directory}/free-alloc`,
-        RAOP_FI_CALLOC_ARM_FILE: `${directory}/calloc`,
-        RAOP_FI_WRITE_BLOCK_ARM_FILE: `${directory}/write-block`,
-        RAOP_FI_POLL_ARM_FILE: `${directory}/poll`,
-      },
-    }).output();
+    const child = await faultOutput(
+      new Deno.Command(Deno.execPath(), {
+        args: [
+          'test',
+          '--frozen',
+          '--cached-only',
+          '--node-modules-dir=manual',
+          '-A',
+          '--filter',
+          name,
+          testFile,
+        ],
+        env: {
+          LD_PRELOAD: path,
+          RAOP_ISOLATION_FAULT_CHILD: name,
+          RAOP_ISOLATION_FAULT_LIB: path,
+          RAOP_FI_RELEASE_ALLOC_ARM_FILE: `${directory}/release`,
+          RAOP_FI_FREE_ALLOC_ARM_FILE: `${directory}/free-alloc`,
+          RAOP_FI_CALLOC_ARM_FILE: `${directory}/calloc`,
+          RAOP_FI_WRITE_BLOCK_ARM_FILE: `${directory}/write-block`,
+          RAOP_FI_POLL_ARM_FILE: `${directory}/poll`,
+        },
+        stdout: 'piped',
+        stderr: 'piped',
+      }),
+      name,
+    );
     const output = new TextDecoder().decode(child.stdout);
     assertEquals(
       child.code,
@@ -114,26 +142,31 @@ export async function progressChild(name: string, mode: string) {
       ],
     }).output();
     assertEquals(build.code, 0, new TextDecoder().decode(build.stderr));
-    const child = await new Deno.Command(Deno.execPath(), {
-      args: [
-        'test',
-        '--frozen',
-        '--cached-only',
-        '--node-modules-dir=manual',
-        '-A',
-        '--filter',
-        name,
-        new URL('../raop-stream-isolation.test.ts', import.meta.url).pathname,
-      ],
-      env: {
-        LD_PRELOAD: path,
-        RAOP_ISOLATION_PROGRESS_CHILD: name,
-        RAOP_PROGRESS_WRAP: '1',
-        RAOP_ISOLATION_PROGRESS_LIB: path,
-        RAOP_PROGRESS_FAULT: mode,
-        RAOP_PROGRESS_ARM: `${directory}/arm`,
-      },
-    }).output();
+    const child = await faultOutput(
+      new Deno.Command(Deno.execPath(), {
+        args: [
+          'test',
+          '--frozen',
+          '--cached-only',
+          '--node-modules-dir=manual',
+          '-A',
+          '--filter',
+          name,
+          new URL('../raop-stream-isolation.test.ts', import.meta.url).pathname,
+        ],
+        env: {
+          LD_PRELOAD: path,
+          RAOP_ISOLATION_PROGRESS_CHILD: name,
+          RAOP_PROGRESS_WRAP: '1',
+          RAOP_ISOLATION_PROGRESS_LIB: path,
+          RAOP_PROGRESS_FAULT: mode,
+          RAOP_PROGRESS_ARM: `${directory}/arm`,
+        },
+        stdout: 'piped',
+        stderr: 'piped',
+      }),
+      name,
+    );
     const output = new TextDecoder().decode(child.stdout);
     assertEquals(
       child.code,
@@ -164,7 +197,7 @@ export function nativeStream() {
       position: number,
       length: number,
     ) =>
-      lib.raop_stream_metadata_now(
+      lib.raop_stream_metadata(
         pointer,
         text(title),
         text(artist),
@@ -307,8 +340,14 @@ export function nativeStream() {
     },
     async close() {
       if (closed) return;
-      for (const h of handles.splice(0)) {
-        assertEquals(await lib.raop_free(h), 0);
+      const failures: Error[] = [];
+      for (const h of [...handles]) {
+        const result = await lib.raop_free(h);
+        if (result === 0) handles.splice(handles.indexOf(h), 1);
+        else failures.push(new Error(`raop_free retained handle: ${result}`));
+      }
+      if (failures.length) {
+        throw new AggregateError(failures, 'native fixture release failed');
       }
       assertEquals(await lib.raop_stream_free(pointer), 0);
       closed = true;
@@ -348,7 +387,10 @@ export async function rendered(
     'complete wire PCM and timing',
     () =>
       receiver.sessions[0].audioPackets >= expected.length / (352 * 4) &&
-      receiver.sessions[0].wire.some((e) => e.kind === 'timing-reply'),
+      receiver.sessions[0].wire.some((e) => e.kind === 'timing-reply') &&
+      receiver.sessions[0].wire.some((e) =>
+        e.kind === 'control' && (e.data[1] & 0x7f) === 0x54
+      ),
   );
   const session = transform(receiver.sessions[0]);
   assertEquals(

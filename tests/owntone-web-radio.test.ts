@@ -548,7 +548,9 @@ Deno.test('live ICY titles invalidate OwnTone WS queue reads while station ident
       await until(() => !!channels.at(-1)?.send);
     };
     const version = (await t.own('/queue')).version;
-    const events = t.f.notifications.length;
+    const queueEvents = () =>
+      t.f.notifications.filter((names) => names.includes('queue')).length;
+    const events = queueEvents();
     await send(null);
     await send("StreamTitle='Artist A - Title A - Part 2';");
     assertEquals(
@@ -556,7 +558,7 @@ Deno.test('live ICY titles invalidate OwnTone WS queue reads while station ident
       version,
       'zero blocks and duplicates do not invalidate',
     );
-    assertEquals(t.f.notifications.length, events);
+    assertEquals(queueEvents(), events);
     const before = snapshots.length;
     await send(
       "StreamTitle='Unsplit B';StreamUrl='https://example.test/cover.jpg';",
@@ -572,7 +574,7 @@ Deno.test('live ICY titles invalidate OwnTone WS queue reads while station ident
       version + 1,
       'zero and duplicate frames were consumed before B without a revision',
     );
-    assertEquals(t.f.notifications.length, events + 1);
+    assertEquals(queueEvents(), events + 1);
     assertEquals(changed.items[0].title, 'Saved station');
     assertEquals(changed.items[0].album, 'Unsplit B');
     assert(!('artist' in changed.items[0]));

@@ -75,7 +75,7 @@ void raop_player_fence(struct raop_player *p, bool fenced);
 int raop_player_append(struct raop_player *p, const uint8_t *pcm, size_t len);
 void raop_player_session_started(struct raop_player *p);
 void raop_player_session_stopped(struct raop_player *p);
-void raop_player_item_set(struct raop_player *p, const char *title,
+int raop_player_item_set(struct raop_player *p, const char *title,
                           const char *artist, uint32_t pos_ms, uint32_t len_ms,
                           uint16_t wanted_metadata);
 
@@ -580,8 +580,11 @@ device_start(raop_t *h, cmd *c)
   event_push(h, "starting");
 
   if (!h->stream || !h->stream->item_set) {
-    raop_player_item_set(h->player, c->title, c->artist, c->pos_ms, c->len_ms,
-                         c->wanted_metadata);
+    if (raop_player_item_set(h->player, c->title, c->artist, c->pos_ms, c->len_ms,
+                         c->wanted_metadata) < 0) {
+      if (h->stream) raop_ffi_attachment_failed(h->stream->id, h->id, RAOP_PROGRESS_ALLOCATION);
+      device_free(h); h->state = OUTPUT_STATE_FAILED; event_push(h, "failed"); return -1;
+    }
     if (h->stream) h->stream->item_set = true;
   }
 
@@ -1027,7 +1030,7 @@ stream_metadata_cb(evutil_socket_t fd, short what, void *arg)
 {
   struct stream_metadata_work *work = arg;
   (void)fd; (void)what;
-  work->sync.result = raop_player_metadata_now(work->stream->player, work->title,
+  work->sync.result = raop_player_metadata(work->stream->player, work->title,
     work->artist, work->position, work->length);
   if (!work->sync.result) work->stream->item_set = true;
   pthread_mutex_lock(&rt.lock);
@@ -1040,7 +1043,7 @@ stream_metadata_cb(evutil_socket_t fd, short what, void *arg)
 }
 
 int
-raop_stream_metadata_now(raop_stream_t *stream, const char *title, const char *artist,
+raop_stream_metadata(raop_stream_t *stream, const char *title, const char *artist,
                      uint32_t position, uint32_t length)
 {
   if (!stream) return -1;
@@ -1477,13 +1480,13 @@ raop_stream_drained(raop_stream_t *stream, uint64_t epoch)
 }
 
 int
-raop_stream_metadata(raop_stream_t *stream, uint64_t epoch, uint64_t source,
+raop_stream_timeline_metadata(raop_stream_t *stream, uint64_t epoch, uint64_t source,
   uint64_t frame, uint64_t origin, uint64_t duration, const char *title, const char *artist)
 {
   if (!stream || !epoch || !source || !title || !artist || origin > UINT64_MAX - frame) return -1;
   pthread_mutex_lock(&rt.lock);
   int result = stream->closing || stream->input_closed || stream->resetting || epoch != stream->epoch
-    ? 2 : raop_player_metadata(stream->player, source, frame, origin, duration, title, artist);
+    ? 2 : raop_player_timeline_metadata(stream->player, source, frame, origin, duration, title, artist);
   pthread_mutex_unlock(&rt.lock);
   return result;
 }

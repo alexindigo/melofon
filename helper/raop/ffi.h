@@ -26,7 +26,7 @@ raop_stream_t *raop_stream_new(void);
  * This is not a source-marker scheduler. Text is copied before return; the
  * callback-free call joins loop dispatch and reserves storage against free.
  * Returns 0 on success, -1 on closed input, scheduling or allocation failure. */
-int raop_stream_metadata_now(raop_stream_t *stream, const char *title, const char *artist,
+int raop_stream_metadata(raop_stream_t *stream, const char *title, const char *artist,
                          uint32_t position_ms, uint32_t length_ms);
 uint64_t raop_stream_id(raop_stream_t *stream);
 raop_t *raop_stream_attach(raop_stream_t *stream);
@@ -83,7 +83,7 @@ int raop_stream_end(raop_stream_t *, uint64_t epoch, uint64_t target,
 int raop_stream_drained(raop_stream_t *, uint64_t epoch);
 /* Copied source-frame metadata. 1 accepted, 0 bounded-marker backpressure,
  * 2 canceled/stale, -1 invalid, -2 allocation failure. No read-time publication. */
-int raop_stream_metadata(raop_stream_t *, uint64_t epoch, uint64_t source,
+int raop_stream_timeline_metadata(raop_stream_t *, uint64_t epoch, uint64_t source,
   uint64_t source_frame, uint64_t media_origin, uint64_t duration_frames,
   const char *title, const char *artist);
 /* After sealed catalog EOF, pace explicitly labelled compatibility silence until

@@ -880,15 +880,15 @@ for (
 
 for (const declaredMs of [null, 0]) {
   test(`cold HTTP catalog duration ${declaredMs} retains completed sink authority until Stop`, async () => {
-    const terminalProgress = Promise.withResolvers<void>();
-    let progressHeld = false;
+    const terminalPublication = Promise.withResolvers<void>();
+    let publicationHeld = false;
     const bytes = pcm(353),
       f = await nativeHttpFixture({
         pcm: bytes,
         declaredMs,
-        completionProgress: () => {
-          progressHeld = true;
-          return terminalProgress.promise;
+        completionPublication: () => {
+          publicationHeld = true;
+          return terminalPublication.promise;
         },
       });
     try {
@@ -905,8 +905,8 @@ for (const declaredMs of [null, 0]) {
         () => f.audio.epochs.length === 1,
       );
       await until(
-        'terminal progress held after completion',
-        () => progressHeld,
+        'terminal publication held after completion',
+        () => publicationHeld,
       );
       assertEquals((await f.own('/player')).state, 'play');
       assertEquals(f.playback.queueView().items.length, 1);
@@ -926,7 +926,7 @@ for (const declaredMs of [null, 0]) {
         [],
         'held source cleanup is not yet acknowledged',
       );
-      terminalProgress.resolve();
+      terminalPublication.resolve();
       await until(
         'retained result ack after explicit Stop',
         () => f.ackStates.length === 1,
@@ -939,7 +939,7 @@ for (const declaredMs of [null, 0]) {
       );
       await libraryProof();
     } finally {
-      terminalProgress.resolve();
+      terminalPublication.resolve();
       await f.close();
     }
   });

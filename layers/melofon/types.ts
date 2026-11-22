@@ -689,6 +689,7 @@ export interface PlayerPlayback {
   ): void | Promise<void>;
   setConsume(on: boolean, source?: Source): void | Promise<void>;
   setCrossfade(ms: number, source?: Source): void | Promise<void>;
+  validateCrossfade(ms: unknown): number;
   setVolume(options: { volume: number }, source?: Source): Promise<void>;
   playerView(): {
     state: 'play' | 'pause' | 'stop';

@@ -570,6 +570,12 @@ Deno.test('OwnTone playback routes command the default player without changing a
       );
       assertEquals(response.status, 204, path);
       await response.arrayBuffer();
+      if (path === 'play' || path === 'toggle') {
+        assertEquals(
+          h.players.get(1).playerView().state,
+          path === 'play' ? 'play' : 'pause',
+        );
+      }
       assertEquals(h.players.get(2).playerView(), peer);
       assertEquals(session.closing, false);
     }

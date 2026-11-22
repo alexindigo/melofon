@@ -310,8 +310,9 @@ Deno.test('test runner: launcher isolates concurrent shards and propagates failu
       `#!/bin/bash
 set -eu
 if [[ "$1" == --version ]]; then echo 'podman stub'; exit; fi
-printf '%s\\0' "$@" >> "$CALL_LOG"
-printf '\\n' >> "$CALL_LOG"
+record_format=''
+for arg in "$@"; do record_format+='%s\\0'; done
+printf "\${record_format}\\n" "$@" >> "$CALL_LOG"
 if [[ "$1" == network && "$2" == inspect ]]; then exit 1; fi
 if [[ "$1" == image && "$2" == inspect ]]; then echo test-image-id; exit; fi
 if [[ "$1" != run ]]; then exit; fi

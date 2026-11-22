@@ -51,7 +51,7 @@ const SYMBOLS = {
   raop_log_poll: { parameters: ['buffer', 'usize'], result: 'i32' },
   raop_new: { parameters: [], result: 'pointer' },
   raop_stream_new: { parameters: [], result: 'pointer' },
-  raop_stream_metadata_now: {
+  raop_stream_metadata: {
     parameters: ['pointer', 'buffer', 'buffer', 'u32', 'u32'],
     result: 'i32',
     nonblocking: true,
@@ -76,7 +76,7 @@ const SYMBOLS = {
     result: 'i32',
   },
   raop_stream_drained: { parameters: ['pointer', 'u64'], result: 'i32' },
-  raop_stream_metadata: {
+  raop_stream_timeline_metadata: {
     parameters: [
       'pointer',
       'u64',
@@ -1014,7 +1014,7 @@ export function createFfiStream(
           input.originFrame,
           input.durationFrames,
         );
-        const result = lib.symbols.raop_stream_metadata(
+        const result = lib.symbols.raop_stream_timeline_metadata(
           handle,
           input.epoch,
           input.source,

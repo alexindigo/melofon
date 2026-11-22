@@ -180,7 +180,7 @@ player_debug(struct raop_player *p)
   });
 }
 
-static void
+static int
 dmap_add_string(struct evbuffer *evbuf, const char *tag, const char *str)
 {
   size_t len = str ? strlen(str) : 0;
@@ -191,12 +191,11 @@ dmap_add_string(struct evbuffer *evbuf, const char *tag, const char *str)
   hdr[5] = (uint8_t)((len >> 16) & 0xff);
   hdr[6] = (uint8_t)((len >> 8) & 0xff);
   hdr[7] = (uint8_t)(len & 0xff);
-  evbuffer_add(evbuf, hdr, 8);
-  if (len > 0)
-    evbuffer_add(evbuf, str, len);
+  if (evbuffer_add(evbuf, hdr, 8) < 0) return -1;
+  return len > 0 ? evbuffer_add(evbuf, str, len) : 0;
 }
 
-static void
+static int
 dmap_add_container(struct evbuffer *evbuf, const char *tag, size_t len)
 {
   uint8_t hdr[8];
@@ -206,7 +205,7 @@ dmap_add_container(struct evbuffer *evbuf, const char *tag, size_t len)
   hdr[5] = (uint8_t)((len >> 16) & 0xff);
   hdr[6] = (uint8_t)((len >> 8) & 0xff);
   hdr[7] = (uint8_t)(len & 0xff);
-  evbuffer_add(evbuf, hdr, 8);
+  return evbuffer_add(evbuf, hdr, 8);
 }
 
 /* Minimal mlit { minm, asar } — enough for RAOP text; full dmap_common.c
@@ -219,18 +218,21 @@ dmap_encode_text(struct evbuffer *out, const char *title, const char *artist)
 
   if (!inner)
     return -1;
-  dmap_add_string(inner, "minm", title ? title : "");
-  dmap_add_string(inner, "asar", artist ? artist : "");
+  int ret = -1;
+  if (dmap_add_string(inner, "minm", title ? title : "") < 0 ||
+      dmap_add_string(inner, "asar", artist ? artist : "") < 0) goto out;
   n = evbuffer_get_length(inner);
-  dmap_add_container(out, "mlit", n);
-  evbuffer_add_buffer(out, inner);
+  if (dmap_add_container(out, "mlit", n) < 0) goto out;
+  ret = evbuffer_add_buffer(out, inner);
+ out:
   evbuffer_free(inner);
-  return 0;
+  return ret;
 }
 
 static struct timespec
 pts_now(const struct raop_player *p)
 {
+  if (!p->clock_started) return (struct timespec){0};
   uint64_t sec = (uint64_t)p->pts_base.tv_sec + p->pts_samples / 44100;
   uint64_t nsec = (uint64_t)p->pts_base.tv_nsec
                 + (p->pts_samples % 44100) * 1000000000ULL / 44100;
@@ -264,7 +266,9 @@ metadata_send_now(struct raop_player *p)
   rmd->artwork_fmt = -1;
   /* Build stream content, not the first receiver's wishes. Each attachment
    * filters its own request types, including a later text-capable join. */
-  dmap_encode_text(rmd->metadata, p->title, p->artist);
+  if (dmap_encode_text(rmd->metadata, p->title, p->artist) < 0) {
+    evbuffer_free(rmd->metadata); free(rmd); free(md); return -1;
+  }
   md->type = OUTPUT_TYPE_RAOP;
   md->stream_id = p->stream_id;
   md->pos_ms = p->pos_ms;
@@ -339,6 +343,11 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
   if (!p->streaming)
     return;
 
+  pthread_mutex_lock(&p->pcm_lock);
+  bool sync_ready = p->clock_started && !p->fenced && !p->failure.error;
+  pthread_mutex_unlock(&p->pcm_lock);
+  if (sync_ready) raop_sync_pending(p->stream_id, pts_now(p));
+
   for (frames = 1 + overrun; frames > 0; frames--)
     {
       size_t avail;
@@ -382,6 +391,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         clock_gettime(CLOCK_MONOTONIC, &p->pts_base);
         p->pts_samples = 0;
         p->clock_started = true;
+        raop_metadata_anchor_stream(p->stream_id, p->pts_base);
       }
       if (timeline) {
         /* A short real read is not a padded tick. B continues A's partial
@@ -498,7 +508,7 @@ metadata_clear(struct raop_player *p)
 }
 
 int
-raop_player_metadata(struct raop_player *p, uint64_t source, uint64_t frame,
+raop_player_timeline_metadata(struct raop_player *p, uint64_t source, uint64_t frame,
   uint64_t origin, uint64_t duration, const char *title, const char *artist)
 {
   pthread_mutex_lock(&p->pcm_lock);
@@ -581,8 +591,12 @@ raop_player_metadata_update(struct raop_player *p)
     md->timeline_frame = transport; md->media_frame = m->origin + m->frame;
     md->position_frames = md->media_frame; md->duration_frames = m->duration;
     md->priv = rmd;
-    raop_metadata_send_stream(p->stream_id, md);
+    int ret = raop_metadata_send_stream(p->stream_id, md);
     metadata_marker_free(m);
+    if (ret < 0) {
+      raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_ALLOCATION);
+      return;
+    }
   }
   if (p->metadata_source) {
     struct raop_progress_snapshot progress;
@@ -1155,27 +1169,45 @@ raop_player_drain_complete(struct raop_player *p)
 /* Loop thread: the start command's item (title/artist/len) and the TXT
  * wanted_metadata bitmask. Called before the session connects so the
  * event_play_start send has them. */
-void
+int
 raop_player_item_set(struct raop_player *p, const char *title,
                      const char *artist, uint32_t pos_ms, uint32_t len_ms,
                      uint16_t wanted_metadata)
 {
+  char *next_title = title && *title ? strdup(title) : NULL;
+  char *next_artist = artist && *artist ? strdup(artist) : NULL;
+  if ((title && *title && !next_title) || (artist && *artist && !next_artist)) {
+    free(next_title); free(next_artist); return -1;
+  }
   free(p->title);
   free(p->artist);
-  p->title = title && *title ? strdup(title) : NULL;
-  p->artist = artist && *artist ? strdup(artist) : NULL;
+  p->title = next_title;
+  p->artist = next_artist;
   p->pos_ms = pos_ms;
   p->len_ms = len_ms;
   p->wanted_metadata = wanted_metadata;
   p->metadata_sent = false;
+  return 0;
 }
 
 /* Current transport metadata, not a source-boundary scheduling policy. Before
  * the first clock anchor, retain the content and refresh its PTS on playback. */
 int
-raop_player_metadata_now(struct raop_player *p, const char *title, const char *artist,
+raop_player_metadata(struct raop_player *p, const char *title, const char *artist,
                       uint32_t pos_ms, uint32_t len_ms)
 {
-  raop_player_item_set(p, title, artist, pos_ms, len_ms, p->wanted_metadata);
-  return metadata_send_now(p);
+  struct raop_player next = {
+    .stream_id = p->stream_id, .wanted_metadata = p->wanted_metadata,
+    .pts_base = p->pts_base, .pts_samples = p->pts_samples,
+    .clock_started = p->clock_started
+  };
+  if (raop_player_item_set(&next, title, artist, pos_ms, len_ms, p->wanted_metadata) < 0)
+    return -1;
+  int ret = metadata_send_now(&next);
+  if (ret < 0) { free(next.title); free(next.artist); return ret; }
+  free(p->title); free(p->artist);
+  p->title = next.title; p->artist = next.artist;
+  p->pos_ms = next.pos_ms; p->len_ms = next.len_ms;
+  p->metadata_sent = next.metadata_sent;
+  return ret;
 }

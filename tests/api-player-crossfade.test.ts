@@ -1,6 +1,7 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { crossfadeHttp } from './helpers/crossfade-http.ts';
 import { crossfadeReference } from './helpers/crossfade-proof.ts';
+import type { CrossfadeRecord } from '../src/playback-mix.ts';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 import {
   concatenate,
@@ -21,6 +22,69 @@ function test(name: string, fn: () => Promise<void>) {
   });
 }
 const parts = [timelinePcm(22050 + 137), timelinePcm(22050 + 19, 2)];
+
+for (const supplied of [false, true]) {
+  test(`setup failure releases acquired receivers and ${supplied ? 'preserves caller' : 'removes owned'} directory`, async () => {
+    const directory = await Deno.makeTempDir({
+      prefix: 'crossfade-setup-failure-',
+    });
+    await Deno.writeTextFile(`${directory}/db`, 'not a store directory');
+    const listeners: Deno.Listener[] = [];
+    const listen = Deno.listen, makeTempDir = Deno.makeTempDir;
+    Deno.listen = new Proxy(listen, {
+      apply(target, self, args) {
+        const listener: Deno.Listener = Reflect.apply(target, self, args);
+        listeners.push(listener);
+        return listener;
+      },
+    });
+    Deno.makeTempDir = () => Promise.resolve(directory);
+    try {
+      await assertRejects(() =>
+        crossfadeHttp({ parts, ...(supplied ? { directory } : {}) })
+      );
+      assertEquals(
+        listeners.length,
+        2,
+        'both receivers were acquired before setup failed',
+      );
+      for (const listener of listeners) {
+        await assertRejects(() => listener.accept(), Deno.errors.BadResource);
+      }
+      if (supplied) {
+        assertEquals(
+          await Deno.readTextFile(`${directory}/db`),
+          'not a store directory',
+        );
+      } else {
+        await assertRejects(() => Deno.stat(directory), Deno.errors.NotFound);
+      }
+    } finally {
+      Deno.listen = listen;
+      Deno.makeTempDir = makeTempDir;
+      if (supplied) await Deno.remove(directory, { recursive: true });
+    }
+  });
+}
+
+test('teardown attempts all later releases after persistence fails', async () => {
+  const t = await crossfadeHttp({ parts });
+  const close = t.persistence.close.bind(t.persistence);
+  const failure = new Error('injected persistence cleanup failure');
+  t.persistence.close = async () => {
+    await close();
+    throw failure;
+  };
+  const error = await assertRejects(() => t.close(), AggregateError);
+  assertEquals(error.errors.length, 1);
+  assertEquals(error.errors[0].cause, failure);
+  for (const receiver of t.receivers) {
+    using rebound = Deno.listen({ hostname: '127.0.0.1', port: receiver.port });
+    assertEquals((rebound.addr as Deno.NetAddr).port, receiver.port);
+  }
+  await assertRejects(() => fetch(t.f.origin));
+  await assertRejects(() => Deno.stat(t.directory), Deno.errors.NotFound);
+});
 
 test('fresh and upgrade default to zero without refreshing saved playback', async () => {
   const directory = await Deno.makeTempDir({ prefix: 'crossfade-upgrade-' });
@@ -134,6 +198,8 @@ test('invalid whole bodies and rejected auth/Origin never mutate settings or mod
     for (
       const crossfadeMs of [
         -1,
+        13_001,
+        1_000_000_000,
         1.5,
         null,
         '100',
@@ -149,7 +215,9 @@ test('invalid whole bodies and rejected auth/Origin never mutate settings or mod
         consume: true,
         crossfadeMs,
       }, t.credential);
-      assertEquals(response.status, 400, await response.text());
+      const error = await response.json();
+      assertEquals(response.status, 400, JSON.stringify(error));
+      assertEquals(error.code, 'invalid_field');
       const current = await t.current();
       assertEquals([
         current.name,
@@ -172,17 +240,50 @@ test('invalid whole bodies and rejected auth/Origin never mutate settings or mod
     assertEquals(origin.status, 403, await origin.text());
     assertEquals((await t.current()).crossfadeMs, 0);
     const cookie = await t.f.login('cookie');
-    const accepted = await t.f.json('/api/v1/players/1', 'PATCH', {
-      crossfadeMs: 1_000_000_000,
-    }, cookie.credential);
-    assertEquals(accepted.status, 200, await accepted.text());
-    assertEquals(
-      (await t.current()).crossfadeMs,
-      1_000_000_000,
-      'no arbitrary duration cap',
-    );
+    for (const crossfadeMs of [13_000, 0]) {
+      const accepted = await t.f.json('/api/v1/players/1', 'PATCH', {
+        crossfadeMs,
+      }, cookie.credential);
+      assertEquals(accepted.status, 200, await accepted.text());
+      assertEquals((await t.current()).crossfadeMs, crossfadeMs);
+      assertEquals(
+        (await t.f.store.players.list())[0].crossfadeMs,
+        crossfadeMs,
+      );
+    }
   } finally {
     await t.close();
+  }
+});
+
+test('restore rejects a legacy out-of-range crossfade without rewriting saved data', async () => {
+  const directory = await Deno.makeTempDir({
+    prefix: 'crossfade-legacy-range-',
+  });
+  const db = `${directory}/db`;
+  let store = await openStore(db);
+  try {
+    await rawSql(store).run(
+      'UPDATE players SET crossfade_ms = 1000000000 WHERE id = 1',
+    );
+    await rawSql(store).run(
+      `INSERT INTO player_state VALUES (1, 'pause', NULL, 4321, 'all', false, true, TIMESTAMPTZ '2020-01-02 03:04:05.678+00')`,
+    );
+    const before = await store.playback.loadPlayerState(1);
+    await store.close();
+    await assertRejects(
+      () => crossfadeHttp({ parts, directory }),
+      RangeError,
+      '0 to 13000',
+    );
+    store = await openStore(db);
+    assertEquals(await rawSql(store).all('SELECT crossfade_ms FROM players'), [{
+      crossfade_ms: 1_000_000_000n,
+    }]);
+    assertEquals(await store.playback.loadPlayerState(1), before);
+  } finally {
+    await store.close();
+    await Deno.remove(directory, { recursive: true });
   }
 });
 
@@ -225,6 +326,105 @@ test('published setting has one command and a retained exact C4 save batch', asy
   } finally {
     fail = false;
     await t.close();
+  }
+});
+
+test('enabling crossfade during A holds only unsubmitted PCM for the next boundary', async () => {
+  const bytes = [timelinePcm(44100 + 137), timelinePcm(44100 + 19, 2)];
+  const resumeDecoder = Promise.withResolvers<void>();
+  let heldFrames = 0n;
+  const records: CrossfadeRecord[] = [];
+  const f = await nativeHttpFixture({
+    pcm: bytes[0],
+    additionalPcm: [bytes[1]],
+    crossfadeObserved: (record) => records.push(record),
+    async afterDecodedChunk(path, frames) {
+      if (!path.endsWith('source.wav') || heldFrames) return;
+      heldFrames = frames;
+      await resumeDecoder.promise;
+    },
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.command('play');
+    await timelineUntil(
+      'A stalls after submitting its first unfaded chunk',
+      () => heldFrames > 0n,
+    );
+    assertEquals(
+      (await f.native.source(f.native.epoch, 1n))?.acceptedFrames,
+      heldFrames,
+    );
+    await c.modes({ crossfadeMs: 100 });
+    resumeDecoder.resolve();
+    await timelineUntil(
+      'the newly enabled A/B overlap drains',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(records.map((r) => [r.requestedFrames, r.appliedFrames]), [[
+      4410n,
+      4410n,
+    ]]);
+    const expected = crossfadeReference(bytes, 4410).pcm;
+    assertEquals(
+      expected.subarray(0, Number(heldFrames) * 4),
+      bytes[0].subarray(0, Number(heldFrames) * 4),
+    );
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      expected,
+    );
+  } finally {
+    resumeDecoder.resolve();
+    await f.close();
+  }
+});
+
+test('disabling crossfade during B head wait leaves the uncommitted A/B boundary gapless', async () => {
+  const bytes = [timelinePcm(44100 + 137), timelinePcm(44100 + 19, 2)];
+  const resumeHead = Promise.withResolvers<void>();
+  const resumeWait = Promise.withResolvers<void>();
+  let waiting = false;
+  const records: CrossfadeRecord[] = [];
+  const f = await nativeHttpFixture({
+    pcm: bytes[0],
+    additionalPcm: [bytes[1]],
+    crossfadeObserved: (record) => records.push(record),
+    async afterDecodedChunk(path) {
+      if (path.endsWith('next-0.wav')) await resumeHead.promise;
+    },
+    async crossfadeWaiting() {
+      waiting = true;
+      await resumeWait.promise;
+    },
+  });
+  try {
+    const c = await timelineControl(f);
+    await c.add();
+    await c.modes({ crossfadeMs: 400 });
+    await c.command('play');
+    await timelineUntil(
+      'the reader waits for B before binding an overlap',
+      () => waiting,
+    );
+    assertEquals(records, []);
+    await c.modes({ crossfadeMs: 0 });
+    resumeHead.resolve();
+    resumeWait.resolve();
+    await timelineUntil(
+      'the unfaded A/B boundary and both tails drain',
+      () => f.playback.playerView().state === 'stop',
+    );
+    assertEquals(records, [], 'no stale 400 ms overlap is committed');
+    assertEquals(
+      f.audio.scheduledRealAudio(f.receiver.sessions[0], f.receiver.nowMs()),
+      concatenate(bytes),
+    );
+  } finally {
+    resumeHead.resolve();
+    resumeWait.resolve();
+    await f.close();
   }
 });
 
