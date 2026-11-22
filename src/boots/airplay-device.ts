@@ -432,6 +432,7 @@ export function createAirplayDevices(deps: {
     Permit,
     {
       id: string;
+      receiverIdentity?: string;
       authority(): boolean;
       current(): boolean;
       capacity?: PlaybackCapacity;
@@ -462,6 +463,7 @@ export function createAirplayDevices(deps: {
         const incarnation = outputs.revision(request.id);
         const context = {
           id: request.id,
+          receiverIdentity: undefined as string | undefined,
           authority: outputAuthority(outputs, request.id),
           current: () => true,
           capacity: request.capacity,
@@ -478,7 +480,12 @@ export function createAirplayDevices(deps: {
             context.current() && context.capacityCurrent() &&
             !stream?.operations.closed,
         });
-        if (result.ok) contexts.set(result.value, context);
+        if (result.ok) {
+          context.receiverIdentity = airplayInstance(
+            admitted.facts(request.id)?.service ?? '',
+          )?.id;
+          contexts.set(result.value, context);
+        }
         return result;
       };
       if (!stream) return await prepare(request.signal);
@@ -502,17 +509,27 @@ export function createAirplayDevices(deps: {
           error: new PreparationError('stale', 'foreign or consumed permit'),
         };
       }
+      const receiver = context.receiverIdentity;
+      if (receiver === undefined) {
+        return {
+          ok: false,
+          error: new PreparationError(
+            'invalid',
+            'Receiver identity is missing',
+          ),
+        };
+      }
       const activate = async (): Promise<AdmissionResult<AirplayTransport>> => {
         const owner = context.stream;
         const privateInput = { ...input };
         if (owner) streamInputs.set(privateInput, owner);
-        const previous = releases.get(context.id);
+        const previous = releases.get(receiver);
         let release!: () => void, failed!: (error: unknown) => void;
         const released = new Promise<void>((resolve, reject) => {
           release = resolve;
           failed = reject;
         });
-        releases.set(context.id, released);
+        releases.set(receiver, released);
         void released.catch(() => {});
         let published: AirplayTransport | undefined;
         let retained: { release(): void } | undefined;
@@ -600,8 +617,8 @@ export function createAirplayDevices(deps: {
             else release();
           }
           void released.then(() => {
-            if (releases.get(context.id) === released) {
-              releases.delete(context.id);
+            if (releases.get(receiver) === released) {
+              releases.delete(receiver);
             }
           }, () => {});
           privateInputs.delete(privateInput);
@@ -769,20 +786,22 @@ export function createAirplayDevices(deps: {
         airplayOutputId(
           input.port === undefined ? host : `${host}:${input.port}`,
         );
-      const requestedId = id;
-      id = outputs.restore({
-        ...existing,
-        id,
-        name: input.name ?? existing?.name ?? host,
-        host,
-        type: 'AirPlay',
-        selected: outputs.get(id, { includeIgnored: true })?.selected ?? false,
-        volume: outputs.get(id, { includeIgnored: true })?.volume ?? 100,
-        ...(input.port === undefined ? {} : { port: input.port }),
-        ...(input.connectionStrategy === undefined
-          ? {}
-          : { connectionStrategy: input.connectionStrategy }),
-      }, source);
+      id = outputs.restore(
+        existing ?? {
+          id,
+          name: input.name ?? host,
+          host,
+          type: 'AirPlay',
+          selected: outputs.get(id, { includeIgnored: true })?.selected ??
+            false,
+          volume: outputs.get(id, { includeIgnored: true })?.volume ?? 100,
+          ...(input.port === undefined ? {} : { port: input.port }),
+          ...(input.connectionStrategy === undefined
+            ? {}
+            : { connectionStrategy: input.connectionStrategy }),
+        },
+        source,
+      );
       const configureAddress = () =>
         outputs.restore({
           ...outputs.get(id, { includeIgnored: true })!,
@@ -793,7 +812,6 @@ export function createAirplayDevices(deps: {
             ? {}
             : { connectionStrategy: input.connectionStrategy }),
         }, source);
-      if (id !== requestedId) configureAddress();
       let revision = outputs.revision(id);
       const isCurrent = () =>
         outputs.get(id, { includeIgnored: true }) !== null &&
@@ -810,6 +828,17 @@ export function createAirplayDevices(deps: {
         isCurrent,
       });
       const resolved = outputs.identity({ id, type: 'AirPlay' });
+      if (
+        !prepared.ok &&
+        (prepared.error.code === 'invalid' ||
+          prepared.error.code === 'unsupported')
+      ) {
+        // An already adopted endpoint may report failed preparation without
+        // changing its durable configuration. Rejection never grants adoption.
+        return outputs.lifetime(id).adopted
+          ? outputs.get(id, { includeIgnored: true })
+          : null;
+      }
       // Acquiring a known hardware ID retires the provisional row and its
       // permit. Follow that identity, rather than treating resolution as a
       // cancelled address command. Actual forget/ignore cancellation never
@@ -829,15 +858,15 @@ export function createAirplayDevices(deps: {
       if (resolved !== id) {
         admission.invalidate(id);
         id = resolved;
-        configureAddress();
         revision = outputs.revision(id);
-        await admitted.prepare({
+        const canonical = await admitted.prepare({
           id,
           targetRevision: admission.describe(id).targetRevision,
           signal: controller.signal,
           refresh: true,
           isCurrent,
         });
+        if (!canonical.ok) return null;
       }
       if (!isCurrent()) return null;
       const acquired = outputs.get(id, { includeIgnored: true });
@@ -854,6 +883,7 @@ export function createAirplayDevices(deps: {
         return null;
       }
       if (!isCurrent()) return null;
+      configureAddress();
       return await outputs.adopt(id);
     },
     close() {

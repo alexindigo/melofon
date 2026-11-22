@@ -12,6 +12,7 @@ struct output_metadata;
 int raop_metadata_send_stream(uint64_t stream_id, struct output_metadata *);
 void raop_metadata_purge_stream(uint64_t stream_id);
 void raop_metadata_anchor_stream(uint64_t stream_id, struct timespec pts);
+void raop_sync_pending(uint64_t stream_id, struct timespec pts);
 void raop_backend_stream_free(uint64_t stream_id);
 int raop_player_metadata(struct raop_player *, const char *, const char *, uint32_t, uint32_t);
 int raop_player_timeline_active(struct raop_player *);

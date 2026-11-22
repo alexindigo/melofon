@@ -1505,6 +1505,11 @@ export function createOutputs(
           type: output.type,
           hardware: output.receiverIdentity,
         });
+      } else if (!find(output.id)) {
+        // A new address-only registration must acquire fresh identity. Retired
+        // aliases only redirect the operation which learned that identity;
+        // they cannot establish who owns a subsequently reused address.
+        receiverIdentities.delete(output.id);
       }
       const id = identity(output);
       const resolved = id !== output.id;

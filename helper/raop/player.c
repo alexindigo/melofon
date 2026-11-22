@@ -232,6 +232,7 @@ dmap_encode_text(struct evbuffer *out, const char *title, const char *artist)
 static struct timespec
 pts_now(const struct raop_player *p)
 {
+  if (!p->clock_started) return (struct timespec){0};
   uint64_t sec = (uint64_t)p->pts_base.tv_sec + p->pts_samples / 44100;
   uint64_t nsec = (uint64_t)p->pts_base.tv_nsec
                 + (p->pts_samples % 44100) * 1000000000ULL / 44100;
@@ -341,6 +342,11 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
    * expiration can land right after disarm — never write then. */
   if (!p->streaming)
     return;
+
+  pthread_mutex_lock(&p->pcm_lock);
+  bool sync_ready = p->clock_started && !p->fenced && !p->failure.error;
+  pthread_mutex_unlock(&p->pcm_lock);
+  if (sync_ready) raop_sync_pending(p->stream_id, pts_now(p));
 
   for (frames = 1 + overrun; frames > 0; frames--)
     {

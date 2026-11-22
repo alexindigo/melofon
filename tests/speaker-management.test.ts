@@ -423,6 +423,65 @@ Deno.test('manual and mDNS receiver identity reconcile without transferring conf
   }
 });
 
+Deno.test('a previously acquired alias must identify its current receiver before changing saved configuration', async () => {
+  const t = await fixture();
+  try {
+    t.announce();
+    const id = (await t.read())[0].id;
+    await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+    t.answer(receiver);
+    assertEquals(
+      (await t.speaker(
+        await t.write('', 'POST', {
+          protocol: 'AirPlay',
+          address: 'alias.local',
+        }),
+        201,
+      )).id,
+      id,
+    );
+    t.announce({ ...receiver, address: '192.0.2.12' });
+    t.outputs.update(id, { volume: 29 });
+    await t.persistence.drain();
+    const before = await t.f.store.speakers.loadAdopted();
+    const stranger = {
+      ...receiver,
+      name: '001122334477@Stranger._raop._tcp.local',
+    };
+    t.answer(stranger);
+    const fresh = await t.speaker(
+      await t.write('', 'POST', {
+        protocol: 'AirPlay',
+        address: 'alias.local',
+        name: 'Other room',
+      }),
+      201,
+    );
+    assert(fresh.id !== id);
+    assertEquals(fresh.volume, 100);
+    assertEquals(
+      (await t.f.store.speakers.loadAdopted()).find((row) => row.id === id),
+      before[0],
+    );
+    const rejected = await t.speaker(
+      await t.write('', 'POST', {
+        protocol: 'AirPlay',
+        address: '192.0.2.12',
+        name: 'Must not replace saved name',
+      }),
+      201,
+    );
+    assertEquals(rejected.id, id);
+    assertEquals(
+      (await t.f.store.speakers.loadAdopted()).find((row) => row.id === id),
+      before[0],
+    );
+    assertEquals(t.outputs.get(id)!.name, before[0].name);
+  } finally {
+    await t.close();
+  }
+});
+
 Deno.test('speaker HTTP adoption reports a safe durability failure and remains retryable', async () => {
   const t = await fixture();
   try {

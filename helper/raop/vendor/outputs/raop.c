@@ -3814,6 +3814,39 @@ packets_sync_send(struct raop_master_session *rms)
 }
 
 
+static void
+packets_streaming_set(uint64_t stream_id)
+{
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id != stream_id || rs->state != RAOP_STATE_CONNECTED ||
+        !rs->schedule_valid || rs->sync_start_pending || rs->retiring ||
+        rs->failure_pending || rs->cancel_pending) continue;
+    if (!event_pending(keep_alive_timer, EV_TIMEOUT, NULL))
+      evtimer_add(keep_alive_timer, &keep_alive_tv);
+    rs->state = RAOP_STATE_STREAMING;
+  }
+}
+
+/* Loop-owned readiness work, independent of producer ingress. Reuse the live
+ * clock coordinate without appending PCM or advancing the packet cursor. */
+void
+raop_sync_pending(uint64_t stream_id, struct timespec pts)
+{
+  for (struct raop_master_session *rms = raop_master_sessions; rms; rms = rms->next) {
+    if (rms->stream_id != stream_id || !rms->epoch_frames) continue;
+    bool pending = false;
+    for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+      if (rs->master_session == rms && rs->state == RAOP_STATE_CONNECTED &&
+          rs->sync_start_pending && !rs->retiring && !rs->failure_pending &&
+          !rs->cancel_pending) { pending = true; break; }
+    }
+    if (!pending) continue;
+    timestamp_set(rms, pts);
+    if (packets_sync_send(rms) < 0) return;
+  }
+  packets_streaming_set(stream_id);
+}
+
 /* ------------------------- Time and control service ----------------------- */
 
 static void
@@ -5351,7 +5384,6 @@ static void
 raop_write(struct output_buffer *obuf)
 {
   struct raop_master_session *rms;
-  struct raop_session *rs;
   int i;
 
   for (rms = raop_master_sessions; rms; rms = rms->next)
@@ -5390,18 +5422,7 @@ raop_write(struct output_buffer *obuf)
 
   // Check for devices that have joined since last write (we have already sent them
   // initialization sync and rtp packets via packets_sync_send and packets_send)
-  for (rs = raop_sessions; rs; rs = rs->next)
-    {
-      if (rs->stream_id != obuf->stream_id || rs->state != RAOP_STATE_CONNECTED)
-	continue;
-
-      // Start sending progress to keep ATV's alive
-      if (!event_pending(keep_alive_timer, EV_TIMEOUT, NULL))
-	evtimer_add(keep_alive_timer, &keep_alive_tv);
-
-      rs->state = RAOP_STATE_STREAMING;
-      // Make a cb?
-    }
+  packets_streaming_set(obuf->stream_id);
 }
 
 /* Explicitly erase owned key copies before releasing a context. */
