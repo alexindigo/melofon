@@ -63,7 +63,7 @@ export async function nativeHttpFixture(options: {
   storeDir?: string;
   restore?: boolean;
   targetChecks?: boolean;
-  completionProgress?: () => Promise<void>;
+  completionPublication?: () => Promise<void>;
   cutoffCapture?: Promise<void>;
   seekAdmitted?: (positionMs: number) => void;
   sourcePath?: string;
@@ -154,14 +154,6 @@ export async function nativeHttpFixture(options: {
       async waitCompletion(key) {
         const result = await native.waitCompletion(key);
         completions.push(result);
-        return result;
-      },
-      async progress(epoch, source) {
-        const result = await native.progress(epoch, source);
-        if (
-          options.completionProgress && key &&
-          (await native.pollCompletion(key))?.status === 'complete'
-        ) await options.completionProgress();
         return result;
       },
       get epoch() {
@@ -447,7 +439,27 @@ export async function nativeHttpFixture(options: {
       devices = createTestAirplayDevices(
         outputs,
         undefined,
-        audio.stream,
+        () => {
+          const traced = audio.stream();
+          if (!options.completionPublication) return traced;
+          return {
+            ...traced,
+            get epoch() {
+              return traced.epoch;
+            },
+            async waitCompletion(
+              key: Parameters<AirplayTimelineStream['waitCompletion']>[0],
+            ) {
+              const result = await traced.waitCompletion(key);
+              // Trace the terminal receipt, then hold its publication to the
+              // reader. A periodic progress poll cannot consume this barrier.
+              if (result.status === 'complete') {
+                await options.completionPublication!();
+              }
+              return result;
+            },
+          };
+        },
         options.metadata ? { md: '0,2' } : {},
       );
       boot = createAirplayBoot({
