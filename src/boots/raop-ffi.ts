@@ -1144,7 +1144,7 @@ export function createFfiStream(
         if (
           rc !== 1 || r[0] !== captured || r[1] !== index || !kind || !r[7] ||
           (kind === 'real'
-            ? !r[3] || !r[4]
+            ? !r[3] // segment zero denotes coalesced input identities
             : r[3] !== 0n || r[4] !== 0n || r[5] !== 0n)
         ) {
           throw new Error('Invalid RAOP range snapshot ABI');

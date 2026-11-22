@@ -775,88 +775,110 @@ test('exclusive immutable source/end targets reject late or unordered input with
   }
 });
 
-for (const manySources of [true, false]) {
-  test(`bounded ${manySources ? 'source markers' : 'segment ranges'} backpressure without dropping seals`, async () => {
-    const stream = createFfiStream();
-    try {
-      let frames = 0n;
-      for (let id = 1n; id <= 1000n; id++) {
-        const r = await stream.appendSource({
-          epoch: stream.epoch,
-          source: manySources ? id : 1n,
-          segment: id,
-          pcm: pcm(1),
-        });
-        if (r.status === 'backpressure') {
-          assertEquals(r.acceptedFrames, 0n);
-          break;
-        }
-        assertEquals(r.status, 'accepted');
-        frames++;
-        if (manySources) {
-          assertEquals(
-            (await stream.seal(stream.epoch, id, 1n)).status,
-            'accepted',
-          );
-        }
+test('bounded source markers backpressure without dropping seals', async () => {
+  const stream = createFfiStream();
+  try {
+    let frames = 0n;
+    for (let id = 1n; id <= 1000n; id++) {
+      const r = await stream.appendSource({
+        epoch: stream.epoch,
+        source: id,
+        segment: id,
+        pcm: pcm(1),
+      });
+      if (r.status === 'backpressure') {
+        assertEquals(r.acceptedFrames, 0n);
+        break;
       }
-      assert(
-        frames > 16n && frames < 1000n,
-        'bounded retained records, not the lossy state ring',
-      );
-      for (let id = 1n; id <= (manySources ? frames : 1n); id++) {
-        const s = await stream.source(stream.epoch, id);
-        assertEquals(s!.acceptedFrames, manySources ? 1n : frames);
-      }
-      if (!manySources) {
-        assertEquals(
-          (await stream.seal(stream.epoch, 1n, frames)).status,
-          'accepted',
-        );
-      }
+      assertEquals(r.status, 'accepted');
+      frames++;
       assertEquals(
-        (await stream.endStream(stream.epoch, frames)).status,
+        (await stream.seal(stream.epoch, id, 1n)).status,
         'accepted',
-        'closing markers have reserved storage',
       );
-      const old = stream.epoch;
-      assertEquals((await stream.cancel(old)).status, 'ready');
-      assertEquals(await stream.source(old, 1n), null);
-      assertEquals((await stream.seal(old, 1n, 1n)).status, 'canceled');
-      if (manySources) {
-        assertEquals(
-          (await stream.appendSource({
-            epoch: stream.epoch,
-            source: 1n,
-            segment: 1n,
-            pcm: pcm(1),
-          })).status,
-          'backpressure',
-          'unacked old terminal receipts retain marker capacity across cancel',
-        );
-        for (let source = 1n; source <= frames; source++) {
-          await stream.ackCompletion({
-            epoch: old,
-            source,
-            target: 1n,
-            revision: 1n,
-          });
-        }
-      }
-      await append(stream, 1n, pcm(1));
-      assertEquals((await stream.source(stream.epoch, 1n))!.acceptedFrames, 1n);
-      await stream.ackCancel(old);
-      await libraryProof();
-    } finally {
-      await stream.close();
     }
-    await assertRejects(
-      () => stream.endStream(stream.epoch, 0n),
-      Error,
-      'closed',
+    assert(
+      frames > 16n && frames < 1000n,
+      'bounded retained records, not the lossy state ring',
     );
-  });
-}
+    for (let id = 1n; id <= frames; id++) {
+      const s = await stream.source(stream.epoch, id);
+      assertEquals(s!.acceptedFrames, 1n);
+    }
+    assertEquals(
+      (await stream.endStream(stream.epoch, frames)).status,
+      'accepted',
+      'closing markers have reserved storage',
+    );
+    const old = stream.epoch;
+    assertEquals((await stream.cancel(old)).status, 'ready');
+    assertEquals(await stream.source(old, 1n), null);
+    assertEquals((await stream.seal(old, 1n, 1n)).status, 'canceled');
+    assertEquals(
+      (await stream.appendSource({
+        epoch: stream.epoch,
+        source: 1n,
+        segment: 1n,
+        pcm: pcm(1),
+      })).status,
+      'backpressure',
+      'unacked old terminal receipts retain marker capacity across cancel',
+    );
+    for (let source = 1n; source <= frames; source++) {
+      await stream.ackCompletion({
+        epoch: old,
+        source,
+        target: 1n,
+        revision: 1n,
+      });
+    }
+    await append(stream, 1n, pcm(1));
+    assertEquals((await stream.source(stream.epoch, 1n))!.acceptedFrames, 1n);
+    await stream.ackCancel(old);
+    await libraryProof();
+  } finally {
+    await stream.close();
+  }
+  await assertRejects(
+    () => stream.endStream(stream.epoch, 0n),
+    Error,
+    'closed',
+  );
+});
+
+test('tiny fragmented input reaches the PCM cap rather than the chunk-count cap', async () => {
+  const stream = createFfiStream();
+  try {
+    for (let segment = 1n; segment <= 1000n; segment++) {
+      await append(stream, 1n, pcm(1), segment);
+    }
+    const r = await stream.appendSource({
+      epoch: stream.epoch,
+      source: 1n,
+      segment: 1001n,
+      pcm: pcm(88200),
+    });
+    assertEquals([r.status, r.acceptedFrames, r.sourceOffset], [
+      'backpressure',
+      87200n,
+      1000n,
+    ]);
+    assertEquals(
+      (await stream.source(stream.epoch, 1n))!.acceptedFrames,
+      88200n,
+    );
+    assertEquals(
+      (await stream.seal(stream.epoch, 1n, 88200n)).status,
+      'accepted',
+    );
+    assertEquals(
+      (await stream.endStream(stream.epoch, 88200n)).status,
+      'accepted',
+    );
+  } finally {
+    await stream.close();
+  }
+});
 
 test('cancel fences a sealed old tail and held FLUSH cannot erase the replacement', async () => {
   const stream = createFfiStream();

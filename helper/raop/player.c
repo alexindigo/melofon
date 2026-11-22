@@ -79,12 +79,11 @@ struct raop_metadata_mirror
  * the buffer is NOT drained when the session connects. */
 #define PCM_CAP (2 * 44100 * 4)
 
-/* Bounded retained marker storage, independent of the PCM byte cap. Input runs
- * reserve their dispatch record plus the possible following silence records, so
- * the loop never needs an allocation or drops a range after accepting bytes.
- * Terminal acknowledgement reclaims source/input/range observations. */
+/* Source observations live until ACK, but ingress lives only until dispatch.
+ * Adjacent PCM for a source shares one ingress slot regardless of decoder chunk
+ * identity. History coalesces contiguous source coverage, not chunk identities;
+ * discontinuities reserve their history storage at admission, never on the tick. */
 #define TIMELINE_MARKERS 256
-#define TRANSPORT_RANGES (3 * TIMELINE_MARKERS + 3)
 struct source_record {
   uint64_t id, accepted, fed, target, input_end;
   bool sealed;
@@ -96,11 +95,14 @@ struct timeline {
   bool enabled, ended, tail_reached, complete;
   uint64_t accepted, end_target, padding_left, transport_end;
   uint64_t compatibility_source, last_real_end, prepared_frames;
-  size_t sources, inputs, next_input, ranges;
+  size_t sources, inputs, ranges, range_capacity;
   struct source_record source[TIMELINE_MARKERS];
   struct input_range input[TIMELINE_MARKERS];
-  struct raop_range_snapshot range[TRANSPORT_RANGES];
-  uint64_t range_owner[TRANSPORT_RANGES], last_source;
+  struct transport_range {
+    struct raop_range_snapshot value;
+    uint64_t owner;
+  } *range;
+  uint64_t last_source;
 };
 
 struct metadata_marker {
@@ -401,31 +403,37 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
         uint64_t transport = p->pts_samples;
         size_t left = real;
         while (left) {
-          struct input_range *in = &t->input[t->next_input];
+          struct input_range *in = &t->input[0];
           size_t take = in->frames - in->fed;
           if (take > left) take = left;
-          struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1] : NULL;
+          struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1].value : NULL;
           if (!r || r->kind != RAOP_RANGE_REAL || r->source != in->source ||
-              r->segment != in->segment || r->transport_start + r->frames != transport ||
+              r->transport_start + r->frames != transport ||
               r->source_offset + r->frames != in->source_offset + in->fed) {
-            t->range_owner[t->ranges] = in->source;
-            r = &t->range[t->ranges++];
+            t->range[t->ranges].owner = in->source;
+            r = &t->range[t->ranges++].value;
             *r = (struct raop_range_snapshot){ .kind = RAOP_RANGE_REAL,
               .source = in->source, .segment = in->segment,
               .source_offset = in->source_offset + in->fed, .transport_start = transport };
           }
+          /* A zero segment denotes coalesced coverage of multiple opaque input
+           * identities. Exact per-append identity remains in admission receipts. */
+          if (r->segment != in->segment) r->segment = 0;
           r->frames += take;
           t->last_source = in->source;
           for (size_t i = 0; i < t->sources; i++)
             if (t->source[i].id == in->source) { t->source[i].fed += take; break; }
           in->fed += take;
-          if (in->fed == in->frames) t->next_input++;
+          if (in->fed == in->frames) {
+            t->inputs--;
+            memmove(t->input, t->input + 1, t->inputs * sizeof(*t->input));
+          }
           transport += take;
           t->last_real_end = transport;
           left -= take;
         }
         size_t silence = output_frames - real;
-        if (t->ended && t->next_input == t->inputs && !t->tail_reached) {
+        if (t->ended && !t->inputs && !t->tail_reached) {
           t->tail_reached = true;
           t->transport_end = t->last_real_end;
           t->padding_left = (352 - transport % 352) % 352;
@@ -440,10 +448,10 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
             (t->compatibility_source && t->last_source == t->compatibility_source
               ? RAOP_RANGE_COMPATIBILITY : RAOP_RANGE_UNDERRUN))
                                : RAOP_RANGE_PADDING;
-          struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1] : NULL;
+          struct raop_range_snapshot *r = t->ranges ? &t->range[t->ranges - 1].value : NULL;
           if (!r || r->kind != kind || r->transport_start + r->frames != transport) {
-            t->range_owner[t->ranges] = t->last_source;
-            r = &t->range[t->ranges++];
+            t->range[t->ranges].owner = t->last_source;
+            r = &t->range[t->ranges++].value;
             *r = (struct raop_range_snapshot){ .kind = kind, .transport_start = transport };
           }
           r->frames += count;
@@ -554,7 +562,7 @@ raop_player_metadata_update(struct raop_player *p)
     bool mapped = false;
     if (!p->fenced && !p->failure.error && m && p->timeline) {
       for (size_t i = 0; i < p->timeline->ranges; i++) {
-        struct raop_range_snapshot *r = &p->timeline->range[i];
+        struct raop_range_snapshot *r = &p->timeline->range[i].value;
         if (r->kind == RAOP_RANGE_REAL && r->source == m->source &&
             r->source_offset <= m->frame && m->frame < r->source_offset + r->frames) {
           transport = r->transport_start + m->frame - r->source_offset;
@@ -661,6 +669,7 @@ raop_player_free(struct raop_player *p)
     close(p->timer_fd);
   evbuffer_free(p->pcm);
   metadata_clear(p);
+  if (p->timeline) free(p->timeline->range);
   free(p->timeline);
   pthread_mutex_destroy(&p->pcm_lock);
   free(p->title);
@@ -725,6 +734,28 @@ timeline_get(struct raop_player *p)
   return p->timeline;
 }
 
+/* A queued source run can add one real range and a following underrun; end can
+ * add padding/drain. Reserve conservatively before copying PCM. Repeated chunks
+ * of a contiguous source reuse both ingress and history; only genuine timeline
+ * discontinuities require more history. Allocation failure never accepts bytes. */
+static int
+timeline_reserve(struct timeline *t)
+{
+  size_t extra = 3 * (t->inputs + 1) + 3;
+  if (t->ranges > SIZE_MAX - extra) return -1;
+  size_t required = t->ranges + extra;
+  if (required <= t->range_capacity) return 0;
+  size_t capacity = required;
+  if (t->range_capacity <= SIZE_MAX / 2 && capacity < t->range_capacity * 2)
+    capacity = t->range_capacity * 2;
+  if (capacity > SIZE_MAX / sizeof(*t->range)) return -1;
+  struct transport_range *ranges = realloc(t->range, capacity * sizeof(*ranges));
+  if (!ranges) return -1;
+  t->range = ranges;
+  t->range_capacity = capacity;
+  return 0;
+}
+
 int
 raop_player_append_source(struct raop_player *p, uint64_t source, uint64_t segment,
                           const uint8_t *pcm, size_t len,
@@ -744,9 +775,9 @@ raop_player_append_source(struct raop_player *p, uint64_t source, uint64_t segme
   result->input_offset = t->accepted;
   result->source_offset = s ? s->accepted : 0;
   struct input_range *in = t->inputs ? &t->input[t->inputs - 1] : NULL;
-  /* Merge retries only while the same run still has queued input. Once fully
-   * dispatched a later append gets a new run, since silence may intervene. */
-  bool merge = in && in->source == source && in->segment == segment && in->fed < in->frames;
+  /* Chunk identity cannot consume source-lifetime capacity. Undispatched PCM
+   * is contiguous by construction; transport gaps are recorded at dispatch. */
+  bool merge = in && in->source == source;
   if ((!s && t->sources == TIMELINE_MARKERS) ||
       (len && !merge && t->inputs == TIMELINE_MARKERS)) {
     result->status = RAOP_APPEND_BACKPRESSURE;
@@ -759,6 +790,10 @@ raop_player_append_source(struct raop_player *p, uint64_t source, uint64_t segme
   accept &= ~(size_t)3;
   if (t->accepted > UINT64_MAX - accept / 4 ||
       (s && s->accepted > UINT64_MAX - accept / 4)) goto out;
+  if (accept && timeline_reserve(t) < 0) {
+    result->error = RAOP_APPEND_ERROR_ALLOCATION;
+    goto out;
+  }
   if (accept && evbuffer_add(p->pcm, pcm, accept) < 0) {
     result->error = RAOP_APPEND_ERROR_ALLOCATION;
     goto out;
@@ -773,6 +808,7 @@ raop_player_append_source(struct raop_player *p, uint64_t source, uint64_t segme
       *in = (struct input_range){ .source = source, .segment = segment,
                                  .source_offset = s->accepted };
     }
+    if (in->segment != segment) in->segment = 0;
     in->frames += accept / 4;
     s->accepted += accept / 4;
     t->accepted += accept / 4;
@@ -825,7 +861,7 @@ raop_player_end(struct raop_player *p, uint64_t target, struct raop_marker_resul
              (!t->sources || t->source[t->sources - 1].sealed)) {
     t->ended = true;
     t->end_target = target;
-    if (t->next_input == t->inputs) {
+    if (!t->inputs) {
       /* A delayed end may follow already packetized compatibility/underrun
        * silence. Its exclusive real boundary never moves to that silence. */
       t->tail_reached = true;
@@ -882,7 +918,7 @@ raop_player_range(struct raop_player *p, uint64_t index, struct raop_range_snaps
   int found = 0;
   pthread_mutex_lock(&p->pcm_lock);
   if (p->timeline && index < p->timeline->ranges) {
-    *result = p->timeline->range[index];
+    *result = p->timeline->range[index].value;
     result->index = index;
     found = 1;
   }
@@ -945,7 +981,7 @@ raop_player_progress_at(struct raop_player *p, uint64_t source, uint64_t attachm
   result->fed_frames = p->pts_samples;
   struct timeline *t = p->timeline;
   if (t) for (size_t i = 0; i < t->ranges; i++) {
-    const struct raop_range_snapshot *r = &t->range[i];
+    const struct raop_range_snapshot *r = &t->range[i].value;
     uint64_t start = r->transport_start > result->coverage_start
       ? r->transport_start : result->coverage_start;
     uint64_t end = r->transport_start + r->frames;
@@ -984,7 +1020,7 @@ raop_player_completion_progress(struct raop_player *p, uint64_t source,
       if (t->source[i].id == source)
         sealed = t->source[i].sealed && t->source[i].fed == t->source[i].target;
     for (size_t i = 0; i < t->ranges; i++) {
-      const struct raop_range_snapshot *r = &t->range[i];
+      const struct raop_range_snapshot *r = &t->range[i].value;
       if (r->kind != RAOP_RANGE_REAL || r->source != source) continue;
       *transport_end = r->transport_start + r->frames;
       uint64_t start = r->transport_start > result->coverage_start
@@ -1017,8 +1053,8 @@ raop_player_drained(struct raop_player *p)
   return result;
 }
 
-/* Ack ends source/range observation lifetime. Compact all three bounded ledgers
- * together, including already dispatched inputs. Never erase a queued suffix.
+/* Ack ends source/range observation lifetime, not ingress lifetime. Dispatched
+ * input has already been reclaimed. Never erase a queued suffix.
  * Remaining transport/source offsets stay absolute, not rebased after reclaim. */
 void
 raop_player_ack_source(struct raop_player *p, uint64_t source)
@@ -1039,21 +1075,13 @@ raop_player_ack_source(struct raop_player *p, uint64_t source)
         pthread_mutex_unlock(&p->pcm_lock);
         return; /* failed queued input still owns PCM until ordered cancel */
       }
-    size_t n = 0, next = 0;
-    for (size_t i = 0; i < t->inputs; i++) {
-      if (t->input[i].source == source) continue;
-      if (i < t->next_input) next++;
-      t->input[n++] = t->input[i];
-    }
-    t->inputs = n; t->next_input = next;
-    n = 0;
+    size_t n = 0;
     for (size_t i = 0; i < t->ranges; i++) {
-      uint64_t owner = t->range_owner[i];
+      uint64_t owner = t->range[i].owner;
       bool retained = false;
       for (size_t j = 0; j < t->sources; j++)
         if (t->source[j].id == owner && owner != source) retained = true;
       if (retained) {
-        t->range_owner[n] = owner;
         t->range[n++] = t->range[i];
       }
     }
@@ -1076,6 +1104,7 @@ raop_player_flush(struct raop_player *p)
   metadata_clear(p);
   memset(&p->failure, 0, sizeof(p->failure));
   if (p->timeline && p->timeline->enabled) {
+    free(p->timeline->range);
     memset(p->timeline, 0, sizeof(*p->timeline));
   }
   p->pts_samples = 0;

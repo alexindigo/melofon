@@ -367,10 +367,15 @@ drain silence; absent input after the first real frame yields labeled underrun
 silence. Neither silence nor handshake time advances real-source counters.
 
 `timeline.h` holds value-only ABI records without importing public entry points
-into vendor translation units. The pacer retains bounded source/input markers
-(256 each), reserving dispatch/silence storage before accepting bytes. Exhaustion
-returns zero/backpressure rather than dropping records or moving a seal. This
-port reclaims markers after terminal acknowledgement in the completion layer.
+into vendor translation units. The pacer retains 256 source markers until terminal
+acknowledgement. Its separate ingress queue contains only undispatched PCM and
+reclaims slots as it dispatches. Contiguous queued input from the same source
+coalesces irrespective of decoder chunk identity, so the two-second PCM cap, not
+chunk count, controls ingress backpressure. Transport history coalesces adjacent
+real coverage with matching source and offsets. A mixed-identity real range has
+segment zero; append receipts still carry each exact opaque input identity.
+Genuine discontinuities remain exact, with history storage reserved on admission
+before copying bytes, never allocated by the pacer. Allocation failure is explicit.
 Polling source/range records
 observes admission and pacer dispatch only, not successful submission, scheduled
 playout or completion. Timeline input refuses unlabelled writes in that epoch.
@@ -439,8 +444,8 @@ presentation boundary. Broader source recovery remains the core's responsibility
 
 The retained receipt bound is 256, including old epochs and revisions. Source
 admission reserves its seal slot; exhaustion applies backpressure without losing
-terminal values. The last exact ack of a source's revisions reclaims its dispatched
-source/input/range observations, including associated silence. Range indices are
+terminal values. The last exact ack of a source's revisions reclaims its retained
+source/range observations, including associated silence. Range indices are
 view indices and compact at ack; offsets remain epoch-absolute. Acknowledged source
 incarnations must not be reused. Source/progress range projections cover retained
 observations only after ack. Queued failed input is not reclaimed ahead of cancel.

@@ -67,8 +67,9 @@ int raop_stream_append(raop_stream_t *stream, uint64_t epoch, uint64_t segment,
  * retries of the same marker are idempotent. Seal never pads/ends a stream.
  * Once timeline input starts, unlabelled write/append and the legacy local reset
  * are refused; only ordered cancel can open a fresh accounted epoch.
- * Fixed marker storage applies backpressure, never drops a range. Completion
- * acknowledgement retires source/range observations and reclaims their storage.
+ * The PCM cap bounds ingress, whose slots are reclaimed at dispatch. Source
+ * marker capacity is retained until completion acknowledgement; transport history
+ * coalesces contiguous real coverage and retains exact discontinuities until ACK.
  * Status/error use raop_append_status/error. All fields u64, native byte order.
  */
 int raop_stream_append_source(raop_stream_t *, uint64_t epoch, uint64_t source,
@@ -93,7 +94,9 @@ int raop_stream_compatibility_silence(raop_stream_t *, uint64_t epoch, uint64_t 
  * source/range: 1 found, 0 absent/stale, -1 invalid. index starts at 0 and is a
  * view index, not an incarnation; ack compacts it. After ack, historical source
  * and range projections are unavailable. Transport offsets remain absolute. Silence
- * has source/segment/offset zero and never advances source fed_frames. */
+ * has source/segment/offset zero and never advances source fed_frames. A real
+ * range's segment is zero when it coalesces multiple opaque append identities;
+ * source offsets and transport coverage stay exact. */
 int raop_stream_source(raop_stream_t *, uint64_t epoch, uint64_t source,
                        struct raop_source_snapshot *);
 int raop_stream_range(raop_stream_t *, uint64_t epoch, uint64_t index,

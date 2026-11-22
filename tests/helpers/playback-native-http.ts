@@ -38,6 +38,7 @@ import type {
 export async function nativeHttpFixture(options: {
   pcm: Uint8Array;
   additionalPcm?: Uint8Array[];
+  additionalSourcePaths?: string[];
   titles?: string[];
   durations?: (number | null)[];
   metadata?: boolean;
@@ -116,6 +117,22 @@ export async function nativeHttpFixture(options: {
     header.setUint32(40, pcm.length, true);
     file.set(pcm, 44);
     await Deno.writeFile(`${directory}/media/next-${i}.wav`, file);
+  }
+  const additionalFiles = [
+    ...(options.additionalPcm ?? []).map((_, i) => `next-${i}.wav`),
+    ...(options.additionalSourcePaths ?? []).map((path, i) =>
+      `next-${i + (options.additionalPcm?.length ?? 0)}.${
+        path.split('.').pop()
+      }`
+    ),
+  ];
+  for (const [i, path] of (options.additionalSourcePaths ?? []).entries()) {
+    await Deno.copyFile(
+      path,
+      `${directory}/media/${
+        additionalFiles[i + (options.additionalPcm?.length ?? 0)]
+      }`,
+    );
   }
   const receivers = await Promise.all(
     Array.from({ length: options.receiverCount ?? 1 }, () =>
@@ -225,8 +242,8 @@ export async function nativeHttpFixture(options: {
       songId = songs.find((s) => /\/source\./.test(s.path))!.id;
       songIds = [
         songId,
-        ...(options.additionalPcm ?? []).map((_, i) =>
-          songs.find((s) => s.path.endsWith(`/next-${i}.wav`))!.id
+        ...additionalFiles.map((file) =>
+          songs.find((s) => s.path.endsWith(`/${file}`))!.id
         ),
       ];
       const library = {
