@@ -141,7 +141,7 @@ Deno.test('discovery and every control save path stay temporary across HTTP read
       assertEquals((await next.own()).outputs, []);
       next.announce('up');
       assertEquals((await next.read())[0].selected, false);
-      assertEquals((await next.read())[0].volume, 100);
+      assertEquals((await next.read())[0].volume, 25);
     } finally {
       await next.close();
     }

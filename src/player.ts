@@ -31,6 +31,7 @@ import {
 export type { QueueEntry } from './queue-source.ts';
 import type { Notify } from './notify.ts';
 import type { State } from './state.ts';
+import type { SettingValue } from './settings-schema.ts';
 import { SpeakerError } from './speaker-errors.ts';
 import { outputPlayerId } from './player-outputs.ts';
 import { planSourceFailure } from './source-recovery.ts';
@@ -434,6 +435,8 @@ export interface Outputs {
   ): string;
   list(options?: { includeIgnored?: boolean }): Output[];
   get(id: string, options?: { includeIgnored?: boolean }): Output | null;
+  /** Existing and saved AirPlay preferences take precedence over the default. */
+  airplayRegistrationVolume(id: string, savedVolume?: number): number;
   ignored(): string[];
   ignore(id: string): Promise<void>;
   unignore(id: string): Promise<void>;
@@ -1190,6 +1193,16 @@ export function createPlayer(options: {
   };
 }
 
+const airplayVolumeKey = 'airplay.defaultSpeakerVolume';
+const airplayVolumeSchema = {
+  type: 'integer',
+  minimum: 0,
+  maximum: 100,
+  default: 25,
+  title: 'Default speaker volume',
+  description: 'Starting volume for AirPlay speakers with no existing level',
+};
+
 export function createOutputs(
   {
     notify,
@@ -1211,6 +1224,7 @@ export function createOutputs(
     default: DEFAULT_CONNECTION_STRATEGY,
     description: 'Connection strategy assigned to new AirPlay outputs',
   });
+  state?.declare(airplayVolumeKey, airplayVolumeSchema);
   const emit = (types: string[]) => notify?.emit(types, undefined, 'all');
   // Empty until a boot registers a real output — no dummy row.
   const outputs: Output[] = [];
@@ -1274,29 +1288,37 @@ export function createOutputs(
     };
   };
   let defaultStrategy = DEFAULT_CONNECTION_STRATEGY;
+  let defaultVolume = airplayVolumeSchema.default;
   let initialized = state === undefined;
-  let defaultRevision = 0;
+  const changedDefaults = new Set<string>();
+  const applyDefault = (key: string, value: SettingValue | undefined) => {
+    if (key === CONNECTION_STRATEGY_DEFAULT_KEY) {
+      defaultStrategy = requireConnectionStrategy(value);
+    } else {
+      defaultVolume = Number(value);
+    }
+  };
   state?.onChange((key, value) => {
-    if (key !== CONNECTION_STRATEGY_DEFAULT_KEY) return;
-    defaultStrategy = requireConnectionStrategy(value);
-    defaultRevision++;
+    if (key !== CONNECTION_STRATEGY_DEFAULT_KEY && key !== airplayVolumeKey) {
+      return;
+    }
+    applyDefault(key, value);
+    changedDefaults.add(key);
   });
-  const initialization = state === undefined
-    ? Promise.resolve()
-    : (async () => {
-      const before = defaultRevision;
-      let readRevision: number | undefined;
-      try {
-        readRevision = defaultRevision;
-        const value = await state.getTyped(CONNECTION_STRATEGY_DEFAULT_KEY);
-        if (defaultRevision === readRevision) {defaultStrategy =
-            requireConnectionStrategy(value);}
-        initialized = true;
-      } catch (error) {
-        if (defaultRevision > (readRevision ?? before)) initialized = true;
-        else throw error;
-      }
-    })();
+  const readDefault = async (state: State, key: string) => {
+    try {
+      const value = await state.getTyped(key);
+      if (!changedDefaults.has(key)) applyDefault(key, value);
+    } catch (error) {
+      if (!changedDefaults.has(key)) throw error;
+    }
+  };
+  const initialization = state === undefined ? Promise.resolve() : Promise.all([
+    readDefault(state, CONNECTION_STRATEGY_DEFAULT_KEY),
+    readDefault(state, airplayVolumeKey),
+  ]).then(() => {
+    initialized = true;
+  });
   // The ready() caller owns the rejection; prevent an unobserved startup task.
   void initialization.catch(() => {});
   const commandListeners = new Set<
@@ -1399,6 +1421,10 @@ export function createOutputs(
       const found = find(id);
       return found === null ? null : { ...found };
     },
+    airplayRegistrationVolume(id, savedVolume) {
+      const saved = savedVolume ?? persistence?.savedOutput?.(id)?.volume;
+      return find(id)?.volume ?? saved ?? defaultVolume;
+    },
     ignored: ignoredIds,
     ignore: (id) => changeIgnored(id, true),
     unignore: (id) => changeIgnored(id, false),
@@ -1497,7 +1523,7 @@ export function createOutputs(
       }
       if (!initialized) {
         throw new Error(
-          'output strategy default not initialized; await outputs.ready()',
+          'output defaults not initialized; await outputs.ready()',
         );
       }
       if (output.receiverIdentity !== undefined) {

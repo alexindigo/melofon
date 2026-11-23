@@ -193,7 +193,7 @@ Deno.test('speaker HTTP reads project discovered facts and failures while OwnTon
       selected: false,
       playerId: null,
       linked: true,
-      volume: 100,
+      volume: 25,
       connectionStrategy: 'melofon',
       adopted: false,
       discovered: true,
@@ -231,7 +231,7 @@ Deno.test('speaker HTTP reads project discovered facts and failures while OwnTon
         name: 'Kitchen',
         type: 'AirPlay',
         selected: false,
-        volume: 100,
+        volume: 25,
         has_password: false,
         requires_auth: false,
         needs_auth_key: false,
@@ -397,7 +397,7 @@ Deno.test('temporary selected speakers retain session intent across withdrawal a
       t.announce('up');
       row = (await t.read(credential)).speakers[0];
       assertEquals(row.selected, false);
-      assertEquals(row.volume, 100, 'released temporary preferences are gone');
+      assertEquals(row.volume, 25, 'released temporary preferences are gone');
       t.announce('down');
       assertEquals((await t.read(credential)).speakers, []);
     }

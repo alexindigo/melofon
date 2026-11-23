@@ -202,7 +202,7 @@ Deno.test('up registers with TXT-derived fields; down unregisters', async () => 
     assertEquals(out.name, 'Kitchen ATV');
     assertEquals(out.type, 'AirPlay');
     assertEquals(out.selected, false);
-    assertEquals(out.volume, 100);
+    assertEquals(out.volume, 25);
     assertEquals(out.host, '192.168.1.50');
     assertEquals(out.port, 7000);
     const prepared = await session(out.id);
@@ -272,7 +272,7 @@ Deno.test('a device coming back unregistered registers with the saved selection'
     );
     const patio = outputs.get(BigInt('0x001122334455').toString(10))!;
     assertEquals(patio.selected, false);
-    assertEquals(patio.volume, 100);
+    assertEquals(patio.volume, 25);
   } finally {
     discovery.close();
   }

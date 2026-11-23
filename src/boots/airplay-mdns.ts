@@ -46,7 +46,7 @@ export interface AirplayDiscoveryDeps {
   /** Persisted user state per output id (plan restart-transparency): a
    * device re-announcing while not registered (mDNS down→up, or a restart
    * before its row re-registers) gets its saved selection and volume back.
-   * Absent ⇒ discovery defaults (selected: false, volume: 100). The saved
+   * Absent ⇒ unselected, with the configured starting volume. The saved
    * model is identity (plan atv3-session-recycle): a re-announcement whose
    * TXT omits `am` recovers it. */
   savedOutput?: (
@@ -131,7 +131,7 @@ export function createAirplayDiscovery(
           host: svc.address,
           port: svc.port,
           selected: existing?.selected ?? saved?.selected ?? false,
-          volume: existing?.volume ?? saved?.volume ?? 100,
+          volume: outputs.airplayRegistrationVolume(parsed.id, saved?.volume),
           ...(svc.txt.am?.trim() ? { model: svc.txt.am.trim() } : {}),
         },
         { kind: 'internal', via: 'airplay-discovery' },
@@ -204,7 +204,7 @@ export function createAirplayDiscovery(
         // selection, volume, and PIN completion. A device that was gone gets
         // the persisted state back instead of the discovery defaults.
         selected: existing?.selected ?? saved?.selected ?? false,
-        volume: existing?.volume ?? saved?.volume ?? 100,
+        volume: outputs.airplayRegistrationVolume(parsed.id, saved?.volume),
         host: svc.address,
         port: svc.port,
         ...fields,

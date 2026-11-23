@@ -794,7 +794,7 @@ export function createAirplayDevices(deps: {
           type: 'AirPlay',
           selected: outputs.get(id, { includeIgnored: true })?.selected ??
             false,
-          volume: outputs.get(id, { includeIgnored: true })?.volume ?? 100,
+          volume: outputs.airplayRegistrationVolume(id),
           ...(input.port === undefined ? {} : { port: input.port }),
           ...(input.connectionStrategy === undefined
             ? {}

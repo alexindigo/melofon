@@ -249,7 +249,8 @@ Deno.test('strategies: late initial default read cannot undo a newer live write'
     declare() {},
     get: () => Promise.resolve(null),
     getWithRevision: () => Promise.resolve({ value: null, revision: 0 }),
-    getTyped: () => {
+    getTyped: (key: string) => {
+      if (key !== KEY) return Promise.resolve(25);
       reading = true;
       return new Promise<string>((resolve) => release = resolve);
     },
@@ -283,10 +284,12 @@ Deno.test('strategies: failed or invalid initial read never assigns an irreversi
       declare() {},
       get: () => Promise.resolve(null),
       getWithRevision: () => Promise.resolve({ value: null, revision: 0 }),
-      getTyped: () =>
-        value === null
+      getTyped: (key: string) => {
+        if (key !== KEY) return Promise.resolve(25);
+        return value === null
           ? Promise.reject(new Error('read failed'))
-          : Promise.resolve(value),
+          : Promise.resolve(value);
+      },
       seedIfUnset: () => Promise.resolve(false),
       set: () => Promise.resolve(),
       list: () => Promise.resolve({}),

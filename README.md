@@ -230,6 +230,8 @@ All other core `/_/` admin routes (config, libraries, outputs, last-command)
 are loopback-only: call them from inside the server's container or VM. Requests
 carrying a forwarded header never count as loopback.
 Settings for LAN clients are at `/api/v1/admin/settings`, signed in as admin.
+`airplay.defaultSpeakerVolume` sets the starting level for new AirPlay
+speakers (integer 0-100, default 25).
 `MELOFON_LISTEN` unset → Deno.serve default. Never commit `.env`, `.envrc`,
 or anything under `data/` — keep deployment secrets out of source control.
 
@@ -257,6 +259,9 @@ otherwise.
 
 Players keep their own saved volume. Speakers store absolute levels from 0 to
 100, and AirPlay receives those levels without a second master multiplier.
+Newly discovered and manually registered AirPlay speakers start at 25/100
+unless the admin changes `airplay.defaultSpeakerVolume`. Existing and saved
+speaker levels are unchanged by that setting.
 Moving a player slider moves its linked speakers by the same amount, capped at
 0 and 100; returning from an extreme does not restore the old balance. Player
 zero silences linked speakers only. An individual speaker change does not move

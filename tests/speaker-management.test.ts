@@ -35,6 +35,7 @@ async function fixture(dir?: string) {
     services: async (f) => {
       persistence = createPersistence(f.store);
       outputs = createOutputs({
+        state: f.state,
         persistence: {
           ...persistence,
           adoptOutput: (row) =>
@@ -44,6 +45,7 @@ async function fixture(dir?: string) {
         },
         notify: f.notify,
       });
+      await outputs.ready();
       const saved = await persistence.loadOutputs();
       devices = createAirplayDevices({
         outputs,
@@ -193,6 +195,7 @@ Deno.test('speaker writes enforce login, Origin and core input validity for cook
       );
       assertEquals(row.adopted, true);
       assertEquals(row.selected, false);
+      assertEquals(row.volume, 25);
       assertEquals(row.state.preparation.state, 'failed');
     }
     await error(await t.write('/missing/adopt', 'POST', {}), 404, 'not_found');
@@ -205,6 +208,89 @@ Deno.test('speaker writes enforce login, Origin and core input validity for cook
     assertEquals(t.effects().starts, 0);
   } finally {
     await t.close();
+  }
+});
+
+Deno.test('admin default speaker volume applies to new AirPlay speakers, not saved levels', async () => {
+  const key = 'airplay.defaultSpeakerVolume';
+  const path = '/api/v1/admin/settings';
+  const dir = await Deno.makeTempDir({ prefix: 'speaker-default-volume-' });
+  const patio = {
+    ...receiver,
+    name: '001122334466@Patio._raop._tcp.local',
+    address: '192.0.2.11',
+  };
+  let id: string;
+  try {
+    const t = await fixture(dir);
+    try {
+      t.announce();
+      const [first] = await t.read();
+      id = first.id;
+      assertEquals(first.volume, 25);
+      await t.speaker(await t.write(`/${id}/adopt`, 'POST', {}));
+      t.outputs.update(id, { volume: 0 });
+
+      const { credential } = await t.f.login('bearer');
+      const readSetting = async () => {
+        const response = await t.f.get(`${path}/${key}`, credential);
+        assertEquals(response.status, 200);
+        return await response.json();
+      };
+      const change = (value: number) =>
+        t.f.json(path, 'PATCH', { changes: [{ key, value }] }, credential);
+      assertEquals((await readSetting()).value, 25);
+      const changed = await change(40);
+      assertEquals(changed.status, 200, await changed.text());
+      for (const value of [-1, 101, 25.5]) {
+        const response = await change(value);
+        assertEquals(response.status, 400);
+        const body = await response.json();
+        assertEquals(body.code, 'invalid_value');
+        assertEquals(body.key, key);
+        assertEquals(typeof body.message, 'string');
+      }
+      assertEquals((await readSetting()).value, 40);
+
+      t.announce({ ...receiver, address: '192.0.2.14' });
+      t.announce(patio);
+      const officeAddress = '192.0.2.12';
+      t.announce({
+        ...receiver,
+        address: officeAddress,
+        name: '001122334477@Office._raop._tcp.local',
+        txt: { ...receiver.txt, pw: 'true' },
+      });
+      const rows = await t.read();
+      assertEquals(rows.find((row: { id: string }) => row.id === id).volume, 0);
+      for (const address of [patio.address, officeAddress]) {
+        const row = rows.find((row: { address: string }) =>
+          row.address === address
+        );
+        assertEquals(row.volume, 40);
+      }
+    } finally {
+      await t.close();
+    }
+
+    const next = await fixture(dir);
+    try {
+      const [restored] = await next.read();
+      assertEquals(restored.id, id);
+      assertEquals(restored.volume, 0);
+      const manual = await next.speaker(
+        await next.write('', 'POST', {
+          protocol: 'AirPlay',
+          address: '192.0.2.13',
+        }),
+        201,
+      );
+      assertEquals(manual.volume, 40);
+    } finally {
+      await next.close();
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
   }
 });
 
@@ -402,7 +488,7 @@ Deno.test('manual and mDNS receiver identity reconcile without transferring conf
       assertEquals(rows.length, 2);
       const other = rows.find((r: { id: string }) => r.id !== manualId);
       assertEquals(other.adopted, false);
-      assertEquals(other.volume, 100);
+      assertEquals(other.volume, 25);
       assertEquals(other.selected, false);
       assertEquals(
         rows.find((r: { id: string }) => r.id === manualId).name,
@@ -458,7 +544,7 @@ Deno.test('a previously acquired alias must identify its current receiver before
       201,
     );
     assert(fresh.id !== id);
-    assertEquals(fresh.volume, 100);
+    assertEquals(fresh.volume, 25);
     assertEquals(
       (await t.f.store.speakers.loadAdopted()).find((row) => row.id === id),
       before[0],
@@ -532,7 +618,7 @@ Deno.test('speaker HTTP forget is durable across queued preferences, discovery a
       const row = (await t.read())[0];
       assertEquals(row.adopted, false);
       assertEquals(row.selected, false);
-      assertEquals(row.volume, 100);
+      assertEquals(row.volume, 25);
       assertEquals(row.connectionStrategy, 'melofon');
       t.outputs.update(id, { selected: true, volume: 17 });
       await t.persistence.drain();

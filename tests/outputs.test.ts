@@ -110,7 +110,7 @@ Deno.test('core /_/outputs register/list/delete round-trip', async () => {
   assertEquals(output.name, 'Kitchen ATV');
   assertEquals(output.type, 'AirPlay');
   assertEquals(output.selected, false);
-  assertEquals(output.volume, 100);
+  assertEquals(output.volume, 25);
   assertEquals(output.host, '192.0.2.10');
   // Stable from the host, all digits (the OwnTone wire id regex is /^\d+$/).
   assert(/^\d+$/.test(output.id));
