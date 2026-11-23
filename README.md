@@ -346,7 +346,7 @@ Both accept `startPlaying:true` and optional destination `expectedVersion`.
 Replace starts at the copied spot; add starts the first added entry. Copied
 occurrences have new ids. Empty replace clears/stops; empty add adds nothing.
 Volume, shuffle, crossfade and speaker membership stay with their players. Limit, stale
-version, no-speaker and AirPlay-busy refusals leave both players unchanged.
+version and no-speaker refusals leave both players unchanged.
 An applied command succeeds even if saving fails afterward; the server logs
 the failure and retries the same whole transaction rather than asking the
 client to apply the command again.
