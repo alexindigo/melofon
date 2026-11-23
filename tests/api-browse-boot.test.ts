@@ -3,6 +3,7 @@
 import { assert, assertEquals, assertNotEquals } from '@std/assert';
 import { reservePorts } from './helpers/ports.ts';
 import { tagged } from './helpers/tagged.ts';
+import { createTestHttp } from './helpers/http.ts';
 
 const password = 'browse-boot-password';
 const prefix = '/api/v1';
@@ -89,8 +90,8 @@ async function boot(data: string) {
     assert(status?.success, `main did not shut down cleanly:\n${output}`);
   };
   const origin = `http://melofon.home:${port}`;
-  const request = (path: string, init: RequestInit = {}) =>
-    fetch(`${origin}${path}`, { ...init, signal: AbortSignal.timeout(5000) });
+  const http = createTestHttp(origin);
+  const request = http.request;
   const headers = (credential = '') =>
     new Headers(
       credential.startsWith('melofon_session=')
@@ -99,11 +100,16 @@ async function boot(data: string) {
         ? { Authorization: `Bearer ${credential}` }
         : {},
     );
-  const get = (path: string, credential?: string, etag?: string) => {
+  const get = (
+    path: string,
+    credential?: string,
+    etag?: string,
+    signal?: AbortSignal,
+  ) => {
     const h = headers(credential);
     h.set('Origin', 'http://foreign.example');
     if (etag) h.set('If-None-Match', etag);
-    return request(`${prefix}${path}`, { headers: h });
+    return request(`${prefix}${path}`, { headers: h, signal });
   };
   const json = (
     path: string,
@@ -152,19 +158,12 @@ async function boot(data: string) {
     return body;
   };
   try {
-    await until(async () => {
-      try {
-        const res = await request('/_/health');
-        return (await res.json()).ok === true;
-      } catch {
-        return false;
-      }
-    }, 'cold main never became healthy');
+    await http.ready();
   } catch (error) {
     await stop();
     throw error;
   }
-  return { origin, get, json, login, rest, headers, stop };
+  return { origin, get, json, login, rest, headers, stop, until: http.until };
 }
 
 type Server = Awaited<ReturnType<typeof boot>>;
@@ -288,8 +287,13 @@ async function scan(server: Server, admin: string) {
   );
   assertEquals(res.status, 202, await res.clone().text());
   await res.json();
-  await until(async () => {
-    const status = await server.get('/admin/scans/current', admin);
+  await server.until(async (signal) => {
+    const status = await server.get(
+      '/admin/scans/current',
+      admin,
+      undefined,
+      signal,
+    );
     assertEquals(status.status, 200);
     return !(await status.json()).scan.scanning;
   }, 'HTTP-requested scan did not finish');

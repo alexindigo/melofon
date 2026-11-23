@@ -23,6 +23,7 @@ import { createServerStatus } from '../../src/server-status.ts';
 import { loadConfig } from '../../src/config.ts';
 import type { ScanService } from '../../src/scan.ts';
 import { reservePorts } from './ports.ts';
+import { createTestHttp } from './http.ts';
 
 export async function apiFixture(
   options: {
@@ -196,6 +197,14 @@ export async function apiFixture(
       shutdown = () => server.shutdown();
     }
     const origin = `${options.tls ? 'https' : 'http'}://melofon.home:${port}`;
+    const http = createTestHttp(origin, { client });
+    try {
+      await http.ready();
+    } catch (error) {
+      await shutdown();
+      client?.close();
+      throw error;
+    }
     const request = async (
       path: string,
       init: RequestInit = {},
@@ -203,15 +212,13 @@ export async function apiFixture(
     ) => {
       const headers = new Headers(init.headers);
       // Test callers explicitly control Origin, including absence.
-      const response = await fetch(
+      const response = await http.request(
         `${
           loopback ? origin.replace('melofon.home', '127.0.0.1') : origin
         }${path}`,
         {
           ...init,
           headers,
-          signal: AbortSignal.timeout(5000),
-          ...(client ? { client } : {}),
         },
       );
       for (const [name] of response.headers) {
