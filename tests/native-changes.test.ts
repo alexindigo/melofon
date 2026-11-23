@@ -24,3 +24,11 @@ Deno.test('native gate: git reports only another path → skip native tests', ()
 Deno.test('native gate: git fails → run native tests', () => {
   assertEquals(nativeChanged({ ok: false, stdout: '' }), true);
 });
+
+Deno.test('native gate: prepared runner requires native tests even in a clean checkout', () => {
+  assertEquals(nativeChanged({ ok: true, stdout: '' }, true), true);
+  assertEquals(
+    nativeChanged({ ok: true, stdout: ' M src/player.ts\n' }, true),
+    true,
+  );
+});

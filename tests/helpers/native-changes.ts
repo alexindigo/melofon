@@ -1,8 +1,10 @@
-// Native-test gate: run the helper/raop tests when git shows any change under
-// helper/raop/, or when git can't answer (spawn error, nonzero exit, no repo).
-// Skip them only when git answers and shows nothing changed there.
-export function nativeChanged(r: { ok: boolean; stdout: string }): boolean {
-  if (!r.ok) return true;
+// Prepared shards require native coverage regardless of checkout state. Ad-hoc
+// runs retain the dirty-native gate, including its fail-open git-error behavior.
+export function nativeChanged(
+  r: { ok: boolean; stdout: string },
+  required = false,
+): boolean {
+  if (required || !r.ok) return true;
   return r.stdout.split('\n').some((line) =>
     line.slice(3).startsWith('helper/raop/')
   );
@@ -26,4 +28,7 @@ async function gitStatus(): Promise<{ ok: boolean; stdout: string }> {
     return { ok: false, stdout: '' };
   }
 }
-export const NATIVE_CHANGED = nativeChanged(await gitStatus());
+export const NATIVE_CHANGED = nativeChanged(
+  await gitStatus(),
+  Deno.env.get('MELOFON_NATIVE_TESTS') === '1',
+);

@@ -243,7 +243,9 @@ async function runShard(directory: string, plan: Plan, index: number) {
         '--node-modules-dir=auto',
         ...files,
       ],
-      env: { TMPDIR: tmp, NO_COLOR: '1' },
+      // Preparation builds the native graph. Never let clean-checkout or
+      // inaccessible-worktree git metadata decide coverage in a prepared shard.
+      env: { TMPDIR: tmp, NO_COLOR: '1', MELOFON_NATIVE_TESTS: '1' },
       stdout: 'piped',
       stderr: 'piped',
     }).output();

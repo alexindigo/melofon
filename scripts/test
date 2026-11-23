@@ -70,9 +70,16 @@ prefix="melofon-test-$$-$(basename "$run_dir" | tr '[:upper:]' '[:lower:]')"
 container() {
   local name=$1 network=$2
   shift 2
-  local offline=()
+  local offline=() security=()
   if [[ "$1" != prepare ]]; then offline=(--cached-only); fi
+  # Docker's default seccomp blocks the rootless user+network namespace used
+  # by the native source probe. Podman's default already permits it. Keep the
+  # non-root UID, private network and resource limits; never use --privileged.
+  if [[ "$CONTAINER_ENGINE" == docker && "$1" == run-shard ]]; then
+    security=(--security-opt=seccomp=unconfined)
+  fi
   "$engine" run --rm --init --name="$name" --memory=2g --memory-swap=2g --pids-limit=512 --cpus=1 \
+    "${security[@]}" \
     --user="$(id -u):$(id -g)" --network="$network" --network-alias=melofon.home \
     -v "$PWD:/app" -w /app -e "TMPDIR=/app/$run_dir" \
     -e "MELOFON_BROWSER_TESTS=${MELOFON_BROWSER_TESTS:-}" \
