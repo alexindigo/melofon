@@ -143,6 +143,47 @@ Deno.test('test runner: only the final summary counts, crashes lack a summary', 
   assertEquals(parseSummary('error: process crashed'), undefined);
 });
 
+Deno.test('test runner: prepared shards require native tests without ambient opt-in', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'native-runner-' });
+  try {
+    const fixture = `${dir}/native.test.ts`;
+    await Deno.writeTextFile(
+      fixture,
+      `Deno.test('native suite enabled', () => {
+  if (Deno.env.get('MELOFON_NATIVE_TESTS') !== '1') throw new Error('native suite not required');
+});\n`,
+    );
+    await Deno.writeTextFile(
+      `${dir}/plan.json`,
+      JSON.stringify({ shards: [[fixture]], started: Date.now() }),
+    );
+    const output = await new Deno.Command(Deno.execPath(), {
+      args: [
+        'run',
+        '--frozen',
+        '--cached-only',
+        '--allow-all',
+        'scripts/test-runner.ts',
+        'run-shard',
+        dir,
+        '1',
+        '1',
+      ],
+      env: { MELOFON_NATIVE_TESTS: '' },
+    }).output();
+    const decoder = new TextDecoder();
+    assertEquals(
+      output.code,
+      0,
+      decoder.decode(output.stdout) + decoder.decode(output.stderr),
+    );
+    const result = JSON.parse(await Deno.readTextFile(`${dir}/shard-1.json`));
+    assertEquals(result.summary, { passed: 1, failed: 0, ignored: 0 });
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('test runner: native reuse requires the same image and unchanged outputs', async () => {
   const dir = await Deno.makeTempDir();
   try {
@@ -267,6 +308,22 @@ printf '\\n' >> "$CALL_LOG"
           [engine || 'docker', 'network', 'create', 'melofon-test'],
         ],
       );
+    }
+    for (const engine of ['docker', 'podman']) {
+      const runs = (await invoke('scripts/test', ['--shards', '1'], engine))
+        .filter((call) => call[1] === 'run');
+      assertEquals(runs.length, 3);
+      for (const run of runs) {
+        assertEquals(
+          run.includes('--security-opt=seccomp=unconfined'),
+          engine === 'docker' && run.includes('run-shard'),
+        );
+        assertEquals(run.includes('--privileged'), false);
+        assertEquals(
+          run.includes(`--user=${Deno.uid()}:${Deno.gid()}`),
+          true,
+        );
+      }
     }
   } finally {
     await Deno.remove(dir, { recursive: true });
