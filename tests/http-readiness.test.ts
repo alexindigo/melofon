@@ -15,27 +15,31 @@ function serve(handler: (request: Request) => Response | Promise<Response>) {
 
 Deno.test('HTTP readiness: wait for health and a slow response without replaying a mutation', async () => {
   const gate = Promise.withResolvers<void>();
+  const firstHealth = Promise.withResolvers<void>();
   let healthy = false;
   let mutations = 0;
   let healthChecks = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const { server, origin } = serve(async (request) => {
     if (new URL(request.url).pathname === '/_/health') {
       healthChecks++;
+      // The mutation cannot publish healthy until this response is built.
+      firstHealth.resolve();
       return Response.json({ ok: healthy }, { status: healthy ? 200 : 503 });
     }
     mutations++;
-    await gate.promise;
+    timer = setTimeout(() => gate.resolve(), 5500);
+    await Promise.all([gate.promise, firstHealth.promise]);
+    healthy = true;
     return Response.json({ committed: true }, { status: 201 });
   });
   const http = createTestHttp(origin);
-  const timer = setTimeout(() => {
-    healthy = true;
-    gate.resolve();
-  }, 5500);
   try {
     const [response] = await Promise.all([
       http.request('/mutation', { method: 'POST' }),
-      http.ready(),
+      // Deliberately deliver the first probe after the mutation's delay. It
+      // must still observe not-ready before the mutation publishes healthy.
+      gate.promise.then(() => http.ready()),
     ]);
     assertEquals(response.status, 201);
     assertEquals(await response.json(), { committed: true });
@@ -44,6 +48,7 @@ Deno.test('HTTP readiness: wait for health and a slow response without replaying
   } finally {
     clearTimeout(timer);
     gate.resolve();
+    firstHealth.resolve();
     await server.shutdown();
   }
 });
