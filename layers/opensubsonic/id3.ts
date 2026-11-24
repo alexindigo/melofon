@@ -259,13 +259,16 @@ function byLatestLike<T extends { id: string }>(
 // The current user's favourites (getStarred / getStarred2), honouring
 // musicFolderId: rows that no longer resolve are skipped, each list is
 // newest-like first, and the facts are loaded once for all of them.
-export async function starredLists(context: HatContext): Promise<{
-  artists: ArtistRow[];
-  albums: AlbumRow[];
-  songs: SongRow[];
-  personal: Personal;
-}> {
+export async function starredLists(context: HatContext): Promise<
+  {
+    artists: ArtistRow[];
+    albums: AlbumRow[];
+    songs: SongRow[];
+    personal: Personal;
+  } | Response
+> {
   const folderId = await folderIdParam(context);
+  if (folderId instanceof Response) return folderId;
   const items = await context.app.annotation.starred(
     context.state.user!.username,
     { folderId },
@@ -361,8 +364,8 @@ export async function artistIndex(
   context: HatContext,
   build: typeof artistOf,
   ignoredArticles: string[],
+  folderId: string | undefined,
 ): Promise<Record<string, unknown>[]> {
-  const folderId = await folderIdParam(context);
   const artists = await context.app.library.listArtists(
     folderId,
     { ignoredArticles },
@@ -456,7 +459,6 @@ export async function albumListAlbums(
     sort,
     size: boundedCountParam(params, 'size'),
     offset: safeIntParam(params, 'offset', 0),
-    folderId: await folderIdParam(context),
     username: context.state.user!.username,
     ignoredArticles: (await context.app.library.order()).ignoredArticles,
   };
@@ -479,5 +481,7 @@ export async function albumListAlbums(
     opts.fromYear = from;
     opts.toYear = to;
   }
-  return await context.app.library.listAlbums(opts);
+  const folderId = await folderIdParam(context);
+  if (folderId instanceof Response) return folderId;
+  return await context.app.library.listAlbums({ ...opts, folderId });
 }

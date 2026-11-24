@@ -236,11 +236,11 @@ Deno.test('video facts and captions survive scan, upgrade and HTTP JSON/XML cons
             .video.length,
           2,
         );
-        assertEquals(
-          (await json('getVideos', { musicFolderId: '2147483647' })).videos
-            .video,
-          [],
-        );
+        const unknown = await json('getVideos', {
+          musicFolderId: '2147483648',
+        });
+        assertEquals(unknown.status, 'failed');
+        assertEquals(unknown.error.code, 70);
         info = (await json('getVideoInfo', { id })).videoInfo;
         assertEquals(info.id, id);
         assertEquals(info.audioTrack.map((a) => a.languageCode), [

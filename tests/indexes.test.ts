@@ -99,8 +99,15 @@ Deno.test('getIndexes buckets album artists; musicFolderId filters', async () =>
       (inFolder.indexes as { index: unknown[] }).index.length,
       2,
     );
-    const empty = await get(app, 'getIndexes', '&musicFolderId=bogus');
-    assertEquals((empty.indexes as { index: unknown[] }).index.length, 0);
+    for (const since of ['', `&ifModifiedSince=${indexes.lastModified}`]) {
+      const unknown = await get(
+        app,
+        'getIndexes',
+        `&musicFolderId=bogus${since}`,
+      );
+      assertEquals(unknown.status, 'failed');
+      assertEquals((unknown.error as { code: number }).code, 70);
+    }
   } finally {
     await close();
   }

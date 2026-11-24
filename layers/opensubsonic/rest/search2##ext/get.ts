@@ -14,6 +14,8 @@ export default async (_request: HatRequest, context: HatContext) => {
   const params = context.state.params!;
   const query = requiredParam(context, 'query');
   if (query instanceof Response) return query;
+  const folderId = await folderIdParam(context);
+  if (folderId instanceof Response) return folderId;
   const result = await context.app.library.search3(query, {
     artistCount: intParam(params, 'artistCount', 20),
     artistOffset: intParam(params, 'artistOffset', 0),
@@ -21,7 +23,7 @@ export default async (_request: HatRequest, context: HatContext) => {
     albumOffset: intParam(params, 'albumOffset', 0),
     songCount: intParam(params, 'songCount', 20),
     songOffset: intParam(params, 'songOffset', 0),
-    folderId: await folderIdParam(context),
+    folderId,
   });
   const p = await loadPersonal(context, {
     artists: result.artists.map((artist) => artist.id),

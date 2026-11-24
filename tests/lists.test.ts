@@ -212,10 +212,8 @@ Deno.test('getSongsByGenre filters by genre and musicFolderId', async () => {
       'getSongsByGenre',
       '&genre=Fixture%20Rock&musicFolderId=no-such-folder',
     );
-    assertEquals(
-      (otherFolder.songsByGenre as { song: unknown[] }).song.length,
-      0,
-    );
+    assertEquals(otherFolder.status, 'failed');
+    assertEquals((otherFolder.error as { code: number }).code, 70);
   } finally {
     await close();
   }
