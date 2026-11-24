@@ -95,7 +95,7 @@ Deno.test('actual pipe consumers see correct streams, one-line records and redac
 });
 Deno.test({
   name:
-    'ordinary native diagnostic queue reaches final consumer with before-handle, bounded overflow and truncation facts',
+    'ordinary native diagnostic queue reaches final consumer: before-handle, overflow, truncation and concurrent publication',
   ignore: !NATIVE_CHANGED,
   fn: async () => {
     const result = await child('queue').output();

@@ -336,8 +336,9 @@ The Deno adapter owns a single library-wide drain, through last-handle release,
 and performs final owned-shutdown draining. Failed free retains native ownership.
 
 Diagnostics capture realtime milliseconds/sequence into a dedicated 256-record
-queue with 2048-byte opaque-message bounds. Producers use a try-lock and never
-wait on the JS consumer or allocate diagnostic JSON on the pacing thread.
+queue with 2048-byte opaque-message bounds. Producers reserve slots atomically
+and publish after copying; only a full queue counts as loss. Producers never
+take the poller's lock or allocate diagnostic JSON on the pacing thread.
 Polling copies records into caller-owned buffers; JSON here is ingress transport,
 not the application's final log format. Overflow/truncation counts remain visible,
 including overflow with no later producer record. No foreign-thread JS callback
@@ -355,7 +356,8 @@ assertion/loader/allocator and unsupported library failures are not suppressed.
 `DEBUG_PAIR` key-dump paths remain disabled. The compiled object inventory rejects
 enabled raw writers/key-dump symbols outside the logger transport; its negative
 fixture proves a raw writer is detected. `test/probe_logging.c` verifies bounded
-queue/copy/consumer ownership without touching control or pacing structures.
+queue/copy/consumer ownership and publication during encoding without touching
+control or pacing structures.
 
 ## Ordered timeline ingress
 

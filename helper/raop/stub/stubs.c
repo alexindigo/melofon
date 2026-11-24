@@ -43,9 +43,15 @@ struct diagnostic {
   int64_t time_ms, value, value2;
   char event[48], message[LOG_MESSAGE], name[256], host[256];
 };
-static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct diagnostic diagnostics[LOG_CAPACITY];
-static size_t log_head, log_count;
+struct diagnostic_slot {
+  struct diagnostic record;
+  _Atomic bool ready;
+};
+static struct diagnostic_slot diagnostics[LOG_CAPACITY];
+/* Monotonic ring tickets: producers reserve at tail and publish per slot;
+ * only the poller advances head after successfully encoding the record. */
+static _Atomic uint64_t log_head, log_tail;
+static pthread_mutex_t log_poll_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t log_dropped, log_sequence;
 static _Atomic int log_consumer;
 
@@ -55,16 +61,25 @@ static void capture(struct diagnostic *record)
   clock_gettime(CLOCK_REALTIME, &now);
   record->time_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
   record->sequence = atomic_fetch_add(&log_sequence, 1) + 1;
-  /* A pacing/foreign producer never waits for JS (or for polling's lock). */
-  if (pthread_mutex_trylock(&log_lock) != 0) {
-    atomic_fetch_add(&log_dropped, 1); return;
+  for (;;) {
+    uint64_t tail = atomic_load(&log_tail);
+    uint64_t depth = tail - atomic_load(&log_head);
+    /* Head may have passed the sampled tail while this producer was paused. */
+    if (depth > LOG_CAPACITY) continue;
+    if (depth == LOG_CAPACITY) {
+      atomic_fetch_add(&log_dropped, 1);
+      return;
+    }
+    if (!atomic_compare_exchange_strong(&log_tail, &tail, tail + 1)) continue;
+
+    /* The head load observes the poller's release of any previous occupant.
+     * Publish only after copying; neither another producer nor a slow JSON
+     * consumer can turn contention for an available slot into a drop. */
+    struct diagnostic_slot *slot = &diagnostics[tail % LOG_CAPACITY];
+    slot->record = *record;
+    atomic_store_explicit(&slot->ready, true, memory_order_release);
+    return;
   }
-  if (log_count == LOG_CAPACITY) atomic_fetch_add(&log_dropped, 1);
-  else {
-    diagnostics[(log_head + log_count) % LOG_CAPACITY] = *record;
-    log_count++;
-  }
-  pthread_mutex_unlock(&log_lock);
 }
 
 int raop_log_consumer(int enable)
@@ -91,11 +106,20 @@ int raop_log_poll(char *buf, size_t cap)
   size_t length;
   uint64_t lost;
   if (!buf || !cap || !atomic_load(&log_consumer)) return -1;
-  pthread_mutex_lock(&log_lock);
+  /* Serialize pollers so failed encodes can leave the head record in place.
+   * Producers never take this lock or wait for JSON serialization. */
+  pthread_mutex_lock(&log_poll_lock);
+  uint64_t head = atomic_load(&log_head);
+  struct diagnostic_slot *slot = &diagnostics[head % LOG_CAPACITY];
+  bool ready = atomic_load_explicit(&slot->ready, memory_order_acquire);
   lost = atomic_load(&log_dropped);
-  if (!log_count && !lost) { pthread_mutex_unlock(&log_lock); return 0; }
-  if (log_count) r = &diagnostics[log_head];
+  if (ready) r = &slot->record;
   else {
+    /* Do not block on or skip a producer that has reserved the head slot. */
+    if (!lost || head != atomic_load(&log_tail)) {
+      pthread_mutex_unlock(&log_poll_lock);
+      return 0;
+    }
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     overflow.time_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
@@ -104,7 +128,7 @@ int raop_log_poll(char *buf, size_t cap)
     r = &overflow;
   }
   json = json_object_new_object();
-  if (!json) { pthread_mutex_unlock(&log_lock); return -1; }
+  if (!json) { pthread_mutex_unlock(&log_poll_lock); return -1; }
   json_object_object_add(json, "severity", json_object_new_int(r->severity));
   json_object_object_add(json, "domain", json_object_new_int(r->domain));
   json_object_object_add(json, "timeMs", json_object_new_int64(r->time_ms));
@@ -124,13 +148,16 @@ int raop_log_poll(char *buf, size_t cap)
   } else json_object_object_add(json, "payload", json_object_new_string(r->message));
   encoded = json_object_to_json_string_ext(json, JSON_C_TO_STRING_PLAIN);
   length = strlen(encoded);
-  if (length >= cap) { json_object_put(json); pthread_mutex_unlock(&log_lock); return -1; }
+  if (length >= cap) { json_object_put(json); pthread_mutex_unlock(&log_poll_lock); return -1; }
   memcpy(buf, encoded, length);
   buf[length] = 0;
-  if (log_count) { log_head = (log_head + 1) % LOG_CAPACITY; log_count--; }
   atomic_fetch_sub(&log_dropped, lost);
   json_object_put(json);
-  pthread_mutex_unlock(&log_lock);
+  if (ready) {
+    atomic_store_explicit(&slot->ready, false, memory_order_relaxed);
+    atomic_store(&log_head, head + 1);
+  }
+  pthread_mutex_unlock(&log_poll_lock);
   return (int)length;
 }
 
