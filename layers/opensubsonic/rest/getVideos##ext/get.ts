@@ -9,7 +9,6 @@ import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
   const folder = await folderIdParam(context);
-  if (folder instanceof Response) return folder;
   const videos = await context.app.library.videos(folder);
   const p = await loadPersonal(context, {
     songs: videos.map((song) => song.id),

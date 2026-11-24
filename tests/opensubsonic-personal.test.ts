@@ -631,9 +631,10 @@ Deno.test('H3 musicFolderId filters both favourites lists and type=starred', asy
       assertEquals(idsOf(listOf(scoped, 'song')), [ids.first], op);
       assertEquals(idsOf(listOf(scoped, 'album')), [ids.album], op);
       assertEquals(idsOf(listOf(scoped, 'artist')), [ids.artist], op);
-      const none = await s.get(op, { musicFolderId: unmatched });
-      assertEquals(none.status, 'failed', op);
-      assertEquals((none.error as { code: number }).code, 70, op);
+      const none = (await s.okGet(op, { musicFolderId: unmatched }))[key];
+      for (const kind of ['artist', 'album', 'song']) {
+        assertEquals(listOf(none, kind), [], `${op} unmatched ${kind}`);
+      }
     }
     const list = (await s.okGet('getAlbumList2', {
       type: 'starred',

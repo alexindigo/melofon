@@ -8,12 +8,10 @@
 // every song is in the tree. No shortcuts, no top-level child elements.
 import { ok } from '#opensubsonic/envelope.ts';
 import { artistIndex, artistOf } from '#opensubsonic/id3.ts';
-import { folderIdParam, safeIntParam } from '#opensubsonic/params.ts';
+import { safeIntParam } from '#opensubsonic/params.ts';
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
-  const folderId = await folderIdParam(context);
-  if (folderId instanceof Response) return folderId;
   const scan = await context.app.scan.status();
   const lastModified = scan.lastScanStartedMs ?? 0;
   const since = safeIntParam(context.state.params!, 'ifModifiedSince', 0);
@@ -25,7 +23,7 @@ export default async (_request: HatRequest, context: HatContext) => {
       lastModified,
       index: since >= lastModified
         ? undefined
-        : await artistIndex(context, artistOf, ignoredArticles, folderId),
+        : await artistIndex(context, artistOf, ignoredArticles),
     },
   });
 };

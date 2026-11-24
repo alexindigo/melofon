@@ -15,12 +15,10 @@ export default async (_request: HatRequest, context: HatContext) => {
   const params = context.state.params!;
   const genre = requiredParam(context, 'genre');
   if (genre instanceof Response) return genre;
-  const folderId = await folderIdParam(context);
-  if (folderId instanceof Response) return folderId;
   const songs = await context.app.library.songsByGenre(genre, {
     size: boundedCountParam(params, 'count'),
     offset: safeIntParam(params, 'offset', 0),
-    folderId,
+    folderId: await folderIdParam(context),
   });
   const p = await loadPersonal(context, {
     songs: songs.map((song) => song.id),

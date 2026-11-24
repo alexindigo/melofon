@@ -431,7 +431,7 @@ Deno.test('Personal starred albums: sequence membership, millisecond/date ties, 
         assertEquals(ids(await rest('&offset=1&size=1')), [ordered[1].id]);
         assertEquals(await rest('&offset=9'), []);
         assertEquals(await rest('&size=0'), []);
-        assertEquals(await rest(`&musicFolderId=${f.empty}`), []);
+        assertEquals(await rest('&musicFolderId=missing'), []);
         const alpha = rows.find((row) => row.id === f.a.id)!;
         assertEquals(alpha.starred, new Date(9000).toISOString());
         assertEquals(alpha.userRating, 5);

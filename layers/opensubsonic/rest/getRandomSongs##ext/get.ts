@@ -16,11 +16,9 @@ export default async (_request: HatRequest, context: HatContext) => {
   if (fromYear instanceof Response) return fromYear;
   const toYear = yearParam(context, 'toYear');
   if (toYear instanceof Response) return toYear;
-  const folderId = await folderIdParam(context);
-  if (folderId instanceof Response) return folderId;
   const songs = await context.app.library.randomSongs({
     size: boundedCountParam(params, 'size'),
-    folderId,
+    folderId: await folderIdParam(context),
     genre: params.get('genre') ?? undefined,
     fromYear,
     toYear,

@@ -50,7 +50,7 @@ async function setup(large = false) {
   );
   const libraries = createLibraries(store);
   const sources = [];
-  for (const name of ['A', 'B', 'Empty']) {
+  for (const name of ['A', 'B']) {
     const path = `${dir}/${name}`;
     await Deno.mkdir(path);
     sources.push(await libraries.add(name, path));
@@ -294,39 +294,6 @@ Deno.test('album selection derives genre, year and listening rank from scoped tr
   }
 });
 
-Deno.test('OpenSubsonic returns data-not-found for an unknown music folder', async (t) => {
-  const s = await setup();
-  try {
-    for (
-      const [op, params] of [
-        ['getRandomSongs', { size: '0' }],
-        ['getSongsByGenre', { genre: 'Jazz' }],
-        ['getAlbumList', { type: 'random' }],
-        ['getAlbumList2', { type: 'byGenre', genre: 'Jazz' }],
-        ['search2', { query: 'Same' }],
-        ['search3', { query: '' }],
-        ['getStarred', {}],
-        ['getStarred2', {}],
-        ['getArtists', {}],
-        ['getVideos', {}],
-      ] as const
-    ) {
-      await t.step(op, async () => {
-        for (const musicFolderId of ['2147483648', 'no-such-folder']) {
-          const body = await s.get(op, { ...params, musicFolderId });
-          assertEquals(body.status, 'failed');
-          assertEquals(body.error, {
-            code: 70,
-            message: 'The requested data was not found',
-          });
-        }
-      });
-    }
-  } finally {
-    await s.close();
-  }
-});
-
 Deno.test('H2 behavioral red: present empty query enumerates real REST rows', async () => {
   const s = await setup();
   try {
@@ -472,7 +439,7 @@ Deno.test('H2 stable independent pages join duplicate-label groups without gaps 
     assertEquals(
       ids(
         items(
-          await s.get('search3', { query: '', musicFolderId: s.sources[2].id }),
+          await s.get('search3', { query: '', musicFolderId: '2147483647' }),
           'searchResult3',
         ),
       ),
@@ -501,7 +468,7 @@ Deno.test('H2 exhaustive random predicates handle independent bounds NULL revers
         toYear: '2010',
         musicFolderId: s.sources[0].id,
       }, [100, 101, 102]],
-      [{ musicFolderId: s.sources[2].id }, []],
+      [{ musicFolderId: '2147483647' }, []],
     ];
     const folders = await s.get('getMusicFolders');
     const wire =

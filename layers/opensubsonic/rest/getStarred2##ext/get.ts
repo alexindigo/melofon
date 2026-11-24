@@ -10,9 +10,7 @@ import {
 import type { HatContext, HatRequest } from '#opensubsonic/types.ts';
 
 export default async (_request: HatRequest, context: HatContext) => {
-  const lists = await starredLists(context);
-  if (lists instanceof Response) return lists;
-  const { artists, albums, songs, personal: p } = lists;
+  const { artists, albums, songs, personal: p } = await starredLists(context);
   return ok(context, {
     starred2: {
       artist: artists.map((artist) => artistId3Of(artist, p)),

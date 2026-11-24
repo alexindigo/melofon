@@ -1,7 +1,7 @@
 // layers/opensubsonic/params.ts — request params: merged query+form, typed
 // getters, the required-param failure, and the musicFolderId wire-int
 // mapping. Shared module at the layer root, outside the walked mount tree.
-import { fail, notFound } from '#opensubsonic/envelope.ts';
+import { fail } from '#opensubsonic/envelope.ts';
 import {
   decimalNumber,
   jsonInteger,
@@ -136,15 +136,16 @@ export function folderWireId(id: string): number {
   return Number(BigInt(`0x${id.slice(0, 8)}`) & 0x7fffffffn);
 }
 
-// Resolve the wire int or a legacy storage hash. Only an omitted/empty
-// parameter is unscoped; a supplied unknown folder is a protocol error.
+// musicFolderId arrives as the wire int; resolve to the storage hash. A
+// non-integer value passes through unchanged (a stale client holding a hash);
+// an unmatched int stays unmatched (empty results, Navidrome-like).
 export async function folderIdParam(
   context: HatContext,
-): Promise<string | undefined | Response> {
+): Promise<string | undefined> {
   const raw = context.state.params!.get('musicFolderId');
   if (raw === null || raw === '') return undefined;
+  if (!/^\d+$/.test(raw)) return raw;
+  const n = Number(raw);
   const folders = await context.app.libraries.list();
-  const n = /^\d+$/.test(raw) ? Number(raw) : undefined;
-  return folders.find((f) => f.id === raw)?.id ??
-    folders.find((f) => folderWireId(f.id) === n)?.id ?? notFound(context);
+  return (folders.find((f) => folderWireId(f.id) === n) ?? { id: raw }).id;
 }
