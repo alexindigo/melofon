@@ -184,7 +184,11 @@ async function prepare(directory: string, count: number, changesFile?: string) {
   await buildNative();
   const files: string[] = [];
   for await (const entry of Deno.readDir('tests')) {
-    if (entry.isFile && entry.name.endsWith('.ts')) {
+    // The browser job runs this file separately; still check and cache it.
+    if (
+      entry.isFile && entry.name.endsWith('.ts') &&
+      entry.name !== 'api-browser-media.test.ts'
+    ) {
       files.push(`tests/${entry.name}`);
     }
   }

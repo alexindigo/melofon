@@ -64,18 +64,28 @@ scripts/test --select origin/master
 
 ### CI and browser coverage
 
-Pull requests run the same image, checks, native build and probes. CI prepares
-dependencies once, verifies they resolve offline, then restores the helper and
-Deno/npm caches into eight separate shard jobs. Shards use `--cached-only`;
-the combined summary fails if any shard fails or has no result. Use
-`scripts/test --shards 8` locally to match the grouping and resource limits.
+Pull requests and pushes to `master` run the same checks, native build and
+probes. CI prepares dependencies once, verifies they resolve offline, then
+restores the helper and Deno/npm caches into eight separate shard jobs. Shards
+use `--cached-only`; the combined summary fails if any shard or the browser job
+fails or has no result. Use `scripts/test --shards 8` locally to match the
+grouping and resource limits.
 
-The shared image does not include Chromium, so normal local and current CI runs
-skip the two browser media cases. To require browser coverage, set
-`MELOFON_BROWSER_TESTS=1` in a test environment with Chromium and the tests'
-Nginx HTTP ingress setup. Chromium must be available inside that environment,
-not just on the host; the flag makes an absent browser fail instead of skip.
-A separate browser CI job is planned, not enabled yet.
+After all eight shards pass, CI extends their prepared `dev` image with a pinned
+Chromium version and Nginx, restores the same offline dependencies, and runs only
+`tests/api-browser-media.test.ts`. Both `/` and `/music` must pass in real Chromium;
+the normal `scripts/test` shards do not run these cases.
+
+To opt in locally with rootless Podman, from the checkout root:
+
+```bash
+scripts/test --prepare-only .test-tmp/browser-prep
+podman build --target browser --build-arg BROWSER_BASE=localhost/melofon-dev:local \
+  --build-arg "BROWSER_UID=$(id -u)" --build-arg "BROWSER_GID=$(id -g)" \
+  --memory=2g --memory-swap=2g --cpu-period=100000 --cpu-quota=100000 \
+  -t localhost/melofon-browser:local .
+scripts/test-browser localhost/melofon-browser:local
+```
 
 ### Real AirPlay qualification (opt-in, VM only)
 

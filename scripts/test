@@ -82,7 +82,6 @@ container() {
     "${security[@]}" \
     --user="$(id -u):$(id -g)" --network="$network" --network-alias=melofon.home \
     -v "$PWD:/app" -w /app -e "TMPDIR=/app/$run_dir" \
-    -e "MELOFON_BROWSER_TESTS=${MELOFON_BROWSER_TESTS:-}" \
     --entrypoint deno "$image" run --frozen "${offline[@]}" --allow-all scripts/test-runner.ts "$@"
 }
 new_network() {
