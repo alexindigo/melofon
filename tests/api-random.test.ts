@@ -35,7 +35,7 @@ async function randomFixture() {
               TALB: `Album ${album}`,
               TPE1: 'Shared Artist',
               TPE2: 'Shared Artist',
-              TCON: album === 2 ? 'Rock' : 'Jazz',
+              TCON: album === 2 ? 'Rock; Indie' : 'Jazz',
               TDRC: String(2000 + album * 5 + track),
             });
           }
@@ -189,6 +189,30 @@ for (const collection of ['albums', 'songs'] as const) {
     }
   });
 }
+
+Deno.test('API random: songs and albums can be filtered by a secondary genre', async (t) => {
+  const f = await randomFixture();
+  try {
+    const { credential } = await f.login('bearer');
+    for (const collection of ['albums', 'songs'] as const) {
+      await t.step(collection, async () => {
+        const result = await read(
+          f,
+          collection,
+          credential,
+          `${randomQuery()}&genre=Indie`,
+        );
+        const expected = collection === 'albums'
+          ? f.albums.filter((a) => a.name === 'Album 2')
+          : f.songs.filter((s) => s.albumName === 'Album 2');
+        assertEquals(result.total, collection === 'albums' ? 1 : 2);
+        assertEquals(ids(result[collection]).sort(), ids(expected).sort());
+      });
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('API random: library, genre and inclusive year eligibility precede rank and pagination', async () => {
   const f = await randomFixture();

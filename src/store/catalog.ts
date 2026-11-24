@@ -521,18 +521,32 @@ function albumOf(row: AlbumSqlRow): AlbumRow {
   };
 }
 
-// Album query builder. folderId restricts to albums having at least one file
-// in that source (musicFolderId); genre restricts to albums with a file of
-// that genre; ratedBy inner-joins the user's ratings; listenAgg inner-joins
-// per-album play aggregates for frequent / recent. The WHERE goes before the
-// GROUP BY, so it composes with callers' HAVING / ORDER BY / LIMIT. Ratings
-// join at most one row per album (their PK), and the listen aggregate is one
-// row per album, so song_count and duration stay exact.
-interface AlbumQuery {
-  folderId?: string;
-  genre?: string;
-  yearFrom?: number;
-  yearTo?: number;
+// File eligibility has one owner for sync, browse pages and random sampling.
+// Optional bounds are inclusive; SQL NULL comparisons do not invent a year.
+type SongFilter = Omit<RandomSongOptions, 'size'>;
+
+function songPredicates(opts: SongFilter): string[] {
+  const predicates: string[] = [];
+  if (opts.folderId !== undefined) {
+    predicates.push(`f.library_id = ${esc(opts.folderId)}`);
+  }
+  if (opts.genre !== undefined) {
+    const genre = esc(opts.genre);
+    // Keep matching the primary tag, including legacy rows without a list.
+    predicates.push(
+      `(f.genre = ${genre} OR list_contains(f.genres, ${genre}))`,
+    );
+  }
+  if (opts.fromYear !== undefined) {
+    predicates.push(`f.year >= ${opts.fromYear}`);
+  }
+  if (opts.toYear !== undefined) {
+    predicates.push(`f.year <= ${opts.toYear}`);
+  }
+  return predicates;
+}
+
+interface AlbumQuery extends SongFilter {
   ratedBy?: string; // users.id
   listenAgg?: string; // users.id
   starredBy?: string; // users.id
@@ -573,6 +587,13 @@ async function personalAlbums(
 }
 
 function albumSelect(q: AlbumQuery = {}, extra = ''): string {
+  // Every track-derived fact (including eligibility and listen rank) reads
+  // the same population. The unscoped view still includes trackless albums.
+  const scope = songPredicates({ folderId: q.folderId });
+  const files = scope.length ? 'scoped_files' : 'files';
+  const withScope = scope.length
+    ? `WITH ${files} AS (SELECT * FROM files f WHERE ${scope.join(' AND ')})`
+    : '';
   const joins: string[] = [];
   if (q.starredBy !== undefined) {
     // Membership follows sequence, but legacy starred dates/order use the
@@ -597,62 +618,35 @@ function albumSelect(q: AlbumQuery = {}, extra = ''): string {
       `JOIN (
          SELECT f2.album_id AS album_id, COUNT(li.track_id) AS play_count,
                 MAX(li.played_at) AS last_played
-         FROM files f2
+         FROM ${files} f2
          JOIN listens li ON li.track_id = f2.id
            AND li.user_id = ${esc(q.listenAgg)}
          GROUP BY f2.album_id
        ) agg ON agg.album_id = al.id`,
     );
   }
-  const wheres: string[] = [];
-  if (q.folderId !== undefined) {
-    wheres.push(`f.library_id = ${esc(q.folderId)}`);
-  }
-  if (q.genre !== undefined) {
-    wheres.push(
-      `EXISTS (SELECT 1 FROM files fg WHERE fg.album_id = al.id AND fg.genre = ${
-        esc(q.genre)
-      })`,
-    );
-  }
-  if (q.yearFrom !== undefined || q.yearTo !== undefined) {
-    const years = [
-      ...(q.yearFrom === undefined ? [] : [`fy.year >= ${q.yearFrom}`]),
-      ...(q.yearTo === undefined ? [] : [`fy.year <= ${q.yearTo}`]),
-    ];
-    wheres.push(
-      `EXISTS (SELECT 1 FROM files fy WHERE fy.album_id = al.id AND ${
-        years.join(' AND ')
-      })`,
-    );
-  }
-  return `
+  // Genre and year may be satisfied by different tracks; neither filters the
+  // rows used for album counts, duration or the displayed year.
+  const wheres = [
+    songPredicates({ genre: q.genre }),
+    songPredicates({ fromYear: q.fromYear, toYear: q.toYear }),
+  ].filter((predicates) => predicates.length).map((predicates) =>
+    `EXISTS (SELECT 1 FROM ${files} f WHERE f.album_id = al.id AND ${
+      predicates.join(' AND ')
+    })`
+  );
+  return `${withScope}
   SELECT ${extra} al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
           MAX(f.year) AS year, epoch_ms(MIN(fi.first_seen_at)) AS created_ms,
           ${metadataSelect(albumMetadataColumns, 'al', true)}
   FROM albums al
   LEFT JOIN artists ar ON ar.id = al.album_artist_id
-  LEFT JOIN files f ON f.album_id = al.id
+  ${scope.length ? 'JOIN' : 'LEFT JOIN'} ${files} f ON f.album_id = al.id
   LEFT JOIN file_identity fi ON fi.id = f.id
   ${joins.join('\n')}
   ${wheres.length === 0 ? '' : `WHERE ${wheres.join(' AND ')}`}
   GROUP BY al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name`;
-}
-
-// File eligibility has one owner for sync, browse pages and random sampling.
-// Optional bounds are inclusive; SQL NULL comparisons do not invent a year.
-function songPredicates(opts: Omit<RandomSongOptions, 'size'>): string[] {
-  const predicates: string[] = [];
-  if (opts.folderId !== undefined) {
-    predicates.push(`f.library_id = ${esc(opts.folderId)}`);
-  }
-  if (opts.genre !== undefined) predicates.push(`f.genre = ${esc(opts.genre)}`);
-  if (opts.fromYear !== undefined) {
-    predicates.push(`f.year >= ${opts.fromYear}`);
-  }
-  if (opts.toYear !== undefined) predicates.push(`f.year <= ${opts.toYear}`);
-  return predicates;
 }
 
 interface ArtistGroupSqlRow {
@@ -1135,8 +1129,8 @@ function catalogReads(q: Queries): CatalogReads {
           if (opts.fromYear === undefined || opts.toYear === undefined) {
             return [];
           }
-          query.yearFrom = Math.min(opts.fromYear, opts.toYear);
-          query.yearTo = Math.max(opts.fromYear, opts.toYear);
+          query.fromYear = Math.min(opts.fromYear, opts.toYear);
+          query.toYear = Math.max(opts.fromYear, opts.toYear);
           // Subsonic: fromYear > toYear is a reverse chronological list.
           order = opts.fromYear > opts.toYear
             ? `ORDER BY MAX(f.year) DESC, ${secondaryKey}`
@@ -1175,8 +1169,8 @@ function catalogReads(q: Queries): CatalogReads {
       const query: AlbumQuery = {
         folderId: opts.folderId,
         genre: opts.genre,
-        yearFrom: opts.fromYear,
-        yearTo: opts.toYear,
+        fromYear: opts.fromYear,
+        toYear: opts.toYear,
       };
       const nameKey = namePageKey(
         'COALESCE(al.name, al.folder_name)',

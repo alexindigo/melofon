@@ -194,7 +194,7 @@ Deno.test('API statistics: live global and scoped facts count shared credits onc
   }
 });
 
-Deno.test('API genres: bounded primary-genre counts scope before paging and match song and album filters', async () => {
+Deno.test('API genres: primary-genre counts scope before paging; filters also match secondary tags', async () => {
   const f = await statisticsFixture();
   try {
     const expected = [
@@ -267,14 +267,19 @@ Deno.test('API genres: bounded primary-genre counts scope before paging and matc
           );
         }
       }
-      // Secondary indexed metadata is not a second primary genre/filter bucket.
+      // Secondary tags remain outside the primary-genre counts above, but
+      // a selection by that tag still returns the corresponding tracks/albums.
       const multi = f.songs.find((s) => s.metadata?.genres.length === 2)!;
       const detail = await read(f, credential, `/api/v1/songs/${multi.id}`);
       assertEquals(detail.song.metadata.genres, ['Jazz', 'Fusion']);
-      assertEquals(
-        (await read(f, credential, '/api/v1/songs?genre=Fusion')).total,
-        0,
-      );
+      const songs = await read(f, credential, '/api/v1/songs?genre=Fusion');
+      const albums = await read(f, credential, '/api/v1/albums?genre=Fusion');
+      assertEquals(songs.total, 1);
+      assertEquals(songs.songs.map((song: SongRow) => song.id), [multi.id]);
+      assertEquals(albums.total, 1);
+      assertEquals(albums.albums.map((album: { id: string }) => album.id), [
+        multi.albumId,
+      ]);
     }
     assertEquals(await f.store.catalog.listGenres(), expected); // Legacy shape/policy preserved.
   } finally {

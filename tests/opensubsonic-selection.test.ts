@@ -183,6 +183,117 @@ function items(body: Envelope, key: string, kind = 'song'): Item[] {
 }
 const ids = (rows: Item[]) => rows.map((r) => r.id);
 
+Deno.test('genre selection matches secondary tags in OpenSubsonic and OwnTone', async (t) => {
+  const s = await setup();
+  try {
+    await rawSql(s.db).run(`UPDATE files SET genres = ['Rock', 'Indie']
+      WHERE id = ${sql(id(104))}`);
+    for (
+      const [op, key, kind, expected, extra] of [
+        ['getRandomSongs', 'randomSongs', 'song', 104, {}],
+        ['getSongsByGenre', 'songsByGenre', 'song', 104, {}],
+        ['getAlbumList', 'albumList', 'album', 21, { type: 'byGenre' }],
+        ['getAlbumList2', 'albumList2', 'album', 21, { type: 'byGenre' }],
+      ] as const
+    ) {
+      await t.step(op, async () => {
+        const rows = items(
+          await s.get(op, { genre: 'Indie', ...extra }),
+          key,
+          kind,
+        );
+        assertEquals(ids(rows), [id(expected)]);
+        if (kind === 'song') assertEquals(rows[0].genre, 'Rock');
+      });
+    }
+    for (
+      const [kind, expected] of [['tracks', 104], ['albums', '21'], [
+        'artists',
+        '12',
+      ]] as const
+    ) {
+      await t.step(`OwnTone ${kind}`, async () => {
+        const params = new URLSearchParams({
+          type: kind,
+          expression: 'genre is "Indie"',
+        });
+        const response = await s.own(
+          new Request(`http://x/api/search?${params}`),
+        );
+        assertEquals(response.status, 200);
+        const page = (await response.json())[kind];
+        assertEquals(page.total, 1);
+        assertEquals(
+          page.items.map((item: { id: string | number }) => item.id),
+          [expected],
+        );
+      });
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+Deno.test('album selection derives genre, year and listening rank from scoped tracks', async (t) => {
+  const s = await setup();
+  try {
+    // Give albums A0 and A1 tracks in B. The view must scope every use of
+    // files independently of how the album membership was assembled.
+    await rawSql(s.db).run(
+      `UPDATE files SET album_id = ${sql(id(20))}, genre = 'Remote'
+      WHERE id = ${sql(id(107))}`,
+    );
+    await rawSql(s.db).run(`UPDATE files SET album_id = ${sql(id(21))}
+      WHERE id = ${sql(id(106))}`);
+    await rawSql(s.db).run(`UPDATE files SET album_id = ${sql(id(22))}
+      WHERE id = ${sql(id(102))}`);
+    for (
+      const [track, day] of [
+        [100, 1],
+        [103, 2],
+        [101, 3],
+        [107, 6],
+        [106, 4],
+        [106, 4.5],
+        [106, 5],
+        [105, 7],
+      ] as const
+    ) {
+      const reply = await s.get('scrobble', {
+        id: id(track),
+        time: String(day * 86400000),
+      });
+      assertEquals(reply.status, 'ok');
+    }
+    for (
+      const [type, params, unscoped, scoped] of [
+        ['byGenre', { genre: 'Remote' }, [20], []],
+        ['byYear', { fromYear: '2011', toYear: '2011' }, [20], []],
+        ['frequent', {}, [21, 20, 22], [20, 21]],
+        ['recent', {}, [22, 20, 21], [21, 20]],
+      ] as const
+    ) {
+      await t.step(type, async () => {
+        const get = async (scope: Record<string, string>) =>
+          ids(
+            items(
+              await s.get('getAlbumList2', { type, ...params, ...scope }),
+              'albumList2',
+              'album',
+            ),
+          );
+        assertEquals(await get({}), unscoped.map(id));
+        assertEquals(
+          await get({ musicFolderId: s.sources[0].id }),
+          scoped.map(id),
+        );
+      });
+    }
+  } finally {
+    await s.close();
+  }
+});
+
 Deno.test('H2 behavioral red: present empty query enumerates real REST rows', async () => {
   const s = await setup();
   try {
