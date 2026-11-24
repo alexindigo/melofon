@@ -7,10 +7,16 @@ import {
   until,
 } from './helpers/concurrent-playback.ts';
 import { crossfadeReference } from './helpers/crossfade-proof.ts';
-import { concatenate } from './helpers/timeline-proof.ts';
+import {
+  decodeSourceReference,
+  writeEncodedTone,
+} from './helpers/encoded-playback-source.ts';
+import { concatenate, timelineUntil } from './helpers/timeline-proof.ts';
 import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
 import type { FakeRaopSession } from './helpers/fake-raop.ts';
 import type { AirplayRangeSnapshot } from '../src/boots/airplay-profile.ts';
+import type { CrossfadeRecord } from '../src/playback-mix.ts';
+import { queueDuration } from '../src/queue-source.ts';
 
 type Fixture = Awaited<ReturnType<typeof concurrentFixture>>;
 function test(name: string, fn: () => Promise<void>) {
@@ -21,10 +27,13 @@ function test(name: string, fn: () => Promise<void>) {
     fn,
   });
 }
-async function start(f: Fixture) {
+async function requirePlainHttp(f: Fixture) {
   const ips = await Deno.resolveDns('melofon.home', 'A');
   assert(ips.length > 0 && ips.every((ip) => !ip.startsWith('127.')));
   assert(f.server.f.origin.startsWith('http://melofon.home:'));
+}
+async function start(f: Fixture) {
+  await requirePlainHttp(f);
   const previous = f.receivers.map((r) => r.sessions.length);
   await Promise.all(
     [1, 2].map((id) => f.server.call(`/players/${id}/play`, 'POST', {})),
@@ -152,6 +161,106 @@ test('A fans out a persisted natural fade while B stays gapless, through both fi
       (await f.server.f.store.players.list()).map((p) => p.crossfadeMs),
       [100, 0],
     );
+    await f.libraryProof();
+  } finally {
+    await f.close();
+  }
+});
+
+test('long MP3 sources crossfade naturally with exact scheduled PCM through the final tail', async () => {
+  const outgoingSeconds = 90, incomingSeconds = 60;
+  const crossfadeMs = 100, overlap = Math.floor(crossfadeMs * 44100 / 1000);
+  const fades: CrossfadeRecord[] = [];
+  const f = await concurrentFixture(undefined, {
+    async writeMedia(dir) {
+      const a = `${dir}/A.mp3`, b = `${dir}/B.mp3`;
+      // With no Xing/LAME trim metadata, the catalog and decoder both count
+      // the encoded padding. Row 21 forbids fading across compatibility silence.
+      await writeEncodedTone(a, 'mp3-no-xing', outgoingSeconds, 440);
+      await writeEncodedTone(b, 'mp3-no-xing', incomingSeconds, 660);
+      return [a, b];
+    },
+    crossfadeObserved(playerId, record) {
+      if (playerId === 1) fades.push(record);
+    },
+  });
+  try {
+    const parts = [];
+    for (const [i, path] of f.paths.entries()) {
+      const { pcm, chunkFrames } = await decodeSourceReference(path);
+      assert(
+        chunkFrames.filter((n) => n === 1152).length >=
+          Math.floor([outgoingSeconds, incomingSeconds][i] * 44100 / 1152),
+        'each MP3 decodes to thousands of real 1152-frame chunks',
+      );
+      parts.push(pcm);
+    }
+    const expected = crossfadeReference(parts, overlap).pcm;
+    await f.initialize();
+    await requirePlainHttp(f);
+    await appendOther(f, 1);
+    await f.server.call('/players/1', 'PATCH', { crossfadeMs });
+    const player = f.players.get(1);
+    const entries = player.queueView().items;
+    const [outgoingEntryId, incomingEntryId] = entries.map((e) => e.id);
+    assertEquals(
+      entries.map(queueDuration),
+      parts.map((pcm) => Math.round(pcm.length / 4 * 1000 / 44100)),
+      'catalog duration matches decoded PCM: no compatibility silence',
+    );
+    await f.server.call('/players/1/play', 'POST', {});
+    await timelineUntil(
+      'long source renders past 256 MP3 chunks',
+      () => player.playerView().itemProgressMs >= 10000,
+    );
+    await timelineUntil(
+      'natural MP3 succession',
+      () => player.sourcePlanView().playing?.entryId === incomingEntryId,
+      outgoingSeconds * 1000 + 10000,
+    );
+    await timelineUntil(
+      'successor renders past 256 MP3 chunks',
+      () => player.playerView().itemProgressMs >= 10000,
+    );
+    await timelineUntil(
+      'both long sources stop naturally',
+      () => player.playerView().state === 'stop',
+      incomingSeconds * 1000 + 10000,
+    );
+
+    assertEquals(fades, [{
+      outgoingEntryId,
+      incomingEntryId,
+      requestedFrames: BigInt(overlap),
+      appliedFrames: BigInt(overlap),
+      reason: 'applied',
+    }]);
+    const a = trace(f, 0);
+    assertEquals(a.audio.epochs.length, 1);
+    assertEquals(a.seals.length, 2);
+    assert(a.completions.every((r) => r.status === 'complete'));
+    // Reader and publication observers can receive the same native receipt.
+    const completed = new Map(a.completions.map((r) => [r.source, r]));
+    assertEquals(completed.size, 2);
+    for (const [i, seal] of a.seals.entries()) {
+      const receipt = completed.get(seal.source);
+      assert(receipt, `source ${i + 1} has a native completion receipt`);
+      // The incoming head was already submitted as part of A's mixed tail.
+      const ownFrames = parts[i].length / 4 - (i === 1 ? overlap : 0);
+      assertEquals(receipt.target, BigInt(ownFrames));
+    }
+    let end = 0n;
+    for (const range of a.audio.epochs[0].ranges) {
+      if (range.kind !== 'real') continue;
+      assertEquals(range.transportStart, end, 'no inter-source silence');
+      end += range.frames;
+    }
+    assertEquals(end, BigInt(expected.length / 4), 'complete real final tail');
+    const r = f.receivers[0];
+    assertEquals(r.sessions.length, 1);
+    const session = r.sessions[0];
+    assertEquals(session.flushes, 0);
+    exact(a.audio.scheduledRealAudio(session, r.nowMs()), expected);
     await f.libraryProof();
   } finally {
     await f.close();

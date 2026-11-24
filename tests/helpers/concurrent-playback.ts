@@ -70,6 +70,7 @@ export function wave(frames: number, seed: number) {
 export async function concurrentFixture(
   frames = [44100 + 353, 88200 + 351],
   hooks: {
+    writeMedia?(directory: string): Promise<readonly [string, string]>;
     closeStream?(close: () => Promise<void>): Promise<void>;
     decodePcm?(
       playerId: number,
@@ -82,10 +83,23 @@ export async function concurrentFixture(
   } = {},
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'concurrent-http-' });
-  await Deno.mkdir(`${dir}/media`);
-  const waves = frames.map((n, i) => wave(n, 1000 + i * 2000));
-  for (const [i, bytes] of waves.entries()) {
-    await Deno.writeFile(`${dir}/media/${i === 0 ? 'A' : 'B'}.wav`, bytes);
+  const mediaDir = `${dir}/media`;
+  const waves = hooks.writeMedia
+    ? []
+    : frames.map((n, i) => wave(n, 1000 + i * 2000));
+  let paths: readonly [string, string];
+  try {
+    await Deno.mkdir(mediaDir);
+    if (hooks.writeMedia) paths = await hooks.writeMedia(mediaDir);
+    else {
+      paths = [`${mediaDir}/A.wav`, `${mediaDir}/B.wav`];
+      for (const [i, bytes] of waves.entries()) {
+        await Deno.writeFile(paths[i], bytes);
+      }
+    }
+  } catch (error) {
+    await Deno.remove(dir, { recursive: true });
+    throw error;
   }
   const receivers = await Promise.all(
     [0, 1, 2].map(() =>
@@ -126,18 +140,21 @@ export async function concurrentFixture(
         assert(f.notify);
         const libraries = createLibraries(f.store);
         if (!(await libraries.list()).length) {
-          await libraries.add('Concurrent media', `${dir}/media`);
+          await libraries.add('Concurrent media', mediaDir);
           await scanLibrary(f.store);
+          const firstPath = paths[0].replaceAll("'", "''");
           await rawSql(f.store).run(
-            "UPDATE files SET title = CASE WHEN path LIKE '%/A.wav' THEN 'Player A' ELSE 'Player B' END",
+            `UPDATE files SET title = CASE WHEN path = '${firstPath}' THEN 'Player A' ELSE 'Player B' END`,
           );
         }
         const library = createLibrary(f.store),
           nowPlaying = createNowPlaying(f.store);
-        songs = (await library.listSongs({ offset: 0, size: 10 })).sort((
-          a,
-          b,
-        ) => a.path.localeCompare(b.path));
+        const listed = await library.listSongs({ offset: 0, size: 10 });
+        songs = paths.map((path) => {
+          const song = listed.find((song) => song.path === path);
+          assert(song, `fixture source was not indexed: ${path}`);
+          return song;
+        });
         persistence = createPersistence(f.store);
         outputs = createOutputs({ notify: f.notify, persistence });
         for (const row of await persistence.loadOutputs()) {
@@ -319,6 +336,7 @@ export async function concurrentFixture(
   let server = await start();
   return {
     dir,
+    paths,
     waves,
     receivers,
     traces,

@@ -1,25 +1,18 @@
 // Plain HTTP -> real FLAC/MP3 decoders -> production reader -> native pacer ->
 // independently scheduled ALAC consumer, across thousands of decoder chunks.
 import { assert, assertEquals } from '@std/assert';
-import { createMedia } from '../src/media.ts';
 import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 import { exact } from './helpers/concurrent-playback.ts';
+import {
+  decodeSourceReference,
+  writeEncodedTone,
+} from './helpers/encoded-playback-source.ts';
 import {
   concatenate,
   timelineControl,
   timelineLibraryProof,
   timelineUntil,
 } from './helpers/timeline-proof.ts';
-
-async function decoded(path: string) {
-  const reader = await createMedia().decodePcm(path);
-  assert(reader);
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of reader) chunks.push(chunk.slice());
-  assert(reader.eof);
-  assert(chunks.length > 256, 'normal decoder fragmentation crosses old cap');
-  return concatenate(chunks);
-}
 
 Deno.test({
   name:
@@ -31,26 +24,22 @@ Deno.test({
     try {
       const paths = [`${directory}/a.flac`, `${directory}/b.mp3`];
       for (const [i, path] of paths.entries()) {
-        const result = await new Deno.Command('ffmpeg', {
-          args: [
-            '-hide_banner',
-            '-loglevel',
-            'error',
-            '-f',
-            'lavfi',
-            '-i',
-            `sine=frequency=${440 + i * 220}:sample_rate=44100:duration=180`,
-            '-ac',
-            '2',
-            ...(i === 0
-              ? ['-c:a', 'flac', '-sample_fmt', 's32']
-              : ['-c:a', 'libmp3lame']),
-            path,
-          ],
-        }).output();
-        assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
+        await writeEncodedTone(
+          path,
+          i === 0 ? 'flac' : 'mp3',
+          180,
+          440 + i * 220,
+        );
       }
-      const parts = await Promise.all(paths.map(decoded));
+      const parts = (await Promise.all(paths.map(decodeSourceReference))).map(
+        ({ pcm, chunkFrames }) => {
+          assert(
+            chunkFrames.length > 256,
+            'normal decoder fragmentation crosses old cap',
+          );
+          return pcm;
+        },
+      );
       const f = await nativeHttpFixture({
         pcm: new Uint8Array(),
         sourcePath: paths[0],
