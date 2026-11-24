@@ -181,9 +181,10 @@ int raop_stream_free(raop_stream_t *stream);
  * their native diagnostic transport when no consumer is installed. */
 int raop_log_consumer(int enable);
 /* Copies one owned JSON transport record (capture UTC milliseconds, sequence,
- * source severity/domain, typed facts or opaque payload). 0=empty; -1=buffer
- * too small/invalid. Records are retained on -1. Overflow counts are observable
- * even without a subsequent producer record. No pointer crosses this API. */
+ * source severity/domain, typed facts or opaque payload). 0=nothing ready;
+ * -1=buffer too small/invalid. Records are retained on -1. Overflow counts are
+ * observable even without a subsequent producer record. No pointer crosses
+ * this API. */
 int raop_log_poll(char *buf, size_t cap);
 
 /* One handle per AirPlay device. The first handle starts the library's

@@ -35,6 +35,7 @@ if (mode === 'streams') {
         '-levent',
         `-Wl,-rpath,${root}/helper/raop`,
         '-lpthread',
+        '-ldl',
         '-o',
         binary,
       ],
@@ -46,6 +47,7 @@ if (mode === 'streams') {
     }
     const result = await new Deno.Command(binary, {
       clearEnv: true,
+      signal: AbortSignal.timeout(10000),
       env: { PATH: '/usr/bin:/bin', TMPDIR: dir },
       stdout: 'piped',
       stderr: 'piped',
