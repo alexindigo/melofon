@@ -90,11 +90,11 @@ jobs:
           include-hidden-files: true
           retention-days: 3
 
-  summary:
-    name: Combined test summary
+  browser:
+    name: Real Chromium media tests
     needs: [prepare, test]
-    if: always() && needs.prepare.result == 'success'
     runs-on: *runner
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -103,12 +103,51 @@ jobs:
         with:
           name: test-preparation
           path: .test-tmp/ci
+      - name: Restore prepared image, native outputs and offline dependencies
+        run: |
+          docker load -i .test-tmp/ci/dev-image.tar
+          tar -xf .test-tmp/ci/native.tar
+          tar -xf .test-tmp/ci/dependencies.tar
+          rm .test-tmp/ci/dev-image.tar .test-tmp/ci/native.tar .test-tmp/ci/dependencies.tar
+      - name: Add pinned Chromium and Nginx to the prepared dev image
+        run: |
+          docker build --builder default --target browser \
+            --build-arg "BROWSER_BASE=$MELOFON_TEST_IMAGE" \
+            --build-arg "BROWSER_UID=$(id -u)" --build-arg "BROWSER_GID=$(id -g)" \
+            -t localhost/melofon-browser:ci .
+      - name: Run both native browser media cases
+        run: scripts/test-browser localhost/melofon-browser:ci
+
+  summary:
+    name: Combined test summary
+    needs: [prepare, test, browser]
+    if: always()
+    runs-on: *runner
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.prepare.result == 'success'
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
+        if: needs.prepare.result == 'success'
+        with:
+          name: test-preparation
+          path: .test-tmp/ci
+      - uses: actions/download-artifact@v4
+        if: needs.prepare.result == 'success'
         with:
           pattern: shard-*
           merge-multiple: true
           path: .test-tmp/ci
       - name: Summarize all shard results (missing results fail)
+        if: needs.prepare.result == 'success'
         run: |
           docker load -i .test-tmp/ci/dev-image.tar
           scripts/test --summarize .test-tmp/ci | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Include the browser gate in the combined summary
+        if: always()
+        env:
+          BROWSER_RESULT: ${{ needs.browser.result }}
+        run: |
+          printf '\nReal Chromium media tests (/, /music): %s\n' "$BROWSER_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$BROWSER_RESULT" = success

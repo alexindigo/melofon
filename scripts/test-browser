@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export CONTAINER_ENGINE=${CONTAINER_ENGINE:-podman}
+engine="$PWD/.devcontainer/engine"
+image=${1:?Usage: scripts/test-browser BROWSER-IMAGE}
+
+mkdir -p .test-tmp
+run_dir=$(mktemp -d .test-tmp/browser.XXXXXX)
+network=melofon-$(basename "$run_dir" | tr '[:upper:].' '[:lower:]-')
+"$engine" network create --internal "$network" >/dev/null
+trap '"$engine" network rm "$network" >/dev/null' EXIT
+
+"$engine" run --rm --init --memory=2g --memory-swap=2g --pids-limit=512 \
+  --cpus=2 --shm-size=256m --network="$network" --network-alias=melofon.home \
+  -v "$PWD:/app" -w /app -e "TMPDIR=/app/$run_dir" \
+  -e NO_COLOR=1 -e MELOFON_BROWSER_TESTS=1 --entrypoint deno "$image" \
+  test --frozen --cached-only --env --allow-all --node-modules-dir=auto \
+  tests/api-browser-media.test.ts 2>&1 | tee "$run_dir/browser.log"
+
+# Deno exits zero with ignored tests; this job requires both cases to run.
+if ! grep -q '^ok | 2 passed | 0 failed (' "$run_dir/browser.log"; then
+  echo 'Expected two passing browser cases and no skips' >&2
+  exit 1
+fi
