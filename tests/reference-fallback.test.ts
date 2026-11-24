@@ -117,9 +117,9 @@ Deno.test('reference fallback: every seed genre, no missing/seed songs, real Wor
     await Deno.remove(`${f.root}/other.mp3`);
     await f.scan.run();
     assertEquals(
-      new Set(await reference.similarTracks(song('seed').id, 100, 'admin')),
-      new Set(['rock', 'jazz', 'both'].map((t) => song(t).id)),
-      'when the only usable provider match disappears, use the local genre pool',
+      await reference.similarTracks(song('seed').id, 100, 'admin'),
+      [],
+      'unmatched plugin value is not replaced by local guesses',
     );
   } finally {
     await runner?.close();

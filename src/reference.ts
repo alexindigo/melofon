@@ -1,7 +1,6 @@
 import type { Store } from './store/index.ts';
 import type { State } from './state.ts';
 import {
-  type ExternalTrack,
   type ReferenceName,
   referenceNames,
   type ReferenceType,
@@ -157,28 +156,6 @@ export function createReference(options: {
     };
     return available.sort((a, b) => rank(a.plugin) - rank(b.plugin));
   };
-  // A provider has an answer only after matching and applying local eligibility.
-  const tracksWithFallback = async (
-    external: ExternalTrack[] | undefined,
-    count: number,
-    user: string,
-    exclude: string | undefined,
-    folderId: string | undefined,
-    local: () => Promise<string[]>,
-  ) => {
-    if (count === 0) return [];
-    if (external?.length) {
-      const tracks = await matcher.tracks(
-        external,
-        count,
-        user,
-        exclude,
-        folderId,
-      );
-      if (tracks.length) return tracks;
-    }
-    return local();
-  };
   const service = {
     async get(
       type: ReferenceType,
@@ -224,14 +201,15 @@ export function createReference(options: {
     ): Promise<string[]> {
       validCount(count);
       const values = await service.get('track', trackId, ['track.similar']);
-      return tracksWithFallback(
-        values['track.similar'],
-        count,
-        user,
-        trackId,
-        folderId,
-        () => store.referenceMatcher.genreTracks(trackId, count, folderId),
-      );
+      return values['track.similar']?.length
+        ? matcher.tracks(
+          values['track.similar'],
+          count,
+          user,
+          trackId,
+          folderId,
+        )
+        : store.referenceMatcher.genreTracks(trackId, count, folderId);
     },
     async topTracks(
       artistId: string,
@@ -244,21 +222,21 @@ export function createReference(options: {
       const values = await service.get('artist', artistId, [
         'artist.topTracks',
       ]);
-      return tracksWithFallback(
-        values['artist.topTracks'],
-        count,
-        user,
-        exclude,
-        folderId,
-        () =>
-          store.referenceMatcher.localTopTracks(
-            artistId,
-            count,
-            user,
-            folderId,
-            exclude,
-          ),
-      );
+      return values['artist.topTracks']?.length
+        ? matcher.tracks(
+          values['artist.topTracks'],
+          count,
+          user,
+          exclude,
+          folderId,
+        )
+        : store.referenceMatcher.localTopTracks(
+          artistId,
+          count,
+          user,
+          folderId,
+          exclude,
+        );
     },
     artistByName: store.referenceMatcher.artistByName,
     /** Unknown seed is distinct from a known seed with an empty local mix. */

@@ -270,89 +270,10 @@ Deno.test('API radio: artist weighted pool uses caller played albums and scopes 
   }
 });
 
-Deno.test('radio falls back when nonempty cached facts yield no eligible tracks', async (t) => {
-  const f = await radioFixture();
-  try {
-    const { credential } = await f.login('bearer', 'alice', 'password-alice');
-    const seed = f.song('seed');
-    const scope = `?library=${f.music}`;
-    // Each provider list is nonempty but all facts are unmatched, out of the
-    // folder, absent, or the very track that the matching call excludes.
-    await rawSql(f.store).run(
-      `UPDATE file_identity SET present = false WHERE id = '${f.song('a').id}'`,
-    );
-    const unavailable: [string, string][] = [
-      ['Gone', 'Nobody'],
-      ['Second song', 'Main'],
-      ['Alpha', 'Main'],
-    ];
-    await similar(f, 'seed', [...unavailable, ['Seed', 'Main']]);
-    await t.step(
-      'native track and album radio use local genre matches',
-      async () => {
-        for (const kind of ['songs', 'albums'] as const) {
-          assertEquals(ids(await read(f, credential, path(f, kind) + scope)), [
-            f.song('n').id,
-          ], kind);
-        }
-      },
-    );
-    await t.step(
-      'OpenSubsonic track radio falls back on unmatched provider facts',
-      async () => {
-        await similar(f, 'seed', [['Gone', 'Nobody']]);
-        const params = new URLSearchParams({
-          u: 'alice',
-          p: 'password-alice',
-          v: '1.16.1',
-          c: 'radio-test',
-          f: 'json',
-          id: seed.id,
-        });
-        const response = await f.get(`/rest/getSimilarSongs2.view?${params}`);
-        assertEquals(response.status, 200);
-        const body = (await response.json())['subsonic-response'];
-        assertEquals(body.status, 'ok');
-        assertEquals(
-          new Set(ids({ songs: body.similarSongs2.song })),
-          new Set(['n', 'c', 'f'].map((file) => f.song(file).id)),
-        );
-      },
-    );
-    await t.step(
-      'native artist radio uses caller history when provider results are ineligible',
-      async () => {
-        await createListens(f.store).record('alice', f.song('b').id, {
-          source: 'test',
-        });
-        await f.reference.record('artist', seed.artistId!, 'fixture', [
-          'artist.topTracks',
-        ], {
-          'artist.topTracks': unavailable.map(([title, artist]) => ({
-            title,
-            artist,
-          })),
-        });
-        assertEquals(
-          ids(await read(f, credential, path(f, 'artists') + scope)),
-          [f.song('b').id],
-        );
-      },
-    );
-  } finally {
-    await f.close();
-  }
-});
-
 Deno.test('API radio: song artist top-up excludes seed before the top-track cap and uses requesting user history', async () => {
   const f = await radioFixture();
   try {
     await similar(f, 'seed', [['Missing', 'Nobody']]);
-    // Give the seed no genre neighbors so this exercises only artist top-up.
-    await rawSql(f.store).run(
-      `UPDATE files SET genre = 'Solo genre', genres = ['Solo genre']
-       WHERE id = '${f.song('seed').id}'`,
-    );
     await f.state.set('reference.radioMinTopTracks', '1');
     const listens = createListens(f.store);
     await listens.record('alice', f.song('seed').id, { source: 'test' });
