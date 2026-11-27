@@ -934,6 +934,8 @@ moves. An album uses the earliest first-seen among its listed files; `newest`
 orders that date descending, with ID ties. `recent` and `frequent` include only
 albums the requesting user has played. `byGenre` and `byYear` select album
 membership and count/time the whole album, rather than only matching songs.
+`byYear` orders by the newest matching track year, while the album's displayed
+year still describes the whole album.
 Existing music-folder aggregate scope and empty unmatched-folder behavior stay
 in place. Song Child `parent` points to its album, and album Child `parent` to
 its album artist across browsing, lists and legacy search.

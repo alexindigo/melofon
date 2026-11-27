@@ -625,16 +625,23 @@ function albumSelect(q: AlbumQuery = {}, extra = ''): string {
        ) agg ON agg.album_id = al.id`,
     );
   }
-  // Genre and year may be satisfied by different tracks; neither filters the
-  // rows used for album counts, duration or the displayed year.
-  const wheres = [
-    songPredicates({ genre: q.genre }),
-    songPredicates({ fromYear: q.fromYear, toYear: q.toYear }),
-  ].filter((predicates) => predicates.length).map((predicates) =>
-    `EXISTS (SELECT 1 FROM ${files} f WHERE f.album_id = al.id AND ${
-      predicates.join(' AND ')
+  // The range match and its sort key come from the same scoped tracks;
+  // joining one match row per album leaves the overall album facts intact.
+  const years = songPredicates({ fromYear: q.fromYear, toYear: q.toYear });
+  if (years.length) {
+    joins.push(`JOIN (
+      SELECT f.album_id, MAX(f.year) AS matching_year
+      FROM ${files} f WHERE ${years.join(' AND ')}
+      GROUP BY f.album_id
+    ) ym ON ym.album_id = al.id`);
+  }
+  // Genre and year can be satisfied by different tracks.
+  const genres = songPredicates({ genre: q.genre });
+  const genreFilter = genres.length
+    ? `WHERE EXISTS (SELECT 1 FROM ${files} f WHERE f.album_id = al.id AND ${
+      genres.join(' AND ')
     })`
-  );
+    : '';
   return `${withScope}
   SELECT ${extra} al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
@@ -645,7 +652,7 @@ function albumSelect(q: AlbumQuery = {}, extra = ''): string {
   ${scope.length ? 'JOIN' : 'LEFT JOIN'} ${files} f ON f.album_id = al.id
   LEFT JOIN file_identity fi ON fi.id = f.id
   ${joins.join('\n')}
-  ${wheres.length === 0 ? '' : `WHERE ${wheres.join(' AND ')}`}
+  ${genreFilter}
   GROUP BY al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name`;
 }
 
@@ -1133,8 +1140,8 @@ function catalogReads(q: Queries): CatalogReads {
           query.toYear = Math.max(opts.fromYear, opts.toYear);
           // Subsonic: fromYear > toYear is a reverse chronological list.
           order = opts.fromYear > opts.toYear
-            ? `ORDER BY MAX(f.year) DESC, ${secondaryKey}`
-            : `ORDER BY MAX(f.year), ${secondaryKey}`;
+            ? `ORDER BY MAX(ym.matching_year) DESC, ${secondaryKey}`
+            : `ORDER BY MAX(ym.matching_year), ${secondaryKey}`;
           break;
         }
         default:
