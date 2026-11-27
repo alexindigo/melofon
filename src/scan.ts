@@ -31,6 +31,7 @@ import {
 } from './metadata.ts';
 import { createState, type State } from './state.ts';
 import { type VideoDetails, videoDetails } from './video.ts';
+import { trackDetailsFromTags } from './music-credits.ts';
 import { LibrarySourcesChanged } from './library-errors.ts';
 import { join, relative } from 'node:path';
 import {
@@ -243,6 +244,14 @@ export async function scanLibrary(
     }
   }
   const artists = new Map<string, ArtistIn>(); // name → row
+  const creditIds = new Map<string, Promise<string>>();
+  function creditId(name: string): Promise<string> {
+    const found = creditIds.get(name);
+    if (found !== undefined) return found;
+    const id = stableId('artist', name);
+    creditIds.set(name, id);
+    return id;
+  }
   const albumInputs = new Map<FileIn, Omit<AlbumInput, 'songId'>>();
   const files: FileIn[] = [];
   const embeddedPictures = new Map<FileIn, Omit<LocalVersion, 'origin'>[]>();
@@ -404,6 +413,17 @@ export async function scanLibrary(
             albumName = meta.common.album?.trim() || undefined;
             // Preserve the tagged fact. Album-level inference owns the fallback.
             albumArtist = meta.common.albumartist?.trim() || undefined;
+            const tagged = trackDetailsFromTags(meta);
+            metadata.tagDetails = {
+              ...tagged,
+              credits: await Promise.all(tagged.credits.map(async (credit) => ({
+                ...credit,
+                artist: {
+                  id: await creditId(credit.artist),
+                  name: credit.artist,
+                },
+              }))),
+            };
             trackNo = meta.common.track.no;
             discNo = meta.common.disk.no;
             if (meta.format.duration && meta.format.duration > 0) {
@@ -432,6 +452,8 @@ export async function scanLibrary(
             // audio-only .mp4 stays a song, and a streamless file is skipped.
             isVideo = probe.hasVideo;
             if (isVideo) {
+              metadata.videoWidth = probe.videoWidth ?? null;
+              metadata.videoHeight = probe.videoHeight ?? null;
               video = await videoDetails(
                 abs,
                 probe.audioStreams ?? [],
@@ -454,7 +476,7 @@ export async function scanLibrary(
 
           let artistId: string | null = null;
           if (trackArtist !== undefined) {
-            artistId = await stableId('artist', trackArtist);
+            artistId = await creditId(trackArtist);
           }
           const file: FileIn = {
             id: '',
@@ -591,6 +613,9 @@ export async function scanLibrary(
   const allFiles = [...files, ...preserved];
   for (const file of allFiles) {
     albumInputs.set(file, file.albumInput!);
+    for (const { artist } of file.metadata?.tagDetails?.credits ?? []) {
+      artists.set(artist.name, artist);
+    }
     const name = file.albumInput!.trackArtist;
     if (name !== null && file.artistId !== null) {
       artists.set(name, { id: file.artistId, name });

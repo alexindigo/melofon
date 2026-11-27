@@ -34,6 +34,9 @@ export const songMetadataColumns: Record<keyof SongMetadata, string> = {
   compilation: 'compilation',
   version: 'version',
   albumSortName: 'album_sort_name',
+  tagDetails: 'tag_details',
+  videoWidth: 'video_width',
+  videoHeight: 'video_height',
 };
 export const albumMetadataColumns: Record<keyof AlbumMetadata, string> = {
   musicBrainzId: 'musicbrainz_id',
@@ -48,7 +51,10 @@ export const albumMetadataColumns: Record<keyof AlbumMetadata, string> = {
   sortName: 'sort_name',
   explicit: 'explicit',
   discTitles: 'disc_titles',
+  artistDetails: 'artist_details',
 };
+
+const jsonFields = ['discTitles', 'tagDetails', 'artistDetails'];
 
 export function metadataSelect(
   columns: Record<string, string>,
@@ -98,7 +104,7 @@ export async function writeMetadata(
       ? String(value)
       : typeof value === 'boolean'
       ? String(value)
-      : key === 'discTitles'
+      : jsonFields.includes(key)
       ? `${esc(JSON.stringify(value))}::JSON`
       : `[${(value as string[]).map(esc).join(', ')}]::VARCHAR[]`;
     return `${column} = ${literal}`;

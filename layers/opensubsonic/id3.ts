@@ -85,16 +85,23 @@ export function albumArtistLabel(
   return { id: album.artistId!, name: album.artistName! };
 }
 
-export function artistId3Of(
+export async function artistId3Of(
   artist: ArtistRow,
   p: Personal,
-): Record<string, unknown> {
+  context: HatContext,
+): Promise<Record<string, unknown>> {
+  const hasPhoto =
+    !PLACEHOLDER_KINDS.some((kind) => PLACEHOLDER_IDS[kind] === artist.id) &&
+    await context.app.artwork?.hasArtistPhoto(artist.id);
   return {
     id: artist.id,
     name: artist.name,
     albumCount: artist.albumCount,
     // ArtistID3.md:52,65: supported field, empty JSON default when unknown.
     musicBrainzId: artist.musicBrainzId ?? '',
+    sortName: artist.sortName ?? '',
+    roles: artist.roles ?? [],
+    coverArt: hasPhoto ? artist.id : undefined,
     ...artistFields(p.artist(artist.id)),
   };
 }
@@ -359,7 +366,7 @@ function indexName(key: string): string {
 
 export async function artistIndex(
   context: HatContext,
-  build: typeof artistOf,
+  build: typeof artistOf | typeof artistId3Of,
   ignoredArticles: string[],
 ): Promise<Record<string, unknown>[]> {
   const folderId = await folderIdParam(context);
@@ -382,7 +389,7 @@ export async function artistIndex(
   for (const artist of artists) {
     const name = indexName(artist.sortKey!);
     const list = groups.get(name) ?? [];
-    list.push(build(artist, p));
+    list.push(await build(artist, p, context));
     groups.set(name, list);
   }
   return [...groups.keys()].sort().map((name) => ({

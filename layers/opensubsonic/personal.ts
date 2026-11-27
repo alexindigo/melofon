@@ -19,6 +19,7 @@ export interface Facts {
   averageRating?: number;
   playCount: number;
   played?: string;
+  bookmarkPosition?: number;
 }
 
 export interface Personal {
@@ -69,6 +70,7 @@ function emptyPersonal(): Personal {
 export async function loadPersonal(
   context: HatContext,
   ids: { songs?: string[]; albums?: string[]; artists?: string[] },
+  savedPositions?: ReadonlyMap<string, number>,
 ): Promise<Personal> {
   const user = context.state.user;
   const songs = ids.songs ?? [];
@@ -76,9 +78,13 @@ export async function loadPersonal(
   const artists = ids.artists ?? [];
   const all = [...songs, ...albums, ...artists];
   if (user === undefined || all.length === 0) return emptyPersonal();
-  const annotations = await context.app.annotation.facts(user.username, [
-    ...new Set(all),
-  ]);
+  const annotations = await context.app.annotation.facts(
+    user.username,
+    [...new Set(all)],
+    savedPositions || songs.length === 0
+      ? undefined
+      : { bookmarkTrackIds: [...new Set(songs)] },
+  );
   const plays = await context.app.listens.facts(user.username, {
     songs,
     albums,
@@ -86,8 +92,13 @@ export async function loadPersonal(
   });
   const of = (kind: Record<string, PlayRow>) => (id: string) =>
     factsOf(annotations[id], kind[id] ?? NO_PLAYS);
+  const songFacts = of(plays.songs);
   return {
-    song: of(plays.songs),
+    song: (id) => ({
+      ...songFacts(id),
+      bookmarkPosition: savedPositions?.get(id) ??
+        annotations[id]?.bookmarkPositionMs,
+    }),
     album: of(plays.albums),
     artist: of(plays.artists),
   };
@@ -104,6 +115,7 @@ export function childFields(f: Facts): Record<string, unknown> {
     averageRating: f.averageRating,
     playCount: f.playCount > 0 ? f.playCount : undefined,
     played: f.played ?? '',
+    bookmarkPosition: f.bookmarkPosition,
   };
 }
 

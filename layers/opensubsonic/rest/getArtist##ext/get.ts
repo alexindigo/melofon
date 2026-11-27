@@ -23,7 +23,7 @@ export default async (_request: HatRequest, context: HatContext) => {
   });
   return ok(context, {
     artist: {
-      ...artistId3Of(artist, p),
+      ...await artistId3Of(artist, p, context),
       album: albums.map((album) => albumId3Of(album, p)),
     },
   });

@@ -13,7 +13,9 @@ export default async (_request: HatRequest, context: HatContext) => {
   const { artists, albums, songs, personal: p } = await starredLists(context);
   return ok(context, {
     starred2: {
-      artist: artists.map((artist) => artistId3Of(artist, p)),
+      artist: await Promise.all(
+        artists.map((artist) => artistId3Of(artist, p, context)),
+      ),
       album: albums.map((album) => albumId3Of(album, p)),
       song: songs.map((song) => childOf(song, p)),
     },

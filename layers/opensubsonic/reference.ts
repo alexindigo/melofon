@@ -110,7 +110,9 @@ export async function artistInfo(
     artists: present.map((a) => a.id),
   });
   const build = id3 ? artistId3Of : artistOf;
-  const similar = present.map((a) => build(a, personal));
+  const similar = await Promise.all(
+    present.map((a) => build(a, personal, context)),
+  );
   if (include) {
     for (const a of related) {
       if (!a.present) {

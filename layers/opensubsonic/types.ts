@@ -226,6 +226,7 @@ export interface HatContext {
       facts(
         username: string,
         targetIds: string[],
+        opts?: { bookmarkTrackIds: string[] },
       ): Promise<Record<string, PersonalFactsRow>>;
     };
     listens: {
@@ -521,6 +522,8 @@ export interface ArtistRow {
   id: string;
   name: string;
   musicBrainzId?: string | null;
+  sortName?: string | null;
+  roles?: string[];
   albumCount: number;
   sortKey?: string;
 }
@@ -539,6 +542,9 @@ export interface AlbumRow {
     sortName: string | null;
     explicit: string | null;
     discTitles: { disc: number; title: string }[] | null;
+    artistDetails?:
+      | { artists: ArtistCredit[]; displayArtist: string | null }
+      | null;
   };
   id: string;
   name: string | null;
@@ -551,6 +557,11 @@ export interface AlbumRow {
   year: number | null;
   /** Earliest first observation among the album's listed files. */
   createdAtMs: number | null;
+}
+
+interface ArtistCredit {
+  id: string;
+  name: string;
 }
 
 export interface SongRow {
@@ -575,6 +586,17 @@ export interface SongRow {
     sortTitle: string | null;
     bpm: number | null;
     explicit: string | null;
+    tagDetails?: {
+      credits: { role: string; subRole?: string; artist: ArtistCredit }[];
+      displayArtist: string | null;
+      displayAlbumArtist: string | null;
+      displayComposer: string | null;
+      works: { name: string; musicBrainzId?: string }[];
+      movements: { name: string; number?: number; count?: number }[];
+      groupings: string[];
+    } | null;
+    videoWidth?: number | null;
+    videoHeight?: number | null;
   };
   id: string;
   path: string;
@@ -619,6 +641,7 @@ export interface StarredItem {
 }
 
 export interface PersonalFactsRow {
+  bookmarkPositionMs?: number;
   /** The latest event is a star. */
   starred: boolean;
   /** This user's events for the item, ascending (oldest first). */

@@ -25,6 +25,14 @@ function itemDate(value: string | null | undefined): Record<string, number> {
 
 export function songMetadataFields(song: SongRow): Record<string, unknown> {
   const m = song.metadata;
+  const details = m?.tagDetails;
+  const credits = details?.credits ?? [];
+  const artists = credits.filter(({ role }) => role === 'artist').map((
+    { artist },
+  ) => artist);
+  const albumArtists = credits.filter(({ role }) => role === 'albumartist').map(
+    ({ artist }) => artist,
+  );
   const replayGain = Object.fromEntries(
     (['trackGain', 'albumGain', 'trackPeak', 'albumPeak', 'baseGain'] as const)
       .flatMap((key) => m?.[key] == null ? [] : [[key, m[key]]]),
@@ -47,11 +55,35 @@ export function songMetadataFields(song: SongRow): Record<string, unknown> {
     bpm: m?.bpm ?? 0,
     explicitStatus: m?.explicit ?? '',
     replayGain,
+    artists: artists.length
+      ? artists
+      : song.artistId && song.artistName
+      ? [{ id: song.artistId, name: song.artistName }]
+      : [],
+    displayArtist: details?.displayArtist ?? song.artistName ?? '',
+    albumArtists,
+    displayAlbumArtist: details?.displayAlbumArtist ??
+      albumArtists.map(({ name }) => name).join(', '),
+    contributors: credits.filter(({ role }) =>
+      role !== 'artist' && role !== 'albumartist'
+    ),
+    displayComposer: details?.displayComposer ?? '',
+    works: details?.works ?? [],
+    movements: details?.movements ?? [],
+    groupings: details?.groupings ?? [],
+    originalWidth: song.isVideo ? m?.videoWidth ?? undefined : undefined,
+    originalHeight: song.isVideo ? m?.videoHeight ?? undefined : undefined,
   };
 }
 
 export function albumMetadataFields(album: AlbumRow): Record<string, unknown> {
   const m = album.metadata;
+  const details = m?.artistDetails;
+  const artists = details?.artists.length
+    ? details.artists
+    : album.artistId && album.artistName
+    ? [{ id: album.artistId, name: album.artistName }]
+    : [];
   return {
     musicBrainzId: m?.musicBrainzId ?? '',
     genre: m?.genres?.[0] ?? undefined,
@@ -66,5 +98,8 @@ export function albumMetadataFields(album: AlbumRow): Record<string, unknown> {
     sortName: m?.sortName ?? '',
     explicitStatus: m?.explicit ?? '',
     discTitles: m?.discTitles ?? [],
+    artists,
+    displayArtist: details?.displayArtist ?? album.artistName ??
+      artists.map(({ name }) => name).join(', '),
   };
 }

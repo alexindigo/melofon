@@ -117,6 +117,8 @@ Deno.test('getVideos lists the fixture video as a Child with isVideo', async () 
     const clip = videos[0];
     assertEquals(clip.title, 'Clip');
     assertEquals(clip.isVideo, true);
+    assertEquals(clip.originalWidth, 160);
+    assertEquals(clip.originalHeight, 120);
     assertEquals(clip.type, 'video');
     assertEquals(clip.isDir, false);
     assertEquals(clip.album, 'Fixture Album');
@@ -133,6 +135,7 @@ Deno.test('getVideos lists the fixture video as a Child with isVideo', async () 
     assert(text.includes('<videos>'));
     assert((text.match(/<video /g) ?? []).length === 1);
     assert(text.includes('isVideo="true"'));
+    assert(text.includes('originalWidth="160" originalHeight="120"'));
   } finally {
     await close();
   }

@@ -170,12 +170,18 @@ Deno.test('artist folders follow exclusive album ownership across scan, librarie
     }
     const artistsBody =
       (await (await s.request('getArtists')).json())['subsonic-response'];
-    const placeholder = artistsBody.artists.index.flatMap((
-      i: { artist: { id: string; name: string }[] },
-    ) => i.artist).find((a: { name: string }) => a.name === '[Unknown Artist]');
+    const artists = artistsBody.artists.index.flatMap((
+      i: { artist: { id: string; name: string; coverArt?: string }[] },
+    ) => i.artist) as { id: string; name: string; coverArt?: string }[];
+    const placeholder = artists.find((a) => a.name === '[Unknown Artist]');
     assert(placeholder);
     assertEquals(await s.library.artistFolder(placeholder.id), null);
-    assertEquals(await dimensions(await s.cover(solo.id)), [30, 20]);
+    const soloCover = artists.find((a) => a.id === solo.id)?.coverArt;
+    assert(soloCover);
+    assertEquals(await dimensions(await s.cover(soloCover)), [30, 20]);
+    const artistXml =
+      await (await s.request('getArtist', { id: solo.id, f: 'xml' })).text();
+    assert(artistXml.includes(`coverArt="${soloCover}"`));
     assertEquals(await dimensions(await s.cover(solo.id, 15)), [15, 10]);
     const cached = await s.cover(solo.id, 15);
     assertEquals(cached.headers.get('x-artwork-cache'), 'hit');

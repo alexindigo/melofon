@@ -36,6 +36,7 @@ export interface ArtistRow {
   musicBrainzId: string | null;
   /** Present when files carry an artist sort tag. */
   sortName?: string;
+  roles?: string[];
   albumCount: number;
   /** Resolved text/grouping key on opted-in lists; natural tokens stay internal. */
   sortKey?: string;
@@ -669,6 +670,25 @@ function artistGroupOf(row: ArtistGroupSqlRow): ArtistGroupRow {
   };
 }
 
+async function withArtistRoles(
+  q: Queries,
+  artists: ArtistRow[],
+): Promise<ArtistRow[]> {
+  if (artists.length === 0) return artists;
+  const found = await q.all<{ id: string; role: string }>(
+    `SELECT id, role FROM catalog_artist_roles
+     WHERE id IN (${artists.map(({ id }) => esc(id)).join(', ')})
+     ORDER BY role`,
+  );
+  const byId = new Map<string, string[]>();
+  for (const { id, role } of found) {
+    const list = byId.get(id);
+    if (list) list.push(role);
+    else byId.set(id, [role]);
+  }
+  return artists.map((row) => ({ ...row, roles: byId.get(row.id) ?? [] }));
+}
+
 // Both root groups and details use the same scoped album population. Details
 // additionally admit a performer present only on tracks, with zero memberships.
 function artistGroups(folderId?: string, trackOnly = false): string {
@@ -902,15 +922,15 @@ function catalogReads(q: Queries): CatalogReads {
       sort_name: string | null;
       album_count: number | bigint;
     }[])[0];
-    return row
-      ? {
-        id: row.id,
-        name: row.name,
-        musicBrainzId: row.musicbrainz_id,
-        ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
-        albumCount: Number(row.album_count),
-      }
-      : null;
+    if (!row) return null;
+    const [artist] = await withArtistRoles(q, [{
+      id: row.id,
+      name: row.name,
+      musicBrainzId: row.musicbrainz_id,
+      ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
+      albumCount: Number(row.album_count),
+    }]);
+    return artist;
   }
   return {
     async artistsPage(opts) {
@@ -1008,24 +1028,27 @@ function catalogReads(q: Queries): CatalogReads {
           opts.natural ? naturalKeySql('sort_key') : 'sort_key'
         }, ar.id`,
       );
-      return (res as {
-        id: string;
-        name: string;
-        musicbrainz_id: string | null;
-        sort_name: string | null;
-        album_count: number | bigint;
-        sort_key: string;
-      }[]).map((row) => ({
-        id: row.id,
-        name: row.name,
-        musicBrainzId: row.musicbrainz_id,
-        ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
-        albumCount: Number(row.album_count),
-        ...(opts.ignoredArticles === undefined && !opts.sortTags &&
-            !opts.natural
-          ? {}
-          : { sortKey: row.sort_key }),
-      }));
+      return withArtistRoles(
+        q,
+        (res as {
+          id: string;
+          name: string;
+          musicbrainz_id: string | null;
+          sort_name: string | null;
+          album_count: number | bigint;
+          sort_key: string;
+        }[]).map((row) => ({
+          id: row.id,
+          name: row.name,
+          musicBrainzId: row.musicbrainz_id,
+          ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
+          albumCount: Number(row.album_count),
+          ...(opts.ignoredArticles === undefined && !opts.sortTags &&
+              !opts.natural
+            ? {}
+            : { sortKey: row.sort_key }),
+        })),
+      );
     },
 
     async getArtist(id) {
@@ -1400,19 +1423,22 @@ function catalogReads(q: Queries): CatalogReads {
            LIMIT ${opts.songCount} OFFSET ${opts.songOffset}`,
       );
       return {
-        artists: (artistRes as {
-          id: string;
-          name: string;
-          musicbrainz_id: string | null;
-          sort_name: string | null;
-          album_count: number | bigint;
-        }[]).map((row) => ({
-          id: row.id,
-          name: row.name,
-          musicBrainzId: row.musicbrainz_id,
-          ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
-          albumCount: Number(row.album_count),
-        })),
+        artists: await withArtistRoles(
+          q,
+          (artistRes as {
+            id: string;
+            name: string;
+            musicbrainz_id: string | null;
+            sort_name: string | null;
+            album_count: number | bigint;
+          }[]).map((row) => ({
+            id: row.id,
+            name: row.name,
+            musicBrainzId: row.musicbrainz_id,
+            ...(row.sort_name === null ? {} : { sortName: row.sort_name }),
+            albumCount: Number(row.album_count),
+          })),
+        ),
         albums: (albumRes as unknown as AlbumSqlRow[]).map(
           albumOf,
         ),
@@ -2072,10 +2098,12 @@ async function replaceCatalog(
       }`,
     );
   }
-  await q.run(
-    `DELETE FROM artists WHERE id NOT IN (SELECT artist_id FROM files WHERE artist_id IS NOT NULL)
-    AND id NOT IN (SELECT album_artist_id FROM albums WHERE album_artist_id IS NOT NULL)`,
-  );
+  await pruneArtists(q);
+}
+
+async function pruneArtists(q: Queries): Promise<void> {
+  await q.run(`DELETE FROM artists ar WHERE NOT EXISTS (
+    SELECT 1 FROM catalog_artist_roles cr WHERE cr.id = ar.id)`);
 }
 
 async function checkLibraryPath(q: Queries, path: string, id?: string) {
@@ -2376,14 +2404,7 @@ export function createCatalogStore(engine: Engine) {
           `DELETE FROM albums WHERE id NOT IN
              (SELECT DISTINCT album_id FROM files WHERE album_id IS NOT NULL)`,
         );
-        await q.run(
-          `DELETE FROM artists WHERE id NOT IN
-             (SELECT album_artist_id FROM albums
-               WHERE album_artist_id IS NOT NULL)
-           AND id NOT IN
-             (SELECT DISTINCT artist_id FROM files
-               WHERE artist_id IS NOT NULL)`,
-        );
+        await pruneArtists(q);
         await advanceCatalogRevision(q);
         return true;
       });

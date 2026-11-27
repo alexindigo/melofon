@@ -1,5 +1,6 @@
 // Catalog facts, independent of either protocol, database or tag-parser runtime.
 import type { IAudioMetadata } from 'music-metadata';
+import type { AlbumArtistDetails, TrackTagDetails } from './music-credits.ts';
 
 export interface SongMetadata {
   bitRate: number | null;
@@ -32,6 +33,9 @@ export interface SongMetadata {
   compilation: boolean;
   version: string | null;
   albumSortName: string | null;
+  tagDetails?: TrackTagDetails | null;
+  videoWidth?: number | null;
+  videoHeight?: number | null;
 }
 
 export interface AlbumMetadata {
@@ -47,6 +51,7 @@ export interface AlbumMetadata {
   sortName: string | null;
   explicit: 'explicit' | 'clean' | null;
   discTitles: { disc: number; title: string }[];
+  artistDetails?: AlbumArtistDetails | null;
 }
 
 const text = (value: string | undefined) => value?.trim() || null;
@@ -238,6 +243,13 @@ export function albumMetadata(
   const discTitles = [...discs].sort(([a], [b]) => a - b).map((
     [disc, title],
   ) => ({ disc, title }));
+  const albumArtists = new Map(
+    rows.flatMap((row) => row.tagDetails?.credits ?? [])
+      .filter(({ role }) => role === 'albumartist')
+      .map(({ artist }) => [artist.id, artist]),
+  );
+  const displayArtist = rows.find((row) => row.tagDetails?.displayAlbumArtist)
+    ?.tagDetails?.displayAlbumArtist ?? null;
   return {
     musicBrainzId: mbid,
     recordLabels: merge('recordLabels'),
@@ -257,5 +269,6 @@ export function albumMetadata(
     discTitles: discTitles.length === 1 && !discTitles[0].title
       ? []
       : discTitles,
+    artistDetails: { artists: [...albumArtists.values()], displayArtist },
   };
 }

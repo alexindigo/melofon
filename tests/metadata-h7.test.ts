@@ -292,6 +292,213 @@ async function setup(prepare: (root: string) => Promise<unknown>) {
   };
 }
 
+Deno.test('song and album tag credits and classical facts reach OpenSubsonic JSON and XML', async () => {
+  const workId = 'eeeeeeee-bbbb-cccc-dddd-aaaaaaaaaaaa';
+  const s = await setup(async (root) => {
+    await tagged(`${root}/rich.mp3`, [
+      ['TIT2', 'Quartet II'],
+      ['TALB', 'The Quartet'],
+      ['TPE1', 'Lead & Guests feat. Guest'],
+      ['TXXX', 'ARTISTS\0Lead & Guests\0Guest'],
+      ['TPE2', 'Quartet & Chorus'],
+      ['TXXX', 'ALBUMARTISTS\0Quartet\0Chorus'],
+      ['TSO2', 'Quartet and Chorus, The'],
+      ['TSOT', 'Quartet, Second'],
+      ['TSOA', 'Quartet, The'],
+      ['TCOM', 'One Composer\0Second Composer'],
+      ['TPE3', 'The Conductor'],
+      ['TEXT', 'The Lyricist'],
+      ['TMCL', 'Bass\0Guest\0Voice\0Guest'],
+      ['TIPL', 'arranger\0The Conductor'],
+      ['TXXX', 'WORK\0The Quartet in C'],
+      ['TXXX', `MusicBrainz Work Id\0${workId}`],
+      ['MVNM', 'Andante'],
+      ['MVIN', '2/4'],
+      ['GRP1', 'Classical\0Live'],
+    ]);
+    await tagged(`${root}/plain.mp3`, { TIT2: 'Tag-light track' });
+  });
+  try {
+    const [plain, rich] = await s.songs();
+    const { song } = await s.get('getSong', { id: rich.id });
+    assertEquals(song.artist, 'Lead & Guests feat. Guest');
+    assertEquals(song.artistId, rich.artistId);
+    assertEquals(song.displayArtist, 'Lead & Guests feat. Guest');
+    assertEquals(song.displayAlbumArtist, 'Quartet & Chorus');
+    assertEquals(song.displayComposer, 'One Composer, Second Composer');
+    assertEquals(song.sortName, 'Quartet, Second');
+    assertEquals(song.artists.map((a: { name: string }) => a.name), [
+      'Lead & Guests',
+      'Guest',
+    ]);
+    assertEquals(song.albumArtists.map((a: { name: string }) => a.name), [
+      'Quartet',
+      'Chorus',
+    ]);
+    assertEquals(song.works, [{
+      name: 'The Quartet in C',
+      musicBrainzId: workId,
+    }]);
+    assertEquals(song.movements, [{ name: 'Andante', number: 2, count: 4 }]);
+    assertEquals(song.groupings, ['Classical', 'Live']);
+    assertEquals(
+      song.contributors.map((
+        c: { role: string; subRole?: string; artist: { name: string } },
+      ) => [c.role, c.subRole ?? '', c.artist.name]),
+      [
+        ['composer', '', 'One Composer'],
+        ['composer', '', 'Second Composer'],
+        ['conductor', '', 'The Conductor'],
+        ['lyricist', '', 'The Lyricist'],
+        ['performer', 'Bass', 'Guest'],
+        ['performer', 'Voice', 'Guest'],
+        ['arranger', '', 'The Conductor'],
+      ],
+    );
+    const guest = song.artists[1];
+    assertEquals(Object.keys(guest).sort(), ['id', 'name']);
+    const guestDetails = (await s.get('getArtist', { id: guest.id })).artist;
+    assertEquals(guestDetails.name, 'Guest');
+    assertEquals(guestDetails.roles, ['artist', 'performer']);
+    assertEquals(guestDetails.sortName, '');
+    assertEquals(guestDetails.albumCount, 0);
+    assertEquals(
+      (await s.get('search3', { query: 'Guest' })).searchResult3.artist,
+      [],
+    );
+
+    const { album } = await s.get('getAlbum', { id: rich.albumId! });
+    assertEquals(album.artists, song.albumArtists);
+    assertEquals(album.artist, 'Quartet & Chorus');
+    assertEquals(album.displayArtist, 'Quartet & Chorus');
+    assertEquals(album.sortName, 'Quartet, The');
+    assertEquals(album.song[0].contributors, song.contributors);
+    const owner = (await s.get('getArtist', { id: album.artistId })).artist;
+    assertEquals(owner.sortName, 'Quartet and Chorus, The');
+    assertEquals(owner.roles, ['albumartist']);
+    const searched = await s.get('search3', { query: 'Quartet' });
+    assertEquals(searched.searchResult3.artist[0].sortName, owner.sortName);
+    assertEquals(searched.searchResult3.artist[0].roles, owner.roles);
+    assertEquals(searched.searchResult3.song[0].works, song.works);
+
+    const xml = await (await s.request('getSong', { id: rich.id }, true))
+      .text();
+    assert(xml.includes('displayArtist="Lead &amp; Guests feat. Guest"'));
+    assert(xml.includes('displayAlbumArtist="Quartet &amp; Chorus"'));
+    assert(xml.includes('displayComposer="One Composer, Second Composer"'));
+    assert(xml.includes(`<artists id="${guest.id}" name="Guest"/>`));
+    assert(
+      xml.includes(
+        `<albumArtists id="${album.artists[0].id}" name="Quartet"/>`,
+      ),
+    );
+    assert(
+      xml.includes(
+        `<contributors role="performer" subRole="Bass"><artist id="${guest.id}" name="Guest"/></contributors>`,
+      ),
+    );
+    assert(
+      xml.includes(
+        `<works name="The Quartet in C" musicBrainzId="${workId}"/>`,
+      ),
+    );
+    assert(xml.includes('<movements name="Andante" number="2" count="4"/>'));
+    assert(
+      xml.includes(
+        '<groupings>Classical</groupings><groupings>Live</groupings>',
+      ),
+    );
+    const albumXml =
+      await (await s.request('getAlbum', { id: rich.albumId! }, true)).text();
+    assert(albumXml.includes('displayArtist="Quartet &amp; Chorus"'));
+    assert(
+      albumXml.includes(
+        `<artists id="${album.artists[0].id}" name="Quartet"/>`,
+      ),
+    );
+    const artistXml =
+      await (await s.request('getArtist', { id: album.artistId }, true)).text();
+    assert(artistXml.includes('sortName="Quartet and Chorus, The"'));
+    assert(artistXml.includes('<roles>albumartist</roles>'));
+
+    const empty = (await s.get('getSong', { id: plain.id })).song;
+    for (
+      const key of [
+        'artists',
+        'albumArtists',
+        'contributors',
+        'works',
+        'movements',
+        'groupings',
+      ]
+    ) {
+      assertEquals(empty[key], [], key);
+    }
+    for (
+      const key of [
+        'displayArtist',
+        'displayAlbumArtist',
+        'displayComposer',
+        'sortName',
+      ]
+    ) {
+      assertEquals(empty[key], '', key);
+    }
+    const emptyXml = await (await s.request('getSong', { id: plain.id }, true))
+      .text();
+    for (
+      const key of [
+        'displayArtist=',
+        'displayAlbumArtist=',
+        'displayComposer=',
+        '<contributors',
+        '<works',
+        '<movements',
+      ]
+    ) {
+      assert(!emptyXml.includes(key), key);
+    }
+
+    await Deno.remove(`${s.root}/rich.mp3`);
+    await s.scan();
+    assertEquals((await s.get('getArtist', { id: guest.id })).error?.code, 70);
+  } finally {
+    await s.close();
+  }
+});
+
+Deno.test('Vorbis comments preserve performer instruments and an explicitly numbered movement', async () => {
+  const s = await setup((root) =>
+    remux(`${root}/concert.flac`, 'flac', {
+      TITLE: 'The Trio',
+      ARTIST: 'Lead & Trio',
+      ALBUMARTIST: 'The Trio',
+      COMPOSER: 'The Composer',
+      PERFORMER: 'First Violinist (violin)',
+      WORK: 'Trio in G',
+      MOVEMENTNAME: 'Largo',
+      MOVEMENTNUMBER: '1',
+      MOVEMENTTOTAL: '3',
+      GROUPING: 'Chamber Music',
+    })
+  );
+  try {
+    const [row] = await s.songs();
+    const { song } = await s.get('getSong', { id: row.id });
+    assertEquals(song.displayComposer, 'The Composer');
+    const performer = song.contributors.find((c: { role: string }) =>
+      c.role === 'performer'
+    );
+    assertEquals(performer.subRole, 'violin');
+    assertEquals(performer.artist.name, 'First Violinist');
+    assertEquals(song.works, [{ name: 'Trio in G' }]);
+    assertEquals(song.movements, [{ name: 'Largo', number: 1, count: 3 }]);
+    assertEquals(song.groupings, ['Chamber Music']);
+  } finally {
+    await s.close();
+  }
+});
+
 Deno.test('H7 ID3v2.4 facts reach getSong, getAlbum and search3 JSON/XML', async () => {
   const s = await setup((root) => mp3(`${root}/song.mp3`));
   try {

@@ -30,7 +30,9 @@ export default async (_request: HatRequest, context: HatContext) => {
   });
   return ok(context, {
     searchResult2: {
-      artist: result.artists.map((artist) => artistId3Of(artist, p)),
+      artist: await Promise.all(
+        result.artists.map((artist) => artistId3Of(artist, p, context)),
+      ),
       album: result.albums.map((album) => albumV1Of(album, p)),
       song: result.songs.map((song) => childOf(song, p)),
     },

@@ -106,6 +106,8 @@ export type AudioCodecToken = string;
 export interface Probe {
   audioStreams?: MediaTrack[];
   subtitleStreams?: MediaTrack[];
+  videoWidth?: number;
+  videoHeight?: number;
   durationMs: number | null;
   hasVideo: boolean;
   hasAudio: boolean;
@@ -1484,6 +1486,7 @@ export function createMedia(
         const seconds = input.duration;
         const types = input.streams.map((s) => s.codecpar.codecType);
         const audio = input.audio();
+        const video = input.video()?.codecpar;
         const bitrateKbps = input.bitRate;
         const tracks = (type: number): MediaTrack[] =>
           input.streams
@@ -1505,6 +1508,9 @@ export function createMedia(
             ? {
               audioStreams: tracks(AVMEDIA_TYPE_AUDIO),
               subtitleStreams: tracks(AVMEDIA_TYPE_SUBTITLE),
+              ...(video && video.width > 0 && video.height > 0
+                ? { videoWidth: video.width, videoHeight: video.height }
+                : {}),
             }
             : {}),
           durationMs: seconds > 0 ? Math.round(seconds * 1000) : null,

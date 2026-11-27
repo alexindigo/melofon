@@ -11,6 +11,24 @@ export interface BookmarkRow {
 
 export function createBookmarksStore(engine: Engine) {
   return {
+    positions(
+      username: string,
+      trackIds: string[],
+    ): Promise<Record<string, number>> {
+      if (trackIds.length === 0) return Promise.resolve({});
+      return engine.exclusive(async (q) => {
+        const userId = await requireUserId(q, username);
+        const rows = await q.all<{ track_id: string; position_ms: number }>(
+          `SELECT track_id, position_ms FROM bookmarks
+           WHERE user_id = ${esc(userId)} AND track_id IN (${
+            trackIds.map(esc).join(', ')
+          })`,
+        );
+        return Object.fromEntries(
+          rows.map((row) => [row.track_id, Number(row.position_ms)]),
+        );
+      });
+    },
     list(username: string): Promise<BookmarkRow[]> {
       return atomic(engine, async (q) => {
         const userId_ = await requireUserId(q, username);

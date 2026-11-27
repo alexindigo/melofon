@@ -192,6 +192,9 @@ ALTER TABLE files ADD COLUMN IF NOT EXISTS original_release_date VARCHAR;
 ALTER TABLE files ADD COLUMN IF NOT EXISTS compilation BOOLEAN;
 ALTER TABLE files ADD COLUMN IF NOT EXISTS version VARCHAR;
 ALTER TABLE files ADD COLUMN IF NOT EXISTS album_sort_name VARCHAR;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS tag_details JSON;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS video_width INTEGER;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS video_height INTEGER;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS musicbrainz_id VARCHAR;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS record_labels VARCHAR[];
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_types VARCHAR[];
@@ -204,6 +207,17 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS version VARCHAR;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS sort_name VARCHAR;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS explicit VARCHAR;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS disc_titles JSON;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS artist_details JSON;
+
+-- Artist role membership derives from the current catalog, so deleting a
+-- file or library cannot leave stale credited artists or stale roles.
+CREATE OR REPLACE VIEW catalog_artist_roles AS
+  SELECT artist_id AS id, 'artist' AS role FROM files WHERE artist_id IS NOT NULL
+  UNION
+  SELECT album_artist_id, 'albumartist' FROM albums WHERE album_artist_id IS NOT NULL
+  UNION
+  SELECT json_extract_string(credit, '$.artist.id'), json_extract_string(credit, '$.role')
+  FROM files, UNNEST(json_extract(tag_details, '$.credits[*]')) AS c(credit);
 
 -- M2 user state (keep-on-rescan: scan never deletes from these).
 CREATE TABLE IF NOT EXISTS listens (

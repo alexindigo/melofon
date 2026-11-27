@@ -18,9 +18,14 @@ export default async (_request: HatRequest, context: HatContext) => {
     if (song === null) continue; // bookmarked-then-removed track — skip
     resolved.push({ row, song });
   }
-  const p = await loadPersonal(context, {
-    songs: resolved.map(({ song }) => song.id),
-  });
+  const positions = new Map(
+    resolved.map(({ row, song }) => [song.id, row.positionMs]),
+  );
+  const p = await loadPersonal(
+    context,
+    { songs: [...positions.keys()] },
+    positions,
+  );
   const bookmarks = resolved.map(({ row, song }) => ({
     entry: childOf(song, p),
     position: row.positionMs,

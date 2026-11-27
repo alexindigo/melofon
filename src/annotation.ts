@@ -34,7 +34,8 @@ export interface Annotation {
   facts(
     username: string,
     targetIds: string[],
-  ): Promise<Record<string, PersonalFacts>>;
+    opts?: { bookmarkTrackIds: string[] },
+  ): Promise<Record<string, PersonalFacts & { bookmarkPositionMs?: number }>>;
   /** Across all users: star events for the id and distinct users with one. */
   likes(targetId: string): Promise<{ likes: number; users: number }>;
 }
@@ -70,8 +71,23 @@ export function createAnnotation(store: Store): Annotation {
       return true;
     },
     starred: (username, opts) => store.annotations.starred(username, opts),
-    facts: (username, targetIds) =>
-      store.annotations.facts(username, targetIds),
+    async facts(username, targetIds, opts) {
+      const facts: Record<
+        string,
+        PersonalFacts & { bookmarkPositionMs?: number }
+      > = await store.annotations.facts(username, targetIds);
+      if (!opts?.bookmarkTrackIds.length) return facts;
+      const positions = await store.bookmarks.positions(
+        username,
+        opts.bookmarkTrackIds,
+      );
+      for (const [id, bookmarkPositionMs] of Object.entries(positions)) {
+        if (Object.hasOwn(facts, id)) {
+          facts[id].bookmarkPositionMs = bookmarkPositionMs;
+        }
+      }
+      return facts;
+    },
     likes: (targetId) => store.annotations.likes(targetId),
   };
 }

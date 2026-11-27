@@ -15,6 +15,7 @@ import { createUserService } from '../src/user.ts';
 import { createLibrary } from '../src/library.ts';
 import { createAnnotation } from '../src/annotation.ts';
 import { createListens } from '../src/listens.ts';
+import { createBookmarks } from '../src/bookmarks.ts';
 import { createPlaylists } from '../src/playlists.ts';
 import { createNowPlaying } from '../src/nowplaying.ts';
 import { createPlayer } from '../src/player.ts';
@@ -77,6 +78,7 @@ async function setup(split = false) {
     library,
     annotation: createAnnotation(store),
     listens: createListens(store),
+    bookmarks: createBookmarks(store),
     playlists: createPlaylists(store),
     nowPlaying,
     player,
@@ -165,6 +167,42 @@ async function setup(split = false) {
 }
 
 type Setup = Awaited<ReturnType<typeof setup>>;
+
+Deno.test("song Children read each caller's bookmark in milliseconds, including zero", async () => {
+  await withSetup(async (s) => {
+    const id = s.ids.first;
+    const read = async (user: string) =>
+      ((await s.okGet('getSong', { id }, user)).song as Item).bookmarkPosition;
+    await s.okGet('createBookmark', { id, position: '1350' });
+    assertEquals(await read('admin'), 1350);
+    assertEquals(await read('bob'), undefined);
+    assert(
+      (await s.xml('getSong', { id })).includes('bookmarkPosition="1350"'),
+    );
+    assert(
+      !(await s.xml('getSong', { id }, 'bob')).includes('bookmarkPosition='),
+    );
+    await s.okGet('createBookmark', { id, position: '0' }, 'bob');
+    assertEquals(await read('bob'), 0);
+    assert(
+      (await s.xml('getSong', { id }, 'bob')).includes('bookmarkPosition="0"'),
+    );
+    const { album } = await s.okGet('getAlbum', { id: s.ids.album });
+    assertEquals((album as Item).bookmarkPosition, undefined);
+    assertEquals(
+      find(listOf(album, 'song'), id, 'song').bookmarkPosition,
+      1350,
+    );
+    const { bookmarks } = await s.okGet('getBookmarks');
+    assertEquals(
+      (listOf(bookmarks, 'bookmark')[0].entry as Item).bookmarkPosition,
+      1350,
+    );
+    await s.okGet('deleteBookmark', { id });
+    assertEquals(await read('admin'), undefined);
+    assertEquals(await read('bob'), 0);
+  });
+});
 
 async function withSetup(fn: (s: Setup) => Promise<void>, split = false) {
   const s = await setup(split);

@@ -1113,6 +1113,7 @@ Deno.test('store.catalog artist and album reads return plain rows, scoped counts
       name: 'Artist',
       musicBrainzId: null,
       albumCount: 1,
+      roles: ['albumartist', 'artist'],
     }]);
     assertEquals(await t.domain.listArtists('missing'), []);
     assertEquals(await t.domain.getArtist('performer'), null);
@@ -1121,6 +1122,7 @@ Deno.test('store.catalog artist and album reads return plain rows, scoped counts
       name: 'Performer',
       musicBrainzId: null,
       albumCount: 0,
+      roles: [],
     });
     const album = {
       id: 'album',
