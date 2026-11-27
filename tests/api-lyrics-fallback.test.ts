@@ -612,7 +612,7 @@ Deno.test('API lyrics: timed LRC backgrounds keep per-voice byte offsets, repeat
     '[lang:ukr]',
     '[bg: <00:00.00>orphan]',
     '[00:01.00][00:11.00]<00:01.00>Я<00:02.00>',
-    '[bg: <00:01.30>🎵<00:01.80>]',
+    '[bg: <00:00.90>🎵<00:01.80>]',
     '[bg: untimed]',
     '[bg: <00:02.20>так<00:02.70>]',
     '[00:03.00]<00:03.00>Ми',
@@ -678,11 +678,11 @@ Deno.test('API lyrics: timed LRC backgrounds keep per-voice byte offsets, repeat
         const bg = {
           index,
           agentId: 'bg',
-          start,
+          start: start - 100,
           value: '🎵 так',
           cue: [
             {
-              start: start + 300,
+              start: start - 100,
               end: start + 800,
               value: '🎵',
               byteStart: 0,
@@ -713,7 +713,7 @@ Deno.test('API lyrics: timed LRC backgrounds keep per-voice byte offsets, repeat
       assert(xml.includes('<line start="1000">Я 🎵 так</line>'));
       assert(
         xml.includes(
-          '<cueLine index="0" agentId="bg" start="1000" value="🎵 так">',
+          '<cueLine index="0" agentId="bg" start="900" value="🎵 так">',
         ),
       );
       assert(

@@ -106,10 +106,8 @@ function shiftCues(cues: LyricsCue[], shift: number): LyricsCue[] {
   }));
 }
 
-function orderedCues(cues: LyricsCue[], minimumStart: number): boolean {
-  return cues.every((cue, i) =>
-    cue.start >= (i === 0 ? minimumStart : cues[i - 1].start)
-  );
+function orderedCues(cues: LyricsCue[]): boolean {
+  return cues.every((cue, i) => i === 0 || cue.start >= cues[i - 1].start);
 }
 
 function appendBackground(vocal: LyricsVocal, part: LyricsVocal): void {
@@ -127,11 +125,15 @@ function appendBackground(vocal: LyricsVocal, part: LyricsVocal): void {
 /** Navidrome 18205366 model/lyrics_lrc.go: timed standalone [bg:] tags
  * attach to the preceding timed row. No tags or timing are guessed. */
 function addBackground(lines: LyricsLine[], background: LyricsVocal): void {
-  if (!lines.length || !orderedCues(background.cues, lines[0].start!)) return;
+  if (!orderedCues(background.cues)) return;
   for (const line of lines) {
+    const shift = line.start! - lines[0].start!;
+    const start = background.cues[0].start + shift;
+    if (start < 0) continue;
     const bg = {
       ...background,
-      cues: shiftCues(background.cues, line.start! - lines[0].start!),
+      start,
+      cues: shiftCues(background.cues, shift),
     };
     const priorBg = line.vocals?.at(-1);
     if (priorBg) {
@@ -201,7 +203,7 @@ export function parseLyrics(
       sawTiming = true;
       const line = enhancedLine(row);
       if (!line) return null;
-      if (line.cues && !orderedCues(line.cues, -Infinity)) return null;
+      if (line.cues && !orderedCues(line.cues)) return null;
       preceding = [];
       for (const start of starts) {
         const shift = start - starts[0];
