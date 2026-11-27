@@ -29,7 +29,7 @@
 - Shutdown retries pending saves and cleans up background work. Playback commands stay tied to the items they target, and native AirPlay diagnostics are retained during polling.
 - Local development and GitHub CI share a reproducible dev container. CI runs native tests from clean checkouts and tests media playback in real Chromium.
 
-**Known limits:** The Apple TV idle-start fix was verified by listening on a test build with the same changes; a cold-start check from this release is pending. Chromium's native HLS player still fails to resume a paused video while its playlist is growing (tracked in `todos/hls-event-chromium-resume.md`).
+**Known limits:** Chromium's native HLS player still fails to resume a paused video while its playlist is growing (tracked in `todos/hls-event-chromium-resume.md`).
 
 [Full changes since 0.2.0](https://github.com/alexindigo/melofon/compare/v0.2.0...v0.3.0)
 
