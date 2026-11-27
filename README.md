@@ -871,6 +871,12 @@ treats `submission` as true when missing or empty and otherwise only for
 
 ## OpenSubsonic catalog sync and selection
 
+The deprecated `search` endpoint returns paged file matches for older clients.
+It combines `artist`, `album`, `title` and `any` criteria with case-insensitive
+substring matching. `newerThan` (epoch milliseconds) selects files first seen
+after the given time. The response includes the total before applying `count`
+and `offset`.
+
 `search3` requires the `query` parameter, but `query=` enumerates the catalog for
 offline sync. Artists, albums and songs have independent count/offset pairs
 (defaults20/0); zero suppresses a group. Counts and offsets are nonnegative safe
@@ -934,6 +940,8 @@ moves. An album uses the earliest first-seen among its listed files; `newest`
 orders that date descending, with ID ties. `recent` and `frequent` include only
 albums the requesting user has played. `byGenre` and `byYear` select album
 membership and count/time the whole album, rather than only matching songs.
+`byYear` orders by the newest matching track year, while the album's displayed
+year still describes the whole album.
 Existing music-folder aggregate scope and empty unmatched-folder behavior stay
 in place. Song Child `parent` points to its album, and album Child `parent` to
 its album artist across browsing, lists and legacy search.

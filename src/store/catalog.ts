@@ -130,6 +130,16 @@ export interface Search3Result {
   songs: SongRow[];
 }
 
+interface SongSearchOptions {
+  artist?: string;
+  album?: string;
+  title?: string;
+  text?: string;
+  addedAfterMs?: number;
+  offset: number;
+  limit: number;
+}
+
 export interface RandomSongOptions {
   size: number;
   folderId?: string;
@@ -326,6 +336,10 @@ export interface CatalogReads {
       folderId?: string;
     },
   ): Promise<Search3Result>;
+  searchSongs(opts: SongSearchOptions): Promise<{
+    rows: SongRow[];
+    total: number;
+  }>;
   searchPages(query: string, opts: SearchPageOptions): Promise<SearchPages>;
   /** Absolute path of a song's audio file, for app.stream. */
   songPath(id: string): Promise<string | null>;
@@ -626,16 +640,23 @@ function albumSelect(q: AlbumQuery = {}, extra = ''): string {
        ) agg ON agg.album_id = al.id`,
     );
   }
-  // Genre and year may be satisfied by different tracks; neither filters the
-  // rows used for album counts, duration or the displayed year.
-  const wheres = [
-    songPredicates({ genre: q.genre }),
-    songPredicates({ fromYear: q.fromYear, toYear: q.toYear }),
-  ].filter((predicates) => predicates.length).map((predicates) =>
-    `EXISTS (SELECT 1 FROM ${files} f WHERE f.album_id = al.id AND ${
-      predicates.join(' AND ')
+  // The range match and its sort key come from the same scoped tracks;
+  // joining one match row per album leaves the overall album facts intact.
+  const years = songPredicates({ fromYear: q.fromYear, toYear: q.toYear });
+  if (years.length) {
+    joins.push(`JOIN (
+      SELECT f.album_id, MAX(f.year) AS matching_year
+      FROM ${files} f WHERE ${years.join(' AND ')}
+      GROUP BY f.album_id
+    ) ym ON ym.album_id = al.id`);
+  }
+  // Genre and year can be satisfied by different tracks.
+  const genres = songPredicates({ genre: q.genre });
+  const genreFilter = genres.length
+    ? `WHERE EXISTS (SELECT 1 FROM ${files} f WHERE f.album_id = al.id AND ${
+      genres.join(' AND ')
     })`
-  );
+    : '';
   return `${withScope}
   SELECT ${extra} al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name AS artist_name,
          COUNT(f.id) AS song_count, COALESCE(SUM(f.duration_ms), 0) AS duration_ms,
@@ -646,7 +667,7 @@ function albumSelect(q: AlbumQuery = {}, extra = ''): string {
   ${scope.length ? 'JOIN' : 'LEFT JOIN'} ${files} f ON f.album_id = al.id
   LEFT JOIN file_identity fi ON fi.id = f.id
   ${joins.join('\n')}
-  ${wheres.length === 0 ? '' : `WHERE ${wheres.join(' AND ')}`}
+  ${genreFilter}
   GROUP BY al.id, al.name, al.album_artist_id, al.artist_kind, al.folder_name, ar.name`;
 }
 
@@ -860,6 +881,23 @@ async function readArtistFolders(
 }
 
 function catalogReads(q: Queries): Omit<CatalogReads, 'artistFolder'> {
+  async function searchPage<T>(
+    select: string,
+    order: string,
+    { offset, limit }: { offset: number; limit: number },
+    bindings?: (string | number)[],
+  ) {
+    const count = await q.all<{ total: bigint }>(
+      `SELECT COUNT(*) AS total FROM (${select}) matches`,
+      bindings,
+    );
+    const rows = await q.all<T>(
+      `${select} ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`,
+      bindings,
+    );
+    return { rows, total: Number(count[0].total) };
+  }
+
   async function requireLibrary(folderId?: string) {
     if (folderId === undefined) return;
     const rows = await q.all(
@@ -1212,8 +1250,8 @@ function catalogReads(q: Queries): Omit<CatalogReads, 'artistFolder'> {
           query.toYear = Math.max(opts.fromYear, opts.toYear);
           // Subsonic: fromYear > toYear is a reverse chronological list.
           order = opts.fromYear > opts.toYear
-            ? `ORDER BY MAX(f.year) DESC, ${secondaryKey}`
-            : `ORDER BY MAX(f.year), ${secondaryKey}`;
+            ? `ORDER BY MAX(ym.matching_year) DESC, ${secondaryKey}`
+            : `ORDER BY MAX(ym.matching_year), ${secondaryKey}`;
           break;
         }
         default:
@@ -1378,20 +1416,7 @@ function catalogReads(q: Queries): Omit<CatalogReads, 'artistFolder'> {
       const albums = `${albumSelect({ folderId: opts.folderId })}
         HAVING ${match.album}`;
       const songs = `${SONG_SELECT} WHERE ${match.song}`;
-      async function page<T>(
-        select: string,
-        order: string,
-        paging: { offset: number; limit: number },
-      ) {
-        const count = await q.all<{ total: bigint }>(
-          `SELECT COUNT(*) AS total FROM (${select}) matches`,
-        );
-        const rows = await q.all<T>(
-          `${select} ORDER BY ${order} LIMIT ${paging.limit} OFFSET ${paging.offset}`,
-        );
-        return { rows, total: Number(count[0].total) };
-      }
-      const artistPage = await page<ArtistGroupSqlRow>(
+      const artistPage = await searchPage<ArtistGroupSqlRow>(
         artists,
         `${
           sortKeySql(
@@ -1403,7 +1428,7 @@ function catalogReads(q: Queries): Omit<CatalogReads, 'artistFolder'> {
         }, ar.id`,
         opts.artists,
       );
-      const albumPage = await page<AlbumSqlRow>(
+      const albumPage = await searchPage<AlbumSqlRow>(
         albums,
         `${
           sortKeySql(
@@ -1415,7 +1440,7 @@ function catalogReads(q: Queries): Omit<CatalogReads, 'artistFolder'> {
         }, al.id`,
         opts.albums,
       );
-      const songPage = await page<SongSqlRow>(
+      const songPage = await searchPage<SongSqlRow>(
         songs,
         `${
           sortKeySql(
@@ -1433,6 +1458,42 @@ function catalogReads(q: Queries): Omit<CatalogReads, 'artistFolder'> {
         songs: { ...songPage, rows: songPage.rows.map(songOf) },
         revision: await catalogRevision(q),
       };
+    },
+
+    async searchSongs(opts) {
+      const fields = [
+        ['ar.name', opts.artist],
+        ['COALESCE(al.name, al.folder_name)', opts.album],
+        [SONG_TITLE, opts.title],
+      ] as const;
+      const predicates: string[] = [];
+      const bindings: (string | number)[] = [];
+      const matches = (field: string, text: string) => {
+        bindings.push(text);
+        return `contains(lower(${field}), lower(?))`;
+      };
+      for (const [field, text] of fields) {
+        if (text !== undefined) predicates.push(matches(field, text));
+      }
+      if (opts.text !== undefined) {
+        const text = opts.text;
+        const anyField = fields.map(([field]) => matches(field, text));
+        predicates.push(`(${anyField.join(' OR ')})`);
+      }
+      if (opts.addedAfterMs !== undefined) {
+        predicates.push('epoch_ms(fi.first_seen_at) > ?');
+        bindings.push(opts.addedAfterMs);
+      }
+      const where = predicates.length
+        ? `WHERE ${predicates.join(' AND ')}`
+        : '';
+      const { rows, total } = await searchPage<SongSqlRow>(
+        `${SONG_SELECT} ${where}`,
+        `${SONG_TITLE}, f.id`,
+        opts,
+        bindings.length ? bindings : undefined,
+      );
+      return { rows: rows.map(songOf), total };
     },
 
     async search3(query, opts) {
@@ -1770,6 +1831,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).getVideoSnapshot(id, folderId)),
     search3: (...args) =>
       engine.exclusive((q) => catalogReads(q).search3(...args)),
+    searchSongs: (opts) =>
+      engine.exclusive((q) => catalogReads(q).searchSongs(opts)),
     searchPages: (...args) =>
       engine.exclusive((q) => catalogReads(q).searchPages(...args)),
     songPath: (id) => engine.exclusive((q) => catalogReads(q).songPath(id)),

@@ -294,3 +294,105 @@ Deno.test('search2 answers with the v1 envelope', async () => {
     await close();
   }
 });
+
+Deno.test('legacy search returns file matches and the unpaged total in JSON and XML', async () => {
+  const { app, songIds, close } = await setup();
+  try {
+    const lookup = async (params: Record<string, string>) => {
+      const body = await get(app, 'search', `&${new URLSearchParams(params)}`);
+      assertEquals(body.status, 'ok');
+      return body.searchResult as {
+        offset: number;
+        totalHits: number;
+        match: { id: string; title: string; isDir: boolean }[];
+      };
+    };
+    const first = songIds.find((s) => s.title === 'First Song')!;
+    const second = songIds.find((s) => s.title === 'Second Song')!;
+    assertEquals((await lookup({ artist: 'performer' })).totalHits, 1);
+    assertEquals((await lookup({ album: 'OST' })).totalHits, 1);
+    assertEquals((await lookup({ title: 'fixture' })).totalHits, 0);
+    // The legacy file search also includes the fixture video in this album.
+    assertEquals((await lookup({ any: 'fixture' })).totalHits, 4);
+    assertEquals((await lookup({ any: 'performer' })).totalHits, 1);
+    assertEquals((await lookup({ any: 'Second Song' })).totalHits, 1);
+    assertEquals((await lookup({ any: '%' })).totalHits, 0);
+    assertEquals(
+      (await lookup({ artist: 'performer', title: 'First' })).match,
+      [],
+    );
+    assertEquals(await lookup({ album: 'fixture album', offset: '8' }), {
+      offset: 8,
+      totalHits: 3,
+      match: [],
+    });
+    const page = await lookup({ any: 'song', count: '1' });
+    assertEquals([page.offset, page.totalHits], [0, 2]);
+    assertEquals(page.match.map((s) => [s.id, s.title, s.isDir]), [
+      [first.id, 'First Song', false],
+    ]);
+
+    const response = await app(
+      new Request('http://melofon.home/rest/search.view', {
+        method: 'POST',
+        body: new URLSearchParams({
+          u: 'admin',
+          p: 'test',
+          v: '1.0.0',
+          c: 'legacy-client',
+          artist: 'fixture artist',
+          album: 'fixture album',
+          title: 'song',
+          count: '1',
+          offset: '1',
+        }),
+      }),
+    );
+    assertEquals(response.status, 200);
+    const xml = await response.text();
+    assert(xml.includes('status="ok"'));
+    assert(xml.includes('<searchResult offset="1" totalHits="2">'));
+    assertEquals(
+      [...xml.matchAll(/<match id="([^"]+)"/g)].map((m) => m[1]),
+      [second.id],
+    );
+    assert(xml.includes('title="Second Song"'));
+  } finally {
+    await close();
+  }
+});
+
+Deno.test('legacy search newerThan filters strictly by first observation before paging', async () => {
+  const { app, db, songIds, close } = await setup();
+  try {
+    const first = songIds.find((s) => s.title === 'First Song')!;
+    const second = songIds.find((s) => s.title === 'Second Song')!;
+    await rawSql(db).run(`UPDATE file_identity SET first_seen_at =
+      CASE WHEN id = '${first.id}' THEN make_timestamptz(1000000)
+      ELSE make_timestamptz(1001000) END`);
+    // Deliberately disagree with first-seen dates; retagging is not an addition.
+    await rawSql(db).run(`UPDATE files SET mtime = 42`);
+    const body = await get(
+      app,
+      'search.view',
+      '&title=song&newerThan=1000&count=1',
+    );
+    assertEquals(body.status, 'ok');
+    const page = body.searchResult as {
+      offset: number;
+      totalHits: number;
+      match: { id: string; created: string }[];
+    };
+    assertEquals([page.offset, page.totalHits], [0, 1]);
+    assertEquals(page.match.map((s) => [s.id, s.created]), [
+      [second.id, '1970-01-01T00:00:01.001Z'],
+    ]);
+    const since = await get(app, 'search', '&newerThan=1000');
+    assertEquals((since.searchResult as { totalHits: number }).totalHits, 3);
+    const malformed = await get(app, 'search', '&newerThan=1000.5');
+    assertEquals(malformed.status, 'failed');
+    assertEquals((malformed.error as { code: number }).code, 10);
+  } finally {
+    await close();
+  }
+});

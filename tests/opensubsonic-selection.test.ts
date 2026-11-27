@@ -294,6 +294,59 @@ Deno.test('album selection derives genre, year and listening rank from scoped tr
   }
 });
 
+Deno.test('byYear orders by the newest matching track year without changing album facts', async (t) => {
+  const s = await setup();
+  try {
+    // A0 has a later out-of-range track, A1 has two matching years, and A2
+    // ties A1 on its matching year. A3 is entirely outside the range.
+    await rawSql(s.db).run(
+      `UPDATE files SET year = 2020 WHERE id = ${sql(id(103))}`,
+    );
+    await rawSql(s.db).run(
+      `UPDATE files SET year = 2002 WHERE id = ${sql(id(104))}`,
+    );
+    for (
+      const [op, key] of [
+        ['getAlbumList', 'albumList'],
+        ['getAlbumList2', 'albumList2'],
+      ] as const
+    ) {
+      await t.step(op, async () => {
+        const asc = { type: 'byYear', fromYear: '2000', toYear: '2005' };
+        const desc = { ...asc, fromYear: '2005', toYear: '2000' };
+        const rows = items(await s.get(op, asc), key, 'album');
+        assertEquals(ids(rows), [20, 21, 22].map(id));
+        assertEquals(rows.map((row) => row.year), [2020, 2005, 2005]);
+        assertEquals(
+          rows.map((row: Item & { songCount?: number }) => row.songCount),
+          [2, 2, 2],
+        );
+        const response = await s.request(
+          op + '.view',
+          { ...desc, size: '2', offset: '1' },
+          'GET',
+          'xml',
+        );
+        assertEquals(response.status, 200);
+        const text = await response.text();
+        assert(text.includes('status="ok"'));
+        assert(text.includes(`<${key}>`));
+        assertEquals(
+          [...text.matchAll(/<album id="([^"]+)"/g)].map((m) => m[1]),
+          [22, 20].map(id),
+        );
+        const scoped = await s.get(op, {
+          ...desc,
+          musicFolderId: s.sources[0].id,
+        });
+        assertEquals(ids(items(scoped, key, 'album')), [21, 20].map(id));
+      });
+    }
+  } finally {
+    await s.close();
+  }
+});
+
 Deno.test('H2 behavioral red: present empty query enumerates real REST rows', async () => {
   const s = await setup();
   try {
