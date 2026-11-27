@@ -129,6 +129,16 @@ export interface Search3Result {
   songs: SongRow[];
 }
 
+interface SongSearchOptions {
+  artist?: string;
+  album?: string;
+  title?: string;
+  text?: string;
+  addedAfterMs?: number;
+  offset: number;
+  limit: number;
+}
+
 export interface RandomSongOptions {
   size: number;
   folderId?: string;
@@ -325,6 +335,10 @@ export interface CatalogReads {
       folderId?: string;
     },
   ): Promise<Search3Result>;
+  searchSongs(opts: SongSearchOptions): Promise<{
+    rows: SongRow[];
+    total: number;
+  }>;
   searchPages(query: string, opts: SearchPageOptions): Promise<SearchPages>;
   /** Absolute path of a song's audio file, for app.stream. */
   songPath(id: string): Promise<string | null>;
@@ -791,6 +805,23 @@ async function indexRuns(
 
 // Internal helpers share the current slot, never another public operation.
 function catalogReads(q: Queries): CatalogReads {
+  async function searchPage<T>(
+    select: string,
+    order: string,
+    { offset, limit }: { offset: number; limit: number },
+    bindings?: (string | number)[],
+  ) {
+    const count = await q.all<{ total: bigint }>(
+      `SELECT COUNT(*) AS total FROM (${select}) matches`,
+      bindings,
+    );
+    const rows = await q.all<T>(
+      `${select} ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`,
+      bindings,
+    );
+    return { rows, total: Number(count[0].total) };
+  }
+
   async function requireLibrary(folderId?: string) {
     if (folderId === undefined) return;
     const rows = await q.all(
@@ -1306,20 +1337,7 @@ function catalogReads(q: Queries): CatalogReads {
       const albums = `${albumSelect({ folderId: opts.folderId })}
         HAVING ${match.album}`;
       const songs = `${SONG_SELECT} WHERE ${match.song}`;
-      async function page<T>(
-        select: string,
-        order: string,
-        paging: { offset: number; limit: number },
-      ) {
-        const count = await q.all<{ total: bigint }>(
-          `SELECT COUNT(*) AS total FROM (${select}) matches`,
-        );
-        const rows = await q.all<T>(
-          `${select} ORDER BY ${order} LIMIT ${paging.limit} OFFSET ${paging.offset}`,
-        );
-        return { rows, total: Number(count[0].total) };
-      }
-      const artistPage = await page<ArtistGroupSqlRow>(
+      const artistPage = await searchPage<ArtistGroupSqlRow>(
         artists,
         `${
           sortKeySql(
@@ -1331,7 +1349,7 @@ function catalogReads(q: Queries): CatalogReads {
         }, ar.id`,
         opts.artists,
       );
-      const albumPage = await page<AlbumSqlRow>(
+      const albumPage = await searchPage<AlbumSqlRow>(
         albums,
         `${
           sortKeySql(
@@ -1343,7 +1361,7 @@ function catalogReads(q: Queries): CatalogReads {
         }, al.id`,
         opts.albums,
       );
-      const songPage = await page<SongSqlRow>(
+      const songPage = await searchPage<SongSqlRow>(
         songs,
         `${
           sortKeySql(
@@ -1361,6 +1379,42 @@ function catalogReads(q: Queries): CatalogReads {
         songs: { ...songPage, rows: songPage.rows.map(songOf) },
         revision: await catalogRevision(q),
       };
+    },
+
+    async searchSongs(opts) {
+      const fields = [
+        ['ar.name', opts.artist],
+        ['COALESCE(al.name, al.folder_name)', opts.album],
+        [SONG_TITLE, opts.title],
+      ] as const;
+      const predicates: string[] = [];
+      const bindings: (string | number)[] = [];
+      const matches = (field: string, text: string) => {
+        bindings.push(text);
+        return `contains(lower(${field}), lower(?))`;
+      };
+      for (const [field, text] of fields) {
+        if (text !== undefined) predicates.push(matches(field, text));
+      }
+      if (opts.text !== undefined) {
+        const text = opts.text;
+        const anyField = fields.map(([field]) => matches(field, text));
+        predicates.push(`(${anyField.join(' OR ')})`);
+      }
+      if (opts.addedAfterMs !== undefined) {
+        predicates.push('epoch_ms(fi.first_seen_at) > ?');
+        bindings.push(opts.addedAfterMs);
+      }
+      const where = predicates.length
+        ? `WHERE ${predicates.join(' AND ')}`
+        : '';
+      const { rows, total } = await searchPage<SongSqlRow>(
+        `${SONG_SELECT} ${where}`,
+        `${SONG_TITLE}, f.id`,
+        opts,
+        bindings.length ? bindings : undefined,
+      );
+      return { rows: rows.map(songOf), total };
     },
 
     async search3(query, opts) {
@@ -1731,6 +1785,8 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
       engine.exclusive((q) => catalogReads(q).getVideoSnapshot(id, folderId)),
     search3: (...args) =>
       engine.exclusive((q) => catalogReads(q).search3(...args)),
+    searchSongs: (opts) =>
+      engine.exclusive((q) => catalogReads(q).searchSongs(opts)),
     searchPages: (...args) =>
       engine.exclusive((q) => catalogReads(q).searchPages(...args)),
     songPath: (id) => engine.exclusive((q) => catalogReads(q).songPath(id)),

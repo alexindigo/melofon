@@ -871,6 +871,12 @@ treats `submission` as true when missing or empty and otherwise only for
 
 ## OpenSubsonic catalog sync and selection
 
+The deprecated `search` endpoint returns paged file matches for older clients.
+It combines `artist`, `album`, `title` and `any` criteria with case-insensitive
+substring matching. `newerThan` (epoch milliseconds) selects files first seen
+after the given time. The response includes the total before applying `count`
+and `offset`.
+
 `search3` requires the `query` parameter, but `query=` enumerates the catalog for
 offline sync. Artists, albums and songs have independent count/offset pairs
 (defaults20/0); zero suppresses a group. Counts and offsets are nonnegative safe

@@ -53,7 +53,10 @@ export function esc(value: string): string {
 
 export interface Queries {
   run(sql: string): Promise<void>;
-  all<T = Record<string, unknown>>(sql: string): Promise<T[]>;
+  all<T = Record<string, unknown>>(
+    sql: string,
+    values?: duckdb.DuckDBValue[],
+  ): Promise<T[]>;
   rawAll<T = Record<string, unknown>>(sql: string): Promise<T[]>;
   prepare(sql: string): ReturnType<duckdb.DuckDBConnection['prepare']>;
 }
@@ -170,9 +173,9 @@ async function openNativeEngine(
           check();
           await queries.run(sql);
         },
-        async all<T>(sql: string): Promise<T[]> {
+        async all<T>(sql: string, values?: duckdb.DuckDBValue[]): Promise<T[]> {
           check();
-          const result = await queries.runAndReadAll(sql);
+          const result = await queries.runAndReadAll(sql, values);
           return plain(result.getRowObjectsJS()) as T[];
         },
         async rawAll<T>(sql: string): Promise<T[]> {
