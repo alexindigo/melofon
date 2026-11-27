@@ -75,6 +75,54 @@ Deno.test('lyrics result preserves a whole candidate with source, confidence, va
   }
 });
 
+Deno.test('lyrics result validates exact ends, kinds and scoped vocal groups without flattening them', () => {
+  const lead = { id: 'lead', role: 'main', name: 'Artist' };
+  const guest = { id: 'guest', role: 'voice' };
+  const vocal = {
+    agentId: 'lead',
+    text: '🎵',
+    start: 10,
+    end: 20,
+    cues: [{ start: 10, end: 20, text: '🎵', byteStart: 0, byteEnd: 3 }],
+  };
+  const line = { start: 10, end: 20, text: 'Я 🎵', vocals: [vocal] };
+  const attributed = { ...enhanced(), agents: [lead, guest], lines: [line] };
+  const raw = outcome([attributed, { ...plain(), kind: 'translation' }]);
+  assertEquals<unknown>(parse(raw), raw);
+  for (
+    const invalid of [
+      { ...attributed, kind: 'unrecognized' },
+      { ...attributed, agents: [] },
+      { ...attributed, agents: sparse(lead) },
+      { ...attributed, agents: [guest] },
+      { ...attributed, agents: [lead, lead] },
+      { ...attributed, agents: [lead, { ...guest, role: 'main' }] },
+      { ...attributed, agents: [lead, { ...guest, role: 'narrator' }] },
+      { ...attributed, agents: [lead, { ...guest, id: lead.id }] },
+      { ...attributed, agents: [lead, { ...guest, id: ' ' }] },
+      { ...attributed, agents: [lead, { ...guest, name: '\ud800' }] },
+      { ...attributed, lines: [{ text: 'x', start: 0 }] },
+      { ...plain(), lines: [{ text: 'x', end: 0 }] },
+      { ...attributed, lines: [{ ...line, end: 9 }] },
+      { ...attributed, lines: [{ ...line, end: 10.5 }] },
+      { ...attributed, lines: [{ ...line, end: Number.MAX_SAFE_INTEGER + 1 }] },
+      { ...attributed, lines: [{ ...line, vocals: [vocal, vocal] }] },
+      { ...attributed, lines: [{ ...line, vocals: sparse(vocal) }] },
+      { ...attributed, lines: [{ ...line, cues: vocal.cues }] },
+      {
+        ...attributed,
+        lines: [{ ...line, vocals: [{ ...vocal, agentId: 'missing' }] }],
+      },
+      { ...attributed, lines: [{ ...line, vocals: [{ ...vocal, end: 9 }] }] },
+      {
+        ...attributed,
+        lines: [{ ...line, vocals: [{ ...vocal, text: line.text }] }],
+      },
+      { ...enhanced(), lines: [line] },
+    ]
+  ) assertThrows(() => parse(outcome([plain(), invalid])));
+});
+
 Deno.test('lyrics outcomes reject foreign targets, undeclared values and malformed candidate metadata', () => {
   assertEquals(parse({ candidates: [] }), { candidates: [] });
   assertEquals(parse({ retryAfter: 2, reason: 'busy' }), {

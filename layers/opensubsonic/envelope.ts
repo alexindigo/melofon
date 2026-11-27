@@ -85,13 +85,22 @@ function xmlElement(tag: string, value: unknown): string {
       children += xmlElement(key, val);
       continue;
     }
-    if (isScalar(val)) attrs += ` ${key}="${escapeXml(String(val))}"`;
-    else {children += xmlElement(
+    if (isScalar(val)) {
+      const escaped = escapeXml(String(val));
+      // Prevent XML attribute whitespace normalization from changing the
+      // string that UTF-8 cue offsets address.
+      const attr = tag === 'cueLine' && key === 'value'
+        ? escaped.replace(/[\t\n\r]/g, (char) => `&#${char.charCodeAt(0)};`)
+        : escaped;
+      attrs += ` ${key}="${attr}"`;
+    } else {children += xmlElement(
         tag === 'structuredLyrics' && key === 'agents' ? 'agent' : key,
         val,
       );}
   }
-  const inner = children + (text === null ? '' : escapeXml(text));
+  let content = text === null ? '' : escapeXml(text);
+  if (tag === 'cue') content = content.replaceAll('\r', '&#13;');
+  const inner = children + content;
   return inner === ''
     ? `<${tag}${attrs}/>`
     : `<${tag}${attrs}>${inner}</${tag}>`;
