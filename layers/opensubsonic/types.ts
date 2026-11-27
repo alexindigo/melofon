@@ -15,23 +15,34 @@ export type ResponseFormat =
   | { type: 'json' }
   | { type: 'jsonp'; callback: string };
 
+interface LyricsTextRow {
+  start?: number;
+  end?: number;
+  text: string;
+}
+
+export interface LyricsCueRow extends LyricsTextRow {
+  start: number;
+  byteStart: number;
+  byteEnd: number;
+}
+
 export interface LyricsEntryRow {
   language: string;
   synced: boolean;
+  kind?: 'main' | 'translation' | 'pronunciation';
+  agents?: {
+    id: string;
+    role: 'main' | 'voice' | 'bg' | 'group';
+    name?: string;
+  }[];
   offset?: number;
   artist?: string;
   title?: string;
-  lines: {
-    start?: number;
-    text: string;
-    cues?: {
-      start: number;
-      end?: number;
-      text: string;
-      byteStart: number;
-      byteEnd: number;
-    }[];
-  }[];
+  lines: (LyricsTextRow & {
+    cues?: LyricsCueRow[];
+    vocals?: (LyricsTextRow & { agentId: string; cues: LyricsCueRow[] })[];
+  })[];
 }
 
 export interface HatRequest {
@@ -211,7 +222,10 @@ export interface HatContext {
         artist?: string;
         title?: string;
       }): Promise<LyricsRow | null>;
-      lyricsBySongId(id: string): Promise<LyricsEntryRow[]>;
+      lyricsBySongId(
+        id: string,
+        vocalLayers?: boolean,
+      ): Promise<LyricsEntryRow[]>;
     };
     annotation: {
       /** Appends a star (a like); core classifies the id. false when the id

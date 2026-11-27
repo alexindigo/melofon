@@ -15,14 +15,31 @@ export interface LyricsCue {
   byteStart: number;
   byteEnd: number;
 }
-export interface LyricsLine {
+interface LyricsText {
   start?: number;
+  end?: number;
   text: string;
+}
+export interface LyricsVocal extends LyricsText {
+  agentId: string;
+  cues: LyricsCue[];
+}
+export interface LyricsLine extends LyricsText {
   cues?: LyricsCue[];
+  /** Attributed layers have their own text/cue coordinates. The line keeps the
+   * combined fallback text, and uses either simple cues or vocal layers. */
+  vocals?: LyricsVocal[];
+}
+export interface LyricsAgent {
+  id: string;
+  role: 'main' | 'voice' | 'bg' | 'group';
+  name?: string;
 }
 export interface LyricsEntry {
   language: string;
   synced: boolean;
+  kind?: 'main' | 'translation' | 'pronunciation';
+  agents?: LyricsAgent[];
   offset?: number;
   artist?: string;
   title?: string;
@@ -42,6 +59,7 @@ const millis = (text: string) =>
     text.split(':').reduce((sum, part) => sum * 60 + Number(part), 0) * 1000,
   );
 const utf8 = (text: string) => new TextEncoder().encode(text).length;
+const backgroundTag = /^\[bg:\s*(.*)\]\s*$/;
 
 function enhancedLine(text: string): Pick<LyricsLine, 'text' | 'cues'> | null {
   const markers = [...text.matchAll(new RegExp(`<(${timePattern})>`, 'g'))];
@@ -80,19 +98,87 @@ function enhancedLine(text: string): Pick<LyricsLine, 'text' | 'cues'> | null {
   return { text: value, ...(cues.length ? { cues } : {}) };
 }
 
+function shiftCues(cues: LyricsCue[], shift: number): LyricsCue[] {
+  return cues.map((cue) => ({
+    ...cue,
+    start: cue.start + shift,
+    ...(cue.end !== undefined ? { end: cue.end + shift } : {}),
+  }));
+}
+
+function orderedCues(cues: LyricsCue[]): boolean {
+  return cues.every((cue, i) => i === 0 || cue.start >= cues[i - 1].start);
+}
+
+function appendBackground(vocal: LyricsVocal, part: LyricsVocal): void {
+  const shift = utf8(vocal.text) + 1;
+  vocal.text += ` ${part.text}`;
+  for (const cue of part.cues) {
+    vocal.cues.push({
+      ...cue,
+      byteStart: cue.byteStart + shift,
+      byteEnd: cue.byteEnd + shift,
+    });
+  }
+}
+
+/** Navidrome 18205366 model/lyrics_lrc.go: timed standalone [bg:] tags
+ * attach to the preceding timed row. No tags or timing are guessed. */
+function addBackground(lines: LyricsLine[], background: LyricsVocal): void {
+  if (!orderedCues(background.cues)) return;
+  for (const line of lines) {
+    const shift = line.start! - lines[0].start!;
+    const start = background.cues[0].start + shift;
+    if (start < 0) continue;
+    const bg = {
+      ...background,
+      start,
+      cues: shiftCues(background.cues, shift),
+    };
+    const priorBg = line.vocals?.at(-1);
+    if (priorBg) {
+      if (bg.cues[0].start < priorBg.cues.at(-1)!.start) continue;
+      appendBackground(priorBg, bg);
+    } else {
+      line.vocals = line.cues
+        ? [{ agentId: 'main', text: line.text, cues: line.cues }, bg]
+        : [bg];
+      delete line.cues;
+    }
+    line.text = line.text ? `${line.text} ${bg.text}` : bg.text;
+  }
+}
+
 /** LRC ids/timing follow Navidrome model/lyrics_lrc.go; bad structured input is
  * missing rather than being displayed as literal broken markup (H6 row 3). */
 export function parseLyrics(
   text: string,
   structured = false,
   language = 'xxx',
+  vocalLayers = false,
 ): LyricsEntry | null {
   text = text.replace(/^\ufeff/, '').replace(/\r\n?/g, '\n');
   if (!text.trim() || text.includes('\0')) return null;
   const result: LyricsEntry = { language, synced: false, lines: [] };
   const timestamp = new RegExp(`^\\[(${timePattern})\\]`);
   let sawTiming = false;
+  let preceding: LyricsLine[] = [];
   for (let row of text.split('\n')) {
+    if (vocalLayers) {
+      const bg = backgroundTag.exec(row);
+      // Only intercept tags the legacy parser already recognizes as metadata.
+      if (bg && !bg[1].includes(']')) {
+        const part = enhancedLine(bg[1]);
+        if (part?.cues?.length) {
+          addBackground(preceding, {
+            agentId: 'bg',
+            text: part.text,
+            cues: part.cues,
+          });
+        }
+        continue;
+      }
+    }
     const id = /^\[(ar|ti|lang|offset):([^\]]*)\]\s*$/i.exec(row);
     if (id) {
       if (id[1].toLowerCase() === 'lang') result.language = id[2] || language;
@@ -117,26 +203,17 @@ export function parseLyrics(
       sawTiming = true;
       const line = enhancedLine(row);
       if (!line) return null;
-      if (
-        line.cues?.some((cue, i, cues) =>
-          i > 0 && cue.start < cues[i - 1].start
-        )
-      ) return null;
+      if (line.cues && !orderedCues(line.cues)) return null;
+      preceding = [];
       for (const start of starts) {
         const shift = start - starts[0];
-        result.lines.push({
+        const timed = {
           start,
           text: line.text,
-          ...(line.cues
-            ? {
-              cues: line.cues.map((cue) => ({
-                ...cue,
-                start: cue.start + shift,
-                ...(cue.end !== undefined ? { end: cue.end + shift } : {}),
-              })),
-            }
-            : {}),
-        });
+          ...(line.cues ? { cues: shiftCues(line.cues, shift) } : {}),
+        };
+        result.lines.push(timed);
+        if (vocalLayers) preceding.push(timed);
       }
     } else {
       if (/^\[\d|<\d/.test(row) || (structured && row.trim())) return null;
@@ -150,6 +227,9 @@ export function parseLyrics(
       (a, b) => a.start! - b.start!,
     );
     result.synced = true;
+    if (result.lines.some((line) => line.vocals)) {
+      result.agents = [{ id: 'main', role: 'main' }, { id: 'bg', role: 'bg' }];
+    }
   } else if (structured) return null;
   return result.lines.length ? result : null;
 }
@@ -192,16 +272,24 @@ function sylt(tag: ILyricsTag): LyricsEntry | null {
 
 /** Native tags retain raw LRC, all languages and SYLT timestamp format 1. The
  * common lyrics projection discards enhanced markers and cannot be the owner. */
-export function embeddedLyrics(metadata: IAudioMetadata): LyricsSource[] {
+export function embeddedLyrics(
+  metadata: IAudioMetadata,
+  vocalLayers = false,
+): LyricsSource[] {
   const sources: LyricsSource[] = [];
   for (const tag of Object.values(metadata.native).flat()) {
     if (!/^(USLT|ULT|SYLT|LYRICS|©lyr)$/i.test(tag.id)) continue;
     const value = tag.value as ILyricsTag | string;
     const entry = typeof value === 'string'
-      ? parseLyrics(value)
+      ? parseLyrics(value, false, 'xxx', vocalLayers)
       : tag.id === 'SYLT'
       ? sylt(value)
-      : parseLyrics(value.text ?? '', false, value.language || 'xxx');
+      : parseLyrics(
+        value.text ?? '',
+        false,
+        value.language || 'xxx',
+        vocalLayers,
+      );
     if (entry) sources.push({ origin: 'embedded', entry, native: tag });
   }
   return sources;
@@ -246,7 +334,11 @@ function decode(bytes: Uint8Array) {
 
 /** A source snapshot owns its pre-read cap and parses exactly the bytes that
  * will be archived. Malformed text is still available to the backup owner. */
-export async function readLyricsSidecar(path: string, limit: number) {
+export async function readLyricsSidecar(
+  path: string,
+  limit: number,
+  vocalLayers = false,
+) {
   using file = await Deno.open(path, { read: true });
   const stat = await file.stat();
   if (stat.size > limit) throw new Error('Sidecar exceeds lyrics.maxBytes');
@@ -265,7 +357,12 @@ export async function readLyricsSidecar(path: string, limit: number) {
   ) throw new Error('Lyrics changed during read');
   let entry: LyricsEntry | null = null;
   try {
-    entry = parseLyrics(decode(bytes), !/\.txt$/i.test(path));
+    entry = parseLyrics(
+      decode(bytes),
+      !/\.txt$/i.test(path),
+      'xxx',
+      vocalLayers,
+    );
   } catch { /* Preserve raw invalid bytes, but never display them. */ }
   return { bytes, entry, stat };
 }
@@ -322,18 +419,26 @@ export function createLyrics(
   const sources = async (
     path: string,
     cachedEmbedded?: LyricsSource[],
+    vocalLayers = false,
   ): Promise<LyricsSource[]> => {
     const limit = await maxBytes();
     let embedded: LyricsSource[] = cachedEmbedded ?? [];
     try {
       if (cachedEmbedded === undefined) {
-        embedded = embeddedLyrics(await lyricsMetadata(path, limit));
+        embedded = embeddedLyrics(
+          await lyricsMetadata(path, limit),
+          vocalLayers,
+        );
       }
     } catch { /* Unreadable/oversized tag is missing. */ }
     const sides: LyricsSource[] = [];
     for (const sidecar of await lyricsSidecars(path).catch(() => [])) {
       try {
-        const { bytes, entry } = await readLyricsSidecar(sidecar, limit);
+        const { bytes, entry } = await readLyricsSidecar(
+          sidecar,
+          limit,
+          vocalLayers,
+        );
         if (entry) {
           sides.push({
             origin: sidecar,
@@ -353,8 +458,12 @@ export function createLyrics(
       source.entry
     );
   };
-  const selected = async (id: string, path: string): Promise<LyricsEntry[]> => {
-    const local = shown(await sources(path));
+  const selected = async (
+    id: string,
+    path: string,
+    vocalLayers = false,
+  ): Promise<LyricsEntry[]> => {
+    const local = shown(await sources(path, undefined, vocalLayers));
     if (local.length) return local;
     const candidate = await store.candidates.strongestOpen(
       'song',
@@ -380,14 +489,16 @@ export function createLyrics(
     maxBytes,
     sources,
     shown,
-    async bySongId(id: string): Promise<LyricsEntry[]> {
+    async bySongId(id: string, vocalLayers = false): Promise<LyricsEntry[]> {
       const path = await store.catalog.songPath(id);
-      return path === null ? [] : await selected(id, path);
+      return path === null ? [] : await selected(id, path, vocalLayers);
     },
     async legacy(query: { artist?: string; title?: string }) {
       const limit = Number(await state.getTyped('lyrics.legacyCandidates'));
       for (const song of await store.catalog.songsForLyrics(query, limit)) {
-        const entry = (await selected(song.id, song.path))[0];
+        const entry = (await selected(song.id, song.path)).find((entry) =>
+          entry.kind === undefined || entry.kind === 'main'
+        );
         if (entry) {
           return {
             artist: query.artist ?? null,

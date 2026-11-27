@@ -380,3 +380,354 @@ for (const mode of ['partial', 'overlap', 'absent'] as const) {
     }
   });
 }
+
+Deno.test('API lyrics: enhanced lookup tracks, exact line ends and overlapping vocal agents are opt-in', async () => {
+  const entries: LyricsEntry[] = [
+    {
+      language: 'eng',
+      kind: 'translation',
+      synced: false,
+      lines: [{ text: 'Under the sky' }],
+    },
+    {
+      language: 'jpn',
+      synced: true,
+      offset: -10,
+      agents: [
+        { id: 'lead', role: 'main', name: 'Vocal A' },
+        { id: 'guest', role: 'voice', name: 'Vocal B' },
+        { id: 'echo', role: 'bg' },
+      ],
+      lines: [
+        {
+          start: 0,
+          end: 1800,
+          text: 'こ\tこ echo',
+          vocals: [
+            {
+              agentId: 'echo',
+              start: 700,
+              end: 1700,
+              text: 'echo',
+              cues: [{ start: 700, text: 'echo', byteStart: 0, byteEnd: 3 }],
+            },
+            {
+              agentId: 'lead',
+              text: 'こ\tこ',
+              cues: [
+                { start: 0, end: 1200, text: 'こ', byteStart: 0, byteEnd: 2 },
+                { start: 800, text: 'こ', byteStart: 4, byteEnd: 6 },
+              ],
+            },
+          ],
+        },
+        {
+          start: 2000,
+          end: 3500,
+          text: '空',
+          vocals: [{
+            agentId: 'guest',
+            text: '空',
+            cues: [{
+              start: 2100,
+              end: 3300,
+              text: '空',
+              byteStart: 0,
+              byteEnd: 2,
+            }],
+          }],
+        },
+        { start: 3200, end: 3200, text: '' },
+        { start: 4500, text: '花' },
+        { start: 6000, end: 7200, text: '風' },
+      ],
+    },
+    {
+      language: 'jpn-Latn',
+      kind: 'pronunciation',
+      synced: true,
+      lines: [{ start: 2000, text: 'sora' }],
+    },
+  ];
+  const f = await fixture();
+  try {
+    const { id } = f.songs[0];
+    const runner = await f.start(entries);
+    await runner.afterScan();
+    await eventually(async () =>
+      (await f.store.lookups.stats('lyrics-fixture')).done === 1
+    );
+    assertEquals(
+      (await f.store.candidates.candidatesFor('song', id))[0].details.lyrics,
+      { origin: 'https://provenance.invalid/song', entries },
+    );
+    const versions = (await rest(f, 'getOpenSubsonicExtensions', {}))
+      .openSubsonicExtensions.find((extension: { name: string }) =>
+        extension.name === 'songLyrics'
+      );
+    assertEquals(versions, { name: 'songLyrics', versions: [1, 2] });
+    const extensionXml = await rest(
+      f,
+      'getOpenSubsonicExtensions',
+      {},
+      true,
+    ) as string;
+    assert(
+      extensionXml.includes(
+        '<openSubsonicExtensions name="songLyrics"><versions>1</versions><versions>2</versions></openSubsonicExtensions>',
+      ),
+    );
+
+    const baseLines = entries[1].lines.map(({ start, text }) => ({
+      start,
+      value: text,
+    }));
+    const expectedV1 = [{
+      lang: 'jpn',
+      synced: true,
+      offset: -10,
+      line: baseLines,
+    }];
+    const legacyParams: Record<string, string>[] = [{ id }, {
+      id,
+      enhanced: 'false',
+    }];
+    for (const args of legacyParams) {
+      const plain = await rest(f, 'getLyricsBySongId', args);
+      assertEquals(plain.lyricsList.structuredLyrics, expectedV1);
+      const xml = await rest(f, 'getLyricsBySongId', args, true) as string;
+      assert(!/\b(end|kind)=|<cueLine|<agent/.test(xml));
+      assertEquals(xml.match(/<structuredLyrics\b/g)?.length, 1);
+      assert(xml.includes('<line start="0">こ\tこ echo</line>'));
+    }
+
+    const enhanced = await rest(f, 'getLyricsBySongId', {
+      id,
+      enhanced: 'true',
+    });
+    const [translation, main, pronunciation] =
+      enhanced.lyricsList.structuredLyrics;
+    assertEquals(enhanced.lyricsList.structuredLyrics.length, 3);
+    assertEquals(translation, {
+      lang: 'eng',
+      synced: false,
+      kind: 'translation',
+      line: [{ value: 'Under the sky' }],
+    });
+    assertEquals(pronunciation, {
+      lang: 'jpn-Latn',
+      synced: true,
+      kind: 'pronunciation',
+      line: [{ start: 2000, value: 'sora' }],
+    });
+    assertEquals(main, {
+      lang: 'jpn',
+      synced: true,
+      offset: -10,
+      kind: 'main',
+      agents: entries[1].agents,
+      line: baseLines.map((line, i) => {
+        const { end } = entries[1].lines[i];
+        return { ...line, ...(end === undefined ? {} : { end }) };
+      }),
+      cueLine: [
+        {
+          index: 0,
+          start: 0,
+          end: 1800,
+          agentId: 'lead',
+          value: 'こ\tこ',
+          cue: [
+            { start: 0, end: 800, value: 'こ', byteStart: 0, byteEnd: 2 },
+            { start: 800, end: 1800, value: 'こ', byteStart: 4, byteEnd: 6 },
+          ],
+        },
+        {
+          index: 0,
+          start: 700,
+          end: 1700,
+          agentId: 'echo',
+          value: 'echo',
+          cue: [{ start: 700, value: 'echo', byteStart: 0, byteEnd: 3 }],
+        },
+        {
+          index: 1,
+          start: 2000,
+          end: 3500,
+          agentId: 'guest',
+          value: '空',
+          cue: [{
+            start: 2100,
+            end: 3300,
+            value: '空',
+            byteStart: 0,
+            byteEnd: 2,
+          }],
+        },
+      ],
+    });
+    const xml = await rest(
+      f,
+      'getLyricsBySongId',
+      { id, enhanced: 'true' },
+      true,
+    ) as string;
+    for (
+      const expected of [
+        '<structuredLyrics lang="eng" synced="false" kind="translation">',
+        '<structuredLyrics lang="jpn-Latn" synced="true" kind="pronunciation">',
+        '<line start="0" end="1800">こ\tこ echo</line>',
+        '<line start="2000" end="3500">空</line>',
+        '<line start="3200" end="3200"/>',
+        '<line start="4500">花</line>',
+        '<line start="6000" end="7200">風</line>',
+        '<agent id="lead" role="main" name="Vocal A"/>',
+        '<agent id="guest" role="voice" name="Vocal B"/>',
+        '<agent id="echo" role="bg"/>',
+        '<cueLine index="0" agentId="lead" start="0" end="1800" value="こ&#9;こ">',
+        '<cue start="800" byteStart="4" byteEnd="6" end="1800">こ</cue>',
+        '<cueLine index="0" agentId="echo" start="700" end="1700" value="echo">',
+        '<cue start="700" byteStart="0" byteEnd="3">echo</cue>',
+      ]
+    ) assert(xml.includes(expected), `Missing ${expected} in ${xml}`);
+    assert(
+      xml.indexOf('<cueLine index="0" agentId="lead"') <
+        xml.indexOf('<cueLine index="0" agentId="echo"'),
+    );
+    assertEquals(await native(f, id, await credentials(f)), [entries, entries]);
+    const title = f.songs[0].title;
+    assert(title);
+    const legacy = await rest(f, 'getLyrics', { title });
+    assertEquals(
+      legacy.lyrics.value,
+      baseLines.map((line) => line.value).join('\n'),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('API lyrics: timed LRC backgrounds keep per-voice byte offsets, repeat with a row and leave v1 unchanged', async () => {
+  const source = [
+    '[lang:ukr]',
+    '[bg: <00:00.00>orphan]',
+    '[00:01.00][00:11.00]<00:01.00>Я<00:02.00>',
+    '[bg: <00:00.90>🎵<00:01.80>]',
+    '[bg: untimed]',
+    '[bg: <00:02.20>так<00:02.70>]',
+    '[00:03.00]<00:03.00>Ми',
+  ].join('\n');
+  const f = await fixture(async (root) => {
+    await Deno.writeTextFile(`${root}/song.elrc`, source);
+    await Deno.writeTextFile(`${root}/song.lrc`, '[00:01.00]Lower priority');
+  });
+  try {
+    const { id } = f.songs[0];
+    const expectedPlain = [{
+      lang: 'ukr',
+      synced: true,
+      line: [
+        { start: 1000, value: 'Я' },
+        { start: 3000, value: 'Ми' },
+        { start: 11000, value: 'Я' },
+      ],
+    }];
+    const prove = async () => {
+      const plain = await rest(f, 'getLyricsBySongId', { id });
+      assertEquals(plain.lyricsList.structuredLyrics, expectedPlain);
+      const enhanced = await rest(f, 'getLyricsBySongId', {
+        id,
+        enhanced: 'true',
+      });
+      const [entry] = enhanced.lyricsList.structuredLyrics;
+      assertEquals(entry.agents, [{ id: 'main', role: 'main' }, {
+        id: 'bg',
+        role: 'bg',
+      }]);
+      assertEquals(entry.line, [
+        { start: 1000, value: 'Я 🎵 так' },
+        { start: 3000, value: 'Ми' },
+        { start: 11000, value: 'Я 🎵 так' },
+      ]);
+      assertEquals(
+        entry.cueLine.map((
+          { index, agentId }: { index: number; agentId: string },
+        ) => [index, agentId]),
+        [
+          [0, 'main'],
+          [0, 'bg'],
+          [1, 'main'],
+          [2, 'main'],
+          [2, 'bg'],
+        ],
+      );
+      for (const [index, start] of [[0, 1000], [2, 11000]]) {
+        const lead = {
+          index,
+          agentId: 'main',
+          start,
+          value: 'Я',
+          cue: [{
+            start,
+            end: start + 1000,
+            value: 'Я',
+            byteStart: 0,
+            byteEnd: 1,
+          }],
+        };
+        const bg = {
+          index,
+          agentId: 'bg',
+          start: start - 100,
+          value: '🎵 так',
+          cue: [
+            {
+              start: start - 100,
+              end: start + 800,
+              value: '🎵',
+              byteStart: 0,
+              byteEnd: 3,
+            },
+            {
+              start: start + 1200,
+              end: start + 1700,
+              value: 'так',
+              byteStart: 5,
+              byteEnd: 10,
+            },
+          ],
+        };
+        assertEquals(
+          entry.cueLine.filter((layer: { index: number }) =>
+            layer.index === index
+          ),
+          [lead, bg],
+        );
+      }
+      const xml = await rest(
+        f,
+        'getLyricsBySongId',
+        { id, enhanced: 'true' },
+        true,
+      ) as string;
+      assert(xml.includes('<line start="1000">Я 🎵 так</line>'));
+      assert(
+        xml.includes(
+          '<cueLine index="0" agentId="bg" start="900" value="🎵 так">',
+        ),
+      );
+      assert(
+        xml.includes(
+          '<cue start="2200" byteStart="5" byteEnd="10" end="2700">так</cue>',
+        ),
+      );
+    };
+    await prove();
+    // Embedded still wins over a different same-stem sidecar.
+    await Deno.writeTextFile(`${f.root}/song.elrc`, '[00:01.00]Lower priority');
+    await lyricMp3(`${f.root}/song.mp3`, [{ lang: 'ukr', text: source }]);
+    await prove();
+  } finally {
+    await f.close();
+  }
+});

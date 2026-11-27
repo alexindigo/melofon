@@ -52,7 +52,7 @@ export interface Library extends
   order(): Promise<CatalogOrder>;
   /** Lyrics of the bounded best artist/title match, from the shared service. */
   lyrics(query: { artist?: string; title?: string }): Promise<LyricsRow | null>;
-  lyricsBySongId(id: string): Promise<LyricsEntry[]>;
+  lyricsBySongId(id: string, vocalLayers?: boolean): Promise<LyricsEntry[]>;
   caption(
     videoId: string,
     options?: { key?: string; format?: 'srt' | 'vtt' },

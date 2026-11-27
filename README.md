@@ -816,6 +816,29 @@ Repeated getters retain form values followed
 by query values, including duplicates and their order. Both methods reach
 the same injected core services and canonical state.
 
+### Enhanced lyrics
+
+`getOpenSubsonicExtensions` reports `songLyrics` versions `[1, 2]`.
+Use `getLyricsBySongId?id=...&enhanced=true` to request word timing, exact
+line ends, translations, pronunciations, and separate vocal parts when the
+source supplies them. Without `enhanced=true`, the endpoint returns only the
+main tracks, with line starts but no enhanced fields.
+
+Enhanced LRC in embedded lyrics or a same-stem sidecar can supply word timing
+and timed `[bg: <00:01.50>echo]` vocals for the preceding timed line. The last
+empty word marker gives the last cue's end, not an exact line end. Local TTML
+is not read. Embedded lyrics still take precedence over `.elrc`, `.lrc`, and
+`.txt` sidecars, in that order, followed by a strong lookup candidate.
+
+A `track.lyrics` lookup candidate keeps all tracks together in `entries`.
+Optional `kind` is `main` (the default), `translation`, or `pronunciation`.
+Synced lines may supply an exact `end` in milliseconds. An entry may define
+`agents` (`id`, `role`, optional `name`), with one `main` and other roles
+`voice`, `bg`, or `group`. Each line keeps combined `text`; it may contain
+either simple `cues` or separate `vocals` (`agentId`, `text`, optional
+`start`/`end`, and `cues`). In each vocal part, cue byte offsets are inclusive
+UTF-8 positions into that part's `text`, not into the combined line.
+
 ## OpenSubsonic versions, logins and JSONP
 
 Every response reports `version` 1.16.1, the implemented protocol, with
