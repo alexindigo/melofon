@@ -188,6 +188,7 @@ export function createLibrary(
     getSongSnapshot: catalog.getSongSnapshot,
     songsPage: catalog.songsPage,
     search3: catalog.search3,
+    searchSongs: catalog.searchSongs,
     searchPages: catalog.searchPages,
     songPath: catalog.songPath,
     videos: catalog.videos,

@@ -174,6 +174,15 @@ export interface HatContext {
       ): Promise<
         { artists: ArtistRow[]; albums: AlbumRow[]; songs: SongRow[] }
       >;
+      searchSongs(opts: {
+        artist?: string;
+        album?: string;
+        title?: string;
+        text?: string;
+        addedAfterMs?: number;
+        offset: number;
+        limit: number;
+      }): Promise<{ rows: SongRow[]; total: number }>;
       /** Absolute path of a song's audio file (null when unknown). */
       songPath(id: string): Promise<string | null>;
       /** All music videos in the catalog (getVideos). */
