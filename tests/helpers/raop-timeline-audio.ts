@@ -7,7 +7,10 @@ import type {
 } from '../../src/boots/airplay-profile.ts';
 import type { FakeRaopSession } from './fake-raop.ts';
 import { decodeReceiverAudio } from './raop-audio-consumer.ts';
-import { renderScheduledAudio } from './raop-scheduled-consumer.ts';
+import {
+  parseRtpInfo,
+  renderScheduledAudio,
+} from './raop-scheduled-consumer.ts';
 
 export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
   const epochs: {
@@ -67,10 +70,10 @@ export function traceTimelineAudio(factory: () => AirplayTimelineStream) {
       let anchor = 0, sequence = 0, highest = 0;
       for (const event of session.wire) {
         if (event.kind === 'record' || event.kind === 'flush') {
-          const info = /^seq=(\d+);rtptime=(\d+)$/.exec(event.rtpInfo);
+          const info = parseRtpInfo(event.kind, event.rtpInfo);
           assert(info, 'arrival epoch has valid RTP-Info');
-          sequence = Number(info[1]);
-          anchor = Number(info[2]);
+          sequence = info.seq;
+          anchor = info.rtptime;
           highest = 0;
           current = new Map();
           payloads.push(current);

@@ -15,7 +15,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "outputs.h"
-#include "transcode.h"
+#include "../alac.h"
 
 static void *symbol(const char *name, const char *library)
 {
@@ -119,7 +119,7 @@ ssize_t sendto(int fd, const void *buffer, size_t size, int flags,
   return real(fd, buffer, size, flags, address, length);
 }
 static pthread_mutex_t encoder_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct encode_ctx *encoders[16];
+static struct evbuffer *encoders[16];
 static unsigned encoder_count;
 unsigned raop_fi_encoder_count(void)
 {
@@ -128,17 +128,17 @@ unsigned raop_fi_encoder_count(void)
   pthread_mutex_unlock(&encoder_lock);
   return count;
 }
-int transcode_encode(struct evbuffer *buffer, struct encode_ctx *ctx, transcode_frame *frame, int eof)
+int raop_alac_encode(struct evbuffer *buffer, const uint8_t *pcm, size_t size)
 {
   pthread_mutex_lock(&encoder_lock);
   unsigned i;
-  for (i = 0; i < encoder_count && encoders[i] != ctx; i++) {}
-  if (i == encoder_count && encoder_count < 16) encoders[encoder_count++] = ctx;
+  for (i = 0; i < encoder_count && encoders[i] != buffer; i++) {}
+  if (i == encoder_count && encoder_count < 16) encoders[encoder_count++] = buffer;
   pthread_mutex_unlock(&encoder_lock);
   if (arm("encoder")) return -1;
-  int (*real)(struct evbuffer *, struct encode_ctx *, transcode_frame *, int) =
-    symbol("transcode_encode", getenv("MELOFON_RAOP_LIB"));
-  return real(buffer, ctx, frame, eof);
+  int (*real)(struct evbuffer *, const uint8_t *, size_t) =
+    symbol("raop_alac_encode", getenv("MELOFON_RAOP_LIB"));
+  return real(buffer, pcm, size);
 }
 gcry_error_t gcry_cipher_encrypt(gcry_cipher_hd_t ctx, void *out, size_t size,
                                 const void *in, size_t insize)

@@ -65,6 +65,7 @@ if (mode === 'streams') {
   const objects = [
     'ffi.o',
     'player.o',
+    'alac.o',
     'vendor/outputs/raop.o',
     'vendor/outputs/rtp_common.o',
     'vendor/evrtsp/rtsp.o',

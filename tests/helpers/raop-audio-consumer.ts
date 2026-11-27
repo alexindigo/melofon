@@ -42,6 +42,23 @@ export function alacConfiguration(sdp: string): Buffer {
   return extra;
 }
 
+function decoderPacket(payload: Uint8Array): Buffer {
+  // Audio Station's fixed-size RAOP variant omits END. Restore the delimiter
+  // for libavcodec, leaving the 23-bit CPE/escape prefix and all samples intact.
+  if (
+    payload.length === 3 + 352 * 4 && payload[0] === 0x20 &&
+    payload[1] === 0 && (payload[2] & 0xfe) === 0x02 &&
+    (payload[payload.length - 1] & 1) === 0
+  ) {
+    const framed = Buffer.alloc(payload.length + 1);
+    framed.set(payload);
+    framed[payload.length - 1] |= 1;
+    framed[payload.length] = 0xc0;
+    return framed;
+  }
+  return Buffer.from(payload);
+}
+
 export function decodeReceiverAudio(
   sdp: string,
   payloads: Uint8Array[],
@@ -84,7 +101,7 @@ export function decodeReceiverAudio(
       }
     };
     for (const payload of payloads) {
-      packet.data = Buffer.from(payload);
+      packet.data = decoderPacket(payload);
       FFmpegError.throwIfError(
         context.sendPacketSync(packet),
         'receiver ALAC packet',

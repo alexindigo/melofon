@@ -32,7 +32,7 @@ import {
   createAirplayBoot,
   type HelperEventFn,
 } from '../src/boots/airplay.ts';
-import { startFakeRaop } from './helpers/fake-raop.ts';
+import { type FakeRaopSession, startFakeRaop } from './helpers/fake-raop.ts';
 import { createFfiStream } from '../src/boots/raop-ffi.ts';
 import {
   createTestAirplayDevices,
@@ -554,6 +554,11 @@ async function integrationSetup(opts: {
   bRecordDelayMs?: number;
   aTeardownDelayMs?: number;
   companionFirst?: boolean;
+  metadata?: string;
+  artwork?: Uint8Array;
+  parameterReply?: NonNullable<
+    Parameters<typeof startFakeRaop>[0]
+  >['parameterReply'];
 }): Promise<Integration> {
   const dir = await Deno.makeTempDir({ prefix: 'melofon-rec-ffi-' });
   const store = await openStore(dir);
@@ -576,6 +581,7 @@ async function integrationSetup(opts: {
   const fakeA = await startFakeRaop({
     recordDelayMs: opts.aRecordDelayMs,
     teardownDelayMs: opts.aTeardownDelayMs,
+    parameterReply: opts.parameterReply,
   });
   const fakeB = await startFakeRaop({ recordDelayMs: opts.bRecordDelayMs });
   // The REAL boot: its default spawn is the FFI transport.
@@ -616,6 +622,7 @@ async function integrationSetup(opts: {
       native.push(transport);
       return { transport, start: driver.start };
     }),
+    opts.metadata ? { md: opts.metadata } : {},
   );
   const boot = createAirplayBoot({
     outputs,
@@ -623,6 +630,13 @@ async function integrationSetup(opts: {
     media,
     notify,
     devices,
+    artwork: {
+      cachedCover: () =>
+        Promise.resolve(
+          opts.artwork ? { format: 'image/jpeg', bytes: opts.artwork } : null,
+        ),
+    },
+    ...(opts.parameterReply ? { retryBackoffMs: [] } : {}),
   });
 
   const registerAt = (
@@ -672,6 +686,142 @@ async function integrationSetup(opts: {
 
 function flushesOn(fake: Awaited<ReturnType<typeof startFakeRaop>>): number {
   return fake.sessions.reduce((n, s) => n + s.flushes, 0);
+}
+
+function parameterKind(p: FakeRaopSession['parameters'][number]) {
+  return p.contentType === 'text/parameters'
+    ? new TextDecoder().decode(p.body).split(':')[0]
+    : p.contentType;
+}
+
+for (const mode of ['fresh start', 'resume', 'seek re-open'] as const) {
+  Deno.test({
+    name: `RAOP startup metadata precedes RTP on ${mode}`,
+    ignore: !NATIVE_CHANGED,
+    sanitizeOps: false,
+    sanitizeResources: false,
+    fn: async () => {
+      const artwork = mode === 'resume' ? undefined : await Deno.readFile(
+        'tests/fixtures/library/Fixture Artist/Fixture Album/cover.jpg',
+      );
+      const it = await integrationSetup({
+        metadata: '0,1,2',
+        artwork,
+        async parameterReply(p) {
+          if (parameterKind(p) !== 'volume') await sleep(75);
+          return 'ok';
+        },
+      });
+      try {
+        const song = longSong('startup');
+        it.playback.queueAdd([song], { play: true });
+        await until('initial RTP', () => !!it.fakeA.sessions[0]?.audioPackets);
+        if (mode === 'resume') {
+          it.playback.pause();
+          await until(
+            'paused session closed',
+            () => it.fakeA.sessions[0].closedAtMs !== null,
+          );
+          it.playback.play();
+        } else if (mode === 'seek re-open') {
+          it.playback.seek({ positionMs: 120_000 });
+        }
+        const index = mode === 'fresh start' ? 0 : 1;
+        await until(
+          'startup RTP',
+          () => !!it.fakeA.sessions[index]?.audioPackets,
+        );
+        const session = it.fakeA.sessions[index];
+        const record = session.requests.find(({ method }) =>
+          method === 'RECORD'
+        )!;
+        const parameters = session.parameters.filter((p) =>
+          p.atMs >= record.atMs && p.atMs <= session.firstRtpAtMs!
+        );
+        assertEquals(parameters.map(parameterKind), [
+          'volume',
+          'application/x-dmap-tagged',
+          'image/jpeg',
+          'progress',
+        ]);
+        const anchor = record.rtpInfo?.split(';').find((part) =>
+          part.startsWith('rtptime=')
+        );
+        assert(anchor);
+        for (let i = 1; i < parameters.length; i++) {
+          assertEquals(parameters[i].rtpInfo, anchor);
+          assert(parameters[i].atMs >= parameters[i - 1].replyAtMs!);
+        }
+        const progress = parameters.at(-1)!;
+        assert(session.firstRtpAtMs! >= progress.replyAtMs!);
+        const decoder = new TextDecoder();
+        const text = decoder.decode(parameters[1].body);
+        for (const value of [song.title, song.artistName, song.albumName]) {
+          assert(text.includes(value!));
+        }
+        assertEquals(
+          parameters[2].body,
+          artwork ?? await Deno.readFile(
+            new URL(
+              '../src/boots/assets/airplay-no-cover.jpg',
+              import.meta.url,
+            ),
+          ),
+        );
+        const fields = decoder.decode(progress.body).slice('progress: '.length)
+          .trim().split('/').map(Number);
+        assertEquals(fields[1], Number(anchor.slice('rtptime='.length)));
+        assertEquals((fields[2] - fields[0]) >>> 0, 3_600_000 * 44.1);
+        if (mode === 'seek re-open') {
+          assertEquals((fields[1] - fields[0]) >>> 0, 120_000 * 44.1);
+        }
+      } finally {
+        await it.close();
+      }
+    },
+  });
+}
+
+for (const mode of ['no capability', 'refuse', 'omit'] as const) {
+  Deno.test({
+    name: `RAOP startup metadata: ${mode}`,
+    ignore: !NATIVE_CHANGED,
+    sanitizeOps: false,
+    sanitizeResources: false,
+    async fn() {
+      const it = await integrationSetup({
+        metadata: mode === 'no capability' ? undefined : '0,1,2',
+        parameterReply: (p) =>
+          Promise.resolve(
+            mode !== 'no capability' &&
+              parameterKind(p) === 'application/x-dmap-tagged'
+              ? mode
+              : 'ok',
+          ),
+      });
+      try {
+        it.playback.queueAdd([longSong()], { play: true });
+        const session = () => it.fakeA.sessions[0];
+        if (mode === 'no capability') {
+          await until('RTP without metadata', () => !!session()?.audioPackets);
+          assertEquals(session().parameters.map(parameterKind), ['volume']);
+        } else {
+          await until(
+            'startup failed',
+            () => it.playback.playerView().state === 'pause',
+            20_000,
+          );
+          assertEquals(session().parameters.map(parameterKind), [
+            'volume',
+            'application/x-dmap-tagged',
+          ]);
+          assertEquals(session().audioPackets, 0);
+        }
+      } finally {
+        await it.close();
+      }
+    },
+  });
 }
 
 function packetsOn(fake: Awaited<ReturnType<typeof startFakeRaop>>): number {

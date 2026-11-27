@@ -989,6 +989,11 @@ keys and has no `last_command` field. This is a Melofon-specific diagnostic view
 ## AirPlay connection strategies
 
 AirPlay runs in-process via `helper/raop/libmelofon_raop.so` and Deno FFI.
+RAOP uses verbatim lossless ALAC. To help Apple TV receivers start after
+being idle, Melofon sends the startup metadata the receiver advertises
+support for before sending audio. For receivers that accept artwork, it
+sends the cached cover or a small neutral image if no cached cover is available.
+
 Each registered speaker has a persisted `connectionStrategy`, exposed on
 native `GET /_/outputs` and updated with
 `PUT /_/outputs/<id> {"connectionStrategy":"melofon"}`. Registration accepts

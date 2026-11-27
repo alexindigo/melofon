@@ -32,6 +32,18 @@ function sameEndpoint(a: RaopEndpoint, b?: RaopEndpoint): boolean {
   return b !== undefined && a.address === b.address && a.port === b.port;
 }
 
+/** RECORD advertises first seq + 1; FLUSH still advertises the exact seq. */
+export function parseRtpInfo(kind: 'record' | 'flush', text: string) {
+  const offset = kind === 'record' ? 1 : 0;
+  const match = /^seq=(\d+);rtptime=(\d+)$/.exec(text);
+  if (!match) return null;
+  const seq = Number(match[1]) - offset;
+  const rtptime = Number(match[2]);
+  return seq >= 0 && seq <= 65535 && rtptime <= 0xffffffff
+    ? { seq, rtptime }
+    : null;
+}
+
 export interface ScheduledRange {
   epoch: number;
   sequence: number;
@@ -217,15 +229,15 @@ export function renderScheduledAudio(
     ssrc = null;
     presentationEnd = null;
   };
-  const rtpInfo = (text: string): boolean => {
-    const match = /^seq=(\d+);rtptime=(\d+)$/.exec(text);
-    if (!match || Number(match[1]) > 65535 || Number(match[2]) > 0xffffffff) {
+  const rtpInfo = (event: { kind: 'record' | 'flush'; rtpInfo: string }) => {
+    const info = parseRtpInfo(event.kind, event.rtpInfo);
+    if (!info) {
       issue('invalid RTP-Info');
       active = false;
       return false;
     }
-    originSequence = highestSequence = Number(match[1]);
-    originTimestamp = Number(match[2]);
+    originSequence = highestSequence = info.seq;
+    originTimestamp = info.rtptime;
     return true;
   };
 
@@ -241,7 +253,8 @@ export function renderScheduledAudio(
       reset('record');
       epoch++;
       latency = event.latencyFrames;
-      active = rtpInfo(event.rtpInfo) && Number.isSafeInteger(latency) &&
+      active = rtpInfo(event) &&
+        Number.isSafeInteger(latency) &&
         latency >= 0;
       if (!active) issue('invalid RECORD');
       continue;
@@ -249,7 +262,7 @@ export function renderScheduledAudio(
     if (event.kind === 'flush') {
       reset('flush');
       epoch++;
-      active = !terminal && active && rtpInfo(event.rtpInfo);
+      active = !terminal && active && rtpInfo(event);
       continue;
     }
     if (event.kind === 'teardown' || event.kind === 'close') {

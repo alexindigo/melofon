@@ -183,9 +183,8 @@ player_debug(struct raop_player *p)
 }
 
 static int
-dmap_add_string(struct evbuffer *evbuf, const char *tag, const char *str)
+dmap_add_field(struct evbuffer *evbuf, const char *tag, const void *data, size_t len)
 {
-  size_t len = str ? strlen(str) : 0;
   uint8_t hdr[8];
 
   memcpy(hdr, tag, 4);
@@ -194,7 +193,13 @@ dmap_add_string(struct evbuffer *evbuf, const char *tag, const char *str)
   hdr[6] = (uint8_t)((len >> 8) & 0xff);
   hdr[7] = (uint8_t)(len & 0xff);
   if (evbuffer_add(evbuf, hdr, 8) < 0) return -1;
-  return len > 0 ? evbuffer_add(evbuf, str, len) : 0;
+  return len > 0 ? evbuffer_add(evbuf, data, len) : 0;
+}
+
+static int
+dmap_add_string(struct evbuffer *evbuf, const char *tag, const char *str)
+{
+  return dmap_add_field(evbuf, tag, str, str ? strlen(str) : 0);
 }
 
 static int
@@ -210,10 +215,10 @@ dmap_add_container(struct evbuffer *evbuf, const char *tag, size_t len)
   return evbuffer_add(evbuf, hdr, 8);
 }
 
-/* Minimal mlit { minm, asar } — enough for RAOP text; full dmap_common.c
+/* Minimal mlit { minm, asar, optional asal } — enough for RAOP text; full dmap_common.c
  * waits for DAAP (M7). */
-static int
-dmap_encode_text(struct evbuffer *out, const char *title, const char *artist)
+int
+raop_dmap_encode_text(struct evbuffer *out, const char *title, const char *artist, const char *album)
 {
   struct evbuffer *inner = evbuffer_new();
   size_t n;
@@ -222,9 +227,30 @@ dmap_encode_text(struct evbuffer *out, const char *title, const char *artist)
     return -1;
   int ret = -1;
   if (dmap_add_string(inner, "minm", title ? title : "") < 0 ||
-      dmap_add_string(inner, "asar", artist ? artist : "") < 0) goto out;
+      dmap_add_string(inner, "asar", artist ? artist : "") < 0 ||
+      (album && dmap_add_string(inner, "asal", album) < 0)) goto out;
   n = evbuffer_get_length(inner);
   if (dmap_add_container(out, "mlit", n) < 0) goto out;
+  ret = evbuffer_add_buffer(out, inner);
+ out:
+  evbuffer_free(inner);
+  return ret;
+}
+
+int
+raop_dmap_encode_startup(struct evbuffer *out, const struct raop_startup_metadata *md)
+{
+  struct evbuffer *inner = evbuffer_new();
+  const uint8_t kind = 2, stream = md->len_ms < 1000;
+  int ret = -1;
+  if (!inner) return -1;
+  if (dmap_add_field(inner, "mikd", &kind, 1) < 0 ||
+      dmap_add_field(inner, "aeMK", &kind, 1) < 0 ||
+      dmap_add_field(inner, "asal", md->album, strnlen(md->album, 127)) < 0 ||
+      dmap_add_field(inner, "minm", md->title, strnlen(md->title, 127)) < 0 ||
+      dmap_add_field(inner, "asar", md->artist, strnlen(md->artist, 127)) < 0 ||
+      dmap_add_field(inner, "asdk", &stream, 1) < 0 ||
+      dmap_add_container(out, "mlit", evbuffer_get_length(inner)) < 0) goto out;
   ret = evbuffer_add_buffer(out, inner);
  out:
   evbuffer_free(inner);
@@ -268,7 +294,7 @@ metadata_send_now(struct raop_player *p)
   rmd->artwork_fmt = -1;
   /* Build stream content, not the first receiver's wishes. Each attachment
    * filters its own request types, including a later text-capable join. */
-  if (dmap_encode_text(rmd->metadata, p->title, p->artist) < 0) {
+  if (raop_dmap_encode_text(rmd->metadata, p->title, p->artist, NULL) < 0) {
     evbuffer_free(rmd->metadata); free(rmd); free(md); return -1;
   }
   md->type = OUTPUT_TYPE_RAOP;
@@ -348,7 +374,7 @@ playback_cb(evutil_socket_t fd, short what, void *arg)
   pthread_mutex_lock(&p->pcm_lock);
   bool sync_ready = p->clock_started && !p->fenced && !p->failure.error;
   pthread_mutex_unlock(&p->pcm_lock);
-  if (sync_ready) raop_sync_pending(p->stream_id, pts_now(p));
+  if (sync_ready) raop_dispatch_pending(p->stream_id, pts_now(p));
 
   for (frames = 1 + overrun; frames > 0; frames--)
     {
@@ -589,7 +615,7 @@ raop_player_metadata_update(struct raop_player *p)
       raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_ALLOCATION);
       return;
     }
-    if (dmap_encode_text(rmd->metadata, m->title, m->artist) < 0) {
+    if (raop_dmap_encode_text(rmd->metadata, m->title, m->artist, NULL) < 0) {
       evbuffer_free(rmd->metadata); free(rmd); free(md); metadata_marker_free(m);
       raop_ffi_progress_failed(p->stream_id, RAOP_PROGRESS_ALLOCATION);
       return;

@@ -213,9 +213,13 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     buf += chunk
                 body, buf = buf[:clen], buf[clen:]
 
+                # Probe routing uses the decimal device ID, independent of
+                # wire padding. Keep the raw header in the protocol receipt.
+                active_remote_header = headers.get('active-remote', '')
+                active_remote = active_remote_header.lstrip('0') or '0'
                 state['requests'].append(method)
                 self.connection['requests'].append(method)
-                print(f'SEEN {self.connection["generation"]} {method} {headers.get("active-remote", "0")}', flush=True)
+                print(f'SEEN {self.connection["generation"]} {method} {active_remote}', flush=True)
                 cseq = headers.get('cseq', '0')
                 if PASSWORD is not None and not valid_digest(
                         headers.get('authorization', ''), self.nonce, method, url):
@@ -229,7 +233,7 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                         return
                     continue
                 state['accepted_requests'].append(method)
-                if method == DELAY_METHOD and headers.get('active-remote') == '2':
+                if method == DELAY_METHOD and active_remote == '2':
                     time.sleep(0.6)
                 if method == 'RECORD' and RECORD_DELAY_MS > 0:
                     time.sleep(RECORD_DELAY_MS / 1000)
@@ -237,14 +241,14 @@ class RTSPHandler(socketserver.BaseRequestHandler):
                     state['dacp_ids'].add(headers['dacp-id'])
                 if headers.get('client-instance'):
                     state['client_instances'].add(headers['client-instance'])
-                if headers.get('active-remote'):
-                    state['active_remotes'].add(headers['active-remote'])
+                if active_remote_header:
+                    state['active_remotes'].add(active_remote_header)
                 cseq = headers.get('cseq', '0')
                 if method == 'SETUP':
-                    control_sockets[headers.get('active-remote', '0')] = self.control_sock
+                    control_sockets[active_remote] = self.control_sock
                     safe_headers = {k: v for k, v in headers.items() if k != 'authorization'}
                     print(f'SETUP headers: {safe_headers!r}', file=sys.stderr, flush=True)
-                    print(f'CONTROL {headers.get("active-remote", "0")} {headers["transport"].split("control_port=")[1].split(";")[0]}', flush=True)
+                    print(f'CONTROL {active_remote} {headers["transport"].split("control_port=")[1].split(";")[0]}', flush=True)
                 if method == 'ANNOUNCE':
                     state['sdp'] = body.decode(errors='replace')
                 if method == 'RECORD':

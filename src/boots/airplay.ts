@@ -1,6 +1,7 @@
 // AirPlay lifecycle: engine/operator state survives temporary connections.
 // One scheduler, per-output intent epochs, proven local-release barriers.
 import type { Media } from '../media.ts';
+import type { ArtworkService } from '../artwork.ts';
 import {
   createPlaybackSource,
   type PlaybackSources,
@@ -22,10 +23,11 @@ import {
   type ConnectionStrategy,
 } from '../connection-strategy.ts';
 import type { AirplayDevices } from './airplay-device.ts';
-import type {
-  AirplayCancelResult,
-  AirplayPlaybackStream,
-  AirplayTransport,
+import {
+  type AirplayCancelResult,
+  type AirplayPlaybackStream,
+  type AirplayTransport,
+  RAOP_MD_ARTWORK,
 } from './airplay-profile.ts';
 import { outputAuthority, outputPlayerId } from '../player-outputs.ts';
 import { SpeakerError, type SpeakerPairingView } from '../speakers.ts';
@@ -40,6 +42,7 @@ export interface AirplayBootDeps {
   sources?: PlaybackSources;
   notify: Notify;
   devices: AirplayDevices;
+  artwork?: Pick<ArtworkService, 'cachedCover'>;
   state?: State;
   log?: Log;
   retryBackoffMs?: number[];
@@ -67,6 +70,14 @@ export function parseRetryBackoff(raw: string | null): number[] | null {
 }
 const HOLD_MS = 10_000;
 const DEBUG = ['1', 'true'].includes(Deno.env.get('MELOFON_RAOP_DEBUG') ?? '');
+let noCoverJpeg: Uint8Array | undefined;
+function startupPlaceholder() {
+  // Keep the startup artwork transaction even on an artwork cache miss.
+  noCoverJpeg ??= Deno.readFileSync(
+    new URL('./assets/airplay-no-cover.jpg', import.meta.url),
+  );
+  return { format: 'image/jpeg', bytes: noCoverJpeg } as const;
+}
 type View = ReturnType<Playback['playerView']>;
 interface Epoch {
   generation: number;
@@ -998,6 +1009,20 @@ export function createAirplayBoot(
           isCurrent: current,
         });
         if (preparing.get(id) !== work || !current()) return;
+        view = playback.playerView();
+        const coverEntry = view.current;
+        const wanted = prepared.ok
+          ? devices.protocol.facts(id)?.wantedMetadata ?? 0
+          : 0;
+        const ref = coverEntry?.reference;
+        const image = deps.artwork && (wanted & RAOP_MD_ARTWORK) && ref &&
+            ref.kind !== 'url'
+          ? await deps.artwork.cachedCover({
+            kind: ref.kind === 'song' ? 'song' : 'radio',
+            id: ref.id,
+          }).catch(() => null)
+          : null;
+        if (preparing.get(id) !== work || !current()) return;
         preparing.delete(id);
         grants.delete(id);
         if (!prepared.ok) {
@@ -1017,6 +1042,11 @@ export function createAirplayBoot(
         const latestOut = outputs.get(id)!;
         view = playback.playerView();
         if (!view.current) return;
+        const display = queueDisplay(view.current);
+        const artwork = coverEntry?.id === view.current.id && image &&
+            (image.format === 'image/png' || image.format === 'image/jpeg')
+          ? { format: image.format, bytes: image.bytes } as const
+          : undefined;
         e.failed = false;
         session = (generations.get(id) ?? 0) + 1;
         generations.set(id, session);
@@ -1064,10 +1094,24 @@ export function createAirplayBoot(
           });
           const result = await devices.protocol.activate(prepared.value, {
             volume: r.volume,
-            positionMs: 0,
+            positionMs: wanted ? view.itemProgressMs : 0,
             lengthMs: view.itemLengthMs,
-            title: queueDisplay(view.current).title ?? '',
-            artist: queueDisplay(view.current).artistName ?? '',
+            title: view.current.facts.kind === 'web'
+              ? view.current.facts.streamTitle ?? display.title ?? ''
+              : display.title ?? '',
+            artist: display.artistName ?? '',
+            ...(wanted
+              ? {
+                startup: {
+                  album: view.current.facts.kind === 'song'
+                    ? view.current.facts.song.albumName ?? ''
+                    : '',
+                  artwork: wanted & RAOP_MD_ARTWORK
+                    ? artwork ?? startupPlaceholder()
+                    : undefined,
+                },
+              }
+              : {}),
           }, {
             publish(transport) {
               r.transport = transport;

@@ -181,7 +181,7 @@ Deno.test({
     const result = await child('inventory').output();
     assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
     assertEquals(JSON.parse(records(result.stdout)[0].payload), {
-      compiledNativeObjects: 11,
+      compiledNativeObjects: 12,
       writerViolations: 0,
       negativeRejected: true,
       debugKeyDumpsAbsent: true,

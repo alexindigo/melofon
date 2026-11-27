@@ -14,7 +14,11 @@ import {
 } from './media.ts';
 import { createArtworkCache } from './artwork-cache.ts';
 import type { Podcasts } from './podcasts.ts';
-import { type ArtworkImage, createArtworkSources } from './artwork-sources.ts';
+import {
+  type ArtworkImage,
+  createArtworkSources,
+  type ReadArtworkSource,
+} from './artwork-sources.ts';
 import type { Store } from './store/index.ts';
 import type { createRadio } from './radio.ts';
 import { createRadioArtwork, RADIO_TILE_REVISION } from './radio-artwork.ts';
@@ -85,6 +89,10 @@ interface Policy {
 }
 
 export interface ArtworkService {
+  /** Existing cover bytes only; never decode or fill a miss. */
+  cachedCover(
+    ref: { kind: 'song' | 'radio'; id: string },
+  ): Promise<ArtworkImage | null>;
   /** A real artist photo, never the first-album artwork fallback. */
   hasArtistPhoto(id: string): Promise<boolean>;
   /** Plain facts and owned encoded bytes from one authorized source resolution. */
@@ -195,6 +203,7 @@ export function createArtwork(library: Library, options: {
     id: string,
     maxBytes: number,
     kind?: ArtworkRef['kind'],
+    read: ReadArtworkSource = sources.file(maxBytes),
   ): Promise<Source | null | 'unknown'> {
     if (kind === 'radio' || !kind && id.startsWith('radio-')) {
       const image = await options.radio?.cover(id, maxBytes);
@@ -248,18 +257,18 @@ export function createArtwork(library: Library, options: {
       const own = await library.embeddedCover(
         id,
         maxBytes,
-        sources.file(maxBytes),
+        read,
       );
       if (own !== null) return { ...own, sourceKind: 'embedded' };
       return song.albumId === null
         ? null
-        : await resolve(song.albumId, maxBytes, 'album');
+        : await resolve(song.albumId, maxBytes, 'album', read);
     }
     if ((!kind || kind === 'album') && await library.getAlbum(id) !== null) {
       const path = await library.albumCoverPath(id);
       if (path !== null) {
         try {
-          const image = await sources.file(maxBytes)(
+          const image = await read(
             path,
             'image-v1',
             async () => {
@@ -284,13 +293,13 @@ export function createArtwork(library: Library, options: {
       const embedded = await library.embeddedCover(
         id,
         maxBytes,
-        sources.file(maxBytes),
+        read,
       );
       if (embedded !== null) return { ...embedded, sourceKind: 'embedded' };
       const candidate = await library.candidateCover(
         id,
         maxBytes,
-        sources.file(maxBytes),
+        read,
       );
       return candidate && { ...candidate, sourceKind: 'album-candidate' };
     }
@@ -501,6 +510,13 @@ export function createArtwork(library: Library, options: {
     };
   }
   return {
+    async cachedCover(ref) {
+      const maxBytes = await setting('maxSourceMegabytes') * 1024 * 1024;
+      const image = ref.kind === 'radio'
+        ? await options.radio?.cover(ref.id, maxBytes)
+        : await resolve(ref.id, maxBytes, 'song', sources.cachedFile(maxBytes));
+      return image && image !== 'unknown' ? image : null;
+    },
     async hasArtistPhoto(id) {
       return !!await library.artistPhoto(
         id,

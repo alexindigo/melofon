@@ -17,14 +17,14 @@ export type ReadArtworkSource = (
   load: () => Promise<ArtworkImage | null>,
 ) => Promise<ArtworkImage | null>;
 
-async function signature(path: string): Promise<string | null> {
+async function signature(path: string, wait = true): Promise<string | null> {
   try {
     let s = await stat(path, { bigint: true });
     // Deno 2.9.6 truncates ctime to seconds, including Node's ctimeNs shim.
     // Close that observation window before trusting a signature. Otherwise an
     // in-place same-size edit restoring mtime could alias the previous content.
     const settle = Number(s.ctimeMs) + 1000 - Date.now();
-    if (settle > 0 && settle <= 1000) {
+    if (wait && settle > 0 && settle <= 1000) {
       await new Promise((resolve) => setTimeout(resolve, settle));
       s = await stat(path, { bigint: true });
     }
@@ -90,6 +90,23 @@ export function createArtworkSources(
     return image && { ...image, facts: facts! };
   }
   return {
+    cachedFile(maxBytes: number): ReadArtworkSource {
+      return async (path, kind) => {
+        if (!store) return null;
+        const before = await signature(path, false);
+        if (before === null) return null;
+        const prior = await store.get(`${kind}:${path}`);
+        if (prior?.signature !== `${maxBytes}:${before}` || !prior.facts) {
+          return null;
+        }
+        const facts = prior.facts;
+        const bytes = await cache.get(`${facts.sourceHash}.png`, await limit());
+        return bytes?.length === facts.byteLength &&
+            before === await signature(path, false)
+          ? { bytes, format: facts.format, facts }
+          : null;
+      };
+    },
     file(maxBytes: number): ReadArtworkSource {
       return async (path, kind, read) => {
         if (!store) {

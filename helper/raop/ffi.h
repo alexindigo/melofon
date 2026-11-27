@@ -224,6 +224,17 @@ int raop_start_v2(raop_t *h, const char *host, int port,
                   const uint8_t *password, size_t password_len,
                   const uint8_t *auth_key, size_t auth_key_len);
 
+/* Add a copied per-attachment metadata snapshot. Album can be empty; NULL
+ * opts out. Artwork format: 0 absent, 1 PNG, 2 JPEG. */
+int raop_start_v3(raop_t *h, const char *host, int port,
+                  const char *name, int volume, int devtype, int encrypt,
+                  uint32_t pos_ms, uint32_t len_ms,
+                  uint16_t wanted_metadata, int authsetup, int requires_auth,
+                  const char *title, const char *artist, int has_password,
+                  const uint8_t *password, size_t password_len,
+                  const uint8_t *auth_key, size_t auth_key_len, const char *album,
+                  int artwork_format, const uint8_t *artwork, size_t artwork_len);
+
 /* Same validated/copied input as start_v2, but vendor device_probe only.
  * No ANNOUNCE/SETUP/RECORD or audio. Caller owns the bounded control lifetime. */
 int raop_probe_v2(raop_t *h, const char *host, int port,

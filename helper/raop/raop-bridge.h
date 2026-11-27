@@ -3,16 +3,35 @@
 #define MELOFON_RAOP_BRIDGE_H
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <time.h>
 #include "timeline.h"
 struct raop_player;
 struct output_metadata;
+struct evbuffer;
+/* Snapshot owned by one attachment, never taken from the shared timeline. */
+struct raop_startup_metadata {
+  char title[256], artist[256], album[256];
+  uint32_t pos_ms, len_ms;
+  int artwork_format; /* 1 = PNG, 2 = JPEG */
+  size_t artwork_len;
+  uint8_t artwork[];
+};
+struct raop_extra {
+  int devtype;
+  uint16_t wanted_metadata;
+  bool encrypt;
+  bool supports_auth_setup;
+  struct raop_startup_metadata *startup;
+};
+int raop_dmap_encode_text(struct evbuffer *, const char *, const char *, const char *);
+int raop_dmap_encode_startup(struct evbuffer *, const struct raop_startup_metadata *);
 /* Loop-owned backend state; independent of attachment/master lifetime. Send
  * takes ownership even on allocation failure. Free follows all device joins. */
 int raop_metadata_send_stream(uint64_t stream_id, struct output_metadata *);
 void raop_metadata_purge_stream(uint64_t stream_id);
 void raop_metadata_anchor_stream(uint64_t stream_id, struct timespec pts);
-void raop_sync_pending(uint64_t stream_id, struct timespec pts);
+void raop_dispatch_pending(uint64_t stream_id, struct timespec pts);
 void raop_backend_stream_free(uint64_t stream_id);
 int raop_player_metadata(struct raop_player *, const char *, const char *, uint32_t, uint32_t);
 int raop_player_timeline_active(struct raop_player *);

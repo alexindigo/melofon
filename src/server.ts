@@ -341,6 +341,15 @@ async function startServerRuntime(
     savedOutput: (id) => persistence.savedOutput(id),
   });
   own('discovery', () => discovery.close(), 10);
+  const playlists = createPlaylists(store, notify);
+  const artwork = createArtwork(library, {
+    facts: store.artwork,
+    state,
+    dataDir: cfg.dataDir,
+    playlists,
+    podcasts,
+    radio,
+  });
   const players = await createPlayers({
     store,
     persistence,
@@ -377,6 +386,7 @@ async function startServerRuntime(
         state,
         devices: airplay,
         capacity,
+        artwork,
       }),
   });
   own('players', () => players.close(), 10);
@@ -398,15 +408,6 @@ async function startServerRuntime(
     log: scopedLog('core'),
   };
   const core = await pathfinder({ roots: ['core/'], app });
-  const playlists = createPlaylists(store, notify);
-  const artwork = createArtwork(library, {
-    facts: store.artwork,
-    state,
-    dataDir: cfg.dataDir,
-    playlists,
-    podcasts,
-    radio,
-  });
   const artworkBackground = createArtworkBackground({
     artwork,
     store,

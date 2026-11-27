@@ -57,10 +57,13 @@ function validDigest(
 
 export interface FakeRaopRequest {
   method: string;
+  uri: string;
   cseq: string;
   atMs: number;
-  /** Only the non-secret scheduling header, never authentication headers. */
+  /** Explicit wire fields, never a dump of RTSP request headers. */
   rtpInfo?: string;
+  range?: string;
+  activeRemote?: string;
 }
 
 export interface RaopEndpoint {
@@ -99,6 +102,7 @@ export interface FakeRaopSession {
     body: Uint8Array;
     atMs: number;
     rtpInfo?: string;
+    replyAtMs?: number;
   }[];
   audioPayloads: Uint8Array[];
   rtspPeer: { address: string; port: number };
@@ -133,6 +137,7 @@ let sessionSeq = 0;
 
 export function startFakeRaop(
   opts: {
+    bindAddress?: string;
     recordDelayMs?: number;
     beforeRecordReply?: () => Promise<void>;
     teardownDelayMs?: number;
@@ -140,6 +145,10 @@ export function startFakeRaop(
     flushDelayMs?: number;
     beforeFlushReply?: () => Promise<void>;
     refuseFlush?: boolean;
+    /** Optional hook before a SET_PARAMETER reply; omit skips the reply. */
+    parameterReply?: (
+      parameter: FakeRaopSession['parameters'][number],
+    ) => Promise<'ok' | 'refuse' | 'omit'>;
     captureAudio?: boolean;
     /** A real receiver requests missing datagrams inside its observed suffix. */
     recoverAudioGaps?: boolean;
@@ -162,7 +171,7 @@ export function startFakeRaop(
     (sequence?: number, target?: RaopEndpoint) => void
   >();
   const timingRequests = new Map<string, () => void>();
-  const bindAddress = '127.0.0.1';
+  const bindAddress = opts.bindAddress ?? '127.0.0.1';
   const started = performance.now();
   const now = () => performance.now() - started;
   const realm = opts.digest?.realm ?? 'Fake RAOP';
@@ -385,8 +394,13 @@ export function startFakeRaop(
         const atMs = now();
         session.requests.push({
           method,
+          uri,
           cseq,
           atMs,
+          ...(method === 'RECORD' ? { range: headers.get('range') ?? '' } : {}),
+          ...(headers.has('active-remote')
+            ? { activeRemote: headers.get('active-remote')! }
+            : {}),
           ...((method === 'RECORD' || method === 'FLUSH')
             ? { rtpInfo: headers.get('rtp-info') ?? '' }
             : {}),
@@ -412,16 +426,18 @@ export function startFakeRaop(
           await opts.beforePairVerify?.();
         }
         if (method === 'ANNOUNCE') session.sdp = body;
-        if (method === 'SET_PARAMETER') {
-          session.parameters.push({
-            contentType: headers.get('content-type') ?? '',
-            body: bodyBytes,
-            atMs: now(),
-            ...(headers.has('rtp-info')
-              ? { rtpInfo: headers.get('rtp-info')! }
-              : {}),
-          });
-        }
+        const parameter: FakeRaopSession['parameters'][number] | undefined =
+          method === 'SET_PARAMETER'
+            ? {
+              contentType: headers.get('content-type') ?? '',
+              body: bodyBytes,
+              atMs: now(),
+              ...(headers.has('rtp-info')
+                ? { rtpInfo: headers.get('rtp-info')! }
+                : {}),
+            }
+            : undefined;
+        if (parameter) session.parameters.push(parameter);
         if (method === 'SET_PARAMETER' && body.startsWith('volume')) {
           session.volumeParams.push(body.trim());
         }
@@ -524,11 +540,14 @@ export function startFakeRaop(
             });
           }
         }
+        const reply = parameter && await opts.parameterReply?.(parameter);
+        if (reply === 'omit') continue;
+        if (parameter) parameter.replyAtMs = now();
         await conn.write(
           encoder.encode(
             `RTSP/1.0 ${
               (method === 'RECORD' && !recording) ||
-                (method === 'FLUSH' && opts.refuseFlush)
+                (method === 'FLUSH' && opts.refuseFlush) || reply === 'refuse'
                 ? '500 Refused'
                 : '200 OK'
             }\r\nCSeq: ${cseq}\r\n${extra}Server: fake-raop\r\nContent-Length: 0\r\n\r\n`,

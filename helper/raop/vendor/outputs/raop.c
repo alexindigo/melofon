@@ -71,18 +71,12 @@
 #include "transcode.h"
 #include "outputs.h"
 #include "pair_ap/pair.h"
+#include "../../alac.h"
 #include "../../raop-bridge.h"
-
-#define ALAC_HEADER_LEN                      3
 
 #define RAOP_QUALITY_SAMPLE_RATE_DEFAULT     44100
 #define RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT 16
 #define RAOP_QUALITY_CHANNELS_DEFAULT        2
-
-// AirTunes v2 number of samples per packet
-// Probably using this value because 44100/352 and 48000/352 has good 32 byte
-// alignment, which improves performance of some encoders
-#define RAOP_SAMPLES_PER_PACKET              352
 
 #define RAOP_RTP_PAYLOADTYPE                 0x60
 
@@ -91,6 +85,12 @@
 
 // How many RTP packets to buffer for retransmission
 #define RAOP_PACKET_BUFFER_SIZE    1000
+
+/* A normal 10 ms write makes at most two packets. Bound exceptional dispatch
+ * to eight MTU-sized datagrams per window so a timer overrun or a late join
+ * cannot drop an entire lead's worth of packets into a receiver at once. */
+#define RAOP_DISPATCH_PACKETS 8
+#define RAOP_DISPATCH_WINDOW_NS 8000000ULL
 
 #define RAOP_MD_DELAY_STARTUP      15360
 #define RAOP_MD_DELAY_SWITCH       (RAOP_MD_DELAY_STARTUP * 2)
@@ -149,16 +149,6 @@ enum raop_state {
   RAOP_STATE_PASSWORD  = RAOP_STATE_F_FAILED | 0x02,
 };
 
-// Info about the device, which is not required by the player, only internally
-struct raop_extra
-{
-  enum raop_devtype devtype;
-
-  uint16_t wanted_metadata;
-  bool encrypt;
-  bool supports_auth_setup;
-};
-
 struct raop_master_session
 {
   uint64_t stream_id;
@@ -172,7 +162,6 @@ struct raop_master_session
   struct rtcp_timestamp cur_stamp;
 
   // ALAC encoder and buffer for encoded data
-  struct encode_ctx *encode_ctx;
   struct evbuffer *encoded_buffer;
 
   uint8_t *rawbuf;
@@ -214,6 +203,7 @@ struct raop_session
   struct melofon_release *release;
 
   uint16_t wanted_metadata;
+  uint16_t startup_metadata_pending;
   bool req_has_auth;
   bool encrypt;
   bool auth_quirk_itunes;
@@ -233,6 +223,8 @@ struct raop_session
   uint64_t schedule_origin_ns;
   uint64_t submitted_frames;
   uint64_t coverage_start;
+  uint64_t dispatch_window_end_ns;
+  unsigned int dispatch_packets;
   uint32_t sync_start_pos; /* exact RTP-Info sent by this receiver's RECORD/FLUSH */
   bool sync_start_pending;
   bool marker_pending;
@@ -378,9 +370,6 @@ static struct timeval keep_alive_tv = { RAOP_KEEP_ALIVE_INTERVAL, 0 };
 /* Sessions */
 static struct raop_master_session *raop_master_sessions;
 static struct raop_session *raop_sessions;
-
-/* Don't encode ALAC with ffmpeg */
-static bool raop_uncompressed_alac;
 
 // Forwards
 static int
@@ -537,139 +526,6 @@ source_observer_cb(evutil_socket_t fd, short what, void *arg)
 
 
 /* ------------------------------- MISC HELPERS ----------------------------- */
-
-/* ALAC bits writer - big endian
- * p    outgoing buffer pointer
- * val  bitfield value
- * blen bitfield length, max 8 bits
- * bpos bit position in the current byte (pointed by *p)
- */
-static inline void
-alac_write_bits(uint8_t **p, uint8_t val, int blen, int *bpos)
-{
-  int lb;
-  int rb;
-  int bd;
-
-  /* Remaining bits in the current byte */
-  lb = 7 - *bpos + 1;
-
-  /* Number of bits overflowing */
-  rb = lb - blen;
-
-  if (rb >= 0)
-    {
-      bd = val << rb;
-      if (*bpos == 0)
-	**p = bd;
-      else
-	**p |= bd;
-
-      /* No over- nor underflow, we're done with this byte */
-      if (rb == 0)
-	{
-	  *p += 1;
-	  *bpos = 0;
-	}
-      else
-	*bpos += blen;
-    }
-  else
-    {
-      /* Fill current byte */
-      bd = val >> -rb;
-      **p |= bd;
-
-      /* Overflow goes to the next byte */
-      *p += 1;
-      **p = val << (8 + rb);
-      *bpos = -rb;
-    }
-}
-
-/* Raw data must be little endian */
-static void
-alac_encode_uncompressed(uint8_t *dst, uint8_t *raw, int len)
-{
-  uint8_t *maxraw;
-  int bpos;
-
-  bpos = 0;
-  maxraw = raw + len;
-
-  alac_write_bits(&dst, 1, 3, &bpos); /* channel=1, stereo */
-  alac_write_bits(&dst, 0, 4, &bpos); /* unknown */
-  alac_write_bits(&dst, 0, 8, &bpos); /* unknown */
-  alac_write_bits(&dst, 0, 4, &bpos); /* unknown */
-  alac_write_bits(&dst, 0, 1, &bpos); /* hassize */
-
-  alac_write_bits(&dst, 0, 2, &bpos); /* unused */
-  alac_write_bits(&dst, 1, 1, &bpos); /* is-not-compressed */
-
-  for (; raw < maxraw; raw += 4)
-    {
-      /* Byteswap to big endian */
-      alac_write_bits(&dst, *(raw + 1), 8, &bpos);
-      alac_write_bits(&dst, *raw, 8, &bpos);
-      alac_write_bits(&dst, *(raw + 3), 8, &bpos);
-      alac_write_bits(&dst, *(raw + 2), 8, &bpos);
-    }
-
-  alac_write_bits(&dst, 7, 3, &bpos); /* end tag */
-}
-
-static int
-alac_encode_no_xcode(struct evbuffer *evbuf, uint8_t *rawbuf, size_t rawbuf_size)
-{
-#define BODY_LEN STOB(RAOP_SAMPLES_PER_PACKET, RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT, RAOP_QUALITY_CHANNELS_DEFAULT)
-  // the "+ 1" above is space for the end tag (3 bits)
-  uint8_t dst[ALAC_HEADER_LEN + BODY_LEN + 1];
-  int len = ALAC_HEADER_LEN + rawbuf_size + 1;
-
-  if (len > sizeof(dst))
-    {
-      DPRINTF(E_LOG, L_RAOP, "Bug! Invalid input to ALAC encoder, destination buffer would overflow\n");
-      return -1;
-    }
-
-  alac_encode_uncompressed(dst, rawbuf, rawbuf_size);
-  if (evbuffer_add(evbuf, dst, len) < 0) return -1;
-  return len;
-#undef BODY_LEN
-}
-
-static int
-alac_encode_xcode(struct evbuffer *evbuf, struct encode_ctx *encode_ctx, uint8_t *rawbuf, size_t rawbuf_size, int nsamples, struct media_quality *quality)
-{
-  transcode_frame *frame;
-  int len;
-
-  frame = transcode_frame_new(rawbuf, rawbuf_size, nsamples, quality);
-  if (!frame)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not convert raw PCM to frame (bufsize=%zu)\n", rawbuf_size);
-      return -1;
-    }
-
-  len = transcode_encode(evbuf, encode_ctx, frame, 0);
-  transcode_frame_free(frame);
-  if (len < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not ALAC encode frame\n");
-      return -1;
-    }
-
-  return len;
-}
-
-static int
-alac_encode(struct evbuffer *evbuf, struct encode_ctx *encode_ctx, uint8_t *rawbuf, size_t rawbuf_size, int nsamples, struct media_quality *quality)
-{
-  if (raop_uncompressed_alac)
-    return alac_encode_no_xcode(evbuf, rawbuf, rawbuf_size);
-  else
-    return alac_encode_xcode(evbuf, encode_ctx, rawbuf, rawbuf_size, nsamples, quality);
-}
 
 // AirTunes v2 time synchronization helpers
 static inline void
@@ -1332,9 +1188,8 @@ raop_add_headers(struct raop_session *rs, struct evrtsp_request *req, enum evrts
   evrtsp_add_header(req->output_headers, "Client-Instance", buf);
   evrtsp_add_header(req->output_headers, "DACP-ID", buf);
 
-  // We set Active-Remote as 32 bit unsigned decimal, as at least my device
-  // can't handle any larger. Must be aligned with volume_byactiveremote().
-  snprintf(buf, sizeof(buf), "%" PRIu32, (uint32_t)rs->device_id);
+  // Keep the 32-bit DACP value; only its decimal representation changes.
+  snprintf(buf, sizeof(buf), "%016" PRIu32, (uint32_t)rs->device_id);
   evrtsp_add_header(req->output_headers, "Active-Remote", buf);
 
   if (rs->session)
@@ -1574,6 +1429,12 @@ raop_send_req_set_parameter(struct raop_session *rs, struct evbuffer *evbuf, cha
 
   evrtsp_add_header(req->output_headers, "Content-Type", ctype);
 
+  if (rs->state == RAOP_STATE_RECORD && rtpinfo) {
+    char length[32];
+    snprintf(length, sizeof(length), "%zu", evbuffer_get_length(req->output_buffer));
+    evrtsp_add_header(req->output_headers, "Content-Length", length);
+  }
+
   if (rtpinfo)
     evrtsp_add_header(req->output_headers, "RTP-Info", rtpinfo);
 
@@ -1617,13 +1478,17 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_
       return -1;
     }
 
-  evrtsp_add_header(req->output_headers, "Range", "npt=0-");
+  evrtsp_add_header(req->output_headers, "Range", "npt=0");
 
   /* A new receiver may recover committed audio that is still in the future. */
   record_anchor_set(rs, &seqnum);
   rs->sync_start_pending = true;
-  rs->marker_pending = true;
-  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", seqnum, rs->sync_start_pos);
+  /* Audio Station marks initial sync but leaves the first audio RTP M=0. */
+  rs->marker_pending = false;
+  /* The verbatim dialect advertises the next sequence but the current time.
+   * Do not move the shared RTP cursor or the local first-packet anchor. */
+  ret = snprintf(buf, sizeof(buf), "seq=%u;rtptime=%u",
+                 (unsigned int)seqnum + 1, rs->sync_start_pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
@@ -1755,10 +1620,12 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb, const char *lo
   /* Session ID and session URL */
   gcry_randomize(&session_id, sizeof(session_id), GCRY_STRONG_RANDOM);
 
+  const char *peer_scope = strchr(rs->address, '%');
+  int peer_len = peer_scope ? (int)(peer_scope - rs->address) : (int)strlen(rs->address);
   if (family == AF_INET)
-    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%s/%u", address, session_id);
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%.*s/%u", peer_len, rs->address, session_id);
   else
-    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%s]/%u", address, session_id);
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%.*s]/%u", peer_len, rs->address, session_id);
   if ((ret < 0) || (ret >= sizeof(rs->session_url)))
     {
       DPRINTF(E_LOG, L_RAOP, "Session URL length exceeds 127 characters\n");
@@ -1784,6 +1651,9 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb, const char *lo
       return -1;
     }
 
+  char length[32];
+  snprintf(length, sizeof(length), "%zu", evbuffer_get_length(req->output_buffer));
+  evrtsp_add_header(req->output_headers, "Content-Length", length);
   evrtsp_add_header(req->output_headers, "Content-Type", "application/sdp");
 
   /* Challenge - but only if session is encrypted (important for ATV3 after update 6.0) */
@@ -2020,8 +1890,6 @@ master_session_free(struct raop_master_session *rms)
   outputs_quality_unsubscribe(&rms->rtp_session->quality);
   rtp_session_free(rms->rtp_session);
 
-  transcode_encode_cleanup(&rms->encode_ctx);
-
   if (rms->input_buffer)
     evbuffer_free(rms->input_buffer);
   if (rms->encoded_buffer)
@@ -2077,7 +1945,6 @@ static struct raop_master_session *
 master_session_make(uint64_t stream_id, struct media_quality *quality, bool encrypt)
 {
   struct raop_master_session *rms;
-  struct transcode_encode_setup_args encode_args = { .profile = XCODE_ALAC, .quality = quality };
   uint64_t buffer_duration_ms;
   int ret;
 
@@ -2105,21 +1972,6 @@ master_session_make(uint64_t stream_id, struct media_quality *quality, bool encr
       outputs_quality_unsubscribe(quality);
       free(rms);
       return NULL;
-    }
-
-  encode_args.src_ctx = transcode_decode_setup_raw(XCODE_PCM16, quality);
-  if (!encode_args.src_ctx)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not create decoding context\n");
-      goto error;
-    }
-
-  rms->encode_ctx = transcode_encode_setup(encode_args);
-  transcode_decode_cleanup(&encode_args.src_ctx);
-  if (!rms->encode_ctx)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Will not be able to stream AirPlay, ffmpeg has no ALAC encoder\n");
-      goto error;
     }
 
   buffer_duration_ms = outputs_buffer_duration_ms_get();
@@ -2521,6 +2373,10 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
 
   rs->supports_auth_setup = re->supports_auth_setup;
   rs->wanted_metadata = re->wanted_metadata;
+  if (re->startup)
+    rs->startup_metadata_pending = rs->wanted_metadata &
+      (RAOP_MD_WANTS_TEXT | RAOP_MD_WANTS_PROGRESS |
+       (re->startup->artwork_len ? RAOP_MD_WANTS_ARTWORK : 0));
 
   switch (re->devtype)
     {
@@ -2887,7 +2743,7 @@ raop_metadata_send_generic(struct raop_session *rs, struct output_metadata *meta
 }
 
 static int
-raop_metadata_startup_send(struct raop_session *rs)
+raop_metadata_replay_current(struct raop_session *rs)
 {
   struct output_metadata *metadata = rs->context->metadata;
   if (!rs->wanted_metadata || !metadata)
@@ -3453,6 +3309,7 @@ control_packet_send(struct raop_session *rs, struct rtp_packet *pkt)
 static void
 packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
 {
+  struct raop_master_session *rms = rs->master_session;
   struct rtp_session *rtp_session;
   struct rtp_packet *pkt;
   uint16_t s;
@@ -3465,7 +3322,9 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
   if (rs->retiring || rs->failure_pending || rs->cancel_pending ||
       raop_ffi_stream_fenced(rs->stream_id)) return;
 
-  rtp_session = rs->master_session->rtp_session;
+  if (!rs->schedule_valid || rs->submitted_frames > rms->epoch_frames) return;
+  rtp_session = rms->rtp_session;
+  uint64_t unsent = (rms->epoch_frames - rs->submitted_frames) / rms->samples_per_packet;
 
   DPRINTF(E_DBG, L_RAOP, "Got retransmit request from '%s': seqnum %" PRIu16 " (len %d), next RTP session seqnum %" PRIu16 " (len %zu)\n",
     rs->devname, seqnum, len, rtp_session->seqnum, rtp_session->pktbuf_len);
@@ -3474,7 +3333,9 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
   for (i = 0, s = seqnum; i < len; i++, s++)
     {
       pkt = rtp_packet_get(rtp_session, s);
-      if (pkt)
+      /* Staying in the ring does not make a queued original eligible for
+       * retransmission. It must pass the receiver's ordered dispatch first. */
+      if (pkt && (uint16_t)(rtp_session->seqnum - s) > unsent)
 	packet_send(rs, pkt);
       else
 	pkt_missing = true;
@@ -3552,19 +3413,23 @@ record_anchor_set(struct raop_session *rs, uint16_t *seqnum)
   *seqnum = rtp->seqnum - suffix;
 }
 
-/* RECORD/FLUSH owns the receiver's start, not the time its reply arrives. Find
- * the contiguous committed suffix that can still meet that receiver's schedule.
- * Never move the shared RTP cursor or credit packets before actual submission. */
-static int
-packets_backfill(struct raop_session *rs)
+static uint64_t
+packet_clock_ns(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* RECORD/FLUSH owns the start anchor. Initialize an empty coverage interval
+ * at the first committed frame which still has time to reach the receiver. */
+static void
+packets_backfill_begin(struct raop_session *rs)
 {
   struct raop_master_session *rms = rs->master_session;
   struct rtp_session *rtp = rms->rtp_session;
   size_t count = (uint32_t)(rtp->pos - rs->sync_start_pos) / rms->samples_per_packet;
-  struct timespec ts;
-  bool sent = false;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  uint64_t now = packet_clock_ns();
   uint64_t distance = (uint64_t)count * rms->samples_per_packet;
   uint64_t recorded_frame = distance <= rms->epoch_frames ? rms->epoch_frames - distance : 0;
   uint64_t ready_after = now;
@@ -3574,33 +3439,46 @@ packets_backfill(struct raop_session *rs)
   if (now >= packet_deadline_ns(rs->schedule_origin_ns, recorded_frame))
     ready_after += RAOP_AUDIO_LATENCY_MS * 1000000ULL;
   size_t suffix = packets_future_suffix(rms, count, rs->schedule_origin_ns, ready_after);
+  rs->coverage_start = rs->submitted_frames = rms->epoch_frames - suffix * rms->samples_per_packet;
+}
 
-  for (size_t i = suffix; i > 0; i--) {
-    struct rtp_packet *pkt = rtp_packet_get(rtp, rtp->seqnum - i);
-    uint64_t frame = rms->epoch_frames - (uint64_t)i * rms->samples_per_packet;
+/* One ordered cursor for live packets and backfill. The retransmit ring also
+ * holds unsent committed packets across ticks. Never skip or credit a hole. */
+static int
+packets_dispatch(struct raop_session *rs, bool shared_deadline)
+{
+  struct raop_master_session *rms = rs->master_session;
+  struct rtp_session *rtp = rms->rtp_session;
+  uint64_t now = packet_clock_ns();
+  if (now >= rs->dispatch_window_end_ns) {
+    rs->dispatch_window_end_ns = now + RAOP_DISPATCH_WINDOW_NS;
+    rs->dispatch_packets = 0;
+  }
+  while (rs->submitted_frames < rms->epoch_frames) {
+    uint64_t frame = rs->submitted_frames;
     uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, frame);
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-    if (now >= deadline) {
-      if (!sent) continue; /* The deliverable suffix may shrink before sending. */
-      goto overdue;
-    }
-    int ret = packet_send_first(rs, pkt);
-    if (ret < 0) return -1;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     if (now >= deadline) goto overdue;
-    if (!sent) rs->coverage_start = frame;
-    rs->submitted_frames = frame + rms->samples_per_packet;
-    sent = true;
+    uint64_t behind = (rms->epoch_frames - frame) / rms->samples_per_packet;
+    if (behind > rtp->pktbuf_len) goto overdue;
+    if (rs->dispatch_packets == RAOP_DISPATCH_PACKETS) return 0;
+    struct rtp_packet *pkt = rtp_packet_get(rtp, rtp->seqnum - behind);
+    if (!pkt) goto overdue;
+    if (packet_send_first(rs, pkt) < 0) return 0; /* reported by packet_send */
+    now = packet_clock_ns();
+    if (now >= deadline) goto overdue;
+    rs->submitted_frames += rms->samples_per_packet;
+    rs->dispatch_packets++;
   }
   return 0;
 
  overdue:
   rs->coverage_failed = true;
-  raop_ffi_attachment_failed(rms->stream_id, rs->device_id, RAOP_PROGRESS_OVERDUE);
+  if (shared_deadline)
+    raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_OVERDUE);
+  else
+    raop_ffi_attachment_failed(rs->stream_id, rs->device_id, RAOP_PROGRESS_OVERDUE);
   deferred_session_failure(rs);
-  return -1;
+  return shared_deadline ? -1 : 0;
 }
 
 static int
@@ -3612,7 +3490,7 @@ packets_send(struct raop_master_session *rms)
   int ret;
   bool overdue = false;
 
-  len = alac_encode(rms->encoded_buffer, rms->encode_ctx, rms->rawbuf, rms->rawbuf_size, rms->samples_per_packet, &rms->quality);
+  len = raop_alac_encode(rms->encoded_buffer, rms->rawbuf, rms->rawbuf_size);
   if (len < 0)
     {
       for (rs = raop_sessions; rs; rs = rs->next)
@@ -3652,51 +3530,32 @@ packets_send(struct raop_master_session *rms)
 
       if (rs->state != RAOP_STATE_CONNECTED && rs->state != RAOP_STATE_STREAMING)
         continue;
-      struct timespec submitted;
-      clock_gettime(CLOCK_MONOTONIC, &submitted);
-      uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
+      uint64_t submitted_ns = packet_clock_ns();
       uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, rms->epoch_frames);
-      if (!rs->schedule_valid || rs->coverage_failed || rs->submitted_frames != rms->epoch_frames) {
+      if (!rs->schedule_valid || rs->coverage_failed || rs->submitted_frames > rms->epoch_frames) {
         raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_SYNC);
         return -1;
       }
-      /* Catch up only inside actual available presentation lead. Check BEFORE
-       * sending, not after emitting an overdue burst. No guessed retry quota. */
+      /* Reject an already overdue live write before sending to any receiver. */
       if (submitted_ns >= deadline) {
         raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_OVERDUE);
         return -1;
       }
     }
 
-  /* Validate the whole cohort before the first irreversible send. Once fanout
-   * begins, always commit the packet exactly once, including partial failure. */
+  /* Validate the cohort before sending. Fanout uses the committed packet
+   * whether it can send now or on a later tick. */
+  uint64_t newest = rms->epoch_frames;
+  rtp_packet_commit(rms->rtp_session, pkt);
+  rms->epoch_frames += rms->samples_per_packet;
   for (rs = raop_sessions; rs; rs = rs->next)
     {
       if (rs->master_session != rms || rs->cancel_pending || rs->retiring ||
           rs->failure_pending || (rs->state != RAOP_STATE_CONNECTED &&
           rs->state != RAOP_STATE_STREAMING)) continue;
-      struct timespec submitted;
-      uint64_t deadline = packet_deadline_ns(rs->schedule_origin_ns, rms->epoch_frames);
-
-      // Device just joined
-      ret = packet_send_first(rs, pkt);
-      clock_gettime(CLOCK_MONOTONIC, &submitted);
-      uint64_t submitted_ns = (uint64_t)submitted.tv_sec * 1000000000ULL + submitted.tv_nsec;
-      /* A late burst is not scheduled coverage. Preserve the known contiguous
-       * prefix rather than crediting audio that missed its presentation time. */
-      if (ret < 0) continue;
-      if (submitted_ns >= deadline) {
-        raop_ffi_progress_failed(rms->stream_id, RAOP_PROGRESS_OVERDUE);
-        deferred_session_failure(rs);
+      if (packets_dispatch(rs, rs->submitted_frames == newest) < 0)
         overdue = true;
-        continue;
-      }
-      rs->submitted_frames += rms->samples_per_packet;
     }
-
-  // Commits packet to retransmit buffer, and prepares the session for the next packet
-  rtp_packet_commit(rms->rtp_session, pkt);
-  rms->epoch_frames += rms->samples_per_packet;
 
   /* packet_send owns attachment-local failure and retirement. Even if this
    * master lost every recipient, raop_write must feed the other masters from
@@ -3802,8 +3661,9 @@ packets_sync_send(struct raop_master_session *rms)
           }
           if (control_packet_send(rs, sync_pkt) < 0) continue;
           rs->schedule_valid = !rs->coverage_failed;
-          if (rs->sync_start_pending && packets_backfill(rs) < 0) continue;
+          if (rs->sync_start_pending) packets_backfill_begin(rs);
           rs->sync_start_pending = false;
+          packets_dispatch(rs, false);
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
@@ -3835,10 +3695,10 @@ packets_streaming_set(uint64_t stream_id)
   }
 }
 
-/* Loop-owned readiness work, independent of producer ingress. Reuse the live
- * clock coordinate without appending PCM or advancing the packet cursor. */
+/* Service receiver readiness and deferred sends even without producer input.
+ * This neither appends PCM nor advances the master's packet cursor. */
 void
-raop_sync_pending(uint64_t stream_id, struct timespec pts)
+raop_dispatch_pending(uint64_t stream_id, struct timespec pts)
 {
   for (struct raop_master_session *rms = raop_master_sessions; rms; rms = rms->next) {
     if (rms->stream_id != stream_id || !rms->epoch_frames) continue;
@@ -3853,6 +3713,13 @@ raop_sync_pending(uint64_t stream_id, struct timespec pts)
     if (packets_sync_send(rms) < 0) return;
   }
   packets_streaming_set(stream_id);
+  for (struct raop_session *rs = raop_sessions; rs; rs = rs->next) {
+    if (rs->stream_id == stream_id && rs->state == RAOP_STATE_STREAMING &&
+        rs->schedule_valid && !rs->retiring && !rs->failure_pending &&
+        !rs->cancel_pending && !rs->coverage_failed &&
+        rs->submitted_frames < rs->master_session->epoch_frames)
+      packets_dispatch(rs, false);
+  }
 }
 
 /* ------------------------- Time and control service ----------------------- */
@@ -4138,36 +4005,55 @@ raop_cb_pin_start(struct evrtsp_request *req, void *arg)
   session_failure(rs);
 }
 
-static void
-raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
+static void raop_cb_startup_metadata(struct evrtsp_request *req, void *arg);
+
+/* Send exactly one stage. Its reply, not request enqueue, advances startup. */
+static int
+raop_startup_metadata_next(struct raop_session *rs)
 {
-  struct raop_session *rs = arg;
-  int ret;
+  struct output_device *device = outputs_device_get(rs->device_id);
+  if (!device) return -1;
+  struct raop_extra *re = device->extra_device_info;
+  const struct raop_startup_metadata *md = re->startup;
+  if (!md) return -1;
 
-  rs->reqs_in_flight--;
-  if (rs->failure_pending || rs->retiring) return;
+  struct evbuffer *body = evbuffer_new();
+  if (!body) return -1;
+  char rtptime[32];
+  snprintf(rtptime, sizeof(rtptime), "rtptime=%" PRIu32, rs->sync_start_pos);
+  char *type;
+  int rc;
+  if (rs->startup_metadata_pending & RAOP_MD_WANTS_TEXT) {
+    rs->startup_metadata_pending &= ~RAOP_MD_WANTS_TEXT;
+    type = "application/x-dmap-tagged";
+    rc = raop_dmap_encode_startup(body, md);
+  } else if (rs->startup_metadata_pending & RAOP_MD_WANTS_ARTWORK) {
+    rs->startup_metadata_pending &= ~RAOP_MD_WANTS_ARTWORK;
+    type = md->artwork_format == 1 ? "image/png" : "image/jpeg";
+    rc = evbuffer_add(body, md->artwork, md->artwork_len);
+  } else {
+    rs->startup_metadata_pending &= ~RAOP_MD_WANTS_PROGRESS;
+    type = "text/parameters";
+    uint32_t pos = rs->sync_start_pos;
+    uint32_t start = pos - (uint32_t)((uint64_t)md->pos_ms * 44100 / 1000);
+    uint32_t len = md->len_ms > md->pos_ms ? md->len_ms : md->pos_ms;
+    uint32_t end = start + len / 1000 * 44100U;
+    rc = evbuffer_add_printf(body, "progress: %u/%u/%u", start, pos, end);
+  }
+  if (rc >= 0)
+    rc = raop_send_req_set_parameter(rs, body, type, rtptime, raop_cb_startup_metadata, "startup_metadata");
+  evbuffer_free(body);
+  return rc;
+}
 
-  if (!req)
-    goto cleanup;
-
-  if (req->response_code != RTSP_OK)
-    {
-      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup volume: %d %s\n", req->response_code, req->response_code_line);
-
-      goto cleanup;
-    }
-
-  ret = raop_check_cseq(rs, req);
-  if (ret < 0)
-    goto cleanup;
-
-  ret = raop_metadata_startup_send(rs);
-  if (ret < 0)
-    goto cleanup;
-
+static void
+raop_startup_ready(struct raop_session *rs)
+{
   rs->server_fd = net_connect(rs->address, rs->server_port, SOCK_DGRAM, "RAOP data");
-  if (rs->server_fd < 0)
-    goto cleanup;
+  if (rs->server_fd < 0) {
+    raop_startup_cancel(rs);
+    return;
+  }
 
   if (source_from_socket(&rs->rtp_source, rs->server_fd) < 0)
     {
@@ -4192,11 +4078,46 @@ raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
 
   if (!rs->reqs_in_flight)
     evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
+}
 
+static void
+raop_startup_parameter_reply(struct evrtsp_request *req, struct raop_session *rs, const char *step)
+{
+  rs->reqs_in_flight--;
+  if (rs->failure_pending || rs->retiring) return;
+
+  if (!req) goto cleanup;
+  if (req->response_code != RTSP_OK) {
+    DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup %s: %d %s\n", step, req->response_code, req->response_code_line);
+    goto cleanup;
+  }
+  if (raop_check_cseq(rs, req) < 0) goto cleanup;
+
+  if (rs->startup_metadata_pending) {
+    if (raop_startup_metadata_next(rs) < 0) goto cleanup;
+  } else {
+    /* A late join also needs the already-published boundary at its actual
+     * stream timestamp. Replay that separately after the startup snapshot. */
+    if (raop_metadata_replay_current(rs) < 0)
+      goto cleanup;
+    raop_startup_ready(rs);
+  }
   return;
 
  cleanup:
   raop_startup_cancel(rs);
+}
+
+static void
+raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
+{
+  raop_startup_parameter_reply(req, arg, "volume");
+}
+
+static void
+raop_cb_startup_metadata(struct evrtsp_request *req, void *arg)
+{
+  raop_startup_parameter_reply(req, arg, "metadata");
 }
 
 static void
@@ -5385,6 +5306,7 @@ raop_device_free_extra(struct output_device *device)
 {
   struct raop_extra *re = device->extra_device_info;
 
+  if (re) free(re->startup);
   free(re);
 }
 
@@ -5546,8 +5468,6 @@ raop_init(void)
 
       goto out_free_timer;
     }
-
-  raop_uncompressed_alac = cfg_getbool(cfg_getsec(cfg, "airplay_shared"), "uncompressed_alac");
 
   ret = mdns_browse("_raop._tcp", raop_device_cb, MDNS_CONNECTION_TEST);
   if (ret < 0)

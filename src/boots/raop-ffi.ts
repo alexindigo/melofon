@@ -46,6 +46,28 @@ import { appLogger, type EventFacts, type Log, scopedLog } from '../logging.ts';
 import { createOperationScope } from '../operations.ts';
 import { createReleaseSet, releaseOrThrow } from '../releases.ts';
 
+const START_PARAMETERS = [
+  'pointer',
+  'buffer',
+  'i32',
+  'buffer',
+  'i32',
+  'i32',
+  'i32',
+  'u32',
+  'u32',
+  'u16',
+  'i32',
+  'i32',
+  'buffer',
+  'buffer',
+  'i32',
+  'buffer',
+  'usize',
+  'buffer',
+  'usize',
+] as const;
+
 const SYMBOLS = {
   raop_log_consumer: { parameters: ['i32'], result: 'i32' },
   raop_log_poll: { parameters: ['buffer', 'usize'], result: 'i32' },
@@ -158,51 +180,15 @@ const SYMBOLS = {
     nonblocking: true,
   },
   raop_start_v2: {
-    parameters: [
-      'pointer',
-      'buffer',
-      'i32',
-      'buffer',
-      'i32',
-      'i32',
-      'i32',
-      'u32',
-      'u32',
-      'u16',
-      'i32',
-      'i32',
-      'buffer',
-      'buffer',
-      'i32',
-      'buffer',
-      'usize',
-      'buffer',
-      'usize',
-    ],
+    parameters: START_PARAMETERS,
+    result: 'i32',
+  },
+  raop_start_v3: {
+    parameters: [...START_PARAMETERS, 'buffer', 'i32', 'buffer', 'usize'],
     result: 'i32',
   },
   raop_probe_v2: {
-    parameters: [
-      'pointer',
-      'buffer',
-      'i32',
-      'buffer',
-      'i32',
-      'i32',
-      'i32',
-      'u32',
-      'u32',
-      'u16',
-      'i32',
-      'i32',
-      'buffer',
-      'buffer',
-      'i32',
-      'buffer',
-      'usize',
-      'buffer',
-      'usize',
-    ],
+    parameters: START_PARAMETERS,
     result: 'i32',
   },
   raop_write: { parameters: ['pointer', 'buffer', 'usize'], result: 'i32' },
@@ -473,7 +459,7 @@ class FfiTransport implements AirplayTransport {
       const open = input.probe
         ? this.lib.symbols.raop_probe_v2
         : this.lib.symbols.raop_start_v2;
-      rc = open(
+      const args = [
         this.handle,
         cstr(profile.host),
         profile.port,
@@ -493,7 +479,20 @@ class FfiTransport implements AirplayTransport {
         BigInt(passwordBytes === null ? 0 : passwordBytes.length - 1),
         keyBytes,
         BigInt(keyBytes?.length ?? 0),
-      );
+      ] as const;
+      const startup = input.probe || !profile.wantedMetadata
+        ? undefined
+        : input.startup;
+      const art = startup?.artwork;
+      rc = startup
+        ? this.lib.symbols.raop_start_v3(
+          ...args,
+          cstr(startup.album),
+          art?.format === 'image/png' ? 1 : art ? 2 : 0,
+          art?.bytes ?? null,
+          BigInt(art?.bytes.length ?? 0),
+        )
+        : open(...args);
     } finally {
       passwordBytes?.fill(0);
       keyBytes?.fill(0);
@@ -860,16 +859,23 @@ export function createFfiStream(
     });
   const readCompletion = async (
     key: AirplayCompletionKey,
+    signal: AbortSignal,
   ): Promise<AirplayCompletionResult | null> => {
     completionKey(key);
     const r = new BigUint64Array(12);
-    const rc = await lib.symbols.raop_stream_completion_poll(
-      handle,
-      key.epoch,
-      key.source,
-      key.revision,
-      r,
-    );
+    const poll = () =>
+      lib.symbols.raop_stream_completion_poll(
+        handle,
+        key.epoch,
+        key.source,
+        key.revision,
+        r,
+      );
+    let rc = await poll();
+    // Close settles native receipts before aborting operations, but the
+    // worker can have already copied a still-pending receipt. Read the settled
+    // value while this operation still owns the handle.
+    if (rc === 1 && r[6] === 0n && signal.aborted) rc = await poll();
     if (rc === 0) return null;
     const state =
       (['pending', 'complete', 'canceled', 'failed'] as const)[Number(r[6])];
@@ -1057,11 +1063,12 @@ export function createFfiStream(
           throw new Error('RAOP compatibility silence refused');
         }
       }),
-    pollCompletion: (key) => operations.run(() => readCompletion(key)),
+    pollCompletion: (key) =>
+      operations.run(({ signal }) => readCompletion(key, signal)),
     waitCompletion(key) {
-      return operations.run(async () => {
+      return operations.run(async ({ signal }) => {
         for (;;) {
-          const receipt = await readCompletion(key);
+          const receipt = await readCompletion(key, signal);
           if (!receipt) throw new Error('RAOP completion receipt absent');
           if (receipt.status !== 'pending') return receipt;
           await new Promise((resolve) => setTimeout(resolve, 5));

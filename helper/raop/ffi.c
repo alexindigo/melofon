@@ -140,6 +140,7 @@ typedef struct cmd
   char *auth_key;
   char title[256];
   char artist[256];
+  struct raop_startup_metadata *startup;
   free_sync *sync;              /* CMD_FREE only */
   struct cmd *next;
 } cmd;
@@ -150,6 +151,7 @@ cmd_free(cmd *c)
   if (c->password) { explicit_bzero(c->password, strlen(c->password)); free(c->password); }
   if (c->auth_key) { explicit_bzero(c->auth_key, strlen(c->auth_key)); free(c->auth_key); }
   explicit_bzero(c->pin, sizeof(c->pin));
+  free(c->startup);
   free(c);
 }
 
@@ -471,15 +473,6 @@ device_free(raop_t *h)
   h->device = NULL;
 }
 
-/* raop.c's private struct raop_extra, mirrored (see VENDORING.md). */
-struct raop_extra_mirror
-{
-  int devtype;
-  uint16_t wanted_metadata;
-  bool encrypt;
-  bool supports_auth_setup;
-};
-
 /* OwnTone raop.c:302-311 — grep-able vs "Adding AirPlay device". */
 static const char *raop_devtype_name[] =
 {
@@ -497,7 +490,7 @@ static int
 device_start(raop_t *h, cmd *c)
 {
   struct output_device *dev;
-  struct raop_extra_mirror *re;
+  struct raop_extra *re;
   char *address;
 
   pthread_mutex_lock(&rt.lock);
@@ -534,6 +527,8 @@ device_start(raop_t *h, cmd *c)
   re->wanted_metadata = c->wanted_metadata;
   re->encrypt = c->encrypt ? true : false;
   re->supports_auth_setup = c->authsetup ? true : false;
+  re->startup = c->startup;
+  c->startup = NULL;
 
   dev->id = h->id;
   dev->stream_id = h->stream ? h->stream->id : 1;
@@ -2104,7 +2099,8 @@ raop_open(raop_t *h, const char *host, int port, const char *name, int volume,
               uint16_t wanted_metadata, int authsetup, int requires_auth,
               const char *title, const char *artist, int has_password,
               const uint8_t *password, size_t password_len,
-              const uint8_t *auth_key, size_t auth_key_len, int probe)
+              const uint8_t *auth_key, size_t auth_key_len, int probe,
+              const char *album, int artwork_format, const uint8_t *artwork, size_t artwork_len)
 {
   cmd *c;
 
@@ -2155,6 +2151,22 @@ raop_open(raop_t *h, const char *host, int port, const char *name, int volume,
     snprintf(c->title, sizeof(c->title), "%s", title);
   if (artist)
     snprintf(c->artist, sizeof(c->artist), "%s", artist);
+  if (album && wanted_metadata && !probe) {
+    if ((!artwork && artwork_len) || artwork_len > SIZE_MAX - sizeof(*c->startup) ||
+        (artwork_len && artwork_format != 1 && artwork_format != 2)) {
+      cmd_free(c); return -1;
+    }
+    c->startup = calloc(1, sizeof(*c->startup) + artwork_len);
+    if (!c->startup) { cmd_free(c); return -1; }
+    snprintf(c->startup->title, sizeof(c->startup->title), "%s", c->title);
+    snprintf(c->startup->artist, sizeof(c->startup->artist), "%s", c->artist);
+    snprintf(c->startup->album, sizeof(c->startup->album), "%s", album);
+    c->startup->pos_ms = pos_ms;
+    c->startup->len_ms = len_ms;
+    c->startup->artwork_format = artwork_format;
+    c->startup->artwork_len = artwork_len;
+    if (artwork_len) memcpy(c->startup->artwork, artwork, artwork_len);
+  }
 
   pthread_mutex_lock(&rt.lock);
   int claimed = stream_admit_locked(h->stream);
@@ -2174,7 +2186,23 @@ raop_start_v2(raop_t *h, const char *host, int port, const char *name, int volum
 {
   return raop_open(h, host, port, name, volume, devtype, encrypt, pos_ms, len_ms,
                    wanted_metadata, authsetup, requires_auth, title, artist,
-                   has_password, password, password_len, auth_key, auth_key_len, 0);
+                   has_password, password, password_len, auth_key, auth_key_len, 0,
+                   NULL, 0, NULL, 0);
+}
+
+int
+raop_start_v3(raop_t *h, const char *host, int port, const char *name, int volume,
+              int devtype, int encrypt, uint32_t pos_ms, uint32_t len_ms,
+              uint16_t wanted_metadata, int authsetup, int requires_auth,
+              const char *title, const char *artist, int has_password,
+              const uint8_t *password, size_t password_len,
+              const uint8_t *auth_key, size_t auth_key_len, const char *album,
+              int artwork_format, const uint8_t *artwork, size_t artwork_len)
+{
+  return raop_open(h, host, port, name, volume, devtype, encrypt, pos_ms, len_ms,
+                   wanted_metadata, authsetup, requires_auth, title, artist,
+                   has_password, password, password_len, auth_key, auth_key_len, 0,
+                   album, artwork_format, artwork, artwork_len);
 }
 
 int
@@ -2187,7 +2215,8 @@ raop_probe_v2(raop_t *h, const char *host, int port, const char *name, int volum
 {
   return raop_open(h, host, port, name, volume, devtype, encrypt, pos_ms, len_ms,
                    wanted_metadata, authsetup, requires_auth, title, artist,
-                   has_password, password, password_len, auth_key, auth_key_len, 1);
+                   has_password, password, password_len, auth_key, auth_key_len, 1,
+                   NULL, 0, NULL, 0);
 }
 
 int

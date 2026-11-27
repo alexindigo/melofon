@@ -13,10 +13,31 @@ import { icyBlock } from './helpers/http-radio.ts';
 type Session = Awaited<
   ReturnType<typeof nativeHttpFixture>
 >['receiver']['sessions'][number];
-function text(session: Session) {
+const decoder = new TextDecoder();
+function dmap(body: Uint8Array) {
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  assertEquals(decoder.decode(body.subarray(0, 4)), 'mlit');
+  assertEquals(view.getUint32(4), body.length - 8);
+  const tags = new Map<string, string>();
+  for (let at = 8; at < body.length;) {
+    const tag = decoder.decode(body.subarray(at, at + 4));
+    const size = view.getUint32(at + 4);
+    assert(!tags.has(tag) && at + 8 + size <= body.length);
+    tags.set(tag, decoder.decode(body.subarray(at + 8, at + 8 + size)));
+    at += 8 + size;
+  }
+  return tags;
+}
+function allText(session: Session) {
   return session.parameters.filter((p) =>
     p.contentType === 'application/x-dmap-tagged'
-  ).map((p) => ({ ...p, value: new TextDecoder().decode(p.body) }));
+  ).map((p) => ({ ...p, tags: dmap(p.body), value: decoder.decode(p.body) }));
+}
+function text(session: Session) {
+  // The startup snapshot carries album (even empty); the scheduled boundary
+  // encoder still emits title/artist alone. A late-join replay of a boundary
+  // can precede RTP too, so packet arrival time does not classify these.
+  return allText(session).filter((p) => !p.tags.has('asal'));
 }
 function anchor(session: Session) {
   const event = session.wire.find((event) => event.kind === 'record');
@@ -27,10 +48,36 @@ function target(parameter: { rtpInfo?: string }) {
   assert(parameter.rtpInfo);
   return Number(/^rtptime=(\d+)$/.exec(parameter.rtpInfo)![1]);
 }
+function progressParameters(session: Session) {
+  return session.parameters.map((p) => ({
+    ...p,
+    value: decoder.decode(p.body),
+  }))
+    .filter((p) => p.value.startsWith('progress:'));
+}
 function progresses(session: Session) {
-  return session.parameters.map((p) => new TextDecoder().decode(p.body)).filter(
-    (body) => body.startsWith('progress:'),
+  return progressParameters(session).filter((p) => !p.rtpInfo).map((p) =>
+    p.value
   );
+}
+async function assertStartup(session: Session, title: string) {
+  await timelineUntil(
+    'first RTP after startup snapshot',
+    () => session.firstRtpAtMs !== null,
+  );
+  const record = session.wire.find((event) => event.kind === 'record');
+  assert(record?.kind === 'record');
+  const snapshots = allText(session).filter((p) => p.tags.has('asal'));
+  const initialProgress = progressParameters(session).filter((p) => p.rtpInfo);
+  assertEquals(snapshots.length, 1, 'one startup DMAP per session');
+  assertEquals(initialProgress.length, 1, 'one startup progress per session');
+  const [snapshot] = snapshots, [progress] = initialProgress;
+  assertEquals(snapshot.tags.get('minm'), title);
+  assert(snapshot.tags.has('asar'));
+  assertEquals(target(snapshot), anchor(session));
+  assertEquals(target(progress), anchor(session));
+  assert(record.atMs <= snapshot.atMs && snapshot.replyAtMs! <= progress.atMs);
+  assert(progress.replyAtMs! <= session.firstRtpAtMs!);
 }
 function progressFrames(body: string) {
   const [, start, position] = /progress: (\d+)\/(\d+)\/(\d+)/.exec(body)!;
@@ -109,6 +156,7 @@ test('HTTP, OwnTone, WS and RTSP follow exact scheduled natural markers', async 
       'final scheduled media',
       () => f.playback.playerView().state === 'stop',
     );
+    await assertStartup(session, 'Marker A');
     assertEquals(f.audio.realAudio(session), concatenate(parts));
     assertEquals(
       f.audio.scheduledRealAudio(session, f.receiver.nowMs()),
@@ -153,6 +201,7 @@ test('seek discards future metadata and binds commanded origin to a fresh RTP ma
     );
     assertEquals(progressFrames(progresses(session)[0]), 30870);
     assert((await c.current()).positionMs >= 700);
+    await assertStartup(session, 'Seek A');
     await timelineLibraryProof();
   } finally {
     await f.close();
@@ -185,6 +234,7 @@ test('repeat-single refreshes timed marker identity without resetting the sessio
     assertEquals((await c.current()).current.entryId, id);
     assertEquals(f.receiver.sessions.length, 1);
     assertEquals(f.receiver.sessions[0].flushes, 0);
+    await assertStartup(f.receiver.sessions[0], 'Repeated source');
     await timelineLibraryProof();
   } finally {
     await f.close();
@@ -261,6 +311,7 @@ test('ICY uses observed decoded-frame boundaries rather than read-ahead time', a
           m.value.includes('Artist - Later')
         ),
     );
+    await assertStartup(f.receiver.sessions[0], '');
     await timelineLibraryProof();
   } finally {
     held.resolve();
@@ -302,6 +353,8 @@ test('late join receives current scheduled metadata instead of the read cursor',
       target(text(session)[0]),
       (anchor(f.receiver.sessions[0]) + parts[0].length / 4) % 2 ** 32,
     );
+    await assertStartup(f.receiver.sessions[0], 'Joined A');
+    await assertStartup(session, 'Joined B');
     await timelineLibraryProof();
   } finally {
     await f.close();
@@ -334,6 +387,7 @@ test('keepalive and OwnTone previous use frozen real-source progress during comp
       35000,
     );
     assertEquals(progressFrames(progresses(session).at(-1)!), 353);
+    await assertStartup(session, 'Keepalive A');
     assertEquals((await c.current()).positionMs, 8);
     assertEquals((await f.own('/player')).item_progress_ms, 8);
     await f.own('/player/previous', 'PUT');

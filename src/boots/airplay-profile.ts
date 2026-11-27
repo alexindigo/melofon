@@ -25,6 +25,10 @@ export interface AirplayInput {
   lengthMs: number;
   title: string;
   artist: string;
+  startup?: {
+    album: string;
+    artwork?: { format: 'image/png' | 'image/jpeg'; bytes: Uint8Array };
+  };
 }
 export interface AirplayProfile {
   requestedHost: string;

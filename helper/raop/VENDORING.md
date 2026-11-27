@@ -22,7 +22,7 @@ metadata, mDNS discovery, HTTP icy metadata. `stub/config.h` is the
 hand-written autoconf `config.h` stand-in for Linux.
 
 Do not "sync" these files wholesale from upstream without re-running
-`make test`; `struct raop_extra` remains mirrored in `ffi.c`. Native session
+`make test`; `struct raop_extra` is shared through `raop-bridge.h`. Native session
 layouts are not mirrored: `raop-bridge.h` exposes device-ID local release.
 
 ## Intentional local patch: receiver-local first-sync anchor
@@ -40,14 +40,17 @@ fallback is normal and is not a failed backfill.
 
 For every joining receiver, RECORD selects the oldest contiguous committed
 packet whose presentation deadline leaves the receiver's 250 ms buffering
-interval for the RECORD/first-sync round trip. Sequence and timestamp both name
-that cached packet. This is receiver-local: the master keeps pacing for ready
-peers, without waiting for a startup cohort or rewinding its RTP cursor.
+interval for the RECORD/first-sync round trip. RECORD advertises this packet's
+timestamp and its sequence number plus one. The first sync is marked; initial
+audio packets are not. The master keeps pacing ready peers without rewinding.
 
-The first sync backfills the contiguous cached suffix from that anchor
-whose presentation deadlines remain in the future. Only the first delivered
-packet carries the marker; successful, on-time sends establish coverage from
-the first backfilled epoch frame, never from audio already presented.
+First sync admits the still-deliverable cached suffix. One bounded send cursor
+per receiver drains both that suffix and timer-overrun audio in order from the
+existing RTP ring. This avoids bursts overflowing a receiver's UDP queue now
+that all packets are 1423 bytes. Ordinary writes do not reach the burst limit;
+pending sends resume on the next player tick, even without new PCM. Only
+on-time sends extend coverage, and neither backfill nor catch-up moves the
+presentation clock.
 
 This follows upstream `rtp_common.c`'s documented first-sync/RTSP compatibility
 requirement (Eufy Genie) and the RECORD and sync definitions in sections 5.1-5.2
@@ -402,15 +405,15 @@ Packet allocation, encoding, cipher and timer failures retain an explicit epoch
 failure and the last proven group prefix. Attachment startup, send and sync
 failures settle that attachment and leave viable peers pacing; loss of every
 viable attachment also freezes shared diagnostics. Packet fanout validates its
-cohort before sending and commits the shared RTP position exactly once after
-sending, even when a later receiver fails, preserving successful peer coverage.
+cohort and commits the shared RTP packet exactly once before dispatch. Each
+receiver's coverage only advances on successful send, even when another fails.
 An attachment-local send failure, including loss of a master's only receiver,
 does not abort feeding other masters of the stream. Mixed encrypted/plain
 master regressions verify exact healthy PCM with both input APIs.
 Failed snapshots remain frozen until ordered cancel/reset. Pacer catch-up checks
 each packet's established presentation deadline before emission, and again after
-send; missing the available lead fails the epoch rather than emitting a stale
-burst and crediting it as played. Successful submission alone is not playout.
+send. An overdue live write fails the epoch; an overdue queued send fails the
+lagging receiver. Successful submission alone is not playout.
 The compatibility local-reset path reanchors the pacer and orders a fresh wire
 sync for its retained attachments together. It cannot reuse an old presentation
 deadline after changing the input clock. Accounted epochs still refuse local
@@ -418,9 +421,11 @@ reset and require ordered cancel; this adds neither FLUSH nor receiver reopen.
 
 `test/progress-faultinject.c` is compiled only by the timeline consumer tests.
 It controls dependency failures and actual timer expirations, exercises the
-existing backend offset field and forces wire counter wrap. None of its controls
-or symbols enters production. Scheduled progress is not a retained source
-completion. Public scheduled position is a separate core projection.
+existing backend offset field and forces wire counter wrap. Encoder faults and
+per-master isolation observe the verbatim ALAC encoder call and its caller-owned
+buffer. No test controls are linked into production. Scheduled progress is not
+a retained source completion. Public scheduled position is a separate core
+projection.
 
 ## Retained source completion
 

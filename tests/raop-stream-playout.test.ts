@@ -13,7 +13,10 @@ import {
 } from '../src/boots/airplay-profile.ts';
 import { startFakeRaop } from './helpers/fake-raop.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
-import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
+import {
+  parseRtpInfo,
+  renderScheduledAudio,
+} from './helpers/raop-scheduled-consumer.ts';
 
 type Stream = ReturnType<typeof createFfiStream>;
 type Receiver = Awaited<ReturnType<typeof startFakeRaop>>;
@@ -28,9 +31,9 @@ const sleep = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
 function rtpInfo(session: Receiver['sessions'][number]) {
   const record = session.wire.find((e) => e.kind === 'record');
   assert(record?.kind === 'record');
-  const match = /^seq=(\d+);rtptime=(\d+)$/.exec(record.rtpInfo);
-  assert(match, 'RECORD has RTP-Info');
-  return { seq: Number(match[1]), rtptime: Number(match[2]) };
+  const info = parseRtpInfo(record.kind, record.rtpInfo);
+  assert(info, 'RECORD has RTP-Info');
+  return info;
 }
 async function until(
   what: string,
@@ -2170,12 +2173,16 @@ for (const delay of ['request', 'reply']) {
           e.kind === 'audio'
         );
         assert(audio[0]?.kind === 'audio');
-        assertEquals(audio[0].data[1] & 0x80, 0x80);
         assert(
-          audio.slice(1).every((e) =>
-            e.kind === 'audio' && (e.data[1] & 0x80) === 0
-          ),
-          'only the first delivered packet carries the marker, including backfill',
+          audio.every((e) => e.kind === 'audio' && (e.data[1] & 0x80) === 0),
+          'audio has no initial marker, including backfill',
+        );
+        const sync = receiver.sessions[0].wire.find((e) =>
+          e.kind === 'control'
+        );
+        assert(
+          sync?.kind === 'control' && sync.data[0] === 0x90,
+          'the initial sync still carries the start flag',
         );
       }
       await libraryProof();

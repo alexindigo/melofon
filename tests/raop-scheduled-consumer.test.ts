@@ -58,7 +58,7 @@ function audio(index: number): Uint8Array {
   const payload = alac(pcm(index * BLOCK));
   const data = new Uint8Array(12 + payload.length);
   const view = new DataView(data.buffer);
-  data.set([0x80, 0xe0]);
+  data.set([0x80, 0x60]);
   view.setUint16(2, (65535 + index) & 0xffff);
   view.setUint32(4, (FIRST + index * BLOCK) >>> 0);
   view.setUint32(8, SSRC);
@@ -107,7 +107,7 @@ function fixture(): Capture {
       {
         kind: 'record',
         atMs: 1000,
-        rtpInfo: `seq=65535;rtptime=${FIRST}`,
+        rtpInfo: `seq=65536;rtptime=${FIRST}`,
         latencyFrames: 11025,
       },
       {
@@ -449,7 +449,7 @@ async function until(what: string, predicate: () => boolean) {
 
 Deno.test({
   name:
-    'scheduled receiver: production public FFI -> UDP -> ALAC -> scheduled PCM',
+    'scheduled receiver: production public FFI -> verbatim ALAC -> scheduled PCM',
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -463,7 +463,24 @@ Deno.test({
       await Deno.realPath(Deno.env.get('MELOFON_RAOP_LIB')!),
       expectedLibrary,
     );
-    const fake = await startFakeRaop({ captureAudio: true, captureWire: true });
+    const fake = await startFakeRaop({
+      captureAudio: true,
+      captureWire: true,
+      bindAddress: '127.0.0.2',
+    });
+    // A small opaque JPEG body exercises the exact-byte artwork pass-through.
+    const artwork = Uint8Array.of(
+      0xff,
+      0xd8,
+      0xff,
+      0xfe,
+      0,
+      4,
+      0,
+      0,
+      0xff,
+      0xd9,
+    );
     let connected = false;
     const driver = createFfiSpawn()((event, value) => {
       if (event === 'state' && value === 'connected') connected = true;
@@ -473,12 +490,22 @@ Deno.test({
         profileFromService({
           name: '001122334455@Scheduled._raop._tcp.local',
           host: 'fixture.local',
-          address: '127.0.0.1',
+          address: '127.0.0.2',
           port: fake.port,
           ttlMs: 60000,
-          txt: { tp: 'UDP', am: 'AppleTV2,1' },
+          txt: { tp: 'UDP', am: 'AppleTV2,1', md: '0,1,2' },
         }),
-        { volume: 50, positionMs: 0, lengthMs: 1000, title: '', artist: '' },
+        {
+          volume: 55,
+          positionMs: 0,
+          lengthMs: 70999,
+          title: '01 Future Shock Suite',
+          artist: 'The Girl From Tomorrow',
+          startup: {
+            album: 'Endurance',
+            artwork: { format: 'image/jpeg', bytes: artwork },
+          },
+        },
       );
       await until('native connected', () => connected);
       await driver.transport.pcm(pcm(0, 704));
@@ -489,6 +516,75 @@ Deno.test({
           fake.sessions[0].wire.some((e) => e.kind === 'timing-reply'),
       );
       const session = fake.sessions[0];
+      const rawRecord = session.requests[3];
+      const first = session.wire.find((e) => e.kind === 'audio');
+      assert(first?.kind === 'audio');
+      const rtp = new DataView(first.data.buffer, first.data.byteOffset);
+      const stamp = rtp.getUint32(4);
+      assertEquals(session.requests.map((r) => r.method), [
+        'OPTIONS',
+        'ANNOUNCE',
+        'SETUP',
+        'RECORD',
+        'SET_PARAMETER',
+        'SET_PARAMETER',
+        'SET_PARAMETER',
+        'SET_PARAMETER',
+      ]);
+      assertEquals(session.requests[0].uri, '*');
+      const origin = /^o=iTunes (\d+) 0 IN IP4 127\.0\.0\.1\r$/m.exec(
+        session.sdp,
+      );
+      assert(origin);
+      assert(
+        session.requests.slice(1).every((r) =>
+          r.uri === `rtsp://127.0.0.2/${origin[1]}`
+        ),
+      );
+      assertEquals(
+        rawRecord.rtpInfo,
+        `seq=${rtp.getUint16(2) + 1};rtptime=${stamp}`,
+      );
+      assertEquals(session.parameters.map((p) => p.contentType), [
+        'text/parameters',
+        'application/x-dmap-tagged',
+        'image/jpeg',
+        'text/parameters',
+      ]);
+      const encode = new TextEncoder();
+      assertEquals(
+        session.parameters[0].body,
+        encode.encode('volume: -13.500000\r\n'),
+      );
+      const dmap = await crypto.subtle.digest(
+        'SHA-256',
+        Uint8Array.from(session.parameters[1].body),
+      );
+      assertEquals(
+        Array.from(new Uint8Array(dmap), (n) => n.toString(16).padStart(2, '0'))
+          .join(''),
+        'b79561b380d940513e2b1696b862211d7d793aea9775a9c1c00c3032bdf0130f',
+      );
+      assertEquals(session.parameters[2].body, artwork);
+      assertEquals(
+        session.parameters[3].body,
+        encode.encode(`progress: ${stamp}/${stamp}/${(stamp + 3087000) >>> 0}`),
+      );
+      for (const p of session.parameters.slice(1)) {
+        assertEquals(p.rtpInfo, `rtptime=${stamp}`);
+        assert(p.replyAtMs! <= first.atMs);
+      }
+      const headers = session.wire.flatMap((e) =>
+        e.kind === 'audio' ? [[e.data.length, e.data[1]]] : []
+      );
+      assertEquals(headers, [
+        [1423, 0x60],
+        [1423, 0x60],
+      ]);
+      assertEquals(
+        session.audioPayloads.map((p) => [p[0], p[1], p[2] & 0xfe]),
+        [[0x20, 0, 2], [0x20, 0, 2]],
+      );
       const maps = await Deno.readTextFile('/proc/self/maps');
       assert(
         maps.split('\n').some((line) => line.endsWith(` ${expectedLibrary}`)),
@@ -538,7 +634,13 @@ Deno.test({
       assertEquals(actual.duplicates, 1);
       assertEquals(session.flushes, 0);
       assertEquals(session.teardowns, 0);
-      assert(session.requests.some((r) => r.method === 'RECORD' && r.rtpInfo));
+      const record = session.requests.find((r) => r.method === 'RECORD');
+      assert(record?.rtpInfo);
+      assertEquals(record.range, 'npt=0');
+      const activeRemote = record.activeRemote;
+      assert(activeRemote && /^\d{16}$/.test(activeRemote));
+      assert(Number(activeRemote) > 0 && Number(activeRemote) <= 0xffffffff);
+      assert(session.requests.every((r) => r.activeRemote === activeRemote));
       assert(session.endpoints?.senderControl?.port);
       assert(session.endpoints?.senderTiming?.port);
       assertEquals(

@@ -3,7 +3,10 @@ import { nativeHttpFixture } from './helpers/playback-native-http.ts';
 import type { AirplayTimelineStream } from '../src/boots/airplay-profile.ts';
 import type { CrossfadeRecord } from '../src/playback-mix.ts';
 import { decodeReceiverAudio } from './helpers/raop-audio-consumer.ts';
-import { renderScheduledAudio } from './helpers/raop-scheduled-consumer.ts';
+import {
+  parseRtpInfo,
+  renderScheduledAudio,
+} from './helpers/raop-scheduled-consumer.ts';
 import { crossfadeReference } from './helpers/crossfade-proof.ts';
 import { exact } from './helpers/concurrent-playback.ts';
 import {
@@ -275,8 +278,9 @@ for (const phase of ['before', 'during', 'after'] as const) {
           if (!event || event.kind !== 'record' && event.kind !== 'flush') {
             return null;
           }
-          const match = /seq=(\d+);rtptime=(\d+)/.exec(event.rtpInfo)!;
-          const sequence = Number(match[1]), anchor = Number(match[2]);
+          const info = parseRtpInfo(event.kind, event.rtpInfo);
+          assert(info, 'valid replacement RTP-Info');
+          const { seq: sequence, rtptime: anchor } = info;
           const packets = new Map<number, Uint8Array>();
           for (const event of session.wire.slice(boundary + 1)) {
             if (event.kind !== 'audio') continue;

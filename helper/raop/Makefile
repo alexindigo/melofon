@@ -25,6 +25,7 @@ LDFLAGS  = -Wl,-z,nodelete
 
 SRC = ffi.c \
       player.c \
+      alac.c \
       stub/stubs.c \
       vendor/outputs/raop.c \
       vendor/outputs/rtp_common.c \
@@ -42,6 +43,7 @@ libmelofon_raop.so: $(OBJ)
 	$(CC) -shared -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
 ffi.o player.o stub/stubs.o vendor/outputs/raop.o test/driver.o: timeline.h
+alac.o vendor/outputs/raop.o: alac.h
 
 # Functional smoke test: driver links the library; a fake RAOP device (no
 # Apple hardware needed) asserts the wire.

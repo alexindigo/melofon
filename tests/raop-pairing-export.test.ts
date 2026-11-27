@@ -73,6 +73,7 @@ async function buildProbe() {
     const sources = [
       'test/probe_pairing_export.c',
       'player.c',
+      'alac.c',
       'stub/stubs.c',
       'vendor/outputs/rtp_common.c',
       'vendor/evrtsp/rtsp.c',
