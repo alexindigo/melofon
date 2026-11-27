@@ -803,7 +803,63 @@ async function indexRuns(
 }
 
 // Internal helpers share the current slot, never another public operation.
-function catalogReads(q: Queries): CatalogReads {
+type ArtistFolder = { directory: string; libraryId: string };
+
+async function readArtistFolders(
+  q: Queries,
+): Promise<Map<string, ArtistFolder>> {
+  const rows = await q.all<{
+    root: string;
+    libraryId: string;
+    artistId: string | null;
+    libraryPath: string;
+  }>(`SELECT al.root_dir AS root, al.library_id AS libraryId,
+      al.album_artist_id AS artistId, l.path AS libraryPath
+      FROM albums al JOIN libraries l ON l.id = al.library_id`);
+  const candidates = new Map<string, ArtistFolder | null>();
+  const owners = new Map<string, Map<string, string | null>>();
+  for (const { root, libraryId, artistId, libraryPath } of rows) {
+    const libraryRoot = libraryPath.replace(/\/+$/, '');
+    const albumDir = `${libraryRoot}/${root}`;
+    const owned = owners.get(libraryId) ?? new Map<string, string | null>();
+    owners.set(libraryId, owned);
+    // Include the album directory itself, so a different artist residing at
+    // a candidate parent defeats ownership as well as a descendant would.
+    for (
+      let dir = albumDir;
+      dir.startsWith(`${libraryRoot}/`) && dir !== `${libraryRoot}/`;
+      dir = dirname(dir)
+    ) {
+      if (!owned.has(dir)) owned.set(dir, artistId);
+      else if (owned.get(dir) !== artistId) owned.set(dir, null);
+    }
+    if (artistId === null) continue;
+    const current = candidates.get(artistId);
+    const parent = dirname(albumDir);
+    if (current === undefined) {
+      candidates.set(artistId, { directory: parent, libraryId });
+    } else if (current && current.libraryId === libraryId) {
+      let dir = current.directory;
+      while (dir !== parent && !parent.startsWith(`${dir}/`)) {
+        const next = dirname(dir);
+        if (next === dir) break;
+        dir = next;
+      }
+      current.directory = dir;
+    } else {
+      candidates.set(artistId, null);
+    }
+  }
+  const result = new Map<string, ArtistFolder>();
+  for (const [id, folder] of candidates) {
+    if (folder && owners.get(folder.libraryId)?.get(folder.directory) === id) {
+      result.set(id, folder);
+    }
+  }
+  return result;
+}
+
+function catalogReads(q: Queries): Omit<CatalogReads, 'artistFolder'> {
   async function requireLibrary(folderId?: string) {
     if (folderId === undefined) return;
     const rows = await q.all(
@@ -1632,45 +1688,6 @@ function catalogReads(q: Queries): CatalogReads {
       return row?.path ?? null;
     },
 
-    async artistFolder(id) {
-      const rows = await q.all<
-        {
-          root: string;
-          libraryId: string;
-          artistId: string | null;
-          libraryPath: string;
-        }
-      >(
-        `SELECT al.root_dir AS root, al.library_id AS libraryId,
-          al.album_artist_id AS artistId, l.path AS libraryPath
-         FROM albums al JOIN libraries l ON l.id = al.library_id`,
-      );
-      const own = rows.filter((row) => row.artistId === id);
-      if (!own.length || new Set(own.map((row) => row.libraryId)).size !== 1) {
-        return null;
-      }
-      const root = own[0].libraryPath.replace(/\/+$/, '');
-      // An artist holds albums: never mistake the album's own directory for
-      // its artist folder, including when the artist has only one album.
-      let directory = dirname(`${root}/${own[0].root}`);
-      for (const row of own.slice(1)) {
-        const parent = dirname(`${root}/${row.root}`);
-        while (parent !== directory && !parent.startsWith(`${directory}/`)) {
-          const next = dirname(directory);
-          if (next === directory) return null;
-          directory = next;
-        }
-      }
-      if (directory === root || !directory.startsWith(`${root}/`)) return null;
-      if (
-        rows.some((row) =>
-          row.libraryId === own[0].libraryId && row.artistId !== id &&
-          (`${root}/${row.root}` === directory ||
-            `${root}/${row.root}`.startsWith(`${directory}/`))
-        )
-      ) return null;
-      return { directory, libraryId: own[0].libraryId };
-    },
     async albumCoverDirectories(id) {
       const rows = await q.all<{
         dir: string;
@@ -1713,6 +1730,9 @@ function catalogReads(q: Queries): CatalogReads {
 }
 
 function createCatalogReadStore(engine: Engine): CatalogReads {
+  let artistFolders:
+    | { revision: string; byArtist: Map<string, ArtistFolder> }
+    | undefined;
   return {
     artistsPage: (opts) =>
       engine.exclusive((q) => catalogReads(q).artistsPage(opts)),
@@ -1783,7 +1803,14 @@ function createCatalogReadStore(engine: Engine): CatalogReads {
     albumCoverDirectories: (id) =>
       engine.exclusive((q) => catalogReads(q).albumCoverDirectories(id)),
     artistFolder: (id) =>
-      engine.exclusive((q) => catalogReads(q).artistFolder(id)),
+      engine.exclusive(async (q) => {
+        const revision = await catalogRevision(q);
+        if (artistFolders?.revision !== revision) {
+          artistFolders = { revision, byArtist: await readArtistFolders(q) };
+        }
+        const found = artistFolders.byArtist.get(id);
+        return found ? { ...found } : null;
+      }),
   };
 }
 

@@ -294,6 +294,7 @@ async function setup(prepare: (root: string) => Promise<unknown>) {
 
 Deno.test('song and album tag credits and classical facts reach OpenSubsonic JSON and XML', async () => {
   const workId = 'eeeeeeee-bbbb-cccc-dddd-aaaaaaaaaaaa';
+  const secondWorkId = 'eeeeeeee-bbbb-cccc-dddd-bbbbbbbbbbbb';
   const s = await setup(async (root) => {
     await tagged(`${root}/rich.mp3`, [
       ['TIT2', 'Quartet II'],
@@ -310,16 +311,27 @@ Deno.test('song and album tag credits and classical facts reach OpenSubsonic JSO
       ['TEXT', 'The Lyricist'],
       ['TMCL', 'Bass\0Guest\0Voice\0Guest'],
       ['TIPL', 'arranger\0The Conductor'],
-      ['TXXX', 'WORK\0The Quartet in C'],
+      ['TXXX', 'WORK\0The Quartet in C\0Overture'],
       ['TXXX', `MusicBrainz Work Id\0${workId}`],
+      ['TXXX', `MUSICBRAINZ_WORKID\0${secondWorkId}`],
       ['MVNM', 'Andante'],
       ['MVIN', '2/4'],
       ['GRP1', 'Classical\0Live'],
     ]);
     await tagged(`${root}/plain.mp3`, { TIT2: 'Tag-light track' });
+    await tagged(`${root}/third.mp3`, {
+      TIT2: 'Cantata',
+      TIT1: 'The Cantata',
+      GRP1: 'Sacred music',
+      MVNM: 'Chorale',
+    });
+    await tagged(`${root}/traditional.mp3`, {
+      TIT2: 'Plain',
+      TIT1: 'Ordinary grouping',
+    });
   });
   try {
-    const [plain, rich] = await s.songs();
+    const [plain, rich, itunes, traditional] = await s.songs();
     const { song } = await s.get('getSong', { id: rich.id });
     assertEquals(song.artist, 'Lead & Guests feat. Guest');
     assertEquals(song.artistId, rich.artistId);
@@ -338,7 +350,7 @@ Deno.test('song and album tag credits and classical facts reach OpenSubsonic JSO
     assertEquals(song.works, [{
       name: 'The Quartet in C',
       musicBrainzId: workId,
-    }]);
+    }, { name: 'Overture', musicBrainzId: secondWorkId }]);
     assertEquals(song.movements, [{ name: 'Andante', number: 2, count: 4 }]);
     assertEquals(song.groupings, ['Classical', 'Live']);
     assertEquals(
@@ -422,6 +434,12 @@ Deno.test('song and album tag credits and classical facts reach OpenSubsonic JSO
     assert(artistXml.includes('<roles>albumartist</roles>'));
 
     const empty = (await s.get('getSong', { id: plain.id })).song;
+    const classical = (await s.get('getSong', { id: itunes.id })).song;
+    assertEquals(classical.works, [{ name: 'The Cantata' }]);
+    assertEquals(classical.groupings, ['Sacred music']);
+    const ordinary = (await s.get('getSong', { id: traditional.id })).song;
+    assertEquals(ordinary.works, []);
+    assertEquals(ordinary.groupings, ['Ordinary grouping']);
     for (
       const key of [
         'artists',

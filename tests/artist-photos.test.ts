@@ -220,6 +220,11 @@ Deno.test('artist folders follow exclusive album ownership across scan, librarie
     await scanLibrary(s.store);
     assertEquals(await s.library.artistFolder(solo.id), null);
     assertEquals(await dimensions(await s.cover(solo.id)), [18, 12]);
+    const updatedArtist =
+      (await (await s.request('getArtist', { id: solo.id })).json())[
+        'subsonic-response'
+      ].artist;
+    assertEquals(updatedArtist.coverArt, undefined);
   } finally {
     await s.close();
   }

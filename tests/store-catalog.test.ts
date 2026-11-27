@@ -17,6 +17,42 @@ import { createMedia } from '../src/media.ts';
 import { domainFixture } from './helpers/store.ts';
 import { rawSql } from '../src/store/testing.ts';
 
+Deno.test('artist folder ownership reads album topology once per catalog revision', async () => {
+  let topologyReads = 0;
+  const t = await domainFixture((engine) =>
+    createCatalogStore({
+      ...engine,
+      exclusive: (fn) =>
+        engine.exclusive((q) =>
+          fn({
+            ...q,
+            all<T>(sql: string): Promise<T[]> {
+              if (sql.includes('al.root_dir AS root')) topologyReads++;
+              return q.all<T>(sql);
+            },
+          })
+        ),
+    })
+  );
+  try {
+    await t.run("INSERT INTO libraries VALUES ('lib', 'Music', '/music')");
+    await t.run(
+      "UPDATE albums SET library_id='lib', root_dir='Solo/Album' WHERE id='album'",
+    );
+    assertEquals(await t.domain.artistFolder('artist'), {
+      directory: '/music/Solo',
+      libraryId: 'lib',
+    });
+    assertEquals(await t.domain.artistFolder('another'), null);
+    assertEquals(topologyReads, 1);
+    await t.domain.removeLibrary('lib');
+    assertEquals(await t.domain.artistFolder('artist'), null);
+    assertEquals(topologyReads, 2);
+  } finally {
+    await t.close();
+  }
+});
+
 function snapshot(): CatalogSnapshot {
   const file: CatalogFile = {
     id: 'song',

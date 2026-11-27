@@ -123,21 +123,25 @@ export function trackDetailsFromTags(
     workNames.push(common.work.trim());
   }
   // Only attach IDs when the tags provide a matching, ordered list.
-  const workIds = [
-    ...freeform('MUSICBRAINZ_WORKID'),
-    ...freeform('MUSICBRAINZ WORK ID'),
-  ];
+  const workIds = freeform('MUSICBRAINZ_WORKID', 'MUSICBRAINZ WORK ID');
   if (!workIds.length && common.musicbrainz_workid) {
     workIds.push(common.musicbrainz_workid);
   }
+  const movementName = text(common.movement) ??
+    text(freeform('MOVEMENTNAME')[0]);
+  const titleGroup = text(values('TIT1')[0]);
+  const itunesGrouping = clean(values('GRP1'));
+  // TIT1 is normally grouping. Treat it as iTunes work only with separate
+  // iTunes grouping and independent evidence that the file tags a work.
+  const itunesWork = !workNames.length && itunesGrouping.length > 0 &&
+    (movementName !== null || workIds.some((id) => id.trim())) && titleGroup;
+  if (itunesWork) workNames.push(itunesWork);
   const works = workNames.map((name, index) => {
     const musicBrainzId = workNames.length === workIds.length
       ? text(workIds[index])
       : null;
     return { name, ...(musicBrainzId ? { musicBrainzId } : {}) };
   });
-  const movementName = text(common.movement) ??
-    text(freeform('MOVEMENTNAME')[0]);
   const movementIndex = freeform('MOVEMENT', 'MOVEMENTNUMBER')[0]?.split('/');
   const positiveInt = (value: string | number | null | undefined) => {
     if (typeof value === 'string' && !/^\d+$/.test(value.trim())) {
@@ -154,6 +158,7 @@ export function trackDetailsFromTags(
   const groupings = clean([
     ...freeform('GROUPING'),
     ...values('GRP1', 'GP1', '©GRP'),
+    ...(!itunesWork && titleGroup ? [titleGroup] : []),
   ]);
   if (!groupings.length && common.grouping?.trim()) {
     groupings.push(common.grouping.trim());
