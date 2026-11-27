@@ -32,6 +32,8 @@
 #include "db.h"
 #include "../raop-bridge.h"
 
+extern struct output_definition output_raop;
+
 /* ------------------------------- logger ---------------------------------- */
 
 /* 0 = quiet .. 5 = spam; set from argv --verbose in main.c. */
@@ -459,6 +461,8 @@ outputs_device_free(struct output_device *device)
   if (!device)
     return;
 
+  if (device->type == OUTPUT_TYPE_RAOP && device->extra_device_info)
+    output_raop.device_free_extra(device);
   free(device->name);
   free(device->v4_address);
   free(device->v6_address);

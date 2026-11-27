@@ -463,12 +463,6 @@ device_free(raop_t *h)
   if (!h->device)
     return;
 
-  if (h->device->extra_device_info)
-    {
-      free(h->device->extra_device_info);
-      h->device->extra_device_info = NULL;
-    }
-
   outputs_device_free(h->device);
   h->device = NULL;
 }

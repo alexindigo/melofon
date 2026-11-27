@@ -73,6 +73,7 @@ async function build(directory: string) {
     `${directory}/probe`,
     ...sources,
     ...decoder.decode(pc.stdout).trim().split(/\s+/),
+    '-Wl,--wrap=calloc,--wrap=free,--wrap=send,--wrap=clock_gettime',
     '-levent_pthreads',
     '-lgpg-error',
     '-lunistring',
@@ -113,6 +114,40 @@ Deno.test({
         receiver.close();
       }
     } finally {
+      await Deno.remove(directory, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    'native source probe: frees startup artwork and reports an overdue live packet after backfill',
+  ignore: !NATIVE_CHANGED,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const directory = await Deno.makeTempDir({ prefix: 'raop-source-probe-' });
+    const receiver = await startFakeRaop();
+    try {
+      const probe = await build(directory);
+      const runs = await Promise.all(
+        [['startup-release', String(receiver.port)], ['live-deadline']].map(
+          (args) =>
+            new Deno.Command(probe, {
+              args,
+              env: childEnvironment(),
+              clearEnv: true,
+              signal: AbortSignal.timeout(30_000),
+            }).output(),
+        ),
+      );
+      assertEquals(
+        runs.map((r) => r.code),
+        [0, 0],
+        runs.map((r) => new TextDecoder().decode(r.stderr)).join('\n'),
+      );
+    } finally {
+      receiver.close();
       await Deno.remove(directory, { recursive: true });
     }
   },

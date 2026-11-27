@@ -237,6 +237,15 @@ raop_dmap_encode_text(struct evbuffer *out, const char *title, const char *artis
   return ret;
 }
 
+/* FFI input is UTF-8. A limit must not split a code point across fields. */
+static size_t
+startup_field_size(const char *s)
+{
+  size_t len = strnlen(s, 127);
+  while (len && ((uint8_t)s[len] & 0xc0) == 0x80) len--;
+  return len;
+}
+
 int
 raop_dmap_encode_startup(struct evbuffer *out, const struct raop_startup_metadata *md)
 {
@@ -246,9 +255,9 @@ raop_dmap_encode_startup(struct evbuffer *out, const struct raop_startup_metadat
   if (!inner) return -1;
   if (dmap_add_field(inner, "mikd", &kind, 1) < 0 ||
       dmap_add_field(inner, "aeMK", &kind, 1) < 0 ||
-      dmap_add_field(inner, "asal", md->album, strnlen(md->album, 127)) < 0 ||
-      dmap_add_field(inner, "minm", md->title, strnlen(md->title, 127)) < 0 ||
-      dmap_add_field(inner, "asar", md->artist, strnlen(md->artist, 127)) < 0 ||
+      dmap_add_field(inner, "asal", md->album, startup_field_size(md->album)) < 0 ||
+      dmap_add_field(inner, "minm", md->title, startup_field_size(md->title)) < 0 ||
+      dmap_add_field(inner, "asar", md->artist, startup_field_size(md->artist)) < 0 ||
       dmap_add_field(inner, "asdk", &stream, 1) < 0 ||
       dmap_add_container(out, "mlit", evbuffer_get_length(inner)) < 0) goto out;
   ret = evbuffer_add_buffer(out, inner);

@@ -34,14 +34,15 @@ first sync matches RTSP without rewinding the master or changing other peers.
 Both sides of the live RTP/NTP correlation are translated by the same frame
 interval; periodic sync and native scheduled progress retain the live clock.
 
-On cold start, or when no cached packet meets the buffering cutoff, RECORD
-uses the master's next sequence number and RTP timestamp. This live-cursor
-fallback is normal and is not a failed backfill.
+On cold start, or when no cached packet meets the buffering cutoff, the
+anchor is the master's next packet. This live-cursor fallback is normal and
+is not a failed backfill.
 
 For every joining receiver, RECORD selects the oldest contiguous committed
 packet whose presentation deadline leaves the receiver's 250 ms buffering
-interval for the RECORD/first-sync round trip. RECORD advertises this packet's
-timestamp and its sequence number plus one. The first sync is marked; initial
+interval for the RECORD/first-sync round trip. RECORD advertises the anchor's
+timestamp and sequence number plus one for both cached and cold-start anchors.
+The first sync is marked; initial
 audio packets are not. The master keeps pacing ready peers without rewinding.
 
 First sync admits the still-deliverable cached suffix. One bounded send cursor

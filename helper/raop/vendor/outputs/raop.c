@@ -3324,7 +3324,6 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
 
   if (!rs->schedule_valid || rs->submitted_frames > rms->epoch_frames) return;
   rtp_session = rms->rtp_session;
-  uint64_t unsent = (rms->epoch_frames - rs->submitted_frames) / rms->samples_per_packet;
 
   DPRINTF(E_DBG, L_RAOP, "Got retransmit request from '%s': seqnum %" PRIu16 " (len %d), next RTP session seqnum %" PRIu16 " (len %zu)\n",
     rs->devname, seqnum, len, rtp_session->seqnum, rtp_session->pktbuf_len);
@@ -3333,9 +3332,13 @@ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
   for (i = 0, s = seqnum; i < len; i++, s++)
     {
       pkt = rtp_packet_get(rtp_session, s);
-      /* Staying in the ring does not make a queued original eligible for
-       * retransmission. It must pass the receiver's ordered dispatch first. */
-      if (pkt && (uint16_t)(rtp_session->seqnum - s) > unsent)
+
+      /* A cache hit can precede this receiver's first dispatch or be queued
+       * for a later tick. Only repair packets in its dispatched interval. */
+      uint64_t distance = (uint64_t)(uint16_t)(rtp_session->seqnum - s) * rms->samples_per_packet;
+      if (pkt && distance <= rms->epoch_frames &&
+          rms->epoch_frames - distance >= rs->coverage_start &&
+          rms->epoch_frames - distance < rs->submitted_frames)
 	packet_send(rs, pkt);
       else
 	pkt_missing = true;
@@ -3445,7 +3448,7 @@ packets_backfill_begin(struct raop_session *rs)
 /* One ordered cursor for live packets and backfill. The retransmit ring also
  * holds unsent committed packets across ticks. Never skip or credit a hole. */
 static int
-packets_dispatch(struct raop_session *rs, bool shared_deadline)
+packets_dispatch(struct raop_session *rs, uint64_t live_frame)
 {
   struct raop_master_session *rms = rs->master_session;
   struct rtp_session *rtp = rms->rtp_session;
@@ -3472,7 +3475,9 @@ packets_dispatch(struct raop_session *rs, bool shared_deadline)
   return 0;
 
  overdue:
+  // The live packet can miss even if this receiver started with a backlog.
   rs->coverage_failed = true;
+  bool shared_deadline = rs->submitted_frames == live_frame;
   if (shared_deadline)
     raop_ffi_progress_failed(rs->stream_id, RAOP_PROGRESS_OVERDUE);
   else
@@ -3553,7 +3558,7 @@ packets_send(struct raop_master_session *rms)
       if (rs->master_session != rms || rs->cancel_pending || rs->retiring ||
           rs->failure_pending || (rs->state != RAOP_STATE_CONNECTED &&
           rs->state != RAOP_STATE_STREAMING)) continue;
-      if (packets_dispatch(rs, rs->submitted_frames == newest) < 0)
+      if (packets_dispatch(rs, newest) < 0)
         overdue = true;
     }
 
@@ -3663,7 +3668,7 @@ packets_sync_send(struct raop_master_session *rms)
           rs->schedule_valid = !rs->coverage_failed;
           if (rs->sync_start_pending) packets_backfill_begin(rs);
           rs->sync_start_pending = false;
-          packets_dispatch(rs, false);
+          packets_dispatch(rs, UINT64_MAX);
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
@@ -3718,7 +3723,7 @@ raop_dispatch_pending(uint64_t stream_id, struct timespec pts)
         rs->schedule_valid && !rs->retiring && !rs->failure_pending &&
         !rs->cancel_pending && !rs->coverage_failed &&
         rs->submitted_frames < rs->master_session->epoch_frames)
-      packets_dispatch(rs, false);
+      packets_dispatch(rs, UINT64_MAX);
   }
 }
 
@@ -4035,9 +4040,12 @@ raop_startup_metadata_next(struct raop_session *rs)
     rs->startup_metadata_pending &= ~RAOP_MD_WANTS_PROGRESS;
     type = "text/parameters";
     uint32_t pos = rs->sync_start_pos;
-    uint32_t start = pos - (uint32_t)((uint64_t)md->pos_ms * 44100 / 1000);
-    uint32_t len = md->len_ms > md->pos_ms ? md->len_ms : md->pos_ms;
-    uint32_t end = start + len / 1000 * 44100U;
+    uint64_t elapsed = (uint64_t)md->pos_ms * 44100 / 1000;
+    uint32_t start = pos - (uint32_t)elapsed;
+    /* Keep whole-second duration on the wire, but never put a resume or seek
+     * position past the end (compare offsets before the RTP clock wraps). */
+    uint64_t duration = (uint64_t)(md->len_ms / 1000) * 44100;
+    uint32_t end = start + (uint32_t)(duration > elapsed ? duration : elapsed);
     rc = evbuffer_add_printf(body, "progress: %u/%u/%u", start, pos, end);
   }
   if (rc >= 0)
@@ -5308,6 +5316,7 @@ raop_device_free_extra(struct output_device *device)
 
   if (re) free(re->startup);
   free(re);
+  device->extra_device_info = NULL;
 }
 
 static void
